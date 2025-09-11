@@ -1,0 +1,30 @@
+services:
+  finance-app:
+    build: .
+    container_name: kite-app
+    ports:
+      # - "100.66.97.99:8555:8555"
+      - "127.0.0.1:8777:8777"  
+    volumes:
+      - .:/app                   # ← mount your source in
+      - /app/__pycache__         # ← optional: ignore container bytecode
+    command:
+      - uvicorn
+      - main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8777"
+      - --reload                 # ← enable hot-reload
+    restart: unless-stopped
+    networks:
+      - db-net
+      - caddy-net
+    env_file:
+      - .env
+
+networks:
+  db-net:
+    external: true
+  caddy-net:
+    external: true
