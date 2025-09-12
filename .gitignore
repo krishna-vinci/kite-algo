@@ -1,1 +1,11 @@
 /.env
+__pycache__/charts.cpython-312.pyc
+.gitignore
+.gitignore
+__pycache__/mcp_server.cpython-312.pyc
+broker_api/__pycache__/kite_auth.cpython-312.pyc
+broker_api/__pycache__/kite_auth.cpython-312.pyc
+broker_api/__pycache__/kite_auth.cpython-312.pyc
+__pycache__/database.cpython-312.pyc
+broker_api/__pycache__/kite_auth.cpython-312.pyc
+broker_api/__pycache__/kite_auth.cpython-312.pyc

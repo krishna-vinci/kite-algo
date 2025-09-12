@@ -52,14 +52,14 @@ from fyers_apiv3 import fyersModel
 
 from fastapi import FastAPI
 from broker_api.broker_api import router as kite_router
-
+from mcp_server import mcp_router
 ######
 app = FastAPI(title="Kite App API")
 
 
 
 app.mount("/charts", charts_app)
-
+app.include_router(mcp_router, prefix="/kite_mcp", tags=["MCP"])
 app.include_router(broker_api_router, prefix="/broker")
 
 # CSV file paths and their corresponding source list names
