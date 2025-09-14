@@ -57,3 +57,9 @@ CREATE TABLE IF NOT EXISTS kite_historical_data (
 
 -- Create index for historical data
 CREATE INDEX IF NOT EXISTS idx_timestamp ON kite_historical_data ("timestamp");
+-- Table for Kite sessions
+CREATE TABLE IF NOT EXISTS kite_sessions (
+    session_id VARCHAR(36) PRIMARY KEY,
+    access_token VARCHAR NOT NULL,
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+);

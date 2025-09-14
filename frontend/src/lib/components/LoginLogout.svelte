@@ -7,7 +7,7 @@
 	let isLoading = false;
 
 	// API base URL - using the backend port from the Docker configuration
-	const API_BASE_URL = 'http://localhost:8777/broker';
+	const API_BASE_URL = 'http://localhost:8777';
 
 	// Check login status on component mount
 	onMount(async () => {
@@ -17,7 +17,7 @@
 	// Check if user is logged in by checking for session cookie
 	async function checkLoginStatus() {
 		try {
-			const response = await fetch(`${API_BASE_URL}/profile_kite`, {
+			const response = await fetch(`${API_BASE_URL}/broker/profile_kite`, {
 				credentials: 'include'
 			});
 			
@@ -39,7 +39,7 @@
 	async function login() {
 		isLoading = true;
 		try {
-			const response = await fetch(`${API_BASE_URL}/login_kite`, {
+			const response = await fetch(`${API_BASE_URL}/broker/login_kite`, {
 				method: 'POST',
 				credentials: 'include'
 			});
@@ -62,7 +62,7 @@
 	async function logout() {
 		isLoading = true;
 		try {
-			const response = await fetch(`${API_BASE_URL}/logout_kite`, {
+			const response = await fetch(`${API_BASE_URL}/broker/logout_kite`, {
 				method: 'POST',
 				credentials: 'include'
 			});

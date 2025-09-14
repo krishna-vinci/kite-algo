@@ -52,6 +52,7 @@ from fyers_apiv3 import fyersModel
 
 from fastapi import FastAPI, Depends
 from broker_api.broker_api import router as kite_router
+from strategies.momentum import router as momentum_router
 
 from broker_api.broker_api import get_kite
 from kiteconnect import KiteConnect
@@ -147,8 +148,9 @@ mcp_app_direct = mcp.http_app(path="/")
 mcp_app_direct_wrapped = MCPAuthWrapper(mcp_app_direct)
 app.mount("/mcp", mcp_app_direct_wrapped)
 
-# 4. Include existing API routes
-app.include_router(broker_api_router)
+# 4. Include existing API routes (mounted under /broker to match frontend)
+app.include_router(broker_api_router, prefix="/broker")
+app.include_router(momentum_router, prefix="/broker")
 
 
 # CSV file paths and their corresponding source list names
@@ -281,11 +283,3 @@ async def hello():
 @app.get("/status")
 async def status():
     return {"status": "running", "backend": "FastAPI"}
-from strategies.momentum import get_momentum_portfolio
-
-@app.get("/momentum-portfolio")
-def fetch_momentum_portfolio():
-    """
-    Returns top momentum stocks.
-    """
-    return get_momentum_portfolio()
