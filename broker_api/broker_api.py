@@ -13,6 +13,7 @@ import csv
 import io
 import logging # Added logging
 
+
 import requests
 import httpx
 import pyotp
@@ -111,9 +112,35 @@ load_dotenv()
 # API router
 router = APIRouter()
 
-# Pydantic request model
+# Pydantic request models
 class TickerRequest(BaseModel):
     symbol: str
+
+class PlaceOrderRequest(BaseModel):
+    tradingsymbol: str
+    exchange: str
+    transaction_type: str
+    quantity: int
+    product: str
+    order_type: str
+    price: Optional[float] = None
+    validity: Optional[str] = None
+    disclosed_quantity: Optional[int] = None
+    trigger_price: Optional[float] = None
+    squareoff: Optional[float] = None
+    stoploss: Optional[float] = None
+    trailing_stoploss: Optional[float] = None
+    tag: Optional[str] = None
+
+class PortfolioSnapshotCreate(BaseModel):
+    strategy_name: str
+    symbol: str
+    quantity: int
+    purchase_price: float # Use float for Pydantic, will be converted to Numeric for SQLAlchemy
+    total_value: float # Use float for Pydantic, will be converted to Numeric for SQLAlchemy
+
+    class Config:
+        orm_mode = True # Enable ORM mode for Pydantic
 
 
 
@@ -205,6 +232,26 @@ class KiteInstrument(Base):
     exchange = Column(String, index=True)         # NSE, NFO, BSE, BFO, MCX, etc.
     last_updated = Column(DateTime, default=datetime.utcnow)
 
+class PortfolioSnapshot(Base):
+    __tablename__ = "portfolio_snapshots"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+    strategy_name = Column(String, nullable=False)
+    symbol = Column(String, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    purchase_price = Column(Numeric, nullable=False)
+    total_value = Column(Numeric, nullable=False)
+
+class PortfolioHistory(Base):
+    __tablename__ = "portfolio_history"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+    strategy_name = Column(String, nullable=False)
+    total_capital = Column(Numeric, nullable=False)
+    total_value = Column(Numeric, nullable=False)
+    profit_loss = Column(Numeric, nullable=False)
+    percentage_change = Column(Numeric, nullable=False)
+
 # ───────── FASTAPI SETUP ─────────
 app    = FastAPI()
 router = APIRouter()
@@ -218,6 +265,12 @@ async def _startup():
     if "kite_instruments" in inspector.get_table_names():
         logger.warning("Dropping existing 'kite_instruments' table for fresh creation. This will delete all existing instrument data.")
         KiteInstrument.__table__.drop(bind=engine)
+    if "portfolio_snapshots" in inspector.get_table_names():
+        logger.warning("Dropping existing 'portfolio_snapshots' table for fresh creation. This will delete all existing portfolio snapshot data.")
+        PortfolioSnapshot.__table__.drop(bind=engine)
+    if "portfolio_history" in inspector.get_table_names():
+        logger.warning("Dropping existing 'portfolio_history' table for fresh creation. This will delete all existing portfolio history data.")
+        PortfolioHistory.__table__.drop(bind=engine)
 
     # auto-create all tables (including kite_instruments with primary key)
     Base.metadata.create_all(bind=engine)
@@ -323,7 +376,6 @@ def profile(kite: KiteConnect = Depends(get_kite)):
 def holdings(kite: KiteConnect = Depends(get_kite)):
     return kite.holdings()
 
-
 @router.get("/margins")
 def get_margins(kite: KiteConnect = Depends(get_kite)):
     try:
@@ -348,35 +400,36 @@ def get_margins(kite: KiteConnect = Depends(get_kite)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ─────────── Place order ───────────
-from pydantic import BaseModel
-
-class OrderRequest(BaseModel):
-    exchange: str
-    tradingsymbol: str
-    transaction_type: str  # "BUY" or "SELL"
-    quantity: int
-    product: str           # e.g. "CNC"
-    order_type: str        # e.g. "MARKET"
-
-@router.post("/order_kite")
-def place_order(req: OrderRequest, kite: KiteConnect = Depends(get_kite)):
+@router.post("/place_single_order")
+async def place_single_order(order_details: PlaceOrderRequest, kite: KiteConnect = Depends(get_kite)):
+    """
+    Places a single order using the KiteConnect API.
+    """
     try:
         order_id = kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=req.exchange,
-            tradingsymbol=req.tradingsymbol,
-            transaction_type=req.transaction_type,
-            quantity=req.quantity,
-            product=req.product,
-            order_type=req.order_type
+            variety=kite.VARIETY_REGULAR, # Assuming regular orders for now
+            tradingsymbol=order_details.tradingsymbol,
+            exchange=order_details.exchange,
+            transaction_type=order_details.transaction_type,
+            quantity=order_details.quantity,
+            product=order_details.product,
+            order_type=order_details.order_type,
+            price=order_details.price,
+            validity=order_details.validity,
+            disclosed_quantity=order_details.disclosed_quantity,
+            trigger_price=order_details.trigger_price,
+            squareoff=order_details.squareoff,
+            stoploss=order_details.stoploss,
+            trailing_stoploss=order_details.trailing_stoploss,
+            tag=order_details.tag
         )
+        logger.info(f"Order placed successfully for {order_details.tradingsymbol}. Order ID: {order_id}")
+        return {"message": "Order placed successfully", "order_id": order_id}
     except Exception as e:
-        raise HTTPException(400, str(e))
-    return {"order_id": order_id}
-
-# ─────────── Instruments import functionality ───────────
+        logger.error(f"Error placing order for {order_details.tradingsymbol}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to place order: {str(e)}")
+ 
+ # ─────────── Instruments import functionality ───────────
 async def upsert_instrument(record, db_session):
     """Upsert instrument with proper error handling for constraint issues"""
     query = """
@@ -778,3 +831,194 @@ async def get_historical_data_progress():
     """
     global historical_data_update_progress
     return historical_data_update_progress
+
+
+
+@router.post("/portfolio/snapshot")
+async def create_portfolio_snapshot(
+    snapshots: List[PortfolioSnapshotCreate], # Use the Pydantic model for request body
+    db: Session = Depends(get_db)
+):
+    """
+    Creates a snapshot of the portfolio after orders are executed.
+    """
+    try:
+        for snapshot_data in snapshots:
+            snapshot = PortfolioSnapshot(
+                strategy_name=snapshot_data.strategy_name,
+                symbol=snapshot_data.symbol,
+                quantity=snapshot_data.quantity,
+                purchase_price=snapshot_data.purchase_price,
+                total_value=snapshot_data.total_value
+            )
+            db.add(snapshot)
+        db.commit()
+        logger.info(f"Successfully created portfolio snapshot for {len(snapshots)} items.")
+        return {"message": f"Portfolio snapshot created successfully for {len(snapshots)} items."}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error creating portfolio snapshot: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to create portfolio snapshot: {str(e)}")
+
+@router.get("/portfolio/performance")
+async def get_portfolio_performance(
+    strategy_name: str = Query(..., description="Name of the strategy to fetch performance for"),
+    db: Session = Depends(get_db)
+):
+    """
+    Retrieves historical performance data for a given strategy.
+    """
+    try:
+        performance_data = db.query(PortfolioHistory).filter(
+            PortfolioHistory.strategy_name == strategy_name
+        ).order_by(PortfolioHistory.timestamp).all()
+
+        if not performance_data:
+            raise HTTPException(status_code=404, detail=f"No performance data found for strategy: {strategy_name}")
+
+        return performance_data
+    except Exception as e:
+        logger.error(f"Error fetching portfolio performance for strategy {strategy_name}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch portfolio performance: {str(e)}")
+
+# ─────────── Orders API (Non-MCP): Preview margins and place single/basket orders ───────────
+# NOTE: These endpoints are independent of MCP and should be used by the frontend.
+
+from pydantic import BaseModel
+from typing import List, Optional
+
+class OrderLeg(BaseModel):
+    exchange: str  # e.g. "NSE"
+    tradingsymbol: str  # e.g. "INFY"
+    transaction_type: str  # "BUY" or "SELL"
+    quantity: int
+    product: str = "CNC"  # CNC / MIS / NRML
+    order_type: str = "MARKET"  # MARKET / LIMIT / SL / SL-M
+    price: Optional[float] = None
+    trigger_price: Optional[float] = None
+    validity: Optional[str] = "DAY"  # DAY / IOC
+    variety: Optional[str] = "regular"  # regular / amo / bo / co
+    disclosed_quantity: Optional[int] = None
+    tag: Optional[str] = None  # for grouping (e.g., "strategy:momentum")
+
+class BasketOrderRequest(BaseModel):
+    orders: List[OrderLeg]
+    consider_positions: bool = True  # include current positions when computing margins
+    margin_mode: Optional[str] = "compact"  # "compact" or None (per-leg breakdown)
+    all_or_none: bool = False  # if True, attempt best-effort rollback on first failure
+    dry_run: bool = False  # if True, only compute margins and return preview
+
+def _order_leg_to_margin_dict(leg: OrderLeg) -> dict:
+    """
+    Build payload item for kite.basket_order_margins() as per Kite docs:
+    Requires: exchange, tradingsymbol, transaction_type, variety, product, order_type, quantity
+    Optional: price, trigger_price, validity, disclosed_quantity, tag
+    """
+    d = {
+        "exchange": leg.exchange,
+        "tradingsymbol": leg.tradingsymbol,
+        "transaction_type": leg.transaction_type,
+        "variety": leg.variety,
+        "product": leg.product,
+        "order_type": leg.order_type,
+        "quantity": leg.quantity,
+        "price": leg.price,
+        "trigger_price": leg.trigger_price,
+        "validity": leg.validity,
+        "disclosed_quantity": leg.disclosed_quantity,
+        "tag": leg.tag,
+    }
+    return {k: v for k, v in d.items() if v is not None}
+
+def _order_leg_to_place_kwargs(leg: OrderLeg) -> dict:
+    """
+    Build kwargs for kite.place_order() as per Kite docs.
+    """
+    kwargs = {
+        "variety": leg.variety or "regular",
+        "exchange": leg.exchange,
+        "tradingsymbol": leg.tradingsymbol,
+        "transaction_type": leg.transaction_type,
+        "quantity": leg.quantity,
+        "product": leg.product,
+        "order_type": leg.order_type,
+        "price": leg.price,
+        "trigger_price": leg.trigger_price,
+        "validity": leg.validity,
+        "disclosed_quantity": leg.disclosed_quantity,
+        "tag": leg.tag,
+    }
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+@router.post("/orders/preview_margins")
+def preview_basket_margins(req: BasketOrderRequest, kite: KiteConnect = Depends(get_kite)):
+    """
+    Compute total margins for a basket of orders (no placement).
+    Uses kite.basket_order_margins() per official Kite docs.
+    """
+    try:
+        params = [_order_leg_to_margin_dict(leg) for leg in req.orders]
+        data = kite.basket_order_margins(params, consider_positions=req.consider_positions, mode=req.margin_mode)
+        return {"status": "ok", "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/orders/place")
+def place_single_order(leg: OrderLeg, kite: KiteConnect = Depends(get_kite)):
+    """
+    Place a single order (non-basket). Thin wrapper over kite.place_order().
+    """
+    try:
+        order_id = kite.place_order(**_order_leg_to_place_kwargs(leg))
+        return {"status": "ok", "order_id": order_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/orders/place_basket")
+def place_basket(req: BasketOrderRequest, kite: KiteConnect = Depends(get_kite)):
+    """
+    Place a basket by sequentially placing each leg via kite.place_order().
+    - If dry_run is True, only returns margin preview.
+    - If all_or_none is True, on first failure we attempt best-effort cancel of already placed orders.
+      Note: Market orders may get executed immediately; cancellation isn't guaranteed.
+    """
+    try:
+        if req.dry_run:
+            params = [_order_leg_to_margin_dict(l) for l in req.orders]
+            preview = kite.basket_order_margins(params, consider_positions=req.consider_positions, mode=req.margin_mode)
+            return {"status": "dry_run", "margins": preview}
+
+        results = []
+        placed = []  # [{index, order_id}]
+        errors = []
+
+        for idx, leg in enumerate(req.orders):
+            try:
+                oid = kite.place_order(**_order_leg_to_place_kwargs(leg))
+                placed.append({"index": idx, "order_id": oid})
+                results.append({"index": idx, "tradingsymbol": leg.tradingsymbol, "order_id": oid, "status": "success"})
+            except Exception as e:
+                err = {"index": idx, "tradingsymbol": leg.tradingsymbol, "error": str(e)}
+                errors.append(err)
+                results.append({"index": idx, "tradingsymbol": leg.tradingsymbol, "status": "failed", "error": str(e)})
+
+                if req.all_or_none:
+                    # Best-effort rollback of previously placed orders
+                    for p in placed:
+                        try:
+                            leg_for_cancel = req.orders[p["index"]]
+                            kite.cancel_order(variety=(leg_for_cancel.variety or "regular"), order_id=p["order_id"])
+                        except Exception:
+                            # swallow cancel errors; we still report the failure
+                            pass
+                    return {
+                        "status": "failed",
+                        "results": results,
+                        "errors": errors,
+                        "note": "Best-effort rollback attempted; some orders may already be executed."
+                    }
+
+        final_status = "success" if not errors else "partial"
+        return {"status": final_status, "results": results, "errors": errors}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

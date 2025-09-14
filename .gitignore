@@ -9,3 +9,8 @@ broker_api/__pycache__/kite_auth.cpython-312.pyc
 __pycache__/database.cpython-312.pyc
 broker_api/__pycache__/kite_auth.cpython-312.pyc
 broker_api/__pycache__/kite_auth.cpython-312.pyc
+__pycache__/main.cpython-312.pyc
+__pycache__/mcp_broker_server.cpython-313.pyc
+__pycache__/server.cpython-313.pyc
+broker_api/__pycache__/broker_api.cpython-312.pyc
+.gitignore

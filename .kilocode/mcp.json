@@ -1,1 +1,8 @@
-{"mcpServers":{}}
+{
+  "mcpServers": {
+    "Kite App MCP": {
+      "transport": "http",
+      "url": "http://localhost:8777/llm/mcp"
+    }
+  }
+}
