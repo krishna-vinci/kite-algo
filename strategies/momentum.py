@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel
+from fastapi import Query # Added Query for the new endpoint
 
 from kiteconnect import KiteConnect
 from broker_api.broker_api import get_kite
@@ -21,13 +21,39 @@ async def get_momentum_investable_margin(kite: KiteConnect = Depends(get_kite)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve investable margin: {str(e)}")
 
+@router.get("/momentum-portfolio/live-ltp")
+async def get_live_ltp_for_symbols(
+    symbols: List[str] = Query(..., description="List of trading symbols (e.g., INFY, RELIANCE)"),
+    kite: KiteConnect = Depends(get_kite)
+):
+    """
+    Retrieves the live Last Traded Price (LTP) for a given list of trading symbols.
+    """
+    if not symbols:
+        return {}
+
+    try:
+        # KiteConnect expects instruments in "EXCHANGE:TRADINGSYMBOL" format
+        kite_symbols = [f"NSE:{s}" for s in symbols]
+        ltp_response = kite.ltp(kite_symbols)
+
+        # Extract only the last_price and map back to original symbols
+        live_ltp_data = {}
+        for instrument_key, data in ltp_response.items():
+            symbol = instrument_key.split(':')[1]
+            if data and 'last_price' in data:
+                live_ltp_data[symbol] = data['last_price']
+        return live_ltp_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve live LTP: {str(e)}")
+
 @router.get("/momentum-portfolio")
 def get_momentum_portfolio_endpoint():
     """
     Returns top momentum stocks as objects containing:
       - symbol (string)
       - ret    (float)  -> 252-day return %
-      - ltp    (float)  -> latest close as LTP
+      - ltp    (float)  -> latest close as LTP (from historical data)
     """
     conn = None
     cur = None
@@ -36,7 +62,6 @@ def get_momentum_portfolio_endpoint():
         cur = conn.cursor()
 
         # Load all tradingsymbols from consolidated tickers table
-        # (kite_instruments may not exist in schema.sql; kite_ticker_tickers does)
         cur.execute("SELECT tradingsymbol FROM kite_ticker_tickers")
         symbols = [r[0] for r in cur.fetchall()]
 

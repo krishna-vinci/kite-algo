@@ -306,6 +306,50 @@
             }
         }
     }
+
+    async function refreshLivePrices() {
+        loading = true;
+        error = null;
+        try {
+            const symbolsToFetch = momentumStocks.map(stock => stock.symbol);
+            if (symbolsToFetch.length === 0) {
+                console.warn("No momentum stocks to refresh LTP for.");
+                return;
+            }
+
+            const queryParams = new URLSearchParams();
+            symbolsToFetch.forEach(symbol => {
+                queryParams.append('symbols', symbol);
+            });
+
+            const response = await fetch(`${API_BASE_URL}/broker/momentum-portfolio/live-ltp?${queryParams.toString()}`, {
+                credentials: 'include'
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to fetch live LTP: ${response.statusText}`);
+            }
+
+            const liveLtpData = await response.json();
+
+            // Update the ltp for each stock in momentumStocks
+            momentumStocks = momentumStocks.map(stock => {
+                if (liveLtpData[stock.symbol] !== undefined) {
+                    return { ...stock, ltp: liveLtpData[stock.symbol] };
+                }
+                return stock;
+            });
+
+            // Trigger recalculation of allocations with new LTPs
+            await calculateEquiAllocations();
+
+        } catch (e: any) {
+            console.error('Error refreshing live prices:', e);
+            error = e.message;
+        } finally {
+            loading = false;
+        }
+    }
 </script>
 
 <div class="container mx-auto p-4">
@@ -368,7 +412,16 @@
 
             <div class="md:col-span-2">
                 <div class="bg-white p-6 rounded-lg shadow-md mb-6">
-                    <h2 class="text-xl font-semibold mb-4">Top Momentum Stocks</h2>
+                    <div class="flex justify-between items-center mb-4">
+                        <h2 class="text-xl font-semibold">Top Momentum Stocks</h2>
+                        <button
+                            on:click={refreshLivePrices}
+                            class="bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-md transition duration-200"
+                            disabled={loading}
+                        >
+                            Refresh Live Prices
+                        </button>
+                    </div>
                     <MomentumStockTable
                         stocks={momentumStocks}
                         bind:selectedStocks
