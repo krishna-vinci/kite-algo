@@ -44,7 +44,7 @@ def login_headless():
         data={"user_id": USER_ID, "password": PASSWORD}
     )
     if r1.status_code != 200:
-        raise HTTPException(400, f"Login failed: {r1.text}")
+        raise ValueError(f"Login failed: {r1.text}")
     req_id = r1.json()["data"]["request_id"]
 
     # 3) Submit TOTP
@@ -59,13 +59,13 @@ def login_headless():
         }
     )
     if r2.status_code != 200:
-        raise HTTPException(400, f"2FA failed: {r2.text}")
+        raise ValueError(f"2FA failed: {r2.text}")
 
     # 4) Fetch redirect with request_token
     final = session.get(approve_url + "&skip_session=true", allow_redirects=True)
     token = parse_qs(urlparse(final.url).query).get("request_token", [None])[0]
     if not token:
-        raise HTTPException(400, "No request_token in final URL")
+        raise ValueError("No request_token in final URL")
 
     # 5) Exchange for access_token via official library
     kite = KiteConnect(api_key=API_KEY)

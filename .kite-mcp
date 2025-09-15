@@ -3,14 +3,11 @@ import os
 import httpx
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from threading import Thread
-import webbrowser
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+
 from mcp.server.fastmcp import FastMCP, Context
 from kiteconnect import KiteConnect
 from dotenv import load_dotenv
+from broker_api.kite_auth import login_headless
 
 # Load environment variables from .env file
 load_dotenv()
@@ -18,14 +15,6 @@ load_dotenv()
 # Constants
 KITE_API_KEY = os.getenv("KITE_API_KEY")
 KITE_API_SECRET = os.getenv("KITE_API_SECRET")
-REDIRECT_URL = "http://127.0.0.1:5000/zerodha/auth/redirect"
-TOKEN_STORE_PATH = os.path.join(os.path.dirname(__file__), ".tokens")
-
-# Initialize FastAPI app for handling redirect
-app = FastAPI(title="Zerodha Login Handler")
-
-# Global variables for auth flow
-_request_token: Optional[str] = None
 
 
 @dataclass
@@ -35,34 +24,6 @@ class ZerodhaContext:
     kite: KiteConnect
     api_key: str
     api_secret: str
-    app: FastAPI
-    server_thread: Optional[Thread] = None
-
-
-def load_stored_token() -> Optional[str]:
-    """Load stored access token if it exists"""
-    try:
-        if os.path.exists(TOKEN_STORE_PATH):
-            with open(TOKEN_STORE_PATH, "r") as f:
-                return f.read().strip()
-    except Exception:
-        return None
-    return None
-
-
-def save_access_token(token: str):
-    """Save access token to file"""
-    try:
-        with open(TOKEN_STORE_PATH, "w") as f:
-            f.write(token)
-    except Exception as e:
-        print(f"Warning: Could not save access token: {e}")
-
-
-def start_server():
-    """Start the FastAPI server"""
-    print("Starting FastAPI server on http://127.0.0.1:5000")
-    uvicorn.run(app, host="127.0.0.1", port=5000, log_level="error")
 
 
 @asynccontextmanager
@@ -76,77 +37,22 @@ async def zerodha_lifespan(server: FastMCP) -> AsyncIterator[ZerodhaContext]:
             "KITE_API_KEY and KITE_API_SECRET must be set in the .env file"
         )
 
-    kite = KiteConnect(api_key=KITE_API_KEY)
-
-    # Try to load existing token
-    stored_token = load_stored_token()
-    if stored_token:
-        try:
-            kite.set_access_token(stored_token)
-            # Verify token is still valid with a simple API call
-            kite.margins()
-            print("Successfully restored previous session")
-        except Exception:
-            print("Stored token is invalid, will wait for new login...")
-            if os.path.exists(TOKEN_STORE_PATH):
-                os.remove(TOKEN_STORE_PATH)
+    # Use login_headless from broker_api.kite_auth to get authenticated KiteConnect instance
+    try:
+        kite, access_token = login_headless()
+        print("Successfully authenticated with Zerodha using headless login.")
+    except Exception as e:
+        print(f"Error during headless login: {e}")
+        raise Exception(f"Failed to authenticate with Zerodha: {e}")
 
     # Create context
     ctx = ZerodhaContext(
         kite=kite,
         api_key=KITE_API_KEY,
         api_secret=KITE_API_SECRET,
-        app=app,
     )
 
     try:
-        # Setup FastAPI endpoint for auth callback
-        @app.get("/zerodha/auth/redirect")
-        async def callback(request_token: str = None, status: str = None):
-            """Handle the redirect from Zerodha login"""
-            global _request_token
-
-            if status != "success":
-                print(f"Login failed with status: {status}")
-                raise HTTPException(
-                    status_code=400, detail=f"Login failed with status: {status}"
-                )
-            if not request_token:
-                print("No request token received")
-                raise HTTPException(status_code=400, detail="No request token received")
-
-            try:
-                # Generate session
-                print("Generating session with request token")
-                data = ctx.kite.generate_session(
-                    request_token, api_secret=ctx.api_secret
-                )
-                access_token = data["access_token"]
-
-                # Save and set the access token
-                print("Saving and setting access token")
-                save_access_token(access_token)
-                ctx.kite.set_access_token(access_token)
-                _request_token = request_token
-                print("Login successful")
-
-                return HTMLResponse(
-                    content="""
-                    <html>
-                        <body style="font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f5f5f5;">
-                            <div style="text-align: center; padding: 2rem; background-color: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-                                <h1 style="color: #2ecc71;">Login Successful!</h1>
-                                <p>You can close this window now.</p>
-                            </div>
-                        </body>
-                    </html>
-                    """
-                )
-            except Exception as e:
-                error_msg = f"Failed to generate session: {str(e)}"
-                print(error_msg)
-                raise HTTPException(status_code=500, detail=error_msg)
-
         # Yield the context to the tools
         yield ctx
     finally:
@@ -159,57 +65,8 @@ async def zerodha_lifespan(server: FastMCP) -> AsyncIterator[ZerodhaContext]:
 mcp = FastMCP(
     "zerodha",
     lifespan=zerodha_lifespan,
-    dependencies=["kiteconnect", "fastapi", "uvicorn", "python-dotenv", "httpx"],
+    dependencies=["kiteconnect", "python-dotenv", "httpx", "sqlalchemy", "psycopg2-binary"],
 )
-
-
-@mcp.tool()
-def initiate_login(ctx: Context) -> Dict[str, Any]:
-    """
-    Start the Zerodha login flow by opening the login URL in a browser
-    and starting a local server to handle the redirect
-    """
-    try:
-        # Reset the request token
-        global _request_token
-        _request_token = None
-        print("Initiating Zerodha login flow")
-
-        # Get strongly typed context
-        zerodha_ctx: ZerodhaContext = ctx.request_context.lifespan_context
-
-        # Start the local server in a separate thread if not already running
-        if not zerodha_ctx.server_thread or not zerodha_ctx.server_thread.is_alive():
-            server_thread = Thread(target=start_server)
-            server_thread.daemon = True
-            server_thread.start()
-            zerodha_ctx.server_thread = server_thread
-
-        # Get the login URL
-        login_url = zerodha_ctx.kite.login_url()
-        print(f"Generated login URL: {login_url}")
-
-        # Open the login URL in browser
-        webbrowser.open(login_url)
-        print("Opened login URL in browser")
-
-        return {
-            "message": "Login page opened in browser. Please complete the login process."
-        }
-    except Exception as e:
-        error_msg = f"Error initiating login: {str(e)}"
-        print(error_msg)
-        return {"error": error_msg}
-
-
-@mcp.tool()
-def get_request_token(ctx: Context) -> Dict[str, Any]:
-    """Get the current request token after login redirect"""
-    if _request_token:
-        return {"request_token": _request_token}
-    return {
-        "error": "No request token available. Please complete the login process first."
-    }
 
 
 @mcp.tool()
@@ -322,46 +179,6 @@ def get_historical_data(
         )
     except Exception as e:
         return {"error": str(e)}
-
-
-@mcp.tool()
-def check_and_authenticate(ctx: Context) -> Dict[str, Any]:
-    """
-    Check if Kite is authenticated and initiate authentication if needed.
-    Returns the authentication status and any relevant messages.
-    """
-    try:
-        zerodha_ctx: ZerodhaContext = ctx.request_context.lifespan_context
-
-        # First try to load existing token
-        stored_token = load_stored_token()
-        if stored_token:
-            try:
-                zerodha_ctx.kite.set_access_token(stored_token)
-                # Verify token is still valid with a simple API call
-                zerodha_ctx.kite.margins()
-                return {
-                    "status": "authenticated",
-                    "message": "Already authenticated with valid token",
-                }
-            except Exception:
-                print("Stored token is invalid, will initiate new login...")
-                if os.path.exists(TOKEN_STORE_PATH):
-                    os.remove(TOKEN_STORE_PATH)
-
-        # If we reach here, we need to authenticate
-        # Call the existing initiate_login function
-        login_result = initiate_login(ctx)
-
-        if "error" in login_result:
-            return {"status": "error", "message": login_result["error"]}
-
-        return {"status": "login_initiated", "message": login_result["message"]}
-
-    except Exception as e:
-        error_msg = f"Error checking/initiating authentication: {str(e)}"
-        print(error_msg)
-        return {"status": "error", "message": error_msg}
 
 
 # Mutual Fund Tools

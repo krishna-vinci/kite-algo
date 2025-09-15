@@ -4,7 +4,7 @@ services:
     container_name: kite-app
     ports:
       # - "100.66.97.99:8555:8555"
-      - "127.0.0.1:8777:8777"  
+      - "8777:8777"
     volumes:
       - .:/app                   # ← mount your source in
       - /app/__pycache__         # ← optional: ignore container bytecode
@@ -22,6 +22,28 @@ services:
       - caddy-net
     env_file:
       - .env
+
+  mcpo-proxy:
+    image: ghcr.io/open-webui/mcpo:main
+    container_name: mcpo-proxy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./mcp-config.json:/app/mcp-config.json
+    depends_on:
+      - finance-app
+    command:
+      - mcpo
+      - --config
+      - /app/mcp-config.json
+      - --host
+      - 0.0.0.0
+      - --api-key
+      - top-secret
+    restart: unless-stopped
+    networks:
+      - db-net
+      - caddy-net
 
 networks:
   db-net:

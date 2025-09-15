@@ -25,3 +25,4 @@ python-multipart
 asyncpg
 kiteconnect
 indexed-gzip
+fastmcp

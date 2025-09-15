@@ -13,6 +13,7 @@ import csv
 import io
 import logging # Added logging
 
+
 import requests
 import httpx
 import pyotp
@@ -111,9 +112,23 @@ load_dotenv()
 # API router
 router = APIRouter()
 
-# Pydantic request model
+# Pydantic request models
 class TickerRequest(BaseModel):
     symbol: str
+
+class InstrumentsRequest(BaseModel):
+    instruments: List[str]
+
+
+class PortfolioSnapshotCreate(BaseModel):
+    strategy_name: str
+    symbol: str
+    quantity: int
+    purchase_price: float # Use float for Pydantic, will be converted to Numeric for SQLAlchemy
+    total_value: float # Use float for Pydantic, will be converted to Numeric for SQLAlchemy
+
+    class Config:
+        orm_mode = True # Enable ORM mode for Pydantic
 
 
 
@@ -205,6 +220,56 @@ class KiteInstrument(Base):
     exchange = Column(String, index=True)         # NSE, NFO, BSE, BFO, MCX, etc.
     last_updated = Column(DateTime, default=datetime.utcnow)
 
+
+class KiteIndex(Base):
+    __tablename__ = "kite_indices"
+    instrument_token = Column(BigInteger, primary_key=True)
+    exchange_token = Column(BigInteger)
+    tradingsymbol = Column(String, index=True)
+    name = Column(String)
+    last_price = Column(Float)
+    expiry = Column(Date)
+    strike = Column(Float)
+    tick_size = Column(Float)
+    lot_size = Column(Integer)
+    instrument_type = Column(String, index=True)
+    segment = Column(String, index=True)
+    exchange = Column(String, index=True)
+    last_updated = Column(DateTime, default=datetime.utcnow)
+
+class KiteIndexHistoricalData(Base):
+    __tablename__ = "kite_indices_historical_data"
+    instrument_token = Column(BigInteger, ForeignKey("kite_indices.instrument_token", ondelete="CASCADE"), primary_key=True)
+    timestamp = Column(DateTime(timezone=True), primary_key=True)
+    interval = Column(String(10), primary_key=True)
+    open = Column(Float, nullable=False)
+    high = Column(Float, nullable=False)
+    low = Column(Float, nullable=False)
+    close = Column(Float, nullable=False)
+    volume = Column(BigInteger, nullable=False)
+    oi = Column(BigInteger)
+
+
+class PortfolioSnapshot(Base):
+    __tablename__ = "portfolio_snapshots"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+    strategy_name = Column(String, nullable=False)
+    symbol = Column(String, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    purchase_price = Column(Numeric, nullable=False)
+    total_value = Column(Numeric, nullable=False)
+
+class PortfolioHistory(Base):
+    __tablename__ = "portfolio_history"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+    strategy_name = Column(String, nullable=False)
+    total_capital = Column(Numeric, nullable=False)
+    total_value = Column(Numeric, nullable=False)
+    profit_loss = Column(Numeric, nullable=False)
+    percentage_change = Column(Numeric, nullable=False)
+
 # ───────── FASTAPI SETUP ─────────
 app    = FastAPI()
 router = APIRouter()
@@ -215,9 +280,6 @@ router = APIRouter()
 async def _startup():
     # For development: Drop table if it exists to ensure fresh schema with primary key
     inspector = inspect(engine)
-    if "kite_instruments" in inspector.get_table_names():
-        logger.warning("Dropping existing 'kite_instruments' table for fresh creation. This will delete all existing instrument data.")
-        KiteInstrument.__table__.drop(bind=engine)
 
     # auto-create all tables (including kite_instruments with primary key)
     Base.metadata.create_all(bind=engine)
@@ -282,10 +344,12 @@ def get_kite(request: Request, db: Session = Depends(get_db)) -> KiteConnect:
 def headless_login(response: Response, db: Session = Depends(get_db)):
     try:
         kite, at = login_headless()
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(500, f"An unexpected error occurred: {e}")
 
     sid = str(uuid.uuid4())
     db.add(KiteSession(session_id=sid, access_token=at))
@@ -323,7 +387,6 @@ def profile(kite: KiteConnect = Depends(get_kite)):
 def holdings(kite: KiteConnect = Depends(get_kite)):
     return kite.holdings()
 
-
 @router.get("/margins")
 def get_margins(kite: KiteConnect = Depends(get_kite)):
     try:
@@ -348,35 +411,21 @@ def get_margins(kite: KiteConnect = Depends(get_kite)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ─────────── Place order ───────────
-from pydantic import BaseModel
-
-class OrderRequest(BaseModel):
-    exchange: str
-    tradingsymbol: str
-    transaction_type: str  # "BUY" or "SELL"
-    quantity: int
-    product: str           # e.g. "CNC"
-    order_type: str        # e.g. "MARKET"
-
-@router.post("/order_kite")
-def place_order(req: OrderRequest, kite: KiteConnect = Depends(get_kite)):
+@router.post("/ltp")
+def get_ltp(request: InstrumentsRequest, kite: KiteConnect = Depends(get_kite)):
+    """
+    Retrieve last price for a list of instruments.
+    Instruments are in the format of `exchange:tradingsymbol`. For example NSE:INFY
+    """
     try:
-        order_id = kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=req.exchange,
-            tradingsymbol=req.tradingsymbol,
-            transaction_type=req.transaction_type,
-            quantity=req.quantity,
-            product=req.product,
-            order_type=req.order_type
-        )
+        # The kite.ltp method expects a list of instrument strings
+        ltp_data = kite.ltp(request.instruments)
+        return ltp_data
     except Exception as e:
-        raise HTTPException(400, str(e))
-    return {"order_id": order_id}
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve LTP: {str(e)}")
 
-# ─────────── Instruments import functionality ───────────
+ 
+ # ─────────── Instruments import functionality ───────────
 async def upsert_instrument(record, db_session):
     """Upsert instrument with proper error handling for constraint issues"""
     query = """
@@ -432,31 +481,6 @@ async def import_instruments_for_exchange(exchange: str, kite: KiteConnect):
         raise HTTPException(status_code=500, detail=f"Failed to import instruments: {str(e)}")
 
 # ─────────── Instruments endpoints ───────────
-@router.post("/import_instruments/nse")
-async def import_nse_instruments(kite: KiteConnect = Depends(get_kite)):
-    """Import NSE instruments"""
-    return await import_instruments_for_exchange("NSE", kite)
-
-@router.post("/import_instruments/nfo")
-async def import_nfo_instruments(kite: KiteConnect = Depends(get_kite)):
-    """Import NFO instruments"""
-    return await import_instruments_for_exchange("NFO", kite)
-
-@router.post("/import_instruments/commodity")
-async def import_commodity_instruments(kite: KiteConnect = Depends(get_kite)):
-    """Import commodity instruments (MCX, BFO, etc.)"""
-    # For commodities, we'll import from multiple exchanges
-    exchanges = ["MCX", "BFO"]
-    results = []
-    
-    for exchange in exchanges:
-        try:
-            result = await import_instruments_for_exchange(exchange, kite)
-            results.append(result)
-        except Exception as e:
-            results.append({"exchange": exchange, "error": str(e)})
-    
-    return {"message": "Imported commodity instruments", "results": results}
 
 @router.post("/import_instruments/all")
 async def import_all_instruments(kite: KiteConnect = Depends(get_kite)):
@@ -511,7 +535,7 @@ async def schedule_daily_instruments_update():
             now_ist = now_utc.astimezone(IST)
 
             # Calculate next run time for 8:00 AM IST
-            next_run_ist = now_ist.replace(hour=8, minute=0, second=0, microsecond=0)
+            next_run_ist = now_ist.replace(hour=7, minute=0, second=0, microsecond=0)
             if now_ist >= next_run_ist:
                 next_run_ist += timedelta(days=1)
 
@@ -556,7 +580,7 @@ async def update_all_instruments_daily():
     logger.info("Daily instruments update completed.")
 
 ####KITE
-from .historical_data import fetch_and_store_historical_data
+from .historical_data import fetch_and_store_historical_data, fetch_and_store_indices_historical_data
 from database import get_db_connection
 from fastapi import BackgroundTasks
 
@@ -778,3 +802,184 @@ async def get_historical_data_progress():
     """
     global historical_data_update_progress
     return historical_data_update_progress
+
+
+
+
+@router.post("/update_indices_from_instruments")
+async def update_indices_from_instruments():
+    """
+    Updates the kite_indices table with data from kite_instruments where the segment is 'INDICES'.
+    """
+    try:
+        # First, clear the existing indices to ensure the table is fresh
+        delete_query = "TRUNCATE TABLE kite_indices RESTART IDENTITY CASCADE;"
+        await database.execute(delete_query)
+
+        # Now, select and insert the indices from the instruments table
+        insert_query = """
+            INSERT INTO kite_indices (
+                instrument_token, exchange_token, tradingsymbol, name, last_price,
+                expiry, strike, tick_size, lot_size, instrument_type, segment, exchange, last_updated
+            )
+            SELECT
+                instrument_token, exchange_token, tradingsymbol, name, last_price,
+                expiry, strike, tick_size, lot_size, instrument_type, segment, exchange, last_updated
+            FROM
+                kite_instruments
+            WHERE
+                segment = 'INDICES'
+        """
+        await database.execute(insert_query)
+
+        return {"message": "Successfully updated the indices table."}
+    except Exception as e:
+        logging.error(f"Error updating indices table: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error updating indices table: {e}")
+
+
+@router.post("/fetch_indices_historical_data")
+async def fetch_indices_historical_data(background_tasks: BackgroundTasks, kite: KiteConnect = Depends(get_kite)):
+    """
+    Fetches historical data for all indices in the kite_indices table for the last 5 years.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT instrument_token, tradingsymbol FROM kite_indices")
+            instruments = [{"token": row[0], "symbol": row[1]} for row in cur.fetchall()]
+        
+        if not instruments:
+            return {"message": "No instruments found in kite_indices table. Nothing to fetch."}
+
+        IST = pytz.timezone('Asia/Calcutta')
+        to_date = datetime.now(IST)
+        from_date = to_date - timedelta(days=5*365)
+        
+        background_tasks.add_task(run_historical_data_fetch_indices, kite, instruments, from_date, to_date, "day")
+        
+        logging.info(f"Started background task to fetch historical data for {len(instruments)} indices.")
+        return {"message": f"Started fetching historical data for {len(instruments)} indices in the background."}
+    except Exception as e:
+        logging.error(f"Error starting historical data fetch for indices: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error starting historical data fetch for indices: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def run_historical_data_fetch_indices(kite: KiteConnect, instruments: list, from_date: datetime, to_date: datetime, interval: str):
+    """
+    The actual data fetching and storing process for indices that runs in the background.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        total_records = 0
+        instrument = None
+        
+        start_date = from_date.date()
+        end_date = to_date.date()
+        logging.info(f"[IMPORTANT] Indices historical fetch: instruments={len(instruments)}, date_range={start_date}..{end_date}, interval={interval}")
+
+        for instrument in instruments:
+            records_fetched = fetch_and_store_indices_historical_data(
+                kite, conn, instrument["token"], instrument["symbol"], start_date, end_date, interval
+            )
+            if records_fetched > 0:
+                conn.commit()
+                total_records += records_fetched
+                logging.info(f"Committed {records_fetched} records for index {instrument['symbol']}")
+        
+        logging.info(f"Finished initial historical data fetch for indices. Total records committed: {total_records}.")
+    except Exception as e:
+        logging.error(f"Error during historical data fetch for index {instrument.get('token', 'N/A') if instrument else 'N/A'}: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+@router.post("/update_indices_historical_data")
+async def update_indices_historical_data(
+    background_tasks: BackgroundTasks,
+    kite: KiteConnect = Depends(get_kite),
+    to_date: Optional[date] = Query(None, description="The end date for the data fetch in YYYY-MM-DD format. Defaults to today.")
+):
+    """
+    Updates historical data for all indices. Fetches data from the last recorded point up to the specified `to_date`.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT instrument_token, tradingsymbol FROM kite_indices")
+            instruments = [{"token": row[0], "symbol": row[1]} for row in cur.fetchall()]
+        
+        if not instruments:
+            return {"message": "No instruments found in kite_indices table. Nothing to update."}
+
+        IST = pytz.timezone('Asia/Calcutta')
+        end_date_val = to_date if to_date else datetime.now(IST).date()
+        
+        background_tasks.add_task(run_historical_data_update_indices, kite, instruments, "day", end_date_val)
+        
+        logging.info(f"Started background task to update historical data for {len(instruments)} indices.")
+        return {"message": f"Started updating historical data for {len(instruments)} indices in the background."}
+    except Exception as e:
+        logging.error(f"Error starting historical data update for indices: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error starting historical data update for indices: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def run_historical_data_update_indices(kite: KiteConnect, instruments: list, interval: str, to_date: date):
+    """
+    The actual data updating process for indices that runs in the background.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        total_records = 0
+
+        logging.info(f"[IMPORTANT] Indices historical update: instruments={len(instruments)}, interval={interval}, to_date={to_date}")
+
+        instrument = None
+        for i, instrument in enumerate(instruments, 1):
+            logging.info(f"Processing index {i}/{len(instruments)}: {instrument['symbol']} ({instrument['token']})")
+            
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT MAX("timestamp") FROM kite_indices_historical_data WHERE instrument_token = %s AND interval = %s""",
+                    (instrument["token"], interval)
+                )
+                last_timestamp = cur.fetchone()[0]
+            
+            if last_timestamp:
+                from_date = last_timestamp.date() + timedelta(days=1)
+                logging.info(f"Last record for index {instrument['symbol']} is on {last_timestamp.date()}. Fetching new data from {from_date}.")
+            else:
+                from_date = to_date - timedelta(days=5*365)
+                logging.info(f"No existing data for index {instrument['symbol']}. Fetching last 5 years from {from_date}.")
+
+            if from_date <= to_date:
+                records_fetched = fetch_and_store_indices_historical_data(
+                    kite, conn, instrument["token"], instrument["symbol"], from_date, to_date, interval
+                )
+                if records_fetched > 0:
+                    conn.commit()
+                    total_records += records_fetched
+                    logging.info(f"Successfully committed {records_fetched} new records for index {instrument['symbol']}")
+                else:
+                    logging.info(f"No new records to commit for index {instrument['symbol']}")
+            else:
+                logging.info(f"Data for index {instrument['symbol']} is already up to date.")
+
+        logging.info(f"Finished historical data update for indices. Total new records committed: {total_records}.")
+    except Exception as e:
+        logging.error(f"Error during historical data update for index {instrument.get('token', 'N/A') if instrument else 'N/A'}: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()

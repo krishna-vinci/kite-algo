@@ -50,17 +50,108 @@ import json
 from urllib import parse
 from fyers_apiv3 import fyersModel
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from broker_api.broker_api import router as kite_router
+from strategies.momentum import router as momentum_router
 
-######
-app = FastAPI(title="Kite App API")
+from broker_api.broker_api import get_kite
+from kiteconnect import KiteConnect
+from typing import List, Optional
+from server import mcp
+from contextlib import asynccontextmanager
+import server
+from kite_auth import login_headless
+import logging
+from database import SessionLocal
+from broker_api.broker_api import KiteSession
+from broker_api.kite_auth import API_KEY
+
+# 1. Create the MCP's ASGI app
+mcp_app = mcp.http_app(path='/mcp')
+
+# Wrap the MCP ASGI app to inject a per-request KiteConnect (based on cookie 'kite_session_id')
+class MCPAuthWrapper:
+    def __init__(self, app):
+        self.app = app
+
+    @staticmethod
+    def _get_cookie(scope, name: str) -> str | None:
+        headers = dict(scope.get("headers") or [])
+        raw = headers.get(b"cookie")
+        if not raw:
+            return None
+        try:
+            cookie_str = raw.decode("latin-1")
+            for part in cookie_str.split(";"):
+                k_v = part.strip().split("=", 1)
+                if len(k_v) == 2 and k_v[0] == name:
+                    return k_v[1]
+        except Exception:
+            return None
+        return None
+
+    async def __call__(self, scope, receive, send):
+        # Intercept all HTTP requests for this mounted app to inject request-scoped KiteConnect
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+
+        ctx_token = None
+        try:
+            sid = self._get_cookie(scope, "kite_session_id")
+            if sid:
+                db = SessionLocal()
+                try:
+                    ks = db.query(KiteSession).filter_by(session_id=sid).first()
+                    if ks:
+                        from kiteconnect import KiteConnect
+                        kite = KiteConnect(api_key=API_KEY)
+                        kite.set_access_token(ks.access_token)
+                        ctx_token = server.set_request_kite(kite)
+                finally:
+                    db.close()
+            return await self.app(scope, receive, send)
+        finally:
+            if ctx_token is not None:
+                server.reset_request_kite(ctx_token)
+
+# Wrapped app that injects request-scoped KiteConnect into FastMCP tools
+mcp_app_wrapped = MCPAuthWrapper(mcp_app)
+
+# 2. Combine the lifespans
+@asynccontextmanager
+async def combined_lifespan(app: FastAPI):
+    # Perform headless login at startup and store the KiteConnect instance
+    try:
+        kite, _ = login_headless()
+        server.mcp_kite_instance = kite
+        logging.info("MCP Kite instance initialized successfully.")
+    except Exception as e:
+        logging.error(f"Failed to initialize MCP Kite instance: {e}", exc_info=True)
+        # Depending on the desired behavior, you might want to exit the application
+        # or proceed without a valid Kite instance for MCP.
+        # For now, we'll log the error and continue.
+        server.mcp_kite_instance = None
+
+    async with mcp_app.lifespan(app):
+        yield
 
 
+app = FastAPI(title="Kite App API", lifespan=combined_lifespan)
 
-app.mount("/charts", charts_app)
+# 3. Mount the MCP app at a subpath so normal FastAPI routes remain reachable
+# Final MCP endpoint will be available at /llm/mcp (since mcp_app was created with path='/mcp')
+app.mount("/llm", mcp_app_wrapped)
 
+# 3b. Also expose MCP directly at /mcp for clients expecting the legacy path
+# For this mount, set the MCP ASGI app path to "/" so the full endpoint is exactly "/mcp"
+mcp_app_direct = mcp.http_app(path="/")
+mcp_app_direct_wrapped = MCPAuthWrapper(mcp_app_direct)
+app.mount("/mcp", mcp_app_direct_wrapped)
+
+# 4. Include existing API routes (mounted under /broker to match frontend)
 app.include_router(broker_api_router, prefix="/broker")
+app.include_router(momentum_router, prefix="/broker")
+
 
 # CSV file paths and their corresponding source list names
 CSV_FILES = {
@@ -192,11 +283,3 @@ async def hello():
 @app.get("/status")
 async def status():
     return {"status": "running", "backend": "FastAPI"}
-from strategies.momentum import get_momentum_portfolio
-
-@app.get("/momentum-portfolio")
-def fetch_momentum_portfolio():
-    """
-    Returns top momentum stocks.
-    """
-    return get_momentum_portfolio()

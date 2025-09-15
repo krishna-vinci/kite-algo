@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "kite": {
+      "command": "npx",
+      "args": ["mcp-remote", "http://localhost:8777/llm/mcp", "--allow-http"],
+      "env": {
+        "APP_MODE": "http",
+        "KITE_API_KEY": "your_api_key",
+        "KITE_API_SECRET": "your_api_secret"
+      }
+    }
+  }
+}
