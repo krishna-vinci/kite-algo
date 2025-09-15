@@ -46,7 +46,7 @@ def get_historical_data(kite: KiteConnect, instrument_token: int, from_date: dat
         logging.error(f"Error fetching historical data for token {instrument_token}: {e}")
         return pd.DataFrame()
 
-def fetch_and_store_historical_data(kite: KiteConnect, conn, instrument_token: int, tradingsymbol: str, from_date: date, to_date: date, interval: str):
+def fetch_and_store_historical_data(kite: KiteConnect, conn, instrument_token: int, tradingsymbol: str, from_date: date, to_date: date, interval: str, table_name: str = 'kite_historical_data'):
     """
     Fetches historical data and stores it in the database using a bulk insert.
     Returns the number of records newly inserted.
@@ -106,8 +106,8 @@ def fetch_and_store_historical_data(kite: KiteConnect, conn, instrument_token: i
             
             execute_values(
                 cur,
-                """
-                INSERT INTO kite_historical_data (instrument_token, tradingsymbol, "timestamp", interval, open, high, low, close, volume, oi)
+                f"""
+                INSERT INTO {table_name} (instrument_token, tradingsymbol, "timestamp", interval, open, high, low, close, volume, oi)
                 VALUES %s
                 ON CONFLICT (instrument_token, "timestamp", interval) DO NOTHING;
                 """,
@@ -124,4 +124,118 @@ def fetch_and_store_historical_data(kite: KiteConnect, conn, instrument_token: i
             logging.error(f"Error during bulk insert for {tradingsymbol} ({instrument_token}): {e}")
             logging.error(f"Sample record that failed: {records_to_insert[0] if records_to_insert else 'None'}")
             # The transaction will be rolled back by the calling function's error handler.
+            return 0
+
+
+def fetch_and_store_indices_historical_data(
+    kite: KiteConnect,
+    conn,
+    instrument_token: int,
+    tradingsymbol: str,
+    from_date: date,
+    to_date: date,
+    interval: str,
+    table_name: str = 'kite_indices_historical_data'
+) -> int:
+    """
+    Dedicated indices historical data fetch-and-insert to avoid interfering with stock flow.
+    - Adds stronger sanitization for index-specific nulls.
+    - Ensures transaction rollback on error to prevent 'current transaction is aborted' cascades.
+    """
+    logging.info(f"[IMPORTANT] Starting indices historical fetch for {tradingsymbol} ({instrument_token}) "
+                 f"from {from_date} to {to_date} interval={interval} into table={table_name}")
+
+    df = get_historical_data(kite, instrument_token, from_date, to_date, interval)
+    if df.empty:
+        logging.info(f"No historical data returned from API for index {tradingsymbol} ({instrument_token}) "
+                     f"from {from_date} to {to_date}.")
+        return 0
+
+    logging.info(f"Retrieved {len(df)} index records from API for {tradingsymbol}")
+
+    # Data validation
+    required_columns = ['date', 'open', 'high', 'low', 'close', 'volume']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        logging.error(f"Missing required columns in API response for index {tradingsymbol}: {missing_columns}")
+        return 0
+
+    # Log sample of data for debugging
+    if len(df) > 0:
+        sample_row = df.iloc[0]
+        logging.info(f"Sample row for index {tradingsymbol}: date={sample_row['date']}, "
+                     f"open={sample_row['open']}, close={sample_row['close']}")
+
+    # Prepare data for bulk insert with index-specific sanitization
+    records_to_insert = []
+    for _, row in df.iterrows():
+        try:
+            # Volume can be 0 or missing for indices; coerce missing/NaN to 0
+            vol_val = row.get('volume', 0)
+            try:
+                # pandas.isna handles None/NaN
+                vol_val = 0 if pd.isna(vol_val) else int(vol_val)
+            except Exception:
+                vol_val = 0
+
+            # OI often not applicable for spot indices; allow NULL
+            oi_raw = row.get('oi', None)
+            oi_val = None
+            if oi_raw is not None and not pd.isna(oi_raw):
+                try:
+                    oi_val = int(oi_raw)
+                except Exception:
+                    oi_val = None
+
+            record = (
+                instrument_token,
+                tradingsymbol,
+                row['date'],
+                interval,
+                float(row['open']),
+                float(row['high']),
+                float(row['low']),
+                float(row['close']),
+                vol_val,
+                oi_val
+            )
+            records_to_insert.append(record)
+        except (ValueError, TypeError) as e:
+            logging.error(f"Error preparing index record for {tradingsymbol} at {row.get('date', 'unknown date')}: {e}")
+            continue
+
+    if not records_to_insert:
+        logging.error(f"No valid index records to insert for {tradingsymbol}")
+        return 0
+
+    logging.info(f"Prepared {len(records_to_insert)} valid index records for insertion")
+
+    with conn.cursor() as cur:
+        try:
+            logging.debug(f"Executing indices bulk insert for {tradingsymbol} with {len(records_to_insert)} records")
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO {table_name} (instrument_token, tradingsymbol, "timestamp", interval, open, high, low, close, volume, oi)
+                VALUES %s
+                ON CONFLICT (instrument_token, "timestamp", interval) DO NOTHING;
+                """,
+                records_to_insert
+            )
+            inserted_rows = cur.rowcount
+            logging.info(f"Successfully processed {len(records_to_insert)} index records for {tradingsymbol} "
+                         f"({instrument_token}), inserted {inserted_rows} new ones.")
+            if inserted_rows == 0:
+                logging.warning(f"All {len(records_to_insert)} index records for {tradingsymbol} already exist "
+                                f"in database (conflicts)")
+            return inserted_rows
+        except Exception as e:
+            logging.error(f"Error during indices bulk insert for {tradingsymbol} ({instrument_token}): {e}")
+            logging.error(f"Sample index record that failed: {records_to_insert[0] if records_to_insert else 'None'}")
+            # CRITICAL: reset aborted transaction so caller can continue with same connection
+            try:
+                conn.rollback()
+                logging.info("Rolled back transaction after indices insert error to clear aborted state.")
+            except Exception as rb_err:
+                logging.error(f"Rollback failed after indices insert error: {rb_err}")
             return 0
