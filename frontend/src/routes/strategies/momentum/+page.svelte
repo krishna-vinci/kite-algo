@@ -4,8 +4,9 @@
     import MomentumStockTable from '$lib/components/MomentumStockTable.svelte';
     import AllocationSummary from '$lib/components/AllocationSummary.svelte';
     import OrderExecution from '$lib/components/OrderExecution.svelte';
+    import { apiFetch, getApiBase } from '$lib/api';
 
-    const API_BASE_URL = 'http://localhost:8777';
+    const API_BASE_URL = getApiBase();
 
     let momentumStocks: any[] = [];
     let investableMargin: number = 0; // Renamed from availableMargin
@@ -44,9 +45,7 @@
         error = null;
         try {
             // Fetch momentum stocks
-            const stocksResponse = await fetch(`${API_BASE_URL}/broker/momentum-portfolio`, {
-                credentials: 'include'
-            });
+            const stocksResponse = await apiFetch(`/broker/momentum-portfolio`);
             if (!stocksResponse.ok) {
                 throw new Error(`Failed to fetch momentum stocks: ${stocksResponse.statusText}`);
             }
@@ -59,9 +58,7 @@
             });
 
             // Fetch investable margin from the new endpoint
-            const marginsResponse = await fetch(`${API_BASE_URL}/broker/momentum-portfolio/investable-margin`, {
-                credentials: 'include'
-            });
+            const marginsResponse = await apiFetch(`/broker/momentum-portfolio/investable-margin`);
             if (!marginsResponse.ok) {
                 throw new Error(`Failed to fetch investable margin: ${marginsResponse.statusText}`);
             }
@@ -81,9 +78,7 @@
         fetchingPerformance = true;
         performanceError = null;
         try {
-            const response = await fetch(`${API_BASE_URL}/broker/portfolio/performance?strategy_name=${encodeURIComponent(STRATEGY_NAME)}`, {
-                credentials: 'include'
-            });
+            const response = await apiFetch(`/broker/portfolio/performance?strategy_name=${encodeURIComponent(STRATEGY_NAME)}`);
             if (!response.ok) {
                 if (response.status === 404) {
                     portfolioPerformance = [];
@@ -116,10 +111,9 @@
         const capitalForAllocation = investableMargin * (marginAllocationPercentage / 100);
 
         try {
-            const response = await fetch(`${API_BASE_URL}/broker/momentum-portfolio/calculate-equi-allocation`, {
+            const response = await apiFetch(`/broker/momentum-portfolio/calculate-equi-allocation`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                credentials: 'include',
                 body: JSON.stringify({
                     selected_symbols: selectedSymbols,
                     investable_capital: capitalForAllocation,
@@ -188,10 +182,9 @@
             if (orders.length === 0) {
                 throw new Error("No valid orders to preview. Adjust allocation or selections.");
             }
-            const resp = await fetch(`${API_BASE_URL}/broker/orders/preview_margins`, {
+            const resp = await apiFetch(`/broker/orders/preview_margins`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                credentials: 'include',
                 body: JSON.stringify({
                     orders,
                     consider_positions: true,
@@ -229,10 +222,9 @@
 
         if (useBasket) {
             try {
-                const resp = await fetch(`${API_BASE_URL}/broker/orders/place_basket`, {
+                const resp = await apiFetch(`/broker/orders/place_basket`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    credentials: 'include',
                     body: JSON.stringify({
                         orders: ordersToPlace,
                         consider_positions: true,
@@ -287,10 +279,9 @@
         // If there are successful orders, create a portfolio snapshot
         if (snapshotData.length > 0) {
             try {
-                const snapshotResponse = await fetch(`${API_BASE_URL}/broker/portfolio/snapshot`, {
+                const snapshotResponse = await apiFetch(`/broker/portfolio/snapshot`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    credentials: 'include',
                     body: JSON.stringify(snapshotData)
                 });
 
@@ -322,9 +313,7 @@
                 queryParams.append('symbols', symbol);
             });
 
-            const response = await fetch(`${API_BASE_URL}/broker/momentum-portfolio/live-ltp?${queryParams.toString()}`, {
-                credentials: 'include'
-            });
+            const response = await apiFetch(`/broker/momentum-portfolio/live-ltp?${queryParams.toString()}`);
 
             if (!response.ok) {
                 throw new Error(`Failed to fetch live LTP: ${response.statusText}`);

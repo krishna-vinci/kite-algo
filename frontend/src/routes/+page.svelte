@@ -1,8 +1,9 @@
 <script lang="ts">
 import { onMount, onDestroy } from 'svelte'; // Import onDestroy
 import SkeletonLoader from '$lib/components/SkeletonLoader.svelte';
+import { apiFetch, getApiBase } from '$lib/api';
 
-const API_BASE_URL = 'http://localhost:8777';
+const API_BASE_URL = getApiBase();
 
   const REFRESH_INTERVAL = 5000; // 5 seconds
 
@@ -88,9 +89,7 @@ const API_BASE_URL = 'http://localhost:8777';
  
   async function fetchMargins() {
     try {
-      const response = await fetch(`${API_BASE_URL}/broker/margins`, {
-        credentials: 'include'
-      });
+      const response = await apiFetch(`/broker/margins`);
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
@@ -109,8 +108,7 @@ const API_BASE_URL = 'http://localhost:8777';
   async function fetchHoldings() {
     holdingsLoading = true;
     try {
-      const response = await fetch(`${API_BASE_URL}/broker/holdings_kite`, {
-        credentials: 'include',
+      const response = await apiFetch(`/broker/holdings_kite`, {
         cache: 'no-store' // Ensure fresh data is fetched
       });
       if (!response.ok) {
@@ -252,9 +250,8 @@ const API_BASE_URL = 'http://localhost:8777';
       error: null,
     };
     try {
-      const response = await fetch(`${API_BASE_URL}/broker/update_historical_data`, {
-        method: 'POST',
-        credentials: 'include'
+      const response = await apiFetch(`/broker/update_historical_data`, {
+        method: 'POST'
       });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -277,9 +274,7 @@ const API_BASE_URL = 'http://localhost:8777';
  
   async function fetchHistoricalDataProgress() {
     try {
-      const response = await fetch(`${API_BASE_URL}/broker/historical_data_progress`, {
-        credentials: 'include'
-      });
+      const response = await apiFetch(`/broker/historical_data_progress`);
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }

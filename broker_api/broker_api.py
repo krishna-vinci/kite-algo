@@ -324,7 +324,8 @@ def get_psql_conn():
 
 # ─────────── Helper to load Kite client ───────────
 def get_kite(request: Request, db: Session = Depends(get_db)) -> KiteConnect:
-    sid = request.cookies.get("kite_session_id")
+    # Support session via header (for dev cross-origin) or cookie
+    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
     if not sid:
         raise HTTPException(401, "Not authenticated; login first")
     ks = db.query(KiteSession).filter_by(session_id=sid).first()
@@ -341,7 +342,7 @@ def get_kite(request: Request, db: Session = Depends(get_db)) -> KiteConnect:
 
 # ─────────── Login endpoint ───────────
 @router.post("/login_kite")
-def headless_login(response: Response, db: Session = Depends(get_db)):
+def headless_login(request: Request, response: Response, db: Session = Depends(get_db)):
     try:
         kite, at = login_headless()
     except ValueError as e:
@@ -355,8 +356,24 @@ def headless_login(response: Response, db: Session = Depends(get_db)):
     db.add(KiteSession(session_id=sid, access_token=at))
     db.commit()
 
-    response.set_cookie("kite_session_id", sid, httponly=True, secure=False)
-    return {"access_token": at, "profile": kite.profile()}
+    # Determine if the request is over HTTPS (directly or via reverse proxy)
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    scheme = forwarded_proto or request.url.scheme
+    is_secure = scheme == "https"
+
+    # For cross-origin XHR/fetch with cookies, browsers require SameSite=None and Secure when using HTTPS.
+    # In dev over plain HTTP across devices, some browsers will block SameSite=None without Secure.
+    # We still set the cookie for completeness, and also return session_id for header-based auth as a fallback.
+    response.set_cookie(
+        "kite_session_id",
+        sid,
+        httponly=True,
+        secure=is_secure,
+        samesite="none" if is_secure else "lax",
+    )
+
+    # Also return session_id so the frontend can send it in the X-Session-ID header (dev-friendly)
+    return {"session_id": sid, "access_token": at, "profile": kite.profile()}
 
 
 # ─────────── Logout endpoint ───────────

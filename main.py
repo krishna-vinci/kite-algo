@@ -266,7 +266,10 @@ async def ingest_stock_data_endpoint():
 # Add CORS middleware for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Svelte dev server
+    # IMPORTANT: For credentialed requests, browsers require a specific echoed Origin.
+    # Using allow_origin_regex lets Starlette echo the incoming Origin when it matches.
+    allow_origins=[],                 # do not use "*" with allow_credentials=True
+    allow_origin_regex=".*",          # echo any Origin in dev; tighten for prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

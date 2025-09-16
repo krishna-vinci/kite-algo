@@ -1,25 +1,24 @@
 <script>
 	import { onMount } from 'svelte';
+	import { apiFetch, getApiBase, setSessionId, clearSessionId } from '$lib/api';
 
 	// State variables
 	let isLoggedIn = false;
 	let userName = '';
 	let isLoading = false;
 
-	// API base URL - using the backend port from the Docker configuration
-	const API_BASE_URL = 'http://localhost:8777';
+	// API base URL resolved dynamically for cross-device access
+	const API_BASE_URL = getApiBase();
 
 	// Check login status on component mount
 	onMount(async () => {
 		checkLoginStatus();
 	});
 
-	// Check if user is logged in by checking for session cookie
+	// Check if user is logged in by checking for session cookie/header session
 	async function checkLoginStatus() {
 		try {
-			const response = await fetch(`${API_BASE_URL}/broker/profile_kite`, {
-				credentials: 'include'
-			});
+			const response = await apiFetch(`/broker/profile_kite`);
 			
 			if (response.ok) {
 				const profile = await response.json();
@@ -39,15 +38,18 @@
 	async function login() {
 		isLoading = true;
 		try {
-			const response = await fetch(`${API_BASE_URL}/broker/login_kite`, {
-				method: 'POST',
-				credentials: 'include'
+			const response = await apiFetch(`/broker/login_kite`, {
+				method: 'POST'
 			});
 
 			if (response.ok) {
 				const data = await response.json();
+				// Store session_id so subsequent requests include X-Session-ID header (dev-friendly across devices)
+				if (data?.session_id) {
+					setSessionId(data.session_id);
+				}
 				isLoggedIn = true;
-				userName = data.profile.user_shortname || data.profile.user_name || data.profile.email || 'User';
+				userName = data.profile?.user_shortname || data.profile?.user_name || data.profile?.email || 'User';
 			} else {
 				console.error('Login failed:', response.status);
 			}
@@ -62,12 +64,13 @@
 	async function logout() {
 		isLoading = true;
 		try {
-			const response = await fetch(`${API_BASE_URL}/broker/logout_kite`, {
-				method: 'POST',
-				credentials: 'include'
+			const response = await apiFetch(`/broker/logout_kite`, {
+				method: 'POST'
 			});
 
 			if (response.ok) {
+				// Clear header-based session fallback
+				clearSessionId();
 				isLoggedIn = false;
 				userName = '';
 			} else {
