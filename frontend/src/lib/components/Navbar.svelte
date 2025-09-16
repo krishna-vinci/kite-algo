@@ -4,6 +4,7 @@
 
   const navItems = [
     { name: 'Dashboard', href: '/' },
+    { name: 'Market Watch', href: '/marketwatch' },
     { name: 'Orders', href: '/orders' },
     { name: 'Holdings', href: '/holdings' },
     { name: 'Positions', href: '/positions' },

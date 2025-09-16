@@ -69,6 +69,7 @@ from fastapi import APIRouter, Depends, Response, HTTPException, Request
 from .kite_auth import login_headless
 from kiteconnect import KiteConnect
 from database import SessionLocal, Base
+from fastapi import WebSocket, WebSocketDisconnect
 
 from dotenv import load_dotenv
 
@@ -561,6 +562,23 @@ async def search_instruments(symbol: str):
     results = await database.fetch_all(query, {"symbol": f"%{symbol}%"})
     return results
 
+
+@router.get("/instruments/fuzzy-search")
+async def fuzzy_search_instruments(query: str = Query(..., min_length=1)):
+    """
+    Fuzzy search for instruments by tradingsymbol or name.
+    """
+    search_pattern = f"%{query}%"
+    sql_query = """
+        SELECT instrument_token, tradingsymbol, name, exchange, instrument_type
+        FROM kite_instruments
+        WHERE tradingsymbol ILIKE :search_pattern OR name ILIKE :search_pattern
+        ORDER BY tradingsymbol
+        LIMIT 20
+    """
+    results = await database.fetch_all(sql_query, {"search_pattern": search_pattern})
+    return results
+
 # ─────────── Daily update functionality ───────────
 async def schedule_daily_instruments_update():
     """Schedule daily instruments update task"""
@@ -1023,3 +1041,5 @@ def run_historical_data_update_indices(kite: KiteConnect, instruments: list, int
     finally:
         if conn:
             conn.close()
+
+

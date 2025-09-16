@@ -50,7 +50,7 @@ import json
 from urllib import parse
 from fyers_apiv3 import fyersModel
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
 from broker_api.broker_api import router as kite_router
 from strategies.momentum import router as momentum_router
 
@@ -65,6 +65,11 @@ import logging
 from database import SessionLocal
 from broker_api.broker_api import KiteSession
 from broker_api.kite_auth import API_KEY
+from broker_api.websocket_manager import WebSocketManager
+
+
+# Global instance for the WebSocketManager
+ws_manager: Optional[WebSocketManager] = None
 
 # 1. Create the MCP's ASGI app
 mcp_app = mcp.http_app(path='/mcp')
@@ -120,13 +125,42 @@ mcp_app_wrapped = MCPAuthWrapper(mcp_app)
 # 2. Combine the lifespans
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
+    global ws_manager
     # Perform headless login at startup and store the KiteConnect instance
     try:
-        kite, _ = login_headless()
+        # Prefer DB-stored access_token; fallback to headless login
+        at = None
+        kite = None
+        try:
+            db = SessionLocal()
+            ks = db.query(KiteSession).order_by(KiteSession.created_at.desc()).first()
+            if ks and ks.access_token:
+                from kiteconnect import KiteConnect
+                kite = KiteConnect(api_key=API_KEY)
+                kite.set_access_token(ks.access_token)
+                at = ks.access_token
+                logging.info("Using access_token from DB KiteSession.")
+            else:
+                kite, at = login_headless()
+                logging.info("Performed headless login to obtain access_token.")
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+
         server.mcp_kite_instance = kite
         logging.info("MCP Kite instance initialized successfully.")
+
+        # Initialize and start the WebSocketManager
+        logging.info("Initializing WebSocketManager...")
+        # Get the main event loop to pass to the WebSocketManager
+        main_event_loop = asyncio.get_event_loop()
+        ws_manager = WebSocketManager(api_key=API_KEY, access_token=at, main_event_loop=main_event_loop)
+        ws_manager.start()
+        logging.info("WebSocketManager started.")
     except Exception as e:
-        logging.error(f"Failed to initialize MCP Kite instance: {e}", exc_info=True)
+        logging.error(f"Failed to initialize MCP Kite instance or WebSocketManager: {e}", exc_info=True)
         # Depending on the desired behavior, you might want to exit the application
         # or proceed without a valid Kite instance for MCP.
         # For now, we'll log the error and continue.
@@ -134,6 +168,12 @@ async def combined_lifespan(app: FastAPI):
 
     async with mcp_app.lifespan(app):
         yield
+    
+    # Cleanup on shutdown
+    if ws_manager:
+        logging.info("Stopping WebSocketManager...")
+        ws_manager.stop()
+        logging.info("WebSocketManager stopped.")
 
 
 app = FastAPI(title="Kite App API", lifespan=combined_lifespan)
@@ -285,4 +325,57 @@ async def hello():
 
 @app.get("/status")
 async def status():
-    return {"status": "running", "backend": "FastAPI"}
+    info = {"status": "running", "backend": "FastAPI"}
+    try:
+        wm = ws_manager
+        if wm:
+            info.update({
+                "websocket_status": wm.get_websocket_status(),
+                "num_clients": len(wm.clients),
+                "aggregated_token_count": len(wm.token_refcount),
+                "flush_interval_ms": wm.flush_interval_ms,
+            })
+    except Exception:
+        pass
+    return info
+
+
+@app.websocket("/broker/ws/marketwatch")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            action = data.get("action")
+            if not action:
+                await websocket.send_text(json.dumps({"type": "error", "message": "Missing action"}))
+                continue
+
+            if action == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
+                continue
+
+            tokens = data.get("tokens") or []
+            mode = data.get("mode")
+
+            if tokens and isinstance(tokens, list):
+                try:
+                    tokens = [int(t) for t in tokens]
+                except Exception:
+                    await websocket.send_text(json.dumps({"type": "error", "message": "Invalid tokens"}))
+                    continue
+
+            if action == "subscribe" and tokens:
+                await ws_manager.subscribe(websocket, tokens, mode)
+            elif action == "unsubscribe" and tokens:
+                await ws_manager.unsubscribe(websocket, tokens)
+            elif action == "set_mode" and tokens and mode:
+                await ws_manager.set_mode(websocket, tokens, mode)
+            else:
+                await websocket.send_text(json.dumps({"type": "error", "message": "Invalid action"}))
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+        logging.info("Client disconnected.")
+    except Exception as e:
+        logging.error(f"Error in websocket endpoint: {e}", exc_info=True)
+        ws_manager.disconnect(websocket)
