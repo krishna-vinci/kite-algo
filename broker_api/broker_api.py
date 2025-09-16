@@ -31,6 +31,25 @@ import uuid
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+SCHEDULER_NTFY_URL = os.getenv("SCHEDULER_NTFY_URL", "https://ntfy.krishna.quest/scheduler-alerts")
+
+async def send_ntfy_notification(message: str, title: str = "Kite App Notification", tags: Optional[List[str]] = None):
+    """Sends a notification to the ntfy.sh topic."""
+    try:
+        headers = {"Title": title}
+        if tags:
+            headers["Tags"] = ",".join(tags)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(SCHEDULER_NTFY_URL, content=message, headers=headers)
+            response.raise_for_status()
+            logger.info(f"ntfy notification sent: {message}")
+    except httpx.RequestError as e:
+        logger.error(f"ntfy notification failed (request error): {e}")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"ntfy notification failed (HTTP error): {e.response.status_code} - {e.response.text}")
+    except Exception as e:
+        logger.error(f"ntfy notification failed (unexpected error): {e}")
+
 # Global state for historical data update progress
 historical_data_update_progress = {
     "status": "idle", # "idle", "in_progress", "completed", "failed"
@@ -565,9 +584,11 @@ async def schedule_daily_instruments_update():
 
             # Run the daily update
             await update_all_instruments_daily()
+            await send_ntfy_notification("Daily instrument update completed successfully.", title="Scheduler Success", tags=["success", "instruments"])
 
         except Exception as e:
             logger.error(f"Error in daily instruments update scheduler: {e}", exc_info=True)
+            await send_ntfy_notification(f"Daily instrument update failed: {e}", title="Scheduler Failure", tags=["failure", "instruments"])
             # Wait for 1 hour before retrying the scheduler logic
             await asyncio.sleep(60 * 60)
 
@@ -593,8 +614,10 @@ async def update_all_instruments_daily():
             logger.info(f"Successfully imported instruments for exchange: {exchange}")
         except Exception as e:
             logger.error(f"Error importing instruments for exchange {exchange}: {e}", exc_info=True)
+            await send_ntfy_notification(f"Error importing instruments for exchange {exchange}: {e}", title="Instrument Import Failure", tags=["failure", "instruments"])
 
     logger.info("Daily instruments update completed.")
+    await send_ntfy_notification("All instruments updated successfully.", title="Instrument Update Success", tags=["success", "instruments"])
 
 ####KITE
 from .historical_data import fetch_and_store_historical_data, fetch_and_store_indices_historical_data
