@@ -47,8 +47,12 @@ class WebSocketManager:
     """
 
     def __init__(self, api_key: str, access_token: str, main_event_loop: AbstractEventLoop):
+        # Store credentials
+        self.api_key = api_key
+        self.access_token = access_token
+
         # Kite Ticker
-        self.kws = KiteTicker(api_key, access_token)
+        self.kws = KiteTicker(self.api_key, self.access_token)
 
         # Per-client connection map
         self.clients: Dict[WebSocket, ClientConnection] = {}
@@ -68,6 +72,8 @@ class WebSocketManager:
         self._flush_task: Optional[asyncio.Task] = None
         self._running: bool = False
 
+        # Alert events queue for text-mode alert messages
+        self.alert_event_queue: asyncio.Queue = asyncio.Queue()
         # Assign Kite callbacks
         self.kws.on_ticks = self.on_ticks
         self.kws.on_connect = self.on_connect
@@ -75,6 +81,12 @@ class WebSocketManager:
         self.kws.on_error = self.on_error
         self.kws.on_noreconnect = self.on_noreconnect
         self.kws.on_reconnect = self.on_reconnect
+        # Raw text/binary messages (alerts and order updates)
+        try:
+            self.kws.on_message = self.on_message
+        except Exception:
+            # Fallback for kiteconnect versions without on_message
+            pass
 
     def get_websocket_status(self) -> str:
         """Returns current KiteTicker/WebSocketManager connection status."""
@@ -109,6 +121,52 @@ class WebSocketManager:
         if self._flush_task and not self._flush_task.done():
             self._flush_task.cancel()
         self._flush_task = None
+
+    def reinit_with_token(self, new_token: str) -> None:
+        """
+        Rotate the access token at runtime without tearing down the flush loop.
+        - No-op if token is unchanged.
+        - Stops current KiteTicker, rebuilds with new token, reassigns callbacks, and connects again.
+        Resubscriptions happen in on_connect().
+        """
+        try:
+            if not isinstance(new_token, str) or not new_token:
+                return
+            # If equal to current, no-op
+            if hasattr(self, "access_token") and new_token == self.access_token:
+                return
+
+            old_fp = (self.access_token[-6:] if isinstance(getattr(self, "access_token", None), str) else "")
+            new_fp = (new_token[-6:] if isinstance(new_token, str) else "")
+            logger.info("Reinitializing KiteTicker with new token (..%s -> ..%s)", old_fp, new_fp)
+
+            # Stop only the KiteTicker; keep flush loop running
+            try:
+                self.kws.stop()
+            except Exception:
+                pass
+
+            # Update token and rebuild KiteTicker
+            self.access_token = new_token
+            self.kws = KiteTicker(self.api_key, self.access_token)
+
+            # Reassign callbacks
+            self.kws.on_ticks = self.on_ticks
+            self.kws.on_connect = self.on_connect
+            self.kws.on_close = self.on_close
+            self.kws.on_error = self.on_error
+            self.kws.on_noreconnect = self.on_noreconnect
+            self.kws.on_reconnect = self.on_reconnect
+            try:
+                self.kws.on_message = self.on_message
+            except Exception:
+                pass
+
+            # Connect again
+            self.websocket_status = "CONNECTING"
+            self.kws.connect(threaded=True)
+        except Exception as e:
+            logger.error("Failed to rotate KiteTicker token: %s", e, exc_info=True)
 
     # ---------------------------
     # Client connection management
@@ -394,6 +452,44 @@ class WebSocketManager:
             self.main_event_loop.call_soon_threadsafe(enqueue)
         except Exception as e:
             logger.error("Error in on_ticks: %s", e, exc_info=True)
+
+    def on_message(self, ws, payload, is_binary):
+        """Callback for raw messages; capture alert text messages and enqueue for dispatcher."""
+        try:
+            if is_binary:
+                return
+            # payload may be bytes or str
+            if isinstance(payload, (bytes, bytearray)):
+                try:
+                    text = payload.decode("utf-8", errors="ignore")
+                except Exception:
+                    return
+            else:
+                text = payload
+            data = None
+            try:
+                data = json.loads(text)
+            except Exception:
+                return
+            if not isinstance(data, dict):
+                return
+            msg_type = data.get("type")
+            if msg_type == "alert":
+                # Normalize event shape; leave full payload for dispatcher
+                alert_event = {
+                    "type": "alert",
+                    "raw": data,
+                    "received_at": asyncio.get_event_loop().time(),
+                }
+                # Enqueue to main loop to avoid cross-thread issues
+                def put_event():
+                    try:
+                        self.alert_event_queue.put_nowait(alert_event)
+                    except Exception as qe:
+                        logger.error("Failed to enqueue alert_event: %s", qe)
+                self.main_event_loop.call_soon_threadsafe(put_event)
+        except Exception as e:
+            logger.error("Error in on_message: %s", e, exc_info=True)
 
     def on_connect(self, ws, response):
         """Callback on successful connect to KiteTicker."""

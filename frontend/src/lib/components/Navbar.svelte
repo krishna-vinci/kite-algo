@@ -10,6 +10,7 @@
     { name: 'Positions', href: '/positions' },
     { name: 'Bids', href: '/bids' },
     { name: 'Funds', href: '/funds' },
+    { name: 'Alerts', href: '/alerts' },
     { name: 'Strategies', href: '/strategies/momentum' },
   ];
 </script>

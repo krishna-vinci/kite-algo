@@ -134,3 +134,101 @@ BEGIN
             ADD COLUMN tradingsymbol VARCHAR(50);
     END IF;
 END $$;
+
+
+-- Table for Alerts
+CREATE TABLE IF NOT EXISTS alerts (
+    uuid UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id VARCHAR(50) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'enabled',
+    alert_type VARCHAR(50) NOT NULL,
+    lhs_exchange VARCHAR(50),
+    lhs_tradingsymbol VARCHAR(50),
+    lhs_attribute VARCHAR(50) NOT NULL,
+    operator VARCHAR(10) NOT NULL,
+    rhs_type VARCHAR(50) NOT NULL,
+    rhs_constant DOUBLE PRECISION,
+    rhs_exchange VARCHAR(50),
+    rhs_tradingsymbol VARCHAR(50),
+    rhs_attribute VARCHAR(50),
+    basket JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    triggered_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_user_id ON alerts (user_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts (status);
+CREATE INDEX IF NOT EXISTS idx_alerts_lhs_tradingsymbol ON alerts (lhs_tradingsymbol);
+
+-- Table for Alert History
+CREATE TABLE IF NOT EXISTS alert_history (
+    id SERIAL PRIMARY KEY,
+    alert_uuid UUID NOT NULL,
+    triggered_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    trigger_price DOUBLE PRECISION NOT NULL,
+    meta JSONB,
+    FOREIGN KEY (alert_uuid) REFERENCES alerts (uuid) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_history_alert_uuid ON alert_history (alert_uuid);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Alerts table extensions (idempotent)
+-- Adds columns needed for mirroring Kite alerts state, scheduling and cooldowns
+-- ─────────────────────────────────────────────────────────────────────────────
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'alerts' AND column_name = 'alert_count'
+    ) THEN
+        ALTER TABLE alerts ADD COLUMN alert_count INTEGER NOT NULL DEFAULT 0;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'alerts' AND column_name = 'last_alert_count'
+    ) THEN
+        ALTER TABLE alerts ADD COLUMN last_alert_count INTEGER NOT NULL DEFAULT 0;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'alerts' AND column_name = 'last_notified_at'
+    ) THEN
+        ALTER TABLE alerts ADD COLUMN last_notified_at TIMESTAMPTZ NULL;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'alerts' AND column_name = 'cooldown_sec'
+    ) THEN
+        ALTER TABLE alerts ADD COLUMN cooldown_sec INTEGER NOT NULL DEFAULT 120;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'alerts' AND column_name = 'schedule'
+    ) THEN
+        ALTER TABLE alerts ADD COLUMN schedule JSONB NULL;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'alerts' AND column_name = 'tags'
+    ) THEN
+        ALTER TABLE alerts ADD COLUMN tags JSONB NULL;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'alerts' AND column_name = 'source'
+    ) THEN
+        ALTER TABLE alerts ADD COLUMN source VARCHAR(20) NOT NULL DEFAULT 'kite';
+    END IF;
+END $$;
+
+-- Helpful index
+CREATE INDEX IF NOT EXISTS idx_alerts_last_notified_at ON alerts (last_notified_at);

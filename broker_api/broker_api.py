@@ -4,7 +4,7 @@ import time
 import json
 import csv
 import asyncio
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 from datetime import date, datetime, timedelta
 from urllib.parse import urlparse
 from urllib import parse
@@ -176,6 +176,39 @@ class KiteSession(Base):
     access_token  = Column(String, nullable=False)
     created_at    = Column(DateTime, default=datetime.utcnow, nullable=False)
 
+# ---- Centralized helpers for system token (DB is source of truth) ----
+def upsert_kite_session(db: Session, session_id: str, access_token: str) -> "KiteSession":
+    """
+    If a KiteSession with session_id exists, update access_token and created_at=now().
+    Else insert a new row. Caller is responsible for commit.
+    """
+    obj = db.query(KiteSession).filter_by(session_id=session_id).first()
+    now_dt = datetime.utcnow()
+    if obj:
+        obj.access_token = access_token
+        obj.created_at = now_dt
+        return obj
+    obj = KiteSession(session_id=session_id, access_token=access_token, created_at=now_dt)
+    db.add(obj)
+    return obj
+
+def get_system_access_token(db: Session) -> Optional[str]:
+    """Return access_token for session_id == 'system' if exists, else None."""
+    ks = db.query(KiteSession).filter_by(session_id="system").first()
+    return ks.access_token if ks else None
+
+def run_headless_login_and_persist_system_token(db: Session) -> str:
+    """
+    Perform headless login and upsert the access_token to KiteSession with session_id='system'.
+    Caller is responsible for committing the transaction.
+    Returns the redacted fingerprint (last 6 chars) of the access_token.
+    """
+    kite, at = login_headless()
+    upsert_kite_session(db, "system", at)
+    fp = at[-6:] if isinstance(at, str) else ""
+    logger.info("System access_token refreshed and upserted (..%s)", fp)
+    return fp
+
 
 class Ticker(Base):
     __tablename__ = "tickers"
@@ -305,8 +338,7 @@ async def _startup():
     Base.metadata.create_all(bind=engine)
     await database.connect()
     
-    # Start background task for daily instruments update
-    asyncio.create_task(schedule_daily_instruments_update())
+    # Daily instruments update scheduling is managed by main; no internal scheduler here
 
 @router.on_event("shutdown")
 async def _shutdown():
@@ -375,6 +407,11 @@ def headless_login(request: Request, response: Response, db: Session = Depends(g
     sid = str(uuid.uuid4())
     db.add(KiteSession(session_id=sid, access_token=at))
     db.commit()
+
+    # Also persist/refresh system token so app startup and jobs use a consistent source
+    upsert_kite_session(db, "system", at)
+    db.commit()
+    logger.info("System access token upserted via login (..%s)", (at[-6:] if isinstance(at, str) else ""))
 
     # Determine if the request is over HTTPS (directly or via reverse proxy)
     forwarded_proto = request.headers.get("x-forwarded-proto")
@@ -566,18 +603,125 @@ async def search_instruments(symbol: str):
 @router.get("/instruments/fuzzy-search")
 async def fuzzy_search_instruments(query: str = Query(..., min_length=1)):
     """
-    Fuzzy search for instruments by tradingsymbol or name.
+    Fuzzy search across indices, NSE equities, and NFO contracts with alias handling.
+    Priority ranking:
+      0) exact tradingsymbol match (including aliases like 'banknifty' -> 'NIFTY BANK')
+      1) prefix tradingsymbol match
+      2) prefix name match
+      3) INDICES exchange
+      4) alphabetical
+    Returns up to 20 rows with fields:
+      instrument_token, tradingsymbol, name, exchange, instrument_type, segment
     """
-    search_pattern = f"%{query}%"
-    sql_query = """
-        SELECT instrument_token, tradingsymbol, name, exchange, instrument_type
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    # Enhanced parsing to separate instrument identifiers from numeric values
+    # This helps with queries like "NIFTY 25000"
+    parts = q.split()
+    instrument_query_base = q
+    numeric_value = None
+    
+    # If the last part is a number, separate it
+    if len(parts) > 1:
+        try:
+            numeric_value = float(parts[-1])
+            instrument_query_base = " ".join(parts[:-1])
+        except ValueError:
+            pass
+
+    # Basic alias normalization for common India index terms
+    qm = instrument_query_base.replace(" ", "").lower()
+    alias_map = {
+        "nifty50": "NIFTY 50",
+        "nifty": "NIFTY 50",  # common shorthand
+        "banknifty": "NIFTY BANK",
+        "sensex": "SENSEX",
+        "finnifty": "FINNIFTY",
+        "niftymidcap100": "NIFTY MIDCAP 100",
+        "midcap100": "NIFTY MIDCAP 100",
+    }
+    alias = alias_map.get(qm, instrument_query_base)
+
+    # Prepare for "contains all words" check
+    search_words = [word.strip() for word in instrument_query_base.split() if word.strip()]
+    
+    # Base WHERE condition
+    where_clause = "(tradingsymbol ILIKE :like OR name ILIKE :like)"
+    
+    # Add parameters for dynamic WHERE clause and ORDER BY
+    params = {
+        "instrument_query": instrument_query_base,
+        "alias": alias,
+        "like": f"%{instrument_query_base}%",
+        "prefix": f"{instrument_query_base}%",
+        "alias_prefix": f"{alias}%",
+        "numeric_value": numeric_value,
+        "has_numeric_value": numeric_value is not None, # New parameter for explicit check
+        "is_index_query": any(idx_term in instrument_query_base.lower() for idx_term in ['nifty', 'banknifty', 'sensex', 'finnifty'])
+    }
+
+    # Add individual word parameters for "contains all words" check
+    for i, word in enumerate(search_words):
+        params[f"word_{i}"] = f"%{word}%"
+        # Also add to where_clause for initial filtering
+        where_clause += f" AND (tradingsymbol ILIKE :word_{i} OR name ILIKE :word_{i})"
+
+
+    sql = f"""
+    WITH universe AS (
+        SELECT instrument_token, tradingsymbol, name, exchange, instrument_type, segment, strike
         FROM kite_instruments
-        WHERE tradingsymbol ILIKE :search_pattern OR name ILIKE :search_pattern
-        ORDER BY tradingsymbol
-        LIMIT 20
+        WHERE {where_clause}
+        UNION ALL
+        SELECT instrument_token, tradingsymbol, name, exchange, instrument_type, segment, strike
+        FROM kite_indices
+        WHERE {where_clause}
+    )
+    SELECT instrument_token, tradingsymbol, name, exchange, instrument_type, segment
+    FROM universe
+    ORDER BY
+        CASE
+            -- Absolute Exact Matches (Priority 0)
+            WHEN lower(tradingsymbol) = lower(:alias) THEN 0
+            WHEN lower(tradingsymbol) = lower(:instrument_query) THEN 0
+            WHEN lower(name) = lower(:alias) THEN 0
+            WHEN lower(name) = lower(:instrument_query) THEN 0
+
+            -- Strong Prefix Matches - tradingsymbol (Priority 1)
+            WHEN tradingsymbol ILIKE :alias_prefix THEN 1
+            WHEN tradingsymbol ILIKE :prefix THEN 1
+
+            -- Strong Prefix Matches - name (Priority 2)
+            WHEN name ILIKE :alias_prefix THEN 2
+            WHEN name ILIKE :prefix THEN 2
+
+            -- Options contracts with strike close to numeric value (Priority 3)
+            WHEN :has_numeric_value AND (instrument_type = 'CE' OR instrument_type = 'PE')
+                 AND ABS(strike - :numeric_value) <= 50 THEN 3
+
+            -- Contains All Words - tradingsymbol (Priority 4)
+            {"WHEN " + " AND ".join([f"tradingsymbol ILIKE :word_{i}" for i in range(len(search_words))]) + " THEN 4" if len(search_words) > 1 else ""}
+
+            -- Contains All Words - name (Priority 5)
+            {"WHEN " + " AND ".join([f"name ILIKE :word_{i}" for i in range(len(search_words))]) + " THEN 5" if len(search_words) > 1 else ""}
+
+            -- Indices Boost (Priority 6) - only if query is index-related
+            WHEN exchange = 'INDICES' AND :is_index_query THEN 6
+
+            -- General Substring Matches (Priority 7)
+            WHEN tradingsymbol ILIKE :like THEN 7
+            WHEN name ILIKE :like THEN 7
+
+            ELSE 8
+        END,
+        tradingsymbol
+    LIMIT 10
     """
-    results = await database.fetch_all(sql_query, {"search_pattern": search_pattern})
-    return results
+    rows = await database.fetch_all(sql, params)
+    # Add a temporary test field to verify that the latest code is running
+    return [{**row, "test_field": "test_value"} for row in rows]
 
 # ─────────── Daily update functionality ───────────
 async def schedule_daily_instruments_update():
@@ -616,7 +760,18 @@ async def update_all_instruments_daily():
 
     try:
         # Obtain a KiteConnect instance for the background task
-        kite, _ = login_headless()
+        kite, at = login_headless()
+        # Persist the system token obtained during daily job
+        try:
+            _db = SessionLocal()
+            upsert_kite_session(_db, "system", at)
+            _db.commit()
+            logger.info("System access token upserted via daily job (..%s)", (at[-6:] if isinstance(at, str) else ""))
+        finally:
+            try:
+                _db.close()
+            except Exception:
+                pass
     except HTTPException as e:
         logger.error(f"Error during headless login for daily update: {e.detail}", exc_info=True)
         return
@@ -1043,3 +1198,388 @@ def run_historical_data_update_indices(kite: KiteConnect, instruments: list, int
             conn.close()
 
 
+
+# ───────── Alerts (Kite Alerts API proxy + DB mirror) ─────────
+from fastapi import Request, Body
+from typing import Any as _Any
+
+# Sub-router for alerts
+alerts_router = APIRouter(prefix="/alerts", tags=["alerts"])
+
+def _alerts_ntfy_url() -> str:
+    return os.getenv("KITE_ALERTS_NTFY_URL") or os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
+
+def _kite_alerts_headers(api_key: str, access_token: str) -> Dict[str, str]:
+    return {
+        "X-Kite-Version": "3",
+        "Authorization": f"token {api_key}:{access_token}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+
+async def _alerts_upsert_db(row: Dict[str, _Any]) -> None:
+    """
+    Upsert a single alert row returned by Kite into 'alerts' table (mirror fields).
+    """
+    sql = """
+    INSERT INTO alerts (
+        uuid, user_id, name, status, alert_type,
+        lhs_exchange, lhs_tradingsymbol, lhs_attribute,
+        operator, rhs_type, rhs_constant, rhs_exchange, rhs_tradingsymbol, rhs_attribute,
+        basket, alert_count, updated_at
+    ) VALUES (
+        :uuid, :user_id, :name, :status, :alert_type,
+        :lhs_exchange, :lhs_tradingsymbol, :lhs_attribute,
+        :operator, :rhs_type, :rhs_constant, :rhs_exchange, :rhs_tradingsymbol, :rhs_attribute,
+        :basket, :alert_count, NOW()
+    )
+    ON CONFLICT (uuid) DO UPDATE SET
+        user_id = EXCLUDED.user_id,
+        name = EXCLUDED.name,
+        status = EXCLUDED.status,
+        alert_type = EXCLUDED.alert_type,
+        lhs_exchange = EXCLUDED.lhs_exchange,
+        lhs_tradingsymbol = EXCLUDED.lhs_tradingsymbol,
+        lhs_attribute = EXCLUDED.lhs_attribute,
+        operator = EXCLUDED.operator,
+        rhs_type = EXCLUDED.rhs_type,
+        rhs_constant = EXCLUDED.rhs_constant,
+        rhs_exchange = EXCLUDED.rhs_exchange,
+        rhs_tradingsymbol = EXCLUDED.rhs_tradingsymbol,
+        rhs_attribute = EXCLUDED.rhs_attribute,
+        basket = EXCLUDED.basket,
+        alert_count = EXCLUDED.alert_count,
+        updated_at = NOW();
+    """
+    values = {
+        "uuid": row.get("uuid"),
+        "user_id": row.get("user_id", "me"),
+        "name": row.get("name"),
+        "status": row.get("status"),
+        "alert_type": row.get("type"),
+        "lhs_exchange": row.get("lhs_exchange"),
+        "lhs_tradingsymbol": row.get("lhs_tradingsymbol"),
+        "lhs_attribute": row.get("lhs_attribute"),
+        "operator": row.get("operator"),
+        "rhs_type": row.get("rhs_type"),
+        "rhs_constant": row.get("rhs_constant"),
+        "rhs_exchange": row.get("rhs_exchange"),
+        "rhs_tradingsymbol": row.get("rhs_tradingsymbol"),
+        "rhs_attribute": row.get("rhs_attribute"),
+        "basket": json.dumps(row.get("basket")) if row.get("basket") is not None else None,
+        "alert_count": int(row.get("alert_count") or 0),
+    }
+    await database.execute(sql, values)
+
+async def _publish_ntfy_alert(title: str, message: str, tags: Optional[List[str]] = None) -> None:
+    url = _alerts_ntfy_url()
+    headers = {"Title": title}
+    if tags:
+        headers["Tags"] = ",".join(tags)
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            r = await client.post(url, content=message, headers=headers)
+            r.raise_for_status()
+        except Exception as e:
+            logger.error(f"[NTFY] publish failed: {e}")
+
+@alerts_router.post("")
+async def create_alert(
+    payload: Dict[str, Any] = Body(...),
+    kite: KiteConnect = Depends(get_kite),
+):
+    """
+    Create a simple Kite alert. Accepts JSON body with fields similar to Kite Alerts API.
+    Minimal required for simple alert:
+      - name, lhs_exchange, lhs_tradingsymbol, lhs_attribute='LastTradedPrice', operator, rhs_type='constant', rhs_constant, type='simple'
+    """
+    api_key = API_KEY
+    access_token = getattr(kite, "access_token", None)
+    if not access_token:
+        raise HTTPException(401, "No access token available")
+    # Prepare Kite form data with sensible defaults
+    form = {
+        "name": payload.get("name"),
+        "lhs_exchange": payload.get("lhs_exchange"),
+        "lhs_tradingsymbol": payload.get("lhs_tradingsymbol"),
+        "lhs_attribute": payload.get("lhs_attribute", "LastTradedPrice"),
+        "operator": payload.get("operator"),
+        "rhs_type": payload.get("rhs_type", "constant"),
+        "type": payload.get("type", "simple"),
+    }
+    if form["rhs_type"] == "constant":
+        form["rhs_constant"] = payload.get("rhs_constant")
+    # Optional ATO basket as JSON string
+    if form["type"] == "ato" and payload.get("basket") is not None:
+        form["basket"] = json.dumps(payload["basket"])
+    # Validate minimal required
+    missing = [k for k in ["name","lhs_exchange","lhs_tradingsymbol","operator"] if not form.get(k)]
+    if form["rhs_type"] == "constant" and form.get("rhs_constant") is None:
+        missing.append("rhs_constant")
+    if missing:
+        raise HTTPException(400, f"Missing fields: {', '.join(missing)}")
+    url = "https://api.kite.trade/alerts"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(url, headers=_kite_alerts_headers(api_key, access_token), data=form)
+        try:
+            r.raise_for_status()
+        except Exception:
+            raise HTTPException(r.status_code, r.text)
+        resp = r.json()
+        data = resp.get("data") or {}
+        await _alerts_upsert_db(data)
+        return data
+
+@alerts_router.get("")
+async def list_alerts(kite: KiteConnect = Depends(get_kite), refresh: bool = Query(False)):
+    """
+    List alerts from mirror. If refresh=true, first fetch from Kite and upsert mirror.
+    """
+    api_key = API_KEY
+    access_token = getattr(kite, "access_token", None)
+    if refresh and access_token:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get("https://api.kite.trade/alerts", headers=_kite_alerts_headers(api_key, access_token))
+                r.raise_for_status()
+                data = (r.json() or {}).get("data") or []
+                for a in data:
+                    await _alerts_upsert_db(a)
+        except Exception as e:
+            logger.error(f"[ALERTS] refresh failed: {e}")
+    rows = await database.fetch_all("SELECT * FROM alerts ORDER BY updated_at DESC LIMIT 500")
+    def _row_to_dict(r):
+        d = dict(r)
+        # decode json fields if string
+        if d.get("basket") and isinstance(d["basket"], str):
+            try:
+                d["basket"] = json.loads(d["basket"])
+            except Exception:
+                pass
+        return d
+    return {"data": [_row_to_dict(r) for r in rows]}
+
+@alerts_router.get("/{uuid}")
+async def get_alert(uuid: str, kite: KiteConnect = Depends(get_kite), refresh: bool = Query(False)):
+    api_key = API_KEY
+    access_token = getattr(kite, "access_token", None)
+    if refresh and access_token:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"https://api.kite.trade/alerts/{uuid}", headers=_kite_alerts_headers(api_key, access_token))
+            if r.status_code == 200:
+                data = (r.json() or {}).get("data") or {}
+                await _alerts_upsert_db(data)
+    row = await database.fetch_one("SELECT * FROM alerts WHERE uuid = :u", {"u": uuid})
+    if not row:
+        raise HTTPException(404, "Alert not found")
+    d = dict(row)
+    if d.get("basket") and isinstance(d["basket"], str):
+        try:
+            d["basket"] = json.loads(d["basket"])
+        except Exception:
+            pass
+    return d
+
+@alerts_router.put("/{uuid}")
+async def modify_alert(uuid: str, payload: Dict[str, Any] = Body(...), kite: KiteConnect = Depends(get_kite)):
+    api_key = API_KEY
+    access_token = getattr(kite, "access_token", None)
+    if not access_token:
+        raise HTTPException(401, "No access token available")
+    # Kite expects form fields similar to create; pass through supported fields.
+    allowed = {
+        "name","lhs_exchange","lhs_tradingsymbol","lhs_attribute","operator",
+        "rhs_type","rhs_constant","type","basket"
+    }
+    form = {k: v for k, v in payload.items() if k in allowed and v is not None}
+    if "basket" in form and isinstance(form["basket"], (dict, list)):
+        form["basket"] = json.dumps(form["basket"])
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.put(f"https://api.kite.trade/alerts/{uuid}", headers=_kite_alerts_headers(api_key, access_token), data=form)
+        try:
+            r.raise_for_status()
+        except Exception:
+            raise HTTPException(r.status_code, r.text)
+        data = (r.json() or {}).get("data") or {}
+        await _alerts_upsert_db(data)
+        return data
+
+@alerts_router.delete("/{uuid}")
+async def delete_alert(uuid: str, kite: KiteConnect = Depends(get_kite)):
+    api_key = API_KEY
+    access_token = getattr(kite, "access_token", None)
+    if not access_token:
+        raise HTTPException(401, "No access token available")
+    url = f"https://api.kite.trade/alerts?uuid={uuid}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.delete(url, headers=_kite_alerts_headers(api_key, access_token))
+        try:
+            r.raise_for_status()
+        except Exception:
+            raise HTTPException(r.status_code, r.text)
+    # Remove from mirror
+    await database.execute("DELETE FROM alerts WHERE uuid = :u", {"u": uuid})
+    return {"status": "success"}
+
+@alerts_router.get("/{uuid}/history")
+async def alert_history(uuid: str, kite: KiteConnect = Depends(get_kite), refresh: bool = Query(False), limit: int = Query(50, ge=1, le=500)):
+    api_key = API_KEY
+    access_token = getattr(kite, "access_token", None)
+    if refresh and access_token:
+        # Fetch and append latest history
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(f"https://api.kite.trade/alerts/{uuid}/history", headers=_kite_alerts_headers(api_key, access_token))
+            if r.status_code == 200:
+                arr = (r.json() or {}).get("data") or []
+                # Insert without strict dedupe (poller/dispatcher handle dedupe for notifications)
+                for h in arr:
+                    ts = h.get("created_at") or h.get("timestamp")
+                    last_price = 0.0
+                    meta = h.get("meta")
+                    if isinstance(meta, list) and meta:
+                        last_price = float(meta[0].get("last_price") or 0.0)
+                    try:
+                        await database.execute(
+                            "INSERT INTO alert_history (alert_uuid, triggered_at, trigger_price, meta) VALUES (:u, :ts, :p, :m)",
+                            {"u": uuid, "ts": ts, "p": last_price, "m": json.dumps(h)}
+                        )
+                    except Exception:
+                        # Ignore duplicates or parsing issues
+                        pass
+    rows = await database.fetch_all(
+        "SELECT id, alert_uuid, triggered_at, trigger_price, meta FROM alert_history WHERE alert_uuid = :u ORDER BY triggered_at DESC LIMIT :n",
+        {"u": uuid, "n": limit}
+    )
+    return {"data": [dict(r) for r in rows]}
+
+@alerts_router.post("/validate")
+async def validate_alert(payload: Dict[str, Any] = Body(...)):
+    """
+    Validate alert parameters quickly against instruments DB.
+    """
+    lhs_exchange = payload.get("lhs_exchange")
+    lhs_tradingsymbol = payload.get("lhs_tradingsymbol")
+    operator = payload.get("operator")
+    rhs_type = payload.get("rhs_type", "constant")
+    rhs_constant = payload.get("rhs_constant")
+    # Basic checks
+    if not lhs_exchange or not lhs_tradingsymbol or not operator:
+        return {"valid": False, "reason": "Missing symbol/operator"}
+    # Ensure instrument exists
+    row = await database.fetch_one(
+        "SELECT instrument_token FROM kite_instruments WHERE exchange = :ex AND tradingsymbol = :ts LIMIT 1",
+        {"ex": lhs_exchange, "ts": lhs_tradingsymbol}
+    )
+    if not row:
+        return {"valid": False, "reason": "Instrument not found"}
+    # rhs check
+    if rhs_type == "constant" and rhs_constant is None:
+        return {"valid": False, "reason": "rhs_constant required for rhs_type=constant"}
+    # operator whitelist
+    allowed_ops = {">=", "<=", ">", "<", "==", "!="}
+    if operator not in allowed_ops:
+        return {"valid": False, "reason": f"Invalid operator; allowed: {', '.join(sorted(allowed_ops))}"}
+    return {"valid": True}
+
+@alerts_router.post("/test-notification")
+async def alerts_test_notification_endpoint():
+    await _publish_ntfy_alert("Test: Kite Alerts (broker)", "Hello from /broker/alerts/test-notification", tags=["test","alerts"])
+    return {"status": "ok"}
+
+# Include alerts_router into the main router
+try:
+    router.include_router(alerts_router)
+except Exception as _e:
+    # If router was not yet defined for some reason, define and include
+    router = APIRouter()
+    router.include_router(alerts_router)
+
+# ─────────── Instruments helpers for Alerts UI ───────────
+
+from pydantic import BaseModel as _BM
+from typing import Optional as _Opt, List as _List, Dict as _Dict, Any as _Any
+
+@router.get("/instruments/top-defaults")
+async def instruments_top_defaults():
+    """
+    Curated Top defaults for instrument picker.
+    Defaults: NIFTY 50, NIFTY BANK, SENSEX, FINNIFTY, NIFTY MIDCAP 100
+    Returns minimal fields required by the picker.
+    """
+    names = ["NIFTY 50", "NIFTY BANK", "SENSEX", "FINNIFTY", "NIFTY MIDCAP 100"]
+
+    # Build safe placeholders for two IN clauses (indices table + instruments fallback)
+    ph_a = ", ".join([f":a{i}" for i in range(len(names))])
+    ph_b = ", ".join([f":b{i}" for i in range(len(names))])
+    params = {}
+    for i, n in enumerate(names):
+        params[f"a{i}"] = n
+        params[f"b{i}"] = n
+
+    sql = f"""
+    WITH src AS (
+        SELECT instrument_token, tradingsymbol, name, COALESCE(exchange, 'INDICES') AS exchange,
+               instrument_type, segment
+        FROM kite_indices
+        WHERE tradingsymbol IN ({ph_a})
+        UNION
+        SELECT instrument_token, tradingsymbol, name, COALESCE(exchange, 'INDICES') AS exchange,
+               instrument_type, segment
+        FROM kite_instruments
+        WHERE segment = 'INDICES' AND tradingsymbol IN ({ph_b})
+    )
+    SELECT DISTINCT ON (tradingsymbol)
+           instrument_token, tradingsymbol, name, exchange, instrument_type, segment
+    FROM src
+    ORDER BY tradingsymbol;
+    """
+    rows = await database.fetch_all(sql, params)
+    return {"data": [dict(r) for r in rows]}
+
+class ResolveItem(_BM):
+    exchange: _Opt[str] = None
+    tradingsymbol: str
+
+class ResolveRequest(_BM):
+    items: _List[ResolveItem]
+
+@router.post("/instruments/resolve")
+async def instruments_resolve(req: ResolveRequest):
+    """
+    Resolve a list of {exchange, tradingsymbol} pairs (case-insensitive) to canonical rows.
+    - If exchange is 'INDICES' or missing, resolve from kite_indices first, then fallback to instruments (segment='INDICES')
+    - Otherwise resolve from kite_instruments filtered by exchange.
+    Response: { data: [ {found: bool, instrument?} ] }
+    """
+    out: _List[_Dict[str, _Any]] = []
+    for item in req.items:
+        ex = (item.exchange or "").strip().upper()
+        ts = item.tradingsymbol.strip()
+        row = None
+
+        if ex in ("", "INDICES"):
+            # Try indices table
+            row = await database.fetch_one(
+                "SELECT instrument_token, tradingsymbol, name, 'INDICES' AS exchange, instrument_type, segment "
+                "FROM kite_indices WHERE lower(tradingsymbol) = lower(:ts) LIMIT 1",
+                {"ts": ts}
+            )
+            if not row:
+                # Fallback to instruments where segment is INDICES
+                row = await database.fetch_one(
+                    "SELECT instrument_token, tradingsymbol, name, COALESCE(exchange, 'INDICES') AS exchange, instrument_type, segment "
+                    "FROM kite_instruments WHERE segment = 'INDICES' AND lower(tradingsymbol) = lower(:ts) LIMIT 1",
+                    {"ts": ts}
+                )
+        else:
+            row = await database.fetch_one(
+                "SELECT instrument_token, tradingsymbol, name, exchange, instrument_type, segment "
+                "FROM kite_instruments WHERE upper(exchange) = :ex AND lower(tradingsymbol) = lower(:ts) LIMIT 1",
+                {"ex": ex, "ts": ts}
+            )
+
+        if row:
+            out.append({"found": True, "instrument": dict(row)})
+        else:
+            out.append({"found": False, "instrument": None, "reason": "Not found"})
+
+    return {"data": out}

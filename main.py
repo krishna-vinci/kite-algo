@@ -28,6 +28,7 @@ import psycopg2
 from psycopg2 import extras
 import logging
 from datetime import datetime, date # Import date for CURRENT_DATE
+from zoneinfo import ZoneInfo
 
 # Configure logging for the main application
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -62,14 +63,18 @@ from contextlib import asynccontextmanager
 import server
 from kite_auth import login_headless
 import logging
-from database import SessionLocal
-from broker_api.broker_api import KiteSession
+from database import SessionLocal, database as async_db
+from broker_api.broker_api import KiteSession, get_system_access_token, upsert_kite_session
+from broker_api.broker_api import run_headless_login_and_persist_system_token, update_all_instruments_daily
 from broker_api.kite_auth import API_KEY
 from broker_api.websocket_manager import WebSocketManager
 
 
 # Global instance for the WebSocketManager
 ws_manager: Optional[WebSocketManager] = None
+
+# Daily gating event (set once headless login succeeds; cleared before daily rotation)
+daily_token_ready: asyncio.Event = asyncio.Event()
 
 # 1. Create the MCP's ASGI app
 mcp_app = mcp.http_app(path='/mcp')
@@ -127,38 +132,99 @@ mcp_app_wrapped = MCPAuthWrapper(mcp_app)
 async def combined_lifespan(app: FastAPI):
     global ws_manager
     # Perform headless login at startup and store the KiteConnect instance
+    token_watcher_task = None
+    scheduler_task = None
     try:
-        # Prefer DB-stored access_token; fallback to headless login
+        # Determine system access_token from DB; validate and fallback to headless login
         at = None
         kite = None
+        db = None
         try:
             db = SessionLocal()
-            ks = db.query(KiteSession).order_by(KiteSession.created_at.desc()).first()
-            if ks and ks.access_token:
+            # Prefer explicit "system" session_id token
+            system_at = get_system_access_token(db)
+            if system_at:
                 from kiteconnect import KiteConnect
                 kite = KiteConnect(api_key=API_KEY)
-                kite.set_access_token(ks.access_token)
-                at = ks.access_token
-                logging.info("Using access_token from DB KiteSession.")
+                kite.set_access_token(system_at)
+                at = system_at
+                try:
+                    # Lightweight validation
+                    kite.profile()
+                    logging.info("Using system access_token from DB (..%s)", at[-6:] if isinstance(at, str) else "")
+                except Exception as e:
+                    logging.warning("System token validation failed (..%s); performing headless login: %s", (at[-6:] if isinstance(at, str) else ""), e)
+                    kite, at = login_headless()
+                    upsert_kite_session(db, "system", at)
+                    db.commit()
+                    logging.info("Refreshed system access_token via headless login (..%s)", at[-6:] if isinstance(at, str) else "")
             else:
+                # No system token; perform headless login and persist
                 kite, at = login_headless()
-                logging.info("Performed headless login to obtain access_token.")
+                upsert_kite_session(db, "system", at)
+                db.commit()
+                logging.info("Obtained system access_token via headless login (..%s)", at[-6:] if isinstance(at, str) else "")
         finally:
             try:
-                db.close()
+                if db:
+                    db.close()
             except Exception:
                 pass
 
         server.mcp_kite_instance = kite
         logging.info("MCP Kite instance initialized successfully.")
 
-        # Initialize and start the WebSocketManager
+        # Initialize and start the WebSocketManager with the selected token
         logging.info("Initializing WebSocketManager...")
         # Get the main event loop to pass to the WebSocketManager
         main_event_loop = asyncio.get_event_loop()
         ws_manager = WebSocketManager(api_key=API_KEY, access_token=at, main_event_loop=main_event_loop)
         ws_manager.start()
         logging.info("WebSocketManager started.")
+
+        # Start background token watcher to rotate WS token when DB 'system' token changes
+        async def _system_token_watcher():
+            poll_seconds = int(os.getenv("SYSTEM_TOKEN_POLL_SEC", "45"))
+            last_token = at
+            while True:
+                try:
+                    await asyncio.sleep(max(30, min(poll_seconds, 60)))
+                    _db = SessionLocal()
+                    try:
+                        new_token = get_system_access_token(_db)
+                    finally:
+                        _db.close()
+                    if new_token and new_token != last_token:
+                        old_fp = (last_token[-6:] if isinstance(last_token, str) else "")
+                        new_fp = (new_token[-6:] if isinstance(new_token, str) else "")
+                        logging.info("System token change detected; rotating WS token (..%s -> ..%s)", old_fp, new_fp)
+                        ws_manager.reinit_with_token(new_token)
+                        last_token = new_token
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logging.error("Token watcher error: %s", e, exc_info=True)
+                    # Continue watching
+                    continue
+
+        token_watcher_task = asyncio.create_task(_system_token_watcher())
+        # Initialize daily token gate in app state and start scheduler
+        app.state.daily_token_ready = daily_token_ready
+        if not daily_token_ready.is_set():
+            daily_token_ready.set()
+        logging.info("[GATE] Initialized and open at startup (will close at next 07:31 IST)")
+        scheduler_task = asyncio.create_task(daily_token_scheduler())
+
+        # Ensure async DB is connected for workers
+        try:
+            if hasattr(async_db, "is_connected") and not async_db.is_connected:
+                await async_db.connect()
+        except Exception:
+            pass
+        # Start alert dispatcher (WS text messages) and 2s polling fallback
+        alerts_ntfy_url = os.getenv("KITE_ALERTS_NTFY_URL") or os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
+        asyncio.create_task(alert_event_dispatcher(ws_manager, alerts_ntfy_url))
+        asyncio.create_task(alerts_poll_worker(API_KEY, alerts_ntfy_url))
     except Exception as e:
         logging.error(f"Failed to initialize MCP Kite instance or WebSocketManager: {e}", exc_info=True)
         # Depending on the desired behavior, you might want to exit the application
@@ -170,6 +236,26 @@ async def combined_lifespan(app: FastAPI):
         yield
     
     # Cleanup on shutdown
+    # Cancel token watcher first
+    try:
+        if 'token_watcher_task' in locals() and token_watcher_task:
+            token_watcher_task.cancel()
+            try:
+                await token_watcher_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel daily scheduler
+    try:
+        if 'scheduler_task' in locals() and scheduler_task:
+            scheduler_task.cancel()
+            try:
+                await scheduler_task
+            except Exception:
+                pass
+    except Exception:
+        pass
     if ws_manager:
         logging.info("Stopping WebSocketManager...")
         ws_manager.stop()
@@ -379,3 +465,447 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logging.error(f"Error in websocket endpoint: {e}", exc_info=True)
         ws_manager.disconnect(websocket)
+
+# ───────── Daily token gate and scheduler ─────────
+async def ensure_daily_token_ready(timeout: float = 900.0) -> None:
+    """
+    Wait until the daily system token has been refreshed and the gate is opened.
+    Logs if waiting exceeds timeout but continues to wait afterwards.
+    """
+    try:
+        if daily_token_ready.is_set():
+            return
+        logging.info("[GATE] Waiting for daily system token refresh to complete...")
+        await asyncio.wait_for(daily_token_ready.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        logging.warning("[GATE] Still waiting for system token refresh; continuing to wait without timeout.")
+        await daily_token_ready.wait()
+
+async def daily_token_scheduler() -> None:
+    """
+    Runs forever:
+      - Sleeps until 07:31 Asia/Kolkata
+      - Clears gate, performs headless login + persist 'system' token with retries
+      - Sets gate on success
+      - Triggers dependent daily jobs (e.g., instruments refresh)
+    """
+    tz = ZoneInfo("Asia/Kolkata")
+    while True:
+        try:
+            now = datetime.now(tz)
+            next_run = now.replace(hour=7, minute=31, second=0, microsecond=0)
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            sleep_sec = max(1, int((next_run - now).total_seconds()))
+            logging.info("[SCHED] Next daily headless login scheduled at %s", next_run.strftime("%Y-%m-%d %H:%M:%S %Z%z"))
+            await asyncio.sleep(sleep_sec)
+
+            # Begin rotation
+            logging.info("[SCHED] 07:31 IST reached; clearing gate and refreshing system token")
+            daily_token_ready.clear()
+
+            # Retry loop until success
+            while True:
+                try:
+                    db = SessionLocal()
+                    try:
+                        fp = run_headless_login_and_persist_system_token(db)
+                        db.commit()
+                    finally:
+                        db.close()
+                    logging.info("[SCHED] System access_token rotated (..%s)", fp)
+                    break
+                except Exception as e:
+                    logging.warning("[SCHED] Headless login failed: %s; retrying in 30s", e)
+                    await asyncio.sleep(30)
+
+            # Open gate
+            daily_token_ready.set()
+            logging.info("[GATE] Opened after successful token refresh")
+
+            # Kick off dependent daily jobs (fire-and-forget)
+            try:
+                asyncio.create_task(update_all_instruments_daily())
+                logging.info("[SCHED] Triggered daily instruments update")
+            except Exception as e:
+                logging.error("[SCHED] Failed to start instruments update: %s", e, exc_info=True)
+
+        except asyncio.CancelledError:
+            logging.info("[SCHED] Daily token scheduler cancelled")
+            break
+        except Exception as e:
+            logging.error("[SCHED] Scheduler loop error: %s", e, exc_info=True)
+            await asyncio.sleep(30)
+
+# ───────── Alerts realtime dispatcher and polling fallback ─────────
+import os as _os
+import json as _json
+import httpx as _httpx
+from typing import Optional as _Optional, List as _List, Dict as _Dict
+from datetime import datetime as _dt
+
+# Helper: publish to ntfy
+async def _publish_ntfy(ntfy_url: str, title: str, message: str, tags: _Optional[_List[str]] = None) -> None:
+    headers = {"Title": title}
+    if tags:
+        headers["Tags"] = ",".join(tags)
+    async with _httpx.AsyncClient(timeout=10) as client:
+        try:
+            r = await client.post(ntfy_url, content=message, headers=headers)
+            r.raise_for_status()
+            logging.info(f"[NTFY] published: {title}")
+        except Exception as e:
+            logging.error(f"[NTFY] publish failed: {e}")
+
+# Helper: Upsert alert mirror row
+async def _upsert_alert_row(db, row: _Dict) -> None:
+    # Minimal normalization from Kite Alerts list/get payload shape
+    sql = """
+    INSERT INTO alerts (
+        uuid, user_id, name, status, alert_type,
+        lhs_exchange, lhs_tradingsymbol, lhs_attribute,
+        operator, rhs_type, rhs_constant, rhs_exchange, rhs_tradingsymbol, rhs_attribute,
+        basket, alert_count, updated_at
+    ) VALUES (
+        :uuid, :user_id, :name, :status, :alert_type,
+        :lhs_exchange, :lhs_tradingsymbol, :lhs_attribute,
+        :operator, :rhs_type, :rhs_constant, :rhs_exchange, :rhs_tradingsymbol, :rhs_attribute,
+        :basket, :alert_count, NOW()
+    )
+    ON CONFLICT (uuid) DO UPDATE SET
+        user_id = EXCLUDED.user_id,
+        name = EXCLUDED.name,
+        status = EXCLUDED.status,
+        alert_type = EXCLUDED.alert_type,
+        lhs_exchange = EXCLUDED.lhs_exchange,
+        lhs_tradingsymbol = EXCLUDED.lhs_tradingsymbol,
+        lhs_attribute = EXCLUDED.lhs_attribute,
+        operator = EXCLUDED.operator,
+        rhs_type = EXCLUDED.rhs_type,
+        rhs_constant = EXCLUDED.rhs_constant,
+        rhs_exchange = EXCLUDED.rhs_exchange,
+        rhs_tradingsymbol = EXCLUDED.rhs_tradingsymbol,
+        rhs_attribute = EXCLUDED.rhs_attribute,
+        basket = EXCLUDED.basket,
+        alert_count = EXCLUDED.alert_count,
+        updated_at = NOW();
+    """
+    values = {
+        "uuid": row.get("uuid"),
+        "user_id": row.get("user_id", "me"),
+        "name": row.get("name"),
+        "status": row.get("status"),
+        "alert_type": row.get("type"),
+        "lhs_exchange": row.get("lhs_exchange"),
+        "lhs_tradingsymbol": row.get("lhs_tradingsymbol"),
+        "lhs_attribute": row.get("lhs_attribute"),
+        "operator": row.get("operator"),
+        "rhs_type": row.get("rhs_type"),
+        "rhs_constant": row.get("rhs_constant"),
+        "rhs_exchange": row.get("rhs_exchange"),
+        "rhs_tradingsymbol": row.get("rhs_tradingsymbol"),
+        "rhs_attribute": row.get("rhs_attribute"),
+        "basket": _json.dumps(row.get("basket")) if row.get("basket") is not None else None,
+        "alert_count": int(row.get("alert_count") or 0),
+    }
+    try:
+        await async_db.execute(sql, values)
+    except Exception as e:
+        # Cheap way to detect missing columns from the alerts extension
+        if "column" in str(e) and "does not exist" in str(e):
+            logging.warning(f"[ALERTS] upsert failed, attempting one-shot schema migration: {e}")
+            try:
+                run_schema_migrations()
+                await async_db.execute(sql, values)
+                logging.info("[ALERTS] schema migration successful, retried upsert")
+            except Exception as e2:
+                logging.error(f"[ALERTS] failed to run schema migration or retry upsert: {e2}", exc_info=True)
+                raise e2
+        else:
+            raise e
+
+# Helper: fetch alert mirror state (last counts and controls)
+async def _get_alert_controls(uuid: str):
+    sql = """
+    SELECT last_alert_count, last_notified_at, cooldown_sec, schedule, name, lhs_tradingsymbol, operator, rhs_constant
+    FROM alerts WHERE uuid = :uuid
+    """
+    return await async_db.fetch_one(sql, {"uuid": uuid})
+
+# Helper: update controls after notify
+async def _update_alert_after_notify(uuid: str, new_count: int) -> None:
+    sql = """
+    UPDATE alerts
+    SET last_alert_count = :cnt, last_notified_at = NOW(), updated_at = NOW()
+    WHERE uuid = :uuid
+    """
+    await async_db.execute(sql, {"uuid": uuid, "cnt": new_count})
+
+# Helper: set only last_alert_count (when suppressing notification)
+async def _ack_alert_count(uuid: str, new_count: int) -> None:
+    sql = "UPDATE alerts SET last_alert_count = :cnt, updated_at = NOW() WHERE uuid = :uuid"
+    await async_db.execute(sql, {"uuid": uuid, "cnt": new_count})
+
+# Helper: get latest history timestamp seen
+async def _get_latest_history_time(uuid: str):
+    sql = "SELECT MAX(triggered_at) AS t FROM alert_history WHERE alert_uuid = :uuid"
+    row = await async_db.fetch_one(sql, {"uuid": uuid})
+    return row["t"] if row else None
+
+# Helper: insert history row
+async def _insert_alert_history(uuid: str, triggered_at: str, trigger_price: float, meta: _Dict, condition: _Optional[str]):
+    # Parse timestamp string into a datetime object
+    ts_dt = None
+    if triggered_at:
+        try:
+            # Try parsing the format from Kite API first
+            ts_dt = _dt.strptime(triggered_at, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            # Fallback for ISO format (e.g., from utcnow().isoformat())
+            try:
+                ts_dt = _dt.fromisoformat(triggered_at)
+            except ValueError:
+                logging.warning(f"[ALERTS] could not parse timestamp '{triggered_at}', using NOW()")
+                ts_dt = _dt.utcnow()
+    else:
+        ts_dt = _dt.utcnow()
+
+    sql = """
+    INSERT INTO alert_history (alert_uuid, triggered_at, trigger_price, meta)
+    VALUES (:uuid, :ts, :price, :meta)
+    """
+    await async_db.execute(sql, {
+        "uuid": uuid,
+        "ts": ts_dt,
+        "price": float(trigger_price) if trigger_price is not None else 0.0,
+        "meta": _json.dumps({"condition": condition, "meta": meta})
+    })
+
+# Basic schedule check (Phase 1: allow all hours; placeholder for market hours)
+def _is_within_schedule(_schedule_json: _Optional[str]) -> bool:
+    # TODO: Implement real market hours window in Phase 1 polish
+    return True
+
+# Cooldown check
+def _passes_cooldown(last_notified_at, cooldown_sec: int) -> bool:
+    if not last_notified_at:
+        return True
+    try:
+        # last_notified_at is a datetime object when fetched from DB
+        delta = _dt.utcnow() - last_notified_at
+        return delta.total_seconds() >= max(int(cooldown_sec or 0), 0)
+    except Exception:
+        return True
+
+# Build Kite REST headers
+def _kite_headers(api_key: str, access_token: str) -> _Dict[str, str]:
+    return {
+        "X-Kite-Version": "3",
+        "Authorization": f"token {api_key}:{access_token}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+
+# Fetch Kite alerts list
+async def _kite_list_alerts(api_key: str, access_token: str) -> _List[_Dict]:
+    url = "https://api.kite.trade/alerts"
+    async with _httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, headers=_kite_headers(api_key, access_token))
+        r.raise_for_status()
+        payload = r.json()
+        return payload.get("data", []) or []
+
+# Fetch Kite alert history
+async def _kite_alert_history(api_key: str, access_token: str, uuid: str) -> _List[_Dict]:
+    url = f"https://api.kite.trade/alerts/{uuid}/history"
+    async with _httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, headers=_kite_headers(api_key, access_token))
+        r.raise_for_status()
+        payload = r.json()
+        return payload.get("data", []) or []
+
+# One-shot reconciliation tick (used by WS dispatcher and fallback worker)
+async def alerts_poll_tick(api_key: str, access_token: str, ntfy_url: str) -> None:
+    try:
+        alerts = await _kite_list_alerts(api_key, access_token)
+    except Exception as e:
+        logging.error(f"[ALERTS] list failed: {e}")
+        return
+
+    for a in alerts:
+        try:
+            await _upsert_alert_row(async_db, a)
+            uuid = a.get("uuid")
+            if not uuid:
+                continue
+            # Controls
+            ctrl = await _get_alert_controls(uuid)
+            last_alert_count = int(ctrl["last_alert_count"]) if ctrl and ctrl["last_alert_count"] is not None else 0
+            cooldown_sec = int(ctrl["cooldown_sec"]) if ctrl and ctrl["cooldown_sec"] is not None else 120
+            last_notified_at = ctrl["last_notified_at"] if ctrl else None
+            schedule_json = ctrl["schedule"] if ctrl else None
+
+            current_count = int(a.get("alert_count") or 0)
+            if current_count <= last_alert_count:
+                continue
+
+            # Fetch history and process only new entries
+            hist = await _kite_alert_history(api_key, access_token, uuid)
+            latest_seen = await _get_latest_history_time(uuid)
+            new_events = []
+            for h in hist:
+                created_at = h.get("created_at") or h.get("timestamp")
+                # When DB has no history, consider all as new
+                if latest_seen is None:
+                    new_events.append(h)
+                else:
+                    # Compare timestamps lexically; Postgres will parse during insert
+                    try:
+                        # Convert both to datetime for robust compare
+                        ca = _dt.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+                        if latest_seen.tzinfo is None:
+                            # best-effort naive compare
+                            is_new = ca > latest_seen.replace(tzinfo=None)
+                        else:
+                            is_new = ca.replace(tzinfo=None) > latest_seen.replace(tzinfo=None)
+                        if is_new:
+                            new_events.append(h)
+                    except Exception:
+                        # Fallback: accept as new when count increased
+                        new_events.append(h)
+
+            # If no fine-grained history diff could be determined, still ack count
+            if not new_events:
+                await _ack_alert_count(uuid, current_count)
+                continue
+
+            # Evaluate schedule/cooldown only once per batch (suppress if not allowed)
+            if not _is_within_schedule(_json.dumps(schedule_json) if isinstance(schedule_json, dict) else schedule_json):
+                await _ack_alert_count(uuid, current_count)
+                continue
+            if not _passes_cooldown(last_notified_at, cooldown_sec):
+                await _ack_alert_count(uuid, current_count)
+                continue
+
+            # Insert histories and notify (collapse multiple to a single notification with summary)
+            for h in new_events:
+                condition = h.get("condition")
+                meta = h.get("meta")
+                # meta array; try last_price if available
+                last_price = None
+                if isinstance(meta, list) and meta:
+                    last_price = meta[0].get("last_price")
+                await _insert_alert_history(
+                    uuid=uuid,
+                    triggered_at=h.get("created_at") or h.get("timestamp") or _dt.utcnow().isoformat(),
+                    trigger_price=last_price if last_price is not None else 0.0,
+                    meta=h,
+                    condition=condition
+                )
+
+            # Build notification message
+            name = a.get("name") or (ctrl["name"] if ctrl else uuid)
+            sym = a.get("lhs_tradingsymbol") or (ctrl["lhs_tradingsymbol"] if ctrl else "")
+            op = a.get("operator") or (ctrl["operator"] if ctrl else "")
+            rhs = a.get("rhs_constant") if a.get("rhs_constant") is not None else (ctrl["rhs_constant"] if ctrl else "")
+            title = f"Alert triggered: {name}"
+            body = f"{sym} {op} {rhs} | {len(new_events)} event(s) | uuid={uuid}"
+            await _publish_ntfy(ntfy_url, title, body, tags=["alert", "kite", sym] if sym else ["alert", "kite"])
+
+            # Update controls
+            await _update_alert_after_notify(uuid, current_count)
+
+        except Exception as e:
+            logging.error(f"[ALERTS] reconcile error for uuid={a.get('uuid')}: {e}", exc_info=True)
+
+# Background worker: 2s fallback polling
+async def alerts_poll_worker(api_key: str, ntfy_url: str) -> None:
+    logging.info("[ALERTS] 2s polling worker started")
+    while True:
+        await ensure_daily_token_ready()
+        try:
+            db = SessionLocal()
+            try:
+                at = get_system_access_token(db)
+            finally:
+                db.close()
+            if at:
+                await alerts_poll_tick(api_key, at, ntfy_url)
+        except Exception as e:
+            logging.error(f"[ALERTS] poll tick failed: {e}", exc_info=True)
+        await asyncio.sleep(2)
+
+# Dispatcher: consume WebSocket alert events queue and trigger quick reconcile + immediate ntfy
+async def alert_event_dispatcher(ws_mgr: "WebSocketManager", ntfy_url: str) -> None:
+    logging.info("[ALERTS] WS dispatcher started")
+    api_key = API_KEY
+    while True:
+        await ensure_daily_token_ready()
+        event = await ws_mgr.alert_event_queue.get()
+        try:
+            # Immediate lightweight notification with raw context
+            raw = event.get("raw") if isinstance(event, dict) else {}
+            title = "Alert event (stream)"
+            body = _json.dumps(raw)[:1000]  # cap size
+            await _publish_ntfy(ntfy_url, title, body, tags=["alert", "kite", "ws"])
+        except Exception as e:
+            logging.error(f"[ALERTS] dispatcher immediate notify failed: {e}")
+        # Quick reconcile pass to persist+enrich using the latest system token
+        try:
+            db = SessionLocal()
+            try:
+                access_token = get_system_access_token(db)
+            finally:
+                db.close()
+            if access_token:
+                await alerts_poll_tick(api_key, access_token, ntfy_url)
+        except Exception as e:
+            logging.error(f"[ALERTS] dispatcher reconcile failed: {e}", exc_info=True)
+
+# Minimal endpoints for testing the pipeline
+@app.post("/alerts/test-notification")
+async def alerts_test_notification():
+    ntfy_url = _os.getenv("KITE_ALERTS_NTFY_URL") or _os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
+    await _publish_ntfy(ntfy_url, "Test: Kite Alerts", "This is a test notification from backend.", tags=["test","alerts"])
+    return {"status": "ok"}
+
+@app.get("/alerts/mirror")
+async def alerts_mirror_list(limit: int = 100):
+    rows = await async_db.fetch_all(
+        "SELECT * FROM alerts ORDER BY updated_at DESC LIMIT :n",
+        {"n": max(1, min(limit, 500))}
+    )
+    # Convert to JSON-serializable
+    def _row_to_dict(r):
+        try:
+            d = dict(r)
+            if d.get("basket") and isinstance(d["basket"], str):
+                try:
+                    d["basket"] = _json.loads(d["basket"])
+                except Exception:
+                    pass
+            return d
+        except Exception:
+            return {}
+    return {"data": [_row_to_dict(r) for r in rows]}
+
+# Admin endpoint to ensure schema.sql migrations are applied
+from database import get_db_connection as _get_db_conn_for_schema
+
+@app.post("/admin/run-schema")
+def run_schema_migrations():
+    """
+    One-shot: executes schema.sql via database.get_db_connection() which runs create_tables_if_not_exists.
+    Safe and idempotent. Use before first Alerts usage to ensure columns exist.
+    """
+    conn = None
+    try:
+        conn = _get_db_conn_for_schema()
+        return {"status": "ok", "message": "schema.sql executed"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
