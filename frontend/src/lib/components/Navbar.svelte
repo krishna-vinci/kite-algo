@@ -1,98 +1,131 @@
 <script lang="ts">
-  import { page } from '$app/stores';
-  import LoginLogout from './LoginLogout.svelte';
+	import { page } from '$app/stores';
+	import LoginLogout from './LoginLogout.svelte';
+	import favicon from '$lib/assets/favicon.svg';
+	import SunIcon from "@lucide/svelte/icons/sun";
+	import MoonIcon from "@lucide/svelte/icons/moon";
 
-  const navItems = [
-    { name: 'Dashboard', href: '/' },
-    { name: 'Market Watch', href: '/marketwatch' },
-    { name: 'Orders', href: '/orders' },
-    { name: 'Holdings', href: '/holdings' },
-    { name: 'Positions', href: '/positions' },
-    { name: 'Bids', href: '/bids' },
-    { name: 'Funds', href: '/funds' },
-    { name: 'Alerts', href: '/alerts' },
-    { name: 'Strategies', href: '/strategies/momentum' },
-  ];
+	import { resetMode, setMode } from "mode-watcher";
+	import * as DropdownMenu from "$lib/components/ui/dropdown-menu/index.js";
+	import { buttonVariants } from "$lib/components/ui/button/index.js";
+
+	import { Button } from '$lib/components/ui/button/index.js';
+	import {
+		Root as NavigationMenu,
+		NavigationMenuList,
+		NavigationMenuItem,
+		NavigationMenuLink,
+		NavigationMenuTrigger,
+		NavigationMenuContent,
+		NavigationMenuViewport,
+		NavigationMenuIndicator
+	} from '$lib/components/ui/navigation-menu/index.js';
+	import {
+		Sheet,
+		SheetContent,
+		SheetHeader,
+		SheetTitle,
+		SheetTrigger
+	} from '$lib/components/ui/sheet/index.js';
+
+	const navItems = [
+		{ name: 'Dashboard', href: '/' },
+		{ name: 'Market Watch', href: '/marketwatch' },
+		{ name: 'Orders', href: '/orders' },
+		{ name: 'Holdings', href: '/holdings' },
+		{ name: 'Positions', href: '/positions' },
+		{ name: 'Bids', href: '/bids' },
+		{ name: 'Funds', href: '/funds' },
+		{ name: 'Alerts', href: '/alerts' },
+		{ name: 'Strategies', href: '/strategies/momentum' }
+	];
 </script>
 
-<nav class="bg-white shadow-sm">
-  <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-    <div class="flex justify-between h-16">
-      <div class="flex">
-        <div class="flex-shrink-0 flex items-center">
-          <!-- Logo -->
-          <img class="h-8 w-auto" src="/favicon.svg" alt="Kite App Logo" />
-        </div>
-        <div class="hidden sm:-my-px sm:ml-6 sm:flex sm:space-x-8">
-          {#each navItems as item}
-            <a
-              href={item.href}
-              class="inline-flex items-center px-1 pt-1 border-b-2 text-sm font-medium"
-              class:border-orange-500={$page.url.pathname === item.href}
-              class:text-orange-600={($page.url.pathname === item.href)}
-              class:border-transparent={!($page.url.pathname === item.href)}
-              class:text-gray-500={!($page.url.pathname === item.href)}
-              class:hover:border-gray-300={!($page.url.pathname === item.href)}
-              class:hover:text-gray-700={!($page.url.pathname === item.href)}
-              aria-current={$page.url.pathname === item.href ? 'page' : undefined}
-            >
-              {item.name}
-            </a>
-          {/each}
-        </div>
-      </div>
-      <div class="hidden sm:ml-6 sm:flex sm:items-center">
-        <!-- Notification Bell -->
-        <button
-          type="button"
-          class="bg-white p-1 rounded-full text-gray-400 hover:text-gray-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500"
-        >
-          <span class="sr-only">View notifications</span>
-          <!-- Heroicon name: outline/bell -->
-          <svg
-            class="h-6 w-6"
-            xmlns="http://www.w3.org/2000/svg"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            aria-hidden="true"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              stroke-width="2"
-              d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"
-            />
-          </svg>
-        </button>
+<div class="border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+	<div class="container flex h-14 items-center">
+		<!-- Brand/Logo -->
+		<a href="/" class="mr-4 hidden md:flex">
+			<img src={favicon} alt="Kite App Logo" class="h-8 w-auto" />
+		</a>
 
-        <!-- Shopping Cart -->
-        <button
-          type="button"
-          class="ml-3 bg-white p-1 rounded-full text-gray-400 hover:text-gray-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500"
-        >
-          <span class="sr-only">View cart</span>
-          <!-- Heroicon name: outline/shopping-cart -->
-          <svg
-            class="h-6 w-6"
-            xmlns="http://www.w3.org/2000/svg"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            aria-hidden="true"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              stroke-width="2"
-              d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"
-            />
-          </svg>
-        </button>
+		<!-- Desktop Navigation -->
+		<div class="flex flex-1 items-center justify-center md:justify-center">
+			<NavigationMenu class="hidden md:flex">
+				<NavigationMenuList class="mx-auto">
+					{#each navItems as item}
+						<NavigationMenuItem>
+							<NavigationMenuLink
+								href={item.href}
+								class="group inline-flex h-9 w-max items-center justify-center rounded-md bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent focus:bg-accent focus:outline-none focus:ring-1 focus:ring-ring {$page
+									.url.pathname === item.href
+									? 'bg-primary text-primary-foreground'
+									: 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'}"
+							>
+								{item.name}
+							</NavigationMenuLink>
+						</NavigationMenuItem>
+					{/each}
+				</NavigationMenuList>
+			</NavigationMenu>
+		</div>
 
-        <!-- Profile dropdown -->
-        <LoginLogout />
-      </div>
-    </div>
-  </div>
-</nav>
+
+		<!-- Right side: User controls -->
+		<div class="flex items-center space-x-2">
+		<DropdownMenu.Root>
+		 <DropdownMenu.Trigger
+		  class={buttonVariants({ variant: "outline", size: "icon" })}
+		 >
+		  <SunIcon
+		   class="h-[1.2rem] w-[1.2rem] rotate-0 scale-100 !transition-all dark:-rotate-90 dark:scale-0"
+		  />
+		  <MoonIcon
+		   class="absolute h-[1.2rem] w-[1.2rem] rotate-90 scale-0 !transition-all dark:rotate-0 dark:scale-100"
+		  />
+		  <span class="sr-only">Toggle theme</span>
+		 </DropdownMenu.Trigger>
+		 <DropdownMenu.Content align="end">
+		  <DropdownMenu.Item onclick={() => setMode("light")}>Light</DropdownMenu.Item
+		  >
+		  <DropdownMenu.Item onclick={() => setMode("dark")}>Dark</DropdownMenu.Item>
+		  <DropdownMenu.Item onclick={() => resetMode()}>System</DropdownMenu.Item>
+		 </DropdownMenu.Content>
+		</DropdownMenu.Root>
+			<LoginLogout />
+		</div>
+
+		<!-- Mobile menu trigger -->
+		<Sheet>
+			<SheetTrigger class="mr-2 md:hidden">
+				<Button variant="ghost" size="icon" aria-label="Open menu" type="button">
+					<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+						<path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" />
+					</svg>
+					<span class="sr-only">Open menu</span>
+				</Button>
+			</SheetTrigger>
+			<SheetContent side="right">
+				<SheetHeader class="space-y-2">
+					<SheetTitle>Menu</SheetTitle>
+				</SheetHeader>
+				<div class="py-4">
+					<ul class="space-y-2">
+						{#each navItems as item}
+							<li>
+								<a
+									href={item.href}
+									class="block select-none space-y-1 rounded-md px-2 py-1.5 text-sm font-medium leading-none {$page
+										.url.pathname === item.href
+										? 'bg-primary text-primary-foreground hover:bg-primary'
+										: 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'}"
+								>
+									{item.name}
+								</a>
+							</li>
+						{/each}
+					</ul>
+				</div>
+			</SheetContent>
+		</Sheet>
+	</div>
+</div>

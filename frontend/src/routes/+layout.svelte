@@ -1,5 +1,6 @@
 <script lang="ts">
 	import '../app.css';
+	import { ModeWatcher } from "mode-watcher";
 	import favicon from '$lib/assets/favicon.svg';
 	import Navbar from '$lib/components/Navbar.svelte'; // Import the new Navbar component
 	import Toast from '$lib/components/Toast.svelte';
@@ -12,5 +13,6 @@
 </svelte:head>
 
 <Navbar />
+<ModeWatcher />
 {@render children?.()}
 <Toast />

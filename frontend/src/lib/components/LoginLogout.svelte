@@ -19,7 +19,7 @@
 	async function checkLoginStatus() {
 		try {
 			const response = await apiFetch(`/broker/profile_kite`);
-			
+
 			if (response.ok) {
 				const profile = await response.json();
 				isLoggedIn = true;
@@ -49,7 +49,8 @@
 					setSessionId(data.session_id);
 				}
 				isLoggedIn = true;
-				userName = data.profile?.user_shortname || data.profile?.user_name || data.profile?.email || 'User';
+				userName =
+					data.profile?.user_shortname || data.profile?.user_name || data.profile?.email || 'User';
 			} else {
 				console.error('Login failed:', response.status);
 			}
@@ -84,22 +85,22 @@
 	}
 </script>
 
-<div class="absolute top-4 right-4 flex items-center space-x-2">
+<div class="flex items-center space-x-2">
 	{#if isLoggedIn}
 		<div class="flex items-center space-x-2">
-			<span class="text-white font-medium">Hello, {userName}</span>
-			<button 
+			<span class="text-foreground font-medium">Hello, {userName}</span>
+			<button
 				on:click={logout}
-				class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-md transition duration-200"
+				class="bg-destructive hover:bg-destructive/90 text-white px-3 py-1.5 text-sm rounded-md transition-colors duration-200 disabled:opacity-50"
 				disabled={isLoading}
 			>
 				{isLoading ? 'Logging out...' : 'Logout'}
 			</button>
 		</div>
 	{:else}
-		<button 
+		<button
 			on:click={login}
-			class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-md transition duration-200"
+			class="bg-primary hover:bg-primary/90 text-primary-foreground px-3 py-1.5 text-sm rounded-md transition-colors duration-200 disabled:opacity-50"
 			disabled={isLoading}
 		>
 			{isLoading ? 'Logging in...' : 'Login'}
