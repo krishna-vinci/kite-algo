@@ -33,6 +33,9 @@ from zoneinfo import ZoneInfo
 # Configure logging for the main application
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Suppress INFO level logs from httpx for specific API calls
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 import plotly.express as px
 import pandas_market_calendars as mcal
 
@@ -65,7 +68,7 @@ from kite_auth import login_headless
 import logging
 from database import SessionLocal, database as async_db
 from broker_api.broker_api import KiteSession, get_system_access_token, upsert_kite_session
-from broker_api.broker_api import run_headless_login_and_persist_system_token, update_all_instruments_daily
+from broker_api.broker_api import run_headless_login_and_persist_system_token
 from broker_api.kite_auth import API_KEY
 from broker_api.websocket_manager import WebSocketManager
 
@@ -225,6 +228,23 @@ async def combined_lifespan(app: FastAPI):
         alerts_ntfy_url = os.getenv("KITE_ALERTS_NTFY_URL") or os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
         asyncio.create_task(alert_event_dispatcher(ws_manager, alerts_ntfy_url))
         asyncio.create_task(alerts_poll_worker(API_KEY, alerts_ntfy_url))
+
+        # Ensure Meilisearch index exists on startup (and bootstrap reindex if empty)
+        try:
+            ensure_instruments_index()
+            logger.info("Meilisearch index 'instruments' ensured on startup")
+            try:
+                client = get_meili_client(admin=True)
+                index = client.index("instruments")
+                stats = index.get_stats() if hasattr(index, "get_stats") else index.stats()
+                num_docs = (stats.get("numberOfDocuments") or stats.get("number_of_documents") or 0)
+                if int(num_docs) == 0:
+                    logger.info("Meilisearch 'instruments' index is empty; triggering bootstrap reindex...")
+                    await meili_reindex_instruments()
+            except Exception as ie:
+                logger.exception("Startup Meilisearch reindex-if-empty check failed: %s", ie)
+        except Exception as e:
+            logger.exception("Failed to ensure Meilisearch index on startup: %s", e)
     except Exception as e:
         logging.error(f"Failed to initialize MCP Kite instance or WebSocketManager: {e}", exc_info=True)
         # Depending on the desired behavior, you might want to exit the application
@@ -277,6 +297,11 @@ app.mount("/mcp", mcp_app_direct_wrapped)
 # 4. Include existing API routes (mounted under /broker to match frontend)
 app.include_router(broker_api_router, prefix="/broker")
 app.include_router(momentum_router, prefix="/broker")
+
+from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # CSV file paths and their corresponding source list names
@@ -524,11 +549,7 @@ async def daily_token_scheduler() -> None:
             logging.info("[GATE] Opened after successful token refresh")
 
             # Kick off dependent daily jobs (fire-and-forget)
-            try:
-                asyncio.create_task(update_all_instruments_daily())
-                logging.info("[SCHED] Triggered daily instruments update")
-            except Exception as e:
-                logging.error("[SCHED] Failed to start instruments update: %s", e, exc_info=True)
+            # No dependent jobs for token refresh; other schedulers handle their own updates.
 
         except asyncio.CancelledError:
             logging.info("[SCHED] Daily token scheduler cancelled")

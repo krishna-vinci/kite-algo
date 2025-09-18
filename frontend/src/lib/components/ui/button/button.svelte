@@ -35,6 +35,7 @@
 	export type ButtonProps = WithElementRef<HTMLButtonAttributes> &
 		WithElementRef<HTMLAnchorAttributes> & {
 			variant?: ButtonVariant;
+	     isDialogTrigger?: boolean;
 			size?: ButtonSize;
 		};
 </script>
@@ -49,6 +50,7 @@
 		type = 'button',
 		disabled,
 		children,
+		  isDialogTrigger = false,
 		...restProps
 	}: ButtonProps = $props();
 </script>
@@ -66,6 +68,15 @@
 	>
 		{@render children?.()}
 	</a>
+{:else if isDialogTrigger}
+	<div
+		bind:this={ref}
+		data-slot="button"
+		class={cn(buttonVariants({ variant, size }), className)}
+		{...restProps}
+	>
+		{@render children?.()}
+	</div>
 {:else}
 	<button
 		bind:this={ref}

@@ -9,7 +9,35 @@
 		exchange: string;
 		instrument_type?: string;
 		segment?: string;
+		underlying?: string;
+		option_type?: 'CE' | 'PE';
+		expiry?: string;
+		strike?: number;
 	};
+
+  function formatExpiry(x?: string | null) {
+    if (!x) return '';
+    const d = new Date(x);
+    if (isNaN(d.getTime())) return x;
+    return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' });
+  }
+  function formatLabel(item: any) {
+    const exch = item.exchange ? ` (${item.exchange})` : '';
+    if (item.option_type) {
+      const u = item.underlying ?? '';
+      const exp = formatExpiry(item.expiry);
+      const strike = item.strike ?? '';
+      const ot = item.option_type ?? '';
+      return `${u} ${exp} ${strike} ${ot}${exch}`.trim();
+    }
+    if ((item.instrument_type || '').toUpperCase() === 'FUT') {
+      const u = item.underlying ?? '';
+      const exp = formatExpiry(item.expiry);
+      return `${u} ${exp} FUT${exch}`.trim();
+    }
+    const name = item.name ? ` — ${item.name}` : '';
+    return `${item.tradingsymbol}${name}${exch}`.trim();
+  }
 
 	export let selected: InstrumentRow | null = null;
 	export let placeholder = 'Search eg: infy bse, nifty fut, index';
@@ -129,15 +157,7 @@
 							class:focused={i === focusedIndex}
 							on:mousedown|preventDefault={() => choose(r)}
 						>
-							<div class="ts">{r.tradingsymbol}</div>
-							<div class="meta">
-								{#if r.name}
-									<span class="name">{r.name}</span>
-								{/if}
-								<span class="badge">{r.exchange}</span>
-								{#if r.instrument_type}<span class="badge tone">{r.instrument_type}</span>{/if}
-								{#if r.segment}<span class="badge tone2">{r.segment}</span>{/if}
-							</div>
+							<div class="ts">{formatLabel(r)}</div>
 						</li>
 					{/each}
 				</ul>

@@ -12,7 +12,11 @@ import gzip
 import csv
 import io
 import logging # Added logging
-
+import meilisearch # Added meilisearch
+import re # Added for regex parsing
+import calendar # Added for month mapping
+from kiteconnect import KiteConnect # For LTP fetching
+from database import SessionLocal # For DB session in LTP helper
 
 import requests
 import httpx
@@ -64,7 +68,7 @@ historical_data_update_progress = {
 from sqlalchemy import Column, String, DateTime, inspect
 from sqlalchemy.orm import Session
 
-from fastapi import APIRouter, Depends, Response, HTTPException, Request
+from fastapi import APIRouter, Depends, Response, HTTPException, Request, Query
 
 from .kite_auth import login_headless
 from kiteconnect import KiteConnect
@@ -82,7 +86,8 @@ from fastapi import (
     Cookie,
     Header,
     Query,
-    Response
+    Response,
+    BackgroundTasks
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -271,6 +276,8 @@ class KiteInstrument(Base):
     instrument_type = Column(String, index=True)  # EQ, FUT, CE, PE, etc.
     segment = Column(String, index=True)          # EQ, NFO-FUT, NFO-OPT, etc.
     exchange = Column(String, index=True)         # NSE, NFO, BSE, BFO, MCX, etc.
+    underlying = Column(String, index=True, nullable=True) # Underlying symbol for derivatives
+    option_type = Column(String(2), nullable=True) # CE, PE, or NULL
     last_updated = Column(DateTime, default=datetime.utcnow)
 
 
@@ -338,6 +345,12 @@ async def _startup():
     Base.metadata.create_all(bind=engine)
     await database.connect()
     
+    # Ensure Meilisearch index is set up
+    try:
+        ensure_instruments_index()
+    except Exception as e:
+        logger.error(f"Failed to ensure Meilisearch index on startup: {e}", exc_info=True)
+
     # Daily instruments update scheduling is managed by main; no internal scheduler here
 
 @router.on_event("shutdown")
@@ -367,10 +380,391 @@ def get_psql_conn():
     Fallback raw psycopg2 connection for ad-hoc queries.
     """
     return psycopg2.connect(DATABASE_URL)
+# ─────────── Meilisearch client and index helpers ───────────
+_meili_client = None  # preserved (unused) to keep imports/refs stable
+_meili_client_cache: Dict[str, meilisearch.Client] = {}
+
+def _meili_health_ok(client: "meilisearch.Client") -> bool:
+    """
+    Small helper to check Meilisearch health using available method names.
+    Returns True when healthy, False otherwise.
+    """
+    try:
+        if hasattr(client, "health"):
+            h = client.health()
+        else:
+            h = client.get_health()
+        if isinstance(h, dict):
+            status = h.get("status")
+            # newer SDKs: {"status": "available"}
+            return str(status).lower() == "available"
+        # older SDKs might return truthy
+        return bool(h)
+    except Exception:
+        return False
+
+def get_meili_client(admin: bool = False) -> meilisearch.Client:
+    """
+    Returns a Meilisearch client based on role, with robust URL/key fallback and caching.
+    - Builds ordered URL list:
+        1) MEILI_URL (if set)
+        2) http://meilisearch:7700
+        3) http://localhost:7700
+        4) http://127.0.0.1:7700
+    - Builds ordered key list:
+        admin=True  -> [MEILI_MASTER_KEY, MEILI_SEARCH_API_KEY, MEILI_API_KEY, None]
+        admin=False -> [MEILI_SEARCH_API_KEY, MEILI_API_KEY, MEILI_MASTER_KEY, None]
+    - Tries URLs × keys; on first healthy client, caches per role and returns.
+    - Raises RuntimeError if no combination works.
+    """
+    role = "admin" if admin else "search"
+    # Return cached client if available and healthy
+    cached = _meili_client_cache.get(role)
+    if cached and _meili_health_ok(cached):
+        return cached
+
+    # URL candidates (dedup preserving order)
+    urls_ordered: List[str] = []
+    env_url = os.getenv("MEILI_URL")
+    if env_url:
+        urls_ordered.append(env_url)
+    urls_ordered.extend([
+        "http://meilisearch:7700",
+        "http://localhost:7700",
+        "http://127.0.0.1:7700",
+    ])
+    seen = set()
+    urls: List[str] = []
+    for u in urls_ordered:
+        if u not in seen:
+            urls.append(u)
+            seen.add(u)
+
+    # Key candidates as per role
+    def _env(name: str) -> Optional[str]:
+        v = os.getenv(name)
+        return v if (v is not None and str(v).strip() != "") else None
+
+    if admin:
+        keys: List[Optional[str]] = [
+            _env("MEILI_MASTER_KEY"),
+            _env("MEILI_SEARCH_API_KEY"),
+            _env("MEILI_API_KEY"),
+            None,
+        ]
+    else:
+        keys = [
+            _env("MEILI_SEARCH_API_KEY"),
+            _env("MEILI_API_KEY"),
+            _env("MEILI_MASTER_KEY"),
+            None,
+        ]
+
+    tried_urls: List[str] = []
+
+    for url in urls:
+        tried_urls.append(url)
+        for key in keys:
+            try:
+                client = meilisearch.Client(url) if key is None else meilisearch.Client(url, key)
+                if _meili_health_ok(client):
+                    _meili_client_cache[role] = client
+                    return client
+            except Exception:
+                # continue trying other combinations
+                continue
+
+    # If all attempts failed, raise with summary of tried URLs
+    summary = ", ".join(tried_urls)
+    raise RuntimeError(f"Unable to connect to Meilisearch. Tried URLs (in order): {summary}")
+
+def ensure_instruments_index():
+    """Ensures the 'instruments' index exists and has the correct settings."""
+    client = get_meili_client(admin=True)
+    try:
+        logger.info("Ensuring Meilisearch 'instruments' index exists and settings are applied...")
+        index = client.index("instruments")
+        index.fetch_info() # Check if index exists
+    except meilisearch.errors.MeilisearchApiError as e:
+        if e.code == 'index_not_found':
+            logger.info("Meilisearch 'instruments' index not found, creating it.")
+            task = client.create_index("instruments", {'primaryKey': 'id'})
+            client.wait_for_task(task.task_uid)
+            index = client.index("instruments")
+        else:
+            logger.error(f"Meilisearch API error when checking index: {e}", exc_info=True)
+            return
+    except Exception as e:
+        logger.error(f"Unexpected error when checking Meilisearch index: {e}", exc_info=True)
+        return
+
+    settings = {
+        "searchableAttributes": ["tradingsymbol", "underlying", "name"],
+        "rankingRules": ["typo","words","proximity","attribute","exactness","sort"],
+        "filterableAttributes": [
+            "underlying", "option_type", "exchange", "instrument_type", "segment",
+            "expiry", "strike", "derivative_kind", "expiry_year", "expiry_month"
+        ],
+        "sortableAttributes": ["expiry", "strike"],
+        "synonyms": {
+            "nifty": ["NIFTY", "NIFTY 50", "NIFTY50"],
+            "nifty50": ["NIFTY", "NIFTY 50", "NIFTY50"],
+            "banknifty": ["BANKNIFTY", "NIFTY BANK", "BANK NIFTY"],
+            "finnifty": ["FINNIFTY"],
+            "sensex": ["SENSEX"],
+            "midcap100": ["NIFTY MIDCAP 100"],
+            "nifty bank": ["BANKNIFTY", "NIFTY BANK", "BANK NIFTY"],
+            "crude": ["CRUDEOIL"],
+            "crude oil": ["CRUDEOIL"]
+        }
+    }
+    try:
+        update_task = index.update_settings(settings)
+        client.wait_for_task(update_task.task_uid)
+        logger.info("Meilisearch 'instruments' index settings applied successfully.")
+    except Exception as e:
+        logger.error(f"Error applying Meilisearch index settings: {e}", exc_info=True)
+
+# ─────────── Meilisearch reindex pipeline ───────────
+async def meili_reindex_instruments():
+    """
+    Queries both kite_instruments and kite_indices tables, builds documents,
+    and upserts them into the Meilisearch 'instruments' index.
+    """
+    # Ensure index settings are up-to-date before reindexing
+    ensure_instruments_index()
+
+    client = get_meili_client(admin=True)
+    index = client.index("instruments")
+
+    # SQL query to combine data from both tables
+    sql_query = """
+        SELECT
+            instrument_token, exchange_token, tradingsymbol, name, last_price,
+            expiry, strike, tick_size, lot_size, instrument_type, segment, exchange,
+            underlying, option_type, last_updated
+        FROM kite_instruments
+        UNION ALL
+        SELECT
+            instrument_token, exchange_token, tradingsymbol, name, last_price,
+            expiry, strike, tick_size, lot_size, instrument_type, segment, exchange,
+            NULL AS underlying, NULL AS option_type, last_updated
+        FROM kite_indices;
+    """
+    
+    logger.info("Fetching instruments from PostgreSQL for Meilisearch reindexing...")
+    db_records = await database.fetch_all(sql_query)
+    
+    documents = []
+    
+    # Month abbreviations to numbers mapping
+    month_abbr_to_num = {name.lower(): i for i, name in enumerate(calendar.month_abbr) if i}
+    
+    # Regex to extract underlying symbol from tradingsymbol for stock derivatives
+    # Matches prefix before YYMON (e.g., RELIANCE25OCT) or YYM (e.g., RELIANCE25O)
+    # This regex is designed to be non-greedy and capture the stock symbol part.
+    # It looks for a pattern like 'DDMMM' or 'DDM' where D is digit, M is month char.
+    # Example: RELIANCE25OCT2600CE -> RELIANCE
+    # Example: NIFTY25OCT -> NIFTY
+    # Example: TCS25O -> TCS
+    underlying_symbol_regex = re.compile(r"^([A-Z0-9.&-]+?)(?:\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]?\d*|(?:\d{2}[JFMASOND][\dCEPE]*))", re.IGNORECASE)
+
+    for record in db_records:
+        doc = {
+            "id": str(record["instrument_token"]), # Meili primary key
+            "instrument_token": record["instrument_token"],
+            "exchange_token": record["exchange_token"],
+            "tradingsymbol": record["tradingsymbol"],
+            "name": record["name"],
+            "last_price": float(record["last_price"]) if record["last_price"] is not None else None,
+            "expiry": record["expiry"].isoformat() if record["expiry"] else None, # ISO date string
+            "strike": float(record["strike"]) if record["strike"] is not None else None,
+            "tick_size": float(record["tick_size"]) if record["tick_size"] is not None else None,
+            "lot_size": int(record["lot_size"]) if record["lot_size"] is not None else None,
+            "instrument_type": record["instrument_type"],
+            "segment": record["segment"],
+            "exchange": record["exchange"],
+            "underlying": record["underlying"], # New field
+            "option_type": record["option_type"], # New field
+            "last_updated": record["last_updated"].isoformat() if record["last_updated"] else None, # ISO string
+            # The following fields are for backward compatibility with existing fuzzy search logic
+            "underlying_symbol": record["underlying"], # For existing fuzzy search
+            "derivative_kind": "NONE", # Will be set below
+            "expiry_ts": None, # Will be set below
+            "expiry_year": None, # Will be set below
+            "expiry_month": None, # Will be set below
+        }
+
+        instrument_type = record["instrument_type"]
+        segment = record["segment"]
+        tradingsymbol = record["tradingsymbol"]
+        expiry_date = record["expiry"]
+        strike_price = record["strike"]
+ 
+        # Normalization for INDICES rows:
+        # Ensure indices are represented with consistent fields for Meilisearch documents,
+        # and derive a usable 'underlying' when missing to improve recall for base queries.
+        seg_up = (segment or "").upper() if segment else None
+        if seg_up == "INDICES":
+            # Force canonical values for indices
+            doc["instrument_type"] = "INDEX"
+            doc["segment"] = "INDICES"
+            doc["option_type"] = None
+            doc["expiry"] = None
+            doc["strike"] = None
+            # Derive a simple underlying from tradingsymbol when absent
+            up_ts = (tradingsymbol or "").upper()
+            derived_underlying = None
+            if "BANK" in up_ts:
+                derived_underlying = "BANKNIFTY"
+            elif "NIFTY" in up_ts:
+                derived_underlying = "NIFTY"
+            elif "SENSEX" in up_ts:
+                derived_underlying = "SENSEX"
+            elif "FINNIFTY" in up_ts:
+                derived_underlying = "FINNIFTY"
+            else:
+                # Fallback: take first token and strip non-alphanumerics
+                first_word = up_ts.split()[0] if up_ts.split() else up_ts
+                cleaned = re.sub(r'[^A-Z0-9]', '', first_word)
+                derived_underlying = cleaned if cleaned else up_ts
+            doc["underlying"] = derived_underlying
+            # Keep underlying_symbol in sync for compatibility
+            doc["underlying_symbol"] = doc["underlying"]
+            # reflect the normalized instrument_type for downstream logic
+            instrument_type = doc["instrument_type"]
+        else:
+            # Keep instrument_type as read from DB for non-indices
+            instrument_type = record["instrument_type"]
+ 
+        # Determine derivative_kind
+        if instrument_type in {"CE", "PE"}:
+            doc["derivative_kind"] = "OPT"
+        elif instrument_type == "FUT":
+            doc["derivative_kind"] = "FUT"
+
+        # Set expiry related fields
+        if expiry_date:
+            # Convert expiry date to UTC datetime at 00:00 and then to epoch seconds
+            # Using pytz.utc to ensure it's timezone-aware
+            expiry_utc = datetime.combine(expiry_date, datetime.min.time(), tzinfo=pytz.utc)
+            doc["expiry_ts"] = int(expiry_utc.timestamp())
+            doc["expiry_year"] = expiry_date.year
+            doc["expiry_month"] = expiry_date.month
+
+        documents.append(doc)
+
+    total_documents = len(documents)
+    if not total_documents:
+        logger.info("No instruments to reindex in Meilisearch.")
+        return {"total": 0, "batches": 0}
+
+    batch_size = 5000 # Sensible default batch size
+    batches = 0
+    last_task_uid = None
+
+    logger.info(f"Starting Meilisearch reindexing for {total_documents} instruments in batches of {batch_size}...")
+    for i in range(0, total_documents, batch_size):
+        batch = documents[i:i + batch_size]
+        try:
+            task = index.add_documents(batch, primary_key="id")
+            last_task_uid = task.task_uid
+            batches += 1
+            logger.info(f"Sent batch {batches} to Meilisearch (task_uid: {last_task_uid}).")
+        except Exception as e:
+            logger.error(f"Error sending batch {batches} to Meilisearch: {e}", exc_info=True)
+            # Continue with next batch or re-raise, depending on desired error handling
+            # For now, we log and continue.
+
+    if last_task_uid is not None:
+        logger.info(f"Waiting for last Meilisearch indexing task ({last_task_uid}) to complete...")
+        client.wait_for_task(last_task_uid)
+        logger.info("Meilisearch reindexing completed.")
+    else:
+        logger.info("No documents were sent to Meilisearch for reindexing.")
+
+    return {"total": total_documents, "batches": batches}
 
 
 
 
+
+async def sync_and_reindex_orchestrator(
+    session: Session,
+    refresh_from_broker: bool,
+    backfill_only_nulls: bool,
+    reindex: bool,
+    background_tasks: Optional[BackgroundTasks] = None
+) -> Dict[str, Optional[int]]:
+    """
+    Orchestrates optional instrument refresh, backfill of underlying/option_type, and Meilisearch reindex.
+    """
+    refreshed_count: Optional[int] = None
+    backfilled_counts: Dict[str, int] = {"processed": 0, "updated": 0, "skipped": 0}
+    indexed_count: Optional[int] = None
+
+    try:
+        # 1. Refresh instruments from broker
+        if refresh_from_broker:
+            logger.info("Initiating instruments refresh from broker (orchestrator)...")
+            # We need a KiteConnect instance for import_all_instruments.
+            # For internal calls, we'll create a temporary one using the system token.
+            _db = None
+            try:
+                _db = SessionLocal()
+                access_token = get_system_access_token(_db)
+                if not access_token:
+                    logger.warning("No system access token found for instrument refresh. Skipping.")
+                    refreshed_count = 0
+                else:
+                    kite_instance = KiteConnect(api_key=API_KEY)
+                    kite_instance.set_access_token(access_token)
+                    
+                    # Call import_all_instruments directly
+                    refresh_results = await import_all_instruments(kite_instance)
+                    total_imported = 0
+                    for res in refresh_results.get("results", []):
+                        if "message" in res and "Imported" in res["message"]:
+                            match = re.search(r"Imported (\d+) instruments", res["message"])
+                            if match:
+                                total_imported += int(match.group(1))
+                    refreshed_count = total_imported
+                    logger.info(f"Instruments refresh completed. Total imported: {refreshed_count}.")
+            except Exception as e:
+                logger.error(f"Error during instrument refresh in orchestrator: {e}", exc_info=True)
+                refreshed_count = 0 # Indicate failure
+            finally:
+                if _db:
+                    _db.close()
+        else:
+            logger.info("Instruments refresh skipped as per orchestrator request.")
+
+        # 2. Backfill underlying and option_type
+        logger.info("Initiating backfill for underlying and option_type (orchestrator)...")
+        backfilled_counts = await _parse_and_backfill_underlying(session, only_nulls=backfill_only_nulls)
+        logger.info(f"Backfill completed: Processed {backfilled_counts['processed']}, Updated {backfilled_counts['updated']}, Skipped {backfilled_counts['skipped']}.")
+
+        # 3. Reindex Meilisearch
+        if reindex:
+            logger.info("Initiating Meilisearch reindex (orchestrator)...")
+            reindex_stats = await meili_reindex_instruments()
+            indexed_count = reindex_stats.get("total")
+            logger.info(f"Meilisearch reindex completed. Total indexed: {indexed_count}.")
+        else:
+            logger.info("Meilisearch reindex skipped as per orchestrator request.")
+
+        return {
+            "refreshed": refreshed_count,
+            "backfilled": backfilled_counts["processed"],
+            "updated": backfilled_counts["updated"],
+            "skipped": backfilled_counts["skipped"],
+            "indexed": indexed_count
+        }
+
+    except Exception as e:
+        logger.error(f"Error in sync-and-reindex orchestrator operation: {e}", exc_info=True)
+        # Re-raise or handle as appropriate for a helper function
+        raise e
 
 ######kite
 
@@ -599,133 +993,531 @@ async def search_instruments(symbol: str):
     results = await database.fetch_all(query, {"symbol": f"%{symbol}%"})
     return results
 
+@router.post("/instruments/meili/reindex")
+async def trigger_meilisearch_reindex():
+    """
+    Triggers a full reindex of instruments into Meilisearch.
+    """
+    logger.info("Meilisearch reindex endpoint triggered.")
+    try:
+        stats = await meili_reindex_instruments()
+        return {"status": "success", "message": "Meilisearch reindex initiated.", "stats": stats}
+    except Exception as e:
+        logger.error(f"Error triggering Meilisearch reindex: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to trigger Meilisearch reindex: {e}")
 
-@router.get("/instruments/fuzzy-search")
-async def fuzzy_search_instruments(query: str = Query(..., min_length=1)):
+@router.get("/instruments/meili/health")
+async def get_meilisearch_health():
     """
-    Fuzzy search across indices, NSE equities, and NFO contracts with alias handling.
-    Priority ranking:
-      0) exact tradingsymbol match (including aliases like 'banknifty' -> 'NIFTY BANK')
-      1) prefix tradingsymbol match
-      2) prefix name match
-      3) INDICES exchange
-      4) alphabetical
-    Returns up to 20 rows with fields:
-      instrument_token, tradingsymbol, name, exchange, instrument_type, segment
+    Returns the health status of the Meilisearch service.
     """
-    q = (query or "").strip()
-    if not q:
+    try:
+        client = get_meili_client(admin=False)
+        health = client.health()
+        if health.get("status") == "available":
+            return {"status": "ok"}
+        else:
+            return {"status": "error", "detail": health}
+    except Exception as e:
+        logger.error(f"Error checking Meilisearch health: {e}", exc_info=True)
+        return {"status": "error", "detail": str(e)}
+
+async def _parse_and_backfill_underlying(session: Session, only_nulls: bool = True) -> Dict[str, int]:
+    """
+    Internal helper to populate 'underlying' and 'option_type' columns in 'kite_instruments'.
+    
+    Args:
+        session: SQLAlchemy DB session.
+        only_nulls: If True, only backfill records where 'underlying' is NULL.
+                    If False, process all records.
+                    
+    Returns:
+        A dictionary with counts: {"processed": int, "updated": int, "skipped": int}.
+    """
+    processed_count = 0
+    updated_count = 0
+    skipped_count = 0
+
+    try:
+        if only_nulls:
+            instruments_to_process = session.query(KiteInstrument).filter(KiteInstrument.underlying == None).all()
+            logger.info(f"Starting backfill for {len(instruments_to_process)} instruments where underlying is NULL.")
+        else:
+            instruments_to_process = session.query(KiteInstrument).all()
+            logger.info(f"Starting full backfill for {len(instruments_to_process)} instruments.")
+        
+        # Regex to extract underlying symbol from tradingsymbol for stock derivatives
+        underlying_symbol_regex = re.compile(r"^([A-Z0-9.&-]+?)(?:\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]?\d*|(?:\d{2}[JFMASOND][\dCEPE]*))", re.IGNORECASE)
+
+        for instrument in instruments_to_process:
+            processed_count += 1
+            tradingsymbol = instrument.tradingsymbol
+            current_underlying = instrument.underlying
+            current_option_type = instrument.option_type
+
+            new_underlying = None
+            new_option_type = None
+
+            # Handle Equity (underlying is tradingsymbol, no option type)
+            if instrument.instrument_type == "EQ":
+                new_underlying = tradingsymbol
+                new_option_type = None
+            # Handle Futures
+            elif instrument.instrument_type == "FUT":
+                match = underlying_symbol_regex.match(tradingsymbol)
+                if match:
+                    new_underlying = match.group(1)
+                else:
+                    first_digit_idx = re.search(r"\d", tradingsymbol)
+                    if first_digit_idx:
+                        new_underlying = tradingsymbol[:first_digit_idx.start()]
+                    else:
+                        new_underlying = tradingsymbol
+                new_option_type = None
+            # Handle Options (CE/PE)
+            elif instrument.instrument_type in {"CE", "PE"}:
+                match = underlying_symbol_regex.match(tradingsymbol)
+                if match:
+                    new_underlying = match.group(1)
+                else:
+                    first_digit_idx = re.search(r"\d", tradingsymbol)
+                    if first_digit_idx:
+                        new_underlying = tradingsymbol[:first_digit_idx.start()]
+                    else:
+                        new_underlying = tradingsymbol
+                new_option_type = instrument.instrument_type
+            
+            # Only update if values have changed or are newly determined
+            if (new_underlying and new_underlying.upper() != current_underlying) or \
+               (new_option_type != current_option_type):
+                instrument.underlying = new_underlying.upper() if new_underlying else None
+                instrument.option_type = new_option_type
+                updated_count += 1
+            else:
+                skipped_count += 1
+        
+        session.commit()
+        logger.info(f"Backfill completed: Processed {processed_count}, Updated {updated_count}, Skipped {skipped_count} instruments.")
+        return {"processed": processed_count, "updated": updated_count, "skipped": skipped_count}
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error during underlying and option_type backfill: {e}", exc_info=True)
+        raise e # Re-raise to be handled by the calling endpoint
+
+@router.post("/broker/instruments/populate-underlying")
+async def populate_underlying_and_option_type(db: Session = Depends(get_db)):
+    """
+    [DEPRECATED] Populates the 'underlying' and 'option_type' columns in the 'kite_instruments' table
+    for records where 'underlying' is NULL. Designed for a one-time data backfill.
+    Please use /broker/instruments/sync-and-reindex for unified maintenance operations.
+    """
+    logger.info("Deprecated /broker/instruments/populate-underlying endpoint called. Redirecting to helper.")
+    try:
+        counts = await _parse_and_backfill_underlying(db, only_nulls=True)
+        return {"message": "Underlying and option_type populated successfully", **counts}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error populating underlying and option_type: {e}")
+
+async def sql_fallback_fuzzy_search(query: str, limit: int = 50, parsed: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    SQL-based fuzzy search using structured predicates if provided.
+    Also applies LIKE on name/tradingsymbol as a safety net.
+    """
+    if not (query or "").strip():
         return []
 
-    # Enhanced parsing to separate instrument identifiers from numeric values
-    # This helps with queries like "NIFTY 25000"
-    parts = q.split()
-    instrument_query_base = q
-    numeric_value = None
-    
-    # If the last part is a number, separate it
-    if len(parts) > 1:
-        try:
-            numeric_value = float(parts[-1])
-            instrument_query_base = " ".join(parts[:-1])
-        except ValueError:
-            pass
+    params = {"limit": limit}
+    # Safety net LIKEs
+    base_like = ["(tradingsymbol ILIKE :contains OR name ILIKE :contains)"]
+    params["contains"] = f"%{query}%"
 
-    # Basic alias normalization for common India index terms
-    qm = instrument_query_base.replace(" ", "").lower()
-    alias_map = {
-        "nifty50": "NIFTY 50",
-        "nifty": "NIFTY 50",  # common shorthand
-        "banknifty": "NIFTY BANK",
-        "sensex": "SENSEX",
-        "finnifty": "FINNIFTY",
-        "niftymidcap100": "NIFTY MIDCAP 100",
-        "midcap100": "NIFTY MIDCAP 100",
-    }
-    alias = alias_map.get(qm, instrument_query_base)
+    where_conditions = list(base_like)
 
-    # Prepare for "contains all words" check
-    search_words = [word.strip() for word in instrument_query_base.split() if word.strip()]
-    
-    # Base WHERE condition
-    where_clause = "(tradingsymbol ILIKE :like OR name ILIKE :like)"
-    
-    # Add parameters for dynamic WHERE clause and ORDER BY
-    params = {
-        "instrument_query": instrument_query_base,
-        "alias": alias,
-        "like": f"%{instrument_query_base}%",
-        "prefix": f"{instrument_query_base}%",
-        "alias_prefix": f"{alias}%",
-        "numeric_value": numeric_value,
-        "has_numeric_value": numeric_value is not None, # New parameter for explicit check
-        "is_index_query": any(idx_term in instrument_query_base.lower() for idx_term in ['nifty', 'banknifty', 'sensex', 'finnifty'])
-    }
+    if parsed:
+        if parsed.get("underlying"):
+            where_conditions.append("underlying = :underlying")
+            params["underlying"] = parsed["underlying"]
+        if parsed.get("option_type"):
+            where_conditions.append("option_type = :option_type")
+            params["option_type"] = parsed["option_type"]
+        if parsed.get("instrument_type"):
+            where_conditions.append("instrument_type = :instrument_type")
+            params["instrument_type"] = parsed["instrument_type"]
+        if parsed.get("exchange"):
+            where_conditions.append("exchange = :exchange")
+            params["exchange"] = parsed["exchange"]
+        if parsed.get("strike") is not None:
+            where_conditions.append("strike = :strike")
+            params["strike"] = parsed["strike"]
+        if parsed.get("expiry_date"):
+            where_conditions.append("expiry = :expiry_date")
+            params["expiry_date"] = parsed["expiry_date"]
+        elif parsed.get("expiry_year") and parsed.get("expiry_month"):
+            start, end = month_window(parsed["expiry_year"], parsed["expiry_month"])
+            where_conditions.append("expiry >= :start_date AND expiry < :end_date")
+            params["start_date"] = start
+            params["end_date"] = end
 
-    # Add individual word parameters for "contains all words" check
-    for i, word in enumerate(search_words):
-        params[f"word_{i}"] = f"%{word}%"
-        # Also add to where_clause for initial filtering
-        where_clause += f" AND (tradingsymbol ILIKE :word_{i} OR name ILIKE :word_{i})"
-
+    where_clause = " AND ".join(where_conditions)
 
     sql = f"""
-    WITH universe AS (
-        SELECT instrument_token, tradingsymbol, name, exchange, instrument_type, segment, strike
-        FROM kite_instruments
+        SELECT
+            instrument_token, exchange_token, tradingsymbol, name, last_price,
+            expiry, strike, tick_size, lot_size, instrument_type, segment,
+            exchange, underlying, option_type
+        FROM (
+          SELECT
+            instrument_token,
+            exchange_token,
+            tradingsymbol,
+            name,
+            last_price,
+            expiry,
+            strike,
+            tick_size,
+            lot_size,
+            instrument_type,
+            segment,
+            exchange,
+            underlying,
+            option_type
+          FROM public.kite_instruments
+          UNION ALL
+          SELECT
+            instrument_token,
+            exchange_token,
+            tradingsymbol,
+            name,
+            last_price,
+            expiry,
+            strike,
+            tick_size,
+            lot_size,
+            instrument_type,
+            segment,
+            exchange,
+            NULL::VARCHAR(255) AS underlying,
+            NULL::VARCHAR(10) AS option_type
+          FROM public.kite_indices
+        ) AS instruments_search_v
         WHERE {where_clause}
-        UNION ALL
-        SELECT instrument_token, tradingsymbol, name, exchange, instrument_type, segment, strike
-        FROM kite_indices
-        WHERE {where_clause}
-    )
-    SELECT instrument_token, tradingsymbol, name, exchange, instrument_type, segment
-    FROM universe
-    ORDER BY
-        CASE
-            -- Absolute Exact Matches (Priority 0)
-            WHEN lower(tradingsymbol) = lower(:alias) THEN 0
-            WHEN lower(tradingsymbol) = lower(:instrument_query) THEN 0
-            WHEN lower(name) = lower(:alias) THEN 0
-            WHEN lower(name) = lower(:instrument_query) THEN 0
+        ORDER BY
+            CASE
+                WHEN tradingsymbol ILIKE :exact_q THEN 1
+                WHEN tradingsymbol ILIKE :prefix_q THEN 2
+                ELSE 3
+            END,
+            expiry,
+            strike
+        LIMIT :limit
+    """
+    params["exact_q"] = query
+    params["prefix_q"] = f"{query}%"
 
-            -- Strong Prefix Matches - tradingsymbol (Priority 1)
-            WHEN tradingsymbol ILIKE :alias_prefix THEN 1
-            WHEN tradingsymbol ILIKE :prefix THEN 1
+    rows = await database.fetch_all(sql, params)
+    return [dict(row) for row in rows]
 
-            -- Strong Prefix Matches - name (Priority 2)
-            WHEN name ILIKE :alias_prefix THEN 2
-            WHEN name ILIKE :prefix THEN 2
+async def sql_fallback_plain(query: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Plain SQL fallback for zero-hit Meili responses on unstructured queries.
+    - Prefix match on tradingsymbol OR contains match on name.
+    - Order by LENGTH(tradingsymbol) ASC to prioritize tight symbol matches.
+    """
+    q_text = (query or "").strip()
+    if not q_text:
+        return []
 
-            -- Options contracts with strike close to numeric value (Priority 3)
-            WHEN :has_numeric_value AND (instrument_type = 'CE' OR instrument_type = 'PE')
-                 AND ABS(strike - :numeric_value) <= 50 THEN 3
+    params = {
+        "limit": limit,
+        "prefix": f"{q_text}%",
+        "contains": f"%{q_text}%"
+    }
 
-            -- Contains All Words - tradingsymbol (Priority 4)
-            {"WHEN " + " AND ".join([f"tradingsymbol ILIKE :word_{i}" for i in range(len(search_words))]) + " THEN 4" if len(search_words) > 1 else ""}
-
-            -- Contains All Words - name (Priority 5)
-            {"WHEN " + " AND ".join([f"name ILIKE :word_{i}" for i in range(len(search_words))]) + " THEN 5" if len(search_words) > 1 else ""}
-
-            -- Indices Boost (Priority 6) - only if query is index-related
-            WHEN exchange = 'INDICES' AND :is_index_query THEN 6
-
-            -- General Substring Matches (Priority 7)
-            WHEN tradingsymbol ILIKE :like THEN 7
-            WHEN name ILIKE :like THEN 7
-
-            ELSE 8
-        END,
-        tradingsymbol
-    LIMIT 10
+    sql = """
+        SELECT
+            instrument_token, exchange_token, tradingsymbol, name, last_price,
+            expiry, strike, tick_size, lot_size, instrument_type, segment,
+            exchange, underlying, option_type
+        FROM (
+          SELECT
+            instrument_token,
+            exchange_token,
+            tradingsymbol,
+            name,
+            last_price,
+            expiry,
+            strike,
+            tick_size,
+            lot_size,
+            instrument_type,
+            segment,
+            exchange,
+            underlying,
+            option_type
+          FROM public.kite_instruments
+          UNION ALL
+          SELECT
+            instrument_token,
+            exchange_token,
+            tradingsymbol,
+            name,
+            last_price,
+            expiry,
+            strike,
+            tick_size,
+            lot_size,
+            instrument_type,
+            segment,
+            exchange,
+            NULL::VARCHAR(255) AS underlying,
+            NULL::VARCHAR(10) AS option_type
+          FROM public.kite_indices
+        ) AS instruments_search_v
+        WHERE tradingsymbol ILIKE :prefix OR name ILIKE :contains
+        ORDER BY LENGTH(tradingsymbol) ASC
+        LIMIT :limit
     """
     rows = await database.fetch_all(sql, params)
-    # Add a temporary test field to verify that the latest code is running
-    return [{**row, "test_field": "test_value"} for row in rows]
+    return [dict(r) for r in rows]
+
+
+async def get_anchor_price_for_underlying(underlying_symbol: str) -> Optional[float]:
+    """
+    For major indices, fetches the last traded price (LTP) to use as an anchor for strike sorting.
+    Uses the system KiteConnect session. Returns None on any failure.
+    """
+    if not underlying_symbol:
+        return None
+
+    index_map = {
+        "NIFTY": "NIFTY 50",
+        "BANKNIFTY": "NIFTY BANK",
+        "FINNIFTY": "FINNIFTY",
+        "SENSEX": "SENSEX",
+    }
+    
+    index_tradingsymbol = index_map.get(underlying_symbol.upper())
+    if not index_tradingsymbol:
+        return None
+
+    db = None
+    try:
+        db = SessionLocal()
+        access_token = get_system_access_token(db)
+        if not access_token:
+            logger.warning(f"No system access token found for LTP fetch of {underlying_symbol}")
+            return None
+
+        kite = KiteConnect(api_key=API_KEY)
+        kite.set_access_token(access_token)
+        
+        # Set a short timeout to avoid blocking the search request for too long
+        kite.set_timeout(5)
+
+        instrument = f"INDICES:{index_tradingsymbol}"
+        ltp_data = kite.ltp([instrument])
+        
+        if ltp_data and instrument in ltp_data and "last_price" in ltp_data[instrument]:
+            price = ltp_data[instrument]["last_price"]
+            logger.info(f"Fetched anchor price for {underlying_symbol}: {price}")
+            return float(price)
+        else:
+            logger.warning(f"LTP data not found for {instrument}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to fetch anchor price for {underlying_symbol}: {e}", exc_info=True)
+        return None
+    finally:
+        if db:
+            db.close()
+
+
+class SyncAndReindexRequest(BaseModel):
+    refresh_from_broker: bool = False
+    backfill_only_nulls: bool = True
+    reindex: bool = True
+
+    # refresh_from_broker=True calls an internal import/refresh function (e.g., import_all_instruments) directly if present;
+    # it does not call any HTTP endpoint. If no internal refresh function exists, this endpoint still backfills
+    # underlying/option_type for current DB records and reindexes Meilisearch.
+@router.post("/broker/instruments/sync-and-reindex")
+async def sync_and_reindex_instruments(
+    request: SyncAndReindexRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    # kite: KiteConnect = Depends(get_kite) # KiteConnect instance is handled internally by orchestrator for refresh
+):
+    """
+    Orchestrates optional instrument refresh, backfill of underlying/option_type, and Meilisearch reindex.
+    """
+    try:
+        # Delegate to the centralized orchestrator
+        results = await sync_and_reindex_orchestrator(
+            session=db,
+            refresh_from_broker=request.refresh_from_broker,
+            backfill_only_nulls=request.backfill_only_nulls,
+            reindex=request.reindex,
+            background_tasks=background_tasks # Pass background_tasks if needed for future async operations
+        )
+        return results
+    except Exception as e:
+        logger.error(f"Error in unified sync-and-reindex endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Sync and reindex operation failed: {e}")
+
+@router.get("/instruments/fuzzy-search")
+async def fuzzy_search_instruments(
+    q: Optional[str] = Query(None, alias="q"),
+    query: Optional[str] = Query(None, alias="query"),
+    limit: int = 50
+):
+    """
+    Fuzzy search endpoint with Meilisearch-first and robust SQL fallback.
+    Changes:
+    - Accepts both 'q' and 'query'.
+    - Short query guard (<=3): skip parsing; plain Meili search with no filter.
+    - Always fallback to SQL when Meili returns zero hits.
+    - Always return 200 with a list (possibly empty).
+    """
+    q_text = (q or query or "").strip()
+    if not q_text:
+        return []
+
+    try:
+        client = get_meili_client(admin=False)
+        index = client.index("instruments")
+    except Exception:
+        logger.exception(f"Failed to init Meili client for q='{q_text}'. Falling back to SQL (plain). mode=sql_fallback_plain")
+        rows = await sql_fallback_plain(q_text, limit)
+        logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
+        return rows
+
+    # Short query guard: <= 3 characters -> skip structured parsing entirely
+    if len(q_text) <= 3:
+        try:
+            options = {
+                "limit": limit,
+                "attributesToRetrieve": [
+                    'instrument_token', 'exchange_token', 'tradingsymbol', 'name',
+                    'last_price', 'expiry', 'strike', 'tick_size', 'lot_size',
+                    'instrument_type', 'segment', 'exchange', 'underlying', 'option_type'
+                ]
+            }
+            result = index.search(q_text, options)
+            hits = result.get("hits", [])
+            logger.info(f"q='{q_text}' mode=meili_q_only meili_hits={len(hits)}")
+            if not hits:
+                rows = await sql_fallback_plain(q_text, limit)
+                logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
+                return rows
+            return hits
+        except Exception:
+            logger.exception(f"Meili error for short query q='{q_text}'. Falling back to SQL (plain). mode=sql_fallback_plain")
+            rows = await sql_fallback_plain(q_text, limit)
+            logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
+            return rows
+
+    # Longer queries: try to parse for structured filters
+    parsed = {}
+    try:
+        parsed = parse_fo_query(q_text)
+        logger.info(f"q='{q_text}' parsed={json.dumps(parsed, default=str)}")
+    except Exception:
+        logger.exception(f"Parser error for q='{q_text}'. Proceeding without filters.")
+
+    options = {
+        "limit": limit,
+        "attributesToRetrieve": [
+            'instrument_token', 'exchange_token', 'tradingsymbol', 'name',
+            'last_price', 'expiry', 'strike', 'tick_size', 'lot_size',
+            'instrument_type', 'segment', 'exchange', 'underlying', 'option_type'
+        ]
+    }
+    
+    filter_clauses = []
+
+    # Determine if the user explicitly asked for derivatives
+    explicit_derivative = bool(
+        parsed.get("option_type")
+        or parsed.get("derivative_kind")
+        or parsed.get("expiry_year") or parsed.get("expiry_month") or parsed.get("expiry_date")
+        or (parsed.get("strike") is not None)
+        or ("FUT" in (parsed.get("instrument_type") or ""))
+    )
+
+    # For base queries (no explicit derivatives), exclude options so index/equity/futures surface
+    if not explicit_derivative:
+        filter_clauses.append("option_type IS NULL")
+
+    # Numeric strike without CE/PE => both legs in a band, sorted by expiry then strike
+    strike = parsed.get("strike")
+    if (strike is not None) and not parsed.get("option_type"):
+        # If a strike is provided without CE/PE, we should look for options, not exclude them.
+        # So, we remove the "option_type IS NULL" filter if it was added.
+        if "option_type IS NULL" in filter_clauses:
+            filter_clauses.remove("option_type IS NULL")
+        filter_clauses.append('(option_type = "CE" OR option_type = "PE")')
+        tol = 50
+        filter_clauses.append(f"(strike >= {int(strike - tol)} AND strike <= {int(strike + tol)})")
+        options["sort"] = ["expiry:asc", "strike:asc"]
+
+    # Add other parsed filters
+    # This reuses the existing build_meili_filter logic but integrates it into the new clause system
+    if parsed:
+        # We handle strike and option_type manually above, so we can create a temporary parsed dict without them
+        # to avoid double-filtering.
+        temp_parsed = parsed.copy()
+        temp_parsed.pop("strike", None)
+        # We don't pop option_type because if it's present, it should be used.
+        # The logic above for strike handling only applies when option_type is NOT specified.
+        
+        # The original build_meili_filter is fine to reuse for other attributes
+        additional_filters = build_meili_filter(temp_parsed)
+        if additional_filters:
+            filter_clauses.extend(additional_filters)
+
+    filter_str = " AND ".join(filter_clauses) if filter_clauses else None
+    search_q = parsed.get("residual", q_text) if parsed else q_text
+
+    try:
+        if filter_str:
+            options["filter"] = filter_str
+        
+        result = index.search(search_q, options)
+        hits = result.get("hits", [])
+        mode = "meili_filtered" if filter_str else "meili_q_only"
+        logger.info(f"q='{q_text}' mode={mode} meili_hits={len(hits)}")
+
+        if not hits:
+            # Always fallback to SQL whenever Meili hits are zero
+            if filter_str:
+                rows = await sql_fallback_fuzzy_search(q_text, limit, parsed)
+                logger.info(f"q='{q_text}' mode=sql_fallback_structured sql_rows={len(rows)}")
+                return rows
+            else:
+                rows = await sql_fallback_plain(q_text, limit)
+                logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
+                return rows
+
+        return hits
+    except (meilisearch.errors.MeilisearchCommunicationError, requests.exceptions.ConnectionError, httpx.ConnectError):
+        logger.exception(f"Meili connection error for q='{q_text}'. Falling back to SQL (prefer structured if available).")
+        if filter_str:
+            rows = await sql_fallback_fuzzy_search(q_text, limit, parsed)
+            logger.info(f"q='{q_text}' mode=sql_fallback_structured sql_rows={len(rows)}")
+        else:
+            rows = await sql_fallback_plain(q_text, limit)
+            logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
+        return rows
+    except Exception:
+        logger.exception(f"Unexpected Meili error for q='{q_text}'. Falling back to SQL (plain).")
+        rows = await sql_fallback_plain(q_text, limit)
+        logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
+        return rows
 
 # ─────────── Daily update functionality ───────────
 async def schedule_daily_instruments_update():
-    """Schedule daily instruments update task"""
+    """Schedules the daily instruments maintenance orchestrator."""
     IST = pytz.timezone('Asia/Kolkata')
     while True:
         try:
@@ -741,61 +1533,197 @@ async def schedule_daily_instruments_update():
             next_run_utc = next_run_ist.astimezone(pytz.utc)
             delay = (next_run_utc - now_utc).total_seconds()
 
-            logger.info(f"Next instrument update scheduled for {next_run_ist.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
+            logger.info(f"Next daily instruments maintenance orchestrator run scheduled for {next_run_ist.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
             await asyncio.sleep(delay)
 
-            # Run the daily update
+            # Run the daily maintenance task.
+            # The task itself handles logging and notifications for its own success/failure.
             await update_all_instruments_daily()
-            await send_ntfy_notification("Daily instrument update completed successfully.", title="Scheduler Success", tags=["success", "instruments"])
 
         except Exception as e:
-            logger.error(f"Error in daily instruments update scheduler: {e}", exc_info=True)
-            await send_ntfy_notification(f"Daily instrument update failed: {e}", title="Scheduler Failure", tags=["failure", "instruments"])
+            logger.error(f"Error in daily maintenance scheduler loop: {e}", exc_info=True)
+            await send_ntfy_notification(f"Daily maintenance scheduler failed: {e}", title="Scheduler Failure", tags=["failure", "instruments", "scheduler"])
             # Wait for 1 hour before retrying the scheduler logic
             await asyncio.sleep(60 * 60)
 
 async def update_all_instruments_daily():
-    """Update all instruments daily"""
-    logger.info("Daily instruments update started.")
-
+    """
+    Runs unified instruments maintenance: optional refresh from broker, backfill underlying/option_type, and Meilisearch reindex via sync_and_reindex_orchestrator().
+    """
+    logger.info("Daily instruments maintenance job started.")
+    db = None
     try:
-        # Obtain a KiteConnect instance for the background task
-        kite, at = login_headless()
-        # Persist the system token obtained during daily job
-        try:
-            _db = SessionLocal()
-            upsert_kite_session(_db, "system", at)
-            _db.commit()
-            logger.info("System access token upserted via daily job (..%s)", (at[-6:] if isinstance(at, str) else ""))
-        finally:
-            try:
-                _db.close()
-            except Exception:
-                pass
-    except HTTPException as e:
-        logger.error(f"Error during headless login for daily update: {e.detail}", exc_info=True)
-        return
+        db = SessionLocal()
+        # Invoke the unified orchestrator for daily maintenance.
+        # This handles refreshing from broker, backfilling data, and reindexing.
+        counts = await sync_and_reindex_orchestrator(
+            session=db,
+            refresh_from_broker=True,
+            backfill_only_nulls=True,
+            reindex=True,
+            background_tasks=None
+        )
+        logger.info(f"Daily instruments maintenance completed successfully. Counts: {counts}")
+        await send_ntfy_notification(
+            f"Daily instrument maintenance finished. Details: {counts}",
+            title="Scheduler Success",
+            tags=["success", "instruments"]
+        )
     except Exception as e:
-        logger.error(f"Unexpected error during headless login for daily update: {e}", exc_info=True)
-        return
+        logger.error(f"Error during daily instruments maintenance: {e}", exc_info=True)
+        await send_ntfy_notification(
+            f"Daily instrument maintenance failed: {e}",
+            title="Scheduler Failure",
+            tags=["failure", "instruments"]
+        )
+    finally:
+        if db:
+            db.close()
 
-    exchanges = ["NSE", "NFO", "BSE", "BFO", "MCX"]
-    for exchange in exchanges:
+def month_window(year: int, month: int) -> tuple[date, date]:
+    """Computes the first day of a month and the first day of the next month."""
+    start_date = date(year, month, 1)
+    if month == 12:
+        end_date = date(year + 1, 1, 1)
+    else:
+        end_date = date(year, month + 1, 1)
+    return start_date, end_date
+
+def build_meili_filter(parsed: dict) -> list[str]:
+    """
+    Safe Meilisearch filter builder:
+    - Only string equality with double quotes for: underlying, option_type, instrument_type, exchange.
+    - Only numeric equality for strike.
+    - Expiry: equality only (ISO date string) or skip.
+    - No ranges, no IN clauses.
+    """
+    preds: list[str] = []
+
+    # String fields: equality only, double quotes
+    if parsed.get("underlying"):
+        preds.append(f'underlying = "{parsed["underlying"]}"')
+
+    if parsed.get("instrument_type"):
+        preds.append(f'instrument_type = "{parsed["instrument_type"]}"')
+
+    if parsed.get("option_type"):
+        preds.append(f'option_type = "{parsed["option_type"]}"')
+
+    if parsed.get("exchange"):
+        preds.append(f'exchange = "{parsed["exchange"]}"')
+
+    # Expiry equality only (ISO format) or skip on error
+    if parsed.get("expiry_date"):
         try:
-            logger.info(f"Importing instruments for exchange: {exchange}")
-            await import_instruments_for_exchange(exchange, kite)
-            logger.info(f"Successfully imported instruments for exchange: {exchange}")
-        except Exception as e:
-            logger.error(f"Error importing instruments for exchange {exchange}: {e}", exc_info=True)
-            await send_ntfy_notification(f"Error importing instruments for exchange {exchange}: {e}", title="Instrument Import Failure", tags=["failure", "instruments"])
+            preds.append(f'expiry = "{parsed["expiry_date"].isoformat()}"')
+        except Exception:
+            # Skip malformed expiry to avoid breaking the filter
+            pass
 
-    logger.info("Daily instruments update completed.")
-    await send_ntfy_notification("All instruments updated successfully.", title="Instrument Update Success", tags=["success", "instruments"])
+    # Numeric strike: equality only
+    if parsed.get("strike") is not None:
+        try:
+            sval = float(parsed["strike"])
+            preds.append(f'strike = {int(sval) if sval.is_integer() else sval}')
+        except Exception:
+            # Ignore invalid strike
+            pass
+
+    return preds
+
+def parse_fo_query(query: str) -> Dict[str, Any]:
+    """
+    Parses a user query for instruments, extracting structured intent.
+    Returns a dictionary.
+    """
+    q = re.sub(r'\s+', ' ', query).strip().upper()
+    tokens = q.split()
+    
+    result = {
+        "underlying": None, "instrument_type": None, "option_type": None,
+        "exchange": None, "expiry_date": None, "expiry_month": None,
+        "expiry_year": None, "relative_week": None, "strike": None,
+        "approximate_strike": False, "residual": ""
+    }
+    
+    # Month name to number mapping
+    month_map = {name.upper(): i for i, name in enumerate(calendar.month_abbr) if i}
+    
+    # Exchange hints
+    exchange_map = {"NSE": "NSE", "NFO": "NFO", "BFO": "BFO", "MCX": "MCX"}
+
+    # --- Extraction Logic ---
+    residual_tokens = []
+    
+    for token in tokens:
+        # Option Type
+        if token in ("CE", "PE"):
+            result["option_type"] = token
+            result["instrument_type"] = token # Infer instrument_type
+            continue
+        # Futures
+        if token in ("FUT", "FUTURE", "FUTURES"):
+            result["instrument_type"] = "FUT"
+            continue
+        # Explicit Equity token (only when user types 'EQ' or 'EQUITY')
+        if token in ("EQ", "EQUITY"):
+            result["instrument_type"] = "EQ"
+            continue
+        # Exchange
+        if token in exchange_map:
+            result["exchange"] = exchange_map[token]
+            continue
+        # Month
+        if token in month_map:
+            result["expiry_month"] = month_map[token]
+            continue
+        # Year
+        if re.fullmatch(r"\d{4}", token):
+            result["expiry_year"] = int(token)
+            continue
+        if re.fullmatch(r"\d{2}", token) and not result["expiry_year"]:
+             result["expiry_year"] = 2000 + int(token)
+             continue
+        # Strike
+        if re.fullmatch(r"\d{3,}(\.\d+)?", token):
+            try:
+                result["strike"] = int(float(token))
+            except ValueError:
+                residual_tokens.append(token)
+            continue
+        
+        residual_tokens.append(token)
+
+    # Determine underlying and residual text
+    if residual_tokens:
+        # A simple heuristic: if the first token is a known underlying, use it.
+        # This can be improved with a proper entity recognition system.
+        potential_underlying = residual_tokens[0]
+        # A more robust check would involve querying a list of known underlyings.
+        # For now, we assume common ones.
+        if potential_underlying in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"):
+             result["underlying"] = potential_underlying
+             result["residual"] = " ".join(residual_tokens[1:])
+        else:
+             # If not a known index, assume the first token is the underlying
+             result["underlying"] = potential_underlying
+             result["residual"] = " ".join(residual_tokens[1:])
+    
+    # If year is not specified for a month, assume current or next year
+    if result["expiry_month"] and not result["expiry_year"]:
+        today = date.today()
+        if result["expiry_month"] < today.month:
+            result["expiry_year"] = today.year + 1
+        else:
+            result["expiry_year"] = today.year
+# Do not default instrument_type to 'EQ' automatically.
+# Only set instrument_type when the user explicitly supplies an indicator (e.g., "EQ", "CE", "PE", "FUT").
+        
+    return result
 
 ####KITE
 from .historical_data import fetch_and_store_historical_data, fetch_and_store_indices_historical_data
 from database import get_db_connection
-from fastapi import BackgroundTasks
 
 @router.post("/clear_historical_data")
 def clear_historical_data(conn = Depends(get_psql_conn)):

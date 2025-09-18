@@ -345,6 +345,7 @@
 				<button
 					on:click={() => (error = null)}
 					class="text-destructive hover:text-destructive/80 focus:outline-none"
+				     aria-label="Clear error message"
 				>
 					<svg
 						class="h-5 w-5"
