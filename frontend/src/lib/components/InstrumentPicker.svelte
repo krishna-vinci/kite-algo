@@ -25,7 +25,7 @@
     const exch = item.exchange ? ` (${item.exchange})` : '';
     if (item.option_type) {
       const u = item.underlying ?? '';
-      const exp = formatExpiry(item.expiry);
+      const exp = item.expiry_label ?? formatExpiry(item.expiry);
       const strike = item.strike ?? '';
       const ot = item.option_type ?? '';
       return `${u} ${exp} ${strike} ${ot}${exch}`.trim();

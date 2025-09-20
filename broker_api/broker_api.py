@@ -499,13 +499,14 @@ def ensure_instruments_index():
         return
 
     settings = {
-        "searchableAttributes": ["tradingsymbol", "underlying", "name"],
+        "searchableAttributes": ["tradingsymbol", "aliases", "underlying", "name"],
         "rankingRules": ["typo","words","proximity","attribute","exactness","sort"],
+        "customRanking": ["desc(boost_score)","asc(type_rank)","asc(expiry_ts)"],
         "filterableAttributes": [
             "underlying", "option_type", "exchange", "instrument_type", "segment",
             "expiry", "strike", "derivative_kind", "expiry_year", "expiry_month"
         ],
-        "sortableAttributes": ["expiry", "strike"],
+        "sortableAttributes": ["expiry", "expiry_ts", "strike", "type_rank", "boost_score"],
         "synonyms": {
             "nifty": ["NIFTY", "NIFTY 50", "NIFTY50"],
             "nifty50": ["NIFTY", "NIFTY 50", "NIFTY50"],
@@ -522,6 +523,12 @@ def ensure_instruments_index():
         update_task = index.update_settings(settings)
         client.wait_for_task(update_task.task_uid)
         logger.info("Meilisearch 'instruments' index settings applied successfully.")
+        try:
+            effective_settings = index.get_settings()
+            effective_sortables = effective_settings.get("sortableAttributes")
+            logger.info(f"effective_sortables={effective_sortables}")
+        except Exception as e:
+            logger.warning(f"Could not fetch effective settings after update: {e}")
     except Exception as e:
         logger.error(f"Error applying Meilisearch index settings: {e}", exc_info=True)
 
@@ -569,6 +576,53 @@ async def meili_reindex_instruments():
     # Example: TCS25O -> TCS
     underlying_symbol_regex = re.compile(r"^([A-Z0-9.&-]+?)(?:\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]?\d*|(?:\d{2}[JFMASOND][\dCEPE]*))", re.IGNORECASE)
 
+    # Helper functions for Meilisearch document enrichment
+    def _format_expiry_label(dt: Optional[date]) -> Optional[str]:
+        if not dt: return None
+        try:
+            # Use datetime.strftime for consistent formatting, even if input is date
+            return dt.strftime("%d-%b-%Y")
+        except Exception:
+            return None
+
+    def _type_rank(doc: Dict[str, Any]) -> int:
+        segment = str(doc.get("segment", "")).upper()
+        instrument_type = str(doc.get("instrument_type", "")).upper()
+        option_type = str(doc.get("option_type", "")).upper()
+
+        if segment == "INDICES" or instrument_type == "INDEX": return 1
+        if instrument_type == "FUT": return 2
+        if instrument_type == "EQ" and not option_type: return 3
+        if option_type in ("CE", "PE"): return 4
+        return 9
+
+    def _boost_and_aliases(underlying: str, tradingsymbol: str, name: Optional[str]) -> Tuple[int, List[str]]:
+        u = (underlying or "").upper()
+        base_aliases = []
+        boost = 0
+
+        if "BANKNIFTY" in u or "BANK" in u:
+            boost = 100
+            base_aliases.extend(["BANKNIFTY", "NIFTY BANK", "BANK NIFTY"])
+        elif "FINNIFTY" in u:
+            boost = 100
+            base_aliases.extend(["FINNIFTY", "FIN NIFTY"])
+        elif "SENSEX" in u:
+            boost = 100
+            base_aliases.extend(["SENSEX"])
+        elif "NIFTY" in u:
+            boost = 100
+            base_aliases.extend(["NIFTY", "NIFTY50", "NIFTY 50"])
+        
+        # Add tradingsymbol and name to aliases, ensuring uniqueness
+        all_aliases = set(base_aliases)
+        if tradingsymbol:
+            all_aliases.add(tradingsymbol.upper())
+        if name:
+            all_aliases.add(name.upper())
+        
+        return boost, list(all_aliases)
+
     for record in db_records:
         doc = {
             "id": str(record["instrument_token"]), # Meili primary key
@@ -593,6 +647,10 @@ async def meili_reindex_instruments():
             "expiry_ts": None, # Will be set below
             "expiry_year": None, # Will be set below
             "expiry_month": None, # Will be set below
+            "expiry_label": None, # New field
+            "type_rank": 9, # New field, default to 9
+            "boost_score": 0, # New field, default to 0
+            "aliases": [], # New field
         }
 
         instrument_type = record["instrument_type"]
@@ -651,6 +709,16 @@ async def meili_reindex_instruments():
             doc["expiry_ts"] = int(expiry_utc.timestamp())
             doc["expiry_year"] = expiry_date.year
             doc["expiry_month"] = expiry_date.month
+            doc["expiry_label"] = _format_expiry_label(expiry_date) # Assign expiry_label
+
+        # Assign type_rank
+        doc["type_rank"] = _type_rank(doc)
+
+        # Assign boost_score and aliases
+        underlying_for_aliases = doc.get("underlying") or tradingsymbol
+        boost, alias_list = _boost_and_aliases(underlying_for_aliases, tradingsymbol, doc.get("name"))
+        doc["boost_score"] = boost
+        doc["aliases"] = list(set(alias_list)) # Ensure uniqueness
 
         documents.append(doc)
 
@@ -1371,6 +1439,17 @@ async def fuzzy_search_instruments(
     query: Optional[str] = Query(None, alias="query"),
     limit: int = 50
 ):
+    def _sanitize_sort(index, sort_list: list[str]) -> list[str]:
+        try:
+            settings = index.get_settings()
+            allowed = set(settings.get("sortableAttributes") or [])
+            sanitized = [s for s in (sort_list or []) if (s.split(":")[0] in allowed)]
+            if len(sanitized) != len(sort_list or []):
+                logger.info(f"sanitized_sort={sanitized} allowed={allowed}")
+            return sanitized
+        except Exception as e:
+            logger.exception("Failed to sanitize sort, returning empty list.")
+            return []  # fallback: no sort
     """
     Fuzzy search endpoint with Meilisearch-first and robust SQL fallback.
     Changes:
@@ -1397,13 +1476,27 @@ async def fuzzy_search_instruments(
         try:
             options = {
                 "limit": limit,
+                "sort": ["boost_score:desc","type_rank:asc","expiry_ts:asc"],
                 "attributesToRetrieve": [
                     'instrument_token', 'exchange_token', 'tradingsymbol', 'name',
                     'last_price', 'expiry', 'strike', 'tick_size', 'lot_size',
                     'instrument_type', 'segment', 'exchange', 'underlying', 'option_type'
                 ]
             }
-            result = index.search(q_text, options)
+            try:
+                result = index.search(q_text, options)
+            except meilisearch.errors.MeilisearchApiError as e:
+                if "invalid_search_sort" in str(e) or "not sortable" in str(e):
+                    logger.warning(f"Meili search failed with invalid sort for q='{q_text}'. Sanitizing and retrying.")
+                    options["sort"] = _sanitize_sort(index, options.get("sort"))
+                    try:
+                        result = index.search(q_text, options)
+                    except Exception:
+                        logger.error(f"Meili retry failed for q='{q_text}' after sanitizing. Retrying without sort.")
+                        options.pop("sort", None)
+                        result = index.search(q_text, options)
+                else:
+                    raise
             hits = result.get("hits", [])
             logger.info(f"q='{q_text}' mode=meili_q_only meili_hits={len(hits)}")
             if not hits:
@@ -1440,7 +1533,8 @@ async def fuzzy_search_instruments(
     explicit_derivative = bool(
         parsed.get("option_type")
         or parsed.get("derivative_kind")
-        or parsed.get("expiry_year") or parsed.get("expiry_month") or parsed.get("expiry_date")
+        or parsed.get("expiry_date")
+        or (parsed.get("expiry_year") and parsed.get("expiry_month"))
         or (parsed.get("strike") is not None)
         or ("FUT" in (parsed.get("instrument_type") or ""))
     )
@@ -1448,6 +1542,8 @@ async def fuzzy_search_instruments(
     # For base queries (no explicit derivatives), exclude options so index/equity/futures surface
     if not explicit_derivative:
         filter_clauses.append("option_type IS NULL")
+        # Prefer major indices and futures first for base queries
+        options["sort"] = ["boost_score:desc","type_rank:asc","expiry_ts:asc"]
 
     # Numeric strike without CE/PE => both legs in a band, sorted by expiry then strike
     strike = parsed.get("strike")
@@ -1459,7 +1555,8 @@ async def fuzzy_search_instruments(
         filter_clauses.append('(option_type = "CE" OR option_type = "PE")')
         tol = 50
         filter_clauses.append(f"(strike >= {int(strike - tol)} AND strike <= {int(strike + tol)})")
-        options["sort"] = ["expiry:asc", "strike:asc"]
+        # Prefer expiry_ts for sorting if available
+        options["sort"] = ["expiry_ts:asc", "strike:asc"]
 
     # Add other parsed filters
     # This reuses the existing build_meili_filter logic but integrates it into the new clause system
@@ -1477,13 +1574,27 @@ async def fuzzy_search_instruments(
             filter_clauses.extend(additional_filters)
 
     filter_str = " AND ".join(filter_clauses) if filter_clauses else None
-    search_q = parsed.get("residual", q_text) if parsed else q_text
+    resid = parsed.get("residual") if parsed else None
+    search_q = resid or q_text
 
     try:
         if filter_str:
             options["filter"] = filter_str
         
-        result = index.search(search_q, options)
+        try:
+            result = index.search(search_q, options)
+        except meilisearch.errors.MeilisearchApiError as e:
+            if "invalid_search_sort" in str(e) or "not sortable" in str(e):
+                logger.warning(f"Meili search failed with invalid sort for q='{q_text}'. Sanitizing and retrying.")
+                options["sort"] = _sanitize_sort(index, options.get("sort"))
+                try:
+                    result = index.search(search_q, options)
+                except Exception:
+                    logger.error(f"Meili retry failed for q='{q_text}' after sanitizing. Retrying without sort.")
+                    options.pop("sort", None)
+                    result = index.search(search_q, options)
+            else:
+                raise
         hits = result.get("hits", [])
         mode = "meili_filtered" if filter_str else "meili_q_only"
         logger.info(f"q='{q_text}' mode={mode} meili_hits={len(hits)}")
@@ -1637,7 +1748,6 @@ def parse_fo_query(query: str) -> Dict[str, Any]:
     Returns a dictionary.
     """
     q = re.sub(r'\s+', ' ', query).strip().upper()
-    tokens = q.split()
     
     result = {
         "underlying": None, "instrument_type": None, "option_type": None,
@@ -1645,6 +1755,12 @@ def parse_fo_query(query: str) -> Dict[str, Any]:
         "expiry_year": None, "relative_week": None, "strike": None,
         "approximate_strike": False, "residual": ""
     }
+
+    if "BANK NIFTY" in q or "NIFTY BANK" in q:
+        result["underlying"] = "BANKNIFTY"
+        q = q.replace("BANK NIFTY", "").replace("NIFTY BANK", "")
+
+    tokens = q.split()
     
     # Month name to number mapping
     month_map = {name.upper(): i for i, name in enumerate(calendar.month_abbr) if i}
@@ -1677,13 +1793,23 @@ def parse_fo_query(query: str) -> Dict[str, Any]:
         if token in month_map:
             result["expiry_month"] = month_map[token]
             continue
-        # Year
+        # Year (context-aware)
+        current_year = datetime.now().year
+        # 4-digit year
         if re.fullmatch(r"\d{4}", token):
-            result["expiry_year"] = int(token)
-            continue
-        if re.fullmatch(r"\d{2}", token) and not result["expiry_year"]:
-             result["expiry_year"] = 2000 + int(token)
-             continue
+            year_val = int(token)
+            # Accept if a month is already found OR it's a reasonable year
+            if result["expiry_month"] or (current_year - 5 <= year_val <= current_year + 5):
+                result["expiry_year"] = year_val
+                continue
+        # 2-digit year
+        if re.fullmatch(r"\d{2}", token):
+            year_val = 2000 + int(token)
+            # Accept only if a month is found OR it's a reasonable year
+            if result["expiry_month"] or (current_year - 5 <= year_val <= current_year + 5):
+                 if not result["expiry_year"]: # Don't overwrite a 4-digit year
+                    result["expiry_year"] = year_val
+                 continue
         # Strike
         if re.fullmatch(r"\d{3,}(\.\d+)?", token):
             try:
@@ -1702,11 +1828,17 @@ def parse_fo_query(query: str) -> Dict[str, Any]:
         # A more robust check would involve querying a list of known underlyings.
         # For now, we assume common ones.
         if potential_underlying in ("NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"):
-             result["underlying"] = potential_underlying
-             result["residual"] = " ".join(residual_tokens[1:])
+             if not result["underlying"]: # Don't overwrite pre-parsed underlying
+                result["underlying"] = potential_underlying
+             # If the next token is a number, it's likely part of the name, not a separate residual
+             if len(residual_tokens) > 1 and residual_tokens[1].isdigit():
+                 result["residual"] = " ".join(residual_tokens)
+             else:
+                 result["residual"] = " ".join(residual_tokens[1:])
         else:
              # If not a known index, assume the first token is the underlying
-             result["underlying"] = potential_underlying
+             if not result["underlying"]:
+                result["underlying"] = potential_underlying
              result["residual"] = " ".join(residual_tokens[1:])
     
     # If year is not specified for a month, assume current or next year
