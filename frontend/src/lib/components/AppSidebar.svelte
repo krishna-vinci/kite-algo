@@ -1,7 +1,7 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { browser } from '$app/environment';
-    import { getApiBase } from '$lib/api';
+    import { getApiBase, getUserSubscriptions, saveUserSubscriptions } from '$lib/api';
     import { marketwatch } from '$lib/stores/marketwatch';
     import type { Instrument, Group, WatchlistData } from '$lib/types';
    
@@ -70,7 +70,6 @@
 
     // Drag & Drop state
     let dropIndicator: { targetId: string | null; position: 'before' | 'after' } = { targetId: null, position: 'before' };
-    const STORAGE_KEY = 'svelte-all-watchlists-data';
 
     function generateId() {
         return crypto?.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15);
@@ -107,14 +106,29 @@
     }
 
     // --- Persistence ---
-    onMount(() => {
-    	marketwatch.connect();
-    	try {
-    		const storedData = localStorage.getItem(STORAGE_KEY);
-    		if (storedData) {
-                allWatchlists = JSON.parse(storedData);
+    onMount(async () => {
+        marketwatch.connect();
+        try {
+            // Try scoped sidebar data first
+            let resp = await getUserSubscriptions('sidebar');
+            let subs = resp?.subscriptions;
+    
+            // Fallback to legacy (unscoped) if empty/missing
+            if (!subs || !subs.groups || subs.groups.length === 0) {
+                const legacy = await getUserSubscriptions();
+                subs = legacy?.subscriptions || legacy; // support legacy shape temporarily
+            }
+    
+            if (subs && subs.groups && subs.groups.length > 0) {
+                // The API returns a single watchlist, so we wrap it in an array
+                allWatchlists = [{
+                    groups: subs.groups,
+                    activeGroupIndex: subs.activeGroupIndex || 0
+                }];
+                // Assuming we are only dealing with one watchlist for now
+                currentWatchlistPage = 0;
             } else {
-                // Initialize with 7 pages if nothing is stored
+                // Initialize with a default structure if nothing is stored on the server
                 allWatchlists = [
                     createDefaultWatchlist(),
                     createEmptyWatchlist(),
@@ -124,39 +138,32 @@
                     createEmptyWatchlist(),
                     createEmptyWatchlist()
                 ];
-                // Pre-populate page 7 to match the image
-                allWatchlists[6] = {
-                    groups: [
-                        {
-                        	id: generateId(),
-                        	name: 'Momentum',
-                        	instruments: [
-                        		{ instrument_token: 12345, id: generateId(), name: 'PAYTM', qty: 3, change: -52.1, percentChange: -4.24, price: 1177.2 },
-                        		{ instrument_token: 23456, id: generateId(), name: 'TATAMOTORS', qty: 4, change: -3.75, percentChange: -0.53, price: 707.45 }
-                        	]
-                        },
-                        {
-                        	id: generateId(),
-                        	name: 'Default',
-                        	instruments: [{ instrument_token: 34567, id: generateId(), name: 'LAURUSLABS', qty: 4, change: 8.85, percentChange: 0.96, price: 932.1 }]
-                        }
-                       ],
-                       activeGroupIndex: 0
-                      };
-                currentWatchlistPage = 6; // Start on page 7 to match image
             }
         } catch (e) {
-            console.warn('Could not access localStorage. State will not be persisted.', e);
+            console.warn('Could not fetch subscriptions from server. Using default.', e);
+            allWatchlists = [createDefaultWatchlist()];
         }
     });
 
+    let saveTimeout: ReturnType<typeof setTimeout>;
     function saveData() {
-        if (!allWatchlists || allWatchlists.length === 0) return;
-        try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(allWatchlists));
-        } catch (e) {
-            console.warn('Could not save to localStorage.', e);
-        }
+        if (!activeWatchlist) return;
+        clearTimeout(saveTimeout);
+        saveTimeout = setTimeout(async () => {
+            try {
+                await saveUserSubscriptions(
+                    {
+                        subscriptions: {
+                            groups: activeWatchlist.groups,
+                            activeGroupId: activeGroup?.id
+                        }
+                    },
+                    'sidebar'
+                );
+            } catch (e) {
+                console.warn('Could not save to server.', e);
+            }
+        }, 1000); // Debounce for 1 second
     }
     
     function setActiveGroup(index: number) {
@@ -266,10 +273,38 @@
         dropIndicator = { targetId: null, position: 'before' };
         saveData();
     }
+
+    function getPercentChange(liveData: any, instrument: Instrument): number {
+        if (typeof liveData?.change === 'number') {
+            return liveData.change;
+        }
+        if (typeof liveData?.ohlc?.close === 'number' && typeof liveData?.last_price === 'number' && liveData.ohlc.close > 0) {
+            return ((liveData.last_price - liveData.ohlc.close) * 100) / liveData.ohlc.close;
+        }
+        return instrument.percentChange || 0;
+    }
+
+    // Absolute price change helper: last_price - close (falls back to 0)
+    function getPriceChange(liveData: any, instrument: Instrument): number {
+        const last = typeof liveData?.last_price === 'number' ? liveData.last_price : undefined;
+        const close = typeof liveData?.ohlc?.close === 'number' ? liveData.ohlc.close : undefined;
+        if (typeof last === 'number' && typeof close === 'number') {
+            const diff = last - close;
+            return Number.isFinite(diff) ? diff : 0;
+        }
+        // Optional fallback if instrument has a cached close; else 0
+        const instPrice = typeof instrument?.price === 'number' ? instrument.price : undefined;
+        const instClose = (instrument as any)?.close;
+        if (typeof instPrice === 'number' && typeof instClose === 'number') {
+            const diff = instPrice - instClose;
+            return Number.isFinite(diff) ? diff : 0;
+        }
+        return 0;
+    }
 </script>
 
 <aside class="sidebar">
-	<!-- Top Section -->
+ <!-- Top Section -->
 	<div class="top-section">
 		<div class="search-container">
 			<div class="search-icon">{@html SearchIcon}</div>
@@ -316,7 +351,9 @@
 			<ul>
 				{#each activeGroup.instruments as instrument (instrument.id)}
 					{@const liveData = $marketwatch.instruments[instrument.instrument_token] || instrument}
-					{@const isDown = (liveData.change ?? 0) < 0}
+					{@const percentChange = getPercentChange(liveData, instrument)}
+					{@const priceChange = getPriceChange(liveData, instrument)}
+					{@const isDown = (percentChange ?? 0) < 0}
 					<li
 						class="stock-item"
 						draggable="true"
@@ -330,12 +367,12 @@
 
 						<span class="stock-name" class:red={isDown} class:green={!isDown}>{instrument.name}</span>
 						<div class="stock-data">
-							<span class="data-point change" class:red={isDown}>{(liveData.change ?? 0).toFixed(2)}</span>
+							<span class="data-point change" class:red={isDown}>{(priceChange ?? 0).toFixed(2)}</span>
 							<span class="data-point percent-change" class:red={isDown} class:green={!isDown}>
-								{instrument.percentChange.toFixed(2)}%
+								{(percentChange ?? 0).toFixed(2)}%
 								<span class="arrow-icon">{#if isDown}{@html ArrowDownIcon}{:else}{@html ArrowUpIcon}{/if}</span>
 							</span>
-							<span class="data-point price" class:red={isDown} class:green={!isDown}>{(liveData.last_price ?? instrument.price).toFixed(2)}</span>
+							<span class="data-point price" class:red={isDown} class:green={!isDown}>{(liveData?.last_price ?? instrument.price ?? 0).toFixed(2)}</span>
 						</div>
 						<button class="delete-button" title="Delete Instrument" on:click|stopPropagation={() => deleteInstrument(instrument.id)}>
 							{@html TrashIcon}

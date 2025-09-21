@@ -78,6 +78,13 @@ CREATE INDEX IF NOT EXISTS idx_kite_indices_tradingsymbol
 CREATE INDEX IF NOT EXISTS idx_kite_indices_segment
   ON public.kite_indices (segment);
 
+-- Table for single-user settings (e.g., marketwatch subscriptions)
+CREATE TABLE IF NOT EXISTS public.user_settings (
+  owner_id           VARCHAR(255) PRIMARY KEY DEFAULT 'default',
+  settings_json      JSONB,
+  last_updated       TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- =========================================
 -- Unified search view
 -- =========================================

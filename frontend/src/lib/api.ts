@@ -62,3 +62,27 @@ export async function apiFetch(path: string, init: RequestInit = {}) {
 	};
 	return fetch(url, opts);
 }
+
+export async function getUserSubscriptions(scope?: 'sidebar' | 'marketwatch') {
+    const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
+    const response = await apiFetch(`/user/subscriptions${qs}`);
+    if (!response.ok) {
+        throw new Error('Failed to fetch user subscriptions');
+    }
+    return response.json();
+}
+
+export async function saveUserSubscriptions(subscriptions: any, scope?: 'sidebar' | 'marketwatch') {
+    const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
+    const response = await apiFetch(`/user/subscriptions${qs}`, {
+        method: 'PUT',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(subscriptions)
+    });
+    if (!response.ok) {
+        throw new Error('Failed to save user subscriptions');
+    }
+    return response.json();
+}

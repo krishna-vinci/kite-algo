@@ -76,3 +76,36 @@ SessionLocal = sessionmaker(
 
 # async Database client (if you still need it)
 database = Database(DATABASE_URL)
+
+# ───────── User Settings ─────────
+import json
+
+def get_user_settings(db_session, owner_id: str = "default") -> dict:
+    """Fetches user settings JSON from the database."""
+    from sqlalchemy import text
+    try:
+        stmt = text("SELECT settings_json FROM user_settings WHERE owner_id = :owner_id")
+        result = db_session.execute(stmt, {"owner_id": owner_id}).fetchone()
+        if result and result[0]:
+            return result[0]
+    except Exception as e:
+        logging.error(f"Error fetching user settings for {owner_id}: {e}")
+    return {}
+
+def update_user_settings(db_session, settings: dict, owner_id: str = "default"):
+    """Upserts user settings JSON to the database."""
+    from sqlalchemy import text
+    try:
+        stmt = text("""
+            INSERT INTO user_settings (owner_id, settings_json, last_updated)
+            VALUES (:owner_id, :settings, NOW())
+            ON CONFLICT (owner_id) DO UPDATE SET
+                settings_json = EXCLUDED.settings_json,
+                last_updated = NOW();
+        """)
+        db_session.execute(stmt, {"owner_id": owner_id, "settings": json.dumps(settings)})
+        db_session.commit()
+    except Exception as e:
+        logging.error(f"Error updating user settings for {owner_id}: {e}")
+        db_session.rollback()
+        raise

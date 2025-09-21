@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { browser } from '$app/environment';
-	import { getApiBase } from '$lib/api';
+	import { getApiBase, getUserSubscriptions, saveUserSubscriptions } from '$lib/api';
 	import { marketwatch } from '$lib/stores/marketwatch';
 
 	interface Instrument {
@@ -92,17 +92,27 @@
 		}
 	}
 
-	// Persist subscriptions to localStorage
+	// Persist subscriptions to the server (scoped to marketwatch)
+	let saveTimeout: ReturnType<typeof setTimeout>;
 	function saveSubscriptions() {
 		if (!browser) return;
-		try {
-			const subs = Array.from(subscribedInstruments.entries());
-			const modes = Array.from(desiredModes.entries());
-			localStorage.setItem('marketwatch_subscriptions', JSON.stringify(subs));
-			localStorage.setItem('marketwatch_modes', JSON.stringify(modes));
-		} catch (e) {
-			console.error('Failed to save subscriptions to localStorage:', e);
-		}
+		clearTimeout(saveTimeout);
+		saveTimeout = setTimeout(async () => {
+			try {
+				// Construct payload matching the tolerant backend structure
+				const groups = [
+					{
+						name: 'Marketwatch',
+						instruments: Array.from(subscribedInstruments.values())
+					}
+				];
+				const mode = 'quote'; // Default mode for now, can be enhanced later
+
+				await saveUserSubscriptions({ subscriptions: { groups, mode } }, 'marketwatch');
+			} catch (e) {
+				console.warn('Failed to save subscriptions to server:', e);
+			}
+		}, 1000); // Debounce saves by 1 second
 	}
 
 	function subscribe(instrument: Instrument) {
@@ -138,42 +148,83 @@
 		marketwatch.subscribeToInstruments([instrument_token], mode);
 	}
 
-	function resubscribeAll() {
-		const tokens = Array.from(subscribedInstruments.keys());
-		if (tokens.length === 0) return;
+	// Removed legacy resubscribeAll() to avoid localStorage-driven clobbering.
 
-		// Subscribe all with default quote first
-		marketwatch.subscribeToInstruments(tokens, 'quote');
-
-		// Then upgrade those that desire full
-		const fullTokens = tokens.filter((t) => desiredModes.get(t) === 'full');
-		if (fullTokens.length > 0) {
-			marketwatch.subscribeToInstruments(fullTokens, 'full');
-		}
-	}
-
-	onMount(() => {
+	onMount(async () => {
 		if (!browser) return;
 
-		// Load subscriptions from localStorage
+		// Load subscriptions from the server (scoped: marketwatch)
 		try {
-			const storedSubs = localStorage.getItem('marketwatch_subscriptions');
-			const storedModes = localStorage.getItem('marketwatch_modes');
-			if (storedSubs) {
-				subscribedInstruments = new Map(JSON.parse(storedSubs));
-			}
-			if (storedModes) {
-				desiredModes = new Map(JSON.parse(storedModes));
+			// getUserSubscriptions returns an envelope: { subscriptions: ... }
+			const resp = await getUserSubscriptions('marketwatch');
+			const subs = resp?.subscriptions ?? {};
+
+			if (subs && subs.groups) {
+				const tokens = new Set<number>();
+				const instrumentsByToken = new Map<number, Instrument>();
+
+				subs.groups.forEach((group: any) => {
+					// Prefer full instrument objects when present
+					if (Array.isArray(group?.instruments)) {
+						group.instruments.forEach((inst: any) => {
+							const raw = inst?.instrument_token ?? inst?.token;
+							const token = typeof raw === 'string' ? parseInt(raw, 10) : Number(raw);
+							if (Number.isFinite(token)) {
+								tokens.add(token);
+								// Restore richer details from persisted instruments
+								const instrument: Instrument = {
+									instrument_token: token,
+									tradingsymbol: String(inst?.tradingsymbol ?? inst?.symbol ?? `TOKEN ${token}`),
+									name: String(inst?.name ?? inst?.tradingsymbol ?? `Token ${token}`),
+									exchange: String(inst?.exchange ?? ''),
+									instrument_type: String(inst?.instrument_type ?? '')
+								};
+								instrumentsByToken.set(token, instrument);
+							}
+						});
+					} else if (Array.isArray(group?.tokens)) {
+						// Fallback: tokens array only
+						group.tokens.forEach((t: any) => {
+							const token = typeof t === 'string' ? parseInt(t, 10) : Number(t);
+							if (Number.isFinite(token)) {
+								tokens.add(token);
+								// Only create a minimal placeholder if no instrument details exist for this token
+								if (!instrumentsByToken.has(token)) {
+									instrumentsByToken.set(token, {
+										instrument_token: token,
+										tradingsymbol: String(token),
+										name: '',
+										exchange: '',
+										instrument_type: ''
+									});
+								}
+							}
+						});
+					}
+				});
+
+				// Apply restored instruments to UI map (do not overwrite later)
+				if (instrumentsByToken.size > 0) {
+					subscribedInstruments = new Map(instrumentsByToken);
+				}
+
+				const validTokens = Array.from(tokens);
+				const mode = (subs && ['ltp', 'quote', 'full'].includes(subs.mode)) ? (subs.mode as Mode) : 'quote';
+
+				if (validTokens.length > 0) {
+					// Subscribe in quote mode by default; adjust mode if needed
+					marketwatch.subscribeToInstruments(validTokens, 'quote');
+					if (mode !== 'quote') {
+						marketwatch.setMode(mode);
+					}
+				}
 			}
 		} catch (e) {
-			console.error('Failed to load subscriptions from localStorage:', e);
+			console.warn('Could not fetch subscriptions from server (marketwatch scope). Starting fresh.', e);
 		}
 
 		// Use the store to connect - singleton guard will prevent duplicate connections
 		marketwatch.connect();
-		
-		// Resubscribe to stored subscriptions using the store
-		resubscribeAll();
 	});
 
 	onDestroy(() => {

@@ -71,7 +71,12 @@ from broker_api.broker_api import KiteSession, get_system_access_token, upsert_k
 from broker_api.broker_api import run_headless_login_and_persist_system_token
 from broker_api.kite_auth import API_KEY
 from broker_api.websocket_manager import WebSocketManager
+from database import get_user_settings, update_user_settings
+from pydantic import BaseModel
 
+class UserSubscriptions(BaseModel):
+    groups: List[dict]
+    activeGroupId: Optional[str] = None
 
 # Global instance for the WebSocketManager
 ws_manager: Optional[WebSocketManager] = None
@@ -138,6 +143,8 @@ async def combined_lifespan(app: FastAPI):
     token_watcher_task = None
     scheduler_task = None
     try:
+        # Ensure the schema is applied before any other database operations
+        run_schema_migrations()
         # Determine system access_token from DB; validate and fallback to headless login
         at = None
         kite = None
@@ -451,9 +458,134 @@ async def status():
     return info
 
 
+@app.get("/user/subscriptions")
+def get_subscriptions(scope: Optional[str] = Query(default=None, pattern="^(sidebar|marketwatch)$")):
+    """
+    GET /user/subscriptions
+    - If scope is provided, return {"subscriptions": settings_json.get(f"subscriptions_{scope}") or {}}
+    - If no scope, return legacy {"subscriptions": settings_json.get("subscriptions") or {}}
+    """
+    db = SessionLocal()
+    try:
+        settings = get_user_settings(db)
+        if scope:
+            value = settings.get(f"subscriptions_{scope}") or {}
+        else:
+            value = settings.get("subscriptions") or {}
+        return JSONResponse(content={"subscriptions": value})
+    finally:
+        db.close()
+
+@app.put("/user/subscriptions")
+async def put_subscriptions(
+    request: Request,
+    scope: Optional[str] = Query(default=None, pattern="^(sidebar|marketwatch)$")
+):
+    """
+    PUT /user/subscriptions
+    - Accepts JSON body that must contain a top-level "subscriptions" object.
+    - If scope is provided, upsert into settings_json[f"subscriptions_{scope}"].
+    - If no scope, upsert into legacy "subscriptions".
+    """
+    body = await request.json()
+    subs = body.get("subscriptions")
+    if subs is None or not isinstance(subs, (dict, list)):
+        # Keep consistent error shape
+        raise HTTPException(status_code=400, detail="Body must contain a 'subscriptions' object")
+
+    db = SessionLocal()
+    try:
+        # Load full settings_json, mutate appropriate key, then persist
+        settings = get_user_settings(db) or {}
+        if scope:
+            settings[f"subscriptions_{scope}"] = subs
+        else:
+            settings["subscriptions"] = subs
+        update_user_settings(db, settings)
+        return JSONResponse(content={"status": "ok"})
+    finally:
+        db.close()
+
 @app.websocket("/broker/ws/marketwatch")
 async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
+
+    # Auto-subscribe on connect (aggregate across legacy + scoped namespaces)
+    db = SessionLocal()
+    try:
+        settings = get_user_settings(db) or {}
+
+        def _extract_tokens_from_subs(_subs: dict) -> int:
+            """
+            Extract tokens from a subscriptions object using tolerant parsing.
+            Returns count added into outer token_set.
+            """
+            if not _subs or not isinstance(_subs, dict):
+                return 0
+            token_count = 0
+            for group in _subs.get("groups", []) or []:
+                if not group or not isinstance(group, dict):
+                    continue
+                # Prefer explicit 'tokens' array
+                if isinstance(group.get("tokens"), list):
+                    for t in group["tokens"]:
+                        try:
+                            token_set.add(int(t))
+                            token_count += 1
+                        except (ValueError, TypeError):
+                            pass
+                # Fallback to instruments array
+                elif isinstance(group.get("instruments"), list):
+                    for inst in group["instruments"]:
+                        if not inst or not isinstance(inst, dict):
+                            continue
+                        token = inst.get("instrument_token") or inst.get("token")
+                        if token is None:
+                            continue
+                        try:
+                            token_set.add(int(token))
+                            token_count += 1
+                        except (ValueError, TypeError):
+                            pass
+            return token_count
+
+        token_set: set[int] = set()
+        # Legacy
+        legacy = settings.get("subscriptions")
+        if isinstance(legacy, dict):
+            c = _extract_tokens_from_subs(legacy)
+            logging.info("[WS auto-restore] Loaded %d tokens from legacy 'subscriptions'", c)
+
+        # Sidebar
+        sb = settings.get("subscriptions_sidebar")
+        if isinstance(sb, dict):
+            c = _extract_tokens_from_subs(sb)
+            logging.info("[WS auto-restore] Loaded %d tokens from 'subscriptions_sidebar'", c)
+
+        # Marketwatch
+        mw = settings.get("subscriptions_marketwatch")
+        if isinstance(mw, dict):
+            c = _extract_tokens_from_subs(mw)
+            logging.info("[WS auto-restore] Loaded %d tokens from 'subscriptions_marketwatch'", c)
+
+        all_tokens = list(token_set)
+        if all_tokens:
+            # Validate mode from any available section, fallback to 'quote'
+            mode = None
+            for candidate in (legacy, sb, mw):
+                if isinstance(candidate, dict):
+                    m = candidate.get("mode")
+                    if m in {"ltp", "quote", "full"}:
+                        mode = m
+                        break
+            if mode not in {"ltp", "quote", "full"}:
+                mode = "quote"
+
+            await ws_manager.subscribe(websocket, all_tokens, mode)
+            logging.info("[WS auto-restore] Auto-subscribed client to %d unique tokens on connect (mode=%s).", len(all_tokens), mode)
+    finally:
+        db.close()
+
     try:
         while True:
             data = await websocket.receive_json()
