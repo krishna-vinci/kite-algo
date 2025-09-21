@@ -23,24 +23,35 @@ services:
     env_file:
       - .env
 
-  mcpo-proxy:
-    image: ghcr.io/open-webui/mcpo:main
-    container_name: mcpo-proxy
+
+  frontend:
+    build: ./frontend
+    container_name: kite-frontend
     ports:
-      - "8000:8000"
+      - "8999:80" # Default port for many dev servers, change if needed
     volumes:
-      - ./mcp-config.json:/app/mcp-config.json
+      - ./frontend:/app
+      - /app/node_modules
+    #command: npm start # Or yarn start, npm run dev, etc.
+    networks:
+      - db-net
+      - caddy-net
     depends_on:
       - finance-app
-    command:
-      - mcpo
-      - --config
-      - /app/mcp-config.json
-      - --host
-      - 0.0.0.0
-      - --api-key
-      - top-secret
-    restart: unless-stopped
+
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    volumes:
+      - ./meili_data:/data.ms
+    ports:
+      - "7700:7700"
+    environment:
+      - MEILI_MASTER_KEY=${MEILI_MASTER_KEY:-aMasterKey}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
     networks:
       - db-net
       - caddy-net

@@ -1,7 +1,7 @@
 <script lang="ts">
-    import StrategyLayout from "$lib/components/StrategyLayout.svelte";
+	import StrategyLayout from '$lib/components/StrategyLayout.svelte';
 </script>
 
 <StrategyLayout>
-    <slot />
+	<slot />
 </StrategyLayout>

@@ -1,26 +1,25 @@
 <script>
 	import { onMount } from 'svelte';
+	import { apiFetch, getApiBase, setSessionId, clearSessionId } from '$lib/api';
 
 	// State variables
 	let isLoggedIn = false;
 	let userName = '';
 	let isLoading = false;
 
-	// API base URL - using the backend port from the Docker configuration
-	const API_BASE_URL = 'http://localhost:8777';
+	// API base URL resolved dynamically for cross-device access
+	const API_BASE_URL = getApiBase();
 
 	// Check login status on component mount
 	onMount(async () => {
 		checkLoginStatus();
 	});
 
-	// Check if user is logged in by checking for session cookie
+	// Check if user is logged in by checking for session cookie/header session
 	async function checkLoginStatus() {
 		try {
-			const response = await fetch(`${API_BASE_URL}/broker/profile_kite`, {
-				credentials: 'include'
-			});
-			
+			const response = await apiFetch(`/broker/profile_kite`);
+
 			if (response.ok) {
 				const profile = await response.json();
 				isLoggedIn = true;
@@ -39,15 +38,19 @@
 	async function login() {
 		isLoading = true;
 		try {
-			const response = await fetch(`${API_BASE_URL}/broker/login_kite`, {
-				method: 'POST',
-				credentials: 'include'
+			const response = await apiFetch(`/broker/login_kite`, {
+				method: 'POST'
 			});
 
 			if (response.ok) {
 				const data = await response.json();
+				// Store session_id so subsequent requests include X-Session-ID header (dev-friendly across devices)
+				if (data?.session_id) {
+					setSessionId(data.session_id);
+				}
 				isLoggedIn = true;
-				userName = data.profile.user_shortname || data.profile.user_name || data.profile.email || 'User';
+				userName =
+					data.profile?.user_shortname || data.profile?.user_name || data.profile?.email || 'User';
 			} else {
 				console.error('Login failed:', response.status);
 			}
@@ -62,12 +65,13 @@
 	async function logout() {
 		isLoading = true;
 		try {
-			const response = await fetch(`${API_BASE_URL}/broker/logout_kite`, {
-				method: 'POST',
-				credentials: 'include'
+			const response = await apiFetch(`/broker/logout_kite`, {
+				method: 'POST'
 			});
 
 			if (response.ok) {
+				// Clear header-based session fallback
+				clearSessionId();
 				isLoggedIn = false;
 				userName = '';
 			} else {
@@ -81,22 +85,22 @@
 	}
 </script>
 
-<div class="absolute top-4 right-4 flex items-center space-x-2">
+<div class="flex items-center space-x-2">
 	{#if isLoggedIn}
 		<div class="flex items-center space-x-2">
-			<span class="text-white font-medium">Hello, {userName}</span>
-			<button 
+			<span class="text-foreground font-medium">Hello, {userName}</span>
+			<button
 				on:click={logout}
-				class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-md transition duration-200"
+				class="bg-destructive hover:bg-destructive/90 text-white px-3 py-1.5 text-sm rounded-md transition-colors duration-200 disabled:opacity-50"
 				disabled={isLoading}
 			>
 				{isLoading ? 'Logging out...' : 'Logout'}
 			</button>
 		</div>
 	{:else}
-		<button 
+		<button
 			on:click={login}
-			class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-md transition duration-200"
+			class="bg-primary hover:bg-primary/90 text-primary-foreground px-3 py-1.5 text-sm rounded-md transition-colors duration-200 disabled:opacity-50"
 			disabled={isLoading}
 		>
 			{isLoading ? 'Logging in...' : 'Login'}
