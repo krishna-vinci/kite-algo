@@ -2,6 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { browser } from '$app/environment';
 	import { getApiBase } from '$lib/api';
+	import { marketwatch } from '$lib/stores/marketwatch';
 
 	interface Instrument {
 		instrument_token: number;
@@ -45,7 +46,6 @@
 		last_trade_time?: string;
 	}
 
-	let socket: WebSocket | null = null;
 	let searchInput: string = '';
 	let searchResults: Instrument[] = [];
 
@@ -53,18 +53,10 @@
 	let subscribedInstruments: Map<number, Instrument> = new Map();
 	let desiredModes: Map<number, Mode> = new Map(); // default 'quote' when subscribing
 
-	// Live ticks keyed by instrument_token
-	let liveTicks: Map<number, Tick> = new Map();
-
-	// CONNECTING, CONNECTED, DISCONNECTED, ERROR, RECONNECTING
-	let websocketStatus: string = 'DISCONNECTED';
-
-	// Resolve backend base and ws URL
-	function buildWsUrl(): string {
-		const base = getApiBase(); // e.g. http://host:8777
-		const wsProto = base.startsWith('https') ? 'wss' : 'ws';
-		return base.replace(/^http/, wsProto) + '/broker/ws/marketwatch';
-	}
+	// Derive websocket status from store connection
+	$: websocketStatus = $marketwatch.connection ? 'CONNECTED' : 'DISCONNECTED';
+	// Get live ticks from store
+	$: liveTicks = new Map(Object.entries($marketwatch.instruments).map(([token, data]) => [parseInt(token), data as Tick]));
 
 	// Fetch instruments search results
 	async function fetchSearchResults(query: string) {
@@ -114,40 +106,27 @@
 	}
 
 	function subscribe(instrument: Instrument) {
-		if (!socket || socket.readyState !== WebSocket.OPEN) {
-			console.warn('WebSocket not connected. Cannot subscribe.');
-			return;
-		}
 		const token = instrument.instrument_token;
 		// Default mode is quote
 		desiredModes.set(token, 'quote');
 		subscribedInstruments.set(token, instrument);
 		subscribedInstruments = new Map(subscribedInstruments); // Trigger reactivity
 		saveSubscriptions();
-		socket.send(JSON.stringify({ action: 'subscribe', tokens: [token], mode: 'quote' }));
+		// Use store method - it handles connection state and queuing
+		marketwatch.subscribeToInstruments([token], 'quote');
 	}
 
 	function unsubscribe(instrument_token: number) {
-		if (!socket || socket.readyState !== WebSocket.OPEN) {
-			console.warn('WebSocket not connected. Cannot unsubscribe.');
-			return;
-		}
-		socket.send(JSON.stringify({ action: 'unsubscribe', tokens: [instrument_token] }));
+		marketwatch.unsubscribeFromInstruments([instrument_token]);
 		subscribedInstruments.delete(instrument_token);
 		desiredModes.delete(instrument_token);
-		liveTicks.delete(instrument_token);
 		saveSubscriptions();
 		// trigger reactivity
-		liveTicks = new Map(liveTicks);
 		subscribedInstruments = new Map(subscribedInstruments);
 		desiredModes = new Map(desiredModes);
 	}
 
 	function setMode(instrument_token: number, mode: Mode) {
-		if (!socket || socket.readyState !== WebSocket.OPEN) {
-			console.warn('WebSocket not connected. Cannot set mode.');
-			return;
-		}
 		if (!subscribedInstruments.has(instrument_token)) {
 			console.warn('Instrument not subscribed; subscribe first.');
 			return;
@@ -155,76 +134,21 @@
 		desiredModes.set(instrument_token, mode);
 		desiredModes = new Map(desiredModes);
 		saveSubscriptions();
-		socket.send(JSON.stringify({ action: 'set_mode', tokens: [instrument_token], mode }));
+		// Use store method to set mode for specific tokens
+		marketwatch.subscribeToInstruments([instrument_token], mode);
 	}
 
 	function resubscribeAll() {
-		if (!socket || socket.readyState !== WebSocket.OPEN) return;
 		const tokens = Array.from(subscribedInstruments.keys());
 		if (tokens.length === 0) return;
 
 		// Subscribe all with default quote first
-		socket.send(JSON.stringify({ action: 'subscribe', tokens, mode: 'quote' }));
+		marketwatch.subscribeToInstruments(tokens, 'quote');
 
 		// Then upgrade those that desire full
 		const fullTokens = tokens.filter((t) => desiredModes.get(t) === 'full');
 		if (fullTokens.length > 0) {
-			socket.send(JSON.stringify({ action: 'set_mode', tokens: fullTokens, mode: 'full' }));
-		}
-	}
-
-	function handleIncomingMessage(ev: MessageEvent) {
-		try {
-			const msg = JSON.parse(ev.data);
-			if (!msg) {
-				console.warn('Received empty message');
-				return;
-			}
-
-			const type = msg.type;
-			if (!type) {
-				// Backward compatibility: if server sent raw array of ticks
-				if (Array.isArray(msg)) {
-					const arr: Tick[] = msg;
-					for (const tick of arr) {
-						if (tick && typeof tick.instrument_token === 'number') {
-							liveTicks.set(tick.instrument_token, tick);
-						}
-					}
-					liveTicks = new Map(liveTicks);
-				}
-				return;
-			}
-
-			if (type === 'status') {
-				websocketStatus = msg.state ?? websocketStatus;
-				return;
-			}
-
-			if (type === 'ack') {
-				// Could reflect UI state; for now just log
-				console.debug('ACK:', msg);
-				return;
-			}
-
-			if (type === 'error') {
-				console.error('WS error:', msg.message);
-				return;
-			}
-
-			if (type === 'ticks' && Array.isArray(msg.data)) {
-				const arr: Tick[] = msg.data;
-				for (const tick of arr) {
-					if (tick && typeof tick.instrument_token === 'number') {
-						liveTicks.set(tick.instrument_token, tick);
-					}
-				}
-				liveTicks = new Map(liveTicks);
-				return;
-			}
-			console.warn('Unhandled message type:', type, msg);
-		} catch (e) {
-			console.error('Failed to parse WS message:', e);
+			marketwatch.subscribeToInstruments(fullTokens, 'full');
 		}
 	}
 
@@ -245,36 +169,16 @@
 			console.error('Failed to load subscriptions from localStorage:', e);
 		}
 
-		const wsUrl = buildWsUrl();
-		socket = new WebSocket(wsUrl);
-
-		socket.onopen = () => {
-			console.log('WebSocket connection established');
-			websocketStatus = 'CONNECTED';
-			resubscribeAll();
-		};
-
-		socket.onmessage = handleIncomingMessage;
-
-		socket.onclose = (event) => {
-			console.log('WebSocket connection closed:', event.code, event.reason);
-			websocketStatus = 'DISCONNECTED';
-		};
-
-		socket.onerror = (error) => {
-			console.error('WebSocket error:', error);
-			websocketStatus = 'ERROR';
-		};
+		// Use the store to connect - singleton guard will prevent duplicate connections
+		marketwatch.connect();
+		
+		// Resubscribe to stored subscriptions using the store
+		resubscribeAll();
 	});
 
 	onDestroy(() => {
-		if (socket) {
-			try {
-				socket.close();
-			} catch {
-				// ignore
-			}
-		}
+		// No need to close socket - the store manages the singleton connection
+		// Other components like Sidebar might still be using it
 	});
 
 	// Helper to format change percentage

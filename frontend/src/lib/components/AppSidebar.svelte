@@ -330,7 +330,6 @@
 
 						<span class="stock-name" class:red={isDown} class:green={!isDown}>{instrument.name}</span>
 						<div class="stock-data">
-							<span class="data-point qty">{instrument.qty} <span class="briefcase-icon">{@html BriefcaseIcon}</span></span>
 							<span class="data-point change" class:red={isDown}>{(liveData.change ?? 0).toFixed(2)}</span>
 							<span class="data-point percent-change" class:red={isDown} class:green={!isDown}>
 								{instrument.percentChange.toFixed(2)}%
@@ -402,12 +401,11 @@
     .drop-indicator { position: absolute; left: 8px; right: 8px; height: 2px; background-color: var(--brand-blue); z-index: 10; }
     .drop-indicator.top { top: -1px; }
     .drop-indicator.bottom { bottom: -1px; }
-    .stock-name { font-size: 14px; font-weight: 500; }
-    .stock-data { display: flex; align-items: center; gap: 12px; font-size: 14px; }
-    .data-point { text-align: right; display: flex; align-items: center; justify-content: flex-end; }
-    .qty { width: 40px; gap: 4px; color: var(--text-gray-500); }
+    .stock-name { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .stock-data { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+    .data-point { text-align: right; }
     .change { width: 64px; }
-    .percent-change { width: 64px; gap: 2px; }
+    .percent-change { width: 70px; gap: 2px; display: flex; align-items: center; justify-content: flex-end; }
     .price { width: 80px; font-weight: 500; }
     .red { color: var(--brand-red); }
     .green { color: var(--brand-green); }
@@ -423,7 +421,6 @@
     .icon-button { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; color: var(--text-gray-500); }
     .icon-button:hover { color: var(--text-gray-800); }
     .icon-button :global(svg) { width: 16px; height: 16px; }
-    .briefcase-icon :global(svg) { width: 14px; height: 14px; }
     .arrow-icon :global(svg) { width: 14px; height: 14px; }
     .bottom-actions .icon-button :global(svg) { width: 20px; height: 20px; }
     .delete-button :global(svg) { width: 14px; height: 14px; }
