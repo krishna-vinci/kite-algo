@@ -63,6 +63,33 @@ export async function apiFetch(path: string, init: RequestInit = {}) {
 	return fetch(url, opts);
 }
 
+/**
+ * One-shot LTP helper. Returns last_price or null.
+ * Uses existing backend route POST /broker/ltp with { instruments: ["EX:TS"] }.
+ */
+export async function getLtp(exchange: string, tradingsymbol: string): Promise<number | null> {
+	try {
+		const key = `${exchange}:${tradingsymbol}`;
+		const res = await apiFetch('/broker/ltp', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ instruments: [key] })
+		});
+		if (!res.ok) return null;
+		const data = await res.json().catch(() => null) as any;
+		const rec = data?.[key] ?? (data?.data ? data.data[key] : null);
+		const price = rec?.last_price ?? rec?.lastPrice ?? null;
+		if (typeof price === 'number') return price;
+		if (price != null) {
+			const n = Number(price);
+			return Number.isFinite(n) ? n : null;
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
 export async function getUserSubscriptions(scope?: 'sidebar' | 'marketwatch') {
     const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
     const response = await apiFetch(`/user/subscriptions${qs}`);

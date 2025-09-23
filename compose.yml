@@ -16,12 +16,14 @@ services:
       - --port
       - "8777"
       - --reload                 # ← enable hot-reload
-    restart: unless-stopped
+    restart: always
     networks:
       - db-net
       - caddy-net
     env_file:
       - .env
+    depends_on:
+      - redis
 
 
   frontend:
@@ -38,6 +40,7 @@ services:
       - caddy-net
     depends_on:
       - finance-app
+    restart: always
 
   meilisearch:
     image: getmeili/meilisearch:latest
@@ -55,6 +58,20 @@ services:
     networks:
       - db-net
       - caddy-net
+    restart: always
+
+  redis:
+    image: "redis:alpine"
+    container_name: kite-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis_data:/data 
+    networks:
+      - db-net
+      - caddy-net
+    restart: always
+
 
 networks:
   db-net:
