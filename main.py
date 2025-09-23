@@ -270,7 +270,8 @@ async def combined_lifespan(app: FastAPI):
 
         # Ensure Meilisearch index exists on startup (and bootstrap reindex if empty)
         try:
-            ensure_instruments_index()
+            # Quick fix: force-reset settings on every startup
+            reset_meili_settings()
             logger.info("Meilisearch index 'instruments' ensured on startup")
             try:
                 client = get_meili_client(admin=True)
@@ -352,6 +353,18 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def reset_meili_settings():
+    """
+    Force-applies the latest index settings from the Python codebase to Meilisearch.
+    This is a quick fix for ensuring settings are synchronized on startup.
+    """
+    try:
+        logger.info("Attempting to reset Meilisearch index settings...")
+        ensure_instruments_index()
+        logger.info("Meilisearch index settings reset successfully.")
+    except Exception as e:
+        logger.error(f"Failed to reset Meilisearch settings: {e}", exc_info=True)
 
 # CSV file paths and their corresponding source list names
 CSV_FILES = {

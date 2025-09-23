@@ -49,7 +49,8 @@ services:
     ports:
       - "7700:7700"
     environment:
-      - MEILI_MASTER_KEY=${MEILI_MASTER_KEY:-aMasterKey}
+      - MEILI_MASTER_KEY=9VZU4Gl2cmca-7FrlXY96bawuYwfFIMkpvohNrMaKCU
+    command: ["meilisearch", "--master-key=9VZU4Gl2cmca-7FrlXY96bawuYwfFIMkpvohNrMaKCU"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
       interval: 30s

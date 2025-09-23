@@ -1483,16 +1483,41 @@ async def fuzzy_search_instruments(
                     'instrument_type', 'segment', 'exchange', 'underlying', 'option_type'
                 ]
             }
+            # Pre-sanitize sort against current index settings to avoid invalid_search_sort
+            try:
+                sanitized = _sanitize_sort(index, options.get("sort"))
+                if not sanitized:
+                    options.pop("sort", None)
+                else:
+                    options["sort"] = sanitized
+            except Exception:
+                # On any settings error, drop sort to avoid invalid_search_sort
+                options.pop("sort", None)
             try:
                 result = index.search(q_text, options)
             except meilisearch.errors.MeilisearchApiError as e:
-                if "invalid_search_sort" in str(e) or "not sortable" in str(e):
+                msg = str(e)
+                if "invalid_search_sort" in msg or "not sortable" in msg:
                     logger.warning(f"Meili search failed with invalid sort for q='{q_text}'. Sanitizing and retrying.")
                     options["sort"] = _sanitize_sort(index, options.get("sort"))
                     try:
                         result = index.search(q_text, options)
                     except Exception:
                         logger.error(f"Meili retry failed for q='{q_text}' after sanitizing. Retrying without sort.")
+                        options.pop("sort", None)
+                        result = index.search(q_text, options)
+                elif "invalid_search_filter" in msg or "not filterable" in msg:
+                    logger.warning(f"Meili search failed with invalid filter settings for q='{q_text}'. Resetting index settings and retrying.")
+                    try:
+                        # Attempt self-heal: re-apply index settings
+                        ensure_instruments_index()
+                        # Reacquire index handle and retry with same options
+                        index = client.index("instruments")
+                        result = index.search(q_text, options)
+                    except Exception:
+                        # Final attempt: drop any filters/sorts and try plain search
+                        logger.error(f"Meili retry failed for q='{q_text}' after resetting settings. Retrying without filter/sort.")
+                        options.pop("filter", None)
                         options.pop("sort", None)
                         result = index.search(q_text, options)
                 else:
@@ -1580,11 +1605,23 @@ async def fuzzy_search_instruments(
     try:
         if filter_str:
             options["filter"] = filter_str
+
+        # Pre-sanitize sort against index settings to avoid invalid_search_sort
+        if "sort" in options:
+            try:
+                sanitized = _sanitize_sort(index, options.get("sort"))
+                if not sanitized:
+                    options.pop("sort", None)
+                else:
+                    options["sort"] = sanitized
+            except Exception:
+                options.pop("sort", None)
         
         try:
             result = index.search(search_q, options)
         except meilisearch.errors.MeilisearchApiError as e:
-            if "invalid_search_sort" in str(e) or "not sortable" in str(e):
+            msg = str(e)
+            if "invalid_search_sort" in msg or "not sortable" in msg:
                 logger.warning(f"Meili search failed with invalid sort for q='{q_text}'. Sanitizing and retrying.")
                 options["sort"] = _sanitize_sort(index, options.get("sort"))
                 try:
@@ -1593,6 +1630,22 @@ async def fuzzy_search_instruments(
                     logger.error(f"Meili retry failed for q='{q_text}' after sanitizing. Retrying without sort.")
                     options.pop("sort", None)
                     result = index.search(search_q, options)
+            elif "invalid_search_filter" in msg or "not filterable" in msg:
+                logger.warning(f"Meili search failed with invalid filter for q='{q_text}' filter='{filter_str}'. Attempting index settings reset.")
+                try:
+                    # Self-heal: ensure index has correct filterableAttributes, wait for task, then retry
+                    ensure_instruments_index()
+                    index = client.index("instruments")
+                    result = index.search(search_q, options)
+                except Exception:
+                    logger.error(f"Meili retry failed for q='{q_text}' after resetting settings. Retrying without filter.")
+                    # Drop the filter and retry as plain query
+                    options.pop("filter", None)
+                    try:
+                        result = index.search(search_q, options)
+                    except Exception:
+                        # Give up on Meili path; let caller fallback to SQL
+                        raise
             else:
                 raise
         hits = result.get("hits", [])
