@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { createEventDispatcher, tick, onMount } from 'svelte';
+  import { createEventDispatcher, tick, onMount, onDestroy } from 'svelte';
   import { toast } from '$lib/stores/toast';
   import InstrumentPicker from '$lib/components/InstrumentPicker.svelte';
   import type { InstrumentRow } from '$lib/types';
@@ -39,15 +39,30 @@
   let submitting = false;
   let inlineError: string | null = null;
   let didPrefill = false;
-  let prefillInstrument: InstrumentRow | null = null;
-  let priceInput: HTMLInputElement | null = null;
 
   $: instrument_token = selectedInstrument?.instrument_token ?? instrument_token;
 
+  // --- Subscription management for live LTP ---
+  let previousToken: number | null = null;
+
+  $: if (instrument_token && instrument_token !== previousToken) {
+    if (previousToken) {
+      marketwatch.unsubscribeFromInstruments([previousToken]);
+    }
+    // Subscribe to the new token for 'ltp' feed
+    marketwatch.subscribeToInstruments([instrument_token], 'ltp');
+    previousToken = instrument_token;
+  }
+
+  onDestroy(() => {
+    if (previousToken) {
+      marketwatch.unsubscribeFromInstruments([previousToken]);
+    }
+  });
+  // --- End subscription management ---
+
   // Live LTP from marketwatch store for selected token
-  $: currentToken = Number(instrument_token ?? selectedInstrument?.instrument_token ?? 0);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  $: ltp = ($marketwatch as any)?.instruments?.[currentToken]?.last_price;
+  $: ltp = instrument_token ? $marketwatch.instruments[instrument_token]?.last_price : null;
 
   // Ensure WS connects so LTP can show when dialog is used
   onMount(() => {
@@ -138,17 +153,7 @@
     name = prefill.name ?? '';
     notes = prefill.notes ?? '';
     selectedInstrument = null;
-    if (prefill.instrument_token) {
-      prefillInstrument = {
-        instrument_token: prefill.instrument_token,
-        tradingsymbol: prefill.name || '',
-        exchange: '',
-      };
-    }
     didPrefill = true;
-    setTimeout(() => {
-      priceInput?.focus();
-    }, 100);
   }
 
   // When dialog closes, allow prefill to re-run next open
@@ -178,11 +183,11 @@
           <label class="text-sm font-medium" for="instrument_token">Instrument</label>
           <div class="flex items-center gap-3">
             <div class="flex-1">
-              <InstrumentPicker on:select={(e) => { selectedInstrument = e.detail.instrument; if (!name) name = e.detail.instrument.tradingsymbol; instrument_token = e.detail.instrument.instrument_token; }} bind:prefillInstrument />
+              <InstrumentPicker on:select={(e) => { selectedInstrument = e.detail.instrument; if (!name) name = e.detail.instrument.tradingsymbol; instrument_token = e.detail.instrument.instrument_token; }} />
             </div>
           </div>
           <input type="hidden" bind:value={instrument_token} />
-          <div class="text-xs text-gray-600">LTP: {ltp ?? '—'}</div>
+          <div class="text-xs text-gray-600">LTP: {ltp != null ? ltp : '—'}</div>
           <p class="text-xs text-muted-foreground">
             Pick an instrument or paste its instrument_token.
           </p>
@@ -200,7 +205,7 @@
         <!-- Target price (absolute) -->
         <div class="grid gap-2">
           <label class="text-sm font-medium" for="absolute_target">Target price</label>
-          <input id="absolute_target" class="input" type="number" step="any" bind:value={absolute_target} aria-required="true" bind:this={priceInput} />
+          <input id="absolute_target" class="input" type="number" step="any" bind:value={absolute_target} aria-required="true" />
         </div>
 
         <!-- Options -->

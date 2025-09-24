@@ -1,7 +1,11 @@
+import asyncio
+import json
 from fastapi import APIRouter, HTTPException, Request, Query, Path
+from starlette.responses import StreamingResponse
 from typing import Optional, Literal, List, Dict, Any, Tuple
 from pydantic import BaseModel
 from database import database as async_db
+from broker_api.redis_events import pubsub_iter
 import logging
 
 router = APIRouter()
@@ -93,10 +97,10 @@ async def create_alert(req: Request, body: AlertCreate):
     sql = """
     INSERT INTO public.alerts (
         instrument_token, comparator, target_type, absolute_target, percent, baseline_price,
-        one_time, name, notes
+        one_time, name, notes, last_evaluated_price
     ) VALUES (
         :instrument_token, :comparator, :target_type, :absolute_target, :percent, :baseline_price,
-        :one_time, :name, :notes
+        :one_time, :name, :notes, :last_evaluated_price
     )
     RETURNING *;
     """
@@ -111,6 +115,13 @@ async def create_alert(req: Request, body: AlertCreate):
         "name": body.name,
         "notes": body.notes,
     }
+    # Seed last_evaluated_price with best-known price at creation
+    initial_ltp = _get_ws_baseline(req, body.instrument_token)
+    if initial_ltp is None:
+        initial_ltp = baseline_price
+
+    values["last_evaluated_price"] = float(initial_ltp) if initial_ltp is not None else None
+
     row = await async_db.fetch_one(sql, values)
     try:
         await _engine_refresh(req)
@@ -427,6 +438,35 @@ async def cancel_alert(id: str, request: Request):
     except Exception:
         pass
     return dict(row)
+
+
+# GET /alerts/events (SSE)
+@router.get("/events")
+async def sse_alerts_events(request: Request):
+    """
+    Server-Sent Events endpoint for real-time alert notifications.
+    Subscribes to the 'alerts.events' Redis channel and streams messages.
+    """
+
+    async def event_stream():
+        logging.info("[ALERTS-SSE] Client connected to alerts event stream.")
+        try:
+            async for message in pubsub_iter("alerts.events"):
+                if await request.is_disconnected():
+                    logging.info("[ALERTS-SSE] Client disconnected.")
+                    break
+
+                if message.get("event") == "heartbeat":
+                    # Send a comment to keep the connection alive
+                    yield ": heartbeat\n\n"
+                else:
+                    yield f"data: {json.dumps(message)}\n\n"
+        except asyncio.CancelledError:
+            logging.info("[ALERTS-SSE] Event stream cancelled.")
+        finally:
+            logging.info("[ALERTS-SSE] Closing alerts event stream.")
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 # POST /alerts/{id}/reactivate
 @router.post("/{id}/reactivate")

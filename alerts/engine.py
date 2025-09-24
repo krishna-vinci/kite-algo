@@ -5,6 +5,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import asyncio
+from broker_api.ntfy import notify_alert_triggered
+from broker_api.redis_events import publish_event
+
 # External async DB client from database.py
 # This is the `databases.Database` instance (already connected by main.py)
 # We will receive it via constructor injection.
@@ -19,9 +23,13 @@ class Alert:
     instrument_token: int
     comparator: str  # "gt" | "lt"
     absolute_target: float
-    last_evaluated_price: Optional[float]
+    baseline_price: Optional[float]
     one_time: bool = True
 
+@dataclass
+class AlertState:
+    """In-memory state per alert, not persisted."""
+    prev_price: Optional[float] = None
 
 class AlertsEngine:
     """
@@ -58,6 +66,7 @@ class AlertsEngine:
 
         # Mapping of token -> alerts
         self._alerts_by_token: Dict[int, List[Alert]] = {}
+        self._alert_state: Dict[str, AlertState] = {}  # alert.id -> AlertState
         self._active_tokens: Set[int] = set()
 
         # Server-side subscriptions that this engine owns (only when no clients are using the token)
@@ -167,49 +176,60 @@ class AlertsEngine:
                     )
 
     async def _evaluate_alert(self, alert: Alert, current_price: float) -> None:
-        prev = alert.last_evaluated_price
+        state = self._alert_state.get(alert.id)
+        if not state:
+            # Should not happen if registration logic is correct
+            logger.warning("[ALERTS-ENGINE] no state for alert id=%s", alert.id)
+            return
+
+        prev_price = state.prev_price
         threshold = alert.absolute_target
 
-        # First-time observation: persist last_evaluated_price and skip trigger to avoid instant fire
-        if prev is None:
-            await self._persist_last_evaluated_price(alert.id, current_price, force=True)
-            alert.last_evaluated_price = current_price
-            return
+        # If prev_price is still None, this is the first tick. Use baseline_price for one-time eval.
+        if prev_price is None:
+            effective_prev = alert.baseline_price if alert.baseline_price is not None else current_price
+            logger.debug(
+                "[ALERTS-ENGINE] first tick eval id=%s token=%s prev=%.6f cur=%.6f target=%.6f",
+                alert.id, alert.instrument_token, effective_prev, current_price, threshold
+            )
+        else:
+            effective_prev = prev_price
 
         # Crossing logic
         triggered = False
         direction: Optional[str] = None
 
+        # Crossing logic for supported comparators
         if alert.comparator == "gt":
-            # previous < target and current >= target
-            if (prev < threshold) and (current_price >= threshold):
+            if effective_prev < threshold and current_price >= threshold:
                 triggered = True
                 direction = "cross_up"
         elif alert.comparator == "lt":
-            # previous > target and current <= target
-            if (prev > threshold) and (current_price <= threshold):
+            if effective_prev > threshold and current_price <= threshold:
                 triggered = True
                 direction = "cross_down"
         else:
-            # Unknown comparator; ignore
-            return
+            return  # Unknown comparator
 
         if triggered and direction:
             await self._handle_trigger(alert, current_price, direction)
-            # Remove from in-memory active list; DB refresh will clean up anyway
             self._remove_alert_from_memory(alert)
             return
 
-        # Not triggered: persist last_evaluated_price when it changed (throttled)
-        if prev != current_price:
+        # Update prev_price for next tick's evaluation
+        if state.prev_price != current_price:
+            state.prev_price = current_price
+            # Also persist to DB for long-term state (throttled)
             await self._persist_last_evaluated_price(alert.id, current_price, force=False)
-            alert.last_evaluated_price = current_price
 
-    async def _handle_trigger(self, alert: Alert, price: float, direction: str) -> None:
+    async def _handle_trigger(self, alert: Alert, current_price: float, direction: str) -> None:
         logger.info(
             "[ALERTS-ENGINE] TRIGGER id=%s token=%s cmp=%s target=%.6f price=%.6f dir=%s",
-            alert.id, alert.instrument_token, alert.comparator, alert.absolute_target, price, direction
+            alert.id, alert.instrument_token, alert.comparator, alert.absolute_target, current_price, direction
         )
+
+        triggered_at_ts = time.time()
+        updated_id = None
 
         # Update alert row and insert event atomically
         async with self.db.transaction():
@@ -221,30 +241,64 @@ class AlertsEngine:
                 last_evaluated_price = :price,
                 updated_at = NOW()
             WHERE id = :id AND status = 'active'
+            RETURNING id
             """
-            await self.db.execute(upd_sql, {"id": alert.id, "price": float(price)})
+            updated_id = await self.db.execute(upd_sql, {"id": alert.id, "price": float(current_price)})
 
-            # Insert trigger event; tolerate duplicate via catching unique violation
-            evt_sql = """
-            INSERT INTO public.alert_events (
-                alert_id, instrument_token, event_type, price_at_event, direction, reason, meta
-            ) VALUES (
-                :id, :token, 'triggered', :price, :direction, NULL, NULL
+            if updated_id:
+                # Insert trigger event; tolerate duplicate via catching unique violation
+                evt_sql = """
+                INSERT INTO public.alert_events (
+                    alert_id, instrument_token, event_type, price_at_event, direction, reason, meta
+                ) VALUES (
+                    :id, :token, 'triggered', :price, :direction, NULL, NULL
+                )
+                """
+                try:
+                    await self.db.execute(evt_sql, {
+                        "id": alert.id,
+                        "token": int(alert.instrument_token),
+                        "price": float(current_price),
+                        "direction": direction,
+                    })
+                except Exception as e:
+                    # If unique index ux_alert_events_triggered_once fires, ignore
+                    if 'ux_alert_events_triggered_once' in str(e):
+                        logger.debug("[ALERTS-ENGINE] duplicate trigger event ignored for id=%s", alert.id)
+                    else:
+                        raise
+        
+        if not updated_id:
+            # This can happen in a race condition where the alert is triggered by two parallel evaluations.
+            # The first one will update the status, and the second will find no active alert to update.
+            logger.info(f"[ALERTS-ENGINE] Trigger for alert {alert.id} was suppressed as it is no longer active.")
+            return
+
+        # Publish event to Redis Pub/Sub
+        event_payload = {
+            "type": "alert.triggered",
+            "id": alert.id,
+            "status": "triggered",
+            "triggered_at": triggered_at_ts,
+            "instrument_token": alert.instrument_token,
+            "comparator": alert.comparator,
+            "absolute_target": alert.absolute_target,
+            "baseline_price": alert.baseline_price,
+        }
+        await publish_event("alerts.events", event_payload)
+
+        # Schedule non-blocking ntfy notification
+        asyncio.create_task(
+            notify_alert_triggered(
+                alert_id=alert.id,
+                instrument_token=alert.instrument_token,
+                comparator=alert.comparator,
+                absolute_target=alert.absolute_target,
+                baseline_price=alert.baseline_price,
+                triggered_at=triggered_at_ts,
+                current_price=current_price,
             )
-            """
-            try:
-                await self.db.execute(evt_sql, {
-                    "id": alert.id,
-                    "token": int(alert.instrument_token),
-                    "price": float(price),
-                    "direction": direction,
-                })
-            except Exception as e:
-                # If unique index ux_alert_events_triggered_once fires, ignore
-                if 'ux_alert_events_triggered_once' in str(e):
-                    logger.debug("[ALERTS-ENGINE] duplicate trigger event ignored for id=%s", alert.id)
-                else:
-                    raise
+        )
 
     async def _persist_last_evaluated_price(self, alert_id: str, price: float, force: bool) -> None:
         now = time.monotonic()
@@ -264,54 +318,99 @@ class AlertsEngine:
             logger.error("[ALERTS-ENGINE] persist last_evaluated_price failed id=%s: %s", alert_id, e)
 
     def _remove_alert_from_memory(self, alert: Alert) -> None:
+        """
+        Removes an alert from all in-memory caches.
+        """
         tok = alert.instrument_token
+        
+        # Remove from token->alerts mapping
         lst = self._alerts_by_token.get(tok)
-        if not lst:
-            return
-        self._alerts_by_token[tok] = [a for a in lst if a.id != alert.id]
-        if not self._alerts_by_token[tok]:
-            self._alerts_by_token.pop(tok, None)
-            self._active_tokens.discard(tok)
-            # We do not immediately unsubscribe here; periodic refresh handles it safely.
+        if lst:
+            self._alerts_by_token[tok] = [a for a in lst if a.id != alert.id]
+            if not self._alerts_by_token[tok]:
+                del self._alerts_by_token[tok]
+                self._active_tokens.discard(tok)
+
+        # Remove from state tracking
+        self._alert_state.pop(alert.id, None)
+        self._last_persist_ts.pop(alert.id, None)
+        
+        logger.info(f"[ALERTS-ENGINE] Removed alert {alert.id} from memory after trigger.")
+    def _register_alert(self, alert: Alert) -> None:
+            """
+            Adds a new alert to in-memory state, including seeding its prev_price.
+            """
+            # Seed prev_price from best available source
+            prev_price = self._get_latest_price(alert.instrument_token)
+            if prev_price is None:
+                prev_price = alert.baseline_price
+    
+            self._alert_state[alert.id] = AlertState(prev_price=prev_price)
+            logger.info(
+                "[ALERTS-ENGINE] register id=%s token=%s initial_prev_price=%.6f",
+                alert.id, alert.instrument_token, prev_price if prev_price is not None else -1.0
+            )
+            # Ensure in-memory indices populated
+            token = alert.instrument_token
+            self._alerts_by_token.setdefault(token, []).append(alert)
+            self._active_tokens.add(token)
 
     # ------------- Active set and subscriptions -------------
 
     async def _refresh_active_alerts_and_subscriptions(self) -> None:
-        rows = await self.db.fetch_all(
-            """
-            SELECT id, instrument_token, comparator, target_type, absolute_target, one_time, last_evaluated_price
-            FROM public.alerts
-            WHERE status = 'active'
-            """
-        )
-        new_by_token: Dict[int, List[Alert]] = {}
-        for r in rows:
             try:
-                a = Alert(
-                    id=str(r["id"]),
-                    instrument_token=int(r["instrument_token"]),
-                    comparator=str(r["comparator"]),
-                    absolute_target=float(r["absolute_target"]),
-                    last_evaluated_price=float(r["last_evaluated_price"]) if r["last_evaluated_price"] is not None else None,
-                    one_time=bool(r["one_time"]) if r["one_time"] is not None else True,
+                rows = await self.db.fetch_all(
+                    """
+                    SELECT id, instrument_token, comparator, target_type, absolute_target, one_time, baseline_price
+                    FROM public.alerts
+                    WHERE status = 'active'
+                    """
                 )
-                new_by_token.setdefault(a.instrument_token, []).append(a)
-            except Exception as e:
-                logger.error("[ALERTS-ENGINE] bad row in active set: %s", e)
-
-        new_tokens: Set[int] = set(new_by_token.keys())
-        old_tokens: Set[int] = set(self._alerts_by_token.keys())
-
-        self._alerts_by_token = new_by_token
-        self._active_tokens = set(new_tokens)
-
-        # Manage server-side subscriptions owned by the engine (only for tokens without any client refcounts)
-        await self._reconcile_engine_subscriptions(new_tokens)
-
-        logger.debug(
-            "[ALERTS-ENGINE] refresh: tokens=%d alerts=%d engine_subs=%d",
-            len(self._active_tokens), sum(len(v) for v in self._alerts_by_token.values()), len(self._engine_subscribed_tokens)
-        )
+                new_alerts_map: Dict[str, Alert] = {}
+                new_by_token: Dict[int, List[Alert]] = {}
+                for r in rows:
+                    try:
+                        a = Alert(
+                            id=str(r["id"]),
+                            instrument_token=int(r["instrument_token"]),
+                            comparator=str(r["comparator"]),
+                            absolute_target=float(r["absolute_target"]),
+                            baseline_price=float(r["baseline_price"]) if r["baseline_price"] is not None else None,
+                            one_time=bool(r["one_time"]) if r["one_time"] is not None else True,
+                        )
+                        new_alerts_map[a.id] = a
+                        new_by_token.setdefault(a.instrument_token, []).append(a)
+                    except Exception as e:
+                        logger.error("[ALERTS-ENGINE] bad row in active set: %s", e)
+    
+                old_alert_ids = set(self._alert_state.keys())
+                new_alert_ids = set(new_alerts_map.keys())
+    
+                # Register new alerts
+                for alert_id in (new_alert_ids - old_alert_ids):
+                    self._register_alert(new_alerts_map[alert_id])
+    
+                # De-register alerts that are no longer active
+                for alert_id in (old_alert_ids - new_alert_ids):
+                    alert = next((a for a_list in self._alerts_by_token.values() for a in a_list if a.id == alert_id), None)
+                    if alert:
+                        self._remove_alert_from_memory(alert)
+                    # Purge from state tracking so it can be re-registered cleanly if reactivated
+                    self._alert_state.pop(alert_id, None)
+                    self._last_persist_ts.pop(alert_id, None)
+    
+                self._alerts_by_token = new_by_token
+                self._active_tokens = set(new_by_token.keys())
+    
+                # Manage server-side subscriptions
+                await self._reconcile_engine_subscriptions(self._active_tokens)
+    
+                logger.debug(
+                    "[ALERTS-ENGINE] refresh: tokens=%d alerts=%d engine_subs=%d",
+                    len(self._active_tokens), len(self._alert_state), len(self._engine_subscribed_tokens)
+                )
+            except Exception:
+                logger.exception("[ALERTS-ENGINE] refresh loop failed; continuing")
 
     async def _reconcile_engine_subscriptions(self, desired_tokens: Set[int]) -> None:
         # Filter to tokens with zero client refcount
@@ -388,13 +487,19 @@ class AlertsEngine:
             status = None
             if self.ws_manager and hasattr(self.ws_manager, "get_websocket_status"):
                 status = self.ws_manager.get_websocket_status()
+
             if status != self._last_ws_status:
-                # On transition to CONNECTED, re-subscribe engine-owned tokens
-                if status == "CONNECTED" and self._engine_subscribed_tokens:
-                    await self._engine_subscribe_safe(sorted(list(self._engine_subscribed_tokens)))
+                prev_status = self._last_ws_status
                 self._last_ws_status = status
-        except Exception:
-            pass
+                logger.info("[ALERTS-ENGINE] WS status change: %s -> %s", prev_status, status)
+
+                # On transition to CONNECTED, reconcile all engine subscriptions
+                if prev_status != "CONNECTED" and status == "CONNECTED":
+                    logger.info("[ALERTS-ENGINE] WS reconnected; reconciling all engine subscriptions")
+                    desired_tokens = set(self._alerts_by_token.keys())
+                    await self._reconcile_engine_subscriptions(desired_tokens)
+        except Exception as e:
+            logger.error("[ALERTS-ENGINE] _handle_ws_reconnect failed: %s", e, exc_info=True)
 
     async def refresh_now(self) -> None:
         """

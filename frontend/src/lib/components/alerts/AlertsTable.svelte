@@ -1,6 +1,8 @@
 <script lang="ts">
-  import { onMount, createEventDispatcher } from 'svelte';
+  import { onMount, createEventDispatcher, onDestroy } from 'svelte';
   import { toast } from '$lib/stores/toast';
+  import * as Alert from '$lib/components/ui/alert/index.js';
+  import CheckCircle2Icon from '@lucide/svelte/icons/check-circle-2';
   import {
     getAlerts,
     pauseAlert,
@@ -10,7 +12,7 @@
     deleteAlert,
     getUserSubscriptions
   } from '$lib/api';
-  import type { Alert, ListAlertsResponse } from '$lib/types';
+  import type { Alert as AlertType, ListAlertsResponse } from '$lib/types';
   import {
     Table,
     TableHeader,
@@ -22,16 +24,25 @@
   } from '$lib/components/ui/table';
   import SkeletonLoader from '$lib/components/SkeletonLoader.svelte';
   import { marketwatch } from '$lib/stores/marketwatch';
-  import { Pause, X, Play, RefreshCw, Copy, Trash2 } from 'lucide-svelte';
 
   let loading = false;
-  let items: Alert[] = [];
+  let items: AlertType[] = [];
   let total = 0;
   let limit = 50;
   let offset = 0;
   let sort: 'created_at' | '-created_at' | 'updated_at' | '-updated_at' = '-created_at';
   let statusFilter: string | undefined = undefined;
   let instrumentFilter: number | undefined = undefined;
+  let pollInterval: ReturnType<typeof setInterval>;
+  let es: EventSource | null = null;
+  let sseConnected = false;
+  const API_BASE = (import.meta.env?.VITE_API_BASE as string) || '';
+  const sseUrl = API_BASE.replace(/\/$/, '') + '/alerts/events';
+
+  let showBanner = false;
+  let bannerTitle = 'Alert Triggered';
+  let bannerDescription = '';
+  let bannerTimer: ReturnType<typeof setTimeout> | null = null;
 
   const limits = [20, 50, 100];
 
@@ -50,7 +61,9 @@
   }
 
   async function load() {
-    loading = true;
+    if (items.length === 0) {
+      loading = true;
+    }
     try {
       let token = undefined;
       if (instrumentFilter) {
@@ -71,6 +84,12 @@
       });
       items = res.items ?? [];
       total = res.total ?? 0;
+
+      // Subscribe to all visible instrument tokens for live LTP
+      const tokens = items.map(a => a.instrument_token).filter(t => t > 0);
+      if (tokens.length > 0) {
+        marketwatch.subscribeToInstruments(tokens, 'ltp');
+      }
 
       // Warm symbol cache for visible rows so trading symbols show quickly
       try {
@@ -116,7 +135,7 @@
     }
   }
 
-  async function doAction(p: Promise<Alert>, successMsg: string) {
+  async function doAction(p: Promise<AlertType>, successMsg: string) {
     try {
       await p;
       toast.success(successMsg);
@@ -126,19 +145,19 @@
     }
   }
 
-  function onPause(a: Alert) {
+  function onPause(a: AlertType) {
     return doAction(pauseAlert(a.id), 'Alert paused');
   }
-  function onResume(a: Alert) {
+  function onResume(a: AlertType) {
     return doAction(resumeAlert(a.id), 'Alert resumed');
   }
-  function onCancel(a: Alert) {
+  function onCancel(a: AlertType) {
     return doAction(cancelAlert(a.id), 'Alert canceled');
   }
-  function onReactivate(a: Alert) {
+  function onReactivate(a: AlertType) {
     return doAction(reactivateAlert(a.id), 'Alert reactivated');
   }
-  function onDelete(a: Alert) {
+  function onDelete(a: AlertType) {
     if (!confirm('Permanently delete this alert? This cannot be undone.')) return;
     return doAction(deleteAlert(a.id, true), 'Alert deleted');
   }
@@ -229,12 +248,73 @@
   }
 
   onMount(() => {
-    load();
-    void preloadSymbols();
-  });
+      load();
+      void preloadSymbols();
+      pollInterval = setInterval(refresh, 5000);
+      try {
+        es = new EventSource(sseUrl);
+        es.onopen = () => {
+          sseConnected = true;
+        };
+        es.onmessage = (ev) => {
+          try {
+            const evt = JSON.parse(ev.data);
+            if (evt?.type === 'alert.triggered' && evt?.id) {
+              items = items.map((it) =>
+                it.id === evt.id
+                  ? { ...it, status: evt.status || 'triggered', triggered_at: evt.triggered_at ?? it.triggered_at }
+                  : it
+              );
+
+              // Show banner
+              bannerTitle = 'Alert Triggered';
+              bannerDescription = `Token ${evt.instrument_token} | ${evt.comparator} ${evt.absolute_target ?? ''} | baseline ${evt.baseline_price ?? ''}`;
+              showBanner = true;
+              if (bannerTimer) clearTimeout(bannerTimer);
+              bannerTimer = setTimeout(() => {
+                showBanner = false;
+              }, 5000);
+            }
+          } catch (_) {
+            // ignore malformed events
+          }
+        };
+        es.onerror = () => {
+          sseConnected = false;
+        };
+      } catch (_) {
+        // SSE init failed; polling continues
+      }
+    });
+
+  onDestroy(() => {
+      // Unsubscribe from all visible tokens to prevent leaks
+      const tokens = items.map(a => a.instrument_token).filter(t => t > 0);
+      if (tokens.length > 0) {
+        marketwatch.unsubscribeFromInstruments(tokens);
+      }
+      if (pollInterval) {
+        clearInterval(pollInterval);
+      }
+      if (es) {
+        es.close();
+        es = null;
+      }
+      if (bannerTimer) {
+        clearTimeout(bannerTimer);
+      }
+    });
 </script>
 
 <section class="space-y-3">
+  {#if showBanner}
+    <Alert.Root>
+      <CheckCircle2Icon />
+      <Alert.Title>{bannerTitle}</Alert.Title>
+      <Alert.Description>{bannerDescription}</Alert.Description>
+    </Alert.Root>
+  {/if}
+
   <div class="flex flex-wrap items-center justify-between gap-2">
     <div class="flex items-center gap-2">
       <label class="text-sm text-gray-600" for="alerts_status">Status</label>
@@ -279,6 +359,7 @@
           <TableHead>Symbol</TableHead>
           <TableHead>Comparator</TableHead>
           <TableHead>Target Price</TableHead>
+          <TableHead>Current Price</TableHead>
           <TableHead>Initial Price</TableHead>
           <TableHead>
             <button class="underline" on:click={toggleCreatedSort} title="Toggle sort">
@@ -294,14 +375,14 @@
         {#if loading}
           {#each Array.from({ length: 5 }) as _, i}
             <TableRow>
-              {#each Array.from({ length: 7 }) as __}
+              {#each Array.from({ length: 8 }) as __}
                 <TableCell><SkeletonLoader height="1rem" /></TableCell>
               {/each}
             </TableRow>
           {/each}
         {:else if items.length === 0}
           <TableRow>
-            <TableCell colspan={7}>
+            <TableCell colspan={8}>
               <div class="p-6 text-sm text-gray-600">No alerts found.</div>
             </TableCell>
           </TableRow>
@@ -311,6 +392,7 @@
               <TableCell>{a.tradingsymbol || (a.instrument_token ? symbolForToken(a.instrument_token) : '-')}</TableCell>
               <TableCell>{@html cmpSymbol(a.comparator)}</TableCell>
               <TableCell>{a.absolute_target ?? '-'}</TableCell>
+              <TableCell>{$marketwatch.instruments[a.instrument_token]?.last_price ?? '-'}</TableCell>
               <TableCell>{a.baseline_price ?? '-'}</TableCell>
               <TableCell class="whitespace-nowrap">{new Date(a.created_at).toLocaleString()}</TableCell>
               <TableCell>
@@ -319,17 +401,17 @@
               <TableCell class="text-right">
                 <div class="flex justify-end gap-2">
                   {#if a.status === 'active'}
-                    <button class="btn btn-xs" on:click={() => onPause(a)} title="Pause"><Pause class="h-4 w-4" /></button>
-                    <button class="btn btn-xs" on:click={() => onCancel(a)} title="Cancel"><X class="h-4 w-4" /></button>
+                    <button class="btn btn-xs" on:click={() => onPause(a)}>Pause</button>
+                    <button class="btn btn-xs" on:click={() => onCancel(a)}>Cancel</button>
                   {:else if a.status === 'paused'}
-                    <button class="btn btn-xs" on:click={() => onResume(a)} title="Resume"><Play class="h-4 w-4" /></button>
-                    <button class="btn btn-xs" on:click={() => onCancel(a)} title="Cancel"><X class="h-4 w-4" /></button>
+                    <button class="btn btn-xs" on:click={() => onResume(a)}>Resume</button>
+                    <button class="btn btn-xs" on:click={() => onCancel(a)}>Cancel</button>
                   {/if}
                   {#if a.status === 'triggered' || a.status === 'canceled' || a.status === 'paused'}
-                    <button class="btn btn-xs" on:click={() => onReactivate(a)} title="Reactivate"><RefreshCw class="h-4 w-4" /></button>
+                    <button class="btn btn-xs" on:click={() => onReactivate(a)}>Reactivate</button>
                   {/if}
-                  <button class="btn btn-xs" on:click={() => dispatch('recreate', { alert: a })} title="Recreate"><Copy class="h-4 w-4" /></button>
-                  <button class="btn btn-xs btn-danger" on:click={() => onDelete(a)} title="Delete"><Trash2 class="h-4 w-4" /></button>
+                  <button class="btn btn-xs" on:click={() => dispatch('recreate', { alert: a })}>Recreate</button>
+                  <button class="btn btn-xs btn-danger" on:click={() => onDelete(a)}>Delete</button>
                 </div>
               </TableCell>
             </TableRow>

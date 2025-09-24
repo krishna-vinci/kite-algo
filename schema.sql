@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS public.alerts (
   one_time BOOLEAN NOT NULL DEFAULT TRUE,
   name  TEXT,
   notes TEXT,
-  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('draft','active','paused','canceled','triggered')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('draft', 'active', 'paused', 'canceled', 'triggered')),
   instrument_exchange     TEXT,
   instrument_tradingsymbol TEXT,
   ltp_source_hint TEXT,

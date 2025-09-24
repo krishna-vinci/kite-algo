@@ -142,12 +142,12 @@ export async function getAlerts(params: {
   offset?: number;
   sort?: 'created_at' | '-created_at' | 'updated_at' | '-updated_at';
 } = {}): Promise<ListAlertsResponse> {
- const newParams: any = {...params};
- //if (newParams.instrument_token) {
- // newParams.instrument_name = newParams.instrument_token;
- // delete newParams.instrument_token;
- //}
- const qs = toQuery(newParams);
+  const newParams: any = {...params};
+  if (newParams.instrument_token) {
+    newParams.instrument_name = newParams.instrument_token;
+    delete newParams.instrument_token;
+  }
+  const qs = toQuery(newParams);
   const res = await apiFetch(`/alerts${qs}`);
   if (!res.ok) {
     const t = await res.text().catch(() => '');
