@@ -32,10 +32,8 @@
 		{ name: 'Dashboard', href: '/' },
 		{ name: 'Market Watch', href: '/marketwatch' },
 		{ name: 'Orders', href: '/orders' },
-		{ name: 'Holdings', href: '/holdings' },
-		{ name: 'Positions', href: '/positions' },
-		{ name: 'Bids', href: '/bids' },
-		{ name: 'Funds', href: '/funds' },
+		{ name: 'Investing', href: '/holdings' },
+		{ name: 'Trades', href: '/positions' },
 		{ name: 'Alerts', href: '/alerts' },
 		{ name: 'Strategies', href: '/strategies/momentum' }
 	];
@@ -57,7 +55,8 @@
 							<NavigationMenuLink
 								href={item.href}
 								class="group inline-flex h-9 w-max items-center justify-center rounded-md bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent focus:bg-accent focus:outline-none focus:ring-1 focus:ring-ring {$page
-									.url.pathname === item.href
+									.url
+									.pathname === item.href || ($page.url.pathname.startsWith(item.href) && item.href !== '/')
 									? 'bg-primary text-primary-foreground'
 									: 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'}"
 							>
@@ -115,7 +114,8 @@
 								<a
 									href={item.href}
 									class="block select-none space-y-1 rounded-md px-2 py-1.5 text-sm font-medium leading-none {$page
-										.url.pathname === item.href
+										.url
+										.pathname === item.href || ($page.url.pathname.startsWith(item.href) && item.href !== '/')
 										? 'bg-primary text-primary-foreground hover:bg-primary'
 										: 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'}"
 								>

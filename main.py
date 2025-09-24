@@ -46,6 +46,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 from broker_api.broker_api import router as broker_api_router
 from broker_api.alerts_router import router as alerts_router
+from broker_api.performance_router import router as performance_router
 
 ### fyers auth import ##
 import httpx
@@ -347,6 +348,7 @@ app.mount("/mcp", mcp_app_direct_wrapped)
 app.include_router(broker_api_router, prefix="/broker")
 app.include_router(momentum_router, prefix="/broker")
 app.include_router(alerts_router, prefix="/alerts")
+app.include_router(performance_router, prefix="/broker")
 
 from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
 import logging

@@ -1,19 +1,21 @@
 <script lang="ts">
-    import { onMount } from 'svelte';
-    import { browser } from '$app/environment';
-    import { getApiBase, getUserSubscriptions, saveUserSubscriptions } from '$lib/api';
-    import { marketwatch } from '$lib/stores/marketwatch';
-    import type { Instrument, Group, WatchlistData } from '$lib/types';
-   
-    // --- Icon Components (as SVG strings) ---
-    const SearchIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`;
-    const SlidersIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"></line><line x1="4" y1="10" x2="4" y2="3"></line><line x1="12" y1="21" x2="12" y2="12"></line><line x1="12" y1="8" x2="12" y2="3"></line><line x1="20" y1="21" x2="20" y2="16"></line><line x1="20" y1="12" x2="20" y2="3"></line><line x1="1" y1="14" x2="7" y2="14"></line><line x1="9" y1="8" x2="15" y2="8"></line><line x1="17" y1="16" x2="23" y2="16"></line></svg>`;
-    const BriefcaseIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>`;
-    const ArrowUpIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>`;
-    const ArrowDownIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><polyline points="19 12 12 19 5 12"></polyline></svg>`;
-    const LayersIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>`;
-    const PlusIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24" viewfill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>`;
-    const TrashIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>`;
+	import { onMount } from 'svelte';
+	import { browser } from '$app/environment';
+	import { getApiBase, getUserSubscriptions, saveUserSubscriptions } from '$lib/api';
+	import { marketwatch } from '$lib/stores/marketwatch';
+	import type { Instrument, Group, WatchlistData } from '$lib/types';
+	export let isCollapsed = true;
+	// --- Icon Components (as SVG strings) ---
+	const SearchIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`;
+	const SlidersIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"></line><line x1="4" y1="10" x2="4" y2="3"></line><line x1="12" y1="21" x2="12" y2="12"></line><line x1="12" y1="8" x2="12" y2="3"></line><line x1="20" y1="21" x2="20" y2="16"></line><line x1="20" y1="12" x2="20" y2="3"></line><line x1="1" y1="14" x2="7" y2="14"></line><line x1="9" y1="8" x2="15" y2="8"></line><line x1="17" y1="16" x2="23" y2="16"></line></svg>`;
+	const BriefcaseIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>`;
+	const ArrowUpIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>`;
+	const ArrowDownIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><polyline points="19 12 12 19 5 12"></polyline></svg>`;
+	const LayersIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>`;
+	const PlusIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24" viewfill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>`;
+	const TrashIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>`;
+	const ChevronLeftIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>`;
+	const ChevronRightIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`;
 
     // --- Primary State ---
     let allWatchlists: WatchlistData[] = [];
@@ -131,13 +133,10 @@
                 // Initialize with a default structure if nothing is stored on the server
                 allWatchlists = [
                     createDefaultWatchlist(),
-                    createEmptyWatchlist(),
-                    createEmptyWatchlist(),
-                    createEmptyWatchlist(),
-                    createEmptyWatchlist(),
-                    createEmptyWatchlist(),
-                    createEmptyWatchlist()
                 ];
+            }
+            while (allWatchlists.length < 5) {
+                allWatchlists.push(createEmptyWatchlist());
             }
         } catch (e) {
             console.warn('Could not fetch subscriptions from server. Using default.', e);
@@ -303,116 +302,225 @@
     }
 </script>
 
-<aside class="sidebar">
- <!-- Top Section -->
-	<div class="top-section">
-		<div class="search-container">
-			<div class="search-icon">{@html SearchIcon}</div>
-			<input type="text" placeholder="Search eg: infy bse, nifty fut, etc" bind:value={searchTerm} />
-			<div class="search-actions"><span class="kbd">Ctrl</span><span class="kbd">K</span><button class="icon-button">{@html SlidersIcon}</button></div>
-			{#if searchResults.length > 0}
-				<ul class="search-results">
-					{#each searchResults as instrument (instrument.instrument_token)}
-						<li on:click={() => addInstrumentToActiveGroup(instrument)}>
-							<span>{instrument.tradingsymbol}</span>
-							<span class="text-xs text-gray-500">{instrument.name}</span>
-							<span class="add-indicator">+</span>
+<aside class="sidebar" class:collapsed={isCollapsed}>
+	<div class="sidebar-content">
+		<!-- Top Section -->
+		<div class="top-section">
+			<div class="search-container">
+				<div class="search-icon">{@html SearchIcon}</div>
+				<input type="text" placeholder="Search eg: infy bse, nifty fut, etc" bind:value={searchTerm} />
+				<div class="search-actions">
+					<span class="kbd">Ctrl</span><span class="kbd">K</span><button class="icon-button">{@html SlidersIcon}</button>
+				</div>
+				{#if searchResults.length > 0}
+					<ul class="search-results">
+						{#each searchResults as instrument (instrument.instrument_token)}
+							<li on:click={() => addInstrumentToActiveGroup(instrument)}>
+								<span>{instrument.tradingsymbol}</span>
+								<span class="text-xs text-gray-500">{instrument.name}</span>
+								<span class="add-indicator">+</span>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</div>
+			<div class="watchlist-info">
+				<span>MW {currentWatchlistPage + 1} ({activeGroup?.instruments.length ?? 0} / 250)</span>
+				<button class="link-button" on:click={addGroup}>+ New group</button>
+			</div>
+			<div class="group-list">
+				{#if groups}
+					{#each groups as group, i (group.id)}
+						<button
+							class="group-selector"
+							class:active={activeGroupIndex === i}
+							on:click={() => setActiveGroup(i)}
+							on:dragover|preventDefault={(e) => (e.currentTarget as HTMLElement).classList.add('drag-over')}
+							on:dragleave={(e) => (e.currentTarget as HTMLElement).classList.remove('drag-over')}
+							on:drop={(e) => handleGroupDrop(e, i)}
+						>
+							<span class="group-name">{group.name}</span>
+							<span class="group-count">({group.instruments.length})</span>
+						</button>
+					{/each}
+				{/if}
+			</div>
+		</div>
+
+		<!-- Middle Section -->
+		<div class="middle-section">
+			{#if activeGroup}
+				<ul>
+					{#each activeGroup.instruments as instrument (instrument.id)}
+						{@const liveData = $marketwatch.instruments[instrument.instrument_token] || instrument}
+						{@const percentChange = getPercentChange(liveData, instrument)}
+						{@const priceChange = getPriceChange(liveData, instrument)}
+						{@const isDown = (percentChange ?? 0) < 0}
+						<li
+							class="stock-item"
+							draggable="true"
+							on:dragstart={(e) => handleDragStart(e, instrument)}
+							on:dragend={handleDragEnd}
+							on:dragover={(e) => handleInstrumentDragOver(e, instrument)}
+							on:dragleave={() => (dropIndicator.targetId = null)}
+							on:drop={(e) => handleInstrumentDrop(e, instrument)}
+						>
+							{#if dropIndicator.targetId === instrument.id && dropIndicator.position === 'before'}
+								<div class="drop-indicator top" />
+							{/if}
+
+							<span class="stock-name" class:red={isDown} class:green={!isDown}>{instrument.name}</span>
+							<div class="stock-data">
+								<span class="data-point change" class:red={isDown}>{(priceChange ?? 0).toFixed(2)}</span>
+								<span class="data-point percent-change" class:red={isDown} class:green={!isDown}>
+									{(percentChange ?? 0).toFixed(2)}%
+									<span class="arrow-icon">{#if isDown}{@html ArrowDownIcon}{:else}{@html ArrowUpIcon}{/if}</span>
+								</span>
+								<span class="data-point price" class:red={isDown} class:green={!isDown}>
+									{(liveData?.last_price ?? instrument.price ?? 0).toFixed(2)}
+								</span>
+							</div>
+							<button
+								class="delete-button"
+								title="Delete Instrument"
+								on:click|stopPropagation={() => deleteInstrument(instrument.id)}
+							>
+								{@html TrashIcon}
+							</button>
+
+							{#if dropIndicator.targetId === instrument.id && dropIndicator.position === 'after'}
+								<div class="drop-indicator bottom" />
+							{/if}
 						</li>
+					{:else}
+						<div class="empty-state">This group is empty. Drag instruments here.</div>
 					{/each}
 				</ul>
+			{:else}
+				<div class="empty-state">Loading...</div>
 			{/if}
 		</div>
-		<div class="watchlist-info">
-			<span>MW {currentWatchlistPage + 1} ({activeGroup?.instruments.length ?? 0} / 250)</span>
-			<button class="link-button" on:click={addGroup}>+ New group</button>
-		</div>
-		<div class="group-list">
-			{#if groups}
-				{#each groups as group, i (group.id)}
+
+		<!-- Bottom Section -->
+		<div class="bottom-section">
+			<div class="pagination">
+				{#each allWatchlists as _, i (i)}
 					<button
-						class="group-selector"
-						class:active={activeGroupIndex === i}
-						on:click={() => setActiveGroup(i)}
-						on:dragover|preventDefault={(e) => (e.currentTarget as HTMLElement).classList.add('drag-over')}
-						on:dragleave={(e) => (e.currentTarget as HTMLElement).classList.remove('drag-over')}
-						on:drop={(e) => handleGroupDrop(e, i)}
+						on:click={() => (currentWatchlistPage = i)}
+						class="pagination-button"
+						class:active={currentWatchlistPage === i}
 					>
-						<span class="group-name">{group.name}</span>
-						<span class="group-count">({group.instruments.length})</span>
+						{i + 1}
 					</button>
 				{/each}
-			{/if}
+			</div>
+			<div class="bottom-actions">
+				<button class="icon-button">{@html LayersIcon}</button>
+				<button class="icon-button">{@html PlusIcon}</button>
+			</div>
 		</div>
 	</div>
-
-	<!-- Middle Section -->
-	<div class="middle-section">
-		{#if activeGroup}
-			<ul>
-				{#each activeGroup.instruments as instrument (instrument.id)}
-					{@const liveData = $marketwatch.instruments[instrument.instrument_token] || instrument}
-					{@const percentChange = getPercentChange(liveData, instrument)}
-					{@const priceChange = getPriceChange(liveData, instrument)}
-					{@const isDown = (percentChange ?? 0) < 0}
-					<li
-						class="stock-item"
-						draggable="true"
-						on:dragstart={(e) => handleDragStart(e, instrument)}
-						on:dragend={handleDragEnd}
-						on:dragover={(e) => handleInstrumentDragOver(e, instrument)}
-						on:dragleave={() => dropIndicator.targetId = null}
-						on:drop={(e) => handleInstrumentDrop(e, instrument)}
-					>
-						{#if dropIndicator.targetId === instrument.id && dropIndicator.position === 'before'}<div class="drop-indicator top" />{/if}
-
-						<span class="stock-name" class:red={isDown} class:green={!isDown}>{instrument.name}</span>
-						<div class="stock-data">
-							<span class="data-point change" class:red={isDown}>{(priceChange ?? 0).toFixed(2)}</span>
-							<span class="data-point percent-change" class:red={isDown} class:green={!isDown}>
-								{(percentChange ?? 0).toFixed(2)}%
-								<span class="arrow-icon">{#if isDown}{@html ArrowDownIcon}{:else}{@html ArrowUpIcon}{/if}</span>
-							</span>
-							<span class="data-point price" class:red={isDown} class:green={!isDown}>{(liveData?.last_price ?? instrument.price ?? 0).toFixed(2)}</span>
-						</div>
-						<button class="delete-button" title="Delete Instrument" on:click|stopPropagation={() => deleteInstrument(instrument.id)}>
-							{@html TrashIcon}
-						</button>
-
-						{#if dropIndicator.targetId === instrument.id && dropIndicator.position === 'after'}<div class="drop-indicator bottom" />{/if}
-					</li>
-				{:else}
-					<div class="empty-state">This group is empty. Drag instruments here.</div>
-				{/each}
-			</ul>
-		{:else}
-			<div class="empty-state">Loading...</div>
-		{/if}
-	</div>
-
-	<!-- Bottom Section -->
-	<div class="bottom-section">
-		<div class="pagination">
-			{#each allWatchlists as _, i (i)}
-				<button on:click={() => (currentWatchlistPage = i)} class="pagination-button" class:active={currentWatchlistPage === i}>
-					{i + 1}
-				</button>
-			{/each}
-		</div>
-		<div class="bottom-actions">
-			<button class="icon-button">{@html LayersIcon}</button>
-			<button class="icon-button">{@html PlusIcon}</button>
-		</div>
-	</div>
+	<button
+		class="collapse-button"
+		on:click={() => (isCollapsed = !isCollapsed)}
+		title={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+	>
+		{@html isCollapsed ? ChevronRightIcon : ChevronLeftIcon}
+	</button>
 </aside>
 
 <style>
-    :root { --border-color: #e5e7eb; --text-gray-400: #9ca3af; --text-gray-500: #6b7280; --text-gray-800: #1f2937; --text-gray-900: #111827; --bg-gray-50: #f9fafb; --bg-gray-100: #f3f4f6; --brand-blue: #2563eb; --brand-orange: #f97316; --brand-red: #dc2626; --brand-green: #16a34a; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    button { background: none; border: none; cursor: pointer; font-family: inherit; }
-    ul { list-style: none; }
-    .sidebar { width: 360px; height: 100%; display: flex; flex-direction: column; border-right: 1px solid var(--border-color); background-color: white; }
-    .top-section { padding: 0.75rem; border-bottom: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 0.75rem; }
-    .middle-section { flex-grow: 1; overflow-y: auto; padding: 0.5rem 0.75rem; }
+	:root {
+		--border-color: #e5e7eb;
+		--text-gray-400: #9ca3af;
+		--text-gray-500: #6b7280;
+		--text-gray-800: #1f2937;
+		--text-gray-900: #111827;
+		--bg-gray-50: #f9fafb;
+		--bg-gray-100: #f3f4f6;
+		--brand-blue: #2563eb;
+		--brand-orange: #f97316;
+		--brand-red: #dc2626;
+		--brand-green: #16a34a;
+	}
+	* {
+		box-sizing: border-box;
+		margin: 0;
+		padding: 0;
+	}
+	button {
+		background: none;
+		border: none;
+		cursor: pointer;
+		font-family: inherit;
+	}
+	ul {
+		list-style: none;
+	}
+	.sidebar {
+		position: relative;
+		width: 360px;
+		height: 100%;
+		display: flex;
+		flex-direction: column;
+		border-right: 1px solid var(--border-color);
+		background-color: white;
+		transition: width 0.2s ease-in-out;
+	}
+	.sidebar.collapsed {
+		width: 0;
+		border-right: none;
+	}
+	.sidebar-content {
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		overflow: hidden;
+	}
+	.sidebar.collapsed .sidebar-content {
+		display: none;
+	}
+	.collapse-button {
+		position: absolute;
+		top: 50%;
+		left: 100%;
+		transform: translate(-50%, -50%);
+		z-index: 100;
+		width: 24px;
+		height: 24px;
+		border-radius: 50%;
+		background-color: white;
+		border: 1px solid var(--border-color);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		cursor: pointer;
+		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+		transition: left 0.2s ease-in-out;
+	}
+	.sidebar.collapsed .collapse-button {
+		left: 12px;
+	}
+	.collapse-button:hover {
+		background-color: var(--bg-gray-50);
+	}
+	.collapse-button :global(svg) {
+		width: 16px;
+		height: 16px;
+	}
+
+	.top-section {
+		padding: 0.75rem;
+		border-bottom: 1px solid var(--border-color);
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+	.middle-section {
+		flex-grow: 1;
+		overflow-y: auto;
+		padding: 0.5rem 0.75rem;
+	}
     .bottom-section { display: flex; align-items: center; justify-content: space-between; padding: 0.375rem 1rem; border-top: 1px solid var(--border-color); }
     .search-container { position: relative; }
     .search-container input { width: 100%; height: 36px; padding-left: 36px; padding-right: 96px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; }
