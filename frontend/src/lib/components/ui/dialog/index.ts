@@ -1,0 +1,33 @@
+import { Dialog as DialogPrimitive } from 'bits-ui';
+import Trigger from './dialog-trigger.svelte';
+import Close from './dialog-close.svelte';
+import Overlay from './dialog-overlay.svelte';
+import Content from './dialog-content.svelte';
+import Header from './dialog-header.svelte';
+import Title from './dialog-title.svelte';
+import Description from './dialog-description.svelte';
+
+const Root = DialogPrimitive.Root;
+const Portal = DialogPrimitive.Portal;
+
+export {
+  Root,
+  Trigger,
+  Close,
+  Portal,
+  Overlay,
+  Content,
+  Header,
+  Title,
+  Description,
+  //
+  Root as Dialog,
+  Trigger as DialogTrigger,
+  Close as DialogClose,
+  Portal as DialogPortal,
+  Overlay as DialogOverlay,
+  Content as DialogContent,
+  Header as DialogHeader,
+  Title as DialogTitle,
+  Description as DialogDescription
+};

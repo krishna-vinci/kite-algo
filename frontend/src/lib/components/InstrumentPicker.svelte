@@ -42,6 +42,11 @@
 	export let selected: InstrumentRow | null = null;
 	export let placeholder = 'Search eg: infy bse, nifty fut, index';
 	export let disabled = false;
+	export let prefillInstrument: InstrumentRow | null = null;
+
+	$: if (prefillInstrument && !selected) {
+		choose(prefillInstrument);
+	}
 
 	const dispatch = createEventDispatcher();
 
@@ -167,6 +172,7 @@
 </div>
 
 <style>
+	@reference "tailwindcss";
 	.picker {
 		position: relative;
 	}

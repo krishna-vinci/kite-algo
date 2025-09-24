@@ -113,3 +113,133 @@ export async function saveUserSubscriptions(subscriptions: any, scope?: 'sidebar
     }
     return response.json();
 }
+
+/**
+ * Alerts API
+ */
+import type {
+  Alert,
+  ListAlertsResponse,
+  AlertCreateRequest,
+  AlertPatchRequest
+} from '$lib/types';
+
+function toQuery(params: Record<string, string | number | boolean | undefined | null>): string {
+  const usp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === '') continue;
+    usp.set(k, String(v));
+  }
+  const qs = usp.toString();
+  return qs ? `?${qs}` : '';
+}
+
+export async function getAlerts(params: {
+  status?: string;
+  instrument_token?: number;
+  instrument_name?: string;
+  limit?: number;
+  offset?: number;
+  sort?: 'created_at' | '-created_at' | 'updated_at' | '-updated_at';
+} = {}): Promise<ListAlertsResponse> {
+ const newParams: any = {...params};
+ //if (newParams.instrument_token) {
+ // newParams.instrument_name = newParams.instrument_token;
+ // delete newParams.instrument_token;
+ //}
+ const qs = toQuery(newParams);
+  const res = await apiFetch(`/alerts${qs}`);
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Failed to fetch alerts: ${res.status} ${t}`);
+  }
+  return (await res.json()) as ListAlertsResponse;
+}
+
+export async function createAlert(body: AlertCreateRequest): Promise<Alert> {
+  const res = await apiFetch('/alerts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (res.status === 424) {
+    // Baseline unavailable special-case for UX
+    const detail = await res.json().catch(() => null) as any;
+    const err = new Error(detail?.detail ?? 'Baseline price unavailable. Provide baseline_price or try later.');
+    (err as any).status = 424;
+    throw err;
+  }
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Create alert failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as Alert;
+}
+
+export async function patchAlert(id: string, patch: AlertPatchRequest): Promise<Alert> {
+  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch)
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Patch alert failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as Alert;
+}
+
+export async function deleteAlert(id: string, hard?: boolean): Promise<Alert> {
+  const qs = toQuery({ hard: !!hard });
+  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Delete alert failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as Alert;
+}
+
+export async function duplicateAlert(id: string): Promise<Alert> {
+  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}/duplicate`, { method: 'POST' });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Duplicate alert failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as Alert;
+}
+
+export async function pauseAlert(id: string): Promise<Alert> {
+  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}/pause`, { method: 'POST' });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Pause alert failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as Alert;
+}
+
+export async function resumeAlert(id: string): Promise<Alert> {
+  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}/resume`, { method: 'POST' });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Resume alert failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as Alert;
+}
+
+export async function cancelAlert(id: string): Promise<Alert> {
+  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Cancel alert failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as Alert;
+}
+
+export async function reactivateAlert(id: string): Promise<Alert> {
+  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}/reactivate`, { method: 'POST' });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Reactivate alert failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as Alert;
+}

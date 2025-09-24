@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { createEventDispatcher, onMount, onDestroy } from 'svelte';
 	import { apiFetch, getLtp } from '$lib/api';
-	import InstrumentPicker, { type InstrumentRow } from '$lib/components/InstrumentPicker.svelte';
+	import InstrumentPicker from '$lib/components/InstrumentPicker.svelte';
+	import type { InstrumentRow } from '$lib/types';
 	import { toast } from '$lib/stores/toast';
 	import { marketwatch } from '$lib/stores/marketwatch';
 
@@ -239,7 +240,7 @@
 	<div class="w-full max-w-3xl rounded-lg bg-white p-8 shadow-xl" on:click|stopPropagation>
 		<header class="mb-6 flex items-center justify-between">
 			<h2 class="text-xl font-semibold text-gray-800">Create New Alert</h2>
-			<button on:click={() => dispatch('close')} class="text-gray-500 hover:text-gray-800">
+			<button on:click={() => dispatch('close')} class="text-gray-500 hover:text-gray-800" aria-label="Close dialog">
 				<svg
 					xmlns="http://www.w3.org/2000/svg"
 					class="h-6 w-6"
@@ -353,6 +354,7 @@
 </div>
 
 <style>
+	@reference "tailwindcss";
 	.btn {
 		@apply rounded-md px-6 py-2 text-sm font-semibold shadow-sm transition-all duration-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2;
 	}

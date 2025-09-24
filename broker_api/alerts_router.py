@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request, Query, Path
-from typing import Optional, Literal, List, Dict, Any
+from typing import Optional, Literal, List, Dict, Any, Tuple
 from pydantic import BaseModel
 from database import database as async_db
 import logging
@@ -123,6 +123,7 @@ async def create_alert(req: Request, body: AlertCreate):
 async def list_alerts(
     status: Optional[str] = Query(default=None),
     instrument_token: Optional[int] = Query(default=None),
+    instrument_name: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     sort: str = Query(default="-created_at")
@@ -132,9 +133,24 @@ async def list_alerts(
     if status:
         where.append("status = :status")
         params["status"] = status
+
+    instrument_token_filter: Optional[Tuple[str, int]] = None
+    if instrument_name is not None:
+        instrument_sql = "SELECT instrument_token FROM public.kite_instruments WHERE tradingsymbol = :instrument_name"
+        instrument_row = await async_db.fetch_one(instrument_sql, {"instrument_name": instrument_name})
+        if instrument_row:
+            instrument_token_filter = ("instrument_token = :instrument_token", int(instrument_row['instrument_token']))
+        else:
+            # No instrument found with that name, return empty list
+            return {"items": [], "total": 0, "limit": params["limit"], "offset": params["offset"]}
+
     if instrument_token is not None:
         where.append("instrument_token = :instrument_token")
         params["instrument_token"] = int(instrument_token)
+    elif instrument_token_filter is not None:
+        where.append(instrument_token_filter[0])
+        params["instrument_token"] = instrument_token_filter[1]
+
     where_clause = f"WHERE {' AND '.join(where)}" if where else ""
     order_map = {
         "created_at": "created_at ASC",
@@ -143,13 +159,16 @@ async def list_alerts(
         "-updated_at": "updated_at DESC",
     }
     order_by = order_map.get(sort, "created_at DESC")
-    items_sql = f"SELECT * FROM public.alerts {where_clause} ORDER BY {order_by} LIMIT :limit OFFSET :offset"
-    count_sql = f"SELECT COUNT(*) AS c FROM public.alerts {where_clause}"
+    items_sql = f"SELECT a.*, i.tradingsymbol FROM public.alerts a LEFT JOIN public.kite_instruments i ON a.instrument_token = i.instrument_token {where_clause} ORDER BY {order_by} LIMIT :limit OFFSET :offset"
+    count_sql = f"SELECT COUNT(*) AS c FROM public.alerts a LEFT JOIN public.kite_instruments i ON a.instrument_token = i.instrument_token {where_clause}"
     rows = await async_db.fetch_all(items_sql, params)
-    count_params = {k: v for k, v in params.items() if k in ("status", "instrument_token")}
+    count_params = {k: v for k, v in params.items() if k in ("status", "instrument_token", "instrument_name")}
     cnt_row = await async_db.fetch_one(count_sql, count_params)
     total = int(cnt_row["c"]) if cnt_row and "c" in cnt_row else 0
-    return {"items": [dict(r) for r in rows], "total": total, "limit": params["limit"], "offset": params["offset"]}
+    items = [dict(r) for r in rows]
+    for item in items:
+        item['tradingsymbol'] = item.pop('tradingsymbol', None)
+    return {"items": items, "total": total, "limit": params["limit"], "offset": params["offset"]}
 
 # GET /alerts/{id}
 @router.get("/{id}")
