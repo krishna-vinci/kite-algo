@@ -267,8 +267,10 @@ async def combined_lifespan(app: FastAPI):
 
         # Start alert dispatcher (WS text messages) and 2s polling fallback
         alerts_ntfy_url = os.getenv("KITE_ALERTS_NTFY_URL") or os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
-        asyncio.create_task(alert_event_dispatcher(ws_manager, alerts_ntfy_url))
-        asyncio.create_task(alerts_poll_worker(API_KEY, alerts_ntfy_url))
+        # TODO: alert_event_dispatcher needs to be implemented. See broker_api/websocket_manager.py:487
+        # asyncio.create_task(alert_event_dispatcher(ws_manager, alerts_ntfy_url))
+        # TODO: alerts_poll_worker needs to be implemented.
+        # asyncio.create_task(alerts_poll_worker(API_KEY, alerts_ntfy_url))
 
         # Ensure Meilisearch index exists on startup (and bootstrap reindex if empty)
         try:
