@@ -60,6 +60,7 @@ from fyers_apiv3 import fyersModel
 from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
 from broker_api.broker_api import router as kite_router
 from strategies.momentum import router as momentum_router
+from broker_api.kite_orders import router as kite_orders_router
 
 from broker_api.broker_api import get_kite
 from kiteconnect import KiteConnect
@@ -353,6 +354,7 @@ app.include_router(momentum_router, prefix="/broker")
 app.include_router(alerts_router, prefix="/alerts")
 
 app.include_router(performance_router, prefix="/broker")
+app.include_router(kite_orders_router, prefix="/broker")
 
 from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
 import logging
