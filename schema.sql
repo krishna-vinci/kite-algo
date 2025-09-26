@@ -226,3 +226,19 @@ CREATE INDEX IF NOT EXISTS idx_alert_events_alert_id_created_at ON public.alert_
 CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_events_triggered_once
   ON public.alert_events (alert_id)
   WHERE event_type = 'triggered';
+
+-- =========================================
+-- Ingestion and Ticker-Specific Data
+-- =========================================
+
+-- Table for enriched ticker data, including sector and other metadata from ingestion.
+CREATE TABLE IF NOT EXISTS public.kite_ticker_tickers (
+  instrument_token   BIGINT,
+  tradingsymbol      VARCHAR(255) NOT NULL,
+  company_name       VARCHAR(255),
+  sector             VARCHAR(255),
+  source_list        VARCHAR(255),
+  last_updated       TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  PRIMARY KEY (instrument_token, source_list)
+);
+

@@ -275,17 +275,17 @@ class AlertsEngine:
             return
 
         # Publish event to Redis Pub/Sub
-        event_payload = {
-            "type": "alert.triggered",
-            "id": alert.id,
-            "status": "triggered",
-            "triggered_at": triggered_at_ts,
-            "instrument_token": alert.instrument_token,
-            "comparator": alert.comparator,
-            "absolute_target": alert.absolute_target,
-            "baseline_price": alert.baseline_price,
-        }
-        await publish_event("alerts.events", event_payload)
+        # event_payload = {
+        #     "type": "alert.triggered",
+        #     "id": alert.id,
+        #     "status": "triggered",
+        #     "triggered_at": triggered_at_ts,
+        #     "instrument_token": alert.instrument_token,
+        #     "comparator": alert.comparator,
+        #     "absolute_target": alert.absolute_target,
+        #     "baseline_price": alert.baseline_price,
+        # }
+        # await publish_event("alerts.events", event_payload)
 
         # Schedule non-blocking ntfy notification
         asyncio.create_task(

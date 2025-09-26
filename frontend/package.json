@@ -48,6 +48,8 @@
 		"vite": "^7.0.4"
 	},
 	"dependencies": {
-		"mode-watcher": "^1.1.0"
+		"d3-array": "^3.2.4",
+		"d3-scale": "^4.0.2",
+		"layerchart": "^1.0.12"
 	}
 }

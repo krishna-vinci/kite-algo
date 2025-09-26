@@ -53,11 +53,11 @@
     return c === 'gt' ? '>' : '<';
   }
   function statusClasses(s: string) {
-    if (s === 'active') return 'bg-green-100 text-green-800';
-    if (s === 'paused') return 'bg-amber-100 text-amber-800';
-    if (s === 'canceled') return 'bg-gray-200 text-gray-800';
-    if (s === 'triggered') return 'bg-red-100 text-red-800';
-    return 'bg-slate-100 text-slate-800';
+    if (s === 'active') return 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300';
+    if (s === 'paused') return 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-300';
+    if (s === 'canceled') return 'bg-gray-200 text-gray-800 dark:bg-gray-700 dark:text-gray-200';
+    if (s === 'triggered') return 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300';
+    return 'bg-slate-100 text-slate-800 dark:bg-slate-700 dark:text-slate-200';
   }
 
   async function load() {
@@ -352,7 +352,7 @@
     </div>
   </div>
 
-  <div class="rounded-lg border bg-white">
+  <div class="rounded-lg border bg-white dark:bg-gray-800 dark:border-gray-700">
     <Table>
       <TableHeader>
         <TableRow>
@@ -383,7 +383,7 @@
         {:else if items.length === 0}
           <TableRow>
             <TableCell colspan={8}>
-              <div class="p-6 text-sm text-gray-600">No alerts found.</div>
+              <div class="p-6 text-sm text-gray-600 dark:text-gray-400">No alerts found.</div>
             </TableCell>
           </TableRow>
         {:else}
@@ -441,15 +441,15 @@
     @apply text-sm;
   }
   .btn-xs {
-    @apply text-xs px-2 py-1 border border-gray-300 bg-white hover:bg-gray-50;
+    @apply text-xs px-2 py-1 border border-gray-300 bg-white hover:bg-gray-50 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200 dark:hover:bg-gray-600;
   }
   .btn-danger {
-    @apply border-red-300 text-red-700 hover:bg-red-50;
+    @apply border-red-300 text-red-700 hover:bg-red-50 dark:border-red-700 dark:text-red-400 dark:hover:bg-red-900;
   }
   .btn-secondary {
-    @apply bg-gray-200 text-gray-800 hover:bg-gray-300 disabled:opacity-50;
+    @apply bg-gray-200 text-gray-800 hover:bg-gray-300 disabled:opacity-50 dark:bg-gray-700 dark:text-gray-200 dark:hover:bg-gray-600;
   }
   .input {
-    @apply border border-gray-300 rounded-md px-2 py-1 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-shadow duration-200;
+    @apply border border-gray-300 rounded-md px-2 py-1 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-shadow duration-200 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:focus:ring-blue-400 dark:focus:border-blue-400;
   }
 </style>

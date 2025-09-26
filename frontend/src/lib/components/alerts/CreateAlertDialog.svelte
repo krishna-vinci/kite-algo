@@ -254,15 +254,15 @@
     @apply px-4 py-2 rounded-md font-semibold transition-colors duration-200;
   }
   .btn-primary {
-    @apply bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50;
+    @apply bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600;
   }
   .btn-secondary {
-    @apply bg-gray-200 text-gray-800 hover:bg-gray-300 disabled:opacity-50;
+    @apply bg-gray-200 text-gray-800 hover:bg-gray-300 disabled:opacity-50 dark:bg-gray-700 dark:text-gray-200 dark:hover:bg-gray-600;
   }
   .input {
-    @apply border border-gray-300 rounded-md px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-shadow duration-200 w-full;
+    @apply border border-gray-300 rounded-md px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-shadow duration-200 w-full dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:focus:ring-blue-400 dark:focus:border-blue-400;
   }
   .textarea {
-    @apply border border-gray-300 rounded-md px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-shadow duration-200 w-full;
+    @apply border border-gray-300 rounded-md px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-shadow duration-200 w-full dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:focus:ring-blue-400 dark:focus:border-blue-400;
   }
 </style>

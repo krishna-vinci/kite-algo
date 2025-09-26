@@ -48,6 +48,7 @@ from broker_api.broker_api import router as broker_api_router
 from broker_api.alerts_router import router as alerts_router
 from broker_api.performance_router import router as performance_router
 
+
 ### fyers auth import ##
 import httpx
 import pyotp
@@ -348,6 +349,7 @@ app.mount("/mcp", mcp_app_direct_wrapped)
 app.include_router(broker_api_router, prefix="/broker")
 app.include_router(momentum_router, prefix="/broker")
 app.include_router(alerts_router, prefix="/alerts")
+
 app.include_router(performance_router, prefix="/broker")
 
 from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
@@ -447,12 +449,7 @@ async def ingest_stock_data_endpoint():
                             """
                             INSERT INTO kite_ticker_tickers (instrument_token, tradingsymbol, company_name, sector, source_list)
                             VALUES (%s, %s, %s, %s, %s)
-                            ON CONFLICT (instrument_token) DO UPDATE SET
-                                tradingsymbol = EXCLUDED.tradingsymbol,
-                                company_name = EXCLUDED.company_name,
-                                sector = EXCLUDED.sector,
-                                source_list = EXCLUDED.source_list,
-                                last_updated = CURRENT_TIMESTAMP;
+                            ON CONFLICT (instrument_token, source_list) DO NOTHING;
                             """,
                             (instrument_token, symbol, company_name, sector, source_list)
                         )
@@ -747,4 +744,5 @@ async def daily_token_scheduler() -> None:
         except Exception as e:
             logging.error("[SCHED] Scheduler loop error: %s", e, exc_info=True)
             await asyncio.sleep(30)
+
 

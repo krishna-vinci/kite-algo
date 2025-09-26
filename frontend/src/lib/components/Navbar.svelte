@@ -4,8 +4,7 @@
 	import favicon from '$lib/assets/favicon.svg';
 	import SunIcon from "@lucide/svelte/icons/sun";
 	import MoonIcon from "@lucide/svelte/icons/moon";
-
-	import { resetMode, setMode } from "mode-watcher";
+	import { theme } from "$lib/theme";
 	import * as DropdownMenu from "$lib/components/ui/dropdown-menu/index.js";
 	import { buttonVariants } from "$lib/components/ui/button/index.js";
 
@@ -84,10 +83,10 @@
 		  <span class="sr-only">Toggle theme</span>
 		 </DropdownMenu.Trigger>
 		 <DropdownMenu.Content align="end">
-		  <DropdownMenu.Item onclick={() => setMode("light")}>Light</DropdownMenu.Item
+		  <DropdownMenu.Item onclick={() => theme.set("light")}>Light</DropdownMenu.Item
 		  >
-		  <DropdownMenu.Item onclick={() => setMode("dark")}>Dark</DropdownMenu.Item>
-		  <DropdownMenu.Item onclick={() => resetMode()}>System</DropdownMenu.Item>
+		  <DropdownMenu.Item onclick={() => theme.set("dark")}>Dark</DropdownMenu.Item>
+		  <DropdownMenu.Item onclick={() => theme.resetToSystem()}>System</DropdownMenu.Item>
 		 </DropdownMenu.Content>
 		</DropdownMenu.Root>
 			<LoginLogout />

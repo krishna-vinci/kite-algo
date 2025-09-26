@@ -109,3 +109,23 @@ def update_user_settings(db_session, settings: dict, owner_id: str = "default"):
         logging.error(f"Error updating user settings for {owner_id}: {e}")
         db_session.rollback()
         raise
+
+async def get_nifty50_instruments():
+    """
+    Fetches Nifty50 instruments from the database.
+    """
+    from databases import Database
+    DATABASE_URL = os.getenv(
+        "DATABASE_URL",
+        f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
+    )
+    database = Database(DATABASE_URL)
+    await database.connect()
+    query = """
+        SELECT instrument_token, tradingsymbol, sector
+        FROM kite_ticker_tickers
+        WHERE source_list='Nifty50' AND instrument_token IS NOT NULL;
+    """
+    results = await database.fetch_all(query)
+    await database.disconnect()
+    return results
