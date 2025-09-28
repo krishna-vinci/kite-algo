@@ -28,3 +28,4 @@ indexed-gzip
 fastmcp
 meilisearch>=0.31.0
 redis
+mibian

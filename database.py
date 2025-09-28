@@ -74,6 +74,14 @@ SessionLocal = sessionmaker(
     bind=engine
 )
 
+def get_db():
+    """Dependency to get a DB session."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 # async Database client (if you still need it)
 database = Database(DATABASE_URL)
 

@@ -129,6 +129,7 @@ from database import FyersSession
 from broker_api.kite_auth import login_headless, get_kite
 from broker_api.kite_auth import API_KEY
 from . import kite_orders
+from . import options_router
 
 
 
@@ -138,6 +139,7 @@ load_dotenv()
 # API router
 router = APIRouter()
 router.include_router(kite_orders.router)
+router.include_router(options_router.router)
 
 # Pydantic request models
 class TickerRequest(BaseModel):

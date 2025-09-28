@@ -2,7 +2,7 @@ import logging
 import asyncio
 import json
 import os
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Set
 from kiteconnect import KiteTicker
 from fastapi import WebSocket
 from asyncio import AbstractEventLoop
@@ -688,3 +688,41 @@ class WebSocketManager:
             await websocket.send_text(json.dumps(payload, default=str))
         except Exception as e:
             logger.debug("Send failed to client (ignored): %s", e)
+    # ---------------------------
+    # External subscription management for Options Sessions
+    # ---------------------------
+    _desired_tokens_union: Set[int] = set()
+    _last_converge_ts: float = 0
+
+    async def set_desired_tokens_union(self, desired: set[int]):
+        """
+        Accepts a desired set of tokens from an external manager (e.g., OptionsSessionManager),
+        computes the diff, and converges the subscriptions. Rate-limited to avoid churn.
+        """
+        now = asyncio.get_event_loop().time()
+        if now - self._last_converge_ts < 5.0:  # Rate limit to once every 5s
+            return
+
+        self._last_converge_ts = now
+        
+        current_subscriptions = set(self.token_mode_agg.keys())
+        to_subscribe = desired - current_subscriptions
+        to_unsubscribe = current_subscriptions - desired
+
+        if to_subscribe:
+            # For simplicity, subscribe with default 'quote' mode.
+            # The options session manager is LTP-driven, so this is sufficient.
+            # A more advanced implementation could accept modes from the manager.
+            self.kws.subscribe(list(to_subscribe))
+            self.kws.set_mode(self.kws.MODE_QUOTE, list(to_subscribe))
+            for token in to_subscribe:
+                self.token_mode_agg[token] = self.kws.MODE_QUOTE
+            logger.info(f"[OptionsSession] Converge: Subscribed to {len(to_subscribe)} new tokens.")
+
+        if to_unsubscribe:
+            self.kws.unsubscribe(list(to_unsubscribe))
+            for token in to_unsubscribe:
+                self.token_mode_agg.pop(token, None)
+            logger.info(f"[OptionsSession] Converge: Unsubscribed from {len(to_unsubscribe)} tokens.")
+        
+        self._desired_tokens_union = desired

@@ -47,6 +47,7 @@ from fastapi import FastAPI
 from broker_api.broker_api import router as broker_api_router
 from broker_api.alerts_router import router as alerts_router
 from broker_api.performance_router import router as performance_router
+from broker_api.options_router import router as options_router
 
 
 ### fyers auth import ##
@@ -352,6 +353,7 @@ app.mount("/mcp", mcp_app_direct_wrapped)
 app.include_router(broker_api_router, prefix="/broker")
 app.include_router(momentum_router, prefix="/broker")
 app.include_router(alerts_router, prefix="/alerts")
+app.include_router(options_router, prefix="/api")
 
 app.include_router(performance_router, prefix="/broker")
 app.include_router(kite_orders_router, prefix="/broker")
