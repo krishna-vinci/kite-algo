@@ -238,6 +238,10 @@ CREATE TABLE IF NOT EXISTS public.kite_ticker_tickers (
   company_name       VARCHAR(255),
   sector             VARCHAR(255),
   source_list        VARCHAR(255),
+  change_1d NUMERIC(10, 2),
+  return_attribution NUMERIC(10, 2),
+  index_weight NUMERIC(10, 2),
+  freefloat_marketcap NUMERIC(20, 2),
   last_updated       TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   PRIMARY KEY (instrument_token, source_list)
 );

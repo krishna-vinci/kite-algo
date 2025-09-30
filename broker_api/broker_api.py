@@ -149,6 +149,20 @@ class InstrumentsRequest(BaseModel):
     instruments: List[str]
 
 
+class OHLCResponseData(BaseModel):
+    instrument_token: int
+    last_price: float
+    open: float
+    high: float
+    low: float
+    previous_close: float
+
+
+class OHLCResponse(BaseModel):
+    status: str = "success"
+    data: Dict[str, OHLCResponseData]
+
+
 class PortfolioSnapshotCreate(BaseModel):
     strategy_name: str
     symbol: str
@@ -963,6 +977,54 @@ def get_ltp(request: InstrumentsRequest, kite: KiteConnect = Depends(get_kite)):
         return ltp_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve LTP: {str(e)}")
+
+
+@router.get("/quote/ohlc", response_model=OHLCResponse, summary="Get OHLC and LTP for multiple instruments")
+def get_ohlc(
+    i: List[str] = Query(..., description="Instrument identifier in the format EXCHANGE:TRADINGSYMBOL"),
+    kite: KiteConnect = Depends(get_kite),
+):
+    """
+    Retrieves OHLC (previous day's close) and last traded price for up to 1000 instruments.
+    """
+    instruments = sorted(list(set(i)))
+    count = len(instruments)
+    if not (1 <= count <= 1000):
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": "Number of instruments must be between 1 and 1000."},
+        )
+
+    try:
+        ohlc_data = kite.ohlc(instruments)
+        
+        response_data = {}
+        for instrument, data in ohlc_data.items():
+            try:
+                # Ensure all required fields are present
+                if "instrument_token" in data and "last_price" in data and "ohlc" in data and "open" in data["ohlc"] and "high" in data["ohlc"] and "low" in data["ohlc"] and "close" in data["ohlc"]:
+                    response_data[instrument] = {
+                        "instrument_token": data["instrument_token"],
+                        "last_price": data["last_price"],
+                        "open": data["ohlc"]["open"],
+                        "high": data["ohlc"]["high"],
+                        "low": data["ohlc"]["low"],
+                        "previous_close": data["ohlc"]["close"],
+                    }
+            except (KeyError, TypeError):
+                # Skip instruments with missing data
+                continue
+        
+        return {"status": "success", "data": response_data}
+
+    except Exception as e:
+        logger.error(f"Upstream Kite OHLC request failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=502,
+            detail={"status": "error", "message": f"Upstream error: {str(e)}"},
+        )
+
+
 
  
  # ─────────── Instruments import functionality ───────────

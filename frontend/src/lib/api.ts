@@ -8,6 +8,8 @@
 const SESSION_STORAGE_KEY = 'kite_session_id';
 
 export function getApiBase(): string {
+	// Returns the base URL for the API, e.g., "http://localhost:8777".
+	// It does NOT include the "/api" suffix. Callers should append it.
 	const env = (import.meta as any).env?.VITE_API_BASE_URL as string | undefined;
 	if (env && typeof env === 'string' && env.trim().length > 0) {
 		return env.replace(/\/+$/, '');
@@ -121,7 +123,11 @@ import type {
   Alert,
   ListAlertsResponse,
   AlertCreateRequest,
-  AlertPatchRequest
+  AlertPatchRequest,
+  SessionsRequest,
+  WatchlistItem,
+  OptionsSessionSnapshot,
+  StopSessionResponse
 } from '$lib/types';
 
 function toQuery(params: Record<string, string | number | boolean | undefined | null>): string {
@@ -242,4 +248,131 @@ export async function reactivateAlert(id: string): Promise<Alert> {
     throw new Error(`Reactivate alert failed: ${res.status} ${t}`);
   }
   return (await res.json()) as Alert;
+}
+
+/**
+ * Options API
+ * Typed HTTP wrappers for sessions and snapshots.
+ */
+
+/**
+ * POST /options/sessions — start/update/replace sessions
+ */
+export async function postOptionsSessions(payload: SessionsRequest): Promise<WatchlistItem[]> {
+  const res = await apiFetch('/options/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`postOptionsSessions failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as WatchlistItem[];
+}
+
+/**
+ * GET /options/session/{underlying}
+ * Returns the latest snapshot. Throws error with status=404 if no active session.
+ */
+export async function getOptionsSession(underlying: string): Promise<OptionsSessionSnapshot> {
+  const res = await apiFetch(`/options/session/${encodeURIComponent(underlying)}`);
+  if (res.status === 404) {
+    const detail = (await res.json().catch(() => null)) as any;
+    const err = new Error(detail?.detail ?? 'No active options session');
+    (err as any).status = 404;
+    throw err;
+  }
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`getOptionsSession failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as OptionsSessionSnapshot;
+}
+
+/**
+ * GET /options/chain/{underlying_symbol} — alias of snapshot
+ * Throws error with status=404 if no active session.
+ */
+export async function getOptionChain(underlyingSymbol: string): Promise<OptionsSessionSnapshot> {
+  const res = await apiFetch(`/options/chain/${encodeURIComponent(underlyingSymbol)}`);
+  if (res.status === 404) {
+    const detail = (await res.json().catch(() => null)) as any;
+    const err = new Error(detail?.detail ?? 'No active options session');
+    (err as any).status = 404;
+    throw err;
+  }
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`getOptionChain failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as OptionsSessionSnapshot;
+}
+
+/**
+ * DELETE /options/session/{underlying}
+ * Note: keep leading slash to avoid backend decorator missing-slash quirk.
+ */
+export async function deleteOptionsSession(underlying: string): Promise<StopSessionResponse> {
+  const res = await apiFetch(`/options/session/${encodeURIComponent(underlying)}`, {
+    method: 'DELETE'
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`deleteOptionsSession failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as StopSessionResponse;
+}
+
+/**
+ * Build WS URL for options session stream.
+ * Transforms http(s) base to ws(s) and appends /ws/options/session/{underlying}.
+ */
+export function buildOptionsSessionWsUrl(underlying: string): string {
+  const base = getApiBase(); // e.g., http://localhost:8777
+  const wsProto = base.startsWith('https') ? 'wss' : 'ws';
+  const wsBase = base.replace(/^http/, wsProto);
+  return `${wsBase}/ws/options/session/${encodeURIComponent(underlying)}`;
+}
+
+/**
+ * Connect to WS /ws/options/session/{underlying}
+ * Messages are raw OptionsSessionSnapshot JSON documents.
+ */
+export function connectOptionsSessionWS(
+  underlying: string,
+  onMessage: (snapshot: OptionsSessionSnapshot) => void,
+  onOpen?: () => void,
+  onClose?: (ev: CloseEvent) => void,
+  onError?: (ev: Event) => void
+): WebSocket {
+  const url = buildOptionsSessionWsUrl(underlying);
+  const ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    if (onOpen) onOpen();
+  };
+
+  ws.onmessage = (ev: MessageEvent) => {
+    try {
+      const data = JSON.parse(ev.data as string) as OptionsSessionSnapshot;
+      onMessage(data);
+    } catch (err) {
+      // surface parsing issues via onError if provided
+      if (onError) onError(err as unknown as Event);
+      // also log to aid debugging
+      // eslint-disable-next-line no-console
+      console.error('Options WS parse error', err);
+    }
+  };
+
+  ws.onclose = (ev) => {
+    if (onClose) onClose(ev);
+  };
+
+  ws.onerror = (ev) => {
+    if (onError) onError(ev);
+  };
+
+  return ws;
 }

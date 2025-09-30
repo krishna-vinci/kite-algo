@@ -16,6 +16,9 @@ from datetime import datetime, timedelta
 import os
 import json
 from dotenv import load_dotenv
+from typing import Dict, Any
+from broker_api.redis_events import get_redis
+import redis.asyncio as redis
 
 load_dotenv() # Load environment variables from .env file
 
@@ -79,10 +82,24 @@ from broker_api.websocket_manager import WebSocketManager
 from alerts.engine import AlertsEngine
 from database import get_user_settings, update_user_settings
 from pydantic import BaseModel
+import csv
 
 class UserSubscriptions(BaseModel):
     groups: List[dict]
     activeGroupId: Optional[str] = None
+
+class OverlaySnapshotTick(BaseModel):
+    instrument_token: int
+    last_price: float
+    change_percent: Optional[float] = None
+    tick_timestamp: int
+    server_timestamp: int
+    age_ms: Optional[int] = None
+    source: str
+
+class OverlaySnapshotResponse(BaseModel):
+    status: str
+    data: Dict[str, OverlaySnapshotTick]
 
 # Global instance for the WebSocketManager
 ws_manager: Optional[WebSocketManager] = None
@@ -428,7 +445,7 @@ async def ingest_stock_data_endpoint():
         kite_instruments_data = {}
         with conn.cursor(cursor_factory=extras.DictCursor) as cur:
             cur.execute(
-                "SELECT tradingsymbol, instrument_token, instrument_type FROM kite_instruments WHERE instrument_type = 'EQ';"
+                "SELECT tradingsymbol, instrument_token, instrument_type FROM kite_instruments WHERE instrument_type = 'EQ' AND exchange = 'NSE';"
             )
             kite_instruments_data = {row['tradingsymbol']: row for row in cur.fetchall()}
             logging.info(f"Fetched {len(kite_instruments_data)} equity instruments from kite_instruments.")
@@ -501,6 +518,91 @@ async def root():
 async def hello():
     return {"message": "Hello World from FastAPI Backend!"}
 
+def clean_value(value_str):
+    """
+    Removes '%' and ',' from a string and converts it to a float.
+    Returns None if the string is empty or cannot be converted.
+    """
+    if not value_str:
+        return None
+    try:
+        return float(value_str.replace('%', '').replace(',', ''))
+    except ValueError:
+        logging.warning(f"Could not convert '{value_str}' to float.")
+        return None
+
+@app.post("/update-nifty50-data")
+async def update_nifty50_data_endpoint():
+    """
+    Reads the nifty50_data.csv file and updates the corresponding
+    rows in the kite_ticker_tickers table.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        with open('nifty50_data.csv', 'r', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                ticker = row.get('Ticker')
+
+                # Skip rows that are not stocks (e.g., sector summaries)
+                if not ticker or not ticker.strip():
+                    continue
+
+                tradingsymbol = ticker.strip()
+                
+                # Prepare data for update
+                data_to_update = {
+                    'change_1d': clean_value(row.get('1D change')),
+                    'return_attribution': clean_value(row.get('Return attribution')),
+                    'index_weight': clean_value(row.get('Index weight')),
+                    'freefloat_marketcap': clean_value(row.get('Free float marketcap'))
+                }
+
+                # Construct and execute the UPDATE statement
+                update_query = """
+                    UPDATE kite_ticker_tickers
+                    SET
+                        change_1d = %(change_1d)s,
+                        return_attribution = %(return_attribution)s,
+                        index_weight = %(index_weight)s,
+                        freefloat_marketcap = %(freefloat_marketcap)s,
+                        last_updated = NOW()
+                    WHERE
+                        tradingsymbol = %(tradingsymbol)s AND source_list = 'Nifty50';
+                """
+                
+                params = {**data_to_update, 'tradingsymbol': tradingsymbol}
+                
+                cur.execute(update_query, params)
+
+                if cur.rowcount == 0:
+                    logging.warning(
+                        f"No row found for tradingsymbol '{tradingsymbol}' with source_list 'Nifty50'. "
+                        "The stock might not be in the database yet."
+                    )
+
+        conn.commit()
+        logging.info("Database update process for Nifty50 data completed successfully.")
+        return JSONResponse(content={"message": "Nifty50 data updated successfully."})
+
+    except FileNotFoundError:
+        logging.error("Error: nifty50_data.csv not found.")
+        raise HTTPException(status_code=500, detail="nifty50_data.csv not found.")
+    except Exception as e:
+        logging.error(f"An error occurred during the database update: {e}")
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"An error occurred during the database update: {e}")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+            logging.info("Database connection closed.")
+
 @app.get("/status")
 async def status():
     info = {"status": "running", "backend": "FastAPI"}
@@ -565,6 +667,145 @@ async def put_subscriptions(
         return JSONResponse(content={"status": "ok"})
     finally:
         db.close()
+
+@app.get("/api/nifty50")
+async def get_nifty50_data():
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("SELECT * FROM kite_ticker_tickers WHERE source_list = 'Nifty50'")
+            data = [dict(row) for row in cur.fetchall()]
+            return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get(
+    "/api/marketwatch/nifty50/overlay-snapshot",
+    response_model=OverlaySnapshotResponse,
+    summary="Get a snapshot of the latest live ticks from the Redis overlay cache.",
+    description="""
+    Fetches the most recent tick data for a given set of instrument tokens from a fast, ephemeral Redis cache.
+    This endpoint is designed to be called by the frontend to overlay live market data on top of a baseline.
+
+    - If no tokens are provided, it defaults to all tokens in the 'Nifty50' source list.
+    - It returns only the data available in the cache; missing tokens are omitted.
+    - If `change_percent` is not in the cached tick, it attempts to compute it using the baseline close price from the database.
+
+    **Example Usage:**
+    ```bash
+    # Fetch specific tokens
+    curl -G "http://localhost:8000/api/marketwatch/nifty50/overlay-snapshot" \
+      --data-urlencode "token=256265" \
+      --data-urlencode "token=738561"
+
+    # Fetch all Nifty50 tokens (default)
+    curl "http://localhost:8000/api/marketwatch/nifty50/overlay-snapshot"
+    ```
+    """
+)
+async def get_overlay_snapshot(
+    token: Optional[List[int]] = Query(None, description="List of instrument tokens to fetch.")
+):
+    if token and (len(token) == 0 or len(token) > 2000):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Invalid token count"}
+        )
+
+    conn = None
+    try:
+        redis_client = get_redis()
+        today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+        
+        target_tokens = token
+        if not target_tokens:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("SELECT instrument_token FROM kite_ticker_tickers WHERE source_list = 'Nifty50'")
+                target_tokens = [row[0] for row in cur.fetchall()]
+
+        keys = [f"marketwatch:overlay:{today_iso}:{t}" for t in target_tokens]
+        
+        try:
+            overlay_data_raw = await redis_client.mget(keys)
+        except redis.exceptions.ConnectionError:
+            logging.warning("Redis connection error in overlay snapshot; returning empty data.")
+            return {"status": "success", "data": {}}
+
+        results: Dict[str, OverlaySnapshotTick] = {}
+        tokens_missing_change = []
+
+        server_ts = int(datetime.utcnow().timestamp() * 1000)
+
+        for i, raw_val in enumerate(overlay_data_raw):
+            if raw_val is None:
+                continue
+            
+            try:
+                overlay_tick = json.loads(raw_val)
+                instrument_token = overlay_tick["instrument_token"]
+                tick_ts = overlay_tick.get("tick_timestamp")
+                
+                snapshot = OverlaySnapshotTick(
+                    instrument_token=instrument_token,
+                    last_price=overlay_tick["last_price"],
+                    change_percent=overlay_tick.get("change_percent"),
+                    tick_timestamp=tick_ts,
+                    server_timestamp=server_ts,
+                    age_ms=server_ts - tick_ts if tick_ts else None,
+                    source="ws"
+                )
+                results[str(instrument_token)] = snapshot
+
+                if snapshot.change_percent is None:
+                    tokens_missing_change.append(instrument_token)
+
+            except (json.JSONDecodeError, KeyError) as e:
+                logging.warning(f"Failed to parse overlay data for key {keys[i]}: {e}")
+                continue
+
+        if tokens_missing_change:
+            if conn is None:
+                conn = get_db_connection()
+            
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                    cur.execute(
+                        "SELECT instrument_token, last_close FROM kite_instruments WHERE instrument_token = ANY(%s)",
+                        (tokens_missing_change,)
+                    )
+                    baseline_closes = {row["instrument_token"]: row["last_close"] for row in cur.fetchall()}
+
+                for token_to_update in tokens_missing_change:
+                    baseline_close = baseline_closes.get(token_to_update)
+                    if baseline_close and baseline_close > 0:
+                        snapshot_to_update = results[str(token_to_update)]
+                        snapshot_to_update.change_percent = (
+                            100 * (snapshot_to_update.last_price / baseline_close - 1)
+                        )
+            except Exception as e:
+                logging.error(f"DB lookup for baseline close failed: {e}", exc_info=True)
+
+        return {"status": "success", "data": results}
+
+    except Exception as e:
+        logging.error(f"Error in overlay snapshot endpoint: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Internal server error"}
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+
+
 
 @app.websocket("/broker/ws/marketwatch")
 async def websocket_endpoint(websocket: WebSocket):

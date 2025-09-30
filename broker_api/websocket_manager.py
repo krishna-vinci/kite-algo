@@ -6,6 +6,9 @@ from typing import Dict, List, Any, Optional, Tuple, Set
 from kiteconnect import KiteTicker
 from fastapi import WebSocket
 from asyncio import AbstractEventLoop
+from datetime import datetime
+import redis.asyncio as redis
+from broker_api.redis_events import get_redis
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -441,6 +444,18 @@ class WebSocketManager:
                 token = tick.get("instrument_token")
                 if token is not None:
                     self.latest_ticks[token] = tick
+            
+            # Write ticks to Redis overlay
+            try:
+                # Fire and forget; run in the main event loop to avoid blocking the KiteTicker thread
+                self.main_event_loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(write_ticks_to_redis_overlay(ticks))
+                )
+            except Exception as e:
+                logger.error("Error scheduling Redis overlay write: %s", e, exc_info=True)
+
+            # Update database with new tick data
+            update_ticker_data_in_db(ticks)
 
             # Merge into pending and let flush loop deliver
             def enqueue():
@@ -726,3 +741,82 @@ class WebSocketManager:
             logger.info(f"[OptionsSession] Converge: Unsubscribed from {len(to_unsubscribe)} tokens.")
         
         self._desired_tokens_union = desired
+
+import psycopg2
+import psycopg2.extras
+from database import get_db_connection
+
+def update_ticker_data_in_db(tick_data):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            for tick in tick_data:
+                instrument_token = tick.get("instrument_token")
+                last_price = tick.get("last_price")
+                change = tick.get("change")
+
+                # Fetch the existing data to perform calculations
+                cur.execute("SELECT freefloat_marketcap, return_attribution FROM kite_ticker_tickers WHERE instrument_token = %s", (instrument_token,))
+                result = cur.fetchone()
+                if result:
+                    freefloat_marketcap, return_attribution = result
+                    
+                    # Perform calculations
+                    change_factor = (change or 0) / 100
+                    new_return_attribution = (return_attribution or 0) + change_factor
+                    new_freefloat_marketcap = (freefloat_marketcap or 0) * (1 + change_factor)
+
+                    # Update the database
+                    cur.execute(
+                        """
+                        UPDATE kite_ticker_tickers
+                        SET last_price = %s, change_1d = %s, return_attribution = %s, freefloat_marketcap = %s, last_updated = NOW()
+                        WHERE instrument_token = %s
+                        """,
+                        (last_price, change, new_return_attribution, new_freefloat_marketcap, instrument_token)
+                    )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error updating ticker data in DB: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+async def write_ticks_to_redis_overlay(ticks: List[Dict[str, Any]]):
+    """
+    Write the latest tick for each instrument to a Redis overlay cache with a TTL.
+    """
+    try:
+        redis_client = get_redis()
+        ttl_seconds = int(os.getenv("OVERLAY_TTL_SECONDS", "60"))
+        today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+        
+        async with redis_client.pipeline(transaction=False) as pipe:
+            for tick in ticks:
+                token = tick.get("instrument_token")
+                last_price = tick.get("last_price")
+
+                if token is None or last_price is None or last_price == 0:
+                    continue
+
+                key = f"marketwatch:overlay:{today_iso}:{token}"
+                
+                payload = {
+                    "instrument_token": token,
+                    "last_price": float(last_price),
+                    "tick_timestamp": int(tick.get("exchange_timestamp", datetime.utcnow()).timestamp() * 1000),
+                    "source": "ws",
+                }
+                if "change" in tick:
+                    payload["change_percent"] = float(tick["change"])
+
+                await pipe.set(key, json.dumps(payload), ex=ttl_seconds)
+            
+            await pipe.execute()
+            
+    except redis.exceptions.ConnectionError as e:
+        logger.warning("Redis connection error in overlay write: %s", e)
+    except Exception as e:
+        logger.error("Error writing ticks to Redis overlay: %s", e, exc_info=True)

@@ -32,7 +32,8 @@
 		{ name: 'Market Watch', href: '/marketwatch' },
 		{ name: 'Orders', href: '/orders' },
 		{ name: 'Investing', href: '/holdings' },
-		{ name: 'Trades', href: '/positions' },
+		{ name: 'Trading', href: '/trading' },
+		{ name: 'NFO', href: '/nfo' },
 		{ name: 'Alerts', href: '/alerts' },
 		{ name: 'Strategies', href: '/strategies/momentum' }
 	];

@@ -50,7 +50,7 @@ class SessionsRequest(BaseModel):
     replace: bool = False
 
 
-@router.post("/api/options/sessions")
+@router.post("/options/sessions")
 async def manage_sessions(
     payload: SessionsRequest,
     manager: OptionsSessionManager = Depends(get_options_session_manager),
@@ -68,7 +68,7 @@ async def manage_sessions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/options/session/{underlying}")
+@router.get("/options/session/{underlying}")
 async def get_session_snapshot(
     underlying: str,
     manager: OptionsSessionManager = Depends(get_options_session_manager),
@@ -84,7 +84,7 @@ async def get_session_snapshot(
     return snapshot
 
 
-@router.delete("/api/options/session/{underlying}")
+@router.delete("options/session/{underlying}")
 async def stop_session(
     underlying: str,
     manager: OptionsSessionManager = Depends(get_options_session_manager),
@@ -96,7 +96,7 @@ async def stop_session(
     return {"status": "stopped", "underlying": underlying}
 
 
-@router.get("/api/options/chain/{underlying_symbol}")
+@router.get("/options/chain/{underlying_symbol}")
 async def get_option_chain(
     underlying_symbol: str,
     manager: OptionsSessionManager = Depends(get_options_session_manager),
