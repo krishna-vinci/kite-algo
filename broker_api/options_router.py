@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from typing import Any, Dict, List
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional
 
 from fastapi import (
     APIRouter,
@@ -10,7 +11,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -23,6 +24,91 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# Pydantic Response Models
+class V1Config:
+    extra = "allow"
+
+
+class WatchlistEntryModel(BaseModel):
+    underlying: str
+    is_running: bool
+    desired_tokens: int
+
+    class Config(V1Config):
+        pass
+
+
+class StopResponseModel(BaseModel):
+    status: str
+    underlying: str
+
+    class Config(V1Config):
+        pass
+
+
+class ErrorResponseModel(BaseModel):
+    code: str
+    message: str
+
+
+class OptionGreeksModel(BaseModel):
+    delta: Optional[float] = None
+    gamma: Optional[float] = None
+    theta: Optional[float] = None
+    vega: Optional[float] = None
+    rho: Optional[float] = None
+
+    class Config(V1Config):
+        pass
+
+
+class OptionInstrumentDataModel(OptionGreeksModel):
+    token: int
+    tsym: str
+    ltp: Optional[float] = None
+    iv: Optional[float] = None
+    oi: Optional[float] = None
+    updated_at: Optional[datetime] = None
+    stale_age_sec: Optional[float] = None
+
+    class Config(V1Config):
+        pass
+
+
+class OptionChainRowModel(BaseModel):
+    strike: float
+    CE: Optional[OptionInstrumentDataModel] = None
+    PE: Optional[OptionInstrumentDataModel] = None
+
+    class Config(V1Config):
+        pass
+
+
+class PerExpiryDataModel(BaseModel):
+    forward: Optional[float] = None
+    sigma_expiry: Optional[float] = None
+    atm_strike: Optional[float] = None
+    strikes: List[float]
+    rows: List[OptionChainRowModel]
+
+    class Config(V1Config):
+        pass
+
+
+class OptionChainSnapshotModel(BaseModel):
+    underlying: str
+    spot_token: int
+    spot_ltp: Optional[float] = None
+    cadence_sec: int
+    expiries: List[date]
+    per_expiry: Dict[str, PerExpiryDataModel]
+    desired_token_count: int
+    updated_at: datetime
+
+    class Config(V1Config):
+        pass
 
 
 def get_options_session_manager(request: Request) -> OptionsSessionManager:
@@ -41,8 +127,12 @@ def get_options_session_manager(request: Request) -> OptionsSessionManager:
 
 class SessionRequestItem(BaseModel):
     underlying: str
-    window: int = 12
-    cadence_sec: int = 5
+    window: int = Field(
+        12, ge=1, description="Number of 5s bars (or unit) to maintain; must be >= 1"
+    )
+    cadence_sec: int = Field(
+        5, ge=1, description="Update cadence in seconds; must be >= 1"
+    )
 
 
 class SessionsRequest(BaseModel):
@@ -50,13 +140,39 @@ class SessionsRequest(BaseModel):
     replace: bool = False
 
 
-@router.post("/options/sessions")
+@router.post(
+    "/options/sessions",
+    response_model=List[WatchlistEntryModel],
+    responses={
+        200: {
+            "description": "Successful Response",
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "underlying": "NIFTY",
+                            "is_running": True,
+                            "desired_tokens": 242,
+                        },
+                        {
+                            "underlying": "BANKNIFTY",
+                            "is_running": True,
+                            "desired_tokens": 198,
+                        },
+                    ]
+                }
+            },
+        }
+    },
+)
 async def manage_sessions(
     payload: SessionsRequest,
     manager: OptionsSessionManager = Depends(get_options_session_manager),
 ):
     """
     Starts, updates, or replaces options sessions.
+
+    Returns a stable response model: `List[WatchlistEntryModel]`.
     """
     try:
         await manager.start_sessions(
@@ -68,41 +184,176 @@ async def manage_sessions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/options/session/{underlying}")
+@router.get(
+    "/options/session/{underlying}",
+    response_model=OptionChainSnapshotModel,
+    response_model_exclude_none=True,
+    responses={
+        404: {"model": ErrorResponseModel},
+        200: {
+            "description": "A full option chain snapshot for the underlying.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "underlying": "NIFTY",
+                        "spot_token": 256257,
+                        "spot_ltp": 22500.5,
+                        "cadence_sec": 5,
+                        "expiries": ["2025-10-09", "2025-10-16"],
+                        "per_expiry": {
+                            "2025-10-09": {
+                                "forward": 22505.1,
+                                "sigma_expiry": 0.145,
+                                "atm_strike": 22500,
+                                "strikes": [22400, 22500, 22600],
+                                "rows": [
+                                    {
+                                        "strike": 22500,
+                                        "CE": {
+                                            "token": 12345,
+                                            "tsym": "NIFTY25OCT22500CE",
+                                            "ltp": 150.0,
+                                            "iv": 0.15,
+                                            "delta": 0.5,
+                                            "gamma": 0.002,
+                                            "theta": -5.2,
+                                            "vega": 30.1,
+                                        },
+                                        "PE": {
+                                            "token": 12346,
+                                            "tsym": "NIFTY25OCT22500PE",
+                                            "ltp": 145.0,
+                                            "iv": 0.14,
+                                            "delta": -0.5,
+                                        },
+                                    }
+                                ],
+                            }
+                        },
+                        "desired_token_count": 242,
+                        "updated_at": "2025-10-02T12:00:00Z",
+                    }
+                }
+            },
+        },
+    },
+)
 async def get_session_snapshot(
     underlying: str,
     manager: OptionsSessionManager = Depends(get_options_session_manager),
 ):
     """
     Returns the latest snapshot for a given underlying's session.
+
+    - Response model: `OptionChainSnapshotModel`
+    - 404 detail shape: `{"code":"OPTION_SESSION_NOT_FOUND","message":"..."}`
     """
-    snapshot = manager.get_snapshot(underlying)
+    normalized_underlying, _ = manager.instrument_repo.normalize_underlying_symbol(
+        underlying
+    )
+    snapshot = manager.get_snapshot(normalized_underlying)
     if not snapshot:
         raise HTTPException(
-            status_code=404, detail=f"No active session for underlying '{underlying}'"
+            status_code=404,
+            detail={
+                "code": "OPTION_SESSION_NOT_FOUND",
+                "message": f"No active session for underlying '{normalized_underlying}'",
+            },
         )
     return snapshot
 
 
-@router.delete("options/session/{underlying}")
+@router.delete(
+    "/options/session/{underlying}",
+    response_model=StopResponseModel,
+    responses={
+        200: {
+            "description": "Confirmation of session stop.",
+            "content": {
+                "application/json": {
+                    "example": {"status": "stopped", "underlying": "NIFTY"}
+                }
+            },
+        }
+    },
+)
 async def stop_session(
     underlying: str,
     manager: OptionsSessionManager = Depends(get_options_session_manager),
 ):
     """
     Stops an options session for a given underlying.
+
+    - Response model: `StopResponseModel`
+    - Returns `{"status":"stopped","underlying":"<normalized>"}`
     """
-    await manager.stop_session(underlying)
-    return {"status": "stopped", "underlying": underlying}
+    normalized_underlying, _ = manager.instrument_repo.normalize_underlying_symbol(
+        underlying
+    )
+    await manager.stop_session(normalized_underlying)
+    return {"status": "stopped", "underlying": normalized_underlying}
 
 
-@router.get("/options/chain/{underlying_symbol}")
+@router.get(
+    "/options/chain/{underlying_symbol}",
+    response_model=OptionChainSnapshotModel,
+    response_model_exclude_none=True,
+    responses={
+        404: {"model": ErrorResponseModel},
+        200: {
+            "description": "A full option chain snapshot for the underlying.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "underlying": "NIFTY",
+                        "spot_token": 256257,
+                        "spot_ltp": 22500.5,
+                        "cadence_sec": 5,
+                        "expiries": ["2025-10-09", "2025-10-16"],
+                        "per_expiry": {
+                            "2025-10-09": {
+                                "forward": 22505.1,
+                                "sigma_expiry": 0.145,
+                                "atm_strike": 22500,
+                                "strikes": [22400, 22500, 22600],
+                                "rows": [
+                                    {
+                                        "strike": 22500,
+                                        "CE": {
+                                            "token": 12345,
+                                            "tsym": "NIFTY25OCT22500CE",
+                                            "ltp": 150.0,
+                                            "iv": 0.15,
+                                            "delta": 0.5,
+                                        },
+                                        "PE": {
+                                            "token": 12346,
+                                            "tsym": "NIFTY25OCT22500PE",
+                                            "ltp": 145.0,
+                                            "iv": 0.14,
+                                            "delta": -0.5,
+                                        },
+                                    }
+                                ],
+                            }
+                        },
+                        "desired_token_count": 242,
+                        "updated_at": "2025-10-02T12:00:00Z",
+                    }
+                }
+            },
+        },
+    },
+)
 async def get_option_chain(
     underlying_symbol: str,
     manager: OptionsSessionManager = Depends(get_options_session_manager),
 ):
     """
     Thin alias to get a session snapshot, for backward compatibility.
+
+    - Response model: `OptionChainSnapshotModel`
+    - 404 detail shape: `{"code":"OPTION_SESSION_NOT_FOUND","message":"..."}`
     """
     normalized_underlying, _ = manager.instrument_repo.normalize_underlying_symbol(
         underlying_symbol
@@ -112,9 +363,47 @@ async def get_option_chain(
         # Optionally, could start a session here on-demand
         raise HTTPException(
             status_code=404,
-            detail=f"No active session for underlying '{normalized_underlying}'. Use POST /api/options/sessions to start one.",
+            detail={
+                "code": "OPTION_SESSION_NOT_FOUND",
+                "message": f"No active session for underlying '{normalized_underlying}'",
+            },
         )
     return snapshot
+
+
+@router.get(
+    "/options/sessions",
+    response_model=List[WatchlistEntryModel],
+    responses={
+        200: {
+            "description": "A list of active or known option sessions.",
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "underlying": "NIFTY",
+                            "is_running": True,
+                            "desired_tokens": 242,
+                        },
+                        {
+                            "underlying": "BANKNIFTY",
+                            "is_running": False,
+                            "desired_tokens": 0,
+                        },
+                    ]
+                }
+            },
+        }
+    },
+)
+async def get_sessions(manager: OptionsSessionManager = Depends(get_options_session_manager)):
+    """
+    Returns the current watchlist of active options sessions.
+
+    - Response model: `List[WatchlistEntryModel]`
+    - This is a read-only view of the active sessions.
+    """
+    return manager.get_watchlist()
 
 
 @router.websocket("/ws/options/session/{underlying}")

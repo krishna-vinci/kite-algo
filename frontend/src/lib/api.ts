@@ -127,7 +127,9 @@ import type {
   SessionsRequest,
   WatchlistItem,
   OptionsSessionSnapshot,
-  StopSessionResponse
+  StopSessionResponse,
+  ErrorResponse,
+  SessionRequestItem
 } from '$lib/types';
 
 function toQuery(params: Record<string, string | number | boolean | undefined | null>): string {
@@ -138,6 +140,15 @@ function toQuery(params: Record<string, string | number | boolean | undefined | 
   }
   const qs = usp.toString();
   return qs ? `?${qs}` : '';
+}
+
+export async function getOptionsWatchlist(): Promise<WatchlistItem[]> {
+  const res = await apiFetch('/api/options/sessions');
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`getOptionsWatchlist failed: ${res.status} ${t}`);
+  }
+  return (await res.json()) as WatchlistItem[];
 }
 
 export async function getAlerts(params: {
@@ -259,7 +270,7 @@ export async function reactivateAlert(id: string): Promise<Alert> {
  * POST /options/sessions — start/update/replace sessions
  */
 export async function postOptionsSessions(payload: SessionsRequest): Promise<WatchlistItem[]> {
-  const res = await apiFetch('/options/sessions', {
+  const res = await apiFetch('/api/options/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -271,21 +282,29 @@ export async function postOptionsSessions(payload: SessionsRequest): Promise<Wat
   return (await res.json()) as WatchlistItem[];
 }
 
+export async function startOptionsSessions(
+  items: SessionRequestItem[],
+  replace = false
+): Promise<WatchlistItem[]> {
+  return postOptionsSessions({ items, replace });
+}
+
 /**
  * GET /options/session/{underlying}
  * Returns the latest snapshot. Throws error with status=404 if no active session.
  */
-export async function getOptionsSession(underlying: string): Promise<OptionsSessionSnapshot> {
-  const res = await apiFetch(`/options/session/${encodeURIComponent(underlying)}`);
+export async function getOptionsSnapshot(underlying: string): Promise<OptionsSessionSnapshot> {
+  const res = await apiFetch(`/api/options/session/${encodeURIComponent(underlying)}`);
   if (res.status === 404) {
-    const detail = (await res.json().catch(() => null)) as any;
-    const err = new Error(detail?.detail ?? 'No active options session');
-    (err as any).status = 404;
-    throw err;
+    const body = await res.json().catch(() => ({}));
+    const detail = (body?.detail ?? body) as ErrorResponse | string;
+    if (typeof detail === 'object' && detail?.code === 'OPTION_SESSION_NOT_FOUND') {
+      throw detail;
+    }
   }
   if (!res.ok) {
     const t = await res.text().catch(() => '');
-    throw new Error(`getOptionsSession failed: ${res.status} ${t}`);
+    throw new Error(`getOptionsSnapshot failed: ${res.status} ${t}`);
   }
   return (await res.json()) as OptionsSessionSnapshot;
 }
@@ -295,7 +314,7 @@ export async function getOptionsSession(underlying: string): Promise<OptionsSess
  * Throws error with status=404 if no active session.
  */
 export async function getOptionChain(underlyingSymbol: string): Promise<OptionsSessionSnapshot> {
-  const res = await apiFetch(`/options/chain/${encodeURIComponent(underlyingSymbol)}`);
+  const res = await apiFetch(`/api/options/chain/${encodeURIComponent(underlyingSymbol)}`);
   if (res.status === 404) {
     const detail = (await res.json().catch(() => null)) as any;
     const err = new Error(detail?.detail ?? 'No active options session');
@@ -314,7 +333,7 @@ export async function getOptionChain(underlyingSymbol: string): Promise<OptionsS
  * Note: keep leading slash to avoid backend decorator missing-slash quirk.
  */
 export async function deleteOptionsSession(underlying: string): Promise<StopSessionResponse> {
-  const res = await apiFetch(`/options/session/${encodeURIComponent(underlying)}`, {
+  const res = await apiFetch(`/api/options/session/${encodeURIComponent(underlying)}`, {
     method: 'DELETE'
   });
   if (!res.ok) {
@@ -322,6 +341,10 @@ export async function deleteOptionsSession(underlying: string): Promise<StopSess
     throw new Error(`deleteOptionsSession failed: ${res.status} ${t}`);
   }
   return (await res.json()) as StopSessionResponse;
+}
+
+export async function stopOptionsSession(underlying: string): Promise<StopSessionResponse> {
+  return deleteOptionsSession(underlying);
 }
 
 /**
@@ -339,40 +362,14 @@ export function buildOptionsSessionWsUrl(underlying: string): string {
  * Connect to WS /ws/options/session/{underlying}
  * Messages are raw OptionsSessionSnapshot JSON documents.
  */
-export function connectOptionsSessionWS(
-  underlying: string,
-  onMessage: (snapshot: OptionsSessionSnapshot) => void,
-  onOpen?: () => void,
-  onClose?: (ev: CloseEvent) => void,
-  onError?: (ev: Event) => void
-): WebSocket {
-  const url = buildOptionsSessionWsUrl(underlying);
-  const ws = new WebSocket(url);
-
-  ws.onopen = () => {
-    if (onOpen) onOpen();
-  };
-
-  ws.onmessage = (ev: MessageEvent) => {
-    try {
-      const data = JSON.parse(ev.data as string) as OptionsSessionSnapshot;
-      onMessage(data);
-    } catch (err) {
-      // surface parsing issues via onError if provided
-      if (onError) onError(err as unknown as Event);
-      // also log to aid debugging
-      // eslint-disable-next-line no-console
-      console.error('Options WS parse error', err);
-    }
-  };
-
-  ws.onclose = (ev) => {
-    if (onClose) onClose(ev);
-  };
-
-  ws.onerror = (ev) => {
-    if (onError) onError(ev);
-  };
-
-  return ws;
+export function openOptionsSessionWS(underlying: string): WebSocket {
+  const loc = window.location;
+  const isSecure = loc.protocol === 'https:';
+  const scheme = isSecure ? 'wss' : 'ws';
+  const apiBase = getApiBase();
+  const basePath = apiBase.replace(/^https?:\/\/[^/]+/, '');
+  const url = `${scheme}://${loc.host}${basePath}/api/ws/options/session/${encodeURIComponent(
+    underlying
+  )}`;
+  return new WebSocket(url);
 }

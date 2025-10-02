@@ -50,6 +50,10 @@
 	"dependencies": {
 		"d3-array": "^3.2.4",
 		"d3-scale": "^4.0.2",
-		"layerchart": "^1.0.12"
+		"echarts": "^5.6.0",
+		"layerchart": "^1.0.12",
+		"lightweight-charts": "^5.0.8",
+		"svelte-echarts": "^1.0.0",
+		"svelte-lightweight-charts": "^2.2.0"
 	}
 }

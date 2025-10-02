@@ -40,6 +40,10 @@
 </script>
 
 <script lang="ts">
+	import { createEventDispatcher } from 'svelte';
+	const dispatch = createEventDispatcher<{
+		click: MouseEvent;
+	}>();
 	let {
 		class: className,
 		variant = "default",
@@ -63,6 +67,7 @@
 		role={disabled ? "link" : undefined}
 		tabindex={disabled ? -1 : undefined}
 		{...restProps}
+		on:click={(e) => dispatch('click', e)}
 	>
 		{@render children?.()}
 	</a>
@@ -74,6 +79,7 @@
 		{type}
 		{disabled}
 		{...restProps}
+		on:click={(e) => dispatch('click', e)}
 	>
 		{@render children?.()}
 	</button>

@@ -725,13 +725,13 @@ class WebSocketManager:
         to_unsubscribe = current_subscriptions - desired
 
         if to_subscribe:
-            # For simplicity, subscribe with default 'quote' mode.
+            # For simplicity, subscribe with default 'full' mode to get OI data.
             # The options session manager is LTP-driven, so this is sufficient.
             # A more advanced implementation could accept modes from the manager.
             self.kws.subscribe(list(to_subscribe))
-            self.kws.set_mode(self.kws.MODE_QUOTE, list(to_subscribe))
+            self.kws.set_mode(self.kws.MODE_FULL, list(to_subscribe))
             for token in to_subscribe:
-                self.token_mode_agg[token] = self.kws.MODE_QUOTE
+                self.token_mode_agg[token] = self.kws.MODE_FULL
             logger.info(f"[OptionsSession] Converge: Subscribed to {len(to_subscribe)} new tokens.")
 
         if to_unsubscribe:

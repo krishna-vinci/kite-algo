@@ -674,9 +674,16 @@ async def get_nifty50_data():
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("SELECT * FROM kite_ticker_tickers WHERE source_list = 'Nifty50'")
-            data = [dict(row) for row in cur.fetchall()]
-            return data
+            cur.execute("SELECT * FROM kite_ticker_tickers WHERE source_list = 'Nifty50' ORDER BY sector")
+            
+            sectors = {}
+            for row in cur.fetchall():
+                sector = row['sector']
+                if sector not in sectors:
+                    sectors[sector] = []
+                sectors[sector].append(dict(row))
+            
+            return sectors
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -699,12 +706,12 @@ async def get_nifty50_data():
     **Example Usage:**
     ```bash
     # Fetch specific tokens
-    curl -G "http://localhost:8000/api/marketwatch/nifty50/overlay-snapshot" \
+    curl -G "http://localhost:8777/api/marketwatch/nifty50/overlay-snapshot" \
       --data-urlencode "token=256265" \
       --data-urlencode "token=738561"
 
     # Fetch all Nifty50 tokens (default)
-    curl "http://localhost:8000/api/marketwatch/nifty50/overlay-snapshot"
+    curl "http://localhost:8777/api/marketwatch/nifty50/overlay-snapshot"
     ```
     """
 )
@@ -804,14 +811,121 @@ async def get_overlay_snapshot(
             conn.close()
 
 
+@app.post("/api/marketwatch/nifty50/finalize-baseline")
+async def finalize_nifty50_baseline(dry_run: bool = False, target_date: Optional[str] = Query(None, description="Target date in YYYY-MM-DD format. Defaults to the last trading day.")):
+    """
+    Computes and stores all derived baseline metrics for all Nifty 50 instruments for a specific date.
+    This endpoint can be used for daily updates or to backfill missed days.
+    """
+    conn = None
+    try:
+        # Determine the target date
+        nse = mcal.get_calendar('NSE')
+        if target_date:
+            process_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+        else:
+            today = datetime.now(timezone('Asia/Kolkata')).date()
+            schedule = nse.schedule(start_date=today - timedelta(days=10), end_date=today)
+            process_date = schedule.index[-1].date()
 
+        schedule_back = nse.schedule(start_date=process_date - timedelta(days=10), end_date=process_date)
+        if len(schedule_back) < 2:
+            raise HTTPException(status_code=400, detail="Not enough historical trading days to calculate change.")
+        prev_trading_date = schedule_back.index[-2].date()
+
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("SELECT instrument_token, tradingsymbol, freefloat_marketcap, index_weight FROM kite_ticker_tickers WHERE source_list = 'Nifty50'")
+            instruments = cur.fetchall()
+
+        db = SessionLocal()
+        try:
+            access_token = get_system_access_token(db)
+            if not access_token:
+                raise HTTPException(status_code=500, detail="System access token not available.")
+            kite = KiteConnect(api_key=API_KEY)
+            kite.set_access_token(access_token)
+        finally:
+            db.close()
+
+        updates = []
+        total_new_marketcap = 0
+        
+        # First pass: calculate individual metrics
+        for inst in instruments:
+            try:
+                hist_data = kite.historical_data(inst['instrument_token'], from_date=prev_trading_date, to_date=process_date, interval='day')
+                if len(hist_data) < 2: continue
+
+                today_data = next((d for d in hist_data if d['date'].date() == process_date), None)
+                prev_day_data = next((d for d in hist_data if d['date'].date() == prev_trading_date), None)
+
+                if not today_data or not prev_day_data: continue
+
+                baseline_close = today_data['close']
+                previous_close = prev_day_data['close']
+                change_1d = 0
+                if previous_close > 0:
+                    change_1d = (baseline_close / previous_close) - 1
+                
+                new_freefloat_marketcap = (inst['freefloat_marketcap'] or 0) * (1 + change_1d)
+                return_attribution = (inst['index_weight'] or 0) * change_1d
+                
+                total_new_marketcap += new_freefloat_marketcap
+
+                updates.append({
+                    "instrument_token": inst['instrument_token'],
+                    "change_1d": change_1d * 100,
+                    "previous_close": previous_close,
+                    "baseline_close": baseline_close,
+                    "freefloat_marketcap": new_freefloat_marketcap,
+                    "return_attribution": return_attribution,
+                    "index_weight": 0 # Placeholder for now
+                })
+            except Exception as e:
+                logging.warning(f"Could not process instrument {inst['tradingsymbol']}: {e}")
+                continue
+        
+        # Second pass: calculate new index weight
+        if total_new_marketcap > 0:
+            for update in updates:
+                update['index_weight'] = (update['freefloat_marketcap'] / total_new_marketcap) * 100
+
+        if dry_run:
+            return {"status": "success", "preview": updates}
+
+        with conn.cursor() as cur:
+            update_query = """
+                UPDATE kite_ticker_tickers
+                SET
+                    change_1d = %(change_1d)s,
+                    previous_close = %(previous_close)s,
+                    baseline_close = %(baseline_close)s,
+                    freefloat_marketcap = %(freefloat_marketcap)s,
+                    return_attribution = %(return_attribution)s,
+                    index_weight = %(index_weight)s,
+                    last_updated = NOW()
+                WHERE
+                    instrument_token = %(instrument_token)s AND source_list = 'Nifty50';
+            """
+            psycopg2.extras.execute_batch(cur, update_query, updates)
+        
+        conn.commit()
+        
+        return {"status": "success", "data": {"updated": len(updates), "skipped": len(instruments) - len(updates), "errors": []}}
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.websocket("/broker/ws/marketwatch")
 async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
-
-
     # Auto-subscribe on connect (aggregate across legacy + scoped namespaces)
     db = SessionLocal()
     try:

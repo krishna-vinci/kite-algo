@@ -61,6 +61,9 @@ class OptionsSession:
             return
 
         await self._initialize_instruments()
+        # Run the first computation synchronously to ensure a snapshot is available
+        await self._compute_and_publish()
+        
         self.is_running = True
         self.task = asyncio.create_task(self._run_cadence())
         logger.info(f"Started options session for {self.underlying}.")
@@ -80,6 +83,30 @@ class OptionsSession:
                 pass
         self.desired_tokens.clear()
         logger.info(f"Stopped options session for {self.underlying}.")
+
+    async def update_config(self, window_size: int, cadence_sec: int):
+        """
+        Updates the session's configuration and restarts the task if needed.
+        """
+        if self.window_size == window_size and self.cadence_sec == cadence_sec:
+            return  # No change
+
+        logger.info(
+            f"Updating config for {self.underlying}: "
+            f"window={self.window_size} -> {window_size}, "
+            f"cadence={self.cadence_sec}s -> {cadence_sec}s"
+        )
+        self.window_size = window_size
+        self.cadence_sec = cadence_sec
+
+        if self.is_running and self.task:
+            logger.info(f"Restarting task for {self.underlying} due to config change.")
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+            self.task = asyncio.create_task(self._run_cadence())
 
     async def _initialize_instruments(self):
         """
@@ -123,10 +150,12 @@ class OptionsSession:
 
     async def _run_cadence(self):
         """
-        The main 5-second loop for computing Greeks and publishing updates.
+        The main loop for computing Greeks and publishing updates.
         """
         while self.is_running:
             try:
+                start_time = asyncio.get_event_loop().time()
+
                 # Lightweight check to refresh expiries every 60 seconds
                 if (
                     not self.last_expiry_refresh_ts
@@ -138,12 +167,23 @@ class OptionsSession:
                     await self._refresh_expiries()
 
                 await self._compute_and_publish()
+
+                # Dynamic sleep to maintain cadence
+                elapsed = asyncio.get_event_loop().time() - start_time
+                sleep_duration = max(0, self.cadence_sec - elapsed)
+                logger.info(f"[{self.underlying}] Computation took {elapsed:.2f}s, sleeping for {sleep_duration:.2f}s")
+                await asyncio.sleep(sleep_duration)
+
+            except asyncio.CancelledError:
+                logger.info(f"Cadence task for {self.underlying} was cancelled.")
+                break
             except Exception as e:
                 logger.error(
                     f"Error in session cadence for {self.underlying}: {e}",
                     exc_info=True,
                 )
-            await asyncio.sleep(self.cadence_sec)
+                # Avoid rapid failure loops
+                await asyncio.sleep(self.cadence_sec)
 
     async def _compute_and_publish(self):
         """
@@ -258,27 +298,26 @@ class OptionsSession:
                             "rho": greeks_unit.get("rho"),
                         }
 
+                    exchange_ts = tick.get("exchange_timestamp") if tick else None
+                    stale_age_sec = None
+                    if exchange_ts:
+                        if exchange_ts.tzinfo is None:
+                            exchange_ts = exchange_ts.replace(tzinfo=timezone.utc)
+                        stale_age_sec = (datetime.now(timezone.utc) - exchange_ts).total_seconds()
+
                     row[option_type] = {
                         "token": inst["instrument_token"],
                         "tsym": inst["tradingsymbol"],
                         "ltp": ltp,
                         "iv": iv,
+                        "oi": tick.get("oi") if tick else None,
                         "delta": greeks.get("delta"),
                         "gamma": greeks.get("gamma"),
                         "theta": greeks.get("theta"),
                         "vega": greeks.get("vega"),
                         "rho": greeks.get("rho"),
-                        "updated_at": tick.get("exchange_timestamp", "").isoformat()
-                        if tick and tick.get("exchange_timestamp")
-                        else None,
-                        "stale_age_sec": (
-                            (
-                                datetime.now(timezone.utc)
-                                - tick["exchange_timestamp"]
-                            ).total_seconds()
-                            if tick and tick.get("exchange_timestamp")
-                            else None
-                        ),
+                        "updated_at": exchange_ts.isoformat() if exchange_ts else None,
+                        "stale_age_sec": stale_age_sec,
                     }
                 rows.append(row)
 
@@ -426,16 +465,14 @@ class OptionsSessionManager:
         self, underlying: str, window_size: int = 12, cadence_sec: int = 5
     ):
         """
-        Starts a session for a single underlying.
+        Starts a session for a single underlying, or updates it if it exists.
         """
         if underlying in self.sessions:
-            # TODO: Handle updates to window/cadence for existing sessions
-            logger.info(f"Session for {underlying} already exists.")
+            session = self.sessions[underlying]
+            await session.update_config(window_size, cadence_sec)
             return
 
-        session = OptionsSession(
-            underlying, self, window_size, cadence_sec
-        )
+        session = OptionsSession(underlying, self, window_size, cadence_sec)
         self.sessions[underlying] = session
         await session.start()
 

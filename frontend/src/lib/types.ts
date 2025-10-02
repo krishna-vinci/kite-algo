@@ -8,6 +8,36 @@ export type Instrument = {
 	price: number;
 	last_price?: number;
 };
+
+export type NiftyInstrument = {
+	instrument_token: number;
+	tradingsymbol: string;
+	company_name: string;
+	sector: string;
+	source_list: string;
+	change_1d: number | null;
+	return_attribution: number | null;
+	index_weight: number | null;
+	freefloat_marketcap: number | null;
+	last_updated: string;
+	ltp: number | null;
+	ltp_live?: number;
+	change_percent_live?: number;
+	ff_mc_live?: number;
+	attribution_pp?: number;
+	weight_live?: number;
+};
+
+export type SnapshotEntry = {
+	last_price?: number;
+	change_percent?: number;
+	tick_timestamp?: number;
+};
+
+export type Sectors = {
+	[sector: string]: NiftyInstrument[];
+};
+
 export type Group = { id: string; name: string; instruments: Instrument[] };
 export type WatchlistData = { groups: Group[]; activeGroupIndex: number };
 
@@ -126,6 +156,7 @@ export interface OptionInstrumentData extends OptionGreeks {
   tsym: string;
   ltp: number | null;
   iv: number | null;
+  oi: number | null;
   updated_at: string | null;     // ISO timestamp or null
   stale_age_sec: number | null;  // seconds since exchange_timestamp, if available
 }
@@ -173,4 +204,9 @@ export interface OptionsSessionSnapshot {
 export interface StopSessionResponse {
   status: 'stopped';
   underlying: string;
+}
+
+export interface ErrorResponse {
+  code: string;
+  message: string;
 }
