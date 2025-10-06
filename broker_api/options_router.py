@@ -2,6 +2,8 @@ import asyncio
 import logging
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
+import json
+from fastapi.responses import StreamingResponse
 
 from fastapi import (
     APIRouter,
@@ -122,6 +124,7 @@ def get_options_session_manager(request: Request) -> OptionsSessionManager:
         request.app.state.options_session_manager = OptionsSessionManager(
             ws_manager, instrument_repo
         )
+        ws_manager.options_session_manager = request.app.state.options_session_manager
     return request.app.state.options_session_manager
 
 
@@ -441,3 +444,55 @@ async def websocket_options_session(
         logger.info(f"Client disconnected from options session {normalized_underlying}")
     finally:
         manager.deregister_client(normalized_underlying, queue)
+
+@router.get("/sse/options/session/{symbol}")
+async def sse_options_session(
+    symbol: str,
+    request: Request,
+    manager: OptionsSessionManager = Depends(get_options_session_manager),
+):
+    """
+    Server-Sent Events endpoint to stream 5s updates for an options session.
+    """
+    normalized_symbol, _ = manager.instrument_repo.normalize_underlying_symbol(symbol)
+
+    async def event_generator():
+        await manager.ensure_session(normalized_symbol)
+        queue = await manager.register_client(normalized_symbol)
+        
+        # Send initial snapshot if available
+        initial_snapshot = manager.get_snapshot(normalized_symbol)
+        if initial_snapshot:
+            yield f"data: {json.dumps(initial_snapshot)}\n\n"
+
+        last_heartbeat = asyncio.get_event_loop().time()
+        
+        try:
+            while True:
+                try:
+                    # Wait for a new item from the queue with a timeout
+                    data = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(data)}\n\n"
+                except asyncio.TimeoutError:
+                    # No data, send a heartbeat to keep the connection alive
+                    yield ": keep-alive\n\n"
+                
+                # Also handle client disconnect
+                if await request.is_disconnected():
+                    logger.info(f"Client disconnected from SSE stream for {normalized_symbol}")
+                    break
+        except asyncio.CancelledError:
+             logger.info(f"SSE stream for {normalized_symbol} was cancelled.")
+        finally:
+            manager.deregister_client(normalized_symbol, queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no", # For Nginx buffering
+        },
+    )

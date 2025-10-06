@@ -6,7 +6,7 @@
     startOptionsSessions,
     getOptionsSnapshot,
     stopOptionsSession,
-    openOptionsSessionWS
+    buildOptionsSessionSseUrl
   } from '$lib/api';
   import type {
     WatchlistItem,
@@ -31,9 +31,7 @@
 
   let selectedExpiry: string | null = null;
 
-  let ws: WebSocket | null = null;
-  let reconnectAttempts = 0;
-  const maxReconnectDelayMs = 30000;
+  let eventSource: EventSource | null = null;
 
   let showInstrumentPicker = false;
 
@@ -59,12 +57,6 @@
     
     // Switch view to the newly selected instrument
     setUnderlying(newUnderlying);
-  }
-
-  function getReconnectDelay() {
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), maxReconnectDelayMs);
-    reconnectAttempts++;
-    return delay;
   }
 
   async function refreshWatchlist() {
@@ -105,15 +97,14 @@
     }
   }
 
-  function connectWS(u: string) {
+  function connectSSE(u: string) {
     if (!browser) return;
-    closeWS();
+    closeSSE();
 
-    ws = openOptionsSessionWS(u);
-    ws.onopen = () => {
-      reconnectAttempts = 0;
-    };
-    ws.onmessage = (ev) => {
+    const url = buildOptionsSessionSseUrl(u);
+    eventSource = new EventSource(url);
+
+    eventSource.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data);
         snapshot = data;
@@ -123,29 +114,20 @@
           }
         }
       } catch (err) {
-        console.error('WS parse error', err);
+        console.error('SSE parse error', err);
       }
     };
-    ws.onclose = (ev) => {
-      ws = null;
-      if (ev.code === 4004) {
-        console.info('WS closed: no active session yet');
-        return;
-      }
-      const delay = getReconnectDelay();
-      setTimeout(() => {
-        connectWS(u);
-      }, delay);
-    };
-    ws.onerror = (ev) => {
-      console.error('WS error', ev);
+
+    eventSource.onerror = (ev) => {
+      console.error('SSE error', ev);
+      // EventSource will automatically try to reconnect.
     };
   }
 
-  function closeWS() {
-    if (ws) {
-      try { ws.close(); } catch {}
-      ws = null;
+  function closeSSE() {
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
     }
   }
 
@@ -155,7 +137,7 @@
       await startOptionsSessions(items, replaceWatchlist);
       await refreshWatchlist();
       await ensureSnapshot(underlying);
-      connectWS(underlying);
+      connectSSE(underlying);
     } catch (e) {
       console.error('Start session failed', e);
     }
@@ -165,7 +147,7 @@
     try {
       await stopOptionsSession(u);
       if (u === underlying) {
-        closeWS();
+        closeSSE();
         snapshot = null;
         selectedExpiry = null;
       }
@@ -178,19 +160,19 @@
   function setUnderlying(u: string) {
     underlying = u;
     ensureSnapshot(underlying);
-    connectWS(underlying);
+    connectSSE(underlying);
   }
 
   onMount(async () => {
     await refreshWatchlist();
     await ensureSnapshot(underlying);
     if (!snapshotError) {
-      connectWS(underlying);
+      connectSSE(underlying);
     }
   });
 
   onDestroy(() => {
-    closeWS();
+    closeSSE();
   });
 
   $: currentExpiryRows =

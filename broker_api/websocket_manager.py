@@ -457,6 +457,10 @@ class WebSocketManager:
             # Update database with new tick data
             update_ticker_data_in_db(ticks)
 
+            # Pass ticks to OptionsSessionManager if it exists
+            if hasattr(self, 'options_session_manager'):
+                self.options_session_manager.on_ticks(ticks)
+
             # Merge into pending and let flush loop deliver
             def enqueue():
                 # This runs in main loop

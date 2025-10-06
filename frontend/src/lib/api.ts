@@ -354,8 +354,15 @@ export async function stopOptionsSession(underlying: string): Promise<StopSessio
 export function buildOptionsSessionWsUrl(underlying: string): string {
   const base = getApiBase(); // e.g., http://localhost:8777
   const wsProto = base.startsWith('https') ? 'wss' : 'ws';
-  const wsBase = base.replace(/^http/, wsProto);
-  return `${wsBase}/ws/options/session/${encodeURIComponent(underlying)}`;
+  const wsHost = base.replace(/^https?:\/\//, '');
+  return `${wsProto}://${wsHost}/api/ws/options/session/${encodeURIComponent(underlying)}`;
+}
+/**
+ * Build SSE URL for options session stream.
+ */
+export function buildOptionsSessionSseUrl(underlying: string): string {
+  const base = getApiBase(); // e.g., http://localhost:8777
+  return `${base}/api/sse/options/session/${encodeURIComponent(underlying)}`;
 }
 
 /**
@@ -363,13 +370,6 @@ export function buildOptionsSessionWsUrl(underlying: string): string {
  * Messages are raw OptionsSessionSnapshot JSON documents.
  */
 export function openOptionsSessionWS(underlying: string): WebSocket {
-  const loc = window.location;
-  const isSecure = loc.protocol === 'https:';
-  const scheme = isSecure ? 'wss' : 'ws';
-  const apiBase = getApiBase();
-  const basePath = apiBase.replace(/^https?:\/\/[^/]+/, '');
-  const url = `${scheme}://${loc.host}${basePath}/api/ws/options/session/${encodeURIComponent(
-    underlying
-  )}`;
+  const url = buildOptionsSessionWsUrl(underlying);
   return new WebSocket(url);
 }

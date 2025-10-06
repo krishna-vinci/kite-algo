@@ -485,6 +485,20 @@ class OptionsSessionManager:
             await session.stop()
             await self._converge_subscriptions()
 
+    async def ensure_session(
+        self, underlying: str, window_size: int = 12, cadence_sec: int = 5
+    ):
+        """
+        Ensures a session for a single underlying is running. Starts it if not.
+        Does not update config if session already exists to avoid side-effects from
+        consumers that just need to ensure it's active.
+        """
+        if underlying not in self.sessions:
+            logger.info(f"Session for {underlying} not found via ensure_session. Starting a new one.")
+            session = OptionsSession(underlying, self, window_size, cadence_sec)
+            self.sessions[underlying] = session
+            await session.start()
+
     def get_snapshot(self, underlying: str) -> Optional[Dict[str, Any]]:
         """
         Returns the latest snapshot for an underlying.
@@ -571,3 +585,11 @@ class OptionsSessionManager:
             self.client_queues[underlying].remove(queue)
             if not self.client_queues[underlying]:
                 del self.client_queues[underlying]
+
+    def on_ticks(self, ticks: List[Dict[str, Any]]):
+        """
+        Callback from WebSocketManager to receive ticks.
+        """
+        for session in self.sessions.values():
+            if session.is_running:
+                asyncio.run_coroutine_threadsafe(session._compute_and_publish(), self.ws_manager.main_event_loop)
