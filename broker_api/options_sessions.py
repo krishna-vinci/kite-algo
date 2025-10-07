@@ -1,8 +1,9 @@
 import asyncio
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from math import floor
 from typing import Any, Dict, List, Optional, Set
+import numpy as np
 
 from broker_api.instruments_repository import InstrumentsRepository
 from broker_api.options_greeks import (
@@ -16,6 +17,10 @@ from broker_api.websocket_manager import WebSocketManager
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# --- Vectorized Computation Flag ---
+OPTIONS_SESSIONS_USE_VECTORIZED = True
+
 
 # Constants
 TOKEN_CAP = 2500
@@ -51,6 +56,11 @@ class OptionsSession:
         self.snapshot: Dict[str, Any] = {}
         self.last_spot_ltp: Optional[float] = None
         self.last_expiry_refresh_ts: Optional[datetime] = None
+        
+        # Instrument cache
+        self._instrument_cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_ts: Dict[str, datetime] = {}
+        self._cache_ttl = timedelta(seconds=60)
 
     async def start(self):
         """
@@ -66,17 +76,22 @@ class OptionsSession:
         # Prime the session by retrying the computation until a valid forward price is calculated.
         # This ensures we don't publish a bad initial snapshot.
         primed = False
-        for i in range(5): # Try up to 5 times (e.g., 5 seconds)
-            await self._compute_and_publish()
-            # Check if the first expiry has a valid forward price.
-            if self.snapshot and self.snapshot.get('per_expiry'):
-                first_expiry_key = next(iter(self.snapshot['per_expiry']), None)
-                if first_expiry_key and self.snapshot['per_expiry'][first_expiry_key].get('forward') is not None:
-                    primed = True
-                    logger.info(f"Session for {self.underlying} primed successfully on attempt {i+1}.")
-                    break
-            logger.warning(f"Priming attempt {i+1} for {self.underlying} failed. Retrying in 1s...")
-            await asyncio.sleep(1)
+        try:
+            for i in range(5): # Try up to 5 times (e.g., 5 seconds)
+                await self._compute_and_publish()
+                # Check if the first expiry has a valid forward price.
+                if self.snapshot and self.snapshot.get('per_expiry'):
+                    first_expiry_key = next(iter(self.snapshot['per_expiry']), None)
+                    if first_expiry_key and self.snapshot['per_expiry'][first_expiry_key].get('forward') is not None:
+                        primed = True
+                        logger.info(f"Session for {self.underlying} primed successfully on attempt {i+1}.")
+                        break
+                logger.warning(f"Priming attempt {i+1} for {self.underlying} failed. Retrying in 1s...")
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"[{self.underlying}] Failed to prime session due to an unhandled exception: {e}", exc_info=True)
+            # We can still proceed, but the session will start with empty data.
+            # The main cadence loop has its own error handling.
 
         if not primed:
             logger.error(f"Failed to prime session for {self.underlying} after multiple attempts. Proceeding with potentially incomplete data.")
@@ -137,6 +152,22 @@ class OptionsSession:
         # Initial expiry selection
         await self._refresh_expiries()
 
+    def _get_cached_instruments(self, cache_key: str, fetch_func) -> Dict[str, Any]:
+        """
+        Retrieves data from the in-memory cache or executes the fetch function
+        if the cache is stale or the key does not exist.
+        """
+        now = datetime.now(timezone.utc)
+        if cache_key in self._instrument_cache and cache_key in self._cache_ts:
+            if now - self._cache_ts[cache_key] < self._cache_ttl:
+                return self._instrument_cache[cache_key]
+        
+        # Cache miss or stale, fetch and cache
+        data = fetch_func()
+        self._instrument_cache[cache_key] = data
+        self._cache_ts[cache_key] = now
+        return data
+
     async def _refresh_expiries(self):
         """
         Refreshes the target expiries, updates strikes, and prunes state.
@@ -160,8 +191,10 @@ class OptionsSession:
             # Fetch strikes for new expiries
             for expiry in self.expiries:
                 if expiry not in self.strikes_by_expiry:
-                    self.strikes_by_expiry[expiry] = repo.get_distinct_strikes(
-                        self.underlying, expiry
+                    cache_key = f"strikes:{self.underlying}:{expiry.isoformat()}"
+                    self.strikes_by_expiry[expiry] = self._get_cached_instruments(
+                        cache_key,
+                        lambda: repo.get_distinct_strikes(self.underlying, expiry)
                     )
         self.last_expiry_refresh_ts = datetime.now(timezone.utc)
 
@@ -206,6 +239,36 @@ class OptionsSession:
         """
         Performs a single cycle of computation and publishing with the new
         row-based payload structure and strict computation rules.
+        The main computation logic is offloaded to a separate thread to avoid
+        blocking the asyncio event loop.
+        """
+        # The actual computation is now done in a separate thread
+        per_expiry_data, new_desired_tokens, spot_ltp = await asyncio.to_thread(
+            self._run_computation
+        )
+
+        self.desired_tokens = new_desired_tokens
+
+        # 3. Assemble and publish snapshot
+        snapshot = {
+            "underlying": self.underlying,
+            "spot_token": self.spot_token,
+            "spot_ltp": spot_ltp,
+            "cadence_sec": self.cadence_sec,
+            "expiries": [e.isoformat() for e in self.expiries],
+            "per_expiry": per_expiry_data,
+            "desired_token_count": len(self.desired_tokens),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.snapshot = snapshot
+
+        # 4. Notify manager to update subscriptions and publish
+        await self.manager.on_session_update(self)
+
+    def _run_computation(self) -> tuple[Dict[str, Any], Set[int], Optional[float]]:
+        """
+        The synchronous, CPU-bound part of the computation. This method is
+        executed in a separate thread pool to avoid blocking the event loop.
         """
         # 1. Get spot LTP. If unavailable, we can still proceed but all
         #    expiry-level calculations will be skipped.
@@ -228,141 +291,227 @@ class OptionsSession:
         per_expiry_data = {}
         new_desired_tokens = {self.spot_token} if self.spot_token else set()
 
-        for expiry in self.expiries:
-            expiry_str = expiry.isoformat()
-            strikes = self.strikes_by_expiry.get(expiry, [])
-            if not strikes or not spot_ltp:
-                per_expiry_data[expiry_str] = {
-                    "forward": None,
-                    "sigma_expiry": None,
-                    "atm_strike": None,
-                    "strikes": [],
-                    "rows": [],
-                }
-                continue
+        if OPTIONS_SESSIONS_USE_VECTORIZED:
+            # --- Vectorized Path ---
+            for expiry in self.expiries:
+                expiry_str = expiry.isoformat()
+                strikes = self.strikes_by_expiry.get(expiry, [])
+                if not strikes or not spot_ltp:
+                    per_expiry_data[expiry_str] = {"forward": None, "sigma_expiry": None, "atm_strike": None, "strikes": [], "rows": []}
+                    continue
 
-            # Determine ATM strike
-            atm_strike = self.manager.instrument_repo.nearest_strike(strikes, spot_ltp)
-            if not atm_strike:
-                continue
+                atm_strike = self.manager.instrument_repo.nearest_strike(strikes, spot_ltp)
+                if not atm_strike:
+                    continue
 
-            # Compute time to expiry
-            T = self._time_to_expiry(expiry)
+                T = self._time_to_expiry(expiry)
+                forward, ce_atm_ltp, pe_atm_ltp = self._compute_forward(expiry, atm_strike, spot_ltp)
+                sigma_expiry = self._compute_sigma(expiry, atm_strike, forward, T, ce_atm_ltp, pe_atm_ltp)
 
-            # Strictly compute synthetic forward and sigma
-            forward, ce_atm_ltp, pe_atm_ltp = self._compute_forward(
-                expiry, atm_strike, spot_ltp
-            )
-            sigma_expiry = self._compute_sigma(
-                expiry, atm_strike, forward, T, ce_atm_ltp, pe_atm_ltp
-            )
-
-            # Build window of strikes and fetch instruments
-            window_strikes = self.manager.instrument_repo.window_strikes(
-                strikes, atm_strike, self.window_size
-            )
-            option_instruments = (
-                self.manager.instrument_repo.get_option_instruments_for_strikes(
-                    self.underlying, expiry, window_strikes
+                window_strikes = self.manager.instrument_repo.window_strikes(strikes, atm_strike, self.window_size)
+                
+                strikes_key = tuple(sorted(window_strikes))
+                cache_key = f"instruments:{self.underlying}:{expiry.isoformat()}:{hash(strikes_key)}"
+                option_instruments = self._get_cached_instruments(
+                    cache_key,
+                    lambda: self.manager.instrument_repo.get_option_instruments_for_strikes(self.underlying, expiry, window_strikes)
                 )
-            )
 
-            # Group instruments by strike for row creation
-            inst_by_strike = {}
-            for inst in option_instruments:
-                strike = inst["strike"]
-                if strike not in inst_by_strike:
-                    inst_by_strike[strike] = {}
-                inst_by_strike[strike][inst["option_type"]] = inst
-                new_desired_tokens.add(inst["instrument_token"])
+                inst_by_strike = {s: {} for s in window_strikes}
+                for inst in option_instruments:
+                    inst_by_strike[inst["strike"]][inst["option_type"]] = inst
+                    new_desired_tokens.add(inst["instrument_token"])
 
-            # Build rows
-            rows = []
-            for strike in sorted(window_strikes):
-                ce_inst = inst_by_strike.get(strike, {}).get("CE")
-                pe_inst = inst_by_strike.get(strike, {}).get("PE")
+                # Vectorized computation
+                greeks_ce, greeks_pe = None, None
+                if forward and T > MIN_T and sigma_expiry:
+                    try:
+                        logger.debug(f"[{self.underlying}] Running vectorized computation for {expiry_str}")
+                        k_array = np.array(sorted(window_strikes))
+                        greeks_ce = black76_greeks("CE", forward, k_array, T, sigma_expiry)
+                        greeks_pe = black76_greeks("PE", forward, k_array, T, sigma_expiry)
+                    except Exception as e:
+                        logger.error(f"[{self.underlying}] Vectorized computation failed for {expiry_str}: {e}", exc_info=True)
+                        # Do not fallback, just skip greeks for this expiry
+                        greeks_ce, greeks_pe = None, None
 
-                row = {"strike": strike, "CE": None, "PE": None}
+                rows = []
+                for i, strike in enumerate(sorted(window_strikes)):
+                    row = {"strike": strike, "CE": None, "PE": None}
+                    for option_type, greeks_set in [("CE", greeks_ce), ("PE", greeks_pe)]:
+                        inst = inst_by_strike.get(strike, {}).get(option_type)
+                        if not inst:
+                            continue
 
-                for inst, option_type in [(ce_inst, "CE"), (pe_inst, "PE")]:
-                    if not inst:
-                        continue
+                        tick = self.manager.ws_manager.latest_ticks.get(inst["instrument_token"])
+                        ltp = tick.get("last_price") if tick else None
+                        
+                        greeks = {}
+                        if greeks_set:
+                            greeks = {
+                                "delta": greeks_set["delta"][i],
+                                "gamma": greeks_set["gamma"][i],
+                                "theta": greeks_set["theta"][i] / 365.0,
+                                "vega": greeks_set["vega"][i] / 100.0,
+                                "rho": greeks_set["rho"],
+                            }
 
-                    tick = self.manager.ws_manager.latest_ticks.get(
-                        inst["instrument_token"]
-                    )
-                    ltp = tick.get("last_price") if tick else None
+                        exchange_ts = tick.get("exchange_timestamp") if tick else None
+                        stale_age_sec = None
+                        if exchange_ts:
+                            if exchange_ts.tzinfo is None:
+                                exchange_ts = exchange_ts.replace(tzinfo=timezone.utc)
+                            stale_age_sec = (datetime.now(timezone.utc) - exchange_ts).total_seconds()
 
-                    greeks = {}
-                    iv = None
-                    if forward and T > MIN_T and sigma_expiry:
-                        iv = sigma_expiry
-                        greeks_unit = black76_greeks(
-                            option_type, forward, strike, T, sigma_expiry
-                        )
-                        # Align Greeks with Mibian conventions for reporting
-                        # Vega: reported per 1% volatility change (hence / 100)
-                        # Theta: reported per calendar day (hence / 365)
-                        greeks = {
-                            "delta": greeks_unit.get("delta"),
-                            "gamma": greeks_unit.get("gamma"),
-                            "theta": greeks_unit.get("theta", 0.0) / 365.0
-                            if greeks_unit.get("theta") is not None
-                            else None,
-                            "vega": greeks_unit.get("vega", 0.0) / 100.0
-                            if greeks_unit.get("vega") is not None
-                            else None,
-                            "rho": greeks_unit.get("rho"),
+                        row[option_type] = {
+                            "token": inst["instrument_token"],
+                            "tsym": inst["tradingsymbol"],
+                            "ltp": ltp,
+                            "iv": sigma_expiry,
+                            "oi": tick.get("oi") if tick else None,
+                            "delta": greeks.get("delta"),
+                            "gamma": greeks.get("gamma"),
+                            "theta": greeks.get("theta"),
+                            "vega": greeks.get("vega"),
+                            "rho": greeks.get("rho"),
+                            "updated_at": exchange_ts.isoformat() if exchange_ts else None,
+                            "stale_age_sec": stale_age_sec,
                         }
+                    rows.append(row)
 
-                    exchange_ts = tick.get("exchange_timestamp") if tick else None
-                    stale_age_sec = None
-                    if exchange_ts:
-                        if exchange_ts.tzinfo is None:
-                            exchange_ts = exchange_ts.replace(tzinfo=timezone.utc)
-                        stale_age_sec = (datetime.now(timezone.utc) - exchange_ts).total_seconds()
-
-                    row[option_type] = {
-                        "token": inst["instrument_token"],
-                        "tsym": inst["tradingsymbol"],
-                        "ltp": ltp,
-                        "iv": iv,
-                        "oi": tick.get("oi") if tick else None,
-                        "delta": greeks.get("delta"),
-                        "gamma": greeks.get("gamma"),
-                        "theta": greeks.get("theta"),
-                        "vega": greeks.get("vega"),
-                        "rho": greeks.get("rho"),
-                        "updated_at": exchange_ts.isoformat() if exchange_ts else None,
-                        "stale_age_sec": stale_age_sec,
+                per_expiry_data[expiry_str] = {
+                    "forward": forward,
+                    "sigma_expiry": sigma_expiry,
+                    "atm_strike": atm_strike,
+                    "strikes": window_strikes,
+                    "rows": rows,
+                }
+        else:
+            # --- Legacy Path ---
+            for expiry in self.expiries:
+                expiry_str = expiry.isoformat()
+                strikes = self.strikes_by_expiry.get(expiry, [])
+                if not strikes or not spot_ltp:
+                    per_expiry_data[expiry_str] = {
+                        "forward": None,
+                        "sigma_expiry": None,
+                        "atm_strike": None,
+                        "strikes": [],
+                        "rows": [],
                     }
-                rows.append(row)
+                    continue
 
-            per_expiry_data[expiry_str] = {
-                "forward": forward,
-                "sigma_expiry": sigma_expiry,
-                "atm_strike": atm_strike,
-                "strikes": window_strikes,
-                "rows": rows,
-            }
+                # Determine ATM strike
+                atm_strike = self.manager.instrument_repo.nearest_strike(strikes, spot_ltp)
+                if not atm_strike:
+                    continue
 
-        self.desired_tokens = new_desired_tokens
+                # Compute time to expiry
+                T = self._time_to_expiry(expiry)
 
-        # 3. Assemble and publish snapshot
-        snapshot = {
-            "underlying": self.underlying,
-            "spot_token": self.spot_token,
-            "spot_ltp": spot_ltp,
-            "cadence_sec": self.cadence_sec,
-            "expiries": [e.isoformat() for e in self.expiries],
-            "per_expiry": per_expiry_data,
-            "desired_token_count": len(self.desired_tokens),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self.snapshot = snapshot
+                # Strictly compute synthetic forward and sigma
+                forward, ce_atm_ltp, pe_atm_ltp = self._compute_forward(
+                    expiry, atm_strike, spot_ltp
+                )
+                sigma_expiry = self._compute_sigma(
+                    expiry, atm_strike, forward, T, ce_atm_ltp, pe_atm_ltp
+                )
 
-        # 4. Notify manager to update subscriptions and publish
-        await self.manager.on_session_update(self)
+                # Build window of strikes and fetch instruments
+                window_strikes = self.manager.instrument_repo.window_strikes(
+                    strikes, atm_strike, self.window_size
+                )
+                
+                # Use a cache key for the instruments of the current expiry window
+                strikes_key = tuple(sorted(window_strikes))
+                cache_key = f"instruments:{self.underlying}:{expiry.isoformat()}:{hash(strikes_key)}"
+                option_instruments = self._get_cached_instruments(
+                    cache_key,
+                    lambda: self.manager.instrument_repo.get_option_instruments_for_strikes(
+                        self.underlying, expiry, window_strikes
+                    )
+                )
+
+                # Group instruments by strike for row creation
+                inst_by_strike = {}
+                for inst in option_instruments:
+                    strike = inst["strike"]
+                    if strike not in inst_by_strike:
+                        inst_by_strike[strike] = {}
+                    inst_by_strike[strike][inst["option_type"]] = inst
+                    new_desired_tokens.add(inst["instrument_token"])
+
+                # Build rows
+                rows = []
+                for strike in sorted(window_strikes):
+                    ce_inst = inst_by_strike.get(strike, {}).get("CE")
+                    pe_inst = inst_by_strike.get(strike, {}).get("PE")
+
+                    row = {"strike": strike, "CE": None, "PE": None}
+
+                    for inst, option_type in [(ce_inst, "CE"), (pe_inst, "PE")]:
+                        if not inst:
+                            continue
+
+                        tick = self.manager.ws_manager.latest_ticks.get(
+                            inst["instrument_token"]
+                        )
+                        ltp = tick.get("last_price") if tick else None
+
+                        greeks = {}
+                        iv = None
+                        if forward and T > MIN_T and sigma_expiry:
+                            iv = sigma_expiry
+                            greeks_unit = black76_greeks(
+                                option_type, forward, strike, T, sigma_expiry
+                            )
+                            # Align Greeks with Mibian conventions for reporting
+                            # Vega: reported per 1% volatility change (hence / 100)
+                            # Theta: reported per calendar day (hence / 365)
+                            greeks = {
+                                "delta": greeks_unit.get("delta"),
+                                "gamma": greeks_unit.get("gamma"),
+                                "theta": greeks_unit.get("theta", 0.0) / 365.0
+                                if greeks_unit.get("theta") is not None
+                                else None,
+                                "vega": greeks_unit.get("vega", 0.0) / 100.0
+                                if greeks_unit.get("vega") is not None
+                                else None,
+                                "rho": greeks_unit.get("rho"),
+                            }
+
+                        exchange_ts = tick.get("exchange_timestamp") if tick else None
+                        stale_age_sec = None
+                        if exchange_ts:
+                            if exchange_ts.tzinfo is None:
+                                exchange_ts = exchange_ts.replace(tzinfo=timezone.utc)
+                            stale_age_sec = (datetime.now(timezone.utc) - exchange_ts).total_seconds()
+
+                        row[option_type] = {
+                            "token": inst["instrument_token"],
+                            "tsym": inst["tradingsymbol"],
+                            "ltp": ltp,
+                            "iv": iv,
+                            "oi": tick.get("oi") if tick else None,
+                            "delta": greeks.get("delta"),
+                            "gamma": greeks.get("gamma"),
+                            "theta": greeks.get("theta"),
+                            "vega": greeks.get("vega"),
+                            "rho": greeks.get("rho"),
+                            "updated_at": exchange_ts.isoformat() if exchange_ts else None,
+                            "stale_age_sec": stale_age_sec,
+                        }
+                    rows.append(row)
+
+                per_expiry_data[expiry_str] = {
+                    "forward": forward,
+                    "sigma_expiry": sigma_expiry,
+                    "atm_strike": atm_strike,
+                    "strikes": window_strikes,
+                    "rows": rows,
+                }
+
+        return per_expiry_data, new_desired_tokens, spot_ltp
 
     def _compute_forward(
         self, expiry: date, atm_strike: float, spot_ltp: float
@@ -592,7 +741,11 @@ class OptionsSessionManager:
     def on_ticks(self, ticks: List[Dict[str, Any]]):
         """
         Callback from WebSocketManager to receive ticks.
+        This method now only updates the tick data. The actual computation
+        is driven by the scheduled _run_cadence loop to prevent excessive
+        CPU usage from high-frequency tick updates.
         """
-        for session in self.sessions.values():
-            if session.is_running:
-                asyncio.run_coroutine_threadsafe(session._compute_and_publish(), self.ws_manager.main_event_loop)
+        # The ws_manager.latest_ticks dictionary is already updated by the
+        # WebSocketManager before this callback is invoked.
+        # No further action is needed here.
+        pass

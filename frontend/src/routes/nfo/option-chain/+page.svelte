@@ -32,6 +32,8 @@
   let selectedExpiry: string | null = null;
 
   let eventSource: EventSource | null = null;
+  let currentStreamUnderlying: string | null = null;
+  let lastCadenceByUnderlying = new Map<string, number>();
 
   let showInstrumentPicker = false;
 
@@ -98,11 +100,12 @@
   }
 
   function connectSSE(u: string) {
-    if (!browser) return;
+    if (!browser || currentStreamUnderlying === u) return;
     closeSSE();
 
     const url = buildOptionsSessionSseUrl(u);
     eventSource = new EventSource(url);
+    currentStreamUnderlying = u;
 
     eventSource.onmessage = (ev) => {
       try {
@@ -129,6 +132,7 @@
       eventSource.close();
       eventSource = null;
     }
+    currentStreamUnderlying = null;
   }
 
   async function onStartSession() {
@@ -157,12 +161,10 @@
     }
   }
 
-  function setUnderlying(u: string) {
+  async function setUnderlying(u: string) {
     underlying = u;
-    // When switching, close any active stream and fetch a static snapshot.
-    // A new stream will only be opened if the user clicks "Start" for the new underlying.
-    closeSSE();
-    ensureSnapshot(underlying);
+    // Reactive guard will handle SSE connection. We just ensure snapshot is loaded.
+    await ensureSnapshot(u);
   }
 
   onMount(async () => {
@@ -187,11 +189,26 @@
   $: atmStrike = currentExpiryData?.atm_strike;
   $: isSessionRunning = watchlist.find(item => item.underlying === underlying)?.is_running ?? false;
 
-  // Reactive statement to auto-update cadence
+  // Reactive statement to auto-update cadence, debounced to avoid churn.
   $: if (browser && isSessionRunning && underlying && cadenceSec > 0) {
-    console.log(`Updating cadence for ${underlying} to ${cadenceSec}s`);
-    startOptionsSessions([{ underlying, cadence_sec: cadenceSec }], false)
-      .catch(err => console.error('Auto-update cadence failed', err));
+    const prev = lastCadenceByUnderlying.get(underlying);
+    if (prev !== cadenceSec) {
+      lastCadenceByUnderlying.set(underlying, cadenceSec);
+      startOptionsSessions([{ underlying, cadence_sec: cadenceSec }], false)
+        .catch(err => console.error('Auto-update cadence failed', err));
+    }
+  }
+
+  // Reactive guard to manage SSE connection lifecycle.
+  // Connects when switching to a running session, disconnects when session stops.
+  $: if (browser && underlying && isSessionRunning) {
+    if (currentStreamUnderlying !== underlying) {
+      connectSSE(underlying);
+    }
+  } else {
+    if (currentStreamUnderlying) {
+      closeSSE();
+    }
   }
 
   function formatOi(oi: number | null | undefined) {
