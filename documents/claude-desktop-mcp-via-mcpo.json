@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "kite": {
-      "command": "npx",
-      "args": ["mcp-remote", "http://localhost:8777/llm/mcp", "--allow-http"]
-    }
-  }
-}

@@ -1,19 +1,21 @@
 <script lang="ts">
-    import { onMount } from 'svelte';
-    import { browser } from '$app/environment';
-    import { getApiBase, getUserSubscriptions, saveUserSubscriptions } from '$lib/api';
-    import { marketwatch } from '$lib/stores/marketwatch';
-    import type { Instrument, Group, WatchlistData } from '$lib/types';
-   
-    // --- Icon Components (as SVG strings) ---
-    const SearchIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`;
-    const SlidersIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"></line><line x1="4" y1="10" x2="4" y2="3"></line><line x1="12" y1="21" x2="12" y2="12"></line><line x1="12" y1="8" x2="12" y2="3"></line><line x1="20" y1="21" x2="20" y2="16"></line><line x1="20" y1="12" x2="20" y2="3"></line><line x1="1" y1="14" x2="7" y2="14"></line><line x1="9" y1="8" x2="15" y2="8"></line><line x1="17" y1="16" x2="23" y2="16"></line></svg>`;
-    const BriefcaseIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>`;
-    const ArrowUpIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>`;
-    const ArrowDownIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><polyline points="19 12 12 19 5 12"></polyline></svg>`;
-    const LayersIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>`;
-    const PlusIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24" viewfill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>`;
-    const TrashIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>`;
+	import { onMount } from 'svelte';
+	import { browser } from '$app/environment';
+	import { getApiBase, getUserSubscriptions, saveUserSubscriptions } from '$lib/api';
+	import { marketwatch } from '$lib/stores/marketwatch';
+	import type { Instrument, Group, WatchlistData } from '$lib/types';
+	export let isCollapsed = true;
+	// --- Icon Components (as SVG strings) ---
+	const SearchIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`;
+	const SlidersIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"></line><line x1="4" y1="10" x2="4" y2="3"></line><line x1="12" y1="21" x2="12" y2="12"></line><line x1="12" y1="8" x2="12" y2="3"></line><line x1="20" y1="21" x2="20" y2="16"></line><line x1="20" y1="12" x2="20" y2="3"></line><line x1="1" y1="14" x2="7" y2="14"></line><line x1="9" y1="8" x2="15" y2="8"></line><line x1="17" y1="16" x2="23" y2="16"></line></svg>`;
+	const BriefcaseIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>`;
+	const ArrowUpIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>`;
+	const ArrowDownIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><polyline points="19 12 12 19 5 12"></polyline></svg>`;
+	const LayersIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"></polygon><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>`;
+	const PlusIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24" viewfill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>`;
+	const TrashIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>`;
+	const ChevronLeftIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>`;
+	const ChevronRightIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`;
 
     // --- Primary State ---
     let allWatchlists: WatchlistData[] = [];
@@ -131,13 +133,10 @@
                 // Initialize with a default structure if nothing is stored on the server
                 allWatchlists = [
                     createDefaultWatchlist(),
-                    createEmptyWatchlist(),
-                    createEmptyWatchlist(),
-                    createEmptyWatchlist(),
-                    createEmptyWatchlist(),
-                    createEmptyWatchlist(),
-                    createEmptyWatchlist()
                 ];
+            }
+            while (allWatchlists.length < 5) {
+                allWatchlists.push(createEmptyWatchlist());
             }
         } catch (e) {
             console.warn('Could not fetch subscriptions from server. Using default.', e);
@@ -303,162 +302,135 @@
     }
 </script>
 
-<aside class="sidebar">
- <!-- Top Section -->
-	<div class="top-section">
-		<div class="search-container">
-			<div class="search-icon">{@html SearchIcon}</div>
-			<input type="text" placeholder="Search eg: infy bse, nifty fut, etc" bind:value={searchTerm} />
-			<div class="search-actions"><span class="kbd">Ctrl</span><span class="kbd">K</span><button class="icon-button">{@html SlidersIcon}</button></div>
-			{#if searchResults.length > 0}
-				<ul class="search-results">
-					{#each searchResults as instrument (instrument.instrument_token)}
-						<li on:click={() => addInstrumentToActiveGroup(instrument)}>
-							<span>{instrument.tradingsymbol}</span>
-							<span class="text-xs text-gray-500">{instrument.name}</span>
-							<span class="add-indicator">+</span>
+<aside class="relative h-full flex flex-col border-r border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 transition-all duration-200 ease-in-out" class:w-0={isCollapsed} class:border-r-0={isCollapsed} class:w-90={!isCollapsed}>
+	<div class="flex flex-col h-full overflow-hidden" class:hidden={isCollapsed} class:w-90={!isCollapsed}>
+		<!-- Top Section -->
+		<div class="p-3 border-b border-gray-200 dark:border-gray-700 flex flex-col gap-3">
+			<div class="relative">
+				<div class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 dark:text-gray-500">{@html SearchIcon}</div>
+				<input type="text" placeholder="Search eg: infy bse, nifty fut, etc" bind:value={searchTerm} class="w-full h-9 pl-9 pr-24 border border-gray-300 dark:border-gray-700 rounded-md text-sm bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200" />
+				<div class="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+					<span class="bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-1.5 py-0.5 text-xs text-gray-500 dark:text-gray-400">Ctrl</span><span class="bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-1.5 py-0.5 text-xs text-gray-500 dark:text-gray-400">K</span><button class="flex items-center justify-center w-8 h-8 text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200">{@html SlidersIcon}</button>
+				</div>
+				{#if searchResults.length > 0}
+					<ul class="absolute top-full left-0 right-0 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 border-t-0 rounded-b-md max-h-50 overflow-y-auto z-10">
+						{#each searchResults as instrument (instrument.instrument_token)}
+							<li on:click={() => addInstrumentToActiveGroup(instrument)} class="flex justify-between items-center px-3 py-2 cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700">
+								<span class="text-gray-800 dark:text-gray-200">{instrument.tradingsymbol}</span>
+								<span class="text-xs text-gray-500 dark:text-gray-400">{instrument.name}</span>
+								<span class="text-green-600 dark:text-green-400">+</span>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</div>
+			<div class="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+				<span>MW {currentWatchlistPage + 1} ({activeGroup?.instruments.length ?? 0} / 250)</span>
+				<button class="text-blue-600 dark:text-blue-400 font-medium hover:underline" on:click={addGroup}>+ New group</button>
+			</div>
+			<div class="flex flex-col gap-1">
+				{#if groups}
+					{#each groups as group, i (group.id)}
+						<button
+							class="w-full h-9 border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 rounded-md text-left px-3 transition-all duration-200 ease-in-out"
+							class:bg-gray-100={activeGroupIndex === i}
+							class:dark:bg-gray-700={activeGroupIndex === i}
+							class:border-gray-400={activeGroupIndex === i}
+							class:dark:border-gray-500={activeGroupIndex === i}
+							on:click={() => setActiveGroup(i)}
+							on:dragover|preventDefault={(e) => (e.currentTarget as HTMLElement).classList.add('drag-over')}
+							on:dragleave={(e) => (e.currentTarget as HTMLElement).classList.remove('drag-over')}
+							on:drop={(e) => handleGroupDrop(e, i)}
+						>
+							<span class="font-semibold text-gray-800 dark:text-gray-200">{group.name}</span>
+							<span class="ml-1 text-gray-500 dark:text-gray-400">({group.instruments.length})</span>
+						</button>
+					{/each}
+				{/if}
+			</div>
+		</div>
+
+		<!-- Middle Section -->
+		<div class="flex-grow overflow-y-auto px-3 py-2">
+			{#if activeGroup}
+				<ul>
+					{#each activeGroup.instruments as instrument (instrument.id)}
+						{@const liveData = $marketwatch.instruments[instrument.instrument_token] || instrument}
+						{@const percentChange = getPercentChange(liveData, instrument)}
+						{@const priceChange = getPriceChange(liveData, instrument)}
+						{@const isDown = (percentChange ?? 0) < 0}
+						<li
+							class="relative grid grid-cols-[1fr_auto] items-center px-2 py-1.5 pr-8 rounded cursor-grab transition-colors duration-200 ease-in-out hover:bg-gray-100 dark:hover:bg-gray-800"
+							draggable="true"
+							on:dragstart={(e) => handleDragStart(e, instrument)}
+							on:dragend={handleDragEnd}
+							on:dragover={(e) => handleInstrumentDragOver(e, instrument)}
+							on:dragleave={() => (dropIndicator.targetId = null)}
+							on:drop={(e) => handleInstrumentDrop(e, instrument)}
+						>
+							{#if dropIndicator.targetId === instrument.id && dropIndicator.position === 'before'}
+								<div class="absolute left-2 right-2 h-0.5 bg-blue-600 dark:bg-blue-400 z-10 top-px" />
+							{/if}
+
+							<span class="text-sm font-medium whitespace-nowrap overflow-hidden text-ellipsis" class:text-red-600={isDown} class:dark:text-red-400={isDown} class:text-green-600={!isDown} class:dark:text-green-400={!isDown}>{instrument.name}</span>
+							<div class="flex items-center gap-2 text-sm">
+								<span class="text-right w-16" class:text-red-600={isDown} class:dark:text-red-400={isDown}>{(priceChange ?? 0).toFixed(2)}</span>
+								<span class="w-17.5 gap-0.5 flex items-center justify-end" class:text-red-600={isDown} class:dark:text-red-400={isDown} class:text-green-600={!isDown} class:dark:text-green-400={!isDown}>
+									{(percentChange ?? 0).toFixed(2)}%
+									<span class="w-3.5 h-3.5">{@html isDown ? ArrowDownIcon : ArrowUpIcon}</span>
+								</span>
+								<span class="text-right w-20 font-medium" class:text-red-600={isDown} class:dark:text-red-400={isDown} class:text-green-600={!isDown} class:dark:text-green-400={!isDown}>
+									{(liveData?.last_price ?? instrument.price ?? 0).toFixed(2)}
+								</span>
+							</div>
+							<button
+								class="absolute top-1/2 right-2 -translate-y-1/2 hidden items-center justify-center w-6 h-6 text-gray-400 dark:text-gray-500 z-50 hover:text-red-600 dark:hover:text-red-400"
+								title="Delete Instrument"
+								on:click|stopPropagation={() => deleteInstrument(instrument.id)}
+							>
+								{@html TrashIcon}
+							</button>
+
+							{#if dropIndicator.targetId === instrument.id && dropIndicator.position === 'after'}
+								<div class="absolute left-2 right-2 h-0.5 bg-blue-600 dark:bg-blue-400 z-10 bottom-px" />
+							{/if}
 						</li>
+					{:else}
+						<div class="text-center text-gray-400 dark:text-gray-500 text-sm py-8">This group is empty. Drag instruments here.</div>
 					{/each}
 				</ul>
+			{:else}
+				<div class="text-center text-gray-400 dark:text-gray-500 text-sm py-8">Loading...</div>
 			{/if}
 		</div>
-		<div class="watchlist-info">
-			<span>MW {currentWatchlistPage + 1} ({activeGroup?.instruments.length ?? 0} / 250)</span>
-			<button class="link-button" on:click={addGroup}>+ New group</button>
-		</div>
-		<div class="group-list">
-			{#if groups}
-				{#each groups as group, i (group.id)}
+
+		<!-- Bottom Section -->
+		<div class="flex items-center justify-between px-4 py-1.5 border-t border-gray-200 dark:border-gray-700">
+			<div class="flex items-center gap-4 overflow-x-auto">
+				{#each allWatchlists as _, i (i)}
 					<button
-						class="group-selector"
-						class:active={activeGroupIndex === i}
-						on:click={() => setActiveGroup(i)}
-						on:dragover|preventDefault={(e) => (e.currentTarget as HTMLElement).classList.add('drag-over')}
-						on:dragleave={(e) => (e.currentTarget as HTMLElement).classList.remove('drag-over')}
-						on:drop={(e) => handleGroupDrop(e, i)}
+						on:click={() => (currentWatchlistPage = i)}
+						class="relative px-1 py-2 text-sm text-gray-500 dark:text-gray-400 flex-shrink-0"
+						class:font-bold={currentWatchlistPage === i}
+						class:text-gray-900={currentWatchlistPage === i}
+						class:dark:text-white={currentWatchlistPage === i}
 					>
-						<span class="group-name">{group.name}</span>
-						<span class="group-count">({group.instruments.length})</span>
+						{i + 1}
 					</button>
 				{/each}
-			{/if}
+			</div>
+			<div class="flex gap-3 text-gray-500 dark:text-gray-400">
+				<button class="flex items-center justify-center w-8 h-8 text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200">{@html LayersIcon}</button>
+				<button class="flex items-center justify-center w-8 h-8 text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200">{@html PlusIcon}</button>
+			</div>
 		</div>
 	</div>
-
-	<!-- Middle Section -->
-	<div class="middle-section">
-		{#if activeGroup}
-			<ul>
-				{#each activeGroup.instruments as instrument (instrument.id)}
-					{@const liveData = $marketwatch.instruments[instrument.instrument_token] || instrument}
-					{@const percentChange = getPercentChange(liveData, instrument)}
-					{@const priceChange = getPriceChange(liveData, instrument)}
-					{@const isDown = (percentChange ?? 0) < 0}
-					<li
-						class="stock-item"
-						draggable="true"
-						on:dragstart={(e) => handleDragStart(e, instrument)}
-						on:dragend={handleDragEnd}
-						on:dragover={(e) => handleInstrumentDragOver(e, instrument)}
-						on:dragleave={() => dropIndicator.targetId = null}
-						on:drop={(e) => handleInstrumentDrop(e, instrument)}
-					>
-						{#if dropIndicator.targetId === instrument.id && dropIndicator.position === 'before'}<div class="drop-indicator top" />{/if}
-
-						<span class="stock-name" class:red={isDown} class:green={!isDown}>{instrument.name}</span>
-						<div class="stock-data">
-							<span class="data-point change" class:red={isDown}>{(priceChange ?? 0).toFixed(2)}</span>
-							<span class="data-point percent-change" class:red={isDown} class:green={!isDown}>
-								{(percentChange ?? 0).toFixed(2)}%
-								<span class="arrow-icon">{#if isDown}{@html ArrowDownIcon}{:else}{@html ArrowUpIcon}{/if}</span>
-							</span>
-							<span class="data-point price" class:red={isDown} class:green={!isDown}>{(liveData?.last_price ?? instrument.price ?? 0).toFixed(2)}</span>
-						</div>
-						<button class="delete-button" title="Delete Instrument" on:click|stopPropagation={() => deleteInstrument(instrument.id)}>
-							{@html TrashIcon}
-						</button>
-
-						{#if dropIndicator.targetId === instrument.id && dropIndicator.position === 'after'}<div class="drop-indicator bottom" />{/if}
-					</li>
-				{:else}
-					<div class="empty-state">This group is empty. Drag instruments here.</div>
-				{/each}
-			</ul>
-		{:else}
-			<div class="empty-state">Loading...</div>
-		{/if}
-	</div>
-
-	<!-- Bottom Section -->
-	<div class="bottom-section">
-		<div class="pagination">
-			{#each allWatchlists as _, i (i)}
-				<button on:click={() => (currentWatchlistPage = i)} class="pagination-button" class:active={currentWatchlistPage === i}>
-					{i + 1}
-				</button>
-			{/each}
-		</div>
-		<div class="bottom-actions">
-			<button class="icon-button">{@html LayersIcon}</button>
-			<button class="icon-button">{@html PlusIcon}</button>
-		</div>
-	</div>
+	<button
+		class="absolute top-1/2 left-full -translate-x-1/2 -translate-y-1/2 z-50 w-6 h-6 rounded-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 flex items-center justify-center cursor-pointer shadow-md transition-all duration-200 ease-in-out"
+		class:left-3={isCollapsed}
+		on:click={() => (isCollapsed = !isCollapsed)}
+		title={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+	>
+		{@html isCollapsed ? ChevronRightIcon : ChevronLeftIcon}
+	</button>
 </aside>
-
-<style>
-    :root { --border-color: #e5e7eb; --text-gray-400: #9ca3af; --text-gray-500: #6b7280; --text-gray-800: #1f2937; --text-gray-900: #111827; --bg-gray-50: #f9fafb; --bg-gray-100: #f3f4f6; --brand-blue: #2563eb; --brand-orange: #f97316; --brand-red: #dc2626; --brand-green: #16a34a; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    button { background: none; border: none; cursor: pointer; font-family: inherit; }
-    ul { list-style: none; }
-    .sidebar { width: 360px; height: 100%; display: flex; flex-direction: column; border-right: 1px solid var(--border-color); background-color: white; }
-    .top-section { padding: 0.75rem; border-bottom: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 0.75rem; }
-    .middle-section { flex-grow: 1; overflow-y: auto; padding: 0.5rem 0.75rem; }
-    .bottom-section { display: flex; align-items: center; justify-content: space-between; padding: 0.375rem 1rem; border-top: 1px solid var(--border-color); }
-    .search-container { position: relative; }
-    .search-container input { width: 100%; height: 36px; padding-left: 36px; padding-right: 96px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; }
-    .search-results { position: absolute; top: 100%; left: 0; right: 0; background: white; border: 1px solid #d1d5db; border-top: none; border-radius: 0 0 6px 6px; max-height: 200px; overflow-y: auto; z-index: 100; }
-    .search-results li { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; cursor: pointer; }
-    .search-results li:hover { background-color: var(--bg-gray-100); }
-    .search-results .add-indicator { color: var(--brand-green); }
-    .search-icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; color: var(--text-gray-400); }
-    .search-actions { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); display: flex; align-items: center; gap: 4px; }
-    .kbd { background-color: var(--bg-gray-100); border: 1px solid #d1d5db; border-radius: 4px; padding: 2px 6px; font-size: 12px; color: var(--text-gray-500); }
-    .watchlist-info { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--text-gray-500); }
-    .link-button { color: var(--brand-blue); font-weight: 500; }
-    .link-button:hover { text-decoration: underline; }
-    .group-list { display: flex; flex-direction: column; gap: 4px; }
-    .group-selector { width: 100%; height: 36px; border: 1px solid #d1d5db; background-color: white; border-radius: 6px; text-align: left; padding: 0 12px; transition: all 0.2s ease; }
-    .group-selector.active { background-color: var(--bg-gray-100); border-color: #a1a1aa; }
-    .group-selector.drag-over { border-color: var(--brand-blue); box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.4); }
-    .group-name { font-weight: 600; color: var(--text-gray-800); }
-    .group-count { margin-left: 4px; color: var(--text-gray-500); }
-    .stock-item { position: relative; display: grid; grid-template-columns: 1fr auto; align-items: center; padding: 6px 32px 6px 8px; border-radius: 4px; cursor: grab; transition: background-color 0.2s ease; }
-    .stock-item:hover { background-color: var(--bg-gray-100); }
-    .stock-item.is-dragging { opacity: 0.5; background-color: #dbeafe; }
-    .drop-indicator { position: absolute; left: 8px; right: 8px; height: 2px; background-color: var(--brand-blue); z-index: 10; }
-    .drop-indicator.top { top: -1px; }
-    .drop-indicator.bottom { bottom: -1px; }
-    .stock-name { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .stock-data { display: flex; align-items: center; gap: 8px; font-size: 14px; }
-    .data-point { text-align: right; }
-    .change { width: 64px; }
-    .percent-change { width: 70px; gap: 2px; display: flex; align-items: center; justify-content: flex-end; }
-    .price { width: 80px; font-weight: 500; }
-    .red { color: var(--brand-red); }
-    .green { color: var(--brand-green); }
-    .delete-button { position: absolute; top: 50%; right: 8px; transform: translateY(-50%); display: none; align-items: center; justify-content: center; width: 24px; height: 24px; color: var(--text-gray-400); z-index: 5; }
-    .stock-item:hover .delete-button { display: flex; }
-    .delete-button:hover { color: var(--brand-red); }
-    .empty-state { text-align: center; color: var(--text-gray-400); font-size: 14px; padding: 2rem 0; }
-    .pagination { display: flex; align-items: center; gap: 16px; overflow-x: auto; }
-    .pagination-button { position: relative; padding: 8px 4px; font-size: 14px; color: var(--text-gray-500); flex-shrink: 0; }
-    .pagination-button.active { font-weight: 700; color: var(--text-gray-900); }
-    .pagination-button.active::after { content: ''; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); width: 20px; height: 2px; background-color: var(--brand-orange); }
-    .bottom-actions { display: flex; gap: 12px; color: var(--text-gray-500); }
-    .icon-button { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; color: var(--text-gray-500); }
-    .icon-button:hover { color: var(--text-gray-800); }
-    .icon-button :global(svg) { width: 16px; height: 16px; }
-    .arrow-icon :global(svg) { width: 14px; height: 14px; }
-    .bottom-actions .icon-button :global(svg) { width: 20px; height: 20px; }
-    .delete-button :global(svg) { width: 14px; height: 14px; }
-   </style>

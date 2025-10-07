@@ -16,12 +16,14 @@ services:
       - --port
       - "8777"
       - --reload                 # ← enable hot-reload
-    restart: unless-stopped
+    restart: always
     networks:
       - db-net
       - caddy-net
     env_file:
       - .env
+    depends_on:
+      - redis
 
 
   frontend:
@@ -38,6 +40,7 @@ services:
       - caddy-net
     depends_on:
       - finance-app
+    restart: always
 
   meilisearch:
     image: getmeili/meilisearch:latest
@@ -45,8 +48,9 @@ services:
       - ./meili_data:/data.ms
     ports:
       - "7700:7700"
-    environment:
-      - MEILI_MASTER_KEY=${MEILI_MASTER_KEY:-aMasterKey}
+    env_file:
+      - .env
+    command: ["meilisearch", "--master-key=${MEILI_MASTER_KEY}"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
       interval: 30s
@@ -55,6 +59,20 @@ services:
     networks:
       - db-net
       - caddy-net
+    restart: always
+
+  redis:
+    image: "redis:alpine"
+    container_name: kite-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis_data:/data 
+    networks:
+      - db-net
+      - caddy-net
+    restart: always
+
 
 networks:
   db-net:

@@ -128,6 +128,8 @@ from database import FyersSession
 
 from broker_api.kite_auth import login_headless, get_kite
 from broker_api.kite_auth import API_KEY
+from . import kite_orders
+from . import options_router
 
 
 
@@ -136,6 +138,8 @@ load_dotenv()
 
 # API router
 router = APIRouter()
+router.include_router(kite_orders.router)
+router.include_router(options_router.router)
 
 # Pydantic request models
 class TickerRequest(BaseModel):
@@ -143,6 +147,20 @@ class TickerRequest(BaseModel):
 
 class InstrumentsRequest(BaseModel):
     instruments: List[str]
+
+
+class OHLCResponseData(BaseModel):
+    instrument_token: int
+    last_price: float
+    open: float
+    high: float
+    low: float
+    previous_close: float
+
+
+class OHLCResponse(BaseModel):
+    status: str = "success"
+    data: Dict[str, OHLCResponseData]
 
 
 class PortfolioSnapshotCreate(BaseModel):
@@ -960,6 +978,54 @@ def get_ltp(request: InstrumentsRequest, kite: KiteConnect = Depends(get_kite)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve LTP: {str(e)}")
 
+
+@router.get("/quote/ohlc", response_model=OHLCResponse, summary="Get OHLC and LTP for multiple instruments")
+def get_ohlc(
+    i: List[str] = Query(..., description="Instrument identifier in the format EXCHANGE:TRADINGSYMBOL"),
+    kite: KiteConnect = Depends(get_kite),
+):
+    """
+    Retrieves OHLC (previous day's close) and last traded price for up to 1000 instruments.
+    """
+    instruments = sorted(list(set(i)))
+    count = len(instruments)
+    if not (1 <= count <= 1000):
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": "Number of instruments must be between 1 and 1000."},
+        )
+
+    try:
+        ohlc_data = kite.ohlc(instruments)
+        
+        response_data = {}
+        for instrument, data in ohlc_data.items():
+            try:
+                # Ensure all required fields are present
+                if "instrument_token" in data and "last_price" in data and "ohlc" in data and "open" in data["ohlc"] and "high" in data["ohlc"] and "low" in data["ohlc"] and "close" in data["ohlc"]:
+                    response_data[instrument] = {
+                        "instrument_token": data["instrument_token"],
+                        "last_price": data["last_price"],
+                        "open": data["ohlc"]["open"],
+                        "high": data["ohlc"]["high"],
+                        "low": data["ohlc"]["low"],
+                        "previous_close": data["ohlc"]["close"],
+                    }
+            except (KeyError, TypeError):
+                # Skip instruments with missing data
+                continue
+        
+        return {"status": "success", "data": response_data}
+
+    except Exception as e:
+        logger.error(f"Upstream Kite OHLC request failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=502,
+            detail={"status": "error", "message": f"Upstream error: {str(e)}"},
+        )
+
+
+
  
  # ─────────── Instruments import functionality ───────────
 async def upsert_instrument(record, db_session):
@@ -1483,16 +1549,41 @@ async def fuzzy_search_instruments(
                     'instrument_type', 'segment', 'exchange', 'underlying', 'option_type'
                 ]
             }
+            # Pre-sanitize sort against current index settings to avoid invalid_search_sort
+            try:
+                sanitized = _sanitize_sort(index, options.get("sort"))
+                if not sanitized:
+                    options.pop("sort", None)
+                else:
+                    options["sort"] = sanitized
+            except Exception:
+                # On any settings error, drop sort to avoid invalid_search_sort
+                options.pop("sort", None)
             try:
                 result = index.search(q_text, options)
             except meilisearch.errors.MeilisearchApiError as e:
-                if "invalid_search_sort" in str(e) or "not sortable" in str(e):
+                msg = str(e)
+                if "invalid_search_sort" in msg or "not sortable" in msg:
                     logger.warning(f"Meili search failed with invalid sort for q='{q_text}'. Sanitizing and retrying.")
                     options["sort"] = _sanitize_sort(index, options.get("sort"))
                     try:
                         result = index.search(q_text, options)
                     except Exception:
                         logger.error(f"Meili retry failed for q='{q_text}' after sanitizing. Retrying without sort.")
+                        options.pop("sort", None)
+                        result = index.search(q_text, options)
+                elif "invalid_search_filter" in msg or "not filterable" in msg:
+                    logger.warning(f"Meili search failed with invalid filter settings for q='{q_text}'. Resetting index settings and retrying.")
+                    try:
+                        # Attempt self-heal: re-apply index settings
+                        ensure_instruments_index()
+                        # Reacquire index handle and retry with same options
+                        index = client.index("instruments")
+                        result = index.search(q_text, options)
+                    except Exception:
+                        # Final attempt: drop any filters/sorts and try plain search
+                        logger.error(f"Meili retry failed for q='{q_text}' after resetting settings. Retrying without filter/sort.")
+                        options.pop("filter", None)
                         options.pop("sort", None)
                         result = index.search(q_text, options)
                 else:
@@ -1580,11 +1671,23 @@ async def fuzzy_search_instruments(
     try:
         if filter_str:
             options["filter"] = filter_str
+
+        # Pre-sanitize sort against index settings to avoid invalid_search_sort
+        if "sort" in options:
+            try:
+                sanitized = _sanitize_sort(index, options.get("sort"))
+                if not sanitized:
+                    options.pop("sort", None)
+                else:
+                    options["sort"] = sanitized
+            except Exception:
+                options.pop("sort", None)
         
         try:
             result = index.search(search_q, options)
         except meilisearch.errors.MeilisearchApiError as e:
-            if "invalid_search_sort" in str(e) or "not sortable" in str(e):
+            msg = str(e)
+            if "invalid_search_sort" in msg or "not sortable" in msg:
                 logger.warning(f"Meili search failed with invalid sort for q='{q_text}'. Sanitizing and retrying.")
                 options["sort"] = _sanitize_sort(index, options.get("sort"))
                 try:
@@ -1593,6 +1696,22 @@ async def fuzzy_search_instruments(
                     logger.error(f"Meili retry failed for q='{q_text}' after sanitizing. Retrying without sort.")
                     options.pop("sort", None)
                     result = index.search(search_q, options)
+            elif "invalid_search_filter" in msg or "not filterable" in msg:
+                logger.warning(f"Meili search failed with invalid filter for q='{q_text}' filter='{filter_str}'. Attempting index settings reset.")
+                try:
+                    # Self-heal: ensure index has correct filterableAttributes, wait for task, then retry
+                    ensure_instruments_index()
+                    index = client.index("instruments")
+                    result = index.search(search_q, options)
+                except Exception:
+                    logger.error(f"Meili retry failed for q='{q_text}' after resetting settings. Retrying without filter.")
+                    # Drop the filter and retry as plain query
+                    options.pop("filter", None)
+                    try:
+                        result = index.search(search_q, options)
+                    except Exception:
+                        # Give up on Meili path; let caller fallback to SQL
+                        raise
             else:
                 raise
         hits = result.get("hits", [])
@@ -2259,299 +2378,8 @@ def run_historical_data_update_indices(kite: KiteConnect, instruments: list, int
 
 
 
-# ───────── Alerts (Kite Alerts API proxy + DB mirror) ─────────
-from fastapi import Request, Body
-from typing import Any as _Any
+# ───────── Alerts (Kite Alerts) ─────────
 
-# Sub-router for alerts
-alerts_router = APIRouter(prefix="/alerts", tags=["alerts"])
-
-def _alerts_ntfy_url() -> str:
-    return os.getenv("KITE_ALERTS_NTFY_URL") or os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
-
-def _kite_alerts_headers(api_key: str, access_token: str) -> Dict[str, str]:
-    return {
-        "X-Kite-Version": "3",
-        "Authorization": f"token {api_key}:{access_token}",
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-
-async def _alerts_upsert_db(row: Dict[str, _Any]) -> None:
-    """
-    Upsert a single alert row returned by Kite into 'alerts' table (mirror fields).
-    """
-    sql = """
-    INSERT INTO alerts (
-        uuid, user_id, name, status, alert_type,
-        lhs_exchange, lhs_tradingsymbol, lhs_attribute,
-        operator, rhs_type, rhs_constant, rhs_exchange, rhs_tradingsymbol, rhs_attribute,
-        basket, alert_count, updated_at
-    ) VALUES (
-        :uuid, :user_id, :name, :status, :alert_type,
-        :lhs_exchange, :lhs_tradingsymbol, :lhs_attribute,
-        :operator, :rhs_type, :rhs_constant, :rhs_exchange, :rhs_tradingsymbol, :rhs_attribute,
-        :basket, :alert_count, NOW()
-    )
-    ON CONFLICT (uuid) DO UPDATE SET
-        user_id = EXCLUDED.user_id,
-        name = EXCLUDED.name,
-        status = EXCLUDED.status,
-        alert_type = EXCLUDED.alert_type,
-        lhs_exchange = EXCLUDED.lhs_exchange,
-        lhs_tradingsymbol = EXCLUDED.lhs_tradingsymbol,
-        lhs_attribute = EXCLUDED.lhs_attribute,
-        operator = EXCLUDED.operator,
-        rhs_type = EXCLUDED.rhs_type,
-        rhs_constant = EXCLUDED.rhs_constant,
-        rhs_exchange = EXCLUDED.rhs_exchange,
-        rhs_tradingsymbol = EXCLUDED.rhs_tradingsymbol,
-        rhs_attribute = EXCLUDED.rhs_attribute,
-        basket = EXCLUDED.basket,
-        alert_count = EXCLUDED.alert_count,
-        updated_at = NOW();
-    """
-    values = {
-        "uuid": row.get("uuid"),
-        "user_id": row.get("user_id", "me"),
-        "name": row.get("name"),
-        "status": row.get("status"),
-        "alert_type": row.get("type"),
-        "lhs_exchange": row.get("lhs_exchange"),
-        "lhs_tradingsymbol": row.get("lhs_tradingsymbol"),
-        "lhs_attribute": row.get("lhs_attribute"),
-        "operator": row.get("operator"),
-        "rhs_type": row.get("rhs_type"),
-        "rhs_constant": row.get("rhs_constant"),
-        "rhs_exchange": row.get("rhs_exchange"),
-        "rhs_tradingsymbol": row.get("rhs_tradingsymbol"),
-        "rhs_attribute": row.get("rhs_attribute"),
-        "basket": json.dumps(row.get("basket")) if row.get("basket") is not None else None,
-        "alert_count": int(row.get("alert_count") or 0),
-    }
-    await database.execute(sql, values)
-
-async def _publish_ntfy_alert(title: str, message: str, tags: Optional[List[str]] = None) -> None:
-    url = _alerts_ntfy_url()
-    headers = {"Title": title}
-    if tags:
-        headers["Tags"] = ",".join(tags)
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            r = await client.post(url, content=message, headers=headers)
-            r.raise_for_status()
-        except Exception as e:
-            logger.error(f"[NTFY] publish failed: {e}")
-
-@alerts_router.post("")
-async def create_alert(
-    payload: Dict[str, Any] = Body(...),
-    kite: KiteConnect = Depends(get_kite),
-):
-    """
-    Create a simple Kite alert. Accepts JSON body with fields similar to Kite Alerts API.
-    Minimal required for simple alert:
-      - name, lhs_exchange, lhs_tradingsymbol, lhs_attribute='LastTradedPrice', operator, rhs_type='constant', rhs_constant, type='simple'
-    """
-    api_key = API_KEY
-    access_token = getattr(kite, "access_token", None)
-    if not access_token:
-        raise HTTPException(401, "No access token available")
-    # Prepare Kite form data with sensible defaults
-    form = {
-        "name": payload.get("name"),
-        "lhs_exchange": payload.get("lhs_exchange"),
-        "lhs_tradingsymbol": payload.get("lhs_tradingsymbol"),
-        "lhs_attribute": payload.get("lhs_attribute", "LastTradedPrice"),
-        "operator": payload.get("operator"),
-        "rhs_type": payload.get("rhs_type", "constant"),
-        "type": payload.get("type", "simple"),
-    }
-    if form["rhs_type"] == "constant":
-        form["rhs_constant"] = payload.get("rhs_constant")
-    # Optional ATO basket as JSON string
-    if form["type"] == "ato" and payload.get("basket") is not None:
-        form["basket"] = json.dumps(payload["basket"])
-    # Validate minimal required
-    missing = [k for k in ["name","lhs_exchange","lhs_tradingsymbol","operator"] if not form.get(k)]
-    if form["rhs_type"] == "constant" and form.get("rhs_constant") is None:
-        missing.append("rhs_constant")
-    if missing:
-        raise HTTPException(400, f"Missing fields: {', '.join(missing)}")
-    url = "https://api.kite.trade/alerts"
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(url, headers=_kite_alerts_headers(api_key, access_token), data=form)
-        try:
-            r.raise_for_status()
-        except Exception:
-            raise HTTPException(r.status_code, r.text)
-        resp = r.json()
-        data = resp.get("data") or {}
-        await _alerts_upsert_db(data)
-        return data
-
-@alerts_router.get("")
-async def list_alerts(kite: KiteConnect = Depends(get_kite), refresh: bool = Query(False)):
-    """
-    List alerts from mirror. If refresh=true, first fetch from Kite and upsert mirror.
-    """
-    api_key = API_KEY
-    access_token = getattr(kite, "access_token", None)
-    if refresh and access_token:
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.get("https://api.kite.trade/alerts", headers=_kite_alerts_headers(api_key, access_token))
-                r.raise_for_status()
-                data = (r.json() or {}).get("data") or []
-                for a in data:
-                    await _alerts_upsert_db(a)
-        except Exception as e:
-            logger.error(f"[ALERTS] refresh failed: {e}")
-    rows = await database.fetch_all("SELECT * FROM alerts ORDER BY updated_at DESC LIMIT 500")
-    def _row_to_dict(r):
-        d = dict(r)
-        # decode json fields if string
-        if d.get("basket") and isinstance(d["basket"], str):
-            try:
-                d["basket"] = json.loads(d["basket"])
-            except Exception:
-                pass
-        return d
-    return {"data": [_row_to_dict(r) for r in rows]}
-
-@alerts_router.get("/{uuid}")
-async def get_alert(uuid: str, kite: KiteConnect = Depends(get_kite), refresh: bool = Query(False)):
-    api_key = API_KEY
-    access_token = getattr(kite, "access_token", None)
-    if refresh and access_token:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"https://api.kite.trade/alerts/{uuid}", headers=_kite_alerts_headers(api_key, access_token))
-            if r.status_code == 200:
-                data = (r.json() or {}).get("data") or {}
-                await _alerts_upsert_db(data)
-    row = await database.fetch_one("SELECT * FROM alerts WHERE uuid = :u", {"u": uuid})
-    if not row:
-        raise HTTPException(404, "Alert not found")
-    d = dict(row)
-    if d.get("basket") and isinstance(d["basket"], str):
-        try:
-            d["basket"] = json.loads(d["basket"])
-        except Exception:
-            pass
-    return d
-
-@alerts_router.put("/{uuid}")
-async def modify_alert(uuid: str, payload: Dict[str, Any] = Body(...), kite: KiteConnect = Depends(get_kite)):
-    api_key = API_KEY
-    access_token = getattr(kite, "access_token", None)
-    if not access_token:
-        raise HTTPException(401, "No access token available")
-    # Kite expects form fields similar to create; pass through supported fields.
-    allowed = {
-        "name","lhs_exchange","lhs_tradingsymbol","lhs_attribute","operator",
-        "rhs_type","rhs_constant","type","basket"
-    }
-    form = {k: v for k, v in payload.items() if k in allowed and v is not None}
-    if "basket" in form and isinstance(form["basket"], (dict, list)):
-        form["basket"] = json.dumps(form["basket"])
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.put(f"https://api.kite.trade/alerts/{uuid}", headers=_kite_alerts_headers(api_key, access_token), data=form)
-        try:
-            r.raise_for_status()
-        except Exception:
-            raise HTTPException(r.status_code, r.text)
-        data = (r.json() or {}).get("data") or {}
-        await _alerts_upsert_db(data)
-        return data
-
-@alerts_router.delete("/{uuid}")
-async def delete_alert(uuid: str, kite: KiteConnect = Depends(get_kite)):
-    api_key = API_KEY
-    access_token = getattr(kite, "access_token", None)
-    if not access_token:
-        raise HTTPException(401, "No access token available")
-    url = f"https://api.kite.trade/alerts?uuid={uuid}"
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.delete(url, headers=_kite_alerts_headers(api_key, access_token))
-        try:
-            r.raise_for_status()
-        except Exception:
-            raise HTTPException(r.status_code, r.text)
-    # Remove from mirror
-    await database.execute("DELETE FROM alerts WHERE uuid = :u", {"u": uuid})
-    return {"status": "success"}
-
-@alerts_router.get("/{uuid}/history")
-async def alert_history(uuid: str, kite: KiteConnect = Depends(get_kite), refresh: bool = Query(False), limit: int = Query(50, ge=1, le=500)):
-    api_key = API_KEY
-    access_token = getattr(kite, "access_token", None)
-    if refresh and access_token:
-        # Fetch and append latest history
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(f"https://api.kite.trade/alerts/{uuid}/history", headers=_kite_alerts_headers(api_key, access_token))
-            if r.status_code == 200:
-                arr = (r.json() or {}).get("data") or []
-                # Insert without strict dedupe (poller/dispatcher handle dedupe for notifications)
-                for h in arr:
-                    ts = h.get("created_at") or h.get("timestamp")
-                    last_price = 0.0
-                    meta = h.get("meta")
-                    if isinstance(meta, list) and meta:
-                        last_price = float(meta[0].get("last_price") or 0.0)
-                    try:
-                        await database.execute(
-                            "INSERT INTO alert_history (alert_uuid, triggered_at, trigger_price, meta) VALUES (:u, :ts, :p, :m)",
-                            {"u": uuid, "ts": ts, "p": last_price, "m": json.dumps(h)}
-                        )
-                    except Exception:
-                        # Ignore duplicates or parsing issues
-                        pass
-    rows = await database.fetch_all(
-        "SELECT id, alert_uuid, triggered_at, trigger_price, meta FROM alert_history WHERE alert_uuid = :u ORDER BY triggered_at DESC LIMIT :n",
-        {"u": uuid, "n": limit}
-    )
-    return {"data": [dict(r) for r in rows]}
-
-@alerts_router.post("/validate")
-async def validate_alert(payload: Dict[str, Any] = Body(...)):
-    """
-    Validate alert parameters quickly against instruments DB.
-    """
-    lhs_exchange = payload.get("lhs_exchange")
-    lhs_tradingsymbol = payload.get("lhs_tradingsymbol")
-    operator = payload.get("operator")
-    rhs_type = payload.get("rhs_type", "constant")
-    rhs_constant = payload.get("rhs_constant")
-    # Basic checks
-    if not lhs_exchange or not lhs_tradingsymbol or not operator:
-        return {"valid": False, "reason": "Missing symbol/operator"}
-    # Ensure instrument exists
-    row = await database.fetch_one(
-        "SELECT instrument_token FROM kite_instruments WHERE exchange = :ex AND tradingsymbol = :ts LIMIT 1",
-        {"ex": lhs_exchange, "ts": lhs_tradingsymbol}
-    )
-    if not row:
-        return {"valid": False, "reason": "Instrument not found"}
-    # rhs check
-    if rhs_type == "constant" and rhs_constant is None:
-        return {"valid": False, "reason": "rhs_constant required for rhs_type=constant"}
-    # operator whitelist
-    allowed_ops = {">=", "<=", ">", "<", "==", "!="}
-    if operator not in allowed_ops:
-        return {"valid": False, "reason": f"Invalid operator; allowed: {', '.join(sorted(allowed_ops))}"}
-    return {"valid": True}
-
-@alerts_router.post("/test-notification")
-async def alerts_test_notification_endpoint():
-    await _publish_ntfy_alert("Test: Kite Alerts (broker)", "Hello from /broker/alerts/test-notification", tags=["test","alerts"])
-    return {"status": "ok"}
-
-# Include alerts_router into the main router
-try:
-    router.include_router(alerts_router)
-except Exception as _e:
-    # If router was not yet defined for some reason, define and include
-    router = APIRouter()
-    router.include_router(alerts_router)
 
 # ─────────── Instruments helpers for Alerts UI ───────────
 

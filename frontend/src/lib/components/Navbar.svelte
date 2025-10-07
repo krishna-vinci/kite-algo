@@ -4,8 +4,7 @@
 	import favicon from '$lib/assets/favicon.svg';
 	import SunIcon from "@lucide/svelte/icons/sun";
 	import MoonIcon from "@lucide/svelte/icons/moon";
-
-	import { resetMode, setMode } from "mode-watcher";
+	import { theme } from "$lib/theme";
 	import * as DropdownMenu from "$lib/components/ui/dropdown-menu/index.js";
 	import { buttonVariants } from "$lib/components/ui/button/index.js";
 
@@ -32,10 +31,9 @@
 		{ name: 'Dashboard', href: '/' },
 		{ name: 'Market Watch', href: '/marketwatch' },
 		{ name: 'Orders', href: '/orders' },
-		{ name: 'Holdings', href: '/holdings' },
-		{ name: 'Positions', href: '/positions' },
-		{ name: 'Bids', href: '/bids' },
-		{ name: 'Funds', href: '/funds' },
+		{ name: 'Investing', href: '/holdings' },
+		{ name: 'Trading', href: '/trading' },
+		{ name: 'NFO', href: '/nfo' },
 		{ name: 'Alerts', href: '/alerts' },
 		{ name: 'Strategies', href: '/strategies/momentum' }
 	];
@@ -57,7 +55,8 @@
 							<NavigationMenuLink
 								href={item.href}
 								class="group inline-flex h-9 w-max items-center justify-center rounded-md bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent focus:bg-accent focus:outline-none focus:ring-1 focus:ring-ring {$page
-									.url.pathname === item.href
+									.url
+									.pathname === item.href || ($page.url.pathname.startsWith(item.href) && item.href !== '/')
 									? 'bg-primary text-primary-foreground'
 									: 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'}"
 							>
@@ -85,10 +84,10 @@
 		  <span class="sr-only">Toggle theme</span>
 		 </DropdownMenu.Trigger>
 		 <DropdownMenu.Content align="end">
-		  <DropdownMenu.Item onclick={() => setMode("light")}>Light</DropdownMenu.Item
+		  <DropdownMenu.Item onclick={() => theme.set("light")}>Light</DropdownMenu.Item
 		  >
-		  <DropdownMenu.Item onclick={() => setMode("dark")}>Dark</DropdownMenu.Item>
-		  <DropdownMenu.Item onclick={() => resetMode()}>System</DropdownMenu.Item>
+		  <DropdownMenu.Item onclick={() => theme.set("dark")}>Dark</DropdownMenu.Item>
+		  <DropdownMenu.Item onclick={() => theme.resetToSystem()}>System</DropdownMenu.Item>
 		 </DropdownMenu.Content>
 		</DropdownMenu.Root>
 			<LoginLogout />
@@ -115,7 +114,8 @@
 								<a
 									href={item.href}
 									class="block select-none space-y-1 rounded-md px-2 py-1.5 text-sm font-medium leading-none {$page
-										.url.pathname === item.href
+										.url
+										.pathname === item.href || ($page.url.pathname.startsWith(item.href) && item.href !== '/')
 										? 'bg-primary text-primary-foreground hover:bg-primary'
 										: 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'}"
 								>

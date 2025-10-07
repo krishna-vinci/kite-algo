@@ -1,8 +1,5 @@
-<script lang="ts">
-	import { createEventDispatcher, onMount } from 'svelte';
-	import { apiFetch } from '$lib/api';
-
-	export type InstrumentRow = {
+<script context="module" lang="ts">
+  export type InstrumentRow = {
 		instrument_token: number;
 		tradingsymbol: string;
 		name?: string;
@@ -14,6 +11,11 @@
 		expiry?: string;
 		strike?: number;
 	};
+</script>
+
+<script lang="ts">
+	import { createEventDispatcher, onMount } from 'svelte';
+	import { apiFetch } from '$lib/api';
 
   function formatExpiry(x?: string | null) {
     if (!x) return '';
@@ -81,7 +83,7 @@
 		}
 		loading = true;
 		try {
-			const url = `/broker/instruments/fuzzy-search?query=${encodeURIComponent(query)}`;
+			const url = `/broker/instruments/fuzzy-search?query=${encodeURIComponent(query)}&segment=NFO`;
 			const res = await apiFetch(url);
 			if (res.ok) {
 				results = await res.json();
@@ -167,6 +169,7 @@
 </div>
 
 <style>
+	@reference "tailwindcss";
 	.picker {
 		position: relative;
 	}

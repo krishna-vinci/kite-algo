@@ -17,7 +17,7 @@
 		"@eslint/compat": "^1.2.5",
 		"@eslint/js": "^9.18.0",
 		"@internationalized/date": "^3.9.0",
-		"@lucide/svelte": "^0.515.0",
+		"@lucide/svelte": "^0.544.0",
 		"@sveltejs/adapter-auto": "^6.0.0",
 		"@sveltejs/adapter-static": "^3.0.2",
 		"@sveltejs/kit": "^2.22.0",
@@ -26,8 +26,9 @@
 		"@tailwindcss/postcss": "^4.1.13",
 		"@tailwindcss/typography": "^0.5.15",
 		"@tailwindcss/vite": "^4.0.0",
+		"@tanstack/table-core": "^8.21.3",
 		"autoprefixer": "^10.4.21",
-		"bits-ui": "^2.9.9",
+		"bits-ui": "^2.11.1",
 		"clsx": "^2.1.1",
 		"eslint": "^9.18.0",
 		"eslint-config-prettier": "^10.0.1",
@@ -39,7 +40,7 @@
 		"svelte": "^5.0.0",
 		"svelte-check": "^4.0.0",
 		"tailwind-merge": "^3.3.1",
-		"tailwind-variants": "^1.0.0",
+		"tailwind-variants": "^3.1.1",
 		"tailwindcss": "^4.0.0",
 		"tw-animate-css": "^1.3.8",
 		"typescript": "^5.0.0",
@@ -47,6 +48,12 @@
 		"vite": "^7.0.4"
 	},
 	"dependencies": {
-		"mode-watcher": "^1.1.0"
+		"d3-array": "^3.2.4",
+		"d3-scale": "^4.0.2",
+		"echarts": "^5.6.0",
+		"layerchart": "^1.0.12",
+		"lightweight-charts": "^5.0.8",
+		"svelte-echarts": "^1.0.0",
+		"svelte-lightweight-charts": "^2.2.0"
 	}
 }

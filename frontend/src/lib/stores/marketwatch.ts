@@ -163,7 +163,11 @@ function createMarketwatchStore() {
 		};
 
 		ws.onclose = (event) => {
-			console.log('Marketwatch WebSocket disconnected:', event.code, event.reason);
+			console.log('❌ MARKETWATCH STORE DEBUG: WebSocket disconnected', {
+				code: event.code,
+				reason: event.reason,
+				wasClean: event.wasClean
+			});
 			connecting = false;
 			connected = false;
 			ws = null;
@@ -171,7 +175,13 @@ function createMarketwatchStore() {
 		};
 
 		ws.onerror = (error) => {
-			console.error('Marketwatch WebSocket error:', error);
+			console.error('❌ MARKETWATCH STORE DEBUG: WebSocket error', {
+				error,
+				wsUrl,
+				readyState: ws?.readyState,
+				connecting,
+				connected
+			});
 			connecting = false;
 			connected = false;
 		};

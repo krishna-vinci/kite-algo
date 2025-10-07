@@ -1,0 +1,62 @@
+Sector,Stock,Ticker,1D change,Return attribution,Index weight,Free float marketcap
+,NIFTY 50,,0.03%,0.03%,100.00%,11043.72
+Industrials,,,-0.10%,,100.00%,682.06
+,Adani Enterprises Ltd,ADANIENT,0.17%,0.02%,9.58%,65.35
+,Adani Ports and Special Economic Zone Ltd,ADANIPORTS,1.07%,0.16%,15.09%,102.94
+,Eicher Motors Ltd,EICHERMOT,0.25%,0.03%,13.73%,93.67
+,Larsen and Toubro Ltd,LT,0.52%,-0.32%,61.59%,420.09
+Health Care,,,,0.41%,100.00%,401.96
+,Apollo Hospitals Enterprise Ltd,APOLLOHOSP,0.01%,0.00%,18.72%,75.25
+,Cipla Ltd,CIPLA,0.41%,0.09%,20.76%,83.45
+,Dr Reddy's Laboratories Ltd,DRREDDY,0.01%,0.00%,18.09%,72.71
+,Sun Pharmaceutical Industries Ltd,SUNPHARMA,0.76%,0.32%,42.43%,170.55
+Materials,,,,0.94%,100.00%,767.66
+,Asian Paints Ltd,ASIANPAINT,0.20%,0.02%,12.34%,94.71
+,Coal India Ltd,COALINDIA,0.21%,0.02%,11.51%,88.40
+,Grasim Industries Ltd,GRASIM,0.44%,0.05%,12.42%,95.33
+,Hindalco Industries Ltd,HINDALCO,1.96%,0.28%,14.15%,108.63
+,JSW Steel Ltd,JSWSTEEL,2.29%,0.30%,13.09%,100.48
+,Tata Steel Ltd,TATASTEEL,0.51%,0.09%,18.30%,140.50
+,UltraTech Cement Ltd,ULTRACEMCO,0.95%,0.17%,18.19%,139.63
+Financials,,,,0.18%,100.00%,4123.53
+,Axis Bank Ltd,AXISBANK,0.28%,-0.02%,8.30%,342.28
+,Bajaj Finserv Ltd,BAJAJFINSV,0.70%,-0.02%,2.79%,114.85
+,Bajaj Finance Ltd,BAJFINANCE,0.37%,0.02%,6.41%,264.25
+,HDFC Bank Ltd,HDFCBANK,0.37%,0.13%,35.48%,1462.85
+,HDFC Life Insurance Company Ltd,HDFCLIFE,0.08%,0.00%,1.74%,71.68
+,ICICI Bank Ltd,ICICIBANK,0.18%,-0.04%,22.75%,938.10
+,Indusind Bank Ltd,INDUSINDBK,0.52%,0.01%,1.13%,46.42
+,Kotak Mahindra Bank Ltd,KOTAKBANK,0.45%,0.03%,6.88%,283.59
+,SBI Life Insurance Company Ltd,SBILIFE,0.04%,0.00%,1.82%,75.24
+,State Bank of India,SBIN,0.52%,0.04%,8.49%,349.97
+,Shriram Finance Ltd,SHRIRAMFIN,1.22%,0.02%,1.86%,76.57
+,Jio Financial Services Ltd,JIOFIN,0.05%,0.00%,2.37%,97.73
+Consumer Discretionary,,,,0.02%,100.00%,1043.32
+,Bajaj Auto Ltd,BAJAJ-AUTO,0.50%,-0.05%,9.58%,100.00
+,Hero MotoCorp Ltd,HEROMOTOCO,2.29%,0.15%,6.49%,67.67
+,Mahindra and Mahindra Ltd,M&M,0.06%,-0.02%,29.53%,308.07
+,Maruti Suzuki India Ltd,MARUTI,0.12%,0.02%,20.11%,209.84
+,Tata Motors Ltd,TATAMOTORS,0.35%,-0.05%,13.21%,137.87
+,Titan Company Ltd,TITAN,0.20%,-0.02%,11.93%,124.48
+,Trent Ltd,TRENT,0.20%,-0.02%,9.14%,95.39
+Information Technology,,,,0.43%,100.00%,1247.16
+,Bharat Electronics Ltd,BEL,1.21%,0.14%,11.25%,140.27
+,HCL Technologies Ltd,HCLTECH,0.93%,0.11%,11.74%,146.36
+,Infosys Ltd,INFY,0.12%,0.05%,40.65%,507.01
+,Tata Consultancy Services Ltd,TCS,0.20%,0.05%,23.75%,296.23
+,Tech Mahindra Ltd,TECHM,0.94%,0.07%,7.12%,88.83
+,Wipro Ltd,WIPRO,0.35%,0.02%,5.49%,68.46
+Communication Services,,,,-0.37%,100.00%,726.39
+,Bharti Airtel Ltd,BHARTIARTL,0.69%,-0.48%,69.03%,501.41
+,Eternal Ltd,ETERNAL,0.35%,0.11%,30.97%,224.98
+Consumer Staples,,,,-0.19%,100.00%,746.04
+,Hindustan Unilever Ltd,HINDUNILVR,1.04%,0.31%,30.00%,223.79
+,ITC Ltd,ITC,1.09%,-0.54%,49.12%,366.47
+,Nestle India Ltd,NESTLEIND,0.16%,0.02%,11.09%,82.71
+,Tata Consumer Products Ltd,TATACONSUM,0.20%,0.02%,9.79%,73.07
+Utilities,,,,0.14%,100.00%,281.87
+,NTPC Ltd,NTPC,0.01%,0.01%,54.84%,154.57
+,Power Grid Corporation of India Ltd,POWERGRID,0.29%,0.13%,45.16%,127.30
+Energy,,,,-0.43%,100.00%,1023.72
+,Oil and Natural Gas Corporation Ltd,ONGC,0.09%,0.01%,9.09%,93.04
+,Reliance Industries Ltd,RELIANCE,0.48%,-0.44%,90.91%,930.68

@@ -16,6 +16,9 @@ from datetime import datetime, timedelta
 import os
 import json
 from dotenv import load_dotenv
+from typing import Dict, Any
+from broker_api.redis_events import get_redis
+import redis.asyncio as redis
 
 load_dotenv() # Load environment variables from .env file
 
@@ -45,6 +48,10 @@ from charts import charts_app
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 from broker_api.broker_api import router as broker_api_router
+from broker_api.alerts_router import router as alerts_router
+from broker_api.performance_router import router as performance_router
+from broker_api.options_router import router as options_router
+
 
 ### fyers auth import ##
 import httpx
@@ -57,6 +64,7 @@ from fyers_apiv3 import fyersModel
 from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
 from broker_api.broker_api import router as kite_router
 from strategies.momentum import router as momentum_router
+from broker_api.kite_orders import router as kite_orders_router
 
 from broker_api.broker_api import get_kite
 from kiteconnect import KiteConnect
@@ -71,12 +79,27 @@ from broker_api.broker_api import KiteSession, get_system_access_token, upsert_k
 from broker_api.broker_api import run_headless_login_and_persist_system_token
 from broker_api.kite_auth import API_KEY
 from broker_api.websocket_manager import WebSocketManager
+from alerts.engine import AlertsEngine
 from database import get_user_settings, update_user_settings
 from pydantic import BaseModel
+import csv
 
 class UserSubscriptions(BaseModel):
     groups: List[dict]
     activeGroupId: Optional[str] = None
+
+class OverlaySnapshotTick(BaseModel):
+    instrument_token: int
+    last_price: float
+    change_percent: Optional[float] = None
+    tick_timestamp: int
+    server_timestamp: int
+    age_ms: Optional[int] = None
+    source: str
+
+class OverlaySnapshotResponse(BaseModel):
+    status: str
+    data: Dict[str, OverlaySnapshotTick]
 
 # Global instance for the WebSocketManager
 ws_manager: Optional[WebSocketManager] = None
@@ -135,6 +158,25 @@ class MCPAuthWrapper:
 # Wrapped app that injects request-scoped KiteConnect into FastMCP tools
 mcp_app_wrapped = MCPAuthWrapper(mcp_app)
 
+def run_schema_migrations() -> None:
+    """
+    Ensure database schema is applied by executing schema.sql via get_db_connection().
+    Safe to call multiple times.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()  # get_db_connection() internally applies schema.sql and commits
+        logging.info("Schema migrations ensured.")
+    except Exception as e:
+        logging.error("Schema migration failed: %s", e, exc_info=True)
+        raise
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
 # 2. Combine the lifespans
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
@@ -191,6 +233,8 @@ async def combined_lifespan(app: FastAPI):
         ws_manager = WebSocketManager(api_key=API_KEY, access_token=at, main_event_loop=main_event_loop)
         ws_manager.start()
         logging.info("WebSocketManager started.")
+        # Expose ws_manager for routers to access latest ticks
+        app.state.ws_manager = ws_manager
 
         # Start background token watcher to rotate WS token when DB 'system' token changes
         async def _system_token_watcher():
@@ -231,14 +275,26 @@ async def combined_lifespan(app: FastAPI):
                 await async_db.connect()
         except Exception:
             pass
+        # Start AlertsEngine (Phase 0) after WS manager and async DB are ready
+        try:
+            alerts_engine = AlertsEngine(async_db, ws_manager, app)
+            alerts_engine.start()
+            app.state.alerts_engine = alerts_engine
+            logging.info("AlertsEngine started (interval_ms=%s)", getattr(alerts_engine, "interval_ms", None))
+        except Exception as e:
+            logging.error("Failed to start AlertsEngine: %s", e, exc_info=True)
+
         # Start alert dispatcher (WS text messages) and 2s polling fallback
         alerts_ntfy_url = os.getenv("KITE_ALERTS_NTFY_URL") or os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
-        asyncio.create_task(alert_event_dispatcher(ws_manager, alerts_ntfy_url))
-        asyncio.create_task(alerts_poll_worker(API_KEY, alerts_ntfy_url))
+        # TODO: alert_event_dispatcher needs to be implemented. See broker_api/websocket_manager.py:487
+        # asyncio.create_task(alert_event_dispatcher(ws_manager, alerts_ntfy_url))
+        # TODO: alerts_poll_worker needs to be implemented.
+        # asyncio.create_task(alerts_poll_worker(API_KEY, alerts_ntfy_url))
 
         # Ensure Meilisearch index exists on startup (and bootstrap reindex if empty)
         try:
-            ensure_instruments_index()
+            # Quick fix: force-reset settings on every startup
+            reset_meili_settings()
             logger.info("Meilisearch index 'instruments' ensured on startup")
             try:
                 client = get_meili_client(admin=True)
@@ -283,6 +339,15 @@ async def combined_lifespan(app: FastAPI):
                 pass
     except Exception:
         pass
+    # Stop AlertsEngine
+    try:
+        eng = getattr(app.state, "alerts_engine", None)
+        if eng:
+            await eng.stop()
+            logging.info("AlertsEngine stopped.")
+    except Exception:
+        pass
+
     if ws_manager:
         logging.info("Stopping WebSocketManager...")
         ws_manager.stop()
@@ -304,12 +369,29 @@ app.mount("/mcp", mcp_app_direct_wrapped)
 # 4. Include existing API routes (mounted under /broker to match frontend)
 app.include_router(broker_api_router, prefix="/broker")
 app.include_router(momentum_router, prefix="/broker")
+app.include_router(alerts_router, prefix="/alerts")
+app.include_router(options_router, prefix="/api")
+
+app.include_router(performance_router, prefix="/broker")
+app.include_router(kite_orders_router, prefix="/broker")
 
 from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
 import logging
 
 logger = logging.getLogger(__name__)
 
+
+def reset_meili_settings():
+    """
+    Force-applies the latest index settings from the Python codebase to Meilisearch.
+    This is a quick fix for ensuring settings are synchronized on startup.
+    """
+    try:
+        logger.info("Attempting to reset Meilisearch index settings...")
+        ensure_instruments_index()
+        logger.info("Meilisearch index settings reset successfully.")
+    except Exception as e:
+        logger.error(f"Failed to reset Meilisearch settings: {e}", exc_info=True)
 
 # CSV file paths and their corresponding source list names
 CSV_FILES = {
@@ -363,7 +445,7 @@ async def ingest_stock_data_endpoint():
         kite_instruments_data = {}
         with conn.cursor(cursor_factory=extras.DictCursor) as cur:
             cur.execute(
-                "SELECT tradingsymbol, instrument_token, instrument_type FROM kite_instruments WHERE instrument_type = 'EQ';"
+                "SELECT tradingsymbol, instrument_token, instrument_type FROM kite_instruments WHERE instrument_type = 'EQ' AND exchange = 'NSE';"
             )
             kite_instruments_data = {row['tradingsymbol']: row for row in cur.fetchall()}
             logging.info(f"Fetched {len(kite_instruments_data)} equity instruments from kite_instruments.")
@@ -390,12 +472,7 @@ async def ingest_stock_data_endpoint():
                             """
                             INSERT INTO kite_ticker_tickers (instrument_token, tradingsymbol, company_name, sector, source_list)
                             VALUES (%s, %s, %s, %s, %s)
-                            ON CONFLICT (instrument_token) DO UPDATE SET
-                                tradingsymbol = EXCLUDED.tradingsymbol,
-                                company_name = EXCLUDED.company_name,
-                                sector = EXCLUDED.sector,
-                                source_list = EXCLUDED.source_list,
-                                last_updated = CURRENT_TIMESTAMP;
+                            ON CONFLICT (instrument_token, source_list) DO NOTHING;
                             """,
                             (instrument_token, symbol, company_name, sector, source_list)
                         )
@@ -440,6 +517,91 @@ async def root():
 @app.get("/hello")
 async def hello():
     return {"message": "Hello World from FastAPI Backend!"}
+
+def clean_value(value_str):
+    """
+    Removes '%' and ',' from a string and converts it to a float.
+    Returns None if the string is empty or cannot be converted.
+    """
+    if not value_str:
+        return None
+    try:
+        return float(value_str.replace('%', '').replace(',', ''))
+    except ValueError:
+        logging.warning(f"Could not convert '{value_str}' to float.")
+        return None
+
+@app.post("/update-nifty50-data")
+async def update_nifty50_data_endpoint():
+    """
+    Reads the nifty50_data.csv file and updates the corresponding
+    rows in the kite_ticker_tickers table.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        with open('nifty50_data.csv', 'r', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                ticker = row.get('Ticker')
+
+                # Skip rows that are not stocks (e.g., sector summaries)
+                if not ticker or not ticker.strip():
+                    continue
+
+                tradingsymbol = ticker.strip()
+                
+                # Prepare data for update
+                data_to_update = {
+                    'change_1d': clean_value(row.get('1D change')),
+                    'return_attribution': clean_value(row.get('Return attribution')),
+                    'index_weight': clean_value(row.get('Index weight')),
+                    'freefloat_marketcap': clean_value(row.get('Free float marketcap'))
+                }
+
+                # Construct and execute the UPDATE statement
+                update_query = """
+                    UPDATE kite_ticker_tickers
+                    SET
+                        change_1d = %(change_1d)s,
+                        return_attribution = %(return_attribution)s,
+                        index_weight = %(index_weight)s,
+                        freefloat_marketcap = %(freefloat_marketcap)s,
+                        last_updated = NOW()
+                    WHERE
+                        tradingsymbol = %(tradingsymbol)s AND source_list = 'Nifty50';
+                """
+                
+                params = {**data_to_update, 'tradingsymbol': tradingsymbol}
+                
+                cur.execute(update_query, params)
+
+                if cur.rowcount == 0:
+                    logging.warning(
+                        f"No row found for tradingsymbol '{tradingsymbol}' with source_list 'Nifty50'. "
+                        "The stock might not be in the database yet."
+                    )
+
+        conn.commit()
+        logging.info("Database update process for Nifty50 data completed successfully.")
+        return JSONResponse(content={"message": "Nifty50 data updated successfully."})
+
+    except FileNotFoundError:
+        logging.error("Error: nifty50_data.csv not found.")
+        raise HTTPException(status_code=500, detail="nifty50_data.csv not found.")
+    except Exception as e:
+        logging.error(f"An error occurred during the database update: {e}")
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"An error occurred during the database update: {e}")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+            logging.info("Database connection closed.")
 
 @app.get("/status")
 async def status():
@@ -506,10 +668,264 @@ async def put_subscriptions(
     finally:
         db.close()
 
+@app.get("/api/nifty50")
+async def get_nifty50_data():
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("SELECT * FROM kite_ticker_tickers WHERE source_list = 'Nifty50' ORDER BY sector")
+            
+            sectors = {}
+            for row in cur.fetchall():
+                sector = row['sector']
+                if sector not in sectors:
+                    sectors[sector] = []
+                sectors[sector].append(dict(row))
+            
+            return sectors
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get(
+    "/api/marketwatch/nifty50/overlay-snapshot",
+    response_model=OverlaySnapshotResponse,
+    summary="Get a snapshot of the latest live ticks from the Redis overlay cache.",
+    description="""
+    Fetches the most recent tick data for a given set of instrument tokens from a fast, ephemeral Redis cache.
+    This endpoint is designed to be called by the frontend to overlay live market data on top of a baseline.
+
+    - If no tokens are provided, it defaults to all tokens in the 'Nifty50' source list.
+    - It returns only the data available in the cache; missing tokens are omitted.
+    - If `change_percent` is not in the cached tick, it attempts to compute it using the baseline close price from the database.
+
+    **Example Usage:**
+    ```bash
+    # Fetch specific tokens
+    curl -G "http://localhost:8777/api/marketwatch/nifty50/overlay-snapshot" \
+      --data-urlencode "token=256265" \
+      --data-urlencode "token=738561"
+
+    # Fetch all Nifty50 tokens (default)
+    curl "http://localhost:8777/api/marketwatch/nifty50/overlay-snapshot"
+    ```
+    """
+)
+async def get_overlay_snapshot(
+    token: Optional[List[int]] = Query(None, description="List of instrument tokens to fetch.")
+):
+    if token and (len(token) == 0 or len(token) > 2000):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Invalid token count"}
+        )
+
+    conn = None
+    try:
+        redis_client = get_redis()
+        today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+        
+        target_tokens = token
+        if not target_tokens:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("SELECT instrument_token FROM kite_ticker_tickers WHERE source_list = 'Nifty50'")
+                target_tokens = [row[0] for row in cur.fetchall()]
+
+        keys = [f"marketwatch:overlay:{today_iso}:{t}" for t in target_tokens]
+        
+        try:
+            overlay_data_raw = await redis_client.mget(keys)
+        except redis.exceptions.ConnectionError:
+            logging.warning("Redis connection error in overlay snapshot; returning empty data.")
+            return {"status": "success", "data": {}}
+
+        results: Dict[str, OverlaySnapshotTick] = {}
+        tokens_missing_change = []
+
+        server_ts = int(datetime.utcnow().timestamp() * 1000)
+
+        for i, raw_val in enumerate(overlay_data_raw):
+            if raw_val is None:
+                continue
+            
+            try:
+                overlay_tick = json.loads(raw_val)
+                instrument_token = overlay_tick["instrument_token"]
+                tick_ts = overlay_tick.get("tick_timestamp")
+                
+                snapshot = OverlaySnapshotTick(
+                    instrument_token=instrument_token,
+                    last_price=overlay_tick["last_price"],
+                    change_percent=overlay_tick.get("change_percent"),
+                    tick_timestamp=tick_ts,
+                    server_timestamp=server_ts,
+                    age_ms=server_ts - tick_ts if tick_ts else None,
+                    source="ws"
+                )
+                results[str(instrument_token)] = snapshot
+
+                if snapshot.change_percent is None:
+                    tokens_missing_change.append(instrument_token)
+
+            except (json.JSONDecodeError, KeyError) as e:
+                logging.warning(f"Failed to parse overlay data for key {keys[i]}: {e}")
+                continue
+
+        if tokens_missing_change:
+            if conn is None:
+                conn = get_db_connection()
+            
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                    cur.execute(
+                        "SELECT instrument_token, last_close FROM kite_instruments WHERE instrument_token = ANY(%s)",
+                        (tokens_missing_change,)
+                    )
+                    baseline_closes = {row["instrument_token"]: row["last_close"] for row in cur.fetchall()}
+
+                for token_to_update in tokens_missing_change:
+                    baseline_close = baseline_closes.get(token_to_update)
+                    if baseline_close and baseline_close > 0:
+                        snapshot_to_update = results[str(token_to_update)]
+                        snapshot_to_update.change_percent = (
+                            100 * (snapshot_to_update.last_price / baseline_close - 1)
+                        )
+            except Exception as e:
+                logging.error(f"DB lookup for baseline close failed: {e}", exc_info=True)
+
+        return {"status": "success", "data": results}
+
+    except Exception as e:
+        logging.error(f"Error in overlay snapshot endpoint: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Internal server error"}
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.post("/api/marketwatch/nifty50/finalize-baseline")
+async def finalize_nifty50_baseline(dry_run: bool = False, target_date: Optional[str] = Query(None, description="Target date in YYYY-MM-DD format. Defaults to the last trading day.")):
+    """
+    Computes and stores all derived baseline metrics for all Nifty 50 instruments for a specific date.
+    This endpoint can be used for daily updates or to backfill missed days.
+    """
+    conn = None
+    try:
+        # Determine the target date
+        nse = mcal.get_calendar('NSE')
+        if target_date:
+            process_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+        else:
+            today = datetime.now(timezone('Asia/Kolkata')).date()
+            schedule = nse.schedule(start_date=today - timedelta(days=10), end_date=today)
+            process_date = schedule.index[-1].date()
+
+        schedule_back = nse.schedule(start_date=process_date - timedelta(days=10), end_date=process_date)
+        if len(schedule_back) < 2:
+            raise HTTPException(status_code=400, detail="Not enough historical trading days to calculate change.")
+        prev_trading_date = schedule_back.index[-2].date()
+
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("SELECT instrument_token, tradingsymbol, freefloat_marketcap, index_weight FROM kite_ticker_tickers WHERE source_list = 'Nifty50'")
+            instruments = cur.fetchall()
+
+        db = SessionLocal()
+        try:
+            access_token = get_system_access_token(db)
+            if not access_token:
+                raise HTTPException(status_code=500, detail="System access token not available.")
+            kite = KiteConnect(api_key=API_KEY)
+            kite.set_access_token(access_token)
+        finally:
+            db.close()
+
+        updates = []
+        total_new_marketcap = 0
+        
+        # First pass: calculate individual metrics
+        for inst in instruments:
+            try:
+                hist_data = kite.historical_data(inst['instrument_token'], from_date=prev_trading_date, to_date=process_date, interval='day')
+                if len(hist_data) < 2: continue
+
+                today_data = next((d for d in hist_data if d['date'].date() == process_date), None)
+                prev_day_data = next((d for d in hist_data if d['date'].date() == prev_trading_date), None)
+
+                if not today_data or not prev_day_data: continue
+
+                baseline_close = today_data['close']
+                previous_close = prev_day_data['close']
+                change_1d = 0
+                if previous_close > 0:
+                    change_1d = (baseline_close / previous_close) - 1
+                
+                new_freefloat_marketcap = (inst['freefloat_marketcap'] or 0) * (1 + change_1d)
+                return_attribution = (inst['index_weight'] or 0) * change_1d
+                
+                total_new_marketcap += new_freefloat_marketcap
+
+                updates.append({
+                    "instrument_token": inst['instrument_token'],
+                    "change_1d": change_1d * 100,
+                    "previous_close": previous_close,
+                    "baseline_close": baseline_close,
+                    "freefloat_marketcap": new_freefloat_marketcap,
+                    "return_attribution": return_attribution,
+                    "index_weight": 0 # Placeholder for now
+                })
+            except Exception as e:
+                logging.warning(f"Could not process instrument {inst['tradingsymbol']}: {e}")
+                continue
+        
+        # Second pass: calculate new index weight
+        if total_new_marketcap > 0:
+            for update in updates:
+                update['index_weight'] = (update['freefloat_marketcap'] / total_new_marketcap) * 100
+
+        if dry_run:
+            return {"status": "success", "preview": updates}
+
+        with conn.cursor() as cur:
+            update_query = """
+                UPDATE kite_ticker_tickers
+                SET
+                    change_1d = %(change_1d)s,
+                    previous_close = %(previous_close)s,
+                    baseline_close = %(baseline_close)s,
+                    freefloat_marketcap = %(freefloat_marketcap)s,
+                    return_attribution = %(return_attribution)s,
+                    index_weight = %(index_weight)s,
+                    last_updated = NOW()
+                WHERE
+                    instrument_token = %(instrument_token)s AND source_list = 'Nifty50';
+            """
+            psycopg2.extras.execute_batch(cur, update_query, updates)
+        
+        conn.commit()
+        
+        return {"status": "success", "data": {"updated": len(updates), "skipped": len(instruments) - len(updates), "errors": []}}
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+
 @app.websocket("/broker/ws/marketwatch")
 async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
-
     # Auto-subscribe on connect (aggregate across legacy + scoped namespaces)
     db = SessionLocal()
     try:
@@ -690,375 +1106,4 @@ async def daily_token_scheduler() -> None:
             logging.error("[SCHED] Scheduler loop error: %s", e, exc_info=True)
             await asyncio.sleep(30)
 
-# ───────── Alerts realtime dispatcher and polling fallback ─────────
-import os as _os
-import json as _json
-import httpx as _httpx
-from typing import Optional as _Optional, List as _List, Dict as _Dict
-from datetime import datetime as _dt
 
-# Helper: publish to ntfy
-async def _publish_ntfy(ntfy_url: str, title: str, message: str, tags: _Optional[_List[str]] = None) -> None:
-    headers = {"Title": title}
-    if tags:
-        headers["Tags"] = ",".join(tags)
-    async with _httpx.AsyncClient(timeout=10) as client:
-        try:
-            r = await client.post(ntfy_url, content=message, headers=headers)
-            r.raise_for_status()
-            logging.info(f"[NTFY] published: {title}")
-        except Exception as e:
-            logging.error(f"[NTFY] publish failed: {e}")
-
-# Helper: Upsert alert mirror row
-async def _upsert_alert_row(db, row: _Dict) -> None:
-    # Minimal normalization from Kite Alerts list/get payload shape
-    sql = """
-    INSERT INTO alerts (
-        uuid, user_id, name, status, alert_type,
-        lhs_exchange, lhs_tradingsymbol, lhs_attribute,
-        operator, rhs_type, rhs_constant, rhs_exchange, rhs_tradingsymbol, rhs_attribute,
-        basket, alert_count, updated_at
-    ) VALUES (
-        :uuid, :user_id, :name, :status, :alert_type,
-        :lhs_exchange, :lhs_tradingsymbol, :lhs_attribute,
-        :operator, :rhs_type, :rhs_constant, :rhs_exchange, :rhs_tradingsymbol, :rhs_attribute,
-        :basket, :alert_count, NOW()
-    )
-    ON CONFLICT (uuid) DO UPDATE SET
-        user_id = EXCLUDED.user_id,
-        name = EXCLUDED.name,
-        status = EXCLUDED.status,
-        alert_type = EXCLUDED.alert_type,
-        lhs_exchange = EXCLUDED.lhs_exchange,
-        lhs_tradingsymbol = EXCLUDED.lhs_tradingsymbol,
-        lhs_attribute = EXCLUDED.lhs_attribute,
-        operator = EXCLUDED.operator,
-        rhs_type = EXCLUDED.rhs_type,
-        rhs_constant = EXCLUDED.rhs_constant,
-        rhs_exchange = EXCLUDED.rhs_exchange,
-        rhs_tradingsymbol = EXCLUDED.rhs_tradingsymbol,
-        rhs_attribute = EXCLUDED.rhs_attribute,
-        basket = EXCLUDED.basket,
-        alert_count = EXCLUDED.alert_count,
-        updated_at = NOW();
-    """
-    values = {
-        "uuid": row.get("uuid"),
-        "user_id": row.get("user_id", "me"),
-        "name": row.get("name"),
-        "status": row.get("status"),
-        "alert_type": row.get("type"),
-        "lhs_exchange": row.get("lhs_exchange"),
-        "lhs_tradingsymbol": row.get("lhs_tradingsymbol"),
-        "lhs_attribute": row.get("lhs_attribute"),
-        "operator": row.get("operator"),
-        "rhs_type": row.get("rhs_type"),
-        "rhs_constant": row.get("rhs_constant"),
-        "rhs_exchange": row.get("rhs_exchange"),
-        "rhs_tradingsymbol": row.get("rhs_tradingsymbol"),
-        "rhs_attribute": row.get("rhs_attribute"),
-        "basket": _json.dumps(row.get("basket")) if row.get("basket") is not None else None,
-        "alert_count": int(row.get("alert_count") or 0),
-    }
-    try:
-        await async_db.execute(sql, values)
-    except Exception as e:
-        # Cheap way to detect missing columns from the alerts extension
-        if "column" in str(e) and "does not exist" in str(e):
-            logging.warning(f"[ALERTS] upsert failed, attempting one-shot schema migration: {e}")
-            try:
-                run_schema_migrations()
-                await async_db.execute(sql, values)
-                logging.info("[ALERTS] schema migration successful, retried upsert")
-            except Exception as e2:
-                logging.error(f"[ALERTS] failed to run schema migration or retry upsert: {e2}", exc_info=True)
-                raise e2
-        else:
-            raise e
-
-# Helper: fetch alert mirror state (last counts and controls)
-async def _get_alert_controls(uuid: str):
-    sql = """
-    SELECT last_alert_count, last_notified_at, cooldown_sec, schedule, name, lhs_tradingsymbol, operator, rhs_constant
-    FROM alerts WHERE uuid = :uuid
-    """
-    return await async_db.fetch_one(sql, {"uuid": uuid})
-
-# Helper: update controls after notify
-async def _update_alert_after_notify(uuid: str, new_count: int) -> None:
-    sql = """
-    UPDATE alerts
-    SET last_alert_count = :cnt, last_notified_at = NOW(), updated_at = NOW()
-    WHERE uuid = :uuid
-    """
-    await async_db.execute(sql, {"uuid": uuid, "cnt": new_count})
-
-# Helper: set only last_alert_count (when suppressing notification)
-async def _ack_alert_count(uuid: str, new_count: int) -> None:
-    sql = "UPDATE alerts SET last_alert_count = :cnt, updated_at = NOW() WHERE uuid = :uuid"
-    await async_db.execute(sql, {"uuid": uuid, "cnt": new_count})
-
-# Helper: get latest history timestamp seen
-async def _get_latest_history_time(uuid: str):
-    sql = "SELECT MAX(triggered_at) AS t FROM alert_history WHERE alert_uuid = :uuid"
-    row = await async_db.fetch_one(sql, {"uuid": uuid})
-    return row["t"] if row else None
-
-# Helper: insert history row
-async def _insert_alert_history(uuid: str, triggered_at: str, trigger_price: float, meta: _Dict, condition: _Optional[str]):
-    # Parse timestamp string into a datetime object
-    ts_dt = None
-    if triggered_at:
-        try:
-            # Try parsing the format from Kite API first
-            ts_dt = _dt.strptime(triggered_at, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            # Fallback for ISO format (e.g., from utcnow().isoformat())
-            try:
-                ts_dt = _dt.fromisoformat(triggered_at)
-            except ValueError:
-                logging.warning(f"[ALERTS] could not parse timestamp '{triggered_at}', using NOW()")
-                ts_dt = _dt.utcnow()
-    else:
-        ts_dt = _dt.utcnow()
-
-    sql = """
-    INSERT INTO alert_history (alert_uuid, triggered_at, trigger_price, meta)
-    VALUES (:uuid, :ts, :price, :meta)
-    """
-    await async_db.execute(sql, {
-        "uuid": uuid,
-        "ts": ts_dt,
-        "price": float(trigger_price) if trigger_price is not None else 0.0,
-        "meta": _json.dumps({"condition": condition, "meta": meta})
-    })
-
-# Basic schedule check (Phase 1: allow all hours; placeholder for market hours)
-def _is_within_schedule(_schedule_json: _Optional[str]) -> bool:
-    # TODO: Implement real market hours window in Phase 1 polish
-    return True
-
-# Cooldown check
-def _passes_cooldown(last_notified_at, cooldown_sec: int) -> bool:
-    if not last_notified_at:
-        return True
-    try:
-        # last_notified_at is a datetime object when fetched from DB
-        delta = _dt.utcnow() - last_notified_at
-        return delta.total_seconds() >= max(int(cooldown_sec or 0), 0)
-    except Exception:
-        return True
-
-# Build Kite REST headers
-def _kite_headers(api_key: str, access_token: str) -> _Dict[str, str]:
-    return {
-        "X-Kite-Version": "3",
-        "Authorization": f"token {api_key}:{access_token}",
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-
-# Fetch Kite alerts list
-async def _kite_list_alerts(api_key: str, access_token: str) -> _List[_Dict]:
-    url = "https://api.kite.trade/alerts"
-    async with _httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url, headers=_kite_headers(api_key, access_token))
-        r.raise_for_status()
-        payload = r.json()
-        return payload.get("data", []) or []
-
-# Fetch Kite alert history
-async def _kite_alert_history(api_key: str, access_token: str, uuid: str) -> _List[_Dict]:
-    url = f"https://api.kite.trade/alerts/{uuid}/history"
-    async with _httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url, headers=_kite_headers(api_key, access_token))
-        r.raise_for_status()
-        payload = r.json()
-        return payload.get("data", []) or []
-
-# One-shot reconciliation tick (used by WS dispatcher and fallback worker)
-async def alerts_poll_tick(api_key: str, access_token: str, ntfy_url: str) -> None:
-    try:
-        alerts = await _kite_list_alerts(api_key, access_token)
-    except Exception as e:
-        logging.error(f"[ALERTS] list failed: {e}")
-        return
-
-    for a in alerts:
-        try:
-            await _upsert_alert_row(async_db, a)
-            uuid = a.get("uuid")
-            if not uuid:
-                continue
-            # Controls
-            ctrl = await _get_alert_controls(uuid)
-            last_alert_count = int(ctrl["last_alert_count"]) if ctrl and ctrl["last_alert_count"] is not None else 0
-            cooldown_sec = int(ctrl["cooldown_sec"]) if ctrl and ctrl["cooldown_sec"] is not None else 120
-            last_notified_at = ctrl["last_notified_at"] if ctrl else None
-            schedule_json = ctrl["schedule"] if ctrl else None
-
-            current_count = int(a.get("alert_count") or 0)
-            if current_count <= last_alert_count:
-                continue
-
-            # Fetch history and process only new entries
-            hist = await _kite_alert_history(api_key, access_token, uuid)
-            latest_seen = await _get_latest_history_time(uuid)
-            new_events = []
-            for h in hist:
-                created_at = h.get("created_at") or h.get("timestamp")
-                # When DB has no history, consider all as new
-                if latest_seen is None:
-                    new_events.append(h)
-                else:
-                    # Compare timestamps lexically; Postgres will parse during insert
-                    try:
-                        # Convert both to datetime for robust compare
-                        ca = _dt.strptime(created_at, "%Y-%m-%d %H:%M:%S")
-                        if latest_seen.tzinfo is None:
-                            # best-effort naive compare
-                            is_new = ca > latest_seen.replace(tzinfo=None)
-                        else:
-                            is_new = ca.replace(tzinfo=None) > latest_seen.replace(tzinfo=None)
-                        if is_new:
-                            new_events.append(h)
-                    except Exception:
-                        # Fallback: accept as new when count increased
-                        new_events.append(h)
-
-            # If no fine-grained history diff could be determined, still ack count
-            if not new_events:
-                await _ack_alert_count(uuid, current_count)
-                continue
-
-            # Evaluate schedule/cooldown only once per batch (suppress if not allowed)
-            if not _is_within_schedule(_json.dumps(schedule_json) if isinstance(schedule_json, dict) else schedule_json):
-                await _ack_alert_count(uuid, current_count)
-                continue
-            if not _passes_cooldown(last_notified_at, cooldown_sec):
-                await _ack_alert_count(uuid, current_count)
-                continue
-
-            # Insert histories and notify (collapse multiple to a single notification with summary)
-            for h in new_events:
-                condition = h.get("condition")
-                meta = h.get("meta")
-                # meta array; try last_price if available
-                last_price = None
-                if isinstance(meta, list) and meta:
-                    last_price = meta[0].get("last_price")
-                await _insert_alert_history(
-                    uuid=uuid,
-                    triggered_at=h.get("created_at") or h.get("timestamp") or _dt.utcnow().isoformat(),
-                    trigger_price=last_price if last_price is not None else 0.0,
-                    meta=h,
-                    condition=condition
-                )
-
-            # Build notification message
-            name = a.get("name") or (ctrl["name"] if ctrl else uuid)
-            sym = a.get("lhs_tradingsymbol") or (ctrl["lhs_tradingsymbol"] if ctrl else "")
-            op = a.get("operator") or (ctrl["operator"] if ctrl else "")
-            rhs = a.get("rhs_constant") if a.get("rhs_constant") is not None else (ctrl["rhs_constant"] if ctrl else "")
-            title = f"Alert triggered: {name}"
-            body = f"{sym} {op} {rhs} | {len(new_events)} event(s) | uuid={uuid}"
-            await _publish_ntfy(ntfy_url, title, body, tags=["alert", "kite", sym] if sym else ["alert", "kite"])
-
-            # Update controls
-            await _update_alert_after_notify(uuid, current_count)
-
-        except Exception as e:
-            logging.error(f"[ALERTS] reconcile error for uuid={a.get('uuid')}: {e}", exc_info=True)
-
-# Background worker: 2s fallback polling
-async def alerts_poll_worker(api_key: str, ntfy_url: str) -> None:
-    logging.info("[ALERTS] 2s polling worker started")
-    while True:
-        await ensure_daily_token_ready()
-        try:
-            db = SessionLocal()
-            try:
-                at = get_system_access_token(db)
-            finally:
-                db.close()
-            if at:
-                await alerts_poll_tick(api_key, at, ntfy_url)
-        except Exception as e:
-            logging.error(f"[ALERTS] poll tick failed: {e}", exc_info=True)
-        await asyncio.sleep(2)
-
-# Dispatcher: consume WebSocket alert events queue and trigger quick reconcile + immediate ntfy
-async def alert_event_dispatcher(ws_mgr: "WebSocketManager", ntfy_url: str) -> None:
-    logging.info("[ALERTS] WS dispatcher started")
-    api_key = API_KEY
-    while True:
-        await ensure_daily_token_ready()
-        event = await ws_mgr.alert_event_queue.get()
-        try:
-            # Immediate lightweight notification with raw context
-            raw = event.get("raw") if isinstance(event, dict) else {}
-            title = "Alert event (stream)"
-            body = _json.dumps(raw)[:1000]  # cap size
-            await _publish_ntfy(ntfy_url, title, body, tags=["alert", "kite", "ws"])
-        except Exception as e:
-            logging.error(f"[ALERTS] dispatcher immediate notify failed: {e}")
-        # Quick reconcile pass to persist+enrich using the latest system token
-        try:
-            db = SessionLocal()
-            try:
-                access_token = get_system_access_token(db)
-            finally:
-                db.close()
-            if access_token:
-                await alerts_poll_tick(api_key, access_token, ntfy_url)
-        except Exception as e:
-            logging.error(f"[ALERTS] dispatcher reconcile failed: {e}", exc_info=True)
-
-# Minimal endpoints for testing the pipeline
-@app.post("/alerts/test-notification")
-async def alerts_test_notification():
-    ntfy_url = _os.getenv("KITE_ALERTS_NTFY_URL") or _os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
-    await _publish_ntfy(ntfy_url, "Test: Kite Alerts", "This is a test notification from backend.", tags=["test","alerts"])
-    return {"status": "ok"}
-
-@app.get("/alerts/mirror")
-async def alerts_mirror_list(limit: int = 100):
-    rows = await async_db.fetch_all(
-        "SELECT * FROM alerts ORDER BY updated_at DESC LIMIT :n",
-        {"n": max(1, min(limit, 500))}
-    )
-    # Convert to JSON-serializable
-    def _row_to_dict(r):
-        try:
-            d = dict(r)
-            if d.get("basket") and isinstance(d["basket"], str):
-                try:
-                    d["basket"] = _json.loads(d["basket"])
-                except Exception:
-                    pass
-            return d
-        except Exception:
-            return {}
-    return {"data": [_row_to_dict(r) for r in rows]}
-
-# Admin endpoint to ensure schema.sql migrations are applied
-from database import get_db_connection as _get_db_conn_for_schema
-
-@app.post("/admin/run-schema")
-def run_schema_migrations():
-    """
-    One-shot: executes schema.sql via database.get_db_connection() which runs create_tables_if_not_exists.
-    Safe and idempotent. Use before first Alerts usage to ensure columns exist.
-    """
-    conn = None
-    try:
-        conn = _get_db_conn_for_schema()
-        return {"status": "ok", "message": "schema.sql executed"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
