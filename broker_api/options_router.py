@@ -456,8 +456,32 @@ async def sse_options_session(
     """
     normalized_symbol, _ = manager.instrument_repo.normalize_underlying_symbol(symbol)
 
+    # Before starting the generator, check if the session exists.
+    # If not, we can't stream anything.
+    if normalized_symbol not in manager.sessions:
+        # A standard response is better here than an empty stream, but for simplicity
+        # and to avoid breaking the EventSource contract, we'll send a specific
+        # error event and then close the connection.
+        async def error_generator():
+            error_payload = {
+                "type": "error",
+                "code": "OPTION_SESSION_NOT_FOUND",
+                "message": f"No active session for underlying '{normalized_symbol}'. Please start one.",
+            }
+            yield f"data: {json.dumps(error_payload)}\n\n"
+        
+        return StreamingResponse(
+            error_generator(),
+            media_type="text/event-stream",
+            status_code=404,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "close",
+            },
+        )
+
     async def event_generator():
-        await manager.ensure_session(normalized_symbol)
         queue = await manager.register_client(normalized_symbol)
         
         # Send initial snapshot if available

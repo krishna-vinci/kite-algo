@@ -55,15 +55,32 @@ class OptionsSession:
     async def start(self):
         """
         Initializes and starts the session's 5s computation task.
+        Includes a priming step to ensure the first snapshot is valid.
         """
         if self.is_running:
             logger.warning(f"Session for {self.underlying} is already running.")
             return
 
         await self._initialize_instruments()
-        # Run the first computation synchronously to ensure a snapshot is available
-        await self._compute_and_publish()
-        
+
+        # Prime the session by retrying the computation until a valid forward price is calculated.
+        # This ensures we don't publish a bad initial snapshot.
+        primed = False
+        for i in range(5): # Try up to 5 times (e.g., 5 seconds)
+            await self._compute_and_publish()
+            # Check if the first expiry has a valid forward price.
+            if self.snapshot and self.snapshot.get('per_expiry'):
+                first_expiry_key = next(iter(self.snapshot['per_expiry']), None)
+                if first_expiry_key and self.snapshot['per_expiry'][first_expiry_key].get('forward') is not None:
+                    primed = True
+                    logger.info(f"Session for {self.underlying} primed successfully on attempt {i+1}.")
+                    break
+            logger.warning(f"Priming attempt {i+1} for {self.underlying} failed. Retrying in 1s...")
+            await asyncio.sleep(1)
+
+        if not primed:
+            logger.error(f"Failed to prime session for {self.underlying} after multiple attempts. Proceeding with potentially incomplete data.")
+
         self.is_running = True
         self.task = asyncio.create_task(self._run_cadence())
         logger.info(f"Started options session for {self.underlying}.")
@@ -484,20 +501,6 @@ class OptionsSessionManager:
         if session:
             await session.stop()
             await self._converge_subscriptions()
-
-    async def ensure_session(
-        self, underlying: str, window_size: int = 12, cadence_sec: int = 5
-    ):
-        """
-        Ensures a session for a single underlying is running. Starts it if not.
-        Does not update config if session already exists to avoid side-effects from
-        consumers that just need to ensure it's active.
-        """
-        if underlying not in self.sessions:
-            logger.info(f"Session for {underlying} not found via ensure_session. Starting a new one.")
-            session = OptionsSession(underlying, self, window_size, cadence_sec)
-            self.sessions[underlying] = session
-            await session.start()
 
     def get_snapshot(self, underlying: str) -> Optional[Dict[str, Any]]:
         """

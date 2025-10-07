@@ -159,14 +159,19 @@
 
   function setUnderlying(u: string) {
     underlying = u;
+    // When switching, close any active stream and fetch a static snapshot.
+    // A new stream will only be opened if the user clicks "Start" for the new underlying.
+    closeSSE();
     ensureSnapshot(underlying);
-    connectSSE(underlying);
   }
 
   onMount(async () => {
+    // On initial load, just fetch the watchlist and a static snapshot if a session is running.
+    // Do not auto-connect the stream.
     await refreshWatchlist();
-    await ensureSnapshot(underlying);
-    if (!snapshotError) {
+    const runningSession = watchlist.find(item => item.underlying === underlying && item.is_running);
+    if (runningSession) {
+      await ensureSnapshot(underlying);
       connectSSE(underlying);
     }
   });
