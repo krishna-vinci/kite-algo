@@ -53,6 +53,7 @@ from broker_api.performance_router import router as performance_router
 from broker_api.options_router import router as options_router
 
 
+
 ### fyers auth import ##
 import httpx
 import pyotp
@@ -65,6 +66,7 @@ from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
 from broker_api.broker_api import router as kite_router
 from strategies.momentum import router as momentum_router
 from broker_api.kite_orders import router as kite_orders_router
+from broker_api.historical_data_api import router as kite_historical_router
 
 from broker_api.broker_api import get_kite
 from kiteconnect import KiteConnect
@@ -368,12 +370,13 @@ app.mount("/mcp", mcp_app_direct_wrapped)
 
 # 4. Include existing API routes (mounted under /broker to match frontend)
 app.include_router(broker_api_router, prefix="/broker")
-app.include_router(momentum_router, prefix="/broker")
-app.include_router(alerts_router, prefix="/alerts")
-app.include_router(options_router, prefix="/api")
-
-app.include_router(performance_router, prefix="/broker")
 app.include_router(kite_orders_router, prefix="/broker")
+app.include_router(options_router, prefix="/broker")
+app.include_router(kite_historical_router, prefix="/broker")
+app.include_router(performance_router, prefix="/broker")
+app.include_router(momentum_router, prefix="/broker")
+
+app.include_router(alerts_router, prefix="/alerts")
 
 from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
 import logging
@@ -621,7 +624,7 @@ async def status():
 
 
 @app.get("/user/subscriptions")
-def get_subscriptions(scope: Optional[str] = Query(default=None, pattern="^(sidebar|marketwatch)$")):
+def get_subscriptions(scope: Optional[str] = Query(default=None, pattern="^(sidebar|marketwatch|nfo-charts|nfo-charts-layouts)$")):
     """
     GET /user/subscriptions
     - If scope is provided, return {"subscriptions": settings_json.get(f"subscriptions_{scope}") or {}}
@@ -641,7 +644,7 @@ def get_subscriptions(scope: Optional[str] = Query(default=None, pattern="^(side
 @app.put("/user/subscriptions")
 async def put_subscriptions(
     request: Request,
-    scope: Optional[str] = Query(default=None, pattern="^(sidebar|marketwatch)$")
+    scope: Optional[str] = Query(default=None, pattern="^(sidebar|marketwatch|nfo-charts|nfo-charts-layouts)$")
 ):
     """
     PUT /user/subscriptions
@@ -939,6 +942,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if not _subs or not isinstance(_subs, dict):
                 return 0
             token_count = 0
+            # Handle `groups` structure (marketwatch, sidebar, nfo-charts union)
             for group in _subs.get("groups", []) or []:
                 if not group or not isinstance(group, dict):
                     continue
@@ -963,6 +967,18 @@ async def websocket_endpoint(websocket: WebSocket):
                             token_count += 1
                         except (ValueError, TypeError):
                             pass
+            
+            # Handle `layouts` structure (nfo-charts-layouts)
+            if isinstance(_subs.get("layouts"), dict):
+                for layout_key, tokens in _subs["layouts"].items():
+                    if isinstance(tokens, list):
+                        for t in tokens:
+                            if t is not None:
+                                try:
+                                    token_set.add(int(t))
+                                    token_count += 1
+                                except (ValueError, TypeError):
+                                    pass
             return token_count
 
         token_set: set[int] = set()
@@ -984,16 +1000,29 @@ async def websocket_endpoint(websocket: WebSocket):
             c = _extract_tokens_from_subs(mw)
             logging.info("[WS auto-restore] Loaded %d tokens from 'subscriptions_marketwatch'", c)
 
+        # NFO Charts Union
+        nfo = settings.get("subscriptions_nfo-charts")
+        if isinstance(nfo, dict):
+            c = _extract_tokens_from_subs(nfo)
+            logging.info("[WS auto-restore] Loaded %d tokens from 'subscriptions_nfo-charts'", c)
+
+        # NFO Charts Layouts
+        nfo_layouts = settings.get("subscriptions_nfo-charts-layouts")
+        if isinstance(nfo_layouts, dict):
+            c = _extract_tokens_from_subs(nfo_layouts)
+            logging.info("[WS auto-restore] Loaded %d tokens from 'subscriptions_nfo-charts-layouts'", c)
+
         all_tokens = list(token_set)
         if all_tokens:
-            # Validate mode from any available section, fallback to 'quote'
+            # Validate mode from any available section, fallback to 'quote'. Prioritize 'full' for NFO charts.
             mode = None
-            for candidate in (legacy, sb, mw):
+            for candidate in (nfo, nfo_layouts, legacy, sb, mw):
                 if isinstance(candidate, dict):
                     m = candidate.get("mode")
                     if m in {"ltp", "quote", "full"}:
                         mode = m
-                        break
+                        if mode == 'full': # Prioritize full mode if found
+                            break
             if mode not in {"ltp", "quote", "full"}:
                 mode = "quote"
 

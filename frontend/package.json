@@ -27,6 +27,7 @@
 		"@tailwindcss/typography": "^0.5.15",
 		"@tailwindcss/vite": "^4.0.0",
 		"@tanstack/table-core": "^8.21.3",
+		"@types/node": "^24.7.0",
 		"autoprefixer": "^10.4.21",
 		"bits-ui": "^2.11.1",
 		"clsx": "^2.1.1",
@@ -35,6 +36,7 @@
 		"eslint-plugin-svelte": "^3.0.0",
 		"flowbite-svelte": "^0.46.1",
 		"globals": "^16.0.0",
+		"paneforge": "^1.0.2",
 		"prettier": "^3.4.2",
 		"prettier-plugin-svelte": "^3.3.3",
 		"svelte": "^5.0.0",
@@ -52,8 +54,7 @@
 		"d3-scale": "^4.0.2",
 		"echarts": "^5.6.0",
 		"layerchart": "^1.0.12",
-		"lightweight-charts": "^5.0.8",
-		"svelte-echarts": "^1.0.0",
-		"svelte-lightweight-charts": "^2.2.0"
+		"lightweight-charts": "^5.0.9",
+		"svelte-echarts": "^1.0.0"
 	}
 }

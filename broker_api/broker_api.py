@@ -130,6 +130,7 @@ from broker_api.kite_auth import login_headless, get_kite
 from broker_api.kite_auth import API_KEY
 from . import kite_orders
 from . import options_router
+from . import historical_data_api
 
 
 
@@ -138,8 +139,6 @@ load_dotenv()
 
 # API router
 router = APIRouter()
-router.include_router(kite_orders.router)
-router.include_router(options_router.router)
 
 # Pydantic request models
 class TickerRequest(BaseModel):
@@ -349,8 +348,6 @@ class PortfolioHistory(Base):
     percentage_change = Column(Numeric, nullable=False)
 
 # ───────── FASTAPI SETUP ─────────
-app    = FastAPI()
-router = APIRouter()
 
 
 
@@ -1995,6 +1992,9 @@ def clear_historical_data(conn = Depends(get_psql_conn)):
         if conn:
             conn.close()
 
+
+
+
 @router.post("/fetch_historical_data")
 async def fetch_historical_data_initial(background_tasks: BackgroundTasks, kite: KiteConnect = Depends(get_kite)):
     """
@@ -2471,3 +2471,5 @@ async def instruments_resolve(req: ResolveRequest):
             out.append({"found": False, "instrument": None, "reason": "Not found"})
 
     return {"data": out}
+
+router.include_router(historical_data_api.router, prefix="/api/v1", tags=["historical-data"])

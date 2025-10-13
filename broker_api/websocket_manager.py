@@ -6,7 +6,7 @@ from typing import Dict, List, Any, Optional, Tuple, Set
 from kiteconnect import KiteTicker
 from fastapi import WebSocket
 from asyncio import AbstractEventLoop
-from datetime import datetime
+from datetime import datetime, timezone
 import redis.asyncio as redis
 from broker_api.redis_events import get_redis
 
@@ -768,8 +768,8 @@ def update_ticker_data_in_db(tick_data):
                     
                     # Perform calculations
                     change_factor = (change or 0) / 100
-                    new_return_attribution = (return_attribution or 0) + change_factor
-                    new_freefloat_marketcap = (freefloat_marketcap or 0) * (1 + change_factor)
+                    new_return_attribution = float(return_attribution or 0) + change_factor
+                    new_freefloat_marketcap = float(freefloat_marketcap or 0) * (1 + change_factor)
 
                     # Update the database
                     cur.execute(
@@ -795,7 +795,7 @@ async def write_ticks_to_redis_overlay(ticks: List[Dict[str, Any]]):
     try:
         redis_client = get_redis()
         ttl_seconds = int(os.getenv("OVERLAY_TTL_SECONDS", "60"))
-        today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+        today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         
         async with redis_client.pipeline(transaction=False) as pipe:
             for tick in ticks:
@@ -810,7 +810,7 @@ async def write_ticks_to_redis_overlay(ticks: List[Dict[str, Any]]):
                 payload = {
                     "instrument_token": token,
                     "last_price": float(last_price),
-                    "tick_timestamp": int(tick.get("exchange_timestamp", datetime.utcnow()).timestamp() * 1000),
+                    "tick_timestamp": int(tick.get("exchange_timestamp", datetime.now(timezone.utc)).timestamp() * 1000),
                     "source": "ws",
                 }
                 if "change" in tick:

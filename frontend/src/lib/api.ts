@@ -92,7 +92,7 @@ export async function getLtp(exchange: string, tradingsymbol: string): Promise<n
 	}
 }
 
-export async function getUserSubscriptions(scope?: 'sidebar' | 'marketwatch') {
+export async function getUserSubscriptions(scope?: 'sidebar' | 'marketwatch' | 'nfo-charts' | 'nfo-charts-layouts') {
     const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
     const response = await apiFetch(`/user/subscriptions${qs}`);
     if (!response.ok) {
@@ -101,7 +101,7 @@ export async function getUserSubscriptions(scope?: 'sidebar' | 'marketwatch') {
     return response.json();
 }
 
-export async function saveUserSubscriptions(subscriptions: any, scope?: 'sidebar' | 'marketwatch') {
+export async function saveUserSubscriptions(subscriptions: any, scope?: 'sidebar' | 'marketwatch' | 'nfo-charts' | 'nfo-charts-layouts') {
     const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
     const response = await apiFetch(`/user/subscriptions${qs}`, {
         method: 'PUT',
@@ -143,7 +143,7 @@ function toQuery(params: Record<string, string | number | boolean | undefined | 
 }
 
 export async function getOptionsWatchlist(): Promise<WatchlistItem[]> {
-  const res = await apiFetch('/api/options/sessions');
+  const res = await apiFetch('/broker/options/sessions');
   if (!res.ok) {
     const t = await res.text().catch(() => '');
     throw new Error(`getOptionsWatchlist failed: ${res.status} ${t}`);
@@ -270,7 +270,7 @@ export async function reactivateAlert(id: string): Promise<Alert> {
  * POST /options/sessions — start/update/replace sessions
  */
 export async function postOptionsSessions(payload: SessionsRequest): Promise<WatchlistItem[]> {
-  const res = await apiFetch('/api/options/sessions', {
+  const res = await apiFetch('/broker/options/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -294,7 +294,7 @@ export async function startOptionsSessions(
  * Returns the latest snapshot. Throws error with status=404 if no active session.
  */
 export async function getOptionsSnapshot(underlying: string): Promise<OptionsSessionSnapshot> {
-  const res = await apiFetch(`/api/options/session/${encodeURIComponent(underlying)}`);
+  const res = await apiFetch(`/broker/options/session/${encodeURIComponent(underlying)}`);
   if (res.status === 404) {
     const body = await res.json().catch(() => ({}));
     const detail = (body?.detail ?? body) as ErrorResponse | string;
@@ -314,7 +314,7 @@ export async function getOptionsSnapshot(underlying: string): Promise<OptionsSes
  * Throws error with status=404 if no active session.
  */
 export async function getOptionChain(underlyingSymbol: string): Promise<OptionsSessionSnapshot> {
-  const res = await apiFetch(`/api/options/chain/${encodeURIComponent(underlyingSymbol)}`);
+  const res = await apiFetch(`/broker/options/chain/${encodeURIComponent(underlyingSymbol)}`);
   if (res.status === 404) {
     const detail = (await res.json().catch(() => null)) as any;
     const err = new Error(detail?.detail ?? 'No active options session');
@@ -333,7 +333,7 @@ export async function getOptionChain(underlyingSymbol: string): Promise<OptionsS
  * Note: keep leading slash to avoid backend decorator missing-slash quirk.
  */
 export async function deleteOptionsSession(underlying: string): Promise<StopSessionResponse> {
-  const res = await apiFetch(`/api/options/session/${encodeURIComponent(underlying)}`, {
+  const res = await apiFetch(`/broker/options/session/${encodeURIComponent(underlying)}`, {
     method: 'DELETE'
   });
   if (!res.ok) {
@@ -355,14 +355,14 @@ export function buildOptionsSessionWsUrl(underlying: string): string {
   const base = getApiBase(); // e.g., http://localhost:8777
   const wsProto = base.startsWith('https') ? 'wss' : 'ws';
   const wsHost = base.replace(/^https?:\/\//, '');
-  return `${wsProto}://${wsHost}/api/ws/options/session/${encodeURIComponent(underlying)}`;
+  return `${wsProto}://${wsHost}/broker/ws/options/session/${encodeURIComponent(underlying)}`;
 }
 /**
  * Build SSE URL for options session stream.
  */
 export function buildOptionsSessionSseUrl(underlying: string): string {
   const base = getApiBase(); // e.g., http://localhost:8777
-  return `${base}/api/sse/options/session/${encodeURIComponent(underlying)}`;
+  return `${base}/broker/sse/options/session/${encodeURIComponent(underlying)}`;
 }
 
 /**
@@ -372,4 +372,144 @@ export function buildOptionsSessionSseUrl(underlying: string): string {
 export function openOptionsSessionWS(underlying: string): WebSocket {
   const url = buildOptionsSessionWsUrl(underlying);
   return new WebSocket(url);
+}
+
+
+/**
+ * Historical Candles API
+ */
+
+export interface Candle {
+	time: number; // UTC epoch seconds
+	open: number;
+	high: number;
+	low: number;
+	close: number;
+	volume: number;
+	oi?: number;
+}
+
+export interface CandlesResponse {
+	status: 'success';
+	meta: {
+		instrument_token: number;
+		timeframe: string;
+		timezone: 'UTC';
+		from: string;
+		to: string;
+	};
+	ingestion: {
+		status: 'triggered' | 'up_to_date' | 'disabled';
+	};
+	candles: Candle[];
+}
+
+type CanonicalTimeframe =
+	| '1minute'
+	| '3minute'
+	| '5minute'
+	| '10minute'
+	| '15minute'
+	| '30minute'
+	| '60minute'
+	| 'day';
+
+const TIMEFRAME_ALIASES: Record<string, CanonicalTimeframe> = {
+	'1m': '1minute',
+	min: '1minute',
+	minute: '1minute',
+	'3m': '3minute',
+	'3minute': '3minute',
+	'5m': '5minute',
+	'5minute': '5minute',
+	'10m': '10minute',
+	'10minute': '10minute',
+	'15m': '15minute',
+	'15minute': '15minute',
+	'30m': '30minute',
+	'30minute': '30minute',
+	'60m': '60minute',
+	'1h': '60minute',
+	'60minute': '60minute',
+	'1d': 'day',
+	day: 'day'
+};
+
+export function normalizeTimeframe(timeframe: string): CanonicalTimeframe {
+	const normalized = TIMEFRAME_ALIASES[timeframe.toLowerCase()];
+	if (!normalized) {
+		// Fallback for existing values that might not be in the alias map
+		const validTimeframes: string[] = [
+			'1minute',
+			'3minute',
+			'5minute',
+			'10minute',
+			'15minute',
+			'30minute',
+			'60minute',
+			'day'
+		];
+		if (validTimeframes.includes(timeframe)) return timeframe as CanonicalTimeframe;
+		throw new Error(`Invalid timeframe alias: "${timeframe}"`);
+	}
+	return normalized;
+}
+
+export async function fetchCandles(
+	identifier: string | number,
+	opts: {
+		timeframe: string;
+		from?: string | number | Date;
+		to?: string | number | Date;
+		ingest?: boolean;
+	}
+): Promise<CandlesResponse> {
+	const canonicalTimeframe = normalizeTimeframe(opts.timeframe);
+	const params = new URLSearchParams({ timeframe: canonicalTimeframe });
+
+	if (opts.from) {
+		if (opts.from instanceof Date) {
+			params.set('from', opts.from.toISOString());
+		} else if (typeof opts.from === 'number') {
+			params.set('from', new Date(opts.from * 1000).toISOString());
+		} else {
+			params.set('from', opts.from);
+		}
+	}
+
+	if (opts.to) {
+		if (opts.to instanceof Date) {
+			params.set('to', opts.to.toISOString());
+		} else if (typeof opts.to === 'number') {
+			params.set('to', new Date(opts.to * 1000).toISOString());
+		} else {
+			params.set('to', opts.to);
+		}
+	}
+
+	// Default ingest to true if not specified
+	params.set('ingest', opts.ingest === false ? 'false' : 'true');
+
+	const url = `/broker/candles/${identifier}?${params.toString()}`;
+	const res = await apiFetch(url);
+
+	if (!res.ok) {
+		const errorText = await res.text().catch(() => 'Unknown error');
+		throw new Error(`Failed to fetch candles: ${res.status} ${errorText}`);
+	}
+
+	const data = await res.json();
+
+	// Ensure numeric types are correct
+	const candles = data.candles.map((c: any) => ({
+		time: Number(c.time),
+		open: Number(c.open),
+		high: Number(c.high),
+		low: Number(c.low),
+		close: Number(c.close),
+		volume: Number(c.volume),
+		oi: c.oi ? Number(c.oi) : undefined
+	}));
+
+	return { ...data, candles };
 }

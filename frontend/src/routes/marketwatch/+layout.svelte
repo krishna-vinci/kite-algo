@@ -24,6 +24,6 @@
 	</nav>
 </div>
 
-<main class="container py-6">
+<main class="px-6 py-6">
 	<slot />
 </main>

@@ -39,5 +39,7 @@
 	.content-wrapper {
 		padding: 1.5rem; /* 24px */
 		flex-grow: 1;
+		display: flex;
+		flex-direction: column;
 	}
 </style>
