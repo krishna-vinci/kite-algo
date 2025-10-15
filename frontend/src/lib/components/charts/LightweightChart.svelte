@@ -77,8 +77,15 @@
 				localization: {
 					locale,
 					...(options?.localization ?? {})
+				},
+				timeScale: {
+					...options.timeScale
 				}
 			};
+
+			// HACK: The 'timezone' property is a valid IANA time zone name, but it's missing from the type definitions.
+			// This ensures the chart displays time in the context of the Indian market.
+			(mergedOptions.timeScale as any).timezone = 'Asia/Kolkata';
 
 			chart = createChart(container, mergedOptions);
 

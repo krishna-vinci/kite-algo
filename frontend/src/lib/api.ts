@@ -393,13 +393,15 @@ export interface CandlesResponse {
 	status: 'success';
 	meta: {
 		instrument_token: number;
-		timeframe: string;
-		timezone: 'UTC';
+		interval: string;
+		timezone: string; // 'UTC' | 'Asia/Kolkata'
 		from: string;
 		to: string;
+		count: number;
 	};
 	ingestion: {
-		status: 'triggered' | 'up_to_date' | 'disabled';
+		status: 'triggered' | 'up_to_date' | 'disabled' | 'error';
+		message?: string;
 	};
 	candles: Candle[];
 }
@@ -512,4 +514,108 @@ export async function fetchCandles(
 	}));
 
 	return { ...data, candles };
+}
+
+export async function clearCandleCache(
+	identifier: string | number
+): Promise<{ status: string; deleted_rows: number; instrument_token: number }> {
+	const url = `/broker/candles/${identifier}/cache`;
+	const res = await apiFetch(url, { method: 'DELETE' });
+
+	if (!res.ok) {
+		const errorText = await res.text().catch(() => 'Unknown error');
+		throw new Error(`Failed to clear candle cache: ${res.status} ${errorText}`);
+	}
+
+	return res.json();
+}
+
+/**
+ * Get data coverage statistics for an instrument
+ */
+export async function getCandleCoverage(
+	identifier: string | number,
+	timeframe: string
+): Promise<any> {
+	const canonicalTimeframe = normalizeTimeframe(timeframe);
+	const url = `/broker/candles/${identifier}/coverage?timeframe=${canonicalTimeframe}`;
+	const res = await apiFetch(url);
+
+	if (!res.ok) {
+		const errorText = await res.text().catch(() => 'Unknown error');
+		throw new Error(`Failed to get candle coverage: ${res.status} ${errorText}`);
+	}
+
+	return res.json();
+}
+
+/**
+ * Build SSE URL for real-time candle streaming
+ */
+export function buildCandleStreamUrl(identifier: string | number, timeframe: string): string {
+	const canonicalTimeframe = normalizeTimeframe(timeframe);
+	const base = getApiBase();
+	return `${base}/broker/candles/stream/${identifier}?timeframe=${canonicalTimeframe}`;
+}
+
+/**
+ * Watchlist API - Dedicated endpoints for managing user watchlists
+ */
+
+export interface WatchlistInstrument {
+	instrument_token: number;
+	tradingsymbol?: string;
+	name?: string;
+	exchange?: string;
+	instrument_type?: string;
+}
+
+export interface WatchlistUpsertResponse {
+	inserted: number;
+	updated: number;
+	removed: number;
+}
+
+/**
+ * Get user's watchlist
+ */
+export async function getUserWatchlist(ownerId: string = 'default'): Promise<WatchlistInstrument[]> {
+	const url = `/broker/candles/user/watchlist?owner_id=${encodeURIComponent(ownerId)}`;
+	const res = await apiFetch(url);
+	
+	if (!res.ok) {
+		const errorText = await res.text().catch(() => 'Unknown error');
+		throw new Error(`Failed to fetch watchlist: ${res.status} ${errorText}`);
+	}
+	
+	return res.json();
+}
+
+/**
+ * Upsert instruments to user's watchlist
+ * @param instruments - List of instruments to add/update
+ * @param ownerId - Owner ID (defaults to 'default')
+ * @param replace - If true, removes instruments not in the list
+ */
+export async function upsertUserWatchlist(
+	instruments: WatchlistInstrument[],
+	ownerId: string = 'default',
+	replace: boolean = false
+): Promise<WatchlistUpsertResponse> {
+	const url = `/broker/candles/user/watchlist?replace=${replace}`;
+	const res = await apiFetch(url, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			owner_id: ownerId,
+			instruments
+		})
+	});
+	
+	if (!res.ok) {
+		const errorText = await res.text().catch(() => 'Unknown error');
+		throw new Error(`Failed to upsert watchlist: ${res.status} ${errorText}`);
+	}
+	
+	return res.json();
 }

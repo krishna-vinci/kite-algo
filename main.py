@@ -51,6 +51,7 @@ from broker_api.broker_api import router as broker_api_router
 from broker_api.alerts_router import router as alerts_router
 from broker_api.performance_router import router as performance_router
 from broker_api.options_router import router as options_router
+from broker_api.candles_api import router as candles_api_router
 
 
 
@@ -66,7 +67,6 @@ from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
 from broker_api.broker_api import router as kite_router
 from strategies.momentum import router as momentum_router
 from broker_api.kite_orders import router as kite_orders_router
-from broker_api.historical_data_api import router as kite_historical_router
 
 from broker_api.broker_api import get_kite
 from kiteconnect import KiteConnect
@@ -372,7 +372,7 @@ app.mount("/mcp", mcp_app_direct_wrapped)
 app.include_router(broker_api_router, prefix="/broker")
 app.include_router(kite_orders_router, prefix="/broker")
 app.include_router(options_router, prefix="/broker")
-app.include_router(kite_historical_router, prefix="/broker")
+app.include_router(candles_api_router, prefix="/broker")  # Unified candles API with all historical endpoints
 app.include_router(performance_router, prefix="/broker")
 app.include_router(momentum_router, prefix="/broker")
 

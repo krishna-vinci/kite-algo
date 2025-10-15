@@ -130,7 +130,6 @@ from broker_api.kite_auth import login_headless, get_kite
 from broker_api.kite_auth import API_KEY
 from . import kite_orders
 from . import options_router
-from . import historical_data_api
 
 
 
@@ -2471,5 +2470,3 @@ async def instruments_resolve(req: ResolveRequest):
             out.append({"found": False, "instrument": None, "reason": "Not found"})
 
     return {"data": out}
-
-router.include_router(historical_data_api.router, prefix="/api/v1", tags=["historical-data"])
