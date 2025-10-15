@@ -407,7 +407,7 @@ export interface CandlesResponse {
 }
 
 type CanonicalTimeframe =
-	| '1minute'
+	| 'minute'
 	| '3minute'
 	| '5minute'
 	| '10minute'
@@ -416,10 +416,11 @@ type CanonicalTimeframe =
 	| '60minute'
 	| 'day';
 
+// MUST match backend's TIMEFRAME_ALIASES in candles_api.py
 const TIMEFRAME_ALIASES: Record<string, CanonicalTimeframe> = {
-	'1m': '1minute',
-	min: '1minute',
-	minute: '1minute',
+	'1m': 'minute',
+	min: 'minute',
+	minute: 'minute',
 	'3m': '3minute',
 	'3minute': '3minute',
 	'5m': '5minute',
@@ -442,7 +443,7 @@ export function normalizeTimeframe(timeframe: string): CanonicalTimeframe {
 	if (!normalized) {
 		// Fallback for existing values that might not be in the alias map
 		const validTimeframes: string[] = [
-			'1minute',
+			'minute',
 			'3minute',
 			'5minute',
 			'10minute',

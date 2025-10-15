@@ -252,7 +252,7 @@
       void preloadSymbols();
       pollInterval = setInterval(refresh, 5000);
       try {
-        es = new EventSource(sseUrl);
+        es = new EventSource(sseUrl, { withCredentials: true });
         es.onopen = () => {
           sseConnected = true;
         };

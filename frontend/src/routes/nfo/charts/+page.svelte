@@ -432,11 +432,8 @@
 		
 		console.log(`🎯 [handlePaneSelect] Selected ${instrument.tradingsymbol} (${token}) with interval ${interval}`);
 		
-		// Start stream immediately (snapshot will provide initial data)
+		// Start stream immediately - snapshot will provide initial data fast
 		startStream(token, interval);
-		
-		// Also load historical data in background
-		await loadCandles(token, interval, { replace: true });
 	}
 
 	async function handleIntervalChange(interval: string, paneIndex: number) {
@@ -458,9 +455,6 @@
 				stopStream(token, oldInterval);
 			}
 			startStream(token, interval);
-			
-			// Load historical data in background
-			await loadCandles(token, interval, { replace: true });
 		}
 	}
 
@@ -489,7 +483,7 @@
 		console.log(`[startStream] Calling streamManager.subscribe...`);
 		streamManager.subscribe(token, interval, {
 			onSnapshot: (snapshot) => {
-				console.log(`[Stream] Snapshot received for ${key}:`, snapshot.candles.length, 'candles');
+				console.log(`📦 [Stream] Snapshot received for ${key}:`, snapshot.candles.length, 'candles');
 				const newCandles = parseRawCandles(snapshot.candles);
 				if (newCandles.length > 0) {
 					const normalizedInterval = normalizeTimeframe(interval);
@@ -497,28 +491,18 @@
 						candlesByTokenAndInterval.set(token, new Map());
 					}
 					
-					// MERGE snapshot with existing data (don't replace!)
-					const existingCandles = candlesByTokenAndInterval.get(token)!.get(normalizedInterval) ?? [];
-					if (existingCandles.length === 0) {
-						// No existing data, use snapshot
-						candlesByTokenAndInterval.get(token)!.set(normalizedInterval, newCandles);
-					} else {
-						// Merge: add any candles from snapshot that we don't have
-						const existingTimes = new Set(existingCandles.map(c => c.time));
-						const uniqueNew = newCandles.filter(c => !existingTimes.has(c.time));
-						if (uniqueNew.length > 0) {
-							const merged = [...existingCandles, ...uniqueNew].sort((a, b) => a.time - b.time);
-							candlesByTokenAndInterval.get(token)!.set(normalizedInterval, merged);
-							console.log(`[Stream] Merged ${uniqueNew.length} new candles from snapshot`);
-						}
-					}
+					// USE SNAPSHOT as primary data source - it's fresh from backend
+					candlesByTokenAndInterval.get(token)!.set(normalizedInterval, newCandles);
 					candlesByTokenAndInterval = new Map(candlesByTokenAndInterval);
+					console.log(`✅ [Stream] Loaded ${newCandles.length} candles from snapshot for ${key}`);
+					
+					// Clear cache to force chart regeneration
+					chartDataCache.delete(key);
 				}
 			},
 			onTick: (tickEvent) => {
 				// Real-time tick-level updates for the FORMING candle
 				const candle = parseRawCandle(tickEvent.candle);
-				console.log(`[Stream] Tick update for ${key}:`, candle);
 				const normalizedInterval = normalizeTimeframe(interval);
 				if (!candlesByTokenAndInterval.has(token)) {
 					candlesByTokenAndInterval.set(token, new Map());
@@ -532,17 +516,16 @@
 					// Update existing forming candle IN PLACE
 					existingCandles[existingIndex] = candle;
 				} else {
-					// New forming candle
+					// New forming candle - add at end
 					existingCandles.push(candle);
-					existingCandles.sort((a, b) => a.time - b.time);
 					
 					// Trim if exceeds max history
 					if (existingCandles.length > MAX_CANDLE_HISTORY) {
-						existingCandles.splice(0, existingCandles.length - MAX_CANDLE_HISTORY);
+						existingCandles.shift(); // Remove oldest
 					}
 				}
 				
-				// Trigger reactivity
+				// CRITICAL: Trigger Svelte reactivity
 				candlesByTokenAndInterval = new Map(candlesByTokenAndInterval);
 			},
 			onCandle: (candleEvent) => {
@@ -810,40 +793,9 @@
 				}
 			}
 			
-			// *** CRITICAL: Load historical data for saved layouts ***
-			console.log('[Init] Loading historical data for saved layouts...', layouts);
-			
-			// Load data for active layout first (priority)
-			const activeTokens = layouts[activeLayout];
-			const activeIntervals = paneIntervals[activeLayout];
-			console.log(`[Init] Active layout '${activeLayout}':`, activeTokens, activeIntervals);
-			
-			for (let i = 0; i < activeTokens.length; i++) {
-				const token = activeTokens[i];
-				const interval = activeIntervals[i];
-				if (token && interval) {
-					console.log(`[Init] Loading candles for pane ${i}: ${token}|${interval}`);
-					// Load historical data for this pane
-					loadCandles(token, interval, { replace: false }).catch(err => {
-						console.warn(`Failed to load candles for ${token}|${interval}:`, err);
-					});
-				}
-			}
-			
-			// Also load for other layouts (lower priority, in background)
-			for (const [layoutKey, tokens] of Object.entries(layouts)) {
-				if (layoutKey === activeLayout) continue; // Already loaded above
-				const intervals = paneIntervals[layoutKey as LayoutType];
-				for (let i = 0; i < tokens.length; i++) {
-					const token = tokens[i];
-					const interval = intervals[i];
-					if (token && interval) {
-						loadCandles(token, interval, { replace: false }).catch(err => {
-							console.warn(`Failed to load candles for ${token}|${interval}:`, err);
-						});
-					}
-				}
-			}
+			// NOTE: We don't load historical data separately anymore
+			// SSE snapshot will provide initial candles automatically when stream connects
+			console.log('✅ [Init] Layouts loaded. Streams will be started by reactive effect.');
 		} catch (e) {
 			console.warn('Could not fetch nfo-charts-layouts.', e);
 		}

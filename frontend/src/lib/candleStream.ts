@@ -121,7 +121,7 @@ class CandleStream {
 			this.eventSource.addEventListener('tick', (event) => {
 				try {
 					const data = JSON.parse(event.data) as StreamCandle;
-					console.log(`[CandleStream] 📈 TICK RECEIVED:`, data.candle);
+					// Reduced logging - ticks are frequent
 					this.callbacks.onTick?.(data);
 				} catch (error) {
 					console.error('[CandleStream] Failed to parse tick:', error, 'Raw data:', event.data);
@@ -233,7 +233,8 @@ export class CandleStreamManager {
 			this.unsubscribe(identifier, timeframe);
 		}
 
-		const stream = new CandleStream(identifier, timeframe, callbacks);
+		const normalizedTimeframe = normalizeTimeframe(timeframe);
+		const stream = new CandleStream(identifier, normalizedTimeframe, callbacks);
 		this.streams.set(key, stream);
 		stream.start();
 

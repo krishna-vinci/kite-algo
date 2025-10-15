@@ -310,6 +310,27 @@ async def combined_lifespan(app: FastAPI):
                 logger.exception("Startup Meilisearch reindex-if-empty check failed: %s", ie)
         except Exception as e:
             logger.exception("Failed to ensure Meilisearch index on startup: %s", e)
+
+        # Auto-start Candle Aggregator with all supported intervals
+        try:
+            from broker_api.candle_aggregator import get_aggregator
+            logging.info("Starting Candle Aggregator...")
+            aggregator = get_aggregator(API_KEY)
+            
+            if not aggregator.running:
+                # Start with ALL supported intervals including 3minute, 30minute, and day
+                await aggregator.start(
+                    access_token=at,
+                    intervals=["minute", "3minute", "5minute", "10minute", "15minute", "30minute", "60minute", "day"],
+                    owner_scope="all",
+                    refresh_seconds=30
+                )
+                logging.info("Candle Aggregator started successfully with all intervals")
+                app.state.candle_aggregator = aggregator
+            else:
+                logging.info("Candle Aggregator already running")
+        except Exception as e:
+            logging.error("Failed to start Candle Aggregator: %s", e, exc_info=True)
     except Exception as e:
         logging.error(f"Failed to initialize MCP Kite instance or WebSocketManager: {e}", exc_info=True)
         # Depending on the desired behavior, you might want to exit the application
@@ -349,6 +370,16 @@ async def combined_lifespan(app: FastAPI):
             logging.info("AlertsEngine stopped.")
     except Exception:
         pass
+
+    # Stop Candle Aggregator
+    try:
+        aggregator = getattr(app.state, "candle_aggregator", None)
+        if aggregator and aggregator.running:
+            logging.info("Stopping Candle Aggregator...")
+            await aggregator.stop()
+            logging.info("Candle Aggregator stopped.")
+    except Exception as e:
+        logging.error("Error stopping Candle Aggregator: %s", e, exc_info=True)
 
     if ws_manager:
         logging.info("Stopping WebSocketManager...")

@@ -69,14 +69,15 @@ class CandlesResponse(BaseModel):
 
 class AggregatorConfig(BaseModel):
     """Configuration for starting the aggregator."""
-    intervals: List[str] = Field(default=["minute", "5minute", "15minute", "60minute"])
+    intervals: List[str] = Field(default=["minute", "3minute", "5minute", "15minute", "30minute", "60minute", "day"])
     owner_scope: str = Field(default="all")
     refresh_seconds: int = Field(default=30, ge=10, le=300)
 
 
+
 class IngestionConfig(BaseModel):
     """Configuration for starting the ingestion scheduler."""
-    intervals: List[str] = Field(default=["minute", "5minute", "15minute", "60minute", "day"])
+    intervals: List[str] = Field(default=["minute", "3minute", "5minute", "15minute", "30minute", "60minute", "day"])
     owner_scope: str = Field(default="all")
     schedule_seconds: int = Field(default=900, ge=60, le=3600)
 
@@ -702,7 +703,8 @@ async def run_ingestion_now(
                 "message": "No tokens found in watchlist"
             }
         
-        intervals = intervals or ["minute", "5minute", "15minute", "60minute"]
+        intervals = intervals or ["minute", "3minute", "5minute", "15minute", "30minute", "60minute", "day"]
+
         
         results = []
         for token in tokens:
