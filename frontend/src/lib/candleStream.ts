@@ -86,10 +86,11 @@ class CandleStream {
 			this.setState('connecting');
 
 			const url = buildCandleStreamUrl(this.identifier, this.timeframe);
+			console.log(`[CandleStream] 🔌 Opening EventSource to: ${url}`);
 			this.eventSource = new EventSource(url, { withCredentials: true });
 
 			this.eventSource.addEventListener('open', () => {
-				console.log(`[CandleStream] Connected: ${this.identifier}|${this.timeframe}`);
+				console.log(`[CandleStream] ✅ CONNECTED: ${this.identifier}|${this.timeframe} at ${url}`);
 				this.setState('connected');
 				this.reconnectAttempts = 0;
 				this.reconnectDelay = 1000;
@@ -98,9 +99,10 @@ class CandleStream {
 			this.eventSource.addEventListener('snapshot', (event) => {
 				try {
 					const data = JSON.parse(event.data) as StreamSnapshot;
+					console.log(`[CandleStream] 📦 SNAPSHOT RECEIVED: ${data.candles.length} candles for ${data.instrument_token}|${data.interval}`);
 					this.callbacks.onSnapshot?.(data);
 				} catch (error) {
-					console.error('[CandleStream] Failed to parse snapshot:', error);
+					console.error('[CandleStream] Failed to parse snapshot:', error, 'Raw data:', event.data);
 					this.callbacks.onError?.(error as Error);
 				}
 			});
@@ -108,9 +110,10 @@ class CandleStream {
 			this.eventSource.addEventListener('candle', (event) => {
 				try {
 					const data = JSON.parse(event.data) as StreamCandle;
+					console.log(`[CandleStream] 🕯️ CANDLE COMPLETED:`, data.candle);
 					this.callbacks.onCandle?.(data);
 				} catch (error) {
-					console.error('[CandleStream] Failed to parse candle:', error);
+					console.error('[CandleStream] Failed to parse candle:', error, 'Raw data:', event.data);
 					this.callbacks.onError?.(error as Error);
 				}
 			});
@@ -118,11 +121,21 @@ class CandleStream {
 			this.eventSource.addEventListener('tick', (event) => {
 				try {
 					const data = JSON.parse(event.data) as StreamCandle;
+					console.log(`[CandleStream] 📈 TICK RECEIVED:`, data.candle);
 					this.callbacks.onTick?.(data);
 				} catch (error) {
-					console.error('[CandleStream] Failed to parse tick:', error);
+					console.error('[CandleStream] Failed to parse tick:', error, 'Raw data:', event.data);
 					this.callbacks.onError?.(error as Error);
 				}
+			});
+
+			this.eventSource.addEventListener('message', (event) => {
+				if (event.data === '' || event.data.includes('heartbeat')) {
+					// Heartbeat received - connection is alive
+					console.debug('[CandleStream] Heartbeat received');
+					return;
+				}
+				console.log(`[CandleStream] Unhandled message:`, event.data);
 			});
 
 			this.eventSource.addEventListener('error', (event) => {
