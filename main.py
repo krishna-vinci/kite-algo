@@ -67,6 +67,7 @@ from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
 from broker_api.broker_api import router as kite_router
 from strategies.momentum import router as momentum_router
 from broker_api.kite_orders import router as kite_orders_router
+from strategies.indexstoploss.router import router as indexstoploss_router
 
 from broker_api.broker_api import get_kite
 from kiteconnect import KiteConnect
@@ -285,6 +286,24 @@ async def combined_lifespan(app: FastAPI):
             logging.info("AlertsEngine started (interval_ms=%s)", getattr(alerts_engine, "interval_ms", None))
         except Exception as e:
             logging.error("Failed to start AlertsEngine: %s", e, exc_info=True)
+        
+        # Start PositionProtectionEngine (Phase 1) after AlertsEngine
+        try:
+            from strategies.indexstoploss.index_stoploss_algo import PositionProtectionEngine
+            from broker_api.kite_orders import OrdersService
+            
+            orders_service = OrdersService()
+            protection_engine = PositionProtectionEngine(
+                db=async_db,
+                ws_manager=ws_manager,
+                orders_service=orders_service,
+                app=app
+            )
+            protection_engine.start()
+            app.state.protection_engine = protection_engine
+            logging.info("PositionProtectionEngine started (500ms interval)")
+        except Exception as e:
+            logging.error("Failed to start PositionProtectionEngine: %s", e, exc_info=True)
 
         # Start alert dispatcher (WS text messages) and 2s polling fallback
         alerts_ntfy_url = os.getenv("KITE_ALERTS_NTFY_URL") or os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
@@ -370,6 +389,15 @@ async def combined_lifespan(app: FastAPI):
             logging.info("AlertsEngine stopped.")
     except Exception:
         pass
+    
+    # Stop PositionProtectionEngine
+    try:
+        protection_eng = getattr(app.state, "protection_engine", None)
+        if protection_eng:
+            await protection_eng.stop()
+            logging.info("PositionProtectionEngine stopped.")
+    except Exception:
+        pass
 
     # Stop Candle Aggregator
     try:
@@ -408,6 +436,7 @@ app.include_router(performance_router, prefix="/broker")
 app.include_router(momentum_router, prefix="/broker")
 
 app.include_router(alerts_router, prefix="/alerts")
+app.include_router(indexstoploss_router, prefix="/strategies")
 
 from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
 import logging

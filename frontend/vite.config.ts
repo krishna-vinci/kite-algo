@@ -11,5 +11,8 @@ export default defineConfig({
 				rewrite: (path) => path.replace(/^\/broker/, '/broker')
 			}
 		}
+	},
+	ssr: {
+		noExternal: ['svelte-sonner']
 	}
 });

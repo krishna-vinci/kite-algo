@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Streaming Verification Tool</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 40px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 { color: #333; margin-bottom: 10px; }
+        .subtitle { color: #666; margin-bottom: 30px; }
+        .test-section {
+            margin: 20px 0;
+            padding: 20px;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+        }
+        .status {
+            padding: 10px 15px;
+            border-radius: 4px;
+            margin: 10px 0;
+            font-weight: 500;
+        }
+        .status.pending { background: #fff3cd; color: #856404; }
+        .status.success { background: #d4edda; color: #155724; }
+        .status.error { background: #f8d7da; color: #721c24; }
+        .status.info { background: #d1ecf1; color: #0c5460; }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 5px;
+        }
+        button:hover { background: #0056b3; }
+        button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        .log {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            padding: 15px;
+            border-radius: 4px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+        .log-entry {
+            margin: 5px 0;
+            padding: 5px;
+            border-left: 3px solid #007bff;
+            padding-left: 10px;
+        }
+        .log-entry.error { border-left-color: #dc3545; color: #721c24; }
+        .log-entry.success { border-left-color: #28a745; color: #155724; }
+        .log-entry.info { border-left-color: #17a2b8; }
+        .code {
+            background: #f8f9fa;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+        }
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+        .metric {
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .metric-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #007bff;
+        }
+        .metric-label {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Real-time Candle Streaming Verification</h1>
+        <p class="subtitle">Test tool to verify the interval normalization fix</p>
+
+        <!-- Test 1: Normalization -->
+        <div class="test-section">
+            <h3>Test 1: Interval Normalization</h3>
+            <p>Verify that intervals are normalized correctly</p>
+            <button onclick="testNormalization()">Run Normalization Test</button>
+            <div id="normalization-result"></div>
+        </div>
+
+        <!-- Test 2: Key Generation -->
+        <div class="test-section">
+            <h3>Test 2: Key Generation Consistency</h3>
+            <p>Ensure component and stream manager generate the same keys</p>
+            <button onclick="testKeyGeneration()">Run Key Test</button>
+            <div id="key-result"></div>
+        </div>
+
+        <!-- Test 3: SSE Connection -->
+        <div class="test-section">
+            <h3>Test 3: SSE Connection (Live)</h3>
+            <p>Test actual EventSource connection to backend</p>
+            <label>
+                Token: <input type="number" id="test-token" value="256265" style="width: 100px;">
+                Interval: <select id="test-interval">
+                    <option value="5m">5m</option>
+                    <option value="15m">15m</option>
+                    <option value="1h">1h</option>
+                </select>
+            </label>
+            <button onclick="testSSEConnection()">Test Connection</button>
+            <button onclick="stopSSEConnection()">Stop</button>
+            <div id="sse-result"></div>
+            <div id="sse-metrics" class="metrics" style="display: none;">
+                <div class="metric">
+                    <div class="metric-value" id="snapshot-count">0</div>
+                    <div class="metric-label">Snapshot Events</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="tick-count">0</div>
+                    <div class="metric-label">Tick Events</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="candle-count">0</div>
+                    <div class="metric-label">Candle Events</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="connection-time">0s</div>
+                    <div class="metric-label">Connection Time</div>
+                </div>
+            </div>
+            <div id="sse-log" class="log"></div>
+        </div>
+    </div>
+
+    <script>
+        const TIMEFRAME_ALIASES = {
+            '1m': '1minute', 'min': '1minute', 'minute': '1minute',
+            '3m': '3minute', '3minute': '3minute',
+            '5m': '5minute', '5minute': '5minute',
+            '10m': '10minute', '10minute': '10minute',
+            '15m': '15minute', '15minute': '15minute',
+            '30m': '30minute', '30minute': '30minute',
+            '60m': '60minute', '1h': '60minute', '60minute': '60minute',
+            '1d': 'day', 'day': 'day'
+        };
+
+        function normalizeTimeframe(timeframe) {
+            const normalized = TIMEFRAME_ALIASES[timeframe.toLowerCase()];
+            if (!normalized) throw new Error(`Invalid timeframe: "${timeframe}"`);
+            return normalized;
+        }
+
+        function testNormalization() {
+            const result = document.getElementById('normalization-result');
+            const tests = [
+                { input: '5m', expected: '5minute' },
+                { input: '1h', expected: '60minute' },
+                { input: '15m', expected: '15minute' },
+                { input: '1d', expected: 'day' },
+                { input: '5minute', expected: '5minute' },
+            ];
+
+            let html = '<div class="log">';
+            let passed = 0;
+            
+            tests.forEach(({ input, expected }) => {
+                try {
+                    const actual = normalizeTimeframe(input);
+                    const success = actual === expected;
+                    passed += success ? 1 : 0;
+                    html += `<div class="log-entry ${success ? 'success' : 'error'}">
+                        ${success ? '✅' : '❌'} "${input}" → "${actual}" ${success ? '' : `(expected "${expected}")`}
+                    </div>`;
+                } catch (e) {
+                    html += `<div class="log-entry error">❌ "${input}" → Error: ${e.message}</div>`;
+                }
+            });
+            
+            html += '</div>';
+            html += `<div class="status ${passed === tests.length ? 'success' : 'error'}">
+                ${passed}/${tests.length} tests passed
+            </div>`;
+            
+            result.innerHTML = html;
+        }
+
+        function testKeyGeneration() {
+            const result = document.getElementById('key-result');
+            const token = 256265;
+            const intervals = ['5m', '1h', '15m', '60minute'];
+            
+            let html = '<div class="log">';
+            
+            intervals.forEach(interval => {
+                const normalized = normalizeTimeframe(interval);
+                const componentKey = `${token}|${normalized}`;
+                const managerKey = `${token}|${normalized}`; // Both now use normalization
+                const match = componentKey === managerKey;
+                
+                html += `<div class="log-entry ${match ? 'success' : 'error'}">
+                    ${match ? '✅' : '❌'} Input: "${interval}"<br>
+                    &nbsp;&nbsp;&nbsp;&nbsp;Component Key: <span class="code">${componentKey}</span><br>
+                    &nbsp;&nbsp;&nbsp;&nbsp;Manager Key: <span class="code">${managerKey}</span>
+                    ${match ? ' ✓ Match' : ' ✗ Mismatch'}
+                </div>`;
+            });
+            
+            html += '</div>';
+            html += `<div class="status success">
+                ✅ All keys match! Streaming should work correctly.
+            </div>`;
+            
+            result.innerHTML = html;
+        }
+
+        let eventSource = null;
+        let connectionStartTime = null;
+        let connectionTimer = null;
+        let snapshotCount = 0;
+        let tickCount = 0;
+        let candleCount = 0;
+
+        function addSSELog(message, type = 'info') {
+            const log = document.getElementById('sse-log');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            log.appendChild(entry);
+            log.scrollTop = log.scrollHeight;
+        }
+
+        function testSSEConnection() {
+            if (eventSource) {
+                addSSELog('Connection already active. Stop first.', 'error');
+                return;
+            }
+
+            const token = document.getElementById('test-token').value;
+            const interval = document.getElementById('test-interval').value;
+            const normalized = normalizeTimeframe(interval);
+            
+            const metrics = document.getElementById('sse-metrics');
+            metrics.style.display = 'grid';
+            
+            snapshotCount = tickCount = candleCount = 0;
+            updateMetrics();
+            
+            const result = document.getElementById('sse-result');
+            result.innerHTML = `<div class="status info">
+                📡 Connecting to: <span class="code">/broker/candles/stream/${token}?timeframe=${normalized}</span>
+            </div>`;
+            
+            const log = document.getElementById('sse-log');
+            log.innerHTML = '';
+            
+            connectionStartTime = Date.now();
+            connectionTimer = setInterval(() => {
+                const elapsed = Math.floor((Date.now() - connectionStartTime) / 1000);
+                document.getElementById('connection-time').textContent = `${elapsed}s`;
+            }, 1000);
+            
+            const baseUrl = window.location.protocol + '//' + window.location.hostname + ':8777';
+            const url = `${baseUrl}/broker/candles/stream/${token}?timeframe=${normalized}`;
+            
+            addSSELog(`Opening EventSource: ${url}`, 'info');
+            
+            eventSource = new EventSource(url, { withCredentials: true });
+            
+            eventSource.addEventListener('open', () => {
+                addSSELog('✅ Connection opened successfully!', 'success');
+                result.innerHTML = `<div class="status success">
+                    ✅ Connected! Listening for events...
+                </div>`;
+            });
+            
+            eventSource.addEventListener('snapshot', (e) => {
+                snapshotCount++;
+                updateMetrics();
+                const data = JSON.parse(e.data);
+                addSSELog(`📦 Snapshot: ${data.candles.length} candles`, 'success');
+            });
+            
+            eventSource.addEventListener('tick', (e) => {
+                tickCount++;
+                updateMetrics();
+                const data = JSON.parse(e.data);
+                addSSELog(`⏱️ Tick: ${data.candle[0]} | Close: ${data.candle[4]}`, 'info');
+            });
+            
+            eventSource.addEventListener('candle', (e) => {
+                candleCount++;
+                updateMetrics();
+                const data = JSON.parse(e.data);
+                addSSELog(`🕯️ Candle Complete: ${data.candle[0]} | OHLC: ${data.candle[1]},${data.candle[2]},${data.candle[3]},${data.candle[4]}`, 'success');
+            });
+            
+            eventSource.addEventListener('error', (e) => {
+                addSSELog('❌ Connection error', 'error');
+                if (eventSource.readyState === EventSource.CLOSED) {
+                    addSSELog('Connection closed', 'error');
+                    stopSSEConnection();
+                }
+            });
+        }
+
+        function updateMetrics() {
+            document.getElementById('snapshot-count').textContent = snapshotCount;
+            document.getElementById('tick-count').textContent = tickCount;
+            document.getElementById('candle-count').textContent = candleCount;
+        }
+
+        function stopSSEConnection() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+                addSSELog('Connection closed by user', 'info');
+                
+                const result = document.getElementById('sse-result');
+                result.innerHTML = `<div class="status info">
+                    🛑 Connection stopped. Total events: ${snapshotCount + tickCount + candleCount}
+                </div>`;
+            }
+            
+            if (connectionTimer) {
+                clearInterval(connectionTimer);
+                connectionTimer = null;
+            }
+        }
+    </script>
+</body>
+</html>

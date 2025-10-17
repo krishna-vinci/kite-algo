@@ -1,0 +1,597 @@
+"""
+Position Protection Engine - Core Implementation
+Phase 1: Index-based monitoring with bracket stoploss support
+
+Architecture follows proven AlertsEngine pattern:
+- Single-process, no multi-threading
+- 500ms evaluation loop with in-memory cache
+- DB refresh every 5 seconds
+- Async order execution with idempotency
+"""
+
+import asyncio
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+from uuid import UUID
+
+from broker_api.kite_orders import OrdersService, PlaceOrderRequest, TransactionType, Variety, Product, OrderType, Validity, Exchange
+from broker_api.websocket_manager import WebSocketManager
+from database import Database
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# POSITION PROTECTION ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PositionProtectionEngine:
+    """
+    Main controller for position protection system.
+    
+    Monitors positions and executes exits based on:
+    - Index price movements (with two-way bracket support)
+    - Premium price movements (Phase 2+)
+    - Hybrid logic (Phase 4+)
+    - Combined premium P&L (Phase 4+)
+    
+    Phase 1 Focus: Index-based monitoring only
+    """
+    
+    def __init__(
+        self,
+        db: Database,
+        ws_manager: WebSocketManager,
+        orders_service: OrdersService,
+        app: Any,
+        interval_ms: int = 500,
+        refresh_interval_sec: int = 5
+    ):
+        """
+        Initialize the engine.
+        
+        Args:
+            db: Async database connection
+            ws_manager: WebSocket manager for price feeds
+            orders_service: Order placement service
+            app: FastAPI app instance (for state access)
+            interval_ms: Evaluation loop interval (default 500ms)
+            refresh_interval_sec: DB refresh interval (default 5s)
+        """
+        self.db = db
+        self.ws_manager = ws_manager
+        self.orders_service = orders_service
+        self.app = app
+        self.interval_ms = interval_ms
+        self.refresh_interval_sec = refresh_interval_sec
+        
+        # In-memory cache of active strategies
+        self._strategies: Dict[str, Dict] = {}
+        self._last_db_refresh = 0
+        
+        # Task management
+        self._task: Optional[asyncio.Task] = None
+        self._running = False
+        
+        # Statistics
+        self._stats = {
+            "evaluations": 0,
+            "triggers": 0,
+            "orders_placed": 0,
+            "errors": 0
+        }
+        
+        logger.info(
+            f"PositionProtectionEngine initialized "
+            f"(interval={interval_ms}ms, refresh={refresh_interval_sec}s)"
+        )
+    
+    def start(self):
+        """Start the evaluation loop"""
+        if self._running:
+            logger.warning("Engine already running")
+            return
+        
+        self._running = True
+        self._task = asyncio.create_task(self._evaluation_loop())
+        logger.info("PositionProtectionEngine started")
+    
+    async def stop(self):
+        """Stop the evaluation loop"""
+        if not self._running:
+            return
+        
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        
+        logger.info("PositionProtectionEngine stopped")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # MAIN EVALUATION LOOP
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    async def _evaluation_loop(self):
+        """
+        Main evaluation loop (runs every 500ms).
+        
+        Pattern:
+        1. Get latest prices from WebSocket
+        2. Refresh strategies from DB (every 5s)
+        3. Evaluate each active strategy
+        4. Sleep for interval
+        """
+        logger.info("Evaluation loop starting...")
+        
+        while self._running:
+            try:
+                loop_start = asyncio.get_event_loop().time()
+                
+                # 1. Refresh strategies from DB if needed
+                await self._refresh_strategies_if_needed()
+                
+                # 2. Get latest price data from WebSocket
+                latest_ticks = self.ws_manager.latest_ticks
+                
+                # 3. Evaluate each active strategy
+                for strategy_id, strategy in list(self._strategies.items()):
+                    try:
+                        await self._evaluate_strategy(strategy, latest_ticks)
+                    except Exception as e:
+                        logger.error(
+                            f"Error evaluating strategy {strategy_id}: {e}",
+                            exc_info=True
+                        )
+                        self._stats["errors"] += 1
+                
+                self._stats["evaluations"] += 1
+                
+                # 4. Sleep for remaining interval
+                elapsed_ms = (asyncio.get_event_loop().time() - loop_start) * 1000
+                sleep_ms = max(0, self.interval_ms - elapsed_ms)
+                
+                if sleep_ms > 0:
+                    await asyncio.sleep(sleep_ms / 1000)
+                else:
+                    logger.warning(
+                        f"Evaluation took {elapsed_ms:.1f}ms "
+                        f"(exceeds {self.interval_ms}ms interval)"
+                    )
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in evaluation loop: {e}", exc_info=True)
+                await asyncio.sleep(1)  # Back off on error
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # STRATEGY LOADING
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    async def _refresh_strategies_if_needed(self):
+        """Refresh strategies from DB every N seconds"""
+        now = asyncio.get_event_loop().time()
+        
+        if now - self._last_db_refresh < self.refresh_interval_sec:
+            return
+        
+        await self._load_active_strategies()
+        self._last_db_refresh = now
+    
+    async def _load_active_strategies(self):
+        """Load all active/partial strategies from database"""
+        try:
+            query = """
+                SELECT 
+                    id, name, strategy_type, monitoring_mode, status,
+                    index_instrument_token, index_tradingsymbol, index_exchange,
+                    index_upper_stoploss, index_lower_stoploss,
+                    stoploss_order_type, stoploss_limit_offset,
+                    trailing_mode, trailing_distance, trailing_unit,
+                    trailing_lock_profit, trailing_highest_price,
+                    trailing_current_level, trailing_activated,
+                    position_snapshot, remaining_quantities,
+                    placed_orders, stoploss_executed,
+                    last_evaluated_price, last_evaluated_at,
+                    created_at, updated_at
+                FROM position_protection_strategies
+                WHERE status IN ('active', 'partial')
+                ORDER BY created_at DESC
+            """
+            
+            rows = await self.db.fetch_all(query)
+            
+            # Update in-memory cache
+            new_strategies = {}
+            for row in rows:
+                strategy_id = str(row['id'])
+                new_strategies[strategy_id] = dict(row)
+            
+            # Detect new strategies for WebSocket subscription
+            new_tokens = set()
+            for strategy_id, strategy in new_strategies.items():
+                if strategy_id not in self._strategies:
+                    # New strategy - subscribe to index token
+                    if strategy['index_instrument_token']:
+                        new_tokens.add(strategy['index_instrument_token'])
+            
+            # Subscribe to new tokens
+            if new_tokens:
+                self.ws_manager.subscribe(list(new_tokens))
+                logger.info(f"Subscribed to {len(new_tokens)} new index tokens")
+            
+            self._strategies = new_strategies
+            logger.debug(f"Loaded {len(self._strategies)} active strategies")
+            
+        except Exception as e:
+            logger.error(f"Failed to load strategies: {e}", exc_info=True)
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # STRATEGY EVALUATION
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    async def _evaluate_strategy(self, strategy: Dict, latest_ticks: Dict[int, Dict]):
+        """
+        Evaluate a single strategy.
+        
+        Phase 1: Index mode only
+        - Check bracket stoploss (upper and lower boundaries)
+        - Update trailing stoploss if configured
+        - Execute exits when triggered
+        """
+        strategy_id = str(strategy['id'])
+        monitoring_mode = strategy['monitoring_mode']
+        
+        # Phase 1: Only handle index mode
+        if monitoring_mode != 'index':
+            return
+        
+        # Check index-based triggers
+        await self._check_index_triggers(strategy, latest_ticks)
+    
+    async def _check_index_triggers(self, strategy: Dict, latest_ticks: Dict[int, Dict]):
+        """
+        Check index-based bracket stoploss.
+        
+        Supports TWO-WAY protection:
+        - Upper boundary: Exit if index >= upper_stoploss (protects from rally)
+        - Lower boundary: Exit if index <= lower_stoploss (protects from crash)
+        
+        For market-neutral strategies (straddles/strangles), both should be set.
+        For directional strategies, set only the relevant boundary.
+        """
+        index_token = strategy.get('index_instrument_token')
+        if not index_token:
+            return
+        
+        # Check if we have price data for this index
+        if index_token not in latest_ticks:
+            logger.debug(
+                f"Strategy {strategy['id']}: No price data for index token {index_token}"
+            )
+            return
+        
+        current_index_price = latest_ticks[index_token]['last_price']
+        strategy_id = str(strategy['id'])
+        
+        # Check UPPER boundary (protects from upward rally)
+        upper_sl = strategy.get('index_upper_stoploss')
+        if upper_sl is not None and current_index_price >= upper_sl:
+            logger.info(
+                f"Strategy {strategy_id}: Index UPPER stoploss triggered! "
+                f"Index={current_index_price:.2f} >= {upper_sl:.2f}"
+            )
+            await self._execute_exit(
+                strategy,
+                "index_upper_stoploss_triggered",
+                current_index_price
+            )
+            return
+        
+        # Check LOWER boundary (protects from downward crash)
+        lower_sl = strategy.get('index_lower_stoploss')
+        if lower_sl is not None and current_index_price <= lower_sl:
+            logger.info(
+                f"Strategy {strategy_id}: Index LOWER stoploss triggered! "
+                f"Index={current_index_price:.2f} <= {lower_sl:.2f}"
+            )
+            await self._execute_exit(
+                strategy,
+                "index_lower_stoploss_triggered",
+                current_index_price
+            )
+            return
+        
+        # Update last evaluated price
+        await self._update_last_evaluated(strategy_id, current_index_price)
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ORDER EXECUTION
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    async def _execute_exit(
+        self,
+        strategy: Dict,
+        trigger_reason: str,
+        trigger_price: float
+    ):
+        """
+        Execute exit orders for all positions in the strategy.
+        
+        Uses idempotency to prevent duplicate orders.
+        Phase 1: MARKET orders only
+        """
+        strategy_id = str(strategy['id'])
+        
+        # Check if already executed
+        if strategy.get('stoploss_executed'):
+            logger.info(f"Strategy {strategy_id}: Already executed, skipping")
+            return
+        
+        correlation_id = str(uuid.uuid4())
+        position_snapshot = strategy.get('position_snapshot', [])
+        
+        if not position_snapshot:
+            logger.warning(f"Strategy {strategy_id}: No positions to exit")
+            return
+        
+        logger.info(
+            f"Strategy {strategy_id}: Executing exit for {len(position_snapshot)} positions "
+            f"(reason={trigger_reason}, price={trigger_price:.2f})"
+        )
+        
+        # Get KiteConnect instance from app state
+        kite = await self._get_kite_instance()
+        if not kite:
+            logger.error("Failed to get KiteConnect instance, cannot place orders")
+            await self._log_event(
+                strategy_id,
+                "error",
+                error_message="Failed to get KiteConnect instance",
+                meta={"trigger_reason": trigger_reason}
+            )
+            return
+        
+        orders_placed = []
+        errors = []
+        
+        # Place exit order for each position
+        for position in position_snapshot:
+            try:
+                # Determine opposite transaction type for exit
+                exit_transaction = (
+                    TransactionType.BUY if position['transaction_type'] == 'SELL'
+                    else TransactionType.SELL
+                )
+                
+                # Generate idempotency key
+                idempotency_key = f"strategy_{strategy_id[:8]}_{trigger_reason}_{position['instrument_token']}"
+                
+                # Create order request
+                order_req = PlaceOrderRequest(
+                    exchange=Exchange.NFO,
+                    tradingsymbol=position['tradingsymbol'],
+                    transaction_type=exit_transaction,
+                    variety=Variety.REGULAR,
+                    product=Product[position['product']],
+                    order_type=OrderType.MARKET,
+                    quantity=position['quantity'],
+                    validity=Validity.DAY
+                )
+                
+                # Place order using OrdersService
+                order_response = await self.orders_service.place_order(
+                    kite=kite,
+                    req=order_req,
+                    corr_id=correlation_id,
+                    idempotency_key=idempotency_key,
+                    session_id="system"
+                )
+                
+                order_id = order_response.order_id
+                
+                orders_placed.append({
+                    "order_id": order_id,
+                    "instrument_token": position['instrument_token'],
+                    "tradingsymbol": position['tradingsymbol'],
+                    "quantity": position['quantity'],
+                    "transaction_type": exit_transaction.value,
+                    "idempotency_key": idempotency_key,
+                    "correlation_id": correlation_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+                
+                logger.info(
+                    f"Order placed: {order_id} for {position['tradingsymbol']} "
+                    f"({exit_transaction.value} {position['quantity']})"
+                )
+                
+                # Log order placed event
+                await self._log_event(
+                    strategy_id,
+                    "order_placed",
+                    order_id=order_id,
+                    instrument_token=position['instrument_token'],
+                    quantity_affected=position['quantity'],
+                    trigger_price=trigger_price,
+                    meta={
+                        "trigger_reason": trigger_reason,
+                        "tradingsymbol": position['tradingsymbol'],
+                        "correlation_id": correlation_id
+                    }
+                )
+                
+            except Exception as e:
+                error_msg = f"Failed to place order for {position['tradingsymbol']}: {e}"
+                logger.error(error_msg, exc_info=True)
+                errors.append({
+                    "tradingsymbol": position['tradingsymbol'],
+                    "error": str(e),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+        
+        # Update strategy in database
+        await self._update_strategy_after_exit(
+            strategy_id,
+            trigger_reason,
+            trigger_price,
+            orders_placed,
+            errors
+        )
+        
+        # Update stats
+        self._stats["triggers"] += 1
+        self._stats["orders_placed"] += len(orders_placed)
+        
+        logger.info(
+            f"Strategy {strategy_id}: Exit complete "
+            f"({len(orders_placed)} orders placed, {len(errors)} errors)"
+        )
+    
+    async def _update_strategy_after_exit(
+        self,
+        strategy_id: str,
+        trigger_reason: str,
+        trigger_price: float,
+        orders_placed: List[Dict],
+        errors: List[Dict]
+    ):
+        """Update strategy status and order history after exit execution"""
+        try:
+            query = """
+                UPDATE position_protection_strategies
+                SET 
+                    status = 'triggered',
+                    stoploss_executed = TRUE,
+                    placed_orders = placed_orders || $1::jsonb,
+                    execution_errors = execution_errors || $2::jsonb,
+                    last_evaluated_price = $3,
+                    last_evaluated_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = $4
+            """
+            
+            import json
+            await self.db.execute(
+                query,
+                json.dumps(orders_placed),
+                json.dumps(errors),
+                trigger_price,
+                UUID(strategy_id)
+            )
+            
+            # Log trigger event
+            await self._log_event(
+                strategy_id,
+                trigger_reason,
+                trigger_price=trigger_price,
+                meta={
+                    "orders_placed": len(orders_placed),
+                    "errors": len(errors)
+                }
+            )
+            
+            # Remove from in-memory cache (will be reloaded as 'triggered' on next refresh)
+            if strategy_id in self._strategies:
+                del self._strategies[strategy_id]
+            
+        except Exception as e:
+            logger.error(f"Failed to update strategy {strategy_id}: {e}", exc_info=True)
+    
+    async def _update_last_evaluated(self, strategy_id: str, price: float):
+        """Update last evaluated price and timestamp"""
+        try:
+            query = """
+                UPDATE position_protection_strategies
+                SET 
+                    last_evaluated_price = $1,
+                    last_evaluated_at = NOW()
+                WHERE id = $2
+            """
+            await self.db.execute(query, price, UUID(strategy_id))
+        except Exception as e:
+            logger.debug(f"Failed to update last_evaluated for {strategy_id}: {e}")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # EVENT LOGGING
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    async def _log_event(
+        self,
+        strategy_id: str,
+        event_type: str,
+        trigger_price: Optional[float] = None,
+        order_id: Optional[str] = None,
+        instrument_token: Optional[int] = None,
+        quantity_affected: Optional[int] = None,
+        error_message: Optional[str] = None,
+        meta: Optional[Dict] = None
+    ):
+        """Log an event to strategy_events table"""
+        try:
+            query = """
+                INSERT INTO strategy_events (
+                    strategy_id, event_type, trigger_price,
+                    order_id, instrument_token, quantity_affected,
+                    error_message, meta, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            """
+            
+            import json
+            await self.db.execute(
+                query,
+                UUID(strategy_id),
+                event_type,
+                trigger_price,
+                order_id,
+                instrument_token,
+                quantity_affected,
+                error_message,
+                json.dumps(meta) if meta else None
+            )
+        except Exception as e:
+            logger.error(f"Failed to log event: {e}", exc_info=True)
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # UTILITIES
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    async def _get_kite_instance(self):
+        """Get system KiteConnect instance from app state"""
+        try:
+            from broker_api.broker_api import get_system_access_token
+            from database import SessionLocal
+            from kiteconnect import KiteConnect
+            from broker_api.kite_auth import API_KEY
+            
+            db = SessionLocal()
+            try:
+                system_token = get_system_access_token(db)
+                if system_token:
+                    kite = KiteConnect(api_key=API_KEY)
+                    kite.set_access_token(system_token)
+                    return kite
+            finally:
+                db.close()
+        except Exception as e:
+            logger.error(f"Failed to get KiteConnect instance: {e}", exc_info=True)
+        
+        return None
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get engine statistics"""
+        return {
+            "running": self._running,
+            "active_strategies": len(self._strategies),
+            "evaluations": self._stats["evaluations"],
+            "triggers": self._stats["triggers"],
+            "orders_placed": self._stats["orders_placed"],
+            "errors": self._stats["errors"],
+            "interval_ms": self.interval_ms
+        }
