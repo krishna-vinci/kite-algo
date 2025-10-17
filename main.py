@@ -234,6 +234,12 @@ async def combined_lifespan(app: FastAPI):
         # Get the main event loop to pass to the WebSocketManager
         main_event_loop = asyncio.get_event_loop()
         ws_manager = WebSocketManager(api_key=API_KEY, access_token=at, main_event_loop=main_event_loop)
+        
+        # Inject real-time positions service into WebSocket manager
+        from broker_api.kite_orders import realtime_positions_service
+        ws_manager.realtime_positions_service = realtime_positions_service
+        logging.info("Real-time positions service injected into WebSocketManager")
+        
         ws_manager.start()
         logging.info("WebSocketManager started.")
         # Expose ws_manager for routers to access latest ticks
@@ -304,6 +310,29 @@ async def combined_lifespan(app: FastAPI):
             logging.info("PositionProtectionEngine started (500ms interval)")
         except Exception as e:
             logging.error("Failed to start PositionProtectionEngine: %s", e, exc_info=True)
+        
+        # Initialize Phase 3: StrikeSelector and PositionBuilder
+        try:
+            from strategies.strike_selector import StrikeSelector, PositionBuilder
+            from broker_api.instruments_repository import InstrumentsRepository
+            from database import get_db
+            
+            # Get OptionsSessionManager from app state
+            osm = getattr(app.state, "osm", None)
+            if osm:
+                db_session = next(get_db())
+                instruments_repo = InstrumentsRepository(db=db_session)
+                
+                strike_selector = StrikeSelector(osm, instruments_repo)
+                position_builder = PositionBuilder(strike_selector, instruments_repo)
+                
+                app.state.strike_selector = strike_selector
+                app.state.position_builder = position_builder
+                logging.info("Phase 3: StrikeSelector and PositionBuilder initialized")
+            else:
+                logging.warning("OptionsSessionManager not available, Phase 3 components not initialized")
+        except Exception as e:
+            logging.error("Failed to initialize Phase 3 components: %s", e, exc_info=True)
 
         # Start alert dispatcher (WS text messages) and 2s polling fallback
         alerts_ntfy_url = os.getenv("KITE_ALERTS_NTFY_URL") or os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"

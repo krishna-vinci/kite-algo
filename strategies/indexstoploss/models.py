@@ -136,26 +136,119 @@ class TrailingConfig(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PREMIUM MONITORING MODELS (Phase 2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PremiumThresholdConfig(BaseModel):
+    """Per-position premium monitoring configuration"""
+    tradingsymbol: str
+    transaction_type: Literal["BUY", "SELL"]
+    entry_price: float
+    
+    # Exit thresholds
+    stoploss_price: Optional[float] = None
+    target_price: Optional[float] = None
+    
+    # Trailing config (per-position)
+    trailing_mode: Optional[TrailingMode] = TrailingMode.NONE
+    trailing_distance: Optional[float] = None
+    trailing_lock_profit: Optional[float] = None
+    
+    # Runtime tracking (updated by engine)
+    highest_premium: Optional[float] = None  # For BUY trailing
+    lowest_premium: Optional[float] = None   # For SELL trailing
+    current_trailing_sl: Optional[float] = None
+    activated: bool = False
+    
+    @model_validator(mode='after')
+    def validate_thresholds(self):
+        """Ensure at least one exit threshold is set"""
+        if self.stoploss_price is None and self.target_price is None:
+            if self.trailing_mode == TrailingMode.NONE:
+                raise ValueError("Must provide stoploss_price, target_price, or enable trailing")
+        return self
+    
+    @model_validator(mode='after')
+    def validate_trailing(self):
+        """Validate trailing configuration"""
+        if self.trailing_mode == TrailingMode.CONTINUOUS:
+            if self.trailing_distance is None:
+                raise ValueError("trailing_distance required for continuous trailing")
+        return self
+
+
+class PremiumMonitoringState(BaseModel):
+    """Runtime state for premium monitoring (response only)"""
+    instrument_token: int
+    tradingsymbol: str
+    transaction_type: Literal["BUY", "SELL"]
+    entry_price: float
+    current_ltp: Optional[float] = None
+    current_pnl: Optional[float] = None
+    stoploss_price: Optional[float] = None
+    target_price: Optional[float] = None
+    trailing_activated: bool = False
+    current_trailing_sl: Optional[float] = None
+    distance_to_sl: Optional[float] = None
+    distance_to_target: Optional[float] = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMBINED PREMIUM MODELS (Phase 4)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CombinedPremiumEntryType(str, Enum):
+    """Entry type for combined premium strategies"""
+    CREDIT = "credit"  # SELL strategies (collect premium)
+    DEBIT = "debit"    # BUY strategies (pay premium)
+
+
+class CombinedPremiumLevel(BaseModel):
+    """Partial exit level for combined premium mode"""
+    level_number: int
+    profit_points: float  # Exit when net profit reaches this
+    exit_percent: int  # Percentage of positions to exit (1-100)
+    executed: bool = False
+    execution_time: Optional[datetime] = None
+
+
+class CombinedPremiumState(BaseModel):
+    """Runtime state for combined premium monitoring (response only)"""
+    entry_type: str  # 'credit' or 'debit'
+    initial_net_premium: float
+    current_net_premium: float
+    net_pnl: float  # Profit/loss in premium points
+    net_pnl_rupees: float  # Profit/loss in rupees
+    best_net_premium: Optional[float] = None
+    profit_target: Optional[float] = None
+    trailing_enabled: bool = False
+    trailing_sl: Optional[float] = None
+    distance_to_sl: Optional[float] = None
+    distance_to_target: Optional[float] = None
+    levels: List[CombinedPremiumLevel] = []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # REQUEST/RESPONSE MODELS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CreateProtectionRequest(BaseModel):
-    """Request to create a new protection strategy (Phase 1: Index mode only)"""
+    """Request to create a new protection strategy (Phase 2: Index + Premium modes)"""
     
     # Metadata
     name: Optional[str] = None
     strategy_type: StrategyType = StrategyType.MANUAL
     notes: Optional[str] = None
     
-    # Monitoring mode
-    monitoring_mode: MonitoringMode = MonitoringMode.INDEX
+    # Monitoring mode (Phase 2: Support premium mode)
+    monitoring_mode: MonitoringMode
     
-    # Index monitoring config (required for Phase 1)
-    index_instrument_token: int
+    # Index monitoring config (required for index/hybrid modes)
+    index_instrument_token: Optional[int] = None
     index_tradingsymbol: str = "NIFTY 50"
     index_exchange: str = "NSE"
     
-    # Bracket stoploss (at least one required)
+    # Bracket stoploss (at least one required for index mode)
     index_upper_stoploss: Optional[float] = Field(
         default=None, 
         description="Exit if index >= this level (protects from rally)"
@@ -168,39 +261,83 @@ class CreateProtectionRequest(BaseModel):
     stoploss_order_type: OrderTypeEnum = OrderTypeEnum.MARKET
     stoploss_limit_offset: Optional[float] = None
     
-    # Trailing config (optional)
+    # Index trailing config (optional)
     trailing_mode: Optional[TrailingMode] = TrailingMode.NONE
     trailing_distance: Optional[float] = None
     trailing_unit: Literal["points", "percent"] = "points"
     trailing_step_size: Optional[float] = None
     trailing_lock_profit: Optional[float] = None
     
+    # Premium monitoring config (Phase 2 - NEW)
+    premium_thresholds: Optional[Dict[str, PremiumThresholdConfig]] = None
+    
+    # Hybrid mode config (Phase 2 - NEW)
+    exit_logic: Optional[ExitLogic] = ExitLogic.ANY
+    
+    # Combined Premium config (Phase 4 - NEW)
+    combined_premium_entry_type: Optional[CombinedPremiumEntryType] = None
+    combined_premium_profit_target: Optional[float] = None
+    combined_premium_trailing_enabled: bool = False
+    combined_premium_trailing_distance: Optional[float] = None
+    combined_premium_trailing_lock_profit: Optional[float] = None
+    combined_premium_levels: Optional[List[CombinedPremiumLevel]] = None
+    
     # Position identification
     position_filter: PositionFilter
     
     @model_validator(mode='after')
-    def validate_index_mode(self):
-        """Phase 1: Validate index mode requirements"""
-        if self.monitoring_mode != MonitoringMode.INDEX:
-            raise ValueError("Phase 1 only supports INDEX monitoring mode")
+    def validate_mode_config(self):
+        """Validate configuration based on monitoring mode"""
+        if self.monitoring_mode == MonitoringMode.INDEX:
+            if self.index_instrument_token is None:
+                raise ValueError("index_instrument_token required for INDEX mode")
+            if self.index_upper_stoploss is None and self.index_lower_stoploss is None:
+                raise ValueError("At least one of index_upper_stoploss or index_lower_stoploss required for INDEX mode")
         
-        if self.index_upper_stoploss is None and self.index_lower_stoploss is None:
-            raise ValueError("At least one of index_upper_stoploss or index_lower_stoploss required")
+        elif self.monitoring_mode == MonitoringMode.PREMIUM:
+            if not self.premium_thresholds or len(self.premium_thresholds) == 0:
+                raise ValueError("premium_thresholds required for PREMIUM mode")
+        
+        elif self.monitoring_mode == MonitoringMode.HYBRID:
+            # Hybrid requires BOTH index and premium config
+            if self.index_instrument_token is None:
+                raise ValueError("index_instrument_token required for HYBRID mode")
+            if self.index_upper_stoploss is None and self.index_lower_stoploss is None:
+                raise ValueError("At least one index stoploss required for HYBRID mode")
+            if not self.premium_thresholds or len(self.premium_thresholds) == 0:
+                raise ValueError("premium_thresholds required for HYBRID mode")
+        
+        elif self.monitoring_mode == MonitoringMode.COMBINED_PREMIUM:
+            # Combined premium requires index bracket stops and entry type
+            if self.index_instrument_token is None:
+                raise ValueError("index_instrument_token required for COMBINED_PREMIUM mode")
+            if self.index_upper_stoploss is None and self.index_lower_stoploss is None:
+                raise ValueError("At least one index stoploss required for COMBINED_PREMIUM mode (bracket protection)")
+            if self.combined_premium_entry_type is None:
+                raise ValueError("combined_premium_entry_type required for COMBINED_PREMIUM mode")
+            # At least one exit condition required
+            if not (self.combined_premium_profit_target or 
+                    self.combined_premium_trailing_enabled or 
+                    (self.combined_premium_levels and len(self.combined_premium_levels) > 0)):
+                raise ValueError("At least one exit condition required: profit_target, trailing, or levels")
         
         return self
 
 
 class UpdateProtectionRequest(BaseModel):
-    """Request to update an existing strategy"""
+    """Request to update an existing strategy (Phase 2: Add premium updates)"""
     
-    # Allow updating stoploss levels
+    # Allow updating index stoploss levels
     index_upper_stoploss: Optional[float] = None
     index_lower_stoploss: Optional[float] = None
     
-    # Allow updating trailing config
+    # Allow updating index trailing config
     trailing_mode: Optional[TrailingMode] = None
     trailing_distance: Optional[float] = None
     trailing_lock_profit: Optional[float] = None
+    
+    # Allow updating premium thresholds (Phase 2)
+    premium_thresholds: Optional[Dict[str, PremiumThresholdConfig]] = None
     
     # Allow updating metadata
     name: Optional[str] = None
@@ -214,7 +351,7 @@ class StatusUpdateRequest(BaseModel):
 
 
 class ProtectionStrategyResponse(BaseModel):
-    """Response with strategy details"""
+    """Response with strategy details (Phase 2: Add premium monitoring)"""
     
     # Core fields
     strategy_id: UUID
@@ -229,11 +366,17 @@ class ProtectionStrategyResponse(BaseModel):
     index_upper_stoploss: Optional[float] = None
     index_lower_stoploss: Optional[float] = None
     
-    # Trailing state
+    # Index trailing state
     trailing_mode: Optional[str] = None
     trailing_distance: Optional[float] = None
     trailing_activated: bool = False
     trailing_current_level: Optional[float] = None
+    
+    # Premium monitoring (Phase 2 - NEW)
+    premium_monitoring: Optional[Dict[str, PremiumMonitoringState]] = None
+    
+    # Combined premium monitoring (Phase 4 - NEW)
+    combined_premium_state: Optional[CombinedPremiumState] = None
     
     # Position snapshot
     positions_captured: int
