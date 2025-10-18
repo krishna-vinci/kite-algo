@@ -100,22 +100,74 @@ class StrikeSelector:
         
         # Build mini chain from snapshot rows
         rows = expiry_data.get('rows', [])
-        mini_chain_rows = []
+        formatted_strikes = []
         
         for row in rows:
-            if row['strike'] in window_strikes:
-                mini_chain_rows.append(row)
+            if row['strike'] not in window_strikes:
+                continue
+                
+            # Transform CE side
+            ce_data = None
+            if row.get('CE'):
+                ce = row['CE']
+                # Get lot size from instruments repo using token
+                lot_size = self.repo.get_lot_size(ce.get('token'))
+                if not lot_size:
+                    # Fallback defaults based on underlying
+                    lot_size = 50 if underlying == 'NIFTY' else 15
+                
+                ce_data = {
+                    "instrument_token": ce.get('token'),
+                    "tradingsymbol": ce.get('tsym'),
+                    "ltp": ce.get('ltp') or 0,
+                    "lot_size": lot_size,
+                    "greeks": {
+                        "delta": ce.get('delta') or 0,
+                        "gamma": ce.get('gamma') or 0,
+                        "theta": ce.get('theta') or 0,
+                        "vega": ce.get('vega') or 0,
+                        "iv": ce.get('iv') or 0
+                    }
+                }
+            
+            # Transform PE side
+            pe_data = None
+            if row.get('PE'):
+                pe = row['PE']
+                # Get lot size from instruments repo using token
+                lot_size = self.repo.get_lot_size(pe.get('token'))
+                if not lot_size:
+                    # Fallback defaults based on underlying
+                    lot_size = 50 if underlying == 'NIFTY' else 15
+                
+                pe_data = {
+                    "instrument_token": pe.get('token'),
+                    "tradingsymbol": pe.get('tsym'),
+                    "ltp": pe.get('ltp') or 0,
+                    "lot_size": lot_size,
+                    "greeks": {
+                        "delta": pe.get('delta') or 0,
+                        "gamma": pe.get('gamma') or 0,
+                        "theta": pe.get('theta') or 0,
+                        "vega": pe.get('vega') or 0,
+                        "iv": pe.get('iv') or 0
+                    }
+                }
+            
+            formatted_strikes.append({
+                "strike": row['strike'],
+                "ce": ce_data,
+                "pe": pe_data,
+                "is_atm": row['strike'] == center_strike
+            })
         
         return {
             "underlying": underlying,
             "expiry": expiry_str,
-            "spot_ltp": spot_ltp,
+            "spot_price": spot_ltp,
             "atm_strike": center_strike,
-            "forward": expiry_data.get('forward'),
-            "sigma_expiry": expiry_data.get('sigma_expiry'),
-            "strikes": window_strikes,
-            "rows": mini_chain_rows,
-            "updated_at": snapshot.get('updated_at')
+            "strikes": formatted_strikes,
+            "timestamp": snapshot.get('updated_at')
         }
     
     def find_strike_by_delta(
@@ -358,6 +410,78 @@ class PositionBuilder:
         self.selector = strike_selector
         self.repo = instruments_repo
     
+    async def build_position_plan_from_strikes(
+        self,
+        underlying: str,
+        expiry: date,
+        strategy_type: str,
+        selected_strikes: List[Dict[str, Any]],
+        protection_config: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Create a position building plan from manually selected strikes.
+        
+        Args:
+            underlying: Index symbol
+            expiry: Target expiry
+            strategy_type: Strategy type
+            selected_strikes: List of manually selected strikes with lots
+            protection_config: Protection strategy configuration
+        
+        Returns:
+            Complete position plan with orders and protection setup
+        """
+        # Build order plan from selected strikes
+        orders = []
+        total_premium = 0
+        
+        for strike in selected_strikes:
+            qty = strike['lot_size'] * strike['lots']
+            premium = strike['ltp'] * qty
+            
+            # Credit for SELL, debit for BUY
+            if strike['transaction_type'] == 'SELL':
+                total_premium += premium
+            else:
+                total_premium -= premium
+            
+            orders.append({
+                'tradingsymbol': strike['tradingsymbol'],
+                'instrument_token': strike['instrument_token'],
+                'exchange': 'NFO',
+                'transaction_type': strike['transaction_type'],
+                'quantity': qty,
+                'lot_size': strike['lot_size'],
+                'lots': strike['lots'],
+                'product': 'MIS',
+                'order_type': 'MARKET',
+                'price': 0,
+                'strike': strike['strike'],
+                'option_type': strike['option_type'],
+                'estimated_price': strike['ltp']
+            })
+        
+        # Build protection plan
+        protection_plan = None
+        if protection_config:
+            protection_plan = self._build_protection_plan_from_strikes(
+                selected_strikes, protection_config, underlying
+            )
+        
+        return {
+            "plan_type": "position_build",
+            "underlying": underlying,
+            "expiry": expiry.isoformat(),
+            "strategy_type": strategy_type,
+            "orders": orders,
+            "protection_plan": protection_plan,
+            "total_lots": sum(s['lots'] for s in selected_strikes),
+            "estimated_cost": abs(total_premium),
+            "estimated_margin": abs(total_premium) * 0.25,  # Rough estimate
+            "max_profit": total_premium if total_premium > 0 else None,
+            "max_loss": abs(total_premium) if total_premium < 0 else None
+        }
+    
     async def build_position_plan(
         self,
         underlying: str,
@@ -429,6 +553,25 @@ class PositionBuilder:
                 "lot_size": suggestions.get('lot_size', 0),
                 "lots": suggestions.get('recommended_lots', 0)
             }
+        }
+    
+    def _build_protection_plan_from_strikes(
+        self,
+        selected_strikes: List[Dict[str, Any]],
+        protection_config: Dict[str, Any],
+        underlying: str
+    ) -> Optional[Dict[str, Any]]:
+        """Build protection plan from manually selected strikes."""
+        if not protection_config.get('enabled'):
+            return None
+        
+        return {
+            "monitoring_mode": protection_config.get('monitoring_mode', 'index'),
+            "index_tradingsymbol": protection_config.get('index_tradingsymbol'),
+            "index_upper_stoploss": protection_config.get('index_upper_stoploss'),
+            "index_lower_stoploss": protection_config.get('index_lower_stoploss'),
+            "trailing_enabled": protection_config.get('trailing_enabled', False),
+            "trailing_distance": protection_config.get('trailing_distance')
         }
     
     def _build_protection_plan(

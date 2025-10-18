@@ -220,3 +220,122 @@ export interface RealtimePositionsResponse {
 	net: RealtimePosition[];
 	day: RealtimePosition[];
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 3: POSITION BUILDER & OPTION CHAIN MODELS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export interface OptionGreeks {
+	delta: number;
+	gamma: number;
+	theta: number;
+	vega: number;
+	iv: number; // Implied Volatility
+}
+
+export interface OptionSide {
+	instrument_token: number;
+	tradingsymbol: string;
+	ltp: number;
+	lot_size: number;
+	greeks: OptionGreeks;
+}
+
+export interface OptionChainStrike {
+	strike: number;
+	ce: OptionSide | null;
+	pe: OptionSide | null;
+	is_atm: boolean;
+}
+
+export interface MiniChainResponse {
+	underlying: string;
+	expiry: string;
+	spot_price: number;
+	atm_strike: number;
+	strikes: OptionChainStrike[];
+	timestamp: string;
+}
+
+export interface StrikeSuggestion {
+	strategy_type: string;
+	strikes: {
+		ce?: {
+			strike: number;
+			tradingsymbol: string;
+			instrument_token: number;
+			delta: number;
+			ltp: number;
+			lot_size: number;
+		};
+		pe?: {
+			strike: number;
+			tradingsymbol: string;
+			instrument_token: number;
+			delta: number;
+			ltp: number;
+			lot_size: number;
+		};
+	};
+	suggested_lots: number;
+	total_margin_required?: number;
+	max_loss?: number;
+	max_profit?: number;
+	notes: string;
+}
+
+export interface SelectedStrike {
+	instrument_token: number;
+	tradingsymbol: string;
+	strike: number;
+	option_type: 'CE' | 'PE';
+	ltp: number;
+	lot_size: number;
+	delta: number;
+	lots: number; // User-selected lots
+	transaction_type: 'BUY' | 'SELL';
+}
+
+export interface PositionBuildOrder {
+	tradingsymbol: string;
+	instrument_token: number;
+	transaction_type: 'BUY' | 'SELL';
+	quantity: number;
+	lot_size: number;
+	lots: number;
+	estimated_price: number;
+}
+
+export interface PositionBuildPlan {
+	strategy_type: string;
+	underlying: string;
+	expiry: string;
+	orders: PositionBuildOrder[];
+	total_lots: number;
+	estimated_cost: number;
+	estimated_margin: number;
+	max_profit?: number;
+	max_loss?: number;
+	protection_config?: any;
+}
+
+export interface BuildPositionRequest {
+	underlying: string;
+	expiry: string;
+	strategy_type: string;
+	selected_strikes?: SelectedStrike[];  // Manual strike selection
+	target_delta?: number;  // Auto-selection based on delta
+	risk_amount?: number;
+	protection_config?: any;
+	place_orders: boolean;
+}
+
+export interface BuildPositionResponse {
+	mode: 'dry_run' | 'execution';
+	status?: 'success' | 'failed' | 'partial';
+	plan?: PositionBuildPlan;
+	orders_placed?: any[];
+	orders_failed?: any[];
+	strategy_id?: string;
+	message: string;
+}

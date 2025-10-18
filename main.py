@@ -318,7 +318,7 @@ async def combined_lifespan(app: FastAPI):
             from database import get_db
             
             # Get OptionsSessionManager from app state
-            osm = getattr(app.state, "osm", None)
+            osm = getattr(app.state, "options_session_manager", None)
             if osm:
                 db_session = next(get_db())
                 instruments_repo = InstrumentsRepository(db=db_session)

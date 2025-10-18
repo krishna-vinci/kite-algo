@@ -47,19 +47,46 @@ def _get_engine(request: Request):
 
 
 def _get_strike_selector(request: Request):
-    """Get StrikeSelector from app state (Phase 3)"""
-    selector = getattr(request.app.state, "strike_selector", None)
-    if not selector:
-        raise HTTPException(status_code=503, detail="Strike selector not available")
-    return selector
+    """Get or create StrikeSelector from app state (Phase 3)"""
+    if not hasattr(request.app.state, "strike_selector"):
+        # Lazy initialization
+        from strategies.strike_selector import StrikeSelector
+        from broker_api.instruments_repository import InstrumentsRepository
+        from database import get_db
+        
+        # Get OptionsSessionManager (will be created if not exists)
+        osm = getattr(request.app.state, "options_session_manager", None)
+        if not osm:
+            raise HTTPException(
+                status_code=503, 
+                detail="Options session manager not available. Start an options session first."
+            )
+        
+        db_session = next(get_db())
+        instruments_repo = InstrumentsRepository(db=db_session)
+        request.app.state.strike_selector = StrikeSelector(osm, instruments_repo)
+        logger.info("StrikeSelector initialized")
+    
+    return request.app.state.strike_selector
 
 
 def _get_position_builder(request: Request):
-    """Get PositionBuilder from app state (Phase 3)"""
-    builder = getattr(request.app.state, "position_builder", None)
-    if not builder:
-        raise HTTPException(status_code=503, detail="Position builder not available")
-    return builder
+    """Get or create PositionBuilder from app state (Phase 3)"""
+    if not hasattr(request.app.state, "position_builder"):
+        # Lazy initialization - requires StrikeSelector
+        from strategies.strike_selector import PositionBuilder
+        from broker_api.instruments_repository import InstrumentsRepository
+        from database import get_db
+        
+        # Get StrikeSelector (will be created if not exists)
+        strike_selector = _get_strike_selector(request)
+        
+        db_session = next(get_db())
+        instruments_repo = InstrumentsRepository(db=db_session)
+        request.app.state.position_builder = PositionBuilder(strike_selector, instruments_repo)
+        logger.info("PositionBuilder initialized")
+    
+    return request.app.state.position_builder
 
 
 async def _fetch_user_positions(kite: KiteConnect) -> List[dict]:
@@ -761,14 +788,66 @@ class SuggestStrikesRequest(BaseModel):
     risk_amount: Optional[float] = None
 
 
+class SelectedStrikeData(BaseModel):
+    instrument_token: int
+    tradingsymbol: str
+    strike: float
+    option_type: str  # 'CE' or 'PE'
+    ltp: float
+    lot_size: int
+    delta: float
+    lots: int
+    transaction_type: str  # 'BUY' or 'SELL'
+
+
 class BuildPositionRequest(BaseModel):
     underlying: str
     expiry: date
     strategy_type: str
-    target_delta: float = 0.30
+    selected_strikes: Optional[List[SelectedStrikeData]] = None  # Manual selection
+    target_delta: float = 0.30  # Auto-selection based on delta
     risk_amount: Optional[float] = None
     protection_config: Optional[Dict[str, Any]] = None
     place_orders: bool = False  # Dry run by default
+
+
+@router.get("/available-expiries/{underlying}")
+async def get_available_expiries(
+    underlying: str,
+    request: Request
+):
+    """
+    Get available expiry dates for an underlying from active options session.
+    
+    Phase 3: Returns list of expiry dates that have live data.
+    """
+    try:
+        # Get options session manager from app state
+        osm = request.app.state.options_session_manager
+        
+        session = osm.sessions.get(underlying.upper())
+        if not session or not session.snapshot:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No active options session for {underlying}. Start a session first."
+            )
+        
+        snapshot = session.snapshot
+        expiries = snapshot.get('expiries', [])
+        spot_ltp = snapshot.get('spot_ltp')
+        
+        return {
+            "underlying": underlying.upper(),
+            "expiries": expiries,
+            "spot_ltp": spot_ltp,
+            "timestamp": snapshot.get('timestamp')
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get available expiries: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/mini-chain/{underlying}/{expiry}")
@@ -794,8 +873,16 @@ async def get_mini_chain(
             count=count
         )
         
+        # Check if error was returned from strike selector
+        if isinstance(chain_data, dict) and "error" in chain_data:
+            error_msg = chain_data["error"]
+            logger.warning(f"Mini chain error: {error_msg}")
+            raise HTTPException(status_code=404, detail=error_msg)
+        
         return chain_data
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to get mini chain: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -847,15 +934,26 @@ async def build_position(
         builder = _get_position_builder(request)
         engine = _get_engine(request)
         
-        # Build position plan
-        plan = await builder.build_position_plan(
-            underlying=req.underlying.upper(),
-            expiry=req.expiry,
-            strategy_type=req.strategy_type,
-            target_delta=req.target_delta,
-            risk_amount=req.risk_amount,
-            protection_config=req.protection_config
-        )
+        # Build position plan - use manual strikes if provided, otherwise auto-select
+        if req.selected_strikes:
+            # Manual strike selection mode
+            plan = await builder.build_position_plan_from_strikes(
+                underlying=req.underlying.upper(),
+                expiry=req.expiry,
+                strategy_type=req.strategy_type,
+                selected_strikes=[s.model_dump() for s in req.selected_strikes],
+                protection_config=req.protection_config
+            )
+        else:
+            # Auto-selection mode based on delta
+            plan = await builder.build_position_plan(
+                underlying=req.underlying.upper(),
+                expiry=req.expiry,
+                strategy_type=req.strategy_type,
+                target_delta=req.target_delta,
+                risk_amount=req.risk_amount,
+                protection_config=req.protection_config
+            )
         
         if 'error' in plan:
             raise HTTPException(status_code=400, detail=plan['error'])

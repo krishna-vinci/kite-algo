@@ -16,9 +16,11 @@
 	import PositionsTable from './components/dashboard/positions-table.svelte';
 	import StrategyDetailsSheet from './components/strategy-details-sheet.svelte';
 	import StrategyManager from './components/strategy-manager.svelte';
+	import PositionBuilderWizard from './components/position-builder/position-builder-wizard.svelte';
 	
 	import { listStrategies, updateStrategyStatus } from './lib/api';
 	import type { PageData } from './$types';
+	import type { BuildPositionResponse } from './types';
 	
 	interface Props {
 		data: PageData;
@@ -79,6 +81,24 @@
 		console.log('Create strategy clicked');
 		// TODO: Open create strategy sheet
 		toast.info('Create strategy feature will be implemented in Phase 4');
+	}
+	
+	// Handle position builder completion
+	function handlePositionBuilderComplete(response: BuildPositionResponse) {
+		console.log('Position builder complete:', response);
+		
+		// Refresh strategies list
+		refreshStrategies();
+		
+		// Switch to dashboard tab
+		activeTab = 'dashboard';
+		
+		// Show success message with strategy ID if created
+		if (response.strategy_id) {
+			toast.success(`Position built and protected! Strategy ID: ${response.strategy_id}`);
+		} else {
+			toast.success('Position built successfully!');
+		}
 	}
 	
 	onMount(() => {
@@ -173,11 +193,7 @@
 		
 		<!-- Position Builder Tab -->
 		<TabsContent value="builder" class="space-y-6">
-			<div class="text-center py-20 text-muted-foreground">
-				<Hammer class="h-16 w-16 mx-auto mb-4 opacity-50" />
-				<h3 class="text-xl font-semibold mb-2">Position Builder</h3>
-				<p>Delta-based position building wizard will be implemented in Phase 5</p>
-			</div>
+			<PositionBuilderWizard onComplete={handlePositionBuilderComplete} />
 		</TabsContent>
 	</Tabs>
 </div>

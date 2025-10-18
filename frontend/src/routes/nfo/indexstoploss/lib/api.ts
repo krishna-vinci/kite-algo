@@ -9,7 +9,11 @@ import type {
 	ProtectionStrategyResponse,
 	EngineHealthResponse,
 	EventsResponse,
-	RealtimePositionsResponse
+	RealtimePositionsResponse,
+	MiniChainResponse,
+	StrikeSuggestion,
+	BuildPositionRequest,
+	BuildPositionResponse
 } from '../types';
 
 const API_PREFIX = '/strategies';
@@ -22,15 +26,13 @@ export async function listStrategies(
 	monitoringMode?: string,
 	limit: number = 50
 ): Promise<StrategyListResponse> {
-	const base = getApiBase();
 	const params = new URLSearchParams();
 	
 	if (status) params.append('status', status);
 	if (monitoringMode) params.append('monitoring_mode', monitoringMode);
 	params.append('limit', limit.toString());
 	
-	const url = `${base}${API_PREFIX}/?${params.toString()}`;
-	const response = await fetch(url);
+	const response = await apiFetch(`${API_PREFIX}/?${params.toString()}`);
 	
 	if (!response.ok) {
 		throw new Error(`Failed to fetch strategies: ${response.statusText}`);
@@ -43,9 +45,7 @@ export async function listStrategies(
  * Get detailed information about a specific strategy
  */
 export async function getStrategy(strategyId: string): Promise<ProtectionStrategyResponse> {
-	const base = getApiBase();
-	const url = `${base}${API_PREFIX}/${strategyId}`;
-	const response = await fetch(url);
+	const response = await apiFetch(`${API_PREFIX}/${strategyId}`);
 	
 	if (!response.ok) {
 		throw new Error(`Failed to fetch strategy: ${response.statusText}`);
@@ -58,9 +58,7 @@ export async function getStrategy(strategyId: string): Promise<ProtectionStrateg
  * Get engine health status
  */
 export async function getEngineHealth(): Promise<EngineHealthResponse> {
-	const base = getApiBase();
-	const url = `${base}${API_PREFIX}/health`;
-	const response = await fetch(url);
+	const response = await apiFetch(`${API_PREFIX}/health`);
 	
 	if (!response.ok) {
 		throw new Error(`Failed to fetch engine health: ${response.statusText}`);
@@ -76,9 +74,7 @@ export async function getStrategyEvents(
 	strategyId: string,
 	limit: number = 50
 ): Promise<EventsResponse> {
-	const base = getApiBase();
-	const url = `${base}${API_PREFIX}/${strategyId}/events?limit=${limit}`;
-	const response = await fetch(url);
+	const response = await apiFetch(`${API_PREFIX}/${strategyId}/events?limit=${limit}`);
 	
 	if (!response.ok) {
 		throw new Error(`Failed to fetch events: ${response.statusText}`);
@@ -95,10 +91,7 @@ export async function updateStrategyStatus(
 	status: 'active' | 'paused',
 	reason?: string
 ): Promise<{ status: string; strategy_id: string; message: string }> {
-	const base = getApiBase();
-	const url = `${base}${API_PREFIX}/${strategyId}/status`;
-	
-	const response = await fetch(url, {
+	const response = await apiFetch(`${API_PREFIX}/${strategyId}/status`, {
 		method: 'PATCH',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ status, reason })
@@ -118,10 +111,7 @@ export async function updateStrategyStatus(
 export async function deleteStrategy(
 	strategyId: string
 ): Promise<{ status: string; strategy_id: string }> {
-	const base = getApiBase();
-	const url = `${base}${API_PREFIX}/${strategyId}`;
-	
-	const response = await fetch(url, {
+	const response = await apiFetch(`${API_PREFIX}/${strategyId}`, {
 		method: 'DELETE'
 	});
 	
@@ -152,4 +142,98 @@ export async function getRealtimePositions(): Promise<RealtimePositionsResponse>
 export function buildPositionStreamUrl(): string {
 	const base = getApiBase();
 	return `${base}/broker/positions/stream`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 3: POSITION BUILDER API FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Get available expiry dates for an underlying from active options session
+ */
+export async function getAvailableExpiries(
+	underlying: string
+): Promise<{ underlying: string; expiries: string[]; spot_ltp: number; timestamp: string }> {
+	const response = await apiFetch(`${API_PREFIX}/available-expiries/${underlying}`);
+	
+	if (!response.ok) {
+		const error = await response.json().catch(() => ({ detail: response.statusText }));
+		throw new Error(error.detail || 'Failed to fetch available expiries');
+	}
+	
+	return response.json();
+}
+
+/**
+ * Get mini option chain with live Greeks
+ */
+export async function getMiniChain(
+	underlying: string,
+	expiry: string,
+	centerStrike?: number,
+	count: number = 11
+): Promise<MiniChainResponse> {
+	const params = new URLSearchParams({ count: count.toString() });
+	if (centerStrike) params.append('center_strike', centerStrike.toString());
+	
+	const response = await apiFetch(`${API_PREFIX}/mini-chain/${underlying}/${expiry}?${params.toString()}`);
+	
+	if (!response.ok) {
+		const error = await response.json().catch(() => ({ detail: response.statusText }));
+		throw new Error(error.detail || 'Failed to fetch mini chain');
+	}
+	
+	return response.json();
+}
+
+/**
+ * Get strike suggestions based on delta and strategy type
+ */
+export async function suggestStrikes(
+	underlying: string,
+	expiry: string,
+	strategyType: string,
+	targetDelta: number = 0.30,
+	riskAmount?: number
+): Promise<StrikeSuggestion> {
+	const response = await apiFetch(`${API_PREFIX}/suggest-strikes`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			underlying,
+			expiry,
+			strategy_type: strategyType,
+			target_delta: targetDelta,
+			risk_amount: riskAmount
+		})
+	});
+	
+	if (!response.ok) {
+		const error = await response.json().catch(() => ({ detail: response.statusText }));
+		throw new Error(error.detail || 'Failed to suggest strikes');
+	}
+	
+	return response.json();
+}
+
+/**
+ * Build position with optional protection strategy
+ * If placeOrders is false, returns dry run plan
+ * If placeOrders is true, executes orders and creates protection
+ */
+export async function buildPosition(
+	request: BuildPositionRequest
+): Promise<BuildPositionResponse> {
+	const response = await apiFetch(`${API_PREFIX}/build-position`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(request)
+	});
+	
+	if (!response.ok) {
+		const error = await response.json().catch(() => ({ detail: response.statusText }));
+		throw new Error(error.detail || 'Failed to build position');
+	}
+	
+	return response.json();
 }
