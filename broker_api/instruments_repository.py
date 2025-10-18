@@ -228,3 +228,72 @@ class InstrumentsRepository:
             return strikes[start:end]
         except ValueError:
             return []
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PHASE 3: DELTA-BASED STRIKE SELECTION
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def get_atm_strike(self, underlying: str, current_spot: float, expiry: date) -> Optional[float]:
+        """
+        Calculate ATM strike closest to spot price.
+        
+        Args:
+            underlying: Index symbol (e.g., 'NIFTY')
+            current_spot: Current spot/index price
+            expiry: Target expiry date
+        
+        Returns:
+            ATM strike price, or None if no strikes available
+        """
+        strikes = self.get_distinct_strikes(underlying, expiry)
+        if not strikes:
+            return None
+        return self.nearest_strike(strikes, current_spot)
+    
+    def get_strikes_around_atm(
+        self, 
+        atm_strike: float, 
+        all_strikes: List[float], 
+        count: int = 5
+    ) -> List[float]:
+        """
+        Get N strikes centered around ATM.
+        
+        Args:
+            atm_strike: The ATM strike
+            all_strikes: All available strikes (sorted)
+            count: Total number of strikes to return (default: 5)
+        
+        Returns:
+            List of strikes centered around ATM
+        """
+        if not all_strikes or atm_strike not in all_strikes:
+            return []
+        
+        try:
+            atm_index = all_strikes.index(atm_strike)
+            half = count // 2
+            start = max(0, atm_index - half)
+            end = min(len(all_strikes), atm_index + half + 1)
+            return all_strikes[start:end]
+        except ValueError:
+            return []
+    
+    def get_lot_size(self, instrument_token: int) -> Optional[int]:
+        """
+        Get lot size for an instrument token.
+        
+        Args:
+            instrument_token: Instrument token
+        
+        Returns:
+            Lot size, or None if not found
+        """
+        query = text(
+            """
+            SELECT lot_size FROM kite_instruments
+            WHERE instrument_token = :token LIMIT 1
+            """
+        )
+        result = self.db.execute(query, {"token": instrument_token}).scalar_one_or_none()
+        return result

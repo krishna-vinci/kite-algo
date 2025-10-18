@@ -249,3 +249,42 @@ CREATE TABLE IF NOT EXISTS public.kite_ticker_tickers (
   PRIMARY KEY (instrument_token, source_list)
 );
 
+
+-- =========================================
+-- Historical Data and Watchlists
+-- =========================================
+
+-- Table for historical OHLCV candle data
+CREATE TABLE IF NOT EXISTS public.historical_candles (
+  instrument_token   BIGINT NOT NULL,
+  interval           TEXT NOT NULL,
+  ts                 TIMESTAMPTZ NOT NULL,
+  open               NUMERIC(18,6) NOT NULL,
+  high               NUMERIC(18,6) NOT NULL,
+  low                NUMERIC(18,6) NOT NULL,
+  close              NUMERIC(18,6) NOT NULL,
+  volume             BIGINT,
+  oi                 BIGINT,
+  created_at         TIMESTAMPTZ DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (instrument_token, interval, ts)
+);
+
+-- Index for efficient querying of historical candles
+CREATE INDEX IF NOT EXISTS idx_hist_candles_token_interval_ts
+  ON public.historical_candles (instrument_token, interval, ts DESC);
+
+-- Table for user-specific watchlists
+CREATE TABLE IF NOT EXISTS public.user_watchlists (
+  owner_id           VARCHAR(255) NOT NULL DEFAULT 'default',
+  instrument_token   BIGINT NOT NULL,
+  tradingsymbol      TEXT,
+  name               TEXT,
+  exchange           TEXT,
+  instrument_type    TEXT,
+  PRIMARY KEY (owner_id, instrument_token)
+);
+
+-- Index for user watchlists
+CREATE INDEX IF NOT EXISTS idx_user_watchlists_owner
+  ON public.user_watchlists (owner_id);

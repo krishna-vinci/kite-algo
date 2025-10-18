@@ -138,8 +138,6 @@ load_dotenv()
 
 # API router
 router = APIRouter()
-router.include_router(kite_orders.router)
-router.include_router(options_router.router)
 
 # Pydantic request models
 class TickerRequest(BaseModel):
@@ -349,8 +347,6 @@ class PortfolioHistory(Base):
     percentage_change = Column(Numeric, nullable=False)
 
 # ───────── FASTAPI SETUP ─────────
-app    = FastAPI()
-router = APIRouter()
 
 
 
@@ -1994,6 +1990,9 @@ def clear_historical_data(conn = Depends(get_psql_conn)):
     finally:
         if conn:
             conn.close()
+
+
+
 
 @router.post("/fetch_historical_data")
 async def fetch_historical_data_initial(background_tasks: BackgroundTasks, kite: KiteConnect = Depends(get_kite)):

@@ -1,12 +1,17 @@
 <script lang="ts">
 	import { page } from '$app/stores';
+	import { Sonner } from '$lib/components/ui/sonner';
+	
 	const subNavItems = [
-		{ name: 'Option Chain', href: '/nfo/option-chain' }
+		{ name: 'Option Chain', href: '/nfo/option-chain' },
+		{ name: 'Index Stoploss', href: '/nfo/indexstoploss' },
+		{ name: 'Positions', href: '/nfo/positions' },
+		{ name: 'Charts', href: '/nfo/charts' }
 	];
 </script>
 
 <div class="sub-nav-container border-b">
-	<nav class="sub-nav container flex gap-4">
+	<nav class="sub-nav flex gap-4 px-6">
 		{#each subNavItems as item}
 			<a
 				href={item.href}
@@ -20,6 +25,8 @@
 	</nav>
 </div>
 
-<main class="container py-6">
+<div class="flex flex-col flex-grow px-6 py-6">
 	<slot />
-</main>
+</div>
+
+<Sonner />

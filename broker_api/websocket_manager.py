@@ -6,7 +6,7 @@ from typing import Dict, List, Any, Optional, Tuple, Set
 from kiteconnect import KiteTicker
 from fastapi import WebSocket
 from asyncio import AbstractEventLoop
-from datetime import datetime
+from datetime import datetime, timezone
 import redis.asyncio as redis
 from broker_api.redis_events import get_redis
 
@@ -461,6 +461,12 @@ class WebSocketManager:
             if hasattr(self, 'options_session_manager'):
                 self.options_session_manager.on_ticks(ticks)
 
+            # Update real-time positions with new LTP
+            if hasattr(self, 'realtime_positions_service'):
+                def update_positions():
+                    asyncio.create_task(self._update_realtime_positions(ticks))
+                self.main_event_loop.call_soon_threadsafe(update_positions)
+
             # Merge into pending and let flush loop deliver
             def enqueue():
                 # This runs in main loop
@@ -471,6 +477,29 @@ class WebSocketManager:
             self.main_event_loop.call_soon_threadsafe(enqueue)
         except Exception as e:
             logger.error("Error in on_ticks: %s", e, exc_info=True)
+    
+    async def _update_realtime_positions(self, ticks):
+        """Update real-time positions with new LTP from WebSocket ticks"""
+        try:
+            if not hasattr(self, 'realtime_positions_service'):
+                return
+            
+            # We need to update positions for all active sessions
+            # For now, we'll iterate through position subscribers
+            for session_id in list(self.realtime_positions_service.position_subscribers.keys()):
+                for tick in ticks:
+                    token = tick.get("instrument_token")
+                    last_price = tick.get("last_price")
+                    
+                    if token and last_price:
+                        await self.realtime_positions_service.update_position_ltp(
+                            session_id=session_id,
+                            instrument_token=token,
+                            last_price=last_price,
+                            corr_id="websocket_tick"
+                        )
+        except Exception as e:
+            logger.error(f"Error updating realtime positions: {e}", exc_info=True)
 
     def on_message(self, ws, payload, is_binary):
         """Callback for raw messages; capture alert text messages and enqueue for dispatcher."""
@@ -768,8 +797,8 @@ def update_ticker_data_in_db(tick_data):
                     
                     # Perform calculations
                     change_factor = (change or 0) / 100
-                    new_return_attribution = (return_attribution or 0) + change_factor
-                    new_freefloat_marketcap = (freefloat_marketcap or 0) * (1 + change_factor)
+                    new_return_attribution = float(return_attribution or 0) + change_factor
+                    new_freefloat_marketcap = float(freefloat_marketcap or 0) * (1 + change_factor)
 
                     # Update the database
                     cur.execute(
@@ -795,7 +824,7 @@ async def write_ticks_to_redis_overlay(ticks: List[Dict[str, Any]]):
     try:
         redis_client = get_redis()
         ttl_seconds = int(os.getenv("OVERLAY_TTL_SECONDS", "60"))
-        today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+        today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         
         async with redis_client.pipeline(transaction=False) as pipe:
             for tick in ticks:
@@ -810,7 +839,7 @@ async def write_ticks_to_redis_overlay(ticks: List[Dict[str, Any]]):
                 payload = {
                     "instrument_token": token,
                     "last_price": float(last_price),
-                    "tick_timestamp": int(tick.get("exchange_timestamp", datetime.utcnow()).timestamp() * 1000),
+                    "tick_timestamp": int(tick.get("exchange_timestamp", datetime.now(timezone.utc)).timestamp() * 1000),
                     "source": "ws",
                 }
                 if "change" in tick:

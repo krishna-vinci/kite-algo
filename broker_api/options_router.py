@@ -143,6 +143,9 @@ class SessionsRequest(BaseModel):
     replace: bool = False
 
 
+router = APIRouter(tags=["option-chain"])
+
+
 @router.post(
     "/options/sessions",
     response_model=List[WatchlistEntryModel],

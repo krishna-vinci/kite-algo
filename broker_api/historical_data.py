@@ -27,19 +27,14 @@ def get_historical_data(kite: KiteConnect, instrument_token: int, from_date: dat
             # Convert the 'date' column to datetime objects first.
             dates = pd.to_datetime(df['date'])
 
-            # Robustly handle timezone conversion. The Kite API can return both naive (UTC) and aware timestamps.
-            # This logic checks if the timestamps are naive and only localizes them if they are.
+            # If the timestamps are naive, localize them to IST ('Asia/Kolkata').
             if dates.dt.tz is None:
-                # If naive, we assume UTC as per the API's standard behavior.
-                dates = dates.dt.tz_localize('UTC')
+                dates = dates.dt.tz_localize('Asia/Kolkata')
+            else:
+                # If they are already timezone-aware, ensure they are in IST.
+                dates = dates.dt.tz_convert('Asia/Kolkata')
             
-            # Now that all timestamps are reliably timezone-aware, we can safely convert them to the desired local timezone.
-            df['date'] = dates.dt.tz_convert('Asia/Calcutta')
-
-            # Data Normalization: Correct for the Kite API's off-by-one day timestamp quirk for daily data.
-            # This is a deliberate correction to align the timestamp with the actual trading day's data.
-            if interval == 'day':
-                df['date'] = df['date'] + pd.Timedelta(days=1)
+            df['date'] = dates
             
         return df
     except Exception as e:

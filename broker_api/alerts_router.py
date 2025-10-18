@@ -66,6 +66,8 @@ def _compute_absolute_from_percent(baseline: float, percent: float, comparator: 
     else:
         return b * (1.0 - p / 100.0)
 
+router = APIRouter(tags=["alerts"])
+
 # POST /alerts
 @router.post("")
 async def create_alert(req: Request, body: AlertCreate):

@@ -104,7 +104,7 @@
     closeSSE();
 
     const url = buildOptionsSessionSseUrl(u);
-    eventSource = new EventSource(url);
+    eventSource = new EventSource(url, { withCredentials: true });
     currentStreamUnderlying = u;
 
     eventSource.onmessage = (ev) => {
