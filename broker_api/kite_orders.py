@@ -110,9 +110,11 @@ class PlaceOrderRequest(BaseModel):
     validity_ttl: Optional[int] = None
     disclosed_quantity: Optional[int] = None
     tag: Optional[str] = None
-    tags: Optional[List[str]] = None
     market_protection: Optional[int] = None
     autoslice: Optional[bool] = None
+    iceberg_legs: Optional[int] = Field(None, ge=2, le=10)
+    iceberg_quantity: Optional[int] = Field(None, gt=0)
+    auction_number: Optional[str] = None
     squareoff: Optional[float] = None
     stoploss: Optional[float] = None
     trailing_stoploss: Optional[float] = None
@@ -140,8 +142,8 @@ class PlaceOrderRequest(BaseModel):
     @field_validator('tag')
     def validate_tag(cls, v: Optional[str]) -> Optional[str]:
         if v is not None:
-            if len(v) > 64:
-                raise ValueError("Tag must be 64 characters or less.")
+            if len(v) > 20:
+                raise ValueError("Tag must be 20 characters or less.")
             if not re.match(r"^[A-Za-z0-9:_-]*$", v):
                 raise ValueError("Tag contains invalid characters. Allowed: A-Z, a-z, 0-9, :, _, -")
         return v
@@ -1069,3 +1071,375 @@ async def stream_realtime_positions(
             "X-Accel-Buffering": "no"
         }
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GTT (Good Till Triggered) ORDERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class GTTType(str, Enum):
+    """GTT trigger types"""
+    SINGLE = "single"
+    TWO_LEG = "two-leg"
+
+class GTTStatus(str, Enum):
+    """GTT trigger status"""
+    ACTIVE = "active"
+    TRIGGERED = "triggered"
+    DISABLED = "disabled"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+    DELETED = "deleted"
+
+class GTTOrderType(str, Enum):
+    """GTT only supports LIMIT orders"""
+    LIMIT = "LIMIT"
+
+class GTTCondition(BaseModel):
+    """GTT trigger condition"""
+    exchange: Exchange
+    tradingsymbol: str
+    trigger_values: List[float] = Field(..., min_length=1, max_length=2)
+    last_price: float
+
+    @model_validator(mode='after')
+    def validate_trigger_values(self) -> 'GTTCondition':
+        if len(self.trigger_values) < 1 or len(self.trigger_values) > 2:
+            raise ValueError("trigger_values must contain 1 or 2 values")
+        return self
+
+class GTTOrder(BaseModel):
+    """Single GTT order specification"""
+    exchange: Exchange
+    tradingsymbol: str
+    transaction_type: TransactionType
+    quantity: int = Field(gt=0)
+    order_type: GTTOrderType = GTTOrderType.LIMIT
+    product: Product
+    price: float = Field(gt=0)
+
+class PlaceGTTRequest(BaseModel):
+    """Request to place a GTT"""
+    type: GTTType
+    condition: GTTCondition
+    orders: List[GTTOrder] = Field(..., min_length=1, max_length=2)
+
+    @model_validator(mode='after')
+    def validate_gtt_type(self) -> 'PlaceGTTRequest':
+        if self.type == GTTType.SINGLE:
+            if len(self.condition.trigger_values) != 1:
+                raise ValueError("Single GTT must have exactly 1 trigger value")
+            if len(self.orders) != 1:
+                raise ValueError("Single GTT must have exactly 1 order")
+        elif self.type == GTTType.TWO_LEG:
+            if len(self.condition.trigger_values) != 2:
+                raise ValueError("Two-leg GTT must have exactly 2 trigger values")
+            if len(self.orders) != 2:
+                raise ValueError("Two-leg GTT must have exactly 2 orders")
+        return self
+
+class ModifyGTTRequest(BaseModel):
+    """Request to modify a GTT"""
+    type: GTTType
+    condition: GTTCondition
+    orders: List[GTTOrder] = Field(..., min_length=1, max_length=2)
+
+    @model_validator(mode='after')
+    def validate_gtt_type(self) -> 'ModifyGTTRequest':
+        if self.type == GTTType.SINGLE:
+            if len(self.condition.trigger_values) != 1:
+                raise ValueError("Single GTT must have exactly 1 trigger value")
+            if len(self.orders) != 1:
+                raise ValueError("Single GTT must have exactly 1 order")
+        elif self.type == GTTType.TWO_LEG:
+            if len(self.condition.trigger_values) != 2:
+                raise ValueError("Two-leg GTT must have exactly 2 trigger values")
+            if len(self.orders) != 2:
+                raise ValueError("Two-leg GTT must have exactly 2 orders")
+        return self
+
+class GTTOrderResult(BaseModel):
+    """Result of a triggered GTT order"""
+    model_config = ConfigDict(extra="allow")
+    status: str
+    order_id: Optional[str] = None
+    rejection_reason: Optional[str] = None
+
+class GTTOrderWithResult(BaseModel):
+    """GTT order with execution result"""
+    model_config = ConfigDict(extra="allow")
+    exchange: str
+    tradingsymbol: str
+    product: str
+    order_type: str
+    transaction_type: str
+    quantity: int
+    price: float
+    result: Optional[Dict[str, Any]] = None
+
+class GTTTrigger(BaseModel):
+    """GTT trigger response"""
+    model_config = ConfigDict(extra="allow")
+    id: int
+    user_id: Optional[str] = None
+    parent_trigger: Optional[int] = None
+    type: str
+    created_at: str
+    updated_at: str
+    expires_at: str
+    status: str
+    condition: Dict[str, Any]
+    orders: List[GTTOrderWithResult]
+    meta: Optional[Dict[str, Any]] = None
+
+class PlaceGTTResponse(BaseModel):
+    """Response after placing a GTT"""
+    trigger_id: int
+
+class DeleteGTTResponse(BaseModel):
+    """Response after deleting a GTT"""
+    trigger_id: int
+
+
+# ---------------- GTT Service Layer ----------------
+class GTTService:
+    """Service for GTT operations"""
+    
+    def _log_context(self, corr_id: str, kite: KiteConnect, **kwargs) -> Dict[str, Any]:
+        """Builds a structured log context."""
+        session_id = kite.access_token[-6:] if kite.access_token else "unknown"
+        context = {"correlation_id": corr_id, "session_suffix": session_id}
+        context.update(kwargs)
+        return context
+
+    def _raw_request(self, method: str, url: str, kite: KiteConnect, corr_id: str, **kwargs) -> Any:
+        """Make raw HTTP request to Kite API"""
+        headers = {
+            "X-Kite-Version": "3",
+            "Authorization": f"token {API_KEY}:{kite.access_token}",
+            "X-Correlation-ID": corr_id
+        }
+        if 'json' in kwargs:
+            headers['Content-Type'] = 'application/json'
+
+        log_ctx = self._log_context(corr_id, kite, method=method, url=url)
+        logger.info(f"GTT raw request sent", extra=log_ctx)
+
+        try:
+            resp = requests.request(method, url, headers=headers, **kwargs)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code
+            detail = f"Provider error: {e.response.text}"
+            logger.error(f"GTT request HTTP error", extra={**log_ctx, "status_code": status_code, "detail": detail})
+            if status_code in [400, 404, 409]:
+                raise HTTPException(status_code=status_code, detail=detail)
+            elif status_code in [502, 503, 504]:
+                raise HTTPException(status_code=status_code, detail="Provider timeout or downtime.")
+            else:
+                raise HTTPException(status_code=502, detail=detail)
+        except Exception as e:
+            logger.error(f"GTT request failed", extra={**log_ctx, "error": str(e)}, exc_info=True)
+            raise HTTPException(status_code=502, detail="An unexpected error occurred with the provider.")
+
+    def place_gtt(self, kite: KiteConnect, req: PlaceGTTRequest, corr_id: str) -> PlaceGTTResponse:
+        """Place a GTT trigger"""
+        log_ctx = self._log_context(corr_id, kite, gtt_type=req.type.value, symbol=req.condition.tradingsymbol)
+        logger.info("Placing GTT trigger", extra=log_ctx)
+
+        try:
+            # Prepare payload
+            payload = {
+                "type": req.type.value,
+                "condition": req.condition.model_dump(),
+                "orders": [order.model_dump() for order in req.orders]
+            }
+
+            result = self._raw_request(
+                "POST",
+                "https://api.kite.trade/gtt/triggers",
+                kite,
+                corr_id,
+                json=payload
+            )
+
+            trigger_id = result.get("data", {}).get("trigger_id")
+            log_ctx["trigger_id"] = trigger_id
+            logger.info("GTT trigger placed successfully", extra=log_ctx)
+
+            return PlaceGTTResponse(trigger_id=trigger_id)
+        except Exception as e:
+            logger.error("Failed to place GTT", extra={**log_ctx, "error": str(e)}, exc_info=True)
+            if not isinstance(e, HTTPException):
+                raise HTTPException(status_code=400, detail=str(e))
+            raise e
+
+    def get_gtts(self, kite: KiteConnect, corr_id: str) -> List[GTTTrigger]:
+        """Retrieve all GTT triggers"""
+        log_ctx = self._log_context(corr_id, kite)
+        logger.info("Retrieving all GTT triggers", extra=log_ctx)
+
+        try:
+            result = self._raw_request(
+                "GET",
+                "https://api.kite.trade/gtt/triggers",
+                kite,
+                corr_id
+            )
+
+            triggers = result.get("data", [])
+            return [GTTTrigger.model_validate(t) for t in triggers]
+        except Exception as e:
+            logger.error("Failed to retrieve GTTs", extra={**log_ctx, "error": str(e)}, exc_info=True)
+            if not isinstance(e, HTTPException):
+                raise HTTPException(status_code=502, detail="Failed to retrieve GTT triggers from provider.")
+            raise e
+
+    def get_gtt(self, kite: KiteConnect, trigger_id: int, corr_id: str) -> GTTTrigger:
+        """Retrieve a specific GTT trigger"""
+        log_ctx = self._log_context(corr_id, kite, trigger_id=trigger_id)
+        logger.info("Retrieving GTT trigger", extra=log_ctx)
+
+        try:
+            result = self._raw_request(
+                "GET",
+                f"https://api.kite.trade/gtt/triggers/{trigger_id}",
+                kite,
+                corr_id
+            )
+
+            trigger = result.get("data", {})
+            if not trigger:
+                raise HTTPException(status_code=404, detail=f"GTT trigger {trigger_id} not found")
+
+            return GTTTrigger.model_validate(trigger)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Failed to retrieve GTT", extra={**log_ctx, "error": str(e)}, exc_info=True)
+            raise HTTPException(status_code=502, detail=f"Failed to retrieve GTT trigger {trigger_id}")
+
+    def modify_gtt(self, kite: KiteConnect, trigger_id: int, req: ModifyGTTRequest, corr_id: str) -> PlaceGTTResponse:
+        """Modify a GTT trigger"""
+        log_ctx = self._log_context(corr_id, kite, trigger_id=trigger_id, gtt_type=req.type.value)
+        logger.info("Modifying GTT trigger", extra=log_ctx)
+
+        try:
+            # Prepare payload
+            payload = {
+                "type": req.type.value,
+                "condition": req.condition.model_dump(),
+                "orders": [order.model_dump() for order in req.orders]
+            }
+
+            result = self._raw_request(
+                "PUT",
+                f"https://api.kite.trade/gtt/triggers/{trigger_id}",
+                kite,
+                corr_id,
+                json=payload
+            )
+
+            modified_trigger_id = result.get("data", {}).get("trigger_id")
+            logger.info("GTT trigger modified successfully", extra={**log_ctx, "modified_trigger_id": modified_trigger_id})
+
+            return PlaceGTTResponse(trigger_id=modified_trigger_id)
+        except Exception as e:
+            logger.error("Failed to modify GTT", extra={**log_ctx, "error": str(e)}, exc_info=True)
+            if not isinstance(e, HTTPException):
+                raise HTTPException(status_code=400, detail=str(e))
+            raise e
+
+    def delete_gtt(self, kite: KiteConnect, trigger_id: int, corr_id: str) -> DeleteGTTResponse:
+        """Delete a GTT trigger"""
+        log_ctx = self._log_context(corr_id, kite, trigger_id=trigger_id)
+        logger.info("Deleting GTT trigger", extra=log_ctx)
+
+        try:
+            result = self._raw_request(
+                "DELETE",
+                f"https://api.kite.trade/gtt/triggers/{trigger_id}",
+                kite,
+                corr_id
+            )
+
+            deleted_trigger_id = result.get("data", {}).get("trigger_id")
+            logger.info("GTT trigger deleted successfully", extra={**log_ctx, "deleted_trigger_id": deleted_trigger_id})
+
+            return DeleteGTTResponse(trigger_id=deleted_trigger_id)
+        except Exception as e:
+            logger.error("Failed to delete GTT", extra={**log_ctx, "error": str(e)}, exc_info=True)
+            if not isinstance(e, HTTPException):
+                raise HTTPException(status_code=400, detail=str(e))
+            raise e
+
+
+# ---------------- GTT Router Endpoints ----------------
+gtt_service = GTTService()
+
+@router.post("/gtt/triggers", response_model=PlaceGTTResponse, description="Place a GTT (Good Till Triggered) order")
+def place_gtt_trigger(
+    req: PlaceGTTRequest,
+    kite: KiteConnect = Depends(get_kite),
+    corr_id: str = Depends(get_correlation_id)
+):
+    """
+    Place a GTT trigger.
+    
+    - **single**: Single trigger value, executes first order when reached
+    - **two-leg**: Two trigger values (OCO - One Cancels Other), executes corresponding order
+    """
+    return gtt_service.place_gtt(kite, req, corr_id)
+
+@router.get("/gtt/triggers", response_model=List[GTTTrigger], description="Retrieve all GTT triggers")
+def get_gtt_triggers(
+    kite: KiteConnect = Depends(get_kite),
+    corr_id: str = Depends(get_correlation_id)
+):
+    """
+    Retrieve all GTT triggers (active and from last 7 days).
+    
+    Statuses:
+    - active: Trigger is active and monitoring
+    - triggered: Trigger was activated
+    - disabled: Trigger is disabled, user action needed
+    - expired: Trigger expired based on expiry date
+    - cancelled: Trigger cancelled by system
+    - rejected: Trigger rejected by system
+    - deleted: Trigger deleted by user
+    """
+    return gtt_service.get_gtts(kite, corr_id)
+
+@router.get("/gtt/triggers/{trigger_id}", response_model=GTTTrigger, description="Retrieve a specific GTT trigger")
+def get_gtt_trigger(
+    trigger_id: int,
+    kite: KiteConnect = Depends(get_kite),
+    corr_id: str = Depends(get_correlation_id)
+):
+    """Retrieve details of a specific GTT trigger by ID."""
+    return gtt_service.get_gtt(kite, trigger_id, corr_id)
+
+@router.put("/gtt/triggers/{trigger_id}", response_model=PlaceGTTResponse, description="Modify a GTT trigger")
+def modify_gtt_trigger(
+    trigger_id: int,
+    req: ModifyGTTRequest,
+    kite: KiteConnect = Depends(get_kite),
+    corr_id: str = Depends(get_correlation_id)
+):
+    """
+    Modify an existing GTT trigger.
+    
+    Recommended: Fetch the trigger using GET /gtt/triggers/{id}, modify values, and send to this endpoint.
+    """
+    return gtt_service.modify_gtt(kite, trigger_id, req, corr_id)
+
+@router.delete("/gtt/triggers/{trigger_id}", response_model=DeleteGTTResponse, description="Delete a GTT trigger")
+def delete_gtt_trigger(
+    trigger_id: int,
+    kite: KiteConnect = Depends(get_kite),
+    corr_id: str = Depends(get_correlation_id)
+):
+    """Delete an active GTT trigger."""
+    return gtt_service.delete_gtt(kite, trigger_id, corr_id)
