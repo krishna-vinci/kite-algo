@@ -143,6 +143,7 @@ export interface StrategyListItem {
 	status: string;
 	total_lots: number;
 	index_instrument_token?: number;
+	index_tradingsymbol?: string;
 	index_upper_stoploss?: number;
 	index_lower_stoploss?: number;
 	last_evaluated_at?: string;

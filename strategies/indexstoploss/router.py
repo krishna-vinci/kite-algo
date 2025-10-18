@@ -375,7 +375,8 @@ async def list_strategies(
         query = f"""
             SELECT 
                 id, name, monitoring_mode, status,
-                index_instrument_token, index_upper_stoploss, index_lower_stoploss,
+                index_instrument_token, index_tradingsymbol,
+                index_upper_stoploss, index_lower_stoploss,
                 position_snapshot, last_evaluated_at, created_at
             FROM position_protection_strategies
             {where_sql}
@@ -390,7 +391,7 @@ async def list_strategies(
         strategies = []
         for row in rows:
             # Calculate total lots from snapshot
-            snapshot = row[7] or []
+            snapshot = row[8] or []
             total_lots = sum(pos.get('lots', 0) for pos in snapshot)
             
             strategies.append(StrategyListItem(
@@ -400,10 +401,11 @@ async def list_strategies(
                 status=row[3],
                 total_lots=float(total_lots),
                 index_instrument_token=row[4],
-                index_upper_stoploss=row[5],
-                index_lower_stoploss=row[6],
-                last_evaluated_at=row[8],
-                created_at=row[9]
+                index_tradingsymbol=row[5],
+                index_upper_stoploss=row[6],
+                index_lower_stoploss=row[7],
+                last_evaluated_at=row[9],
+                created_at=row[10]
             ))
         
         return StrategyListResponse(

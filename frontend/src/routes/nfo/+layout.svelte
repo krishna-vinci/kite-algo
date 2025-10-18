@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/stores';
+	import { Sonner } from '$lib/components/ui/sonner';
+	
 	const subNavItems = [
 		{ name: 'Option Chain', href: '/nfo/option-chain' },
 		{ name: 'Index Stoploss', href: '/nfo/indexstoploss' },
@@ -26,3 +28,5 @@
 <div class="flex flex-col flex-grow px-6 py-6">
 	<slot />
 </div>
+
+<Sonner />

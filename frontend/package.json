@@ -55,6 +55,7 @@
 		"echarts": "^5.6.0",
 		"layerchart": "^1.0.12",
 		"lightweight-charts": "^5.0.9",
-		"svelte-echarts": "^1.0.0"
+		"svelte-echarts": "^1.0.0",
+		"svelte-sonner": "^1.0.5"
 	}
 }

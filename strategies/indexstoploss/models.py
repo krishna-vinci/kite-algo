@@ -409,6 +409,7 @@ class StrategyListItem(BaseModel):
     status: str
     total_lots: float
     index_instrument_token: Optional[int] = None
+    index_tradingsymbol: Optional[str] = None
     index_upper_stoploss: Optional[float] = None
     index_lower_stoploss: Optional[float] = None
     last_evaluated_at: Optional[datetime] = None
