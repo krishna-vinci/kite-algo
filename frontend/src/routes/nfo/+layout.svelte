@@ -2,7 +2,7 @@
 	import { page } from '$app/stores';
 	const subNavItems = [
 		{ name: 'Option Chain', href: '/nfo/option-chain' },
-		{ name: 'Index Stoploss', href: '/nfo/Index-stoploss' },
+		{ name: 'Index Stoploss', href: '/nfo/indexstoploss' },
 		{ name: 'Positions', href: '/nfo/positions' },
 		{ name: 'Charts', href: '/nfo/charts' }
 	];
