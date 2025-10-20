@@ -339,3 +339,71 @@ export interface BuildPositionResponse {
 	strategy_id?: string;
 	message: string;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 4: CREATE PROTECTION STRATEGY MODELS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export interface PremiumThresholdConfig {
+	tradingsymbol: string;
+	transaction_type: 'BUY' | 'SELL';
+	entry_price: number;
+	stoploss_price?: number;
+	target_price?: number;
+	trailing_mode?: TrailingMode;
+	trailing_distance?: number;
+	trailing_lock_profit?: number;
+}
+
+export interface CombinedPremiumLevelConfig {
+	level_number: number;
+	profit_points: number;
+	exit_percent: number;
+}
+
+export interface CreateProtectionRequest {
+	// Metadata
+	name?: string;
+	strategy_type?: StrategyType;
+	notes?: string;
+	
+	// Monitoring mode (required)
+	monitoring_mode: MonitoringMode;
+	
+	// Index monitoring config (for index/hybrid/combined modes)
+	index_instrument_token?: number;
+	index_tradingsymbol?: string;
+	index_exchange?: string;
+	index_upper_stoploss?: number;
+	index_lower_stoploss?: number;
+	index_upper_target?: number; // Profit target if index reaches this (upside)
+	index_lower_target?: number; // Profit target if index reaches this (downside)
+	
+	// Order config
+	stoploss_order_type?: OrderType;
+	stoploss_limit_offset?: number;
+	
+	// Index trailing config
+	trailing_mode?: TrailingMode;
+	trailing_distance?: number;
+	trailing_unit?: 'points' | 'percent';
+	trailing_step_size?: number;
+	trailing_lock_profit?: number;
+	
+	// Premium monitoring config (for premium/hybrid modes)
+	premium_thresholds?: Record<string, PremiumThresholdConfig>;
+	
+	// Hybrid mode config
+	exit_logic?: ExitLogic;
+	
+	// Combined premium config (for combined_premium mode)
+	combined_premium_entry_type?: CombinedPremiumEntryType;
+	combined_premium_profit_target?: number;
+	combined_premium_trailing_enabled?: boolean;
+	combined_premium_trailing_distance?: number;
+	combined_premium_trailing_lock_profit?: number;
+	combined_premium_levels?: CombinedPremiumLevelConfig[];
+	
+	// Position identification (required)
+	position_filter: PositionFilter;
+}

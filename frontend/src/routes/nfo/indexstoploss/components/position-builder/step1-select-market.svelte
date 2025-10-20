@@ -6,8 +6,15 @@
 	import { Button } from '$lib/components/ui/button';
 	import * as Card from '$lib/components/ui/card';
 	import * as Select from '$lib/components/ui/select';
-	import { Loader } from '@lucide/svelte';
+	import { Loader, BookOpen } from '@lucide/svelte';
 	import { getAvailableExpiries } from '../../lib/api';
+	import {
+		type StrategyCategory,
+		neutralStrategies,
+		bullishStrategies,
+		bearishStrategies,
+		type StrategyTemplate
+	} from '../../lib/strategy-templates';
 
 	interface Props {
 		underlying: string;
@@ -29,6 +36,23 @@
 	let expiryDates = $state<string[]>([]);
 	let spotPrice = $state<number | null>(null);
 	let expiryError = $state<string | null>(null);
+	
+	// Strategy template selection
+	let activeCategory = $state<StrategyCategory>('neutral');
+	let selectedTemplate = $state<StrategyTemplate | null>(null);
+	
+	const categories = [
+		{ id: 'bullish' as const, label: 'Bullish', icon: '📈' },
+		{ id: 'bearish' as const, label: 'Bearish', icon: '📉' },
+		{ id: 'neutral' as const, label: 'Neutral', icon: '📊' }
+	];
+	
+	const strategiesByCategory = $derived(
+		activeCategory === 'bullish' ? bullishStrategies :
+		activeCategory === 'bearish' ? bearishStrategies :
+		activeCategory === 'neutral' ? neutralStrategies :
+		[]
+	);
 
 	// Fetch available expiries when underlying changes
 	async function fetchExpiries(und: string) {
@@ -74,8 +98,27 @@
 	const strategyTypes = [
 		{ value: 'straddle', label: 'Straddle (ATM CE + PE)' },
 		{ value: 'strangle', label: 'Strangle (OTM CE + PE)' },
-		{ value: 'single_leg', label: 'Single Leg (CE or PE)' }
+		{ value: 'single_leg', label: 'Single Leg (CE or PE)' },
+		{ value: 'manual', label: 'Custom / Manual Selection' }
 	];
+
+	function handleTemplateSelected(template: StrategyTemplate) {
+		selectedTemplate = template;
+		// Map template to strategy type for backward compatibility
+		const strategyTypeMap: Record<string, string> = {
+			'short_straddle': 'straddle',
+			'long_straddle': 'straddle',
+			'short_strangle': 'strangle',
+			'long_strangle': 'strangle',
+			'buy_call': 'single_leg',
+			'sell_call': 'single_leg',
+			'buy_put': 'single_leg',
+			'sell_put': 'single_leg'
+		};
+		const mappedType = strategyTypeMap[template.id] || 'manual';
+		onUpdate({ strategyType: mappedType, selectedTemplate: template });
+		toast.success(`${template.name} template selected - strikes will be auto-populated in next step`);
+	}
 
 	function handleNext() {
 		if (!underlying || !expiry || !strategyType) {
@@ -166,13 +209,84 @@
 			{/if}
 		</div>
 
-		<!-- Strategy Type Selection -->
+		<!-- Strategy Template Selection -->
+		<div class="space-y-3">
+			<div class="flex items-center justify-between">
+				<Label>Quick Strategy Templates</Label>
+				<a
+					href="https://zerodha.com/varsity/module/option-strategies/"
+					target="_blank"
+					class="flex items-center gap-1 text-xs text-primary hover:underline"
+				>
+					<BookOpen class="h-3 w-3" />
+					Learn
+				</a>
+			</div>
+			
+			<!-- Category Tabs -->
+			<div class="flex gap-2">
+				{#each categories as category}
+					<button
+						type="button"
+						onclick={() => (activeCategory = category.id)}
+						class={`
+							px-4 py-2 rounded-full text-sm font-medium transition-all
+							${activeCategory === category.id
+								? 'bg-primary text-primary-foreground shadow-sm'
+								: 'bg-muted text-muted-foreground hover:bg-muted/80'
+							}
+						`}
+					>
+						<span class="mr-1">{category.icon}</span>
+						{category.label}
+					</button>
+				{/each}
+			</div>
+			
+			<!-- Strategy Cards Grid -->
+			<div class="grid grid-cols-2 gap-2 max-h-60 overflow-y-auto">
+				{#each strategiesByCategory as strategy}
+					<button
+						type="button"
+						onclick={() => handleTemplateSelected(strategy)}
+						class={`
+							p-3 rounded-md border text-left transition-all text-sm
+							hover:shadow-md hover:scale-105
+							${selectedTemplate?.id === strategy.id
+								? 'border-primary bg-primary/5 shadow-sm'
+								: 'border-border bg-card hover:border-primary/50'
+							}
+						`}
+					>
+						<div class="font-semibold mb-1 text-xs">{strategy.name}</div>
+						<div class="text-xs text-muted-foreground line-clamp-2">
+							{strategy.shortDesc}
+						</div>
+						{#if selectedTemplate?.id === strategy.id}
+							<div class="text-xs text-primary font-medium mt-1">✓ Selected</div>
+						{/if}
+					</button>
+				{/each}
+			</div>
+		</div>
+
+		<!-- OR Divider -->
+		<div class="relative">
+			<div class="absolute inset-0 flex items-center">
+				<div class="w-full border-t"></div>
+			</div>
+			<div class="relative flex justify-center text-xs uppercase">
+				<span class="bg-background px-2 text-muted-foreground">Or manual selection</span>
+			</div>
+		</div>
+
+		<!-- Manual Strategy Type Selection -->
 		<div class="space-y-2">
-			<Label for="strategyType">Strategy Type</Label>
+			<Label for="strategyType">Manual Strategy Type</Label>
 			<select
 				id="strategyType"
 				value={strategyType}
-				onchange={(e) => onUpdate({ strategyType: e.currentTarget.value })}
+				onchange={(e) => { onUpdate({ strategyType: e.currentTarget.value }); selectedTemplate = null; }}
 				class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
 			>
 				<option value="" disabled>Select strategy type</option>

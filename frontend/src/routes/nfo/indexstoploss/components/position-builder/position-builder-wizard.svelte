@@ -6,7 +6,8 @@
 	import Step3ProtectionConfig from './step3-protection-config.svelte';
 	import Step4Review from './step4-review.svelte';
 	import PositionPlanPreview from './position-plan-preview.svelte';
-	import type { SelectedStrike, BuildPositionResponse } from '../../types';
+	import type { SelectedStrike, BuildPositionResponse, MiniChainResponse } from '../../types';
+	import { getMiniChain } from '../../lib/api';
 
 	interface Props {
 		onComplete?: (response: BuildPositionResponse) => void;
@@ -22,9 +23,12 @@
 	let expiry = $state('');
 	let strategyType = $state('');
 	let targetDelta = $state(0.30);
+	let selectedTemplate = $state<any>(null); // Strategy template for auto-population
 
 	// Step 2: Strike selection
 	let selectedStrikes = $state<SelectedStrike[]>([]);
+	let chainData = $state<MiniChainResponse | null>(null);
+	let chainLoading = $state(false);
 
 	// Step 3: Protection config
 	let protectionConfig = $state({
@@ -44,12 +48,40 @@
 		{ id: 4, title: 'Review & Execute', description: 'Confirm and place orders' }
 	];
 
+	async function loadChainData() {
+		if (!underlying || !expiry) return;
+
+		chainLoading = true;
+		chainData = null;
+		try {
+			chainData = await getMiniChain(underlying, expiry);
+		} catch (e) {
+			console.error('Failed to load chain in wizard:', e);
+			toast.error('Failed to load option chain. Please try again.');
+		} finally {
+			chainLoading = false;
+		}
+	}
+
 	function updateMarketData(data: any) {
+		const isContextChanging = data.underlying !== undefined || data.expiry !== undefined || data.selectedTemplate !== undefined;
+
+		if (isContextChanging && selectedStrikes.length > 0) {
+			selectedStrikes = [];
+		}
+
 		if (data.underlying !== undefined) underlying = data.underlying;
 		if (data.expiry !== undefined) expiry = data.expiry;
 		if (data.strategyType !== undefined) strategyType = data.strategyType;
 		if (data.targetDelta !== undefined) targetDelta = data.targetDelta;
+		if (data.selectedTemplate !== undefined) selectedTemplate = data.selectedTemplate;
 	}
+
+	$effect(() => {
+		if (currentStep === 2 && (!chainData || chainData.expiry !== expiry)) {
+			loadChainData();
+		}
+	});
 
 	function updateProtectionConfig(data: any) {
 		protectionConfig = { ...protectionConfig, ...data };
@@ -94,7 +126,11 @@
 					underlying={underlying}
 					expiry={expiry}
 					targetDelta={targetDelta}
+					selectedTemplate={selectedTemplate}
 					selectedStrikes={selectedStrikes}
+					chainData={chainData}
+					loading={chainLoading}
+					onReloadChain={loadChainData}
 					onUpdateSelectedStrikes={(strikes) => selectedStrikes = strikes}
 					onNext={() => currentStep = 3}
 					onBack={() => currentStep = 1}

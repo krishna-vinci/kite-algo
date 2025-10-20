@@ -237,3 +237,27 @@ export async function buildPosition(
 	
 	return response.json();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 4: CREATE PROTECTION STRATEGY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Create a new protection strategy for existing positions
+ */
+export async function createProtectionStrategy(
+	request: any
+): Promise<ProtectionStrategyResponse> {
+	const response = await apiFetch(`${API_PREFIX}/protection`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(request)
+	});
+	
+	if (!response.ok) {
+		const error = await response.json().catch(() => ({ detail: response.statusText }));
+		throw new Error(error.detail || 'Failed to create protection strategy');
+	}
+	
+	return response.json();
+}

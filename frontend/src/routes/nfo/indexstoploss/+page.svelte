@@ -17,6 +17,7 @@
 	import StrategyDetailsSheet from './components/strategy-details-sheet.svelte';
 	import StrategyManager from './components/strategy-manager.svelte';
 	import PositionBuilderWizard from './components/position-builder/position-builder-wizard.svelte';
+	import CreateStrategySheet from './components/create-strategy-sheet.svelte';
 	
 	import { listStrategies, updateStrategyStatus } from './lib/api';
 	import type { PageData } from './$types';
@@ -62,6 +63,9 @@
 	let detailsSheetOpen = $state(false);
 	let selectedStrategyId = $state<string | null>(null);
 	
+	// State for create strategy sheet
+	let createSheetOpen = $state(false);
+	
 	// Handle pause/resume strategy
 	async function handlePauseResume(strategyId: string, currentStatus: string) {
 		const newStatus = currentStatus === 'paused' ? 'active' : 'paused';
@@ -78,9 +82,7 @@
 	
 	// Handle create strategy
 	function handleCreateStrategy() {
-		console.log('Create strategy clicked');
-		// TODO: Open create strategy sheet
-		toast.info('Create strategy feature will be implemented in Phase 4');
+		createSheetOpen = true;
 	}
 	
 	// Handle position builder completion
@@ -197,6 +199,15 @@
 		</TabsContent>
 	</Tabs>
 </div>
+
+<!-- Create Strategy Sheet -->
+<CreateStrategySheet
+	bind:open={createSheetOpen}
+	onClose={() => {
+		createSheetOpen = false;
+	}}
+	onCreated={refreshStrategies}
+/>
 
 <!-- Strategy Details Sheet -->
 <StrategyDetailsSheet

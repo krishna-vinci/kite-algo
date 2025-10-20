@@ -1,6 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { toast } from 'svelte-sonner';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Input } from '$lib/components/ui/input';
@@ -8,27 +6,42 @@
 	import * as Card from '$lib/components/ui/card';
 	import * as Table from '$lib/components/ui/table';
 	import * as Tabs from '$lib/components/ui/tabs';
-	import { Loader, RefreshCw, TrendingUp, TrendingDown, Zap, List } from '@lucide/svelte';
-	import { getMiniChain } from '../../lib/api';
-	import type { MiniChainResponse, OptionChainStrike, SelectedStrike } from '../../types';
+	import { Loader, RefreshCw, TrendingUp, TrendingDown, Zap, List, LineChart } from '@lucide/svelte';
+	import type { MiniChainResponse, SelectedStrike } from '../../types';
+	import { calculateStrategyStrikes, findATMStrike } from '../../lib/strike-calculator';
+	import type { StrategyTemplate } from '../../lib/strategy-templates';
+	import PayoffChart from './payoff-chart.svelte';
 
 	interface Props {
 		underlying: string;
 		expiry: string;
 		targetDelta: number;
+		selectedTemplate?: StrategyTemplate | null;
 		selectedStrikes: SelectedStrike[];
+		chainData: MiniChainResponse | null;
+		loading: boolean;
 		onUpdateSelectedStrikes: (strikes: SelectedStrike[]) => void;
 		onNext: () => void;
 		onBack: () => void;
+		onReloadChain: () => void;
 	}
 
-	let { underlying, expiry, targetDelta, selectedStrikes, onUpdateSelectedStrikes, onNext, onBack }: Props = $props();
+	let {
+		underlying,
+		expiry,
+		targetDelta,
+		selectedTemplate,
+		selectedStrikes,
+		chainData,
+		loading,
+		onUpdateSelectedStrikes,
+		onNext,
+		onBack,
+		onReloadChain
+	}: Props = $props();
 	
 	// Mode selection
-	let mode = $state<'chain' | 'quick'>('chain');
-
-	let loading = $state(false);
-	let chainData = $state<MiniChainResponse | null>(null);
+	let mode = $state<'chain' | 'quick' | 'payoff'>('chain');
 	
 	// Computed spot price for quick mode defaults
 	let spotPrice = $derived(chainData?.spot_price || 0);
@@ -42,41 +55,57 @@
 		if (underlying === 'BANKNIFTY') return 51000;
 		return 0;
 	});
-
-	async function loadChainData() {
-		if (!underlying || !expiry) {
-			console.warn('Cannot load chain: missing underlying or expiry', { underlying, expiry });
-			return;
+	
+	// Auto-populate strikes when template is selected and chain data is loaded
+	$effect(() => {
+		if (selectedTemplate && chainData && chainData.strikes.length > 0 && selectedStrikes.length === 0) {
+			console.log('Auto-populating strikes for template:', selectedTemplate.name);
+			
+			// Find ATM strike
+			const atmStrike = chainData.atm_strike || findATMStrike(chainData.strikes, chainData.spot_price);
+			
+			// Calculate strikes based on template
+			const calculatedStrikes = calculateStrategyStrikes(selectedTemplate, atmStrike, underlying);
+			
+			// Convert calculated strikes to SelectedStrike format
+			const autoStrikes: SelectedStrike[] = [];
+			
+			for (const calc of calculatedStrikes) {
+				// Find the strike in chain data
+				const chainStrike = chainData.strikes.find(s => s.strike === calc.strike);
+				if (!chainStrike) {
+					console.warn(`Strike ${calc.strike} not found in chain data`);
+					continue;
+				}
+				
+				// Get the correct side (CE or PE)
+				const side = calc.optionType === 'CE' ? chainStrike.ce : chainStrike.pe;
+				if (!side) {
+					console.warn(`No ${calc.optionType} data for strike ${calc.strike}`);
+					continue;
+				}
+				
+				// Create selected strike
+				autoStrikes.push({
+					instrument_token: side.instrument_token,
+					tradingsymbol: side.tradingsymbol,
+					strike: calc.strike,
+					option_type: calc.optionType,
+					ltp: side.ltp,
+					lot_size: side.lot_size,
+					delta: side.greeks?.delta || 0,
+					lots: 1,
+					transaction_type: calc.transactionType
+				});
+			}
+			
+			if (autoStrikes.length > 0) {
+				onUpdateSelectedStrikes(autoStrikes);
+				console.log(`Auto-selected ${autoStrikes.length} strikes for ${selectedTemplate.name}`);
+			} else {
+				console.warn('Could not auto-populate strikes - please select manually');
+			}
 		}
-
-		loading = true;
-		chainData = null; // Reset previous data
-		try {
-			console.log('Loading chain data for:', { underlying, expiry });
-			const data = await getMiniChain(underlying, expiry);
-			chainData = data;
-			console.log('Chain data loaded successfully:', {
-				spotPrice: data.spot_price,
-				atmStrike: data.atm_strike,
-				strikeCount: data.strikes.length
-			});
-			toast.success(`Loaded ${data.strikes.length} strikes`);
-		} catch (e) {
-			console.error('Failed to load chain:', e);
-			toast.error(`Failed to load chain: ${e instanceof Error ? e.message : 'Unknown error'}`);
-			chainData = null;
-		} finally {
-			loading = false;
-		}
-	}
-
-	onMount(() => {
-		// Try to load chain data but don't block if it fails
-		// User can always use Quick Mode
-		loadChainData().catch(() => {
-			console.log('Chain data not available, user can use Quick Mode');
-			mode = 'quick'; // Auto-switch to quick mode if chain fails
-		});
 	});
 
 	function isStrikeSelected(instrumentToken: number): boolean {
@@ -141,7 +170,7 @@
 		const lots = parseInt(lotsInput.value) || 1;
 		
 		if (!strike || strike <= 0) {
-			toast.error('Please enter a valid strike price');
+			console.warn('Please enter a valid strike price');
 			return;
 		}
 		
@@ -164,12 +193,12 @@
 		
 		// Check if already added
 		if (selectedStrikes.some(s => s.strike === strike && s.option_type === type)) {
-			toast.error(`${type} ${strike} already added`);
+			console.warn(`${type} ${strike} already added`);
 			return;
 		}
 		
 		onUpdateSelectedStrikes([...selectedStrikes, quickStrike]);
-		toast.success(`Added ${type} ${strike} (${transactionType})`);
+		console.log(`Added ${type} ${strike} (${transactionType})`);
 		
 		// Clear inputs
 		strikeInput.value = '';
@@ -192,7 +221,7 @@
 				<Button
 					variant="ghost"
 					size="sm"
-					onclick={loadChainData}
+					onclick={onReloadChain}
 					disabled={loading}
 				>
 					<RefreshCw class="h-4 w-4 {loading ? 'animate-spin' : ''}" />
@@ -201,7 +230,7 @@
 		</Card.Header>
 		<Card.Content>
 			<Tabs.Root bind:value={mode} class="w-full">
-				<Tabs.List class="grid w-full grid-cols-2">
+				<Tabs.List class="grid w-full grid-cols-3">
 					<Tabs.Trigger value="chain" class="flex items-center gap-2" disabled={loading}>
 						<List class="h-4 w-4" />
 						Chain Mode
@@ -209,6 +238,10 @@
 					<Tabs.Trigger value="quick" class="flex items-center gap-2">
 						<Zap class="h-4 w-4" />
 						Quick Mode
+					</Tabs.Trigger>
+					<Tabs.Trigger value="payoff" class="flex items-center gap-2" disabled={selectedStrikes.length === 0}>
+						<LineChart class="h-4 w-4" />
+						Payoff Chart
 					</Tabs.Trigger>
 				</Tabs.List>
 				
@@ -235,9 +268,9 @@
 								<Table.Root>
 									<Table.Header>
 										<Table.Row>
-											<Table.Head colspan="4" class="text-center bg-green-500/10">CE (Call)</Table.Head>
+											<Table.Head colspan={4} class="text-center bg-green-500/10">CE (Call)</Table.Head>
 											<Table.Head class="text-center font-bold">Strike</Table.Head>
-											<Table.Head colspan="4" class="text-center bg-red-500/10">PE (Put)</Table.Head>
+											<Table.Head colspan={4} class="text-center bg-red-500/10">PE (Put)</Table.Head>
 										</Table.Row>
 										<Table.Row class="text-xs">
 											<Table.Head class="text-right">Delta</Table.Head>
@@ -275,7 +308,7 @@
 														</Button>
 													</Table.Cell>
 												{:else}
-													<Table.Cell colspan="4"></Table.Cell>
+													<Table.Cell colspan={4}></Table.Cell>
 												{/if}
 
 												<!-- Strike -->
@@ -307,7 +340,7 @@
 														{strikeData.pe.greeks.delta.toFixed(3)}
 													</Table.Cell>
 												{:else}
-													<Table.Cell colspan="4"></Table.Cell>
+													<Table.Cell colspan={4}></Table.Cell>
 												{/if}
 											</Table.Row>
 										{/each}
@@ -321,7 +354,7 @@
 							<p class="text-sm text-muted-foreground">
 								Make sure an options session is active for {underlying}
 							</p>
-							<Button variant="outline" size="sm" onclick={loadChainData}>
+							<Button variant="outline" size="sm" onclick={onReloadChain}>
 								<RefreshCw class="h-4 w-4 mr-2" />
 								Retry Loading Chain
 							</Button>
@@ -447,6 +480,15 @@
 							</ul>
 						</div>
 					</div>
+				</Tabs.Content>
+				
+				<!-- PAYOFF CHART MODE -->
+				<Tabs.Content value="payoff" class="mt-4">
+					<PayoffChart
+						strikes={selectedStrikes}
+						spotPrice={spotPrice}
+						underlying={underlying}
+					/>
 				</Tabs.Content>
 			</Tabs.Root>
 		</Card.Content>
