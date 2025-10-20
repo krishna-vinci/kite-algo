@@ -28,24 +28,30 @@ export const load: PageServerLoad = async ({ fetch, cookies }) => {
 	let strategies: StrategyListResponse = { total: 0, strategies: [] };
 	if (strategiesRes.status === 'fulfilled' && strategiesRes.value.ok) {
 		strategies = await strategiesRes.value.json();
+	} else if (strategiesRes.status === 'fulfilled' && strategiesRes.value.status === 401) {
+		console.warn('Strategies API returned 401 - User may not be authenticated. Using empty strategies.');
 	} else {
-		console.error('Failed to fetch strategies:', strategiesRes);
+		console.error('Failed to fetch strategies:', strategiesRes.status === 'fulfilled' ? strategiesRes.value.statusText : strategiesRes);
 	}
 	
 	// Parse health
 	let health: EngineHealthResponse | null = null;
 	if (healthRes.status === 'fulfilled' && healthRes.value.ok) {
 		health = await healthRes.value.json();
+	} else if (healthRes.status === 'fulfilled' && healthRes.value.status === 401) {
+		console.warn('Health API returned 401 - User may not be authenticated.');
 	} else {
-		console.error('Failed to fetch health:', healthRes);
+		console.error('Failed to fetch health:', healthRes.status === 'fulfilled' ? healthRes.value.statusText : healthRes);
 	}
 	
 	// Parse positions
 	let positions: RealtimePositionsResponse = { net: [], day: [] };
 	if (positionsRes.status === 'fulfilled' && positionsRes.value.ok) {
 		positions = await positionsRes.value.json();
+	} else if (positionsRes.status === 'fulfilled' && positionsRes.value.status === 401) {
+		console.warn('Positions API returned 401 - User may not be authenticated. Using empty positions.');
 	} else {
-		console.error('Failed to fetch positions:', positionsRes);
+		console.error('Failed to fetch positions:', positionsRes.status === 'fulfilled' ? positionsRes.value.statusText : positionsRes);
 	}
 	
 	return {

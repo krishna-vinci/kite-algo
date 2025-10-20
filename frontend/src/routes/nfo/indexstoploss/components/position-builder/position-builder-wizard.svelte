@@ -1,11 +1,9 @@
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
 	import Stepper from './stepper.svelte';
-	import Step1SelectMarket from './step1-select-market.svelte';
-	import Step2MiniChain from './step2-mini-chain.svelte';
+	import MergedBuilder from './merged-builder.svelte';
 	import Step3ProtectionConfig from './step3-protection-config.svelte';
 	import Step4Review from './step4-review.svelte';
-	import PositionPlanPreview from './position-plan-preview.svelte';
 	import type { SelectedStrike, BuildPositionResponse, MiniChainResponse } from '../../types';
 	import { getMiniChain } from '../../lib/api';
 
@@ -15,7 +13,7 @@
 
 	let { onComplete }: Props = $props();
 
-	// Wizard state
+	// Wizard state (now step 1 merges old step 1 & 2)
 	let currentStep = $state(1);
 
 	// Step 1: Market selection
@@ -25,10 +23,11 @@
 	let targetDelta = $state(0.30);
 	let selectedTemplate = $state<any>(null); // Strategy template for auto-population
 
-	// Step 2: Strike selection
+	// Strike selection (handled in merged builder)
 	let selectedStrikes = $state<SelectedStrike[]>([]);
 	let chainData = $state<MiniChainResponse | null>(null);
 	let chainLoading = $state(false);
+	let multiplier = $state(1);
 
 	// Step 3: Protection config
 	let protectionConfig = $state({
@@ -42,10 +41,9 @@
 	});
 
 	const steps = [
-		{ id: 1, title: 'Select Market', description: 'Choose underlying & expiry' },
-		{ id: 2, title: 'Select Strikes', description: 'View chain & select options' },
-		{ id: 3, title: 'Protection', description: 'Configure stop-loss' },
-		{ id: 4, title: 'Review & Execute', description: 'Confirm and place orders' }
+		{ id: 1, title: 'Build Strategy', description: 'Market, template & strikes' },
+		{ id: 2, title: 'Protection', description: 'Configure stop-loss' },
+		{ id: 3, title: 'Review & Execute', description: 'Confirm and place orders' }
 	];
 
 	async function loadChainData() {
@@ -78,7 +76,7 @@
 	}
 
 	$effect(() => {
-		if (currentStep === 2 && (!chainData || chainData.expiry !== expiry)) {
+		if (underlying && expiry) {
 			loadChainData();
 		}
 	});
@@ -108,64 +106,44 @@
 	<!-- Stepper -->
 	<Stepper steps={steps} currentStep={currentStep} />
 
-	<!-- Main Content with Sidebar -->
-	<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-		<!-- Steps Content -->
-		<div class="lg:col-span-2">
-			{#if currentStep === 1}
-				<Step1SelectMarket
-					underlying={underlying}
-					expiry={expiry}
-					strategyType={strategyType}
-					targetDelta={targetDelta}
-					onUpdate={updateMarketData}
-					onNext={() => currentStep = 2}
-				/>
-			{:else if currentStep === 2}
-				<Step2MiniChain
-					underlying={underlying}
-					expiry={expiry}
-					targetDelta={targetDelta}
-					selectedTemplate={selectedTemplate}
-					selectedStrikes={selectedStrikes}
-					chainData={chainData}
-					loading={chainLoading}
-					onReloadChain={loadChainData}
-					onUpdateSelectedStrikes={(strikes) => selectedStrikes = strikes}
-					onNext={() => currentStep = 3}
-					onBack={() => currentStep = 1}
-				/>
-			{:else if currentStep === 3}
-				<Step3ProtectionConfig
-					underlying={underlying}
-					selectedStrikes={selectedStrikes}
-					protectionConfig={protectionConfig}
-					onUpdateProtection={updateProtectionConfig}
-					onNext={() => currentStep = 4}
-					onBack={() => currentStep = 2}
-				/>
-			{:else if currentStep === 4}
-				<Step4Review
-					underlying={underlying}
-					expiry={expiry}
-					strategyType={strategyType}
-					selectedStrikes={selectedStrikes}
-					protectionConfig={protectionConfig}
-					onBack={() => currentStep = 3}
-					onComplete={handleComplete}
-				/>
-			{/if}
-		</div>
-
-		<!-- Sticky Preview Sidebar -->
-		<div class="lg:col-span-1">
-			<PositionPlanPreview
-				underlying={underlying}
-				expiry={expiry}
-				strategyType={strategyType}
-				selectedStrikes={selectedStrikes}
-				protectionEnabled={protectionConfig.enabled}
-			/>
-		</div>
-	</div>
+	<!-- Main Content -->
+	{#if currentStep === 1}
+		<!-- Merged Builder: Stage 1 & 2 combined -->
+		<MergedBuilder
+			underlying={underlying}
+			expiry={expiry}
+			strategyType={strategyType}
+			targetDelta={targetDelta}
+			selectedStrikes={selectedStrikes}
+			chainData={chainData}
+			chainLoading={chainLoading}
+			bind:multiplier
+			onUpdate={updateMarketData}
+			onUpdateSelectedStrikes={(strikes) => selectedStrikes = strikes}
+			onNext={() => currentStep = 2}
+			onReloadChain={loadChainData}
+		/>
+	{:else if currentStep === 2}
+		<!-- Step 2: Protection Config (old step 3) -->
+		<Step3ProtectionConfig
+			underlying={underlying}
+			selectedStrikes={selectedStrikes}
+			protectionConfig={protectionConfig}
+			onUpdateProtection={updateProtectionConfig}
+			onNext={() => currentStep = 3}
+			onBack={() => currentStep = 1}
+		/>
+	{:else if currentStep === 3}
+		<!-- Step 3: Review & Execute (old step 4) -->
+		<Step4Review
+			underlying={underlying}
+			expiry={expiry}
+			strategyType={strategyType}
+			selectedStrikes={selectedStrikes}
+			protectionConfig={protectionConfig}
+			multiplier={multiplier}
+			onBack={() => currentStep = 2}
+			onComplete={handleComplete}
+		/>
+	{/if}
 </div>

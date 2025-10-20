@@ -1,146 +1,135 @@
 <script lang="ts">
-	import { Trash2, ChevronUp, ChevronDown } from '@lucide/svelte';
+	import { Button } from '$lib/components/ui/button';
+	import { Input } from '$lib/components/ui/input';
+	import { Checkbox } from '$lib/components/ui/checkbox';
+	import { Trash2, RefreshCw, GripVertical, Calculator } from '@lucide/svelte';
 	import type { CalculatedStrike } from '../../lib/strike-calculator';
-	import { calculateNetPremium, getStrikeLabel } from '../../lib/strike-calculator';
-	
-	interface Props {
-		strikes: CalculatedStrike[];
-		lots: number;
+	import { createEventDispatcher } from 'svelte';
+
+	let {
+		strikes,
+		expiries,
+		underlying,
+		onRemove
+	}: {
+		strikes: (CalculatedStrike & { expiry: string })[];
+		expiries: string[];
 		underlying: string;
 		onRemove: (index: number) => void;
+	} = $props();
+
+	const dispatch = createEventDispatcher();
+	let multiplier = $state(1);
+
+	function updateStrike(index: number, newStrike: number) {
+		// This needs to be handled in the parent component
 	}
-	
-	let { strikes, lots, underlying, onRemove }: Props = $props();
-	
-	const lotSize = 25; // TODO: Get from instruments API based on underlying
-	
-	const premiumDetails = $derived(() => {
-		return calculateNetPremium(strikes, lots, lotSize);
-	});
-	
-	function formatCurrency(amount: number): string {
-		return `₹${amount.toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
+
+	function updateTransactionType(index: number) {
+		// This needs to be handled in the parent component
 	}
+
+	function updateLTP(index: number, ltp: number) {
+		// This needs to be handled in the parent component
+	}
+
+	function formatDate(dateString: string) {
+		if (!dateString) return '';
+		const date = new Date(dateString);
+		return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+	}
+
+	const pricePay = $derived(strikes.reduce((acc, s) => acc + (s.ltp || 0), 0));
+	const premiumPay = $derived(pricePay * 25 * multiplier); // Assuming lot size 25
 </script>
 
-<div class="rounded-lg border bg-card">
+<div>
 	<!-- Header -->
-	<div class="flex items-center justify-between p-4 border-b">
-		<h3 class="font-semibold">Selected Positions</h3>
-		<div class="flex items-center gap-4 text-sm">
-			<div>
-				<span class="text-muted-foreground">Lots:</span>
-				<span class="font-semibold ml-1">{lots}</span>
-			</div>
-			<div>
-				<span class="text-muted-foreground">Lot Size:</span>
-				<span class="font-semibold ml-1">{lotSize}</span>
-			</div>
+	<div class="flex items-center justify-between mb-3 px-1">
+		<div class="flex items-center gap-2 text-sm font-medium">
+			<Checkbox id="select-all" />
+			<label for="select-all" class="select-none">{strikes.length} trades selected</label>
 		</div>
+		<Button variant="link" class="h-auto p-0 text-primary" on:click={() => dispatch('reset')}>
+			<RefreshCw class="h-3.5 w-3.5 mr-1" />
+			Reset Prices
+		</Button>
 	</div>
-	
-	<!-- Positions List -->
-	<div class="divide-y">
-		{#each strikes as strike, index}
-			{@const label = getStrikeLabel(strike.strike, strike.strike, strike.optionType, strike.transactionType)}
-			{@const premium = strike.ltp || 0}
-			{@const totalValue = premium * lots * lotSize}
-			{@const isCredit = strike.transactionType === 'SELL'}
-			
-			<div class="p-4 hover:bg-muted/50 transition-colors">
-				<div class="flex items-center gap-4">
-					<!-- Position Details -->
-					<div class="flex-1">
-						<div class="flex items-center gap-2">
-							<span class="font-semibold">{underlying} {strike.strike} {strike.optionType}</span>
-							<span class={`
-								px-2 py-0.5 rounded-full text-xs font-medium
-								${strike.transactionType === 'BUY' 
-									? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' 
-									: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
-								}
-							`}>
-								{strike.transactionType}
-							</span>
-							<span class="text-sm text-muted-foreground">
-								{lots} lot{lots > 1 ? 's' : ''}
-							</span>
-						</div>
-						
-						<div class="text-sm text-muted-foreground mt-1">
-							LTP: ₹{premium.toFixed(2)}
-							{#if strike.delta}
-								• Δ: {strike.delta.toFixed(2)}
-							{/if}
-						</div>
-					</div>
-					
-					<!-- Premium Display -->
-					<div class="text-right">
-						<div class={`font-semibold ${isCredit ? 'text-green-600' : 'text-red-600'}`}>
-							{isCredit ? '+' : '-'}{formatCurrency(totalValue)}
-						</div>
-						<div class="text-xs text-muted-foreground">
-							{isCredit ? 'Credit' : 'Debit'}
-						</div>
-					</div>
-					
-					<!-- Adjustment Buttons (Future) -->
-					<div class="flex flex-col gap-1">
-						<button
-							class="p-1 rounded hover:bg-muted transition-colors"
-							title="Shift strike up"
-							disabled
-						>
-							<ChevronUp class="h-4 w-4 text-muted-foreground" />
-						</button>
-						<button
-							class="p-1 rounded hover:bg-muted transition-colors"
-							title="Shift strike down"
-							disabled
-						>
-							<ChevronDown class="h-4 w-4 text-muted-foreground" />
-						</button>
-					</div>
-					
-					<!-- Remove Button -->
-					<button
-						onclick={() => onRemove(index)}
-						class="p-2 rounded hover:bg-destructive/10 hover:text-destructive transition-colors"
-						title="Remove position"
-					>
-						<Trash2 class="h-4 w-4" />
-					</button>
+
+	<!-- Table -->
+	<div class="space-y-2">
+		<!-- Table Header -->
+		<div class="grid grid-cols-[auto_40px_90px_110px_40px_80px_auto] gap-x-2 px-1 text-xs text-muted-foreground font-medium">
+			<div /> <!-- Checkbox col -->
+			<div>B/S</div>
+			<div>Expiry</div>
+			<div class="text-center">Strike</div>
+			<div>Type</div>
+			<div class="text-center">Price</div>
+			<div /> <!-- Actions col -->
+		</div>
+
+		<!-- Table Body -->
+		{#each strikes as strike, i}
+			<div class="grid grid-cols-[auto_40px_90px_110px_40px_80px_auto] gap-x-2 items-center">
+				<Checkbox />
+				
+				<!-- B/S -->
+				<Button
+					variant="outline"
+					class={`h-8 w-8 text-xs font-bold ${strike.transactionType === 'BUY' ? 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100' : 'bg-red-50 text-red-700 border-red-200 hover:bg-red-100'}`}
+					on:click={() => updateTransactionType(i)}
+				>
+					{strike.transactionType === 'BUY' ? 'B' : 'S'}
+				</Button>
+
+				<!-- Expiry -->
+				<select
+					class="h-8 w-full rounded-md border border-input bg-transparent px-1 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+					value={strike.expiry}
+				>
+					<option value={strike.expiry} disabled selected>{formatDate(strike.expiry)}</option>
+				</select>
+
+				<!-- Strike -->
+				<div class="flex items-center">
+					<Button variant="outline" size="icon" class="h-8 w-7 rounded-r-none" on:click={() => updateStrike(i, strike.strike - 50)}>-</Button>
+					<Input type="number" class="h-8 w-full text-center rounded-none focus-visible:ring-offset-0 focus-visible:ring-0" value={strike.strike} />
+					<Button variant="outline" size="icon" class="h-8 w-7 rounded-l-none" on:click={() => updateStrike(i, strike.strike + 50)}>+</Button>
+				</div>
+
+				<!-- Type -->
+				<div class="text-center text-sm font-medium text-muted-foreground">{strike.optionType}</div>
+
+				<!-- Price -->
+				<Input type="number" class="h-8 text-center" value={strike.ltp} oninput={(e) => updateLTP(i, parseFloat(e.currentTarget.value))} />
+
+				<!-- Actions -->
+				<div class="flex items-center justify-center">
+					<Button variant="ghost" size="icon" class="h-8 w-8 cursor-grab">
+						<GripVertical class="h-4 w-4 text-muted-foreground" />
+					</Button>
+					<Button variant="ghost" size="icon" class="h-8 w-8" on:click={() => onRemove(i)}>
+						<Trash2 class="h-4 w-4 text-muted-foreground" />
+					</Button>
 				</div>
 			</div>
 		{/each}
 	</div>
-	
-	<!-- Summary -->
-	<div class="p-4 border-t bg-muted/30">
-		<div class="flex items-center justify-between">
-			<div>
-				<div class="text-sm text-muted-foreground">Net Premium</div>
-				<div class="text-xs text-muted-foreground mt-1">
-					{strikes.length} leg{strikes.length > 1 ? 's' : ''} • {lots * strikes.length} total lots
-				</div>
-			</div>
-			
-			<div class="text-right">
-				<div class={`text-2xl font-bold ${premiumDetails.creditDebit === 'CREDIT' ? 'text-green-600' : 'text-red-600'}`}>
-					{premiumDetails.creditDebit === 'CREDIT' ? '+' : '-'}{formatCurrency(premiumDetails.totalCost)}
-				</div>
-				<div class="text-sm text-muted-foreground">
-					{premiumDetails.creditDebit}
-				</div>
-			</div>
+
+	<!-- Footer -->
+	<div class="mt-4 flex items-center justify-between">
+		<div class="flex items-center gap-2">
+			<label for="multiplier" class="text-sm font-medium">Multiplier</label>
+			<Input type="number" id="multiplier" class="h-8 w-20" bind:value={multiplier} />
 		</div>
-		
-		<!-- Margin Estimate (Placeholder) -->
-		<div class="mt-3 pt-3 border-t flex items-center justify-between text-sm">
-			<span class="text-muted-foreground">Estimated Margin:</span>
-			<span class="font-semibold">₹47,500</span>
-			<span class="text-xs text-muted-foreground">(approx.)</span>
+		<div class="flex items-center gap-4 text-sm">
+			<span>Price <span class="font-semibold">Pay {pricePay.toFixed(1)}</span></span>
+			<span>Premium <span class="font-semibold">Pay {premiumPay.toLocaleString('en-IN')}</span></span>
+			<Button variant="ghost" class="h-auto p-0 text-primary">
+				<Calculator class="h-4 w-4 mr-1" />
+				Charges
+			</Button>
 		</div>
 	</div>
 </div>

@@ -239,6 +239,7 @@ export interface OptionSide {
 	ltp: number;
 	lot_size: number;
 	greeks: OptionGreeks;
+	oi?: number; // Open Interest
 }
 
 export interface OptionChainStrike {
@@ -292,6 +293,10 @@ export interface SelectedStrike {
 	ltp: number;
 	lot_size: number;
 	delta: number;
+	gamma?: number;
+	theta?: number;
+	vega?: number;
+	oi?: number; // Open Interest
 	lots: number; // User-selected lots
 	transaction_type: 'BUY' | 'SELL';
 }

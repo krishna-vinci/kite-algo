@@ -94,6 +94,10 @@
 					ltp: side.ltp,
 					lot_size: side.lot_size,
 					delta: side.greeks?.delta || 0,
+					gamma: side.greeks?.gamma || 0,
+					theta: side.greeks?.theta || 0,
+					vega: side.greeks?.vega || 0,
+					oi: side.oi,
 					lots: 1,
 					transaction_type: calc.transactionType
 				});
@@ -136,6 +140,10 @@
 				ltp: side.ltp,
 				lot_size: side.lot_size,
 				delta: side.greeks.delta,
+				gamma: side.greeks?.gamma || 0,
+				theta: side.greeks?.theta || 0,
+				vega: side.greeks?.vega || 0,
+				oi: side.oi,
 				lots: 1, // Default to 1 lot
 				transaction_type: 'SELL' // Default to SELL (premium collection)
 			};

@@ -15,11 +15,12 @@
 		strategyType: string;
 		selectedStrikes: SelectedStrike[];
 		protectionConfig: any;
+		multiplier: number;
 		onBack: () => void;
 		onComplete: (response: BuildPositionResponse) => void;
 	}
 
-	let { underlying, expiry, strategyType, selectedStrikes, protectionConfig, onBack, onComplete }: Props = $props();
+	let { underlying, expiry, strategyType, selectedStrikes, protectionConfig, multiplier = 1, onBack, onComplete }: Props = $props();
 
 	let loading = $state(false);
 	let dryRunPlan = $state<PositionBuildPlan | null>(null);
@@ -28,23 +29,29 @@
 
 	const totalCost = $derived(
 		selectedStrikes.reduce((sum, strike) => {
-			const orderValue = strike.ltp * strike.lot_size * strike.lots;
+			const orderValue = strike.ltp * strike.lot_size * strike.lots * multiplier;
 			return sum + (strike.transaction_type === 'BUY' ? orderValue : -orderValue);
 		}, 0)
 	);
 
 	const totalLots = $derived(
-		selectedStrikes.reduce((sum, strike) => sum + strike.lots, 0)
+		selectedStrikes.reduce((sum, strike) => sum + (strike.lots * multiplier), 0)
 	);
 
 	async function runDryRun() {
 		loading = true;
 		try {
+			// Apply multiplier to lots before sending
+			const strikesWithMultiplier = selectedStrikes.map(s => ({
+				...s,
+				lots: s.lots * multiplier
+			}));
+
 			const response = await buildPosition({
 				underlying,
 				expiry,
 				strategy_type: strategyType,
-				selected_strikes: selectedStrikes,  // Send manually selected strikes
+				selected_strikes: strikesWithMultiplier,  // Send manually selected strikes with multiplier
 				protection_config: protectionConfig.enabled ? protectionConfig : undefined,
 				place_orders: false
 			});
@@ -64,11 +71,17 @@
 	async function executeOrders() {
 		executing = true;
 		try {
+			// Apply multiplier to lots before sending
+			const strikesWithMultiplier = selectedStrikes.map(s => ({
+				...s,
+				lots: s.lots * multiplier
+			}));
+
 			const response = await buildPosition({
 				underlying,
 				expiry,
 				strategy_type: strategyType,
-				selected_strikes: selectedStrikes,  // Send manually selected strikes
+				selected_strikes: strikesWithMultiplier,  // Send manually selected strikes with multiplier
 				protection_config: protectionConfig.enabled ? protectionConfig : undefined,
 				place_orders: true
 			});
@@ -130,7 +143,7 @@
 					</Table.Header>
 					<Table.Body>
 						{#each selectedStrikes as strike}
-							{@const qty = strike.lot_size * strike.lots}
+							{@const qty = strike.lot_size * strike.lots * multiplier}
 							{@const value = strike.ltp * qty}
 							<Table.Row>
 								<Table.Cell class="font-medium">{strike.tradingsymbol}</Table.Cell>
@@ -145,7 +158,7 @@
 									</Badge>
 								</Table.Cell>
 								<Table.Cell class="text-right font-mono">₹{strike.ltp.toFixed(2)}</Table.Cell>
-								<Table.Cell class="text-right font-mono">{strike.lots}</Table.Cell>
+								<Table.Cell class="text-right font-mono">{strike.lots * multiplier}</Table.Cell>
 								<Table.Cell class="text-right font-mono">{qty}</Table.Cell>
 								<Table.Cell class="text-right font-mono {strike.transaction_type === 'SELL' ? 'text-green-500' : 'text-red-500'}">
 									{strike.transaction_type === 'SELL' ? '+' : '-'}₹{value.toFixed(2)}

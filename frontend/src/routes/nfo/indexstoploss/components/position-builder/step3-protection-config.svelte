@@ -93,6 +93,9 @@
 		// For multi-leg positions, always need both
 		if (selectedStrikes.length > 1) return true;
 		
+		// If no strikes selected, no SL required
+		if (selectedStrikes.length === 0) return false;
+		
 		// For single leg: CE SELL or PE BUY needs upper SL
 		const strike = selectedStrikes[0];
 		return (strike.option_type === 'CE' && strike.transaction_type === 'SELL') ||
@@ -104,6 +107,9 @@
 		
 		// For multi-leg positions, always need both
 		if (selectedStrikes.length > 1) return true;
+		
+		// If no strikes selected, no SL required
+		if (selectedStrikes.length === 0) return false;
 		
 		// For single leg: CE BUY or PE SELL needs lower SL
 		const strike = selectedStrikes[0];

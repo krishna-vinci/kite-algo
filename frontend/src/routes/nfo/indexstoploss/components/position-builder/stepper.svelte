@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Check } from '@lucide/svelte';
+	import { Check, Hammer, Shield, Eye } from '@lucide/svelte';
 	import { Separator } from '$lib/components/ui/separator';
 
 	interface Step {
@@ -20,54 +20,48 @@
 		if (stepId === currentStep) return 'current';
 		return 'upcoming';
 	}
+	
+	function getStepIcon(stepId: number) {
+		switch(stepId) {
+			case 1: return Hammer;
+			case 2: return Shield;
+			case 3: return Eye;
+			default: return Hammer;
+		}
+	}
 </script>
 
 <nav aria-label="Progress">
-	<ol class="flex items-center w-full">
+	<ol class="flex items-center w-full justify-center">
 		{#each steps as step, index (step.id)}
 			{@const status = getStepStatus(step.id)}
 			{@const isLast = index === steps.length - 1}
+			{@const StepIcon = getStepIcon(step.id)}
 			
-			<li class="flex items-center {isLast ? '' : 'flex-1'}">
-				<!-- Step Circle -->
-				<div class="flex flex-col items-center gap-2">
-					<div class="flex items-center gap-4">
-						<div
-							class="
-								flex items-center justify-center
-								w-10 h-10 rounded-full border-2
-								{status === 'completed' ? 'bg-primary border-primary text-primary-foreground' :
-								status === 'current' ? 'border-primary bg-background text-primary' :
-								'border-muted bg-background text-muted-foreground'}
-							"
-						>
-							{#if status === 'completed'}
-								<Check class="h-5 w-5" />
-							{:else}
-								<span class="font-semibold">{step.id}</span>
-							{/if}
-						</div>
-					</div>
-					
-					<!-- Step Label -->
-					<div class="flex flex-col items-center text-center">
-						<p class="
-							text-sm font-medium
-							{status === 'current' ? 'text-foreground' : 'text-muted-foreground'}
-						">
-							{step.title}
-						</p>
-						<p class="text-xs text-muted-foreground hidden sm:block max-w-[120px]">
-							{step.description}
-						</p>
-					</div>
+			<li class="flex items-center">
+				<!-- Step Circle - Minimized -->
+				<div
+					class="
+						flex items-center justify-center
+						w-7 h-7 rounded-full border-2 transition-all
+						{status === 'completed' ? 'bg-primary border-primary text-primary-foreground' :
+						status === 'current' ? 'border-primary bg-background text-primary' :
+						'border-muted bg-background text-muted-foreground'}
+					"
+					title={step.title}
+				>
+					{#if status === 'completed'}
+						<Check class="h-3.5 w-3.5" />
+					{:else}
+						<StepIcon class="h-3.5 w-3.5" />
+					{/if}
 				</div>
 
 				<!-- Separator Line -->
 				{#if !isLast}
 					<Separator 
 						class="
-							flex-1 mx-4 
+							w-8 mx-2
 							{status === 'completed' ? 'bg-primary' : 'bg-muted'}
 						" 
 					/>
