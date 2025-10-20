@@ -121,6 +121,7 @@ class StrikeSelector:
                     "tradingsymbol": ce.get('tsym'),
                     "ltp": ce.get('ltp') or 0,
                     "lot_size": lot_size,
+                    "oi": ce.get('oi'),
                     "greeks": {
                         "delta": ce.get('delta') or 0,
                         "gamma": ce.get('gamma') or 0,
@@ -145,6 +146,7 @@ class StrikeSelector:
                     "tradingsymbol": pe.get('tsym'),
                     "ltp": pe.get('ltp') or 0,
                     "lot_size": lot_size,
+                    "oi": pe.get('oi'),
                     "greeks": {
                         "delta": pe.get('delta') or 0,
                         "gamma": pe.get('gamma') or 0,

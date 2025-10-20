@@ -64,9 +64,9 @@
 	let sidebarCollapsed = $state(false);
 
 	const categories = [
-		{ id: 'bullish' as const, label: 'Bullish', icon: '📈' },
-		{ id: 'bearish' as const, label: 'Bearish', icon: '📉' },
-		{ id: 'neutral' as const, label: 'Neutral', icon: '📊' }
+		{ id: 'bullish' as const, label: 'Bullish' },
+		{ id: 'bearish' as const, label: 'Bearish' },
+		{ id: 'neutral' as const, label: 'Neutral' }
 	];
 
 	const strategiesByCategory = $derived(
@@ -101,6 +101,32 @@
 			? null
 			: calculateMetrics(selectedStrikes, projectedSpot, multiplier)
 	);
+
+	// Calculate price and premium separately
+	const priceAndPremium = $derived.by(() => {
+		if (selectedStrikes.length === 0) return { netPrice: 0, netPremium: 0, isCredit: false };
+		
+		// Net price = sum of (premium × transaction sign) - this is per unit
+		let netPrice = 0;
+		for (const strike of selectedStrikes) {
+			const sign = strike.transaction_type === 'SELL' ? 1 : -1;
+			netPrice += sign * (strike.ltp || 0);
+		}
+		
+		// Net premium = net price × lot size × lots × multiplier
+		let netPremium = 0;
+		for (const strike of selectedStrikes) {
+			const sign = strike.transaction_type === 'SELL' ? 1 : -1;
+			const quantity = strike.lots * strike.lot_size * multiplier;
+			netPremium += sign * (strike.ltp || 0) * quantity;
+		}
+		
+		return {
+			netPrice: Math.round(netPrice),
+			netPremium: Math.round(netPremium),
+			isCredit: netPrice > 0
+		};
+	});
 
 	const projectedPnL = $derived(() => {
 		if (!metrics || payoffData.length === 0) return 0;
@@ -240,11 +266,6 @@
 		}
 	});
 
-	$effect(() => {
-		if (expiryDate()) {
-			daysToExpiry = daysUntilExpiry();
-		}
-	});
 
 	// Store original prices when strikes are selected
 	$effect(() => {
@@ -419,7 +440,7 @@
 									}
 								`}
 							>
-								{category.icon}
+								{category.label}
 							</button>
 						{/each}
 					</div>
@@ -451,24 +472,23 @@
 
 		<!-- Strategy Details -->
 		{#if selectedStrikes.length > 0}
-			<div>
-				<!-- Header -->
-				<div class="flex items-center justify-between mb-2 px-1">
-					<div class="flex items-center gap-2 text-sm font-medium">
-						<input type="checkbox" checked class="h-4 w-4 rounded border-gray-300" />
-						<label class="select-none">{selectedStrikes.length} trades selected</label>
+			<Card.Root>
+				<Card.Header class="pb-3">
+					<div class="flex items-center justify-between">
+						<Card.Title class="text-sm font-medium">
+							{selectedStrikes.length} {selectedStrikes.length === 1 ? 'Position' : 'Positions'} Selected
+						</Card.Title>
+						<Button variant="link" class="h-auto p-0 text-primary" onclick={resetPrices}>
+							<RefreshCw class="h-3.5 w-3.5 mr-1" />
+							Reset Prices
+						</Button>
 					</div>
-					<Button variant="link" class="h-auto p-0 text-primary" onclick={resetPrices}>
-						<RefreshCw class="h-3.5 w-3.5 mr-1" />
-						Reset Prices
-					</Button>
-				</div>
-
+				</Card.Header>
+				<Card.Content class="space-y-3">
 				<!-- Table -->
 				<div class="space-y-2">
 					<!-- Table Header -->
-					<div class="grid grid-cols-[auto_40px_90px_110px_40px_80px_auto] gap-x-2 px-1 text-xs text-muted-foreground font-medium">
-						<div /> <!-- Checkbox col -->
+					<div class="grid grid-cols-[40px_90px_110px_40px_80px_auto] gap-x-2 px-1 text-xs text-muted-foreground font-medium">
 						<div>B/S</div>
 						<div>Expiry</div>
 						<div class="text-center">Strike</div>
@@ -479,8 +499,7 @@
 
 					<!-- Table Body -->
 					{#each selectedStrikes as strike, i}
-						<div class="grid grid-cols-[auto_40px_90px_110px_40px_80px_auto] gap-x-2 items-center">
-							<input type="checkbox" checked class="h-4 w-4 rounded border-gray-300" />
+						<div class="grid grid-cols-[40px_90px_110px_40px_80px_auto] gap-x-2 items-center">
 							
 							<!-- B/S -->
 							<Button
@@ -540,16 +559,24 @@
 							</select>
 						</div>
 
-						<!-- Price Pay -->
+						<!-- Price Get/Pay -->
 						<div>
-							<div class="text-xs text-muted-foreground">Price Pay</div>
-							<div class="text-sm font-semibold">{Math.abs(metrics?.netPremium || 0).toFixed(1)}</div>
+							<div class="text-xs text-muted-foreground">
+								{priceAndPremium.isCredit ? 'Price Get (Credit)' : 'Price Pay (Debit)'}
+							</div>
+							<div class="text-sm font-semibold {priceAndPremium.isCredit ? 'text-green-600' : 'text-red-600'}">
+								₹{Math.abs(priceAndPremium.netPrice).toFixed(2)}
+							</div>
 						</div>
 
-						<!-- Premium Pay -->
+						<!-- Premium Get/Pay -->
 						<div>
-							<div class="text-xs text-muted-foreground">Premium Pay</div>
-							<div class="text-sm font-semibold">{(Math.abs(metrics?.netPremium || 0) * multiplier * (selectedStrikes[0]?.lot_size || 1)).toLocaleString('en-IN')}</div>
+							<div class="text-xs text-muted-foreground">
+								{priceAndPremium.isCredit ? 'Premium Get' : 'Premium Pay'}
+							</div>
+							<div class="text-sm font-semibold {priceAndPremium.isCredit ? 'text-green-600' : 'text-red-600'}">
+								₹{Math.abs(priceAndPremium.netPremium).toLocaleString('en-IN')}
+							</div>
 						</div>
 					</div>
 
@@ -559,7 +586,8 @@
 						Charges
 					</Button>
 				</div>
-			</div>
+				</Card.Content>
+			</Card.Root>
 		{/if}
 	{:else}
 		<!-- Collapsed sidebar view -->
@@ -647,7 +675,7 @@
 					{/if}
 				{:else if activeView === 'chain'}
 					<div class="space-y-2">
-						<div class="flex justify-between items-center">
+						<div class="flex justify-between items-center mb-1">
 							<span class="text-sm font-semibold">Option Chain</span>
 							<Button variant="ghost" size="sm" onclick={onReloadChain}>
 								<RefreshCw class="h-4 w-4 {chainLoading ? 'animate-spin' : ''}" />
@@ -658,55 +686,102 @@
 								<Loader class="h-8 w-8 animate-spin mx-auto" />
 							</div>
 						{:else if chainData && chainData.strikes.length > 0}
-							<div class="max-h-96 overflow-y-auto">
-								<Table.Root>
-									<Table.Header>
-										<Table.Row>
-											<Table.Head class="text-xs">Strike</Table.Head>
-											<Table.Head class="text-xs">CE LTP</Table.Head>
-											<Table.Head class="text-xs">PE LTP</Table.Head>
-											<Table.Head class="text-xs">Actions</Table.Head>
-										</Table.Row>
-									</Table.Header>
-									<Table.Body>
-										{#each chainData.strikes.slice(0, 15) as strike}
-											<Table.Row class={strike.is_atm ? 'bg-primary/5' : ''}>
-												<Table.Cell class="font-mono text-sm">
+							<div class="max-h-[500px] overflow-y-auto border rounded-lg">
+								<table class="w-full text-xs">
+									<thead class="sticky top-0 bg-background border-b">
+										<tr>
+											<!-- CALLS Header -->
+											<th colspan="6" class="py-2 text-center font-semibold text-red-600 border-r">CALLS</th>
+											<!-- STRIKE Header -->
+											<th class="py-2 text-center font-semibold">STRIKE</th>
+											<!-- PUTS Header -->
+											<th colspan="6" class="py-2 text-center font-semibold text-green-600 border-l">PUTS</th>
+										</tr>
+										<tr class="bg-muted/50">
+											<!-- CALLS Columns -->
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Gamma</th>
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Vega</th>
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Theta</th>
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Delta</th>
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">OI</th>
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground border-r">LTP</th>
+											<!-- STRIKE -->
+											<th class="px-3 py-1.5 text-center font-medium">Strike</th>
+											<!-- PUTS Columns -->
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground border-l">LTP</th>
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">OI</th>
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Delta</th>
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Theta</th>
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Vega</th>
+											<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Gamma</th>
+										</tr>
+									</thead>
+									<tbody>
+										{#each chainData.strikes as strike}
+											{@const ceSelected = strike.ce ? isStrikeSelected(strike.ce.instrument_token) : false}
+											{@const peSelected = strike.pe ? isStrikeSelected(strike.pe.instrument_token) : false}
+											<tr 
+												class={`
+													border-b hover:bg-muted/30 transition-colors
+													${strike.is_atm ? 'bg-yellow-50 dark:bg-yellow-950/20' : ''}
+												`}
+											>
+												<!-- CALLS Data -->
+												<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+													{strike.ce?.greeks?.gamma?.toFixed(4) || '—'}
+												</td>
+												<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+													{strike.ce?.greeks?.vega?.toFixed(2) || '—'}
+												</td>
+												<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+													{strike.ce?.greeks?.theta?.toFixed(2) || '—'}
+												</td>
+												<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+													{strike.ce?.greeks?.delta?.toFixed(2) || '—'}
+												</td>
+												<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+													{strike.ce?.oi ? (strike.ce.oi / 100000).toFixed(1) + 'L' : '—'}
+												</td>
+												<td 
+													class={`px-2 py-1.5 text-right font-mono font-medium border-r cursor-pointer ${ceSelected ? 'bg-blue-100 dark:bg-blue-900/30 font-bold' : 'hover:bg-blue-50'}`}
+													onclick={() => strike.ce && toggleStrike(strike.strike, 'CE', strike.ce)}
+												>
+													{strike.ce?.ltp?.toFixed(2) || '—'}
+													{#if ceSelected}<span class="ml-1 text-blue-600">✓</span>{/if}
+												</td>
+												
+												<!-- STRIKE -->
+												<td class="px-3 py-1.5 text-center font-mono font-semibold">
 													{strike.strike}
-													{#if strike.is_atm}<Badge class="ml-1 text-[10px]">ATM</Badge>{/if}
-												</Table.Cell>
-												<Table.Cell class="font-mono text-sm">
-													{strike.ce ? `₹${strike.ce.ltp.toFixed(2)}` : '—'}
-												</Table.Cell>
-												<Table.Cell class="font-mono text-sm">
-													{strike.pe ? `₹${strike.pe.ltp.toFixed(2)}` : '—'}
-												</Table.Cell>
-												<Table.Cell>
-													<div class="flex gap-1">
-														{#if strike.ce}
-															<Button
-																variant={isStrikeSelected(strike.ce.instrument_token) ? 'default' : 'ghost'}
-																size="sm"
-																onclick={() => toggleStrike(strike.strike, 'CE', strike.ce)}
-															>
-																CE
-															</Button>
-														{/if}
-														{#if strike.pe}
-															<Button
-																variant={isStrikeSelected(strike.pe.instrument_token) ? 'default' : 'ghost'}
-																size="sm"
-																onclick={() => toggleStrike(strike.strike, 'PE', strike.pe)}
-															>
-																PE
-															</Button>
-														{/if}
-													</div>
-												</Table.Cell>
-											</Table.Row>
+												</td>
+												
+												<!-- PUTS Data -->
+												<td 
+													class={`px-2 py-1.5 text-right font-mono font-medium border-l cursor-pointer ${peSelected ? 'bg-green-100 dark:bg-green-900/30 font-bold' : 'hover:bg-green-50'}`}
+													onclick={() => strike.pe && toggleStrike(strike.strike, 'PE', strike.pe)}
+												>
+													{strike.pe?.ltp?.toFixed(2) || '—'}
+													{#if peSelected}<span class="ml-1 text-green-600">✓</span>{/if}
+												</td>
+												<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+													{strike.pe?.oi ? (strike.pe.oi / 100000).toFixed(1) + 'L' : '—'}
+												</td>
+												<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+													{strike.pe?.greeks?.delta?.toFixed(2) || '—'}
+												</td>
+												<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+													{strike.pe?.greeks?.theta?.toFixed(2) || '—'}
+												</td>
+												<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+													{strike.pe?.greeks?.vega?.toFixed(2) || '—'}
+												</td>
+												<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+													{strike.pe?.greeks?.gamma?.toFixed(4) || '—'}
+												</td>
+											</tr>
 										{/each}
-									</Table.Body>
-								</Table.Root>
+									</tbody>
+								</table>
 							</div>
 						{:else}
 							<div class="py-8 text-center text-muted-foreground">

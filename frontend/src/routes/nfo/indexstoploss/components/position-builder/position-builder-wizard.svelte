@@ -52,7 +52,18 @@
 		chainLoading = true;
 		chainData = null;
 		try {
-			chainData = await getMiniChain(underlying, expiry);
+			// Dynamically adjust strike count based on selected strategy and underlying
+			// Note: API has max limit of 25 strikes (le=25 validation)
+			let strikeCount = 15; // Default increased slightly for better UX
+			const isBankNifty = underlying.toUpperCase().includes('BANK');
+			
+			if (selectedTemplate?.id.includes('strangle')) {
+				// Strangle needs wider range - use max allowed (25) for both to get best coverage
+				strikeCount = 25; // Max allowed by API, provides ~12 strikes on each side
+			} else if (selectedTemplate?.id.includes('condor')) {
+				strikeCount = isBankNifty ? 23 : 19; // ~10-11 strikes on each side for BANKNIFTY
+			}
+			chainData = await getMiniChain(underlying, expiry, undefined, strikeCount);
 		} catch (e) {
 			console.error('Failed to load chain in wizard:', e);
 			toast.error('Failed to load option chain. Please try again.');

@@ -42,9 +42,9 @@
 	let selectedTemplate = $state<StrategyTemplate | null>(null);
 	
 	const categories = [
-		{ id: 'bullish' as const, label: 'Bullish', icon: '📈' },
-		{ id: 'bearish' as const, label: 'Bearish', icon: '📉' },
-		{ id: 'neutral' as const, label: 'Neutral', icon: '📊' }
+		{ id: 'bullish' as const, label: 'Bullish' },
+		{ id: 'bearish' as const, label: 'Bearish' },
+		{ id: 'neutral' as const, label: 'Neutral' }
 	];
 	
 	const strategiesByCategory = $derived(
@@ -237,7 +237,6 @@
 							}
 						`}
 					>
-						<span class="mr-1">{category.icon}</span>
 						{category.label}
 					</button>
 				{/each}

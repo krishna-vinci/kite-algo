@@ -18,10 +18,10 @@
 	let activeCategory = $state<StrategyCategory>('neutral');
 	
 	const categories = [
-		{ id: 'bullish' as const, label: 'Bullish', icon: '📈', color: 'text-green-600' },
-		{ id: 'bearish' as const, label: 'Bearish', icon: '📉', color: 'text-red-600' },
-		{ id: 'neutral' as const, label: 'Neutral', icon: '📊', color: 'text-blue-600' },
-		{ id: 'others' as const, label: 'Others', icon: '🔧', color: 'text-gray-600' }
+		{ id: 'bullish' as const, label: 'Bullish', color: 'text-green-600' },
+		{ id: 'bearish' as const, label: 'Bearish', color: 'text-red-600' },
+		{ id: 'neutral' as const, label: 'Neutral', color: 'text-blue-600' },
+		{ id: 'others' as const, label: 'Others', color: 'text-gray-600' }
 	];
 	
 	const strategiesByCategory = $derived(() => {
@@ -78,7 +78,6 @@
 					}
 				`}
 			>
-				<span class="mr-2">{category.icon}</span>
 				{category.label}
 			</button>
 		{/each}

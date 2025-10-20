@@ -46,46 +46,42 @@
 
 <div class="rounded-lg border bg-card">
 	<!-- Header -->
-	<div class="flex items-center justify-between p-4 border-b">
-		<h3 class="font-semibold">Option Chain</h3>
+	<div class="flex items-center justify-between p-3 border-b">
+		<h3 class="font-semibold text-sm">Option Chain</h3>
 		{#if loading}
-			<div class="flex items-center gap-2 text-sm text-muted-foreground">
-				<RefreshCw class="h-4 w-4 animate-spin" />
+			<div class="flex items-center gap-2 text-xs text-muted-foreground">
+				<RefreshCw class="h-3 w-3 animate-spin" />
 				Loading...
 			</div>
 		{/if}
 	</div>
 	
 	<!-- Table -->
-	<div class="overflow-x-auto">
-		<table class="w-full">
-			<thead class="bg-muted/50">
+	<div class="overflow-x-auto max-h-[500px]">
+		<table class="w-full text-xs">
+			<thead class="sticky top-0 bg-background border-b">
 				<tr>
-					<th class="px-4 py-3 text-left text-sm font-medium border-r-2 border-border" colspan="4">
-						CALL SIDE
-					</th>
-					<th class="px-4 py-3 text-center text-sm font-medium w-24">
-						STRIKE
-					</th>
-					<th class="px-4 py-3 text-left text-sm font-medium border-l-2 border-border" colspan="4">
-						PUT SIDE
-					</th>
+					<th colspan="6" class="py-2 text-center font-semibold text-red-600 border-r">CALLS</th>
+					<th class="py-2 text-center font-semibold">STRIKE</th>
+					<th colspan="6" class="py-2 text-center font-semibold text-green-600 border-l">PUTS</th>
 				</tr>
-				<tr class="text-xs text-muted-foreground">
-					<!-- Call Headers -->
-					<th class="px-2 py-2 text-right">LTP</th>
-					<th class="px-2 py-2 text-right">Δ</th>
-					<th class="px-2 py-2 text-right">IV</th>
-					<th class="px-2 py-2 text-center border-r-2 border-border">Actions</th>
-					
-					<!-- Strike -->
-					<th class="px-2 py-2"></th>
-					
-					<!-- Put Headers -->
-					<th class="px-2 py-2 text-center border-l-2 border-border">Actions</th>
-					<th class="px-2 py-2 text-right">LTP</th>
-					<th class="px-2 py-2 text-right">Δ</th>
-					<th class="px-2 py-2 text-right">IV</th>
+				<tr class="bg-muted/50">
+					<!-- CALLS Columns -->
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Gamma</th>
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Vega</th>
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Theta</th>
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Delta</th>
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">OI</th>
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground border-r">LTP</th>
+					<!-- STRIKE -->
+					<th class="px-3 py-1.5 text-center font-medium">Strike</th>
+					<!-- PUTS Columns -->
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground border-l">LTP</th>
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">OI</th>
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Delta</th>
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Theta</th>
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Vega</th>
+					<th class="px-2 py-1.5 text-right font-medium text-muted-foreground">Gamma</th>
 				</tr>
 			</thead>
 			
@@ -98,105 +94,61 @@
 					{@const peStrike = getSelectedStrike(strike.strike, 'PE')}
 					
 					<tr class={`
-						border-t transition-colors
-						${isATM ? 'bg-blue-50 dark:bg-blue-950/20' : ''}
+						border-b transition-colors
+						${isATM ? 'bg-yellow-50 dark:bg-yellow-950/20' : ''}
 						${ceSelected || peSelected ? 'bg-primary/5' : 'hover:bg-muted/30'}
 					`}>
-						<!-- CALL SIDE -->
-						<td class="px-2 py-3 text-right text-sm font-mono">
-							{strike.ce?.ltp?.toFixed(2) || '-'}
+						<!-- CALLS Data -->
+						<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+							{strike.ce?.greeks?.gamma?.toFixed(4) || '—'}
 						</td>
-						<td class="px-2 py-3 text-right text-xs text-muted-foreground">
-							{strike.ce?.greeks?.delta?.toFixed(2) || '-'}
+						<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+							{strike.ce?.greeks?.vega?.toFixed(2) || '—'}
 						</td>
-						<td class="px-2 py-3 text-right text-xs text-muted-foreground">
-							{strike.ce?.greeks?.iv?.toFixed(1) || '-'}%
+						<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+							{strike.ce?.greeks?.theta?.toFixed(2) || '—'}
 						</td>
-						<td class="px-2 py-3 border-r-2 border-border">
-							<div class="flex items-center justify-center gap-1">
-								{#if ceSelected && ceStrike}
-									<div class="flex items-center gap-1 px-2 py-1 rounded bg-primary/10 text-xs font-medium">
-										✓ {ceStrike.transactionType === 'BUY' ? 'B' : 'S'}
-									</div>
-								{:else}
-									<button
-										onclick={() => handleBuySell(strike.strike, 'CE', 'BUY')}
-										class="px-2 py-1 text-xs font-medium rounded bg-green-500 hover:bg-green-600 text-white transition-colors"
-										title="Buy Call"
-									>
-										🟢 B
-									</button>
-									<button
-										onclick={() => handleBuySell(strike.strike, 'CE', 'SELL')}
-										class="px-2 py-1 text-xs font-medium rounded bg-red-500 hover:bg-red-600 text-white transition-colors"
-										title="Sell Call"
-									>
-										🔴 S
-									</button>
-									<button
-										onclick={() => onQuickTrade(strike.strike, 'CE', 'SELL')}
-										class="px-2 py-1 text-xs font-medium rounded bg-yellow-500 hover:bg-yellow-600 text-white transition-colors"
-										title="Quick Trade"
-									>
-										⚡
-									</button>
-								{/if}
-							</div>
+						<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+							{strike.ce?.greeks?.delta?.toFixed(2) || '—'}
+						</td>
+						<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+							{strike.ce?.oi ? (strike.ce.oi / 100000).toFixed(1) + 'L' : '—'}
+						</td>
+						<td 
+							class={`px-2 py-1.5 text-right font-mono font-medium border-r cursor-pointer ${ceSelected ? 'bg-blue-100 dark:bg-blue-900/30 font-bold' : 'hover:bg-blue-50'}`}
+							onclick={() => handleBuySell(strike.strike, 'CE', 'SELL')}
+						>
+							{strike.ce?.ltp?.toFixed(2) || '—'}
+							{#if ceSelected}<span class="ml-1 text-blue-600">✓</span>{/if}
 						</td>
 						
 						<!-- STRIKE -->
-						<td class="px-4 py-3 text-center font-bold">
-							{#if isATM}
-								<div class="flex items-center justify-center gap-2">
-									<span class="text-blue-600">★</span>
-									{strike.strike}
-									<span class="text-xs text-muted-foreground">(ATM)</span>
-								</div>
-							{:else}
-								{strike.strike}
-							{/if}
+						<td class="px-3 py-1.5 text-center font-mono font-semibold">
+							{strike.strike}
 						</td>
 						
-						<!-- PUT SIDE -->
-						<td class="px-2 py-3 border-l-2 border-border">
-							<div class="flex items-center justify-center gap-1">
-								{#if peSelected && peStrike}
-									<div class="flex items-center gap-1 px-2 py-1 rounded bg-primary/10 text-xs font-medium">
-										✓ {peStrike.transactionType === 'BUY' ? 'B' : 'S'}
-									</div>
-								{:else}
-									<button
-										onclick={() => handleBuySell(strike.strike, 'PE', 'BUY')}
-										class="px-2 py-1 text-xs font-medium rounded bg-green-500 hover:bg-green-600 text-white transition-colors"
-										title="Buy Put"
-									>
-										🟢 B
-									</button>
-									<button
-										onclick={() => handleBuySell(strike.strike, 'PE', 'SELL')}
-										class="px-2 py-1 text-xs font-medium rounded bg-red-500 hover:bg-red-600 text-white transition-colors"
-										title="Sell Put"
-									>
-										🔴 S
-									</button>
-									<button
-										onclick={() => onQuickTrade(strike.strike, 'PE', 'SELL')}
-										class="px-2 py-1 text-xs font-medium rounded bg-yellow-500 hover:bg-yellow-600 text-white transition-colors"
-										title="Quick Trade"
-									>
-										⚡
-									</button>
-								{/if}
-							</div>
+						<!-- PUTS Data -->
+						<td 
+							class={`px-2 py-1.5 text-right font-mono font-medium border-l cursor-pointer ${peSelected ? 'bg-green-100 dark:bg-green-900/30 font-bold' : 'hover:bg-green-50'}`}
+							onclick={() => handleBuySell(strike.strike, 'PE', 'SELL')}
+						>
+							{strike.pe?.ltp?.toFixed(2) || '—'}
+							{#if peSelected}<span class="ml-1 text-green-600">✓</span>{/if}
 						</td>
-						<td class="px-2 py-3 text-right text-sm font-mono">
-							{strike.pe?.ltp?.toFixed(2) || '-'}
+						<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+							{strike.pe?.oi ? (strike.pe.oi / 100000).toFixed(1) + 'L' : '—'}
 						</td>
-						<td class="px-2 py-3 text-right text-xs text-muted-foreground">
-							{strike.pe?.greeks?.delta?.toFixed(2) || '-'}
+						<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+							{strike.pe?.greeks?.delta?.toFixed(2) || '—'}
 						</td>
-						<td class="px-2 py-3 text-right text-xs text-muted-foreground">
-							{strike.pe?.greeks?.iv?.toFixed(1) || '-'}%
+						<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+							{strike.pe?.greeks?.theta?.toFixed(2) || '—'}
+						</td>
+						<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+							{strike.pe?.greeks?.vega?.toFixed(2) || '—'}
+						</td>
+						<td class="px-2 py-1.5 text-right font-mono text-xs text-muted-foreground">
+							{strike.pe?.greeks?.gamma?.toFixed(4) || '—'}
 						</td>
 					</tr>
 				{/each}

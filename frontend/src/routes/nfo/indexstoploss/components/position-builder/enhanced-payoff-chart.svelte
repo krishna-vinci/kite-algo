@@ -29,6 +29,13 @@
 	}: Props = $props();
 
 	const projectedSpot = $derived(spotPrice * (1 + targetPriceOffset / 100));
+	
+	// Handler to update target price offset when user enters a target price directly
+	function handleTargetPriceChange(newPrice: number) {
+		if (spotPrice > 0) {
+			targetPriceOffset = ((newPrice - spotPrice) / spotPrice) * 100;
+		}
+	}
 
 	const metrics = $derived(
 		strikes.length === 0
@@ -68,8 +75,8 @@
 		let totalCallOI = 0;
 		let totalPutOI = 0;
 		const strikeOI = chainData.strikes.map(s => {
-			const callOI = s.ce?.oi || 0;
-			const putOI = s.pe?.oi || 0;
+			const callOI = s.ce?.oi ?? 0;
+			const putOI = s.pe?.oi ?? 0;
 			totalCallOI += callOI;
 			totalPutOI += putOI;
 			return { strike: s.strike, callOI, putOI };
@@ -87,12 +94,58 @@
 	});
 
 	const yScale = $derived.by(() => {
-		if (payoffExpiryData.length === 0) return { min: -1000, max: 1000, range: 2000 };
-		const allPnls = [...payoffExpiryData.map(d => d.pnl), ...payoffTargetData.map(d => d.pnl)];
-		const min = Math.min(...allPnls, 0);
-		const max = Math.max(...allPnls, 0);
-		const pad = (max - min) * 0.15;
-		return { min: min - pad, max: max + pad, range: max - min + 2 * pad };
+		if (payoffExpiryData.length === 0)
+			return { min: -10000, max: 10000, range: 20000, step: 5000, ticks: [-10000, -5000, 0, 5000, 10000] };
+		const all = [...payoffExpiryData.map(d => d.pnl), ...payoffTargetData.map(d => d.pnl), 0];
+		let min = Math.min(...all);
+		let max = Math.max(...all);
+		if (min === max) {
+			min = min - 1;
+			max = max + 1;
+		}
+		
+		if (max > 0 && Math.abs(min) > max * 3) {
+			min = -max * 3;
+		}
+		
+		const dataRange = Math.abs(max - min);
+		let step = 10000;
+		if (dataRange < 30000) {
+			step = 5000;
+		} else if (dataRange < 60000) {
+			step = 10000;
+		} else if (dataRange < 120000) {
+			step = 20000;
+		} else if (dataRange < 300000) {
+			step = 50000;
+		} else {
+			step = 100000;
+		}
+		
+		if (max > 0) {
+			if (max < step * 3) {
+				max = step * 3;
+			}
+			if (Math.abs(min) < max * 0.3) {
+				min = -max * 0.3;
+			}
+		} else {
+			const absMax = Math.max(Math.abs(min), Math.abs(max));
+			const profitRatio = max / absMax;
+			if (profitRatio > 0 && profitRatio < 0.3) {
+				max = absMax * 0.3;
+			}
+			const lossRatio = Math.abs(min) / absMax;
+			if (lossRatio > 0 && lossRatio < 0.3) {
+				min = -absMax * 0.3;
+			}
+		}
+		
+		const niceMin = Math.floor(min / step) * step;
+		const niceMax = Math.ceil(max / step) * step;
+		const ticks: number[] = [];
+		for (let v = niceMin; v <= niceMax + 1e-9; v += step) ticks.push(v);
+		return { min: niceMin, max: niceMax, range: niceMax - niceMin, step, ticks };
 	});
 	
 	// OI scale for bars
@@ -108,6 +161,8 @@
 	function toSVGY(pnl: number): number {
 		return padding.top + chartHeight - ((pnl - yScale.min) / yScale.range) * chartHeight;
 	}
+
+	const oiBaseY = $derived(padding.top + chartHeight * 0.5);
 
 	// Path for expiry line (dark purple)
 	const pathExpiry = $derived(
@@ -135,27 +190,12 @@
 	const spotX = $derived(toSVGX(spotPrice));
 	const targetX = $derived(toSVGX(projectedSpot));
 
-	const yTicks = $derived.by(() => {
-		const tickCount = 6;
-		const step = yScale.range / (tickCount - 1);
-		return Array.from({ length: tickCount }, (_, i) => yScale.min + i * step);
-	});
+	const yTicks = $derived.by(() => yScale.ticks);
 
 	const xTicks = $derived.by(() => {
 		const tickCount = 9;
 		const step = xScale.range / (tickCount - 1);
 		return Array.from({ length: tickCount }, (_, i) => xScale.min + i * step);
-	});
-	
-	// SD markers (for display purposes)
-	const sdMarkers = $derived.by(() => {
-		const sd = xScale.range * 0.15; // Approximate SD
-		return [
-			{ label: '-2SD', value: spotPrice - 2 * sd },
-			{ label: '-1SD', value: spotPrice - sd },
-			{ label: '1SD', value: spotPrice + sd },
-			{ label: '2SD', value: spotPrice + 2 * sd }
-		].filter(m => m.value >= xScale.min && m.value <= xScale.max);
 	});
 
 	const projectedPnL = $derived(() => {
@@ -175,47 +215,59 @@
 	function toOIBarHeight(oi: number): number {
 		return (oi / maxOI) * (chartHeight * 0.3); // Max 30% of chart height
 	}
+
+	function formatINRShort(n: number): string {
+		const abs = Math.abs(n);
+		const sign = n < 0 ? '-' : '';
+		if (abs >= 1e7) return `${sign}${(abs / 1e7).toFixed(1)}Cr`;
+		if (abs >= 1e5) return `${sign}${(abs / 1e5).toFixed(1)}L`;
+		if (abs >= 1e3) return `${sign}${(abs / 1e3).toFixed(1)}k`;
+		return `${sign}${abs.toFixed(0)}`;
+	}
 </script>
 
 <div class="space-y-3">
-	<!-- Header with OI Info -->
+	<!-- OI Summary & Legend -->
 	<div class="flex items-center justify-between px-2">
-		<div class="text-xs text-muted-foreground">
-			<div class="flex items-center gap-4">
-				<span>OI @ {spotPrice.toFixed(0)}:</span>
-				<span class="inline-flex items-center gap-1">
-					<span class="w-2 h-2 bg-rose-400 rounded-sm"></span>
-					Call {formatOI(oiData.totalCallOI)}
-				</span>
-				<span class="inline-flex items-center gap-1">
-					<span class="w-2 h-2 bg-emerald-400 rounded-sm"></span>
-					Put {formatOI(oiData.totalPutOI)}
-				</span>
-				{#if positionGreeks}
-					<span class="font-mono text-gray-500 border-l pl-3">
-						<span class="text-blue-600">Δ</span> {positionGreeks.delta.toFixed(2)}
-						<span class="text-purple-600 ml-2">Γ</span> {positionGreeks.gamma.toFixed(4)}
-						<span class="text-red-600 ml-2">θ</span> {positionGreeks.theta.toFixed(2)}
-						<span class="text-green-600 ml-2">ν</span> {positionGreeks.vega.toFixed(2)}
-					</span>
-				{/if}
+		<div class="flex items-center gap-6 text-sm">
+			<div class="flex items-center gap-2">
+				<span class="text-muted-foreground">OI data at {chainData?.spot_price?.toFixed(0) || 0}</span>
+			</div>
+			<div class="flex items-center gap-2">
+				<div class="w-3 h-3 rounded-sm bg-pink-400"></div>
+				<span class="font-medium">Call OI {(oiData.totalCallOI / 10000000).toFixed(2)}Cr</span>
+			</div>
+			<div class="flex items-center gap-2">
+				<div class="w-3 h-3 rounded-sm bg-green-400"></div>
+				<span class="font-medium">Put OI {(oiData.totalPutOI / 10000000).toFixed(2)}Cr</span>
 			</div>
 		</div>
-		<div class="flex items-center gap-2">
-			<div class="flex items-center gap-3 text-xs">
-				<span class="flex items-center gap-1">
-					<div class="w-4 h-0.5 bg-purple-800"></div>
-					On Expiry
-				</span>
-				<span class="flex items-center gap-1">
-					<div class="w-4 h-0.5 bg-blue-500"></div>
-					On Target Date
-				</span>
+		<div class="flex items-center gap-4 text-xs">
+			<div class="flex items-center gap-2">
+				<div class="w-8 h-0.5 bg-red-500"></div>
+				<span>On Expiry</span>
 			</div>
-			<Button variant="outline" size="sm" class="h-7">
-				<ZoomOut class="h-3.5 w-3.5 mr-1" />
-				Zoom Out
-			</Button>
+			<div class="flex items-center gap-2">
+				<div class="w-8 h-0.5 bg-blue-500"></div>
+				<span>On Target Date</span>
+			</div>
+		</div>
+	</div>
+
+	<div class="px-2 -mt-1 text-xs text-muted-foreground">
+		<div class="flex gap-6">
+			<div>Δ {positionGreeks.delta.toFixed(2)}</div>
+			<div>Θ {positionGreeks.theta.toFixed(2)}</div>
+			<div>Γ {positionGreeks.gamma.toFixed(4)}</div>
+			<div>V {positionGreeks.vega.toFixed(2)}</div>
+		</div>
+	</div>
+	
+	<!-- Current Price Indicator -->
+	<div class="text-center py-2">
+		<div class="inline-flex items-center gap-2 px-4 py-1.5 bg-gray-50 border rounded-md">
+			<span class="text-xs text-muted-foreground">Current price:</span>
+			<span class="font-mono font-semibold">{projectedSpot.toFixed(2)}</span>
 		</div>
 	</div>
 	
@@ -229,6 +281,9 @@
 				</pattern>
 			</defs>
 			
+			<rect x="{padding.left}" y="{padding.top}" width="{chartWidth}" height="{Math.max(0, zeroY - padding.top)}" fill="#10b981" opacity="0.08" />
+			<rect x="{padding.left}" y="{zeroY}" width="{chartWidth}" height="{Math.max(0, height - padding.bottom - zeroY)}" fill="#ef4444" opacity="0.08" />
+
 			<!-- Breakeven/Target Info Box -->
 			{#if metrics}
 				<foreignObject x={padding.left + 10} y={padding.top + 10} width="220" height="80">
@@ -246,7 +301,7 @@
 						<div class="flex justify-between items-center">
 							<span class="text-muted-foreground">PnL at Target:</span>
 							<span class="font-semibold {projectedPnL() >= 0 ? 'text-green-600' : 'text-red-600'}">
-								{projectedPnL() >= 0 ? '+' : ''}{formatCurrency(projectedPnL())}
+								{formatCurrency(projectedPnL())}
 							</span>
 						</div>
 						<div class="flex justify-between items-center">
@@ -261,35 +316,18 @@
 
 			<!-- Hatched background -->
 			<rect x="{padding.left}" y="{padding.top}" width="{chartWidth}" height="{chartHeight}" fill="url(#hatch)" />
+
+			<line x1={padding.left} x2={width - padding.right} y1={oiBaseY} y2={oiBaseY} stroke="#e5e7eb" stroke-width="1" stroke-dasharray="4 4" />
 			
-			<!-- OI Bars -->
 			{#each oiData.strikeOI as { strike, callOI, putOI }}
 				{@const x = toSVGX(strike)}
 				{@const callHeight = toOIBarHeight(callOI)}
 				{@const putHeight = toOIBarHeight(putOI)}
-				
-				<!-- Call OI bar (pink/red, upward) -->
 				{#if callOI > 0}
-					<rect
-						x={x - 3}
-						y={padding.top}
-						width="6"
-						height={callHeight}
-						fill="#fb7185"
-						opacity="0.6"
-					/>
+					<rect x={x - 3} y={oiBaseY - callHeight} width="6" height={callHeight} fill="#fb7185" opacity="0.6" />
 				{/if}
-				
-				<!-- Put OI bar (green, upward) -->
 				{#if putOI > 0}
-					<rect
-						x={x - 3}
-						y={padding.top}
-						width="6"
-						height={putHeight}
-						fill="#6ee7b7"
-						opacity="0.6"
-					/>
+					<rect x={x - 3} y={oiBaseY} width="6" height={putHeight} fill="#6ee7b7" opacity="0.6" />
 				{/if}
 			{/each}
 			
@@ -384,12 +422,12 @@
 				</g>
 			{/if}
 			<!-- Payoff Lines -->
-			<!-- Expiry line (dark purple) -->
+			<!-- Expiry line (red) -->
 			{#if pathExpiry}
 				<path
 					d={pathExpiry}
 					fill="none"
-					stroke="#6b21a8"
+					stroke="#ef4444"
 					stroke-width="2.5"
 				/>
 			{/if}
@@ -425,7 +463,7 @@
 					fill="#6b7280"
 					font-size="10"
 				>
-					{tick >= 0 ? '' : ''}{(Math.abs(tick) / 1000).toFixed(0)},{((Math.abs(tick) % 1000) / 10).toFixed(0).padStart(3, '0')}
+					{formatINRShort(tick)}
 				</text>
 			{/each}
 			
@@ -479,109 +517,75 @@
 				</text>
 			{/each}
 			
-			<!-- SD markers on X-axis -->
-			{#each sdMarkers as { label, value }}
-				<text
-					x={toSVGX(value)}
-					y={height - padding.bottom + 35}
-					text-anchor="middle"
-					fill="#9ca3af"
-					font-size="9"
-				>
-					{label}
-				</text>
-			{/each}
+			<!-- Projected Profit Display (inside chart) -->
+			{#if metrics && projectedPnL()}
+				{@const pnl = projectedPnL()}
+				{@const pnlPercent = metrics.netPremium !== 0 ? ((pnl / Math.abs(metrics.netPremium)) * 100) : 0}
+				<foreignObject x={(width - 300) / 2} y={height - padding.bottom + 30} width="300" height="40">
+					<div class="flex justify-center font-sans">
+						<div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-md {pnl >= 0 ? 'bg-green-50 border border-green-200' : 'bg-red-50 border border-red-200'}">
+							<span class="text-xs text-muted-foreground">Projected profit:</span>
+							<span class="text-sm font-bold {pnl >= 0 ? 'text-green-600' : 'text-red-600'}">
+								{formatCurrency(pnl)} ({pnl >= 0 ? '+' : ''}{pnlPercent.toFixed(1)}%)
+							</span>
+						</div>
+					</div>
+				</foreignObject>
+			{/if}
 		</svg>
 	</div>
 
-	
 	<!-- Controls Row -->
-	<div class="grid grid-cols-2 gap-4 px-2">
+	<div class="grid grid-cols-2 gap-6 px-2 py-3 border-t">
 		<!-- Target Control -->
-		<div class="space-y-1.5">
+		<div class="space-y-2">
 			<div class="flex items-center justify-between">
-				<span class="text-xs font-medium text-muted-foreground">{underlying} Target</span>
-				<div class="flex items-center gap-1.5">
-					<Button
-						variant="outline"
-						size="sm"
-						class="h-6 w-6 p-0"
-						onclick={() => (targetPriceOffset = Math.max(targetPriceOffset - 0.5, -10))}
-					>
-						−
-					</Button>
-					<span class="font-mono text-xs font-semibold min-w-[70px] text-center">
-						{projectedSpot.toFixed(0)}
-					</span>
-					<Button
-						variant="outline"
-						size="sm"
-						class="h-6 w-6 p-0"
-						onclick={() => (targetPriceOffset = Math.min(targetPriceOffset + 0.5, 10))}
-					>
-						+
-					</Button>
+				<span class="text-sm font-medium">{underlying} Target</span>
+				<div class="flex items-center gap-2">
+					<span class="text-sm font-semibold text-orange-600">{targetPriceOffset.toFixed(1)}%</span>
+					<button class="text-xs text-blue-600 hover:underline" onclick={() => (targetPriceOffset = 0)}>Reset</button>
 				</div>
 			</div>
-			<input
-				type="range"
-				min="-10"
-				max="10"
-				step="0.1"
-				bind:value={targetPriceOffset}
-				class="w-full h-1.5"
-			/>
-			<div class="flex justify-between text-[10px] text-muted-foreground">
-				<Button variant="link" class="h-auto p-0 text-[10px]" onclick={() => targetPriceOffset = 0}>Reset</Button>
-				<span class="font-semibold">{targetPriceOffset > 0 ? '+' : ''}{targetPriceOffset.toFixed(1)}%</span>
+			<div class="flex items-center gap-2">
+				<button
+					onclick={() => targetPriceOffset = Math.max(-15, targetPriceOffset - 0.5)}
+					class="px-2 py-1 border rounded hover:bg-gray-50 text-sm"
+				>−</button>
+				<input
+					type="number"
+					value={projectedSpot.toFixed(0)}
+					oninput={(e) => handleTargetPriceChange(parseFloat(e.currentTarget.value) || spotPrice)}
+					class="w-full px-2 py-1 text-center text-sm border rounded"
+					step="10"
+				/>
+				<button
+					onclick={() => targetPriceOffset = Math.min(15, targetPriceOffset + 0.5)}
+					class="px-2 py-1 border rounded hover:bg-gray-50 text-sm"
+				>+</button>
 			</div>
+			<input type="range" min="-15" max="15" step="0.1" bind:value={targetPriceOffset} class="w-full accent-blue-600" />
 		</div>
 
 		<!-- Date Control -->
-		<div class="space-y-1.5">
+		<div class="space-y-2">
 			<div class="flex items-center justify-between">
-				<span class="text-xs font-medium text-muted-foreground">Date: {daysToExpiry}D to expiry</span>
-				<div class="flex items-center gap-1.5">
-					<Button
-						variant="outline"
-						size="sm"
-						class="h-6 w-6 p-0"
-						onclick={() => (daysToExpiry = Math.max(daysToExpiry - 1, 0))}
-						disabled={daysToExpiry <= 0}
-					>
-						<ChevronLeft class="h-3 w-3" />
-					</Button>
-					<span class="font-mono text-xs font-semibold min-w-[120px] text-center">
-						{new Date(Date.now() + daysToExpiry * 24 * 60 * 60 * 1000).toLocaleDateString('en-GB', {
-							weekday: 'short',
-							day: '2-digit',
-							month: 'short'
-						})}
-					</span>
-					<Button
-						variant="outline"
-						size="sm"
-						class="h-6 w-6 p-0"
-						onclick={() => (daysToExpiry = Math.min(daysToExpiry + 1, maxDaysToExpiry))}
-						disabled={daysToExpiry >= maxDaysToExpiry}
-					>
-						<ChevronRight class="h-3 w-3" />
-					</Button>
-				</div>
+				<span class="text-sm font-medium">Date: <strong>{daysToExpiry}D</strong> to expiry</span>
+				<button class="text-xs text-blue-600 hover:underline" onclick={() => daysToExpiry = 0}>Reset</button>
 			</div>
-			<input
-				type="range"
-				min="0"
-				max={maxDaysToExpiry}
-				step="1"
-				bind:value={daysToExpiry}
-				class="w-full h-1.5"
-			/>
-			<div class="flex justify-between text-[10px] text-muted-foreground">
-				<Button variant="link" class="h-auto p-0 text-[10px]" onclick={() => daysToExpiry = maxDaysToExpiry}>Reset to Today</Button>
-				<span class="flex items-center gap-1"><Info class="h-2.5 w-2.5" />Indicative</span>
-				<span>{new Date(expiry).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })}</span>
+			<div class="flex items-center gap-2">
+				<button
+					onclick={() => daysToExpiry = Math.max(0, daysToExpiry - 1)}
+					class="px-2 py-1 border rounded hover:bg-gray-50 text-sm"
+				>‹</button>
+				<span class="flex-1 text-sm text-muted-foreground text-center">
+					{new Date(Date.now() + daysToExpiry * 86400000).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })}
+				</span>
+				<button
+					onclick={() => daysToExpiry = Math.min(maxDaysToExpiry, daysToExpiry + 1)}
+					class="px-2 py-1 border rounded hover:bg-gray-50 text-sm"
+				>›</button>
 			</div>
+			<input type="range" min="0" max={maxDaysToExpiry} step="1" bind:value={daysToExpiry} class="w-full accent-indigo-600" />
 		</div>
 	</div>
 </div>

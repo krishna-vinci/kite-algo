@@ -48,23 +48,28 @@ export function calculateStrategyStrikes(
 	atmStrike: number,
 	underlying: string = 'NIFTY'
 ): CalculatedStrike[] {
-	// Get strike gap based on underlying
-	const strikeGap = underlying.toUpperCase().includes('BANK')
-		? template.strikeOffset.banknifty
-		: template.strikeOffset.nifty;
+	// Determine if it's BANKNIFTY or NIFTY
+	const isBankNifty = underlying.toUpperCase().includes('BANK');
+	
+	// Get instrument config based on underlying
+	const instrumentConfig = isBankNifty 
+		? template.instruments.banknifty 
+		: template.instruments.nifty;
 
 	const calculatedStrikes: CalculatedStrike[] = [];
 
-	for (const leg of template.legs) {
-		const actualStrike = atmStrike + leg.strikeOffset * strikeGap;
+	// Map each leg with its corresponding offset from the instruments config
+	template.legs.forEach((leg, index) => {
+		const legStrikeOffset = instrumentConfig.strikeOffsets[index] || 0;
+		const actualStrike = atmStrike + legStrikeOffset * instrumentConfig.strikeGap;
 
 		calculatedStrikes.push({
 			strike: actualStrike,
 			optionType: leg.optionType,
 			transactionType: leg.transactionType,
-			strikeOffset: leg.strikeOffset
+			strikeOffset: legStrikeOffset
 		});
-	}
+	});
 
 	return calculatedStrikes;
 }

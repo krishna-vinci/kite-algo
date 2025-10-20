@@ -1,6 +1,40 @@
 /**
  * Strategy Templates for Strategy Builder V2
  * Defines all pre-built option strategies with auto-strike selection
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * HOW TO ADJUST STRIKE OFFSETS:
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * 
+ * Each strategy has an `instruments` section where you can configure strike offsets
+ * separately for NIFTY and BANKNIFTY:
+ * 
+ * instruments: {
+ *   nifty: { 
+ *     strikeGap: 50,              // Strike price gap (usually 50 for NIFTY)
+ *     strikeOffsets: [0, 4, -4]   // Offset for each leg (in number of strikes)
+ *   },
+ *   banknifty: { 
+ *     strikeGap: 100,             // Strike price gap (usually 100 for BANKNIFTY)
+ *     strikeOffsets: [0, 2, -2]   // Offset for each leg (in number of strikes)
+ *   }
+ * }
+ * 
+ * - strikeOffsets array corresponds to legs array (same order)
+ * - Positive offset = strikes above ATM (OTM for CE, ITM for PE)
+ * - Negative offset = strikes below ATM (ITM for CE, OTM for PE)
+ * - 0 = ATM strike
+ * 
+ * Example: Bull Call Spread with 2 legs
+ *   legs: [
+ *     { optionType: 'CE', transactionType: 'BUY', ... },   // Leg 0
+ *     { optionType: 'CE', transactionType: 'SELL', ... }   // Leg 1
+ *   ]
+ *   instruments.nifty.strikeOffsets: [0, 4]
+ *     → Leg 0 (BUY CE): ATM strike
+ *     → Leg 1 (SELL CE): ATM + (4 × 50) = ATM + 200 points
+ * 
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 
 export type StrategyCategory = 'bullish' | 'bearish' | 'neutral' | 'others';
@@ -11,8 +45,13 @@ export type StrikeSelection = 'atm' | 'itm' | 'otm';
 export interface StrategyLeg {
 	optionType: OptionType;
 	transactionType: TransactionType;
-	strikeOffset: number; // Offset from ATM (0=ATM, +4=4 strikes above, -4=4 strikes below)
+	strikeOffset: number; // Number of strikes from ATM (will be multiplied by instrument's strikeGap)
 	strikeSelection: StrikeSelection;
+}
+
+export interface InstrumentConfig {
+	strikeGap: number; // Strike price gap (e.g., 50 for NIFTY, 100 for BANKNIFTY)
+	strikeOffsets: number[]; // Strike offsets for each leg (in number of strikes from ATM)
 }
 
 export interface StrategyTemplate {
@@ -21,12 +60,14 @@ export interface StrategyTemplate {
 	category: StrategyCategory;
 	description: string;
 	shortDesc: string; // For card display
-	legs: StrategyLeg[];
+	legs: StrategyLeg[]; // Base leg structure (optionType, transactionType, strikeSelection)
 	defaultLots: number;
-	strikeOffset: {
-		nifty: number; // Strike gap for NIFTY (e.g., 50)
-		banknifty: number; // Strike gap for BANKNIFTY (e.g., 100)
+	// ═══ INSTRUMENT CONFIGURATION - EASY TO ADJUST ═══
+	instruments: {
+		nifty: InstrumentConfig;
+		banknifty: InstrumentConfig;
 	};
+	// ═════════════════════════════════════════════════
 	payoffType: 'limited' | 'unlimited'; // For chart rendering
 	riskProfile: 'high' | 'medium' | 'low';
 	minPayoffSVG?: string; // Mini payoff chart for card
@@ -48,7 +89,12 @@ export const neutralStrategies: StrategyTemplate[] = [
 			{ optionType: 'PE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'atm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [0, 0] },
+			banknifty: { strikeGap: 100, strikeOffsets: [0, 0] }
+		},
+		// ═══════════════════════════
 		payoffType: 'limited',
 		riskProfile: 'high'
 	},
@@ -59,11 +105,16 @@ export const neutralStrategies: StrategyTemplate[] = [
 		description: 'Sell OTM Call and OTM Put to collect premium with wider range',
 		shortDesc: 'Sell OTM CE + PE',
 		legs: [
-			{ optionType: 'CE', transactionType: 'SELL', strikeOffset: 4, strikeSelection: 'otm' },
-			{ optionType: 'PE', transactionType: 'SELL', strikeOffset: -4, strikeSelection: 'otm' }
+			{ optionType: 'CE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'otm' },
+			{ optionType: 'PE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'otm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [4, -4] },
+			banknifty: { strikeGap: 100, strikeOffsets: [10, -10] }
+		},
+		// ═══════════════════════════
 		payoffType: 'limited',
 		riskProfile: 'high'
 	},
@@ -78,7 +129,12 @@ export const neutralStrategies: StrategyTemplate[] = [
 			{ optionType: 'PE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'atm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [0, 0] },
+			banknifty: { strikeGap: 100, strikeOffsets: [0, 0] }
+		},
+		// ═══════════════════════════
 		payoffType: 'unlimited',
 		riskProfile: 'medium'
 	},
@@ -89,11 +145,16 @@ export const neutralStrategies: StrategyTemplate[] = [
 		description: 'Buy OTM Call and OTM Put for large move expectation',
 		shortDesc: 'Buy OTM CE + PE',
 		legs: [
-			{ optionType: 'CE', transactionType: 'BUY', strikeOffset: 4, strikeSelection: 'otm' },
-			{ optionType: 'PE', transactionType: 'BUY', strikeOffset: -4, strikeSelection: 'otm' }
+			{ optionType: 'CE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'otm' },
+			{ optionType: 'PE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'otm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [4, -4] },
+			banknifty: { strikeGap: 100, strikeOffsets: [10, -10] }
+		},
+		// ═══════════════════════════
 		payoffType: 'unlimited',
 		riskProfile: 'medium'
 	},
@@ -104,13 +165,18 @@ export const neutralStrategies: StrategyTemplate[] = [
 		description: 'Defined risk neutral strategy with 4 legs',
 		shortDesc: 'CE/PE spreads',
 		legs: [
-			{ optionType: 'CE', transactionType: 'SELL', strikeOffset: 2, strikeSelection: 'otm' },
-			{ optionType: 'CE', transactionType: 'BUY', strikeOffset: 4, strikeSelection: 'otm' },
-			{ optionType: 'PE', transactionType: 'SELL', strikeOffset: -2, strikeSelection: 'otm' },
-			{ optionType: 'PE', transactionType: 'BUY', strikeOffset: -4, strikeSelection: 'otm' }
+			{ optionType: 'CE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'otm' },
+			{ optionType: 'CE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'otm' },
+			{ optionType: 'PE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'otm' },
+			{ optionType: 'PE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'otm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [2, 4, -2, -4] },
+			banknifty: { strikeGap: 100, strikeOffsets: [2, 7, -2, -7] }
+		},
+		// ═══════════════════════════
 		payoffType: 'limited',
 		riskProfile: 'low'
 	},
@@ -122,12 +188,17 @@ export const neutralStrategies: StrategyTemplate[] = [
 		shortDesc: 'ATM + wings',
 		legs: [
 			{ optionType: 'CE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'atm' },
-			{ optionType: 'CE', transactionType: 'BUY', strikeOffset: 4, strikeSelection: 'otm' },
+			{ optionType: 'CE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'otm' },
 			{ optionType: 'PE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'atm' },
-			{ optionType: 'PE', transactionType: 'BUY', strikeOffset: -4, strikeSelection: 'otm' }
+			{ optionType: 'PE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'otm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [0, 4, 0, -4] },
+			banknifty: { strikeGap: 100, strikeOffsets: [0, 5, 0, -5] }
+		},
+		// ═══════════════════════════
 		payoffType: 'limited',
 		riskProfile: 'low'
 	}
@@ -148,7 +219,12 @@ export const bullishStrategies: StrategyTemplate[] = [
 			{ optionType: 'CE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'atm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [0] },
+			banknifty: { strikeGap: 100, strikeOffsets: [0] }
+		},
+		// ═══════════════════════════
 		payoffType: 'unlimited',
 		riskProfile: 'medium'
 	},
@@ -162,7 +238,12 @@ export const bullishStrategies: StrategyTemplate[] = [
 			{ optionType: 'PE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'atm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [0] },
+			banknifty: { strikeGap: 100, strikeOffsets: [0] }
+		},
+		// ═══════════════════════════
 		payoffType: 'limited',
 		riskProfile: 'high'
 	},
@@ -174,10 +255,15 @@ export const bullishStrategies: StrategyTemplate[] = [
 		shortDesc: 'Buy ATM, Sell OTM CE',
 		legs: [
 			{ optionType: 'CE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'atm' },
-			{ optionType: 'CE', transactionType: 'SELL', strikeOffset: 4, strikeSelection: 'otm' }
+			{ optionType: 'CE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'otm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [0, 4] },
+			banknifty: { strikeGap: 100, strikeOffsets: [0, 5] }
+		},
+		// ═══════════════════════════
 		payoffType: 'limited',
 		riskProfile: 'low'
 	},
@@ -189,10 +275,15 @@ export const bullishStrategies: StrategyTemplate[] = [
 		shortDesc: 'Sell ATM, Buy OTM PE',
 		legs: [
 			{ optionType: 'PE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'atm' },
-			{ optionType: 'PE', transactionType: 'BUY', strikeOffset: -4, strikeSelection: 'otm' }
+			{ optionType: 'PE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'otm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [0, -4] },
+			banknifty: { strikeGap: 100, strikeOffsets: [0, -5] }
+		},
+		// ═══════════════════════════
 		payoffType: 'limited',
 		riskProfile: 'low'
 	}
@@ -213,7 +304,12 @@ export const bearishStrategies: StrategyTemplate[] = [
 			{ optionType: 'PE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'atm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [0] },
+			banknifty: { strikeGap: 100, strikeOffsets: [0] }
+		},
+		// ═══════════════════════════
 		payoffType: 'unlimited',
 		riskProfile: 'medium'
 	},
@@ -227,7 +323,12 @@ export const bearishStrategies: StrategyTemplate[] = [
 			{ optionType: 'CE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'atm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [0] },
+			banknifty: { strikeGap: 100, strikeOffsets: [0] }
+		},
+		// ═══════════════════════════
 		payoffType: 'limited',
 		riskProfile: 'high'
 	},
@@ -239,10 +340,15 @@ export const bearishStrategies: StrategyTemplate[] = [
 		shortDesc: 'Sell ATM, Buy OTM CE',
 		legs: [
 			{ optionType: 'CE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'atm' },
-			{ optionType: 'CE', transactionType: 'BUY', strikeOffset: 4, strikeSelection: 'otm' }
+			{ optionType: 'CE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'otm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [0, 4] },
+			banknifty: { strikeGap: 100, strikeOffsets: [0, 5] }
+		},
+		// ═══════════════════════════
 		payoffType: 'limited',
 		riskProfile: 'low'
 	},
@@ -254,10 +360,15 @@ export const bearishStrategies: StrategyTemplate[] = [
 		shortDesc: 'Buy ATM, Sell OTM PE',
 		legs: [
 			{ optionType: 'PE', transactionType: 'BUY', strikeOffset: 0, strikeSelection: 'atm' },
-			{ optionType: 'PE', transactionType: 'SELL', strikeOffset: -4, strikeSelection: 'otm' }
+			{ optionType: 'PE', transactionType: 'SELL', strikeOffset: 0, strikeSelection: 'otm' }
 		],
 		defaultLots: 1,
-		strikeOffset: { nifty: 50, banknifty: 100 },
+		// ═══ ADJUST OFFSETS HERE ═══
+		instruments: {
+			nifty: { strikeGap: 50, strikeOffsets: [0, -4] },
+			banknifty: { strikeGap: 100, strikeOffsets: [0, -5] }
+		},
+		// ═══════════════════════════
 		payoffType: 'limited',
 		riskProfile: 'low'
 	}
