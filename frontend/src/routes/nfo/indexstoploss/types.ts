@@ -220,3 +220,195 @@ export interface RealtimePositionsResponse {
 	net: RealtimePosition[];
 	day: RealtimePosition[];
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 3: POSITION BUILDER & OPTION CHAIN MODELS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export interface OptionGreeks {
+	delta: number;
+	gamma: number;
+	theta: number;
+	vega: number;
+	iv: number; // Implied Volatility
+}
+
+export interface OptionSide {
+	instrument_token: number;
+	tradingsymbol: string;
+	ltp: number;
+	lot_size: number;
+	greeks: OptionGreeks;
+	oi?: number; // Open Interest
+}
+
+export interface OptionChainStrike {
+	strike: number;
+	ce: OptionSide | null;
+	pe: OptionSide | null;
+	is_atm: boolean;
+}
+
+export interface MiniChainResponse {
+	underlying: string;
+	expiry: string;
+	spot_price: number;
+	atm_strike: number;
+	strikes: OptionChainStrike[];
+	timestamp: string;
+}
+
+export interface StrikeSuggestion {
+	strategy_type: string;
+	strikes: {
+		ce?: {
+			strike: number;
+			tradingsymbol: string;
+			instrument_token: number;
+			delta: number;
+			ltp: number;
+			lot_size: number;
+		};
+		pe?: {
+			strike: number;
+			tradingsymbol: string;
+			instrument_token: number;
+			delta: number;
+			ltp: number;
+			lot_size: number;
+		};
+	};
+	suggested_lots: number;
+	total_margin_required?: number;
+	max_loss?: number;
+	max_profit?: number;
+	notes: string;
+}
+
+export interface SelectedStrike {
+	instrument_token: number;
+	tradingsymbol: string;
+	strike: number;
+	option_type: 'CE' | 'PE';
+	ltp: number;
+	lot_size: number;
+	delta: number;
+	gamma?: number;
+	theta?: number;
+	vega?: number;
+	oi?: number; // Open Interest
+	lots: number; // User-selected lots
+	transaction_type: 'BUY' | 'SELL';
+}
+
+export interface PositionBuildOrder {
+	tradingsymbol: string;
+	instrument_token: number;
+	transaction_type: 'BUY' | 'SELL';
+	quantity: number;
+	lot_size: number;
+	lots: number;
+	estimated_price: number;
+}
+
+export interface PositionBuildPlan {
+	strategy_type: string;
+	underlying: string;
+	expiry: string;
+	orders: PositionBuildOrder[];
+	total_lots: number;
+	estimated_cost: number;
+	estimated_margin: number;
+	max_profit?: number;
+	max_loss?: number;
+	protection_config?: any;
+}
+
+export interface BuildPositionRequest {
+	underlying: string;
+	expiry: string;
+	strategy_type: string;
+	selected_strikes?: SelectedStrike[];  // Manual strike selection
+	target_delta?: number;  // Auto-selection based on delta
+	risk_amount?: number;
+	protection_config?: any;
+	place_orders: boolean;
+}
+
+export interface BuildPositionResponse {
+	mode: 'dry_run' | 'execution';
+	status?: 'success' | 'failed' | 'partial';
+	plan?: PositionBuildPlan;
+	orders_placed?: any[];
+	orders_failed?: any[];
+	strategy_id?: string;
+	message: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 4: CREATE PROTECTION STRATEGY MODELS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export interface PremiumThresholdConfig {
+	tradingsymbol: string;
+	transaction_type: 'BUY' | 'SELL';
+	entry_price: number;
+	stoploss_price?: number;
+	target_price?: number;
+	trailing_mode?: TrailingMode;
+	trailing_distance?: number;
+	trailing_lock_profit?: number;
+}
+
+export interface CombinedPremiumLevelConfig {
+	level_number: number;
+	profit_points: number;
+	exit_percent: number;
+}
+
+export interface CreateProtectionRequest {
+	// Metadata
+	name?: string;
+	strategy_type?: StrategyType;
+	notes?: string;
+	
+	// Monitoring mode (required)
+	monitoring_mode: MonitoringMode;
+	
+	// Index monitoring config (for index/hybrid/combined modes)
+	index_instrument_token?: number;
+	index_tradingsymbol?: string;
+	index_exchange?: string;
+	index_upper_stoploss?: number;
+	index_lower_stoploss?: number;
+	index_upper_target?: number; // Profit target if index reaches this (upside)
+	index_lower_target?: number; // Profit target if index reaches this (downside)
+	
+	// Order config
+	stoploss_order_type?: OrderType;
+	stoploss_limit_offset?: number;
+	
+	// Index trailing config
+	trailing_mode?: TrailingMode;
+	trailing_distance?: number;
+	trailing_unit?: 'points' | 'percent';
+	trailing_step_size?: number;
+	trailing_lock_profit?: number;
+	
+	// Premium monitoring config (for premium/hybrid modes)
+	premium_thresholds?: Record<string, PremiumThresholdConfig>;
+	
+	// Hybrid mode config
+	exit_logic?: ExitLogic;
+	
+	// Combined premium config (for combined_premium mode)
+	combined_premium_entry_type?: CombinedPremiumEntryType;
+	combined_premium_profit_target?: number;
+	combined_premium_trailing_enabled?: boolean;
+	combined_premium_trailing_distance?: number;
+	combined_premium_trailing_lock_profit?: number;
+	combined_premium_levels?: CombinedPremiumLevelConfig[];
+	
+	// Position identification (required)
+	position_filter: PositionFilter;
+}

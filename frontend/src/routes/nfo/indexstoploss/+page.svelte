@@ -11,14 +11,18 @@
 	} from '$lib/components/ui/resizable';
 	
 	import EngineHealthBadge from './components/shared/engine-health-badge.svelte';
-	import SummaryCards from './components/dashboard/summary-cards.svelte';
 	import StrategiesTable from './components/dashboard/strategies-table.svelte';
 	import PositionsTable from './components/dashboard/positions-table.svelte';
 	import StrategyDetailsSheet from './components/strategy-details-sheet.svelte';
 	import StrategyManager from './components/strategy-manager.svelte';
+	import PositionBuilderWizard from './components/position-builder/position-builder-wizard.svelte';
+	import CreateStrategySheet from './components/create-strategy-sheet.svelte';
+	import EditStrategyDialog from './components/edit-strategy-dialog.svelte';
+	
 	
 	import { listStrategies, updateStrategyStatus } from './lib/api';
 	import type { PageData } from './$types';
+	import type { BuildPositionResponse } from './types';
 	
 	interface Props {
 		data: PageData;
@@ -32,6 +36,11 @@
 	let positions = $state([...(data.positions.net || []), ...(data.positions.day || [])]);
 	let activeTab = $state('dashboard');
 	let refreshing = $state(false);
+	
+	// Active strategies count for indicator dot
+	const activeCount = $derived(
+		strategies.filter(s => s.status === 'active' || s.status === 'partial').length
+	);
 	
 	// Refresh strategies list
 	async function refreshStrategies() {
@@ -56,9 +65,23 @@
 		detailsSheetOpen = true;
 	}
 	
+	// Handle edit strategy
+	function handleEditStrategy(strategyId: string) {
+		console.log('Edit strategy:', strategyId);
+		editStrategyId = strategyId;
+		editDialogOpen = true;
+	}
+	
 	// State for strategy details sheet
 	let detailsSheetOpen = $state(false);
 	let selectedStrategyId = $state<string | null>(null);
+	
+	// State for create strategy sheet
+	let createSheetOpen = $state(false);
+	
+	// State for edit strategy dialog
+	let editDialogOpen = $state(false);
+	let editStrategyId = $state<string | null>(null);
 	
 	// Handle pause/resume strategy
 	async function handlePauseResume(strategyId: string, currentStatus: string) {
@@ -76,9 +99,25 @@
 	
 	// Handle create strategy
 	function handleCreateStrategy() {
-		console.log('Create strategy clicked');
-		// TODO: Open create strategy sheet
-		toast.info('Create strategy feature will be implemented in Phase 4');
+		createSheetOpen = true;
+	}
+	
+	// Handle position builder completion
+	function handlePositionBuilderComplete(response: BuildPositionResponse) {
+		console.log('Position builder complete:', response);
+		
+		// Refresh strategies list
+		refreshStrategies();
+		
+		// Switch to dashboard tab
+		activeTab = 'dashboard';
+		
+		// Show success message with strategy ID if created
+		if (response.strategy_id) {
+			toast.success(`Position built and protected! Strategy ID: ${response.strategy_id}`);
+		} else {
+			toast.success('Position built successfully!');
+		}
 	}
 	
 	onMount(() => {
@@ -92,49 +131,41 @@
 </svelte:head>
 
 <div class="p-4 space-y-4">
-	<!-- Header -->
-	<div class="flex items-center justify-end gap-3">
-		{#if health}
-			<EngineHealthBadge initialHealth={health} />
-		{/if}
-		<Button onclick={handleCreateStrategy}>
-			<Plus class="h-4 w-4 mr-2" />
-			Create Strategy
-		</Button>
-	</div>
 	
 	<!-- Main Content with Tabs -->
 	<Tabs bind:value={activeTab} class="w-full">
-		<TabsList class="grid w-full grid-cols-3">
-			<TabsTrigger value="dashboard" class="gap-2">
-				<LayoutDashboard class="h-4 w-4" />
-				Dashboard
-			</TabsTrigger>
-			<TabsTrigger value="manager" class="gap-2">
-				<Settings class="h-4 w-4" />
-				Strategy Manager
-			</TabsTrigger>
-			<TabsTrigger value="builder" class="gap-2">
-				<Hammer class="h-4 w-4" />
-				Position Builder
-			</TabsTrigger>
-		</TabsList>
+		<div class="flex items-center gap-2">
+			<TabsList class="grid flex-1 grid-cols-3">
+				<TabsTrigger value="dashboard" class="gap-2 relative">
+					<LayoutDashboard class="h-4 w-4" />
+					Dashboard
+					{#if activeCount > 0}
+						<span class="absolute left-1 top-1/2 -translate-y-1/2 w-1.5 h-1.5 bg-green-500 rounded-full" title="{activeCount} active strategies"></span>
+					{/if}
+				</TabsTrigger>
+				<TabsTrigger value="manager" class="gap-2">
+					<Settings class="h-4 w-4" />
+					Strategy Manager
+				</TabsTrigger>
+				<TabsTrigger value="builder" class="gap-2">
+					<Hammer class="h-4 w-4" />
+					Position Builder
+				</TabsTrigger>
+			</TabsList>
+			<Button onclick={handleCreateStrategy} size="sm">
+				<Plus class="h-4 w-4 mr-1.5" />
+				Create Strategy
+			</Button>
+		</div>
 		
 		<!-- Dashboard Tab -->
 		<TabsContent value="dashboard" class="space-y-4">
-			<!-- Summary Cards -->
-			<SummaryCards 
-				strategies={strategies}
-				positions={positions}
-			/>
-			
 			<!-- Resizable Panel Layout -->
 			<ResizablePaneGroup direction="horizontal" class="min-h-[600px] rounded-lg border">
 				<!-- Left Panel: Strategies List -->
 				<ResizablePane defaultSize={50} minSize={30}>
 					<div class="h-full p-4 space-y-4">
-						<div class="flex items-center justify-between">
-							<h2 class="text-lg font-semibold">Active Strategies</h2>
+						<div class="flex items-center justify-end">
 							<Button 
 								variant="ghost" 
 								size="sm" 
@@ -147,6 +178,7 @@
 						<StrategiesTable 
 							strategies={strategies}
 							onViewDetails={handleViewDetails}
+							onEdit={handleEditStrategy}
 							onPauseResume={handlePauseResume}
 						/>
 					</div>
@@ -173,14 +205,19 @@
 		
 		<!-- Position Builder Tab -->
 		<TabsContent value="builder" class="space-y-6">
-			<div class="text-center py-20 text-muted-foreground">
-				<Hammer class="h-16 w-16 mx-auto mb-4 opacity-50" />
-				<h3 class="text-xl font-semibold mb-2">Position Builder</h3>
-				<p>Delta-based position building wizard will be implemented in Phase 5</p>
-			</div>
+			<PositionBuilderWizard onComplete={handlePositionBuilderComplete} />
 		</TabsContent>
 	</Tabs>
 </div>
+
+<!-- Create Strategy Sheet -->
+<CreateStrategySheet
+	bind:open={createSheetOpen}
+	onClose={() => {
+		createSheetOpen = false;
+	}}
+	onCreated={refreshStrategies}
+/>
 
 <!-- Strategy Details Sheet -->
 <StrategyDetailsSheet
@@ -192,6 +229,17 @@
 	}}
 	onDeleted={refreshStrategies}
 	onStatusChanged={refreshStrategies}
+/>
+
+<!-- Edit Strategy Dialog -->
+<EditStrategyDialog
+	bind:open={editDialogOpen}
+	strategyId={editStrategyId}
+	onClose={() => {
+		editDialogOpen = false;
+		editStrategyId = null;
+	}}
+	onUpdated={refreshStrategies}
 />
 
 <style>
