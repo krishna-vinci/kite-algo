@@ -288,3 +288,46 @@ CREATE TABLE IF NOT EXISTS public.user_watchlists (
 -- Index for user watchlists
 CREATE INDEX IF NOT EXISTS idx_user_watchlists_owner
   ON public.user_watchlists (owner_id);
+
+-- =========================================
+-- Kite Connect Webhook / Postback Events
+-- =========================================
+
+-- Table for storing Kite Connect postback events
+CREATE TABLE IF NOT EXISTS public.order_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  event_timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+  received_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  exchange TEXT,
+  tradingsymbol TEXT,
+  instrument_token BIGINT,
+  transaction_type TEXT,
+  quantity INT,
+  filled_quantity INT,
+  average_price NUMERIC(18,6),
+  payload_json JSONB NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+-- Unique constraint for idempotency
+CREATE UNIQUE INDEX IF NOT EXISTS ux_order_events_unique
+  ON public.order_events (order_id, event_timestamp, status);
+
+-- Indexes for efficient querying
+CREATE INDEX IF NOT EXISTS idx_order_events_order_id
+  ON public.order_events (order_id);
+
+CREATE INDEX IF NOT EXISTS idx_order_events_user_id
+  ON public.order_events (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_order_events_status
+  ON public.order_events (status);
+
+CREATE INDEX IF NOT EXISTS idx_order_events_timestamp
+  ON public.order_events (event_timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_order_events_received
+  ON public.order_events (received_at DESC);

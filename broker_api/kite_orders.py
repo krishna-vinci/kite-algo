@@ -1443,3 +1443,492 @@ def delete_gtt_trigger(
 ):
     """Delete an active GTT trigger."""
     return gtt_service.delete_gtt(kite, trigger_id, corr_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KITE CONNECT WEBHOOK / POSTBACK API
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import hashlib
+from sqlalchemy import text
+
+# API Secret for checksum validation
+API_SECRET = os.getenv("KITE_API_SECRET")
+ALLOW_WEBHOOK_TEST_MODE = os.getenv("ALLOW_WEBHOOK_TEST_MODE", "false").lower() == "true"
+
+
+class PostbackPayload(BaseModel):
+    """
+    Complete Pydantic model for Kite Connect Postback API payload.
+    Matches all fields from the official Kite Connect specification.
+    """
+    model_config = ConfigDict(extra="allow")
+    
+    # User and app identification
+    user_id: str
+    app_id: int
+    checksum: str
+    placed_by: str
+    
+    # Order identification
+    order_id: str
+    exchange_order_id: Optional[str] = None
+    parent_order_id: Optional[str] = None
+    
+    # Order status
+    status: str
+    status_message: Optional[str] = None
+    status_message_raw: Optional[str] = None
+    
+    # Timestamps (stored as strings in "YYYY-MM-DD HH:MM:SS" format)
+    order_timestamp: str
+    exchange_update_timestamp: Optional[str] = None
+    exchange_timestamp: Optional[str] = None
+    
+    # Order details
+    variety: str
+    exchange: str
+    tradingsymbol: str
+    instrument_token: int
+    order_type: str
+    transaction_type: str
+    validity: str
+    validity_ttl: Optional[int] = None
+    product: str
+    
+    # Quantities
+    quantity: int
+    disclosed_quantity: int
+    
+    # Prices
+    price: float
+    trigger_price: float
+    average_price: float
+    
+    # Execution details
+    filled_quantity: int
+    pending_quantity: int
+    cancelled_quantity: int
+    unfilled_quantity: int
+    
+    # Additional fields
+    market_protection: int
+    meta: Dict[str, Any] = Field(default_factory=dict)
+    tag: Optional[str] = None
+    tags: Optional[List[str]] = None
+    guid: Optional[str] = None
+    
+    def get_event_timestamp(self) -> datetime:
+        """Parse order_timestamp string to datetime object"""
+        return datetime.strptime(self.order_timestamp, "%Y-%m-%d %H:%M:%S")
+
+
+class OrderEventResponse(BaseModel):
+    """Response model for a stored order event"""
+    id: str
+    order_id: str
+    user_id: str
+    status: str
+    event_timestamp: datetime
+    received_at: datetime
+    exchange: Optional[str]
+    tradingsymbol: Optional[str]
+    instrument_token: Optional[int]
+    transaction_type: Optional[str]
+    quantity: Optional[int]
+    filled_quantity: Optional[int]
+    average_price: Optional[float]
+    payload: Dict[str, Any]
+
+
+class WebhookService:
+    """Service for handling Kite Connect webhook/postback events"""
+    
+    def _compute_checksum(self, order_id: str, order_timestamp: str) -> str:
+        """
+        Compute SHA-256 checksum for webhook validation.
+        Formula: SHA-256(order_id + order_timestamp + api_secret)
+        """
+        if not API_SECRET:
+            raise HTTPException(
+                status_code=500,
+                detail="API_SECRET not configured"
+            )
+        
+        # Concatenate: order_id + order_timestamp + api_secret
+        data_to_hash = f"{order_id}{order_timestamp}{API_SECRET}"
+        
+        # Compute SHA-256 hash
+        checksum = hashlib.sha256(data_to_hash.encode()).hexdigest()
+        
+        return checksum
+    
+    def _validate_checksum(
+        self,
+        payload: PostbackPayload,
+        corr_id: str,
+        test_mode: bool = False
+    ) -> bool:
+        """
+        Validate webhook checksum to ensure authenticity.
+        Returns True if valid, raises HTTPException if invalid.
+        """
+        if test_mode:
+            logger.warning(
+                "Webhook checksum validation BYPASSED (test mode)",
+                extra={"correlation_id": corr_id, "order_id": payload.order_id}
+            )
+            return True
+        
+        # Compute expected checksum
+        expected_checksum = self._compute_checksum(
+            payload.order_id,
+            payload.order_timestamp
+        )
+        
+        # Validate
+        if expected_checksum != payload.checksum:
+            logger.error(
+                "Webhook checksum validation FAILED",
+                extra={
+                    "correlation_id": corr_id,
+                    "order_id": payload.order_id,
+                    "user_id": payload.user_id,
+                    "expected_checksum": expected_checksum,
+                    "received_checksum": payload.checksum
+                }
+            )
+            raise HTTPException(
+                status_code=401,
+                detail="Checksum validation failed - unauthorized postback"
+            )
+        
+        logger.info(
+            "Webhook checksum validation SUCCESS",
+            extra={"correlation_id": corr_id, "order_id": payload.order_id}
+        )
+        return True
+    
+    async def store_event(
+        self,
+        payload: PostbackPayload,
+        corr_id: str,
+        db: Session
+    ) -> Optional[str]:
+        """
+        Store validated webhook event to database with idempotency.
+        Returns event ID if stored, None if duplicate.
+        """
+        try:
+            event_id = str(uuid.uuid4())
+            event_timestamp = payload.get_event_timestamp()
+            
+            # Prepare SQL insert with ON CONFLICT for idempotency
+            insert_sql = text("""
+                INSERT INTO order_events (
+                    id, order_id, user_id, status, event_timestamp, received_at,
+                    exchange, tradingsymbol, instrument_token, transaction_type,
+                    quantity, filled_quantity, average_price, payload_json
+                )
+                VALUES (
+                    :id, :order_id, :user_id, :status, :event_timestamp, NOW(),
+                    :exchange, :tradingsymbol, :instrument_token, :transaction_type,
+                    :quantity, :filled_quantity, :average_price, :payload_json::jsonb
+                )
+                ON CONFLICT (order_id, event_timestamp, status) DO NOTHING
+                RETURNING id
+            """)
+            
+            result = db.execute(insert_sql, {
+                "id": event_id,
+                "order_id": payload.order_id,
+                "user_id": payload.user_id,
+                "status": payload.status,
+                "event_timestamp": event_timestamp,
+                "exchange": payload.exchange,
+                "tradingsymbol": payload.tradingsymbol,
+                "instrument_token": payload.instrument_token,
+                "transaction_type": payload.transaction_type,
+                "quantity": payload.quantity,
+                "filled_quantity": payload.filled_quantity,
+                "average_price": payload.average_price,
+                "payload_json": json.dumps(payload.model_dump())
+            })
+            
+            db.commit()
+            
+            # Check if row was actually inserted (idempotency check)
+            inserted_id = result.fetchone()
+            if inserted_id:
+                logger.info(
+                    "Webhook event stored successfully",
+                    extra={
+                        "correlation_id": corr_id,
+                        "event_id": event_id,
+                        "order_id": payload.order_id,
+                        "status": payload.status
+                    }
+                )
+                return event_id
+            else:
+                logger.info(
+                    "Duplicate webhook event detected (idempotent)",
+                    extra={
+                        "correlation_id": corr_id,
+                        "order_id": payload.order_id,
+                        "status": payload.status
+                    }
+                )
+                return None
+                
+        except Exception as e:
+            db.rollback()
+            logger.error(
+                "Failed to store webhook event",
+                extra={
+                    "correlation_id": corr_id,
+                    "order_id": payload.order_id,
+                    "error": str(e)
+                },
+                exc_info=True
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to store webhook event: {str(e)}"
+            )
+    
+    async def query_events(
+        self,
+        db: Session,
+        order_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        limit: int = 50,
+        offset: int = 0
+    ) -> List[OrderEventResponse]:
+        """
+        Query stored webhook events with filters and pagination.
+        """
+        try:
+            # Build dynamic query
+            conditions = []
+            params = {"limit": limit, "offset": offset}
+            
+            if order_id:
+                conditions.append("order_id = :order_id")
+                params["order_id"] = order_id
+            
+            if user_id:
+                conditions.append("user_id = :user_id")
+                params["user_id"] = user_id
+            
+            if status:
+                conditions.append("status = :status")
+                params["status"] = status
+            
+            if start_date:
+                conditions.append("event_timestamp >= :start_date")
+                params["start_date"] = start_date
+            
+            if end_date:
+                conditions.append("event_timestamp <= :end_date")
+                params["end_date"] = end_date
+            
+            where_clause = " AND ".join(conditions) if conditions else "1=1"
+            
+            query_sql = text(f"""
+                SELECT 
+                    id, order_id, user_id, status, event_timestamp, received_at,
+                    exchange, tradingsymbol, instrument_token, transaction_type,
+                    quantity, filled_quantity, average_price, payload_json
+                FROM order_events
+                WHERE {where_clause}
+                ORDER BY event_timestamp DESC
+                LIMIT :limit OFFSET :offset
+            """)
+            
+            result = db.execute(query_sql, params)
+            rows = result.fetchall()
+            
+            # Convert to response models
+            events = []
+            for row in rows:
+                events.append(OrderEventResponse(
+                    id=str(row[0]),
+                    order_id=row[1],
+                    user_id=row[2],
+                    status=row[3],
+                    event_timestamp=row[4],
+                    received_at=row[5],
+                    exchange=row[6],
+                    tradingsymbol=row[7],
+                    instrument_token=row[8],
+                    transaction_type=row[9],
+                    quantity=row[10],
+                    filled_quantity=row[11],
+                    average_price=row[12],
+                    payload=row[13]
+                ))
+            
+            return events
+            
+        except Exception as e:
+            logger.error(f"Failed to query webhook events: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to query events: {str(e)}"
+            )
+
+
+# ---------------- Webhook Router Endpoints ----------------
+webhook_service = WebhookService()
+
+
+@router.post(
+    "/webhooks/orders/postback",
+    status_code=200,
+    description="Kite Connect Postback webhook endpoint"
+)
+async def receive_order_postback(
+    request: Request,
+    db: Session = Depends(get_db),
+    x_test_mode: Optional[str] = Header(None, alias="X-Test-Mode"),
+    corr_id: str = Depends(get_correlation_id)
+):
+    """
+    Webhook endpoint for receiving Kite Connect order postback notifications.
+    
+    This endpoint:
+    - Receives POST requests with JSON payload from Kite Connect
+    - Validates checksum (SHA-256 of order_id + order_timestamp + api_secret)
+    - Stores validated events to database with idempotency
+    - Returns 200 OK for both new and duplicate events
+    - Returns 401 if checksum validation fails
+    - Returns 400 if payload is malformed
+    
+    Test Mode:
+    - Set header `X-Test-Mode: true` to bypass checksum validation
+    - Only works if environment variable `ALLOW_WEBHOOK_TEST_MODE=true`
+    """
+    log_ctx = {"correlation_id": corr_id}
+    
+    try:
+        # Read raw body
+        body = await request.body()
+        body_str = body.decode('utf-8')
+        
+        # Parse JSON
+        try:
+            payload_dict = json.loads(body_str)
+        except json.JSONDecodeError as e:
+            logger.error(
+                "Webhook JSON parsing failed",
+                extra={**log_ctx, "error": str(e), "body_preview": body_str[:200]}
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid JSON payload: {str(e)}"
+            )
+        
+        # Validate with Pydantic
+        try:
+            payload = PostbackPayload.model_validate(payload_dict)
+        except Exception as e:
+            logger.error(
+                "Webhook payload validation failed",
+                extra={**log_ctx, "error": str(e), "payload": payload_dict}
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Payload validation failed: {str(e)}"
+            )
+        
+        # Log received postback
+        logger.info(
+            "Webhook postback received",
+            extra={
+                **log_ctx,
+                "order_id": payload.order_id,
+                "status": payload.status,
+                "user_id": payload.user_id,
+                "tradingsymbol": payload.tradingsymbol
+            }
+        )
+        
+        # Check test mode
+        test_mode = False
+        if x_test_mode and x_test_mode.lower() == "true":
+            if not ALLOW_WEBHOOK_TEST_MODE:
+                logger.warning(
+                    "Test mode requested but not allowed",
+                    extra={**log_ctx, "order_id": payload.order_id}
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail="Test mode not enabled on server"
+                )
+            test_mode = True
+        
+        # Validate checksum
+        webhook_service._validate_checksum(payload, corr_id, test_mode)
+        
+        # Store event (with idempotency)
+        event_id = await webhook_service.store_event(payload, corr_id, db)
+        
+        # Return success (200 OK for both new and duplicate events)
+        return {
+            "status": "ok",
+            "event_id": event_id,
+            "duplicate": event_id is None,
+            "order_id": payload.order_id
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Webhook processing failed",
+            extra={**log_ctx, "error": str(e)},
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Webhook processing failed: {str(e)}"
+        )
+
+
+@router.get(
+    "/webhooks/orders/events",
+    response_model=List[OrderEventResponse],
+    description="Query stored webhook events"
+)
+async def query_webhook_events(
+    order_id: Optional[str] = Query(None, description="Filter by order ID"),
+    user_id: Optional[str] = Query(None, description="Filter by user ID"),
+    status: Optional[str] = Query(None, description="Filter by order status"),
+    start_date: Optional[datetime] = Query(None, description="Filter by start date (event_timestamp)"),
+    end_date: Optional[datetime] = Query(None, description="Filter by end date (event_timestamp)"),
+    limit: int = Query(50, ge=1, le=500, description="Number of events to return"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+    db: Session = Depends(get_db)
+):
+    """
+    Query stored webhook events with filters and pagination.
+    
+    Returns events ordered by event_timestamp descending (most recent first).
+    Each event includes the complete postback payload in the `payload` field.
+    
+    Use pagination (limit/offset) for large result sets.
+    """
+    return await webhook_service.query_events(
+        db=db,
+        order_id=order_id,
+        user_id=user_id,
+        status=status,
+        start_date=start_date,
+        end_date=end_date,
+        limit=limit,
+        offset=offset
+    )
