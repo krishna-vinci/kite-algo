@@ -5,7 +5,7 @@
 	import * as Card from '$lib/components/ui/card';
 	import * as Table from '$lib/components/ui/table';
 	import * as AlertDialog from '$lib/components/ui/alert-dialog';
-	import { Loader, CheckCircle, AlertTriangle } from '@lucide/svelte';
+	import { Loader, CheckCircle, AlertTriangle, FlaskConical } from '@lucide/svelte';
 	import { buildPosition } from '../../lib/api';
 	import type { SelectedStrike, BuildPositionResponse, PositionBuildPlan } from '../../types';
 
@@ -87,7 +87,7 @@
 			});
 
 			if (response.status === 'success' || response.status === 'partial') {
-				toast.success('Position built successfully!');
+					toast.success('Position built successfully!');
 				onComplete(response);
 			} else {
 				toast.error('Failed to build position');
@@ -272,8 +272,8 @@
 	<AlertDialog.Content>
 		<AlertDialog.Header>
 			<AlertDialog.Title class="flex items-center gap-2">
-				<AlertTriangle class="h-5 w-5 text-yellow-500" />
-				Confirm Order Execution
+					<AlertTriangle class="h-5 w-5 text-yellow-500" />
+					Confirm Order Execution
 			</AlertDialog.Title>
 			<AlertDialog.Description>
 				This will place {selectedStrikes.length} market order(s) for {totalLots} lot(s).

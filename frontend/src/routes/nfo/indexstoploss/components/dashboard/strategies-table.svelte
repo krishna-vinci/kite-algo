@@ -8,7 +8,7 @@
 		TableRow
 	} from '$lib/components/ui/table';
 	import { Button } from '$lib/components/ui/button';
-	import { Eye, Pause, Play } from '@lucide/svelte';
+	import { Eye, Pause, Play, Pencil } from '@lucide/svelte';
 	import ModeBadge from '../shared/mode-badge.svelte';
 	import StatusBadge from '../shared/status-badge.svelte';
 	import type { StrategyListItem } from '../../types';
@@ -17,17 +17,27 @@
 	interface Props {
 		strategies: StrategyListItem[];
 		onViewDetails?: (strategyId: string) => void;
+		onEdit?: (strategyId: string) => void;
 		onPauseResume?: (strategyId: string, currentStatus: string) => void;
 	}
 	
-	let { strategies, onViewDetails, onPauseResume }: Props = $props();
+	let { strategies, onViewDetails, onEdit, onPauseResume }: Props = $props();
 	
 	function handleView(strategyId: string) {
 		onViewDetails?.(strategyId);
 	}
 	
+	function handleEdit(strategyId: string) {
+		onEdit?.(strategyId);
+	}
+	
 	function handlePauseResume(strategyId: string, status: string) {
 		onPauseResume?.(strategyId, status);
+	}
+	
+	// Check if strategy can be edited (not completed, triggered, or error)
+	function canEdit(status: string): boolean {
+		return !['completed', 'triggered', 'error'].includes(status);
 	}
 </script>
 
@@ -81,7 +91,7 @@
 							{strategy.last_evaluated_at ? formatRelativeTime(strategy.last_evaluated_at) : 'Never'}
 						</TableCell>
 						<TableCell class="text-right">
-							<div class="flex items-center justify-end gap-2">
+							<div class="flex items-center justify-end gap-1">
 								<Button
 									variant="ghost"
 									size="sm"
@@ -90,6 +100,16 @@
 								>
 									<Eye class="h-4 w-4" />
 								</Button>
+								{#if canEdit(strategy.status)}
+									<Button
+										variant="ghost"
+										size="sm"
+										onclick={() => handleEdit(strategy.strategy_id)}
+										title="Edit Strategy"
+									>
+										<Pencil class="h-4 w-4" />
+									</Button>
+								{/if}
 								{#if strategy.status === 'active' || strategy.status === 'partial'}
 									<Button
 										variant="ghost"

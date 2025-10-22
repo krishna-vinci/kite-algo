@@ -106,6 +106,35 @@ export async function updateStrategyStatus(
 }
 
 /**
+ * Update strategy parameters (stoploss levels, trailing config, name)
+ */
+export async function updateStrategy(
+	strategyId: string,
+	updates: {
+		name?: string;
+		index_upper_stoploss?: number;
+		index_lower_stoploss?: number;
+		trailing_mode?: string;
+		trailing_distance?: number;
+		trailing_lock_profit?: number;
+		premium_thresholds?: Record<string, any>;
+	}
+): Promise<ProtectionStrategyResponse> {
+	const response = await apiFetch(`${API_PREFIX}/${strategyId}`, {
+		method: 'PATCH',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(updates)
+	});
+	
+	if (!response.ok) {
+		const error = await response.json().catch(() => ({ detail: response.statusText }));
+		throw new Error(error.detail || 'Failed to update strategy');
+	}
+	
+	return response.json();
+}
+
+/**
  * Delete a strategy (must be paused first)
  */
 export async function deleteStrategy(

@@ -704,6 +704,241 @@ async def delete_strategy(strategy_id: UUID):
             conn.close()
 
 
+@router.patch("/{strategy_id}", response_model=ProtectionStrategyResponse)
+async def update_strategy(
+    strategy_id: UUID,
+    req: UpdateProtectionRequest,
+    request: Request
+):
+    """
+    Update strategy parameters (stoploss levels, trailing config, name).
+    
+    - Cannot edit strategies in 'completed', 'triggered', or 'error' status
+    - Only updates fields provided in request (partial update)
+    - Resets trailing state if trailing config is modified
+    - Forces engine reload if strategy is active/partial
+    - Logs 'updated' event with change details
+    """
+    conn = None
+    try:
+        engine = _get_engine(request)
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # 1. Fetch current strategy
+        cur.execute(
+            """
+            SELECT status, monitoring_mode, index_upper_stoploss, index_lower_stoploss,
+                   trailing_mode, trailing_distance
+            FROM position_protection_strategies WHERE id = %s
+            """,
+            (strategy_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+        
+        current_status = row[0]
+        
+        # 2. Validate status - cannot edit completed/triggered/error strategies
+        if current_status in ('completed', 'triggered', 'error'):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot edit strategy with status '{current_status}'. Only active, paused, or partial strategies can be edited."
+            )
+        
+        # 3. Validate stoploss levels
+        if req.index_upper_stoploss is not None and req.index_lower_stoploss is not None:
+            if req.index_upper_stoploss <= req.index_lower_stoploss:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Upper stoploss must be greater than lower stoploss"
+                )
+        elif req.index_upper_stoploss is not None and row[3] is not None:  # lower exists
+            if req.index_upper_stoploss <= row[3]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Upper stoploss must be greater than current lower stoploss ({row[3]})"
+                )
+        elif req.index_lower_stoploss is not None and row[2] is not None:  # upper exists
+            if req.index_lower_stoploss >= row[2]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Lower stoploss must be less than current upper stoploss ({row[2]})"
+                )
+        
+        # 4. Validate trailing distance
+        if req.trailing_distance is not None and req.trailing_distance <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Trailing distance must be greater than 0"
+            )
+        
+        # 5. Build dynamic UPDATE query
+        update_fields = []
+        params = []
+        changes = {}
+        
+        if req.name is not None:
+            update_fields.append("name = %s")
+            params.append(req.name)
+            changes['name'] = req.name
+        
+        if req.index_upper_stoploss is not None:
+            update_fields.append("index_upper_stoploss = %s")
+            params.append(req.index_upper_stoploss)
+            changes['index_upper_stoploss'] = req.index_upper_stoploss
+        
+        if req.index_lower_stoploss is not None:
+            update_fields.append("index_lower_stoploss = %s")
+            params.append(req.index_lower_stoploss)
+            changes['index_lower_stoploss'] = req.index_lower_stoploss
+        
+        # Check if trailing config is being modified
+        trailing_modified = False
+        if req.trailing_mode is not None:
+            update_fields.append("trailing_mode = %s")
+            params.append(req.trailing_mode.value)
+            changes['trailing_mode'] = req.trailing_mode.value
+            trailing_modified = True
+        
+        if req.trailing_distance is not None:
+            update_fields.append("trailing_distance = %s")
+            params.append(req.trailing_distance)
+            changes['trailing_distance'] = req.trailing_distance
+            trailing_modified = True
+        
+        if req.trailing_lock_profit is not None:
+            update_fields.append("trailing_lock_profit = %s")
+            params.append(req.trailing_lock_profit)
+            changes['trailing_lock_profit'] = req.trailing_lock_profit
+            trailing_modified = True
+        
+        # Premium thresholds update
+        if req.premium_thresholds is not None:
+            premium_thresholds_json = json.dumps({
+                token: config.model_dump() for token, config in req.premium_thresholds.items()
+            })
+            update_fields.append("premium_thresholds = %s")
+            params.append(premium_thresholds_json)
+            changes['premium_thresholds'] = 'updated'
+        
+        # If no fields to update, return error
+        if not update_fields:
+            raise HTTPException(
+                status_code=400,
+                detail="No fields to update. Provide at least one field to modify."
+            )
+        
+        # Reset trailing state if trailing config modified
+        if trailing_modified:
+            update_fields.extend([
+                "trailing_activated = false",
+                "trailing_current_level = NULL"
+            ])
+            changes['trailing_state_reset'] = True
+        
+        # Always update timestamp
+        update_fields.append("updated_at = NOW()")
+        
+        # 6. Execute UPDATE
+        query = f"""
+            UPDATE position_protection_strategies 
+            SET {', '.join(update_fields)}
+            WHERE id = %s
+            RETURNING updated_at
+        """
+        params.append(strategy_id)
+        
+        cur.execute(query, params)
+        updated_at = cur.fetchone()[0]
+        conn.commit()
+        
+        logger.info(f"Strategy {strategy_id} updated. Changes: {changes}")
+        
+        # 7. Log update event
+        cur.execute(
+            """
+            INSERT INTO strategy_events (strategy_id, event_type, meta, created_at)
+            VALUES (%s, 'updated', %s, NOW())
+            """,
+            (strategy_id, json.dumps({"changes": changes}))
+        )
+        conn.commit()
+        
+        # 8. Force engine reload if strategy is active/partial
+        if current_status in ('active', 'partial'):
+            await engine._load_active_strategies()
+            logger.info(f"Engine reloaded after strategy {strategy_id} update")
+        
+        # 9. Fetch and return updated strategy
+        cur.execute(
+            """
+            SELECT
+                id, name, strategy_type, monitoring_mode, status,
+                index_instrument_token, index_tradingsymbol,
+                index_upper_stoploss, index_lower_stoploss,
+                trailing_mode, trailing_distance, trailing_activated,
+                trailing_current_level,
+                position_snapshot, remaining_quantities,
+                placed_orders, levels_executed, stoploss_executed,
+                last_evaluated_price, last_evaluated_at,
+                created_at, updated_at
+            FROM position_protection_strategies
+            WHERE id = %s
+            """,
+            (strategy_id,)
+        )
+        row = cur.fetchone()
+        
+        # Parse position snapshot
+        position_snapshot = []
+        if row[13]:
+            for pos_data in row[13]:
+                position_snapshot.append(PositionSnapshot(**pos_data))
+        
+        total_lots = sum(pos.lots for pos in position_snapshot)
+        
+        return ProtectionStrategyResponse(
+            strategy_id=row[0],
+            name=row[1],
+            strategy_type=row[2],
+            monitoring_mode=row[3],
+            status=row[4],
+            index_instrument_token=row[5],
+            index_tradingsymbol=row[6],
+            index_upper_stoploss=row[7],
+            index_lower_stoploss=row[8],
+            trailing_mode=row[9],
+            trailing_distance=row[10],
+            trailing_activated=row[11] or False,
+            trailing_current_level=row[12],
+            positions_captured=len(position_snapshot),
+            total_lots=float(total_lots),
+            position_snapshot=position_snapshot,
+            remaining_quantities=row[14] or {},
+            placed_orders=row[15] or [],
+            levels_executed=row[16] or [],
+            stoploss_executed=row[17] or False,
+            last_evaluated_price=row[18],
+            last_evaluated_at=row[19],
+            created_at=row[20],
+            updated_at=row[21]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update strategy {strategy_id}: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+
 @router.get("/{strategy_id}/events", response_model=EventsResponse)
 async def get_strategy_events(
     strategy_id: UUID,

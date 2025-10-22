@@ -17,6 +17,8 @@
 	import StrategyManager from './components/strategy-manager.svelte';
 	import PositionBuilderWizard from './components/position-builder/position-builder-wizard.svelte';
 	import CreateStrategySheet from './components/create-strategy-sheet.svelte';
+	import EditStrategyDialog from './components/edit-strategy-dialog.svelte';
+	
 	
 	import { listStrategies, updateStrategyStatus } from './lib/api';
 	import type { PageData } from './$types';
@@ -63,12 +65,23 @@
 		detailsSheetOpen = true;
 	}
 	
+	// Handle edit strategy
+	function handleEditStrategy(strategyId: string) {
+		console.log('Edit strategy:', strategyId);
+		editStrategyId = strategyId;
+		editDialogOpen = true;
+	}
+	
 	// State for strategy details sheet
 	let detailsSheetOpen = $state(false);
 	let selectedStrategyId = $state<string | null>(null);
 	
 	// State for create strategy sheet
 	let createSheetOpen = $state(false);
+	
+	// State for edit strategy dialog
+	let editDialogOpen = $state(false);
+	let editStrategyId = $state<string | null>(null);
 	
 	// Handle pause/resume strategy
 	async function handlePauseResume(strategyId: string, currentStatus: string) {
@@ -165,6 +178,7 @@
 						<StrategiesTable 
 							strategies={strategies}
 							onViewDetails={handleViewDetails}
+							onEdit={handleEditStrategy}
 							onPauseResume={handlePauseResume}
 						/>
 					</div>
@@ -215,6 +229,17 @@
 	}}
 	onDeleted={refreshStrategies}
 	onStatusChanged={refreshStrategies}
+/>
+
+<!-- Edit Strategy Dialog -->
+<EditStrategyDialog
+	bind:open={editDialogOpen}
+	strategyId={editStrategyId}
+	onClose={() => {
+		editDialogOpen = false;
+		editStrategyId = null;
+	}}
+	onUpdated={refreshStrategies}
 />
 
 <style>
