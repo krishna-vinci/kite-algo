@@ -37,7 +37,7 @@
   let es: EventSource | null = null;
   let sseConnected = false;
   const API_BASE = (import.meta.env?.VITE_API_BASE as string) || '';
-  const sseUrl = API_BASE.replace(/\/$/, '') + '/alerts/events';
+  const sseUrl = API_BASE.replace(/\/$/, '') + '/broker/alerts/events';
 
   let showBanner = false;
   let bannerTitle = 'Alert Triggered';

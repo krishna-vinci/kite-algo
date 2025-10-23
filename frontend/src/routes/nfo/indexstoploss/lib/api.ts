@@ -16,7 +16,7 @@ import type {
 	BuildPositionResponse
 } from '../types';
 
-const API_PREFIX = '/strategies';
+const API_PREFIX = '/broker/strategies';
 
 /**
  * Get list of all strategies with optional filters

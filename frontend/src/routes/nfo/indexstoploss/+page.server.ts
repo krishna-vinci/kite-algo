@@ -3,26 +3,23 @@
  * Phase 1: Fetch initial data for SSR
  */
 
-import { getApiBase } from '$lib/api';
 import type { PageServerLoad } from './$types';
 import type { StrategyListResponse, EngineHealthResponse, RealtimePositionsResponse } from './types';
 
 export const load: PageServerLoad = async ({ fetch, cookies }) => {
-	const base = getApiBase();
-	
-	// Get session ID from cookies for authentication
-	const sessionId = cookies.get('kite_session_id');
-	const headers: HeadersInit = {};
-	if (sessionId) {
-		headers['X-Session-ID'] = sessionId;
-	}
-	
-	// Fetch strategies, health, and positions in parallel
-	const [strategiesRes, healthRes, positionsRes] = await Promise.allSettled([
-		fetch(`${base}/strategies/?limit=50`, { credentials: 'include', headers }),
-		fetch(`${base}/strategies/health`, { credentials: 'include', headers }),
-		fetch(`${base}/broker/positions/realtime`, { credentials: 'include', headers })
-	]);
+    // Get session ID from cookies for authentication
+    const sessionId = cookies.get('kite_session_id');
+    const headers: HeadersInit = {};
+    if (sessionId) {
+        headers['X-Session-ID'] = sessionId;
+    }
+    
+    // Fetch strategies, health, and positions in parallel
+    const [strategiesRes, healthRes, positionsRes] = await Promise.allSettled([
+        fetch('/broker/strategies/?limit=50', { credentials: 'include', headers }),
+        fetch('/broker/strategies/health', { credentials: 'include', headers }),
+        fetch('/broker/positions/realtime', { credentials: 'include', headers })
+    ]);
 	
 	// Parse strategies
 	let strategies: StrategyListResponse = { total: 0, strategies: [] };
