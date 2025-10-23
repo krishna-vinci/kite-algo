@@ -14,14 +14,10 @@ export function getApiBase(): string {
         return env.replace(/\/+$/, '');
     }
     
-    // 2) In browser: use relative URLs (empty string) to leverage Vite proxy in dev
-    //    or same-origin in production behind reverse proxy
-    if (typeof window !== 'undefined') {
-        return '';
-    }
-    
-    // 3) SSR fallback: direct backend URL
-    return 'http://localhost:8777';
+    // 2) Always use relative URLs (empty string) in both browser and SSR
+    //    - Dev: Vite proxy handles /broker -> localhost:8777
+    //    - Prod: Caddy reverse proxy handles /broker -> backend container
+    return '';
 }
 
 export function setSessionId(id: string | null | undefined) {
