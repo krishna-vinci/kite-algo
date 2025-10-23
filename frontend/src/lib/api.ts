@@ -8,22 +8,19 @@
 const SESSION_STORAGE_KEY = 'kite_session_id';
 
 export function getApiBase(): string {
-    // Production: use relative URLs (same-origin). Assumes non-localhost in prod.
-    if (typeof window !== 'undefined' && window.location.hostname !== 'localhost') {
-        return '';
-    }
-    // Development: keep existing logic and env override
+    // 1) Explicit override via env (for cross-device dev access)
     const env = (import.meta as any).env?.VITE_API_BASE_URL as string | undefined;
     if (env && typeof env === 'string' && env.trim().length > 0) {
         return env.replace(/\/+$/, '');
     }
+    
+    // 2) In browser: use relative URLs (empty string) to leverage Vite proxy in dev
+    //    or same-origin in production behind reverse proxy
     if (typeof window !== 'undefined') {
-        const proto = window.location.protocol || 'http:';
-        const host = window.location.hostname || 'localhost';
-        const port = '8777';
-        return `${proto}//${host}:${port}`;
+        return '';
     }
-    // Fallback for SSR or unknown environment
+    
+    // 3) SSR fallback: direct backend URL
     return 'http://localhost:8777';
 }
 
@@ -372,6 +369,65 @@ export function buildOptionsSessionWsUrl(underlying: string): string {
 export function buildOptionsSessionSseUrl(underlying: string): string {
   const base = getApiBase(); // e.g., http://localhost:8777
   return `${base}/broker/sse/options/session/${encodeURIComponent(underlying)}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WEBHOOK EVENTS API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export interface WebhookEvent {
+  id: string;
+  order_id: string;
+  user_id: string;
+  status: string;
+  event_timestamp: string;
+  received_at: string;
+  exchange: string | null;
+  tradingsymbol: string | null;
+  instrument_token: number | null;
+  transaction_type: string | null;
+  quantity: number | null;
+  filled_quantity: number | null;
+  average_price: number | null;
+  payload: Record<string, any>;
+}
+
+export interface WebhookEventsResponse {
+  events: WebhookEvent[];
+  total?: number;
+}
+
+export interface WebhookEventsFilters {
+  order_id?: string;
+  user_id?: string;
+  status?: string;
+  start_date?: string;
+  end_date?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * Fetch webhook events with optional filters
+ */
+export async function getWebhookEvents(filters?: WebhookEventsFilters): Promise<WebhookEvent[]> {
+  const params = new URLSearchParams();
+  
+  if (filters?.order_id) params.append('order_id', filters.order_id);
+  if (filters?.user_id) params.append('user_id', filters.user_id);
+  if (filters?.status) params.append('status', filters.status);
+  if (filters?.start_date) params.append('start_date', filters.start_date);
+  if (filters?.end_date) params.append('end_date', filters.end_date);
+  if (filters?.limit) params.append('limit', filters.limit.toString());
+  if (filters?.offset) params.append('offset', filters.offset.toString());
+  
+  const qs = params.toString();
+  const path = `/broker/webhooks/orders/events${qs ? `?${qs}` : ''}`;
+  const resp = await apiFetch(path);
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch webhook events: ${resp.statusText}`);
+  }
+  return resp.json();
 }
 
 /**
