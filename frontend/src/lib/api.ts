@@ -427,6 +427,36 @@ export async function getWebhookEvents(filters?: WebhookEventsFilters): Promise<
 }
 
 /**
+ * Fetch websocket-sourced order events with optional filters
+ */
+export async function getWsOrderEvents(filters?: WebhookEventsFilters): Promise<WebhookEvent[]> {
+  const params = new URLSearchParams();
+  if (filters?.order_id) params.append('order_id', filters.order_id);
+  if (filters?.user_id) params.append('user_id', filters.user_id);
+  if (filters?.status) params.append('status', filters.status);
+  if (filters?.start_date) params.append('start_date', filters.start_date);
+  if (filters?.end_date) params.append('end_date', filters.end_date);
+  if (filters?.limit) params.append('limit', String(filters.limit));
+  if (filters?.offset) params.append('offset', String(filters.offset));
+  const qs = params.toString();
+  const path = `/broker/ws/orders/events${qs ? `?${qs}` : ''}`;
+  const resp = await apiFetch(path);
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch WS order events: ${resp.statusText}`);
+  }
+  return resp.json();
+}
+
+/**
+ * Build SSE URL for order events (source: 'webhook' | 'ws' | 'all')
+ */
+export function buildOrderEventsSseUrl(source?: 'webhook' | 'ws' | 'all'): string {
+  const base = getApiBase();
+  const qs = source ? `?source=${source}` : '';
+  return `${base}/broker/orders/events/stream${qs}`;
+}
+
+/**
  * Connect to WS /ws/options/session/{underlying}
  * Messages are raw OptionsSessionSnapshot JSON documents.
  */

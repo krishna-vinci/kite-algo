@@ -8,6 +8,7 @@ export default defineConfig({
 			'/broker': {
 				target: 'http://127.0.0.1:8777',
 				changeOrigin: true,
+				ws: true,
 				rewrite: (path) => path.replace(/^\/broker/, '/broker')
 			}
 		}

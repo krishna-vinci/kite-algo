@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator, field_valida
 from sqlalchemy import Column, DateTime, String
 from sqlalchemy.orm import Session
 
-from .redis_events import get_redis
+from .redis_events import get_redis, publish_event, pubsub_iter
 from .instruments_repository import InstrumentsRepository
 from database import Base, SessionLocal, get_db
 
@@ -1633,7 +1633,7 @@ class WebhookService:
                 VALUES (
                     :id, :order_id, :user_id, :status, :event_timestamp, NOW(),
                     :exchange, :tradingsymbol, :instrument_token, :transaction_type,
-                    :quantity, :filled_quantity, :average_price, :payload_json::jsonb
+                    :quantity, :filled_quantity, :average_price, CAST(:payload_json AS JSONB)
                 )
                 ON CONFLICT (order_id, event_timestamp, status) DO NOTHING
                 RETURNING id
@@ -1876,6 +1876,28 @@ async def receive_order_postback(
         
         # Store event (with idempotency)
         event_id = await webhook_service.store_event(payload, corr_id, db)
+
+        # Publish SSE event only when inserted (not duplicate)
+        if event_id:
+            try:
+                await publish_event("orders.events", {
+                    "source": "webhook",
+                    "id": event_id,
+                    "order_id": payload.order_id,
+                    "user_id": payload.user_id,
+                    "status": payload.status,
+                    "event_timestamp": payload.get_event_timestamp().isoformat(),
+                    "exchange": payload.exchange,
+                    "tradingsymbol": payload.tradingsymbol,
+                    "instrument_token": payload.instrument_token,
+                    "transaction_type": payload.transaction_type,
+                    "quantity": payload.quantity,
+                    "filled_quantity": payload.filled_quantity,
+                    "average_price": payload.average_price,
+                    "payload": payload.model_dump()
+                })
+            except Exception as pe:
+                logger.error("Failed to publish webhook order event: %s", pe, exc_info=True)
         
         # Return success (200 OK for both new and duplicate events)
         return {
@@ -1932,3 +1954,132 @@ async def query_webhook_events(
         limit=limit,
         offset=offset
     )
+
+@router.get("/orders/events/stream")
+async def sse_order_events(request: Request, source: Optional[str] = Query(None, description="Filter by 'webhook', 'ws' or 'all'")):
+    async def event_stream():
+        try:
+            norm = None
+            if source:
+                s = source.lower().strip()
+                if s == "websocket":
+                    s = "ws"
+                if s != "all":
+                    norm = s
+            async for message in pubsub_iter("orders.events"):
+                if await request.is_disconnected():
+                    break
+                if isinstance(message, dict) and message.get("event") == "heartbeat":
+                    yield ": heartbeat\n\n"
+                    continue
+                if norm and isinstance(message, dict):
+                    if message.get("source") != norm:
+                        continue
+                try:
+                    src = message.get("source") if isinstance(message, dict) else None
+                    prefix = f"event: {src}\n" if src else ""
+                    payload = json.dumps(message)
+                    yield f"{prefix}data: {payload}\n\n"
+                except Exception:
+                    continue
+        except asyncio.CancelledError:
+            pass
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+@router.post("/ws/orders/updates/enable")
+async def enable_ws_order_updates(request: Request):
+    mgr = getattr(request.app.state, "ws_manager", None)
+    if not mgr:
+        raise HTTPException(status_code=503, detail="WebSocket manager not available")
+    mgr.order_updates_enabled = True
+    return {"status": "ok", "enabled": True}
+
+@router.post("/ws/orders/updates/disable")
+async def disable_ws_order_updates(request: Request):
+    mgr = getattr(request.app.state, "ws_manager", None)
+    if not mgr:
+        raise HTTPException(status_code=503, detail="WebSocket manager not available")
+    mgr.order_updates_enabled = False
+    return {"status": "ok", "enabled": False}
+
+@router.get("/ws/orders/updates/status")
+async def ws_order_updates_status(request: Request):
+    mgr = getattr(request.app.state, "ws_manager", None)
+    if not mgr:
+        raise HTTPException(status_code=503, detail="WebSocket manager not available")
+    return {
+        "enabled": bool(getattr(mgr, "order_updates_enabled", False)),
+        "ws_status": mgr.get_websocket_status() if hasattr(mgr, "get_websocket_status") else "unknown",
+        "last_order_update_at": getattr(mgr, "last_order_update_at", None),
+    }
+
+@router.get("/ws/orders/events", response_model=List[OrderEventResponse])
+async def get_ws_order_events(
+    db: Session = Depends(get_db),
+    order_id: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        conditions = []
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+
+        if order_id:
+            conditions.append("order_id = :order_id")
+            params["order_id"] = order_id
+        if user_id:
+            conditions.append("user_id = :user_id")
+            params["user_id"] = user_id
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+        if start_date:
+            conditions.append("event_timestamp >= :start_date")
+            params["start_date"] = start_date
+        if end_date:
+            conditions.append("event_timestamp <= :end_date")
+            params["end_date"] = end_date
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        query_sql = text(f"""
+            SELECT 
+                id, order_id, user_id, status, event_timestamp, received_at,
+                exchange, tradingsymbol, instrument_token, transaction_type,
+                quantity, filled_quantity, average_price, payload_json
+            FROM ws_order_events
+            WHERE {where_clause}
+            ORDER BY event_timestamp DESC
+            LIMIT :limit OFFSET :offset
+        """)
+
+        result = db.execute(query_sql, params)
+        rows = result.fetchall()
+
+        events: List[OrderEventResponse] = []
+        for row in rows:
+            events.append(OrderEventResponse(
+                id=str(row[0]),
+                order_id=row[1] or "",
+                user_id=row[2] or "",
+                status=row[3] or "",
+                event_timestamp=row[4],
+                received_at=row[5],
+                exchange=row[6],
+                tradingsymbol=row[7],
+                instrument_token=row[8],
+                transaction_type=row[9],
+                quantity=row[10],
+                filled_quantity=row[11],
+                average_price=row[12],
+                payload=row[13] or {}
+            ))
+
+        return events
+    except Exception as e:
+        logger.error(f"Failed to query WS order events: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to query WS events: {str(e)}")

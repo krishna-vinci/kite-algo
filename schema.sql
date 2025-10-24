@@ -331,3 +331,36 @@ CREATE INDEX IF NOT EXISTS idx_order_events_timestamp
 
 CREATE INDEX IF NOT EXISTS idx_order_events_received
   ON public.order_events (received_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.ws_order_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id TEXT,
+  user_id TEXT,
+  status TEXT,
+  event_timestamp TIMESTAMPTZ NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  exchange TEXT,
+  tradingsymbol TEXT,
+  instrument_token BIGINT,
+  transaction_type TEXT,
+  quantity INT,
+  filled_quantity INT,
+  average_price NUMERIC(18,6),
+  payload_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ws_order_events_order_id
+  ON public.ws_order_events (order_id);
+
+CREATE INDEX IF NOT EXISTS idx_ws_order_events_user_id
+  ON public.ws_order_events (user_id);
+
+CREATE INDEX IF NOT EXISTS idx_ws_order_events_status
+  ON public.ws_order_events (status);
+
+CREATE INDEX IF NOT EXISTS idx_ws_order_events_timestamp
+  ON public.ws_order_events (event_timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ws_order_events_received
+  ON public.ws_order_events (received_at DESC);

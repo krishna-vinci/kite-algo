@@ -52,9 +52,17 @@ function createMarketwatchStore() {
 			// SSR fallback - should not be called in SSR
 			return 'ws://localhost:8777/broker/ws/marketwatch';
 		}
-		const base = getApiBase(); // e.g., http://localhost:8777
+		const base = getApiBase(); // '' or http(s)://host
+		// If base is empty or relative, derive from current location
+		if (!base || base.startsWith('/')) {
+			const loc = window.location;
+			const wsProto = loc.protocol === 'https:' ? 'wss' : 'ws';
+			return `${wsProto}://${loc.host}/broker/ws/marketwatch`;
+		}
+		// Absolute base provided: convert scheme and construct ws URL
 		const wsProto = base.startsWith('https') ? 'wss' : 'ws';
-		return base.replace(/^http/, wsProto) + '/broker/ws/marketwatch';
+		const wsHost = base.replace(/^https?:\/\//, '');
+		return `${wsProto}://${wsHost}/broker/ws/marketwatch`;
 	}
 
 	// Send action safely when connected, or queue until connection opens
