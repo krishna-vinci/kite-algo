@@ -185,7 +185,7 @@
 			try {
 				const tokensQuery = tokens.map((t) => `token=${t}`).join('&');
 				const response = await fetch(
-					`${getApiBase()}/api/marketwatch/nifty50/overlay-snapshot?${tokensQuery}`
+					`${getApiBase()}/broker/marketwatch/nifty50/overlay-snapshot?${tokensQuery}`
 				);
 				if (response.ok) {
 					const snapshotData = await response.json();

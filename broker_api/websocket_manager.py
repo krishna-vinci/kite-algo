@@ -8,7 +8,10 @@ from fastapi import WebSocket
 from asyncio import AbstractEventLoop
 from datetime import datetime, timezone
 import redis.asyncio as redis
-from broker_api.redis_events import get_redis
+from broker_api.redis_events import get_redis, publish_event
+import uuid
+from database import SessionLocal
+from sqlalchemy import text
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -67,6 +70,7 @@ class WebSocketManager:
         # Ticks and status
         self.latest_ticks: Dict[int, Dict[str, Any]] = {}   # last tick per token
         self.websocket_status: str = "DISCONNECTED"
+        self.last_order_update_at: Optional[datetime] = None
 
         # Event loop and batching
         self.main_event_loop = main_event_loop
@@ -90,6 +94,14 @@ class WebSocketManager:
         except Exception:
             # Fallback for kiteconnect versions without on_message
             pass
+        # Dedicated order updates callback (captures all orders for this login)
+        try:
+            self.kws.on_order_update = self.on_order_update
+        except Exception:
+            pass
+
+        # Feature flag to allow toggling from API
+        self.order_updates_enabled: bool = True
 
     def get_websocket_status(self) -> str:
         """Returns current KiteTicker/WebSocketManager connection status."""
@@ -538,6 +550,145 @@ class WebSocketManager:
                 self.main_event_loop.call_soon_threadsafe(put_event)
         except Exception as e:
             logger.error("Error in on_message: %s", e, exc_info=True)
+
+    def on_order_update(self, ws, data):
+        """Callback for order updates from KiteTicker thread; persist via store_event."""
+        try:
+            if not getattr(self, "order_updates_enabled", True):
+                return
+
+            # Build PostbackPayload-like dict with safe defaults
+            def fmt_ts(v) -> str:
+                if isinstance(v, str) and len(v) >= 19:
+                    return v[:19]
+                try:
+                    # v could be epoch seconds or datetime
+                    if isinstance(v, (int, float)):
+                        return datetime.utcfromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S")
+                    if isinstance(v, datetime):
+                        return v.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass
+                return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+            payload_dict = {
+                "user_id": data.get("user_id") or data.get("placed_by") or "unknown",
+                "app_id": int(data.get("app_id") or 0),
+                "checksum": "",  # not used for WS path
+                "source": "websocket",
+                "placed_by": data.get("placed_by") or data.get("user_id") or "unknown",
+                "order_id": data.get("order_id"),
+                "exchange_order_id": data.get("exchange_order_id"),
+                "parent_order_id": data.get("parent_order_id"),
+                "status": data.get("status") or "UPDATE",
+                "status_message": data.get("status_message"),
+                "status_message_raw": data.get("status_message_raw"),
+                "order_timestamp": fmt_ts(data.get("order_timestamp") or data.get("exchange_timestamp") or datetime.utcnow()),
+                "exchange_update_timestamp": (fmt_ts(data.get("exchange_update_timestamp")) if data.get("exchange_update_timestamp") else None),
+                "exchange_timestamp": (fmt_ts(data.get("exchange_timestamp")) if data.get("exchange_timestamp") else None),
+                "variety": data.get("variety") or "regular",
+                "exchange": data.get("exchange"),
+                "tradingsymbol": data.get("tradingsymbol"),
+                "instrument_token": int(data.get("instrument_token") or 0),
+                "order_type": data.get("order_type") or "MARKET",
+                "transaction_type": data.get("transaction_type") or None,
+                "validity": data.get("validity") or "DAY",
+                "validity_ttl": data.get("validity_ttl"),
+                "product": data.get("product") or None,
+                "quantity": int(data.get("quantity") or data.get("filled_quantity") or 0),
+                "disclosed_quantity": int(data.get("disclosed_quantity") or 0),
+                "price": float(data.get("price") or 0.0),
+                "trigger_price": float(data.get("trigger_price") or 0.0),
+                "average_price": float(data.get("average_price") or 0.0),
+                "filled_quantity": int(data.get("filled_quantity") or 0),
+                "pending_quantity": int(data.get("pending_quantity") or 0),
+                "cancelled_quantity": int(data.get("cancelled_quantity") or 0),
+                "unfilled_quantity": int(data.get("unfilled_quantity") or 0),
+                "market_protection": int(data.get("market_protection") or 0),
+                "meta": data.get("meta") or {},
+                "tag": data.get("tag"),
+                "tags": data.get("tags"),
+                "guid": data.get("guid"),
+            }
+
+            # Persist on main loop to avoid thread-crossing issues
+            async def persist():
+                db = SessionLocal()
+                try:
+                    # Prepare values
+                    event_id = str(uuid.uuid4())
+                    # Parse timestamp string to datetime if possible
+                    evt_ts_str = payload_dict.get("order_timestamp")
+                    try:
+                        evt_ts = datetime.strptime(evt_ts_str, "%Y-%m-%d %H:%M:%S") if isinstance(evt_ts_str, str) else datetime.utcnow()
+                    except Exception:
+                        evt_ts = datetime.utcnow()
+
+                    insert_sql = text("""
+                        INSERT INTO ws_order_events (
+                            id, order_id, user_id, status, event_timestamp, received_at,
+                            exchange, tradingsymbol, instrument_token, transaction_type,
+                            quantity, filled_quantity, average_price, payload_json
+                        )
+                        VALUES (
+                            :id, :order_id, :user_id, :status, :event_ts, NOW(),
+                            :exchange, :tradingsymbol, :instrument_token, :transaction_type,
+                            :quantity, :filled_quantity, :average_price, CAST(:payload_json AS JSONB)
+                        )
+                        RETURNING id
+                    """)
+
+                    db.execute(insert_sql, {
+                        "id": event_id,
+                        "order_id": payload_dict.get("order_id"),
+                        "user_id": payload_dict.get("user_id"),
+                        "status": payload_dict.get("status"),
+                        "event_ts": evt_ts,
+                        "exchange": payload_dict.get("exchange"),
+                        "tradingsymbol": payload_dict.get("tradingsymbol"),
+                        "instrument_token": payload_dict.get("instrument_token"),
+                        "transaction_type": payload_dict.get("transaction_type"),
+                        "quantity": payload_dict.get("quantity"),
+                        "filled_quantity": payload_dict.get("filled_quantity"),
+                        "average_price": payload_dict.get("average_price"),
+                        "payload_json": json.dumps(payload_dict)
+                    })
+                    db.commit()
+                    try:
+                        await publish_event("orders.events", {
+                            "source": "ws",
+                            "id": event_id,
+                            "order_id": payload_dict.get("order_id"),
+                            "user_id": payload_dict.get("user_id"),
+                            "status": payload_dict.get("status"),
+                            "event_timestamp": evt_ts.isoformat(),
+                            "exchange": payload_dict.get("exchange"),
+                            "tradingsymbol": payload_dict.get("tradingsymbol"),
+                            "instrument_token": payload_dict.get("instrument_token"),
+                            "transaction_type": payload_dict.get("transaction_type"),
+                            "quantity": payload_dict.get("quantity"),
+                            "filled_quantity": payload_dict.get("filled_quantity"),
+                            "average_price": payload_dict.get("average_price"),
+                            "payload": payload_dict
+                        })
+                    except Exception as pe:
+                        logger.error("Failed to publish WS order event: %s", pe, exc_info=True)
+                except Exception as pe:
+                    logger.error("Failed to persist WS order_update: %s", pe, exc_info=True)
+                finally:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
+
+            try:
+                # Update last seen timestamp immediately
+                self.last_order_update_at = datetime.utcnow()
+                self.main_event_loop.call_soon_threadsafe(lambda: asyncio.create_task(persist()))
+            except Exception as se:
+                logger.error("Failed to schedule WS order_update persist: %s", se, exc_info=True)
+        except Exception as e:
+            logger.error("Error in on_order_update: %s", e, exc_info=True)
 
     def on_connect(self, ws, response):
         """Callback on successful connect to KiteTicker."""

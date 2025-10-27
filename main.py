@@ -464,8 +464,8 @@ app.include_router(candles_api_router, prefix="/broker")  # Unified candles API 
 app.include_router(performance_router, prefix="/broker")
 app.include_router(momentum_router, prefix="/broker")
 
-app.include_router(alerts_router, prefix="/alerts")
-app.include_router(indexstoploss_router, prefix="/strategies")
+app.include_router(alerts_router, prefix="/broker/alerts")
+app.include_router(indexstoploss_router, prefix="/broker/strategies")
 
 from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
 import logging
@@ -516,7 +516,7 @@ def process_csv_data(csv_file_path, source_list_name):
         logging.error(f"Error processing {csv_file_path}: {e}")
     return data
 
-@app.post("/ingest-stock-data")
+@app.post("/broker/ingest-stock-data")
 async def ingest_stock_data_endpoint():
     """
     FastAPI endpoint to trigger the stock market instrument data ingestion process.
@@ -590,13 +590,10 @@ async def ingest_stock_data_endpoint():
 
 
 
-# Add CORS middleware for frontend
+# Add CORS middleware for frontend (production: single allowed origin)
 app.add_middleware(
     CORSMiddleware,
-    # IMPORTANT: For credentialed requests, browsers require a specific echoed Origin.
-    # Using allow_origin_regex lets Starlette echo the incoming Origin when it matches.
-    allow_origins=[],                 # do not use "*" with allow_credentials=True
-    allow_origin_regex=".*",          # echo any Origin in dev; tighten for prod
+    allow_origins=["https://kite.krishna.quest"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -605,10 +602,6 @@ app.add_middleware(
 @app.get("/")
 async def root():
     return {"message": "Welcome to Kite App API!"}
-
-@app.get("/hello")
-async def hello():
-    return {"message": "Hello World from FastAPI Backend!"}
 
 def clean_value(value_str):
     """
@@ -623,7 +616,7 @@ def clean_value(value_str):
         logging.warning(f"Could not convert '{value_str}' to float.")
         return None
 
-@app.post("/update-nifty50-data")
+@app.post("/broker/update-nifty50-data")
 async def update_nifty50_data_endpoint():
     """
     Reads the nifty50_data.csv file and updates the corresponding
@@ -695,24 +688,10 @@ async def update_nifty50_data_endpoint():
             conn.close()
             logging.info("Database connection closed.")
 
-@app.get("/status")
-async def status():
-    info = {"status": "running", "backend": "FastAPI"}
-    try:
-        wm = ws_manager
-        if wm:
-            info.update({
-                "websocket_status": wm.get_websocket_status(),
-                "num_clients": len(wm.clients),
-                "aggregated_token_count": len(wm.token_refcount),
-                "flush_interval_ms": wm.flush_interval_ms,
-            })
-    except Exception:
-        pass
-    return info
+ 
 
 
-@app.get("/user/subscriptions")
+@app.get("/broker/user/subscriptions")
 def get_subscriptions(scope: Optional[str] = Query(default=None, pattern="^(sidebar|marketwatch|nfo-charts|nfo-charts-layouts)$")):
     """
     GET /user/subscriptions
@@ -730,7 +709,7 @@ def get_subscriptions(scope: Optional[str] = Query(default=None, pattern="^(side
     finally:
         db.close()
 
-@app.put("/user/subscriptions")
+@app.put("/broker/user/subscriptions")
 async def put_subscriptions(
     request: Request,
     scope: Optional[str] = Query(default=None, pattern="^(sidebar|marketwatch|nfo-charts|nfo-charts-layouts)$")
@@ -760,7 +739,7 @@ async def put_subscriptions(
     finally:
         db.close()
 
-@app.get("/api/nifty50")
+@app.get("/broker/nifty50")
 async def get_nifty50_data():
     conn = None
     try:
@@ -784,7 +763,7 @@ async def get_nifty50_data():
 
 
 @app.get(
-    "/api/marketwatch/nifty50/overlay-snapshot",
+    "/broker/marketwatch/nifty50/overlay-snapshot",
     response_model=OverlaySnapshotResponse,
     summary="Get a snapshot of the latest live ticks from the Redis overlay cache.",
     description="""
@@ -903,7 +882,7 @@ async def get_overlay_snapshot(
             conn.close()
 
 
-@app.post("/api/marketwatch/nifty50/finalize-baseline")
+@app.post("/broker/marketwatch/nifty50/finalize-baseline")
 async def finalize_nifty50_baseline(dry_run: bool = False, target_date: Optional[str] = Query(None, description="Target date in YYYY-MM-DD format. Defaults to the last trading day.")):
     """
     Computes and stores all derived baseline metrics for all Nifty 50 instruments for a specific date.

@@ -6,8 +6,9 @@ export default defineConfig({
 	server: {
 		proxy: {
 			'/broker': {
-				target: 'http://finance-app:8777',
+				target: 'http://127.0.0.1:8777',
 				changeOrigin: true,
+				ws: true,
 				rewrite: (path) => path.replace(/^\/broker/, '/broker')
 			}
 		}

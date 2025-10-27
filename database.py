@@ -20,6 +20,7 @@ load_dotenv()
 # the Base for all ORM models
 Base = declarative_base()
 metadata = MetaData()
+_SCHEMA_APPLIED: bool = False
 
 # --- ORM model for Fyers sessions (if you want it here)
 class FyersSession(Base):
@@ -186,7 +187,10 @@ def get_db_connection():
             port=os.getenv("DB_PORT")
         )
         logging.info("Successfully connected to the database.")
-        create_tables_if_not_exists(conn)
+        global _SCHEMA_APPLIED
+        if not _SCHEMA_APPLIED:
+            create_tables_if_not_exists(conn)
+            _SCHEMA_APPLIED = True
         return conn
     except Exception as e:
         logging.error(f"Error connecting to the database or creating tables: {e}")

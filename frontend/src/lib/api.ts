@@ -8,20 +8,16 @@
 const SESSION_STORAGE_KEY = 'kite_session_id';
 
 export function getApiBase(): string {
-	// Returns the base URL for the API, e.g., "http://localhost:8777".
-	// It does NOT include the "/api" suffix. Callers should append it.
-	const env = (import.meta as any).env?.VITE_API_BASE_URL as string | undefined;
-	if (env && typeof env === 'string' && env.trim().length > 0) {
-		return env.replace(/\/+$/, '');
-	}
-	if (typeof window !== 'undefined') {
-		const proto = window.location.protocol || 'http:';
-		const host = window.location.hostname || 'localhost';
-		const port = '8777';
-		return `${proto}//${host}:${port}`;
-	}
-	// Fallback for SSR or unknown environment
-	return 'http://localhost:8777';
+    // 1) Explicit override via env (for cross-device dev access)
+    const env = (import.meta as any).env?.VITE_API_BASE_URL as string | undefined;
+    if (env && typeof env === 'string' && env.trim().length > 0) {
+        return env.replace(/\/+$/, '');
+    }
+    
+    // 2) Always use relative URLs (empty string) in both browser and SSR
+    //    - Dev: Vite proxy handles /broker -> localhost:8777
+    //    - Prod: Caddy reverse proxy handles /broker -> backend container
+    return '';
 }
 
 export function setSessionId(id: string | null | undefined) {
@@ -94,7 +90,7 @@ export async function getLtp(exchange: string, tradingsymbol: string): Promise<n
 
 export async function getUserSubscriptions(scope?: 'sidebar' | 'marketwatch' | 'nfo-charts' | 'nfo-charts-layouts') {
     const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
-    const response = await apiFetch(`/user/subscriptions${qs}`);
+    const response = await apiFetch(`/broker/user/subscriptions${qs}`);
     if (!response.ok) {
         throw new Error('Failed to fetch user subscriptions');
     }
@@ -103,7 +99,7 @@ export async function getUserSubscriptions(scope?: 'sidebar' | 'marketwatch' | '
 
 export async function saveUserSubscriptions(subscriptions: any, scope?: 'sidebar' | 'marketwatch' | 'nfo-charts' | 'nfo-charts-layouts') {
     const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
-    const response = await apiFetch(`/user/subscriptions${qs}`, {
+    const response = await apiFetch(`/broker/user/subscriptions${qs}`, {
         method: 'PUT',
         headers: {
             'Content-Type': 'application/json'
@@ -165,7 +161,7 @@ export async function getAlerts(params: {
     delete newParams.instrument_token;
   }
   const qs = toQuery(newParams);
-  const res = await apiFetch(`/alerts${qs}`);
+  const res = await apiFetch(`/broker/alerts${qs}`);
   if (!res.ok) {
     const t = await res.text().catch(() => '');
     throw new Error(`Failed to fetch alerts: ${res.status} ${t}`);
@@ -174,7 +170,7 @@ export async function getAlerts(params: {
 }
 
 export async function createAlert(body: AlertCreateRequest): Promise<Alert> {
-  const res = await apiFetch('/alerts', {
+  const res = await apiFetch('/broker/alerts', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
@@ -194,7 +190,7 @@ export async function createAlert(body: AlertCreateRequest): Promise<Alert> {
 }
 
 export async function patchAlert(id: string, patch: AlertPatchRequest): Promise<Alert> {
-  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch)
@@ -208,7 +204,7 @@ export async function patchAlert(id: string, patch: AlertPatchRequest): Promise<
 
 export async function deleteAlert(id: string, hard?: boolean): Promise<Alert> {
   const qs = toQuery({ hard: !!hard });
-  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' });
+  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' });
   if (!res.ok) {
     const t = await res.text().catch(() => '');
     throw new Error(`Delete alert failed: ${res.status} ${t}`);
@@ -217,7 +213,7 @@ export async function deleteAlert(id: string, hard?: boolean): Promise<Alert> {
 }
 
 export async function duplicateAlert(id: string): Promise<Alert> {
-  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}/duplicate`, { method: 'POST' });
+  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}/duplicate`, { method: 'POST' });
   if (!res.ok) {
     const t = await res.text().catch(() => '');
     throw new Error(`Duplicate alert failed: ${res.status} ${t}`);
@@ -226,7 +222,7 @@ export async function duplicateAlert(id: string): Promise<Alert> {
 }
 
 export async function pauseAlert(id: string): Promise<Alert> {
-  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}/pause`, { method: 'POST' });
+  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}/pause`, { method: 'POST' });
   if (!res.ok) {
     const t = await res.text().catch(() => '');
     throw new Error(`Pause alert failed: ${res.status} ${t}`);
@@ -235,7 +231,7 @@ export async function pauseAlert(id: string): Promise<Alert> {
 }
 
 export async function resumeAlert(id: string): Promise<Alert> {
-  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}/resume`, { method: 'POST' });
+  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}/resume`, { method: 'POST' });
   if (!res.ok) {
     const t = await res.text().catch(() => '');
     throw new Error(`Resume alert failed: ${res.status} ${t}`);
@@ -244,7 +240,7 @@ export async function resumeAlert(id: string): Promise<Alert> {
 }
 
 export async function cancelAlert(id: string): Promise<Alert> {
-  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
   if (!res.ok) {
     const t = await res.text().catch(() => '');
     throw new Error(`Cancel alert failed: ${res.status} ${t}`);
@@ -253,7 +249,7 @@ export async function cancelAlert(id: string): Promise<Alert> {
 }
 
 export async function reactivateAlert(id: string): Promise<Alert> {
-  const res = await apiFetch(`/alerts/${encodeURIComponent(id)}/reactivate`, { method: 'POST' });
+  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}/reactivate`, { method: 'POST' });
   if (!res.ok) {
     const t = await res.text().catch(() => '');
     throw new Error(`Reactivate alert failed: ${res.status} ${t}`);
@@ -352,7 +348,13 @@ export async function stopOptionsSession(underlying: string): Promise<StopSessio
  * Transforms http(s) base to ws(s) and appends /ws/options/session/{underlying}.
  */
 export function buildOptionsSessionWsUrl(underlying: string): string {
-  const base = getApiBase(); // e.g., http://localhost:8777
+  const base = getApiBase();
+  // If base is empty or relative, derive from window.location
+  if (!base || base.startsWith('/')) {
+    const loc = typeof window !== 'undefined' ? window.location : ({ protocol: 'http:', host: 'localhost:8777' } as any);
+    const wsProto = loc.protocol === 'https:' ? 'wss' : 'ws';
+    return `${wsProto}://${loc.host}/broker/ws/options/session/${encodeURIComponent(underlying)}`;
+  }
   const wsProto = base.startsWith('https') ? 'wss' : 'ws';
   const wsHost = base.replace(/^https?:\/\//, '');
   return `${wsProto}://${wsHost}/broker/ws/options/session/${encodeURIComponent(underlying)}`;
@@ -363,6 +365,95 @@ export function buildOptionsSessionWsUrl(underlying: string): string {
 export function buildOptionsSessionSseUrl(underlying: string): string {
   const base = getApiBase(); // e.g., http://localhost:8777
   return `${base}/broker/sse/options/session/${encodeURIComponent(underlying)}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WEBHOOK EVENTS API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export interface WebhookEvent {
+  id: string;
+  order_id: string;
+  user_id: string;
+  status: string;
+  event_timestamp: string;
+  received_at: string;
+  exchange: string | null;
+  tradingsymbol: string | null;
+  instrument_token: number | null;
+  transaction_type: string | null;
+  quantity: number | null;
+  filled_quantity: number | null;
+  average_price: number | null;
+  payload: Record<string, any>;
+}
+
+export interface WebhookEventsResponse {
+  events: WebhookEvent[];
+  total?: number;
+}
+
+export interface WebhookEventsFilters {
+  order_id?: string;
+  user_id?: string;
+  status?: string;
+  start_date?: string;
+  end_date?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * Fetch webhook events with optional filters
+ */
+export async function getWebhookEvents(filters?: WebhookEventsFilters): Promise<WebhookEvent[]> {
+  const params = new URLSearchParams();
+  
+  if (filters?.order_id) params.append('order_id', filters.order_id);
+  if (filters?.user_id) params.append('user_id', filters.user_id);
+  if (filters?.status) params.append('status', filters.status);
+  if (filters?.start_date) params.append('start_date', filters.start_date);
+  if (filters?.end_date) params.append('end_date', filters.end_date);
+  if (filters?.limit) params.append('limit', filters.limit.toString());
+  if (filters?.offset) params.append('offset', filters.offset.toString());
+  
+  const qs = params.toString();
+  const path = `/broker/webhooks/orders/events${qs ? `?${qs}` : ''}`;
+  const resp = await apiFetch(path);
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch webhook events: ${resp.statusText}`);
+  }
+  return resp.json();
+}
+
+/**
+ * Fetch websocket-sourced order events with optional filters
+ */
+export async function getWsOrderEvents(filters?: WebhookEventsFilters): Promise<WebhookEvent[]> {
+  const params = new URLSearchParams();
+  if (filters?.order_id) params.append('order_id', filters.order_id);
+  if (filters?.user_id) params.append('user_id', filters.user_id);
+  if (filters?.status) params.append('status', filters.status);
+  if (filters?.start_date) params.append('start_date', filters.start_date);
+  if (filters?.end_date) params.append('end_date', filters.end_date);
+  if (filters?.limit) params.append('limit', String(filters.limit));
+  if (filters?.offset) params.append('offset', String(filters.offset));
+  const qs = params.toString();
+  const path = `/broker/ws/orders/events${qs ? `?${qs}` : ''}`;
+  const resp = await apiFetch(path);
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch WS order events: ${resp.statusText}`);
+  }
+  return resp.json();
+}
+
+/**
+ * Build SSE URL for order events (source: 'webhook' | 'ws' | 'all')
+ */
+export function buildOrderEventsSseUrl(source?: 'webhook' | 'ws' | 'all'): string {
+  const base = getApiBase();
+  const qs = source ? `?source=${source}` : '';
+  return `${base}/broker/orders/events/stream${qs}`;
 }
 
 /**

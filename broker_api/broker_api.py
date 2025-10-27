@@ -116,7 +116,7 @@ from sqlalchemy.orm import sessionmaker, relationship, Session
 from databases import Database
 
 import psycopg2
-from psycopg2.extras import execute_batch
+from psycopg2.extras import execute_batch, execute_values
 
 
 from fastapi import APIRouter, Response, HTTPException, Depends
@@ -352,11 +352,11 @@ class PortfolioHistory(Base):
 
 @router.on_event("startup")
 async def _startup():
-    # For development: Drop table if it exists to ensure fresh schema with primary key
-    inspector = inspect(engine)
+    try:
+        KiteSession.__table__.create(bind=engine, checkfirst=True)
+    except Exception as e:
+        logger.error(f"Failed to ensure KiteSession table: {e}", exc_info=True)
 
-    # auto-create all tables (including kite_instruments with primary key)
-    Base.metadata.create_all(bind=engine)
     await database.connect()
     
     # Ensure Meilisearch index is set up
@@ -364,7 +364,7 @@ async def _startup():
         ensure_instruments_index()
     except Exception as e:
         logger.error(f"Failed to ensure Meilisearch index on startup: {e}", exc_info=True)
-
+    
     # Daily instruments update scheduling is managed by main; no internal scheduler here
 
 @router.on_event("shutdown")
@@ -1024,57 +1024,75 @@ def get_ohlc(
 
  
  # ─────────── Instruments import functionality ───────────
-async def upsert_instrument(record, db_session):
-    """Upsert instrument with proper error handling for constraint issues"""
-    query = """
-        INSERT INTO kite_instruments (
-            instrument_token, exchange_token, tradingsymbol, name, last_price,
-            expiry, strike, tick_size, lot_size, instrument_type, segment, exchange, last_updated
-        ) VALUES (
-            :instrument_token, :exchange_token, :tradingsymbol, :name, :last_price,
-            :expiry, :strike, :tick_size, :lot_size, :instrument_type, :segment, :exchange, NOW()
-        )
-        ON CONFLICT (instrument_token) DO UPDATE SET
-            exchange_token = EXCLUDED.exchange_token,
-            tradingsymbol = EXCLUDED.tradingsymbol,
-            name = EXCLUDED.name,
-            last_price = EXCLUDED.last_price,
-            expiry = EXCLUDED.expiry,
-            strike = EXCLUDED.strike,
-            tick_size = EXCLUDED.tick_size,
-            lot_size = EXCLUDED.lot_size,
-            instrument_type = EXCLUDED.instrument_type,
-            segment = EXCLUDED.segment,
-            exchange = EXCLUDED.exchange,
-            last_updated = NOW()
-    """
-    await database.execute(query, values={
-        "instrument_token": int(record['instrument_token']) if record['instrument_token'] else None,
-        "exchange_token": int(record['exchange_token']) if record['exchange_token'] else None,
-        "tradingsymbol": record['tradingsymbol'],
-        "name": record.get('name', ''),
-        "last_price": float(record['last_price']) if record['last_price'] else None,
-        "expiry": record['expiry'] if record['expiry'] else None,
-        "strike": float(record['strike']) if record['strike'] else None,
-        "tick_size": float(record['tick_size']) if record['tick_size'] else None,
-        "lot_size": int(record['lot_size']) if record['lot_size'] else None,
-        "instrument_type": record.get('instrument_type', ''),
-        "segment": record.get('segment', ''),
-        "exchange": record.get('exchange', '')
-    })
+def batch_upsert_instruments(records: list, batch_size: int = 1000):
+    """Batch upsert instruments using psycopg2 for performance"""
+    if not records:
+        return 0
+    
+    conn = get_psql_conn()
+    total_upserted = 0
+    
+    try:
+        with conn.cursor() as cur:
+            upsert_query = """
+                INSERT INTO kite_instruments (
+                    instrument_token, exchange_token, tradingsymbol, name, last_price,
+                    expiry, strike, tick_size, lot_size, instrument_type, segment, exchange, last_updated
+                ) VALUES %s
+                ON CONFLICT (instrument_token) DO UPDATE SET
+                    exchange_token = EXCLUDED.exchange_token,
+                    tradingsymbol = EXCLUDED.tradingsymbol,
+                    name = EXCLUDED.name,
+                    last_price = EXCLUDED.last_price,
+                    expiry = EXCLUDED.expiry,
+                    strike = EXCLUDED.strike,
+                    tick_size = EXCLUDED.tick_size,
+                    lot_size = EXCLUDED.lot_size,
+                    instrument_type = EXCLUDED.instrument_type,
+                    segment = EXCLUDED.segment,
+                    exchange = EXCLUDED.exchange,
+                    last_updated = NOW()
+            """
+            
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i + batch_size]
+                values = []
+                for record in batch:
+                    values.append((
+                        int(record['instrument_token']) if record['instrument_token'] else None,
+                        int(record['exchange_token']) if record['exchange_token'] else None,
+                        record['tradingsymbol'],
+                        record.get('name', ''),
+                        float(record['last_price']) if record['last_price'] else None,
+                        record['expiry'] if record['expiry'] else None,
+                        float(record['strike']) if record['strike'] else None,
+                        float(record['tick_size']) if record['tick_size'] else None,
+                        int(record['lot_size']) if record['lot_size'] else None,
+                        record.get('instrument_type', ''),
+                        record.get('segment', ''),
+                        record.get('exchange', ''),
+                        datetime.utcnow()
+                    ))
+                
+                execute_values(cur, upsert_query, values, page_size=batch_size)
+                conn.commit()
+                total_upserted += len(batch)
+                logger.info(f"Upserted batch {i//batch_size + 1}: {len(batch)} instruments (total: {total_upserted})")
+        
+        return total_upserted
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Batch upsert failed: {e}", exc_info=True)
+        raise
+    finally:
+        conn.close()
 
 async def import_instruments_for_exchange(exchange: str, kite: KiteConnect):
     """Import instruments for a specific exchange"""
     try:
-        # Get instruments from Kite API
         instruments = kite.instruments(exchange)
-        
-        # Upsert each instrument
-        async with database.transaction():
-            for record in instruments:
-                await upsert_instrument(record, None)  # db_session parameter not used in current implementation
-        
-        return {"message": f"Imported {len(instruments)} instruments for exchange {exchange}"}
+        count = batch_upsert_instruments(instruments, batch_size=1000)
+        return {"message": f"Imported {count} instruments for exchange {exchange}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to import instruments: {str(e)}")
 
