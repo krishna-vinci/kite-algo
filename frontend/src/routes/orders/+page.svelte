@@ -45,13 +45,41 @@
 		return s === 'COMPLETE' || s === 'CANCELLED' || s === 'REJECTED';
 	}
 
+	function getStartOfDayIST(): string {
+		const date = new Date();
+		// Add 5h 30m to convert current UTC to IST "value"
+		const istOffset = 5.5 * 60 * 60 * 1000;
+		const istTime = new Date(date.getTime() + istOffset);
+		// Set to midnight of that IST day (using UTC methods on the shifted time)
+		istTime.setUTCHours(0, 0, 0, 0);
+		// Subtract offset to get back to the true UTC timestamp of IST midnight
+		const startOfDay = new Date(istTime.getTime() - istOffset);
+		return startOfDay.toISOString();
+	}
+
 	async function loadEvents() {
 		loading = true;
 		error = '';
 		try {
-			const allEvents = await getWsOrderEvents({ limit: 200, offset: 0 });
-			openOrders = allEvents.filter(e => isOpenStatus(e.status));
-			executedOrders = allEvents.filter(e => isExecutedStatus(e.status));
+			// Fetch only today's events
+			const allEvents = await getWsOrderEvents({ 
+				limit: 200, 
+				offset: 0,
+				start_date: getStartOfDayIST()
+			});
+
+			// Deduplicate: keep only the latest event for each order_id
+			// allEvents is sorted by event_timestamp DESC, so the first occurrence is the latest.
+			const uniqueOrders = new Map<string, WebhookEvent>();
+			for (const ev of allEvents) {
+				if (!uniqueOrders.has(ev.order_id)) {
+					uniqueOrders.set(ev.order_id, ev);
+				}
+			}
+			const latestEvents = Array.from(uniqueOrders.values());
+
+			openOrders = latestEvents.filter(e => isOpenStatus(e.status));
+			executedOrders = latestEvents.filter(e => isExecutedStatus(e.status));
 		} catch (e: any) {
 			error = e.message || 'Failed to load orders';
 			console.error('Failed to load orders:', e);
@@ -106,9 +134,7 @@
 				es.close();
 				es = null;
 			}
-			// Clear tables on stream start
-			openOrders = [];
-			executedOrders = [];
+			// Do not clear tables, just attach to stream for updates
 			
 			const url = buildOrderEventsSseUrl('ws');
 			es = new EventSource(url);
