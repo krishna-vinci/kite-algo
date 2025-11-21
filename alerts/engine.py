@@ -246,27 +246,21 @@ class AlertsEngine:
             updated_id = await self.db.execute(upd_sql, {"id": alert.id, "price": float(current_price)})
 
             if updated_id:
-                # Insert trigger event; tolerate duplicate via catching unique violation
+                # Insert trigger event; tolerate duplicate via ON CONFLICT to avoid error logs
                 evt_sql = """
                 INSERT INTO public.alert_events (
                     alert_id, instrument_token, event_type, price_at_event, direction, reason, meta
                 ) VALUES (
                     :id, :token, 'triggered', :price, :direction, NULL, NULL
                 )
+                ON CONFLICT (alert_id) WHERE event_type = 'triggered' DO NOTHING
                 """
-                try:
-                    await self.db.execute(evt_sql, {
-                        "id": alert.id,
-                        "token": int(alert.instrument_token),
-                        "price": float(current_price),
-                        "direction": direction,
-                    })
-                except Exception as e:
-                    # If unique index ux_alert_events_triggered_once fires, ignore
-                    if 'ux_alert_events_triggered_once' in str(e):
-                        logger.debug("[ALERTS-ENGINE] duplicate trigger event ignored for id=%s", alert.id)
-                    else:
-                        raise
+                await self.db.execute(evt_sql, {
+                    "id": alert.id,
+                    "token": int(alert.instrument_token),
+                    "price": float(current_price),
+                    "direction": direction,
+                })
         
         if not updated_id:
             # This can happen in a race condition where the alert is triggered by two parallel evaluations.

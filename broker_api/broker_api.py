@@ -184,7 +184,7 @@ Base         = declarative_base()
 metadata     = MetaData()
 
 # async database client
-database     = Database(DATABASE_URL)
+from database import database
 
 # module-level session storage
 sessions: Dict[str, str] = {}
@@ -514,8 +514,17 @@ def ensure_instruments_index():
 
     settings = {
         "searchableAttributes": ["tradingsymbol", "aliases", "underlying", "name"],
-        "rankingRules": ["typo","words","proximity","attribute","exactness","sort"],
-        "customRanking": ["desc(boost_score)","asc(type_rank)","asc(expiry_ts)"],
+        "rankingRules": [
+            "typo",
+            "words",
+            "proximity",
+            "attribute",
+            "exactness",
+            "sort",
+            "boost_score:desc",
+            "type_rank:asc",
+            "expiry_ts:asc"
+        ],
         "filterableAttributes": [
             "underlying", "option_type", "exchange", "instrument_type", "segment",
             "expiry", "strike", "derivative_kind", "expiry_year", "expiry_month"

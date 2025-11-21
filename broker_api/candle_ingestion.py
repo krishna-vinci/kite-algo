@@ -143,6 +143,30 @@ class CandleIngestion:
                 'error': str(e)
             }
     
+    async def fetch_raw_records(
+        self,
+        instrument_token: int,
+        interval: str,
+        from_date: datetime,
+        to_date: datetime
+    ) -> List[Dict[str, Any]]:
+        """Fetch historical records without persisting them."""
+        if from_date is None or to_date is None:
+            raise ValueError("from_date and to_date are required for raw fetch")
+
+        to_utc = to_date if to_date.tzinfo else to_date.replace(tzinfo=timezone.utc)
+        from_utc = from_date if from_date.tzinfo else from_date.replace(tzinfo=timezone.utc)
+
+        if from_utc >= to_utc:
+            return []
+
+        return await self._fetch_historical_chunked(
+            instrument_token,
+            from_utc,
+            to_utc,
+            interval
+        )
+    
     async def _fetch_historical_chunked(
         self,
         instrument_token: int,

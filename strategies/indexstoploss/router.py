@@ -174,8 +174,9 @@ async def create_protection_strategy(
     """
     Create a new position protection strategy.
     
-    Phase 1: Index-based monitoring only
-    - Supports two-way bracket stoploss (upper and lower boundaries)
+    Supports:
+    - Index Mode: Two-way bracket stoploss (upper and lower boundaries)
+    - Combined Premium Mode: P&L based exits for strategy
     - Automatically captures current positions matching filter
     - Subscribes to index token for real-time monitoring
     """
@@ -211,13 +212,6 @@ async def create_protection_strategy(
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Prepare premium_thresholds JSON (Phase 2)
-        premium_thresholds_json = None
-        if req.premium_thresholds:
-            premium_thresholds_json = json.dumps({
-                token: config.model_dump() for token, config in req.premium_thresholds.items()
-            })
-        
         # Prepare combined_premium_levels JSON (Phase 4)
         combined_levels_json = None
         if req.combined_premium_levels:
@@ -231,8 +225,6 @@ async def create_protection_strategy(
                 stoploss_order_type, stoploss_limit_offset,
                 trailing_mode, trailing_distance, trailing_unit,
                 trailing_lock_profit,
-                premium_thresholds,
-                exit_logic,
                 combined_premium_entry_type,
                 combined_premium_profit_target,
                 combined_premium_trailing_enabled,
@@ -247,8 +239,6 @@ async def create_protection_strategy(
                 %s, %s,
                 %s, %s,
                 %s, %s, %s,
-                %s,
-                %s,
                 %s,
                 %s,
                 %s,
@@ -277,8 +267,6 @@ async def create_protection_strategy(
             req.trailing_distance,
             req.trailing_unit,
             req.trailing_lock_profit,
-            premium_thresholds_json,
-            req.exit_logic.value if req.exit_logic else 'any',
             req.combined_premium_entry_type.value if req.combined_premium_entry_type else None,
             req.combined_premium_profit_target,
             req.combined_premium_trailing_enabled,
@@ -297,17 +285,12 @@ async def create_protection_strategy(
         
         logger.info(f"Strategy created: {strategy_id}")
         
-        # 4. Subscribe to tokens in WebSocket (Phase 2: Add option tokens)
+        # 4. Subscribe to tokens in WebSocket
         tokens_to_subscribe = []
         
-        # Subscribe to index token if index/hybrid mode
-        if req.index_instrument_token and req.monitoring_mode in ['index', 'hybrid']:
+        # Subscribe to index token
+        if req.index_instrument_token:
             tokens_to_subscribe.append(req.index_instrument_token)
-        
-        # Subscribe to option tokens if premium/hybrid mode (Phase 2)
-        if req.monitoring_mode in ['premium', 'hybrid'] and req.premium_thresholds:
-            for token_str in req.premium_thresholds.keys():
-                tokens_to_subscribe.append(int(token_str))
         
         if tokens_to_subscribe:
             engine.ws_manager.subscribe(tokens_to_subscribe)
@@ -814,15 +797,6 @@ async def update_strategy(
             params.append(req.trailing_lock_profit)
             changes['trailing_lock_profit'] = req.trailing_lock_profit
             trailing_modified = True
-        
-        # Premium thresholds update
-        if req.premium_thresholds is not None:
-            premium_thresholds_json = json.dumps({
-                token: config.model_dump() for token, config in req.premium_thresholds.items()
-            })
-            update_fields.append("premium_thresholds = %s")
-            params.append(premium_thresholds_json)
-            changes['premium_thresholds'] = 'updated'
         
         # If no fields to update, return error
         if not update_fields:
@@ -1367,4 +1341,3 @@ async def get_realtime_positions_summary(
     except Exception as e:
         logger.error(f"Failed to get realtime positions summary: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-

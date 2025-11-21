@@ -4,6 +4,7 @@ import os
 import pyotp
 import requests
 from urllib.parse import urlparse, parse_qs
+from typing import Optional
 
 from kiteconnect import KiteConnect
 from fastapi import HTTPException, Request
@@ -81,6 +82,18 @@ def get_kite(request: Request) -> KiteConnect:
     token = request.cookies.get("kite_at")
     if not token:
         raise HTTPException(401, "Not authenticated; login first")
+    client = KiteConnect(api_key=API_KEY)
+    client.set_access_token(token)
+    return client
+
+def get_kite_optional(request: Request) -> Optional[KiteConnect]:
+    """
+    FastAPI dependency: reads 'kite_at' cookie, returns configured KiteConnect OR None.
+    Does NOT raise 401.
+    """
+    token = request.cookies.get("kite_at")
+    if not token:
+        return None
     client = KiteConnect(api_key=API_KEY)
     client.set_access_token(token)
     return client

@@ -167,6 +167,9 @@ def _create_position_protection_tables(conn):
             cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_events_created_at ON strategy_events(created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_events_type ON strategy_events(event_type)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_events_order_id ON strategy_events(order_id) WHERE order_id IS NOT NULL")
+            
+            # Ensure correlation_id column exists (migration fix)
+            cur.execute("ALTER TABLE strategy_events ADD COLUMN IF NOT EXISTS correlation_id TEXT")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_events_correlation_id ON strategy_events(correlation_id) WHERE correlation_id IS NOT NULL")
         
         conn.commit()

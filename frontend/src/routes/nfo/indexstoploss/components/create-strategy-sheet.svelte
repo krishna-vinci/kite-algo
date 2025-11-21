@@ -140,16 +140,10 @@
 			return 'Please provide a strategy name';
 		}
 		
-		if (selectedMode === 'index' || selectedMode === 'hybrid' || selectedMode === 'combined_premium') {
+		if (selectedMode === 'index' || selectedMode === 'combined_premium') {
 			if (!indexToken) return 'Index token is required';
 			if (!upperStoploss && !lowerStoploss && !upperTarget && !lowerTarget) {
 				return 'At least one exit condition (stop-loss or target) is required for index monitoring';
-			}
-		}
-		
-		if (selectedMode === 'premium' || selectedMode === 'hybrid') {
-			if (!premiumConfigEnabled) {
-				return 'Premium monitoring must be configured for this mode';
 			}
 		}
 		
@@ -191,7 +185,7 @@
 			};
 			
 			// Add mode-specific config
-			if (selectedMode === 'index' || selectedMode === 'hybrid' || selectedMode === 'combined_premium') {
+			if (selectedMode === 'index' || selectedMode === 'combined_premium') {
 				request.index_instrument_token = indexToken;
 				request.index_tradingsymbol = indexSymbol;
 				request.index_exchange = indexExchange;
@@ -208,26 +202,6 @@
 					request.trailing_unit = trailingUnit;
 					request.trailing_lock_profit = trailingLockProfit || undefined;
 				}
-			}
-			
-			if (selectedMode === 'premium' || selectedMode === 'hybrid') {
-				// For now, we'll create a simple premium threshold config from matched positions
-				// In a full implementation, user would configure each position individually
-				request.premium_thresholds = {};
-				matchedPositions.forEach(pos => {
-					request.premium_thresholds![pos.instrument_token.toString()] = {
-						tradingsymbol: pos.tradingsymbol,
-						transaction_type: pos.quantity > 0 ? 'BUY' : 'SELL',
-						entry_price: pos.average_price,
-						// User would set these - using defaults for now
-						stoploss_price: pos.average_price * 0.9,
-						target_price: pos.average_price * 1.1
-					};
-				});
-			}
-			
-			if (selectedMode === 'hybrid') {
-				request.exit_logic = exitLogic;
 			}
 			
 			if (selectedMode === 'combined_premium') {
@@ -331,10 +305,8 @@
 				<h3 class="text-lg font-semibold mb-4">Monitoring Mode</h3>
 				
 				<Tabs bind:value={selectedMode} class="w-full">
-					<TabsList class="grid w-full grid-cols-4">
+					<TabsList class="grid w-full grid-cols-2">
 						<TabsTrigger value="index">INDEX</TabsTrigger>
-						<TabsTrigger value="premium">PREMIUM</TabsTrigger>
-						<TabsTrigger value="hybrid">HYBRID</TabsTrigger>
 						<TabsTrigger value="combined_premium">COMBINED</TabsTrigger>
 					</TabsList>
 					
@@ -488,65 +460,6 @@
 						</Card>
 					</TabsContent>
 					
-					<!-- PREMIUM Mode -->
-					<TabsContent value="premium" class="space-y-4 mt-4">
-						<Card>
-							<CardHeader>
-								<CardTitle>Premium-Based Protection</CardTitle>
-								<CardDescription>
-									Monitor individual position premiums for exit signals
-								</CardDescription>
-							</CardHeader>
-							<CardContent class="space-y-4">
-								<div class="flex items-center justify-between">
-									<Label>Enable Premium Monitoring</Label>
-									<Switch bind:checked={premiumConfigEnabled} />
-								</div>
-								
-								{#if premiumConfigEnabled}
-									<div class="p-4 bg-muted rounded-md">
-										<p class="text-sm text-muted-foreground">
-											Premium thresholds will be auto-configured based on matched positions.
-											Entry prices will be set from current average prices with default stop-loss at 10% and target at 10% profit.
-										</p>
-									</div>
-								{:else}
-									<p class="text-sm text-muted-foreground">
-										Enable premium monitoring to track individual position P&L
-									</p>
-								{/if}
-							</CardContent>
-						</Card>
-					</TabsContent>
-					
-					<!-- HYBRID Mode -->
-					<TabsContent value="hybrid" class="space-y-4 mt-4">
-						<Card>
-							<CardHeader>
-								<CardTitle>Hybrid Protection</CardTitle>
-								<CardDescription>
-									Combine index AND premium monitoring for maximum control
-								</CardDescription>
-							</CardHeader>
-							<CardContent class="space-y-4">
-								<p class="text-sm text-muted-foreground">
-									Configure both INDEX and PREMIUM settings above
-								</p>
-								
-								<div class="space-y-2">
-									<Label for="exit-logic">Exit Logic</Label>
-									<select
-										id="exit-logic"
-										bind:value={exitLogic}
-										class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-									>
-										<option value="any">ANY - Exit when either index OR premium triggers</option>
-										<option value="all">ALL - Exit only when both index AND premium trigger</option>
-									</select>
-								</div>
-							</CardContent>
-						</Card>
-					</TabsContent>
 					
 					<!-- COMBINED PREMIUM Mode -->
 					<TabsContent value="combined_premium" class="space-y-4 mt-4">

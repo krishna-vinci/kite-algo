@@ -364,3 +364,82 @@ CREATE INDEX IF NOT EXISTS idx_ws_order_events_timestamp
 
 CREATE INDEX IF NOT EXISTS idx_ws_order_events_received
   ON public.ws_order_events (received_at DESC);
+
+-- =========================================
+-- Index Stoploss Strategy Tables
+-- =========================================
+
+CREATE TABLE IF NOT EXISTS public.position_protection_strategies (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id VARCHAR(255) NOT NULL DEFAULT 'default',
+    name VARCHAR(255),
+    strategy_type VARCHAR(50) DEFAULT 'manual',
+    status VARCHAR(50) DEFAULT 'active', -- active, paused, completed, triggered, error, partial
+    monitoring_mode VARCHAR(50) NOT NULL, -- index, combined_premium
+    
+    -- Index Config
+    index_instrument_token BIGINT,
+    index_tradingsymbol VARCHAR(255),
+    index_exchange VARCHAR(20),
+    index_upper_stoploss NUMERIC(18,6),
+    index_lower_stoploss NUMERIC(18,6),
+    
+    -- Order Config
+    stoploss_order_type VARCHAR(20) DEFAULT 'MARKET',
+    stoploss_limit_offset NUMERIC(18,6),
+    
+    -- Trailing Config
+    trailing_mode VARCHAR(50) DEFAULT 'none',
+    trailing_distance NUMERIC(18,6),
+    trailing_unit VARCHAR(20) DEFAULT 'points',
+    trailing_step_size NUMERIC(18,6),
+    trailing_lock_profit NUMERIC(18,6),
+    trailing_state JSONB, -- Stores current level, activation status
+    
+    -- Combined Premium Config & State
+    combined_premium_entry_type VARCHAR(20), -- credit, debit
+    combined_premium_profit_target NUMERIC(18,6),
+    combined_premium_trailing_enabled BOOLEAN DEFAULT FALSE,
+    combined_premium_trailing_distance NUMERIC(18,6),
+    combined_premium_trailing_lock_profit NUMERIC(18,6),
+    combined_premium_levels JSONB, -- List of partial exit levels
+    
+    combined_premium_state JSONB, -- current_net_premium, net_pnl, etc.
+    
+    -- Position Data
+    position_snapshot JSONB, -- List of positions at creation
+    remaining_quantities JSONB, -- Tracking remaining qty per instrument
+    
+    -- Execution Tracking
+    placed_orders JSONB DEFAULT '[]'::jsonb, -- List of orders placed
+    execution_errors JSONB DEFAULT '[]'::jsonb,
+    levels_executed JSONB DEFAULT '[]'::jsonb, -- List of executed level IDs
+    stoploss_executed BOOLEAN DEFAULT FALSE,
+    
+    -- Audit & Runtime
+    last_evaluated_price NUMERIC(18,6),
+    last_evaluated_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pps_user_status ON public.position_protection_strategies(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_pps_token ON public.position_protection_strategies(index_instrument_token);
+CREATE INDEX IF NOT EXISTS idx_pps_created ON public.position_protection_strategies(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.strategy_events (
+    id BIGSERIAL PRIMARY KEY,
+    strategy_id UUID NOT NULL REFERENCES public.position_protection_strategies(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    trigger_price NUMERIC(18,6),
+    order_id TEXT,
+    instrument_token BIGINT,
+    quantity_affected INT,
+    error_message TEXT,
+    meta JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_strat_events_strat_id ON public.strategy_events(strategy_id);
+CREATE INDEX IF NOT EXISTS idx_strat_events_created ON public.strategy_events(created_at DESC);

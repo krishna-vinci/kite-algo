@@ -7,6 +7,7 @@ export type Instrument = {
 	percentChange: number;
 	price: number;
 	last_price?: number;
+	tradingsymbol?: string;
 };
 
 export type NiftyInstrument = {

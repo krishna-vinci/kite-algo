@@ -556,6 +556,7 @@ export async function fetchCandles(
 		from?: string | number | Date;
 		to?: string | number | Date;
 		ingest?: boolean;
+		passthrough?: boolean;
 	}
 ): Promise<CandlesResponse> {
 	const canonicalTimeframe = normalizeTimeframe(opts.timeframe);
@@ -583,6 +584,7 @@ export async function fetchCandles(
 
 	// Default ingest to true if not specified
 	params.set('ingest', opts.ingest === false ? 'false' : 'true');
+	params.set('passthrough', opts.passthrough ? 'true' : 'false');
 
 	const url = `/broker/candles/${identifier}?${params.toString()}`;
 	const res = await apiFetch(url);

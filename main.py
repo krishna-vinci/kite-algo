@@ -229,6 +229,16 @@ async def combined_lifespan(app: FastAPI):
         server.mcp_kite_instance = kite
         logging.info("MCP Kite instance initialized successfully.")
 
+        # Ensure async DB is connected (required for Meilisearch reindex and other async ops)
+        try:
+            # Check if 'is_connected' property exists (databases < 0.8.0) or just connect
+            # 'databases' library usually handles idempotency of connect()
+            if not async_db.is_connected:
+                await async_db.connect()
+                logging.info("Async database connected.")
+        except Exception as e:
+             logging.error(f"Failed to connect to async database: {e}")
+
         # Initialize and start the WebSocketManager with the selected token
         logging.info("Initializing WebSocketManager...")
         # Get the main event loop to pass to the WebSocketManager
@@ -278,12 +288,6 @@ async def combined_lifespan(app: FastAPI):
         logging.info("[GATE] Initialized and open at startup (will close at next 07:31 IST)")
         scheduler_task = asyncio.create_task(daily_token_scheduler())
 
-        # Ensure async DB is connected for workers
-        try:
-            if hasattr(async_db, "is_connected") and not async_db.is_connected:
-                await async_db.connect()
-        except Exception:
-            pass
         # Start AlertsEngine (Phase 0) after WS manager and async DB are ready
         try:
             alerts_engine = AlertsEngine(async_db, ws_manager, app)
@@ -350,7 +354,13 @@ async def combined_lifespan(app: FastAPI):
                 client = get_meili_client(admin=True)
                 index = client.index("instruments")
                 stats = index.get_stats() if hasattr(index, "get_stats") else index.stats()
-                num_docs = (stats.get("numberOfDocuments") or stats.get("number_of_documents") or 0)
+                # Handle both dict (older versions) and IndexStats object (newer versions)
+                if isinstance(stats, dict):
+                    num_docs = (stats.get("numberOfDocuments") or stats.get("number_of_documents") or 0)
+                else:
+                    # Try camelCase first then snake_case attributes
+                    num_docs = getattr(stats, "numberOfDocuments", getattr(stats, "number_of_documents", 0))
+
                 if int(num_docs) == 0:
                     logger.info("Meilisearch 'instruments' index is empty; triggering bootstrap reindex...")
                     await meili_reindex_instruments()
@@ -996,6 +1006,10 @@ async def finalize_nifty50_baseline(dry_run: bool = False, target_date: Optional
 
 @app.websocket("/broker/ws/marketwatch")
 async def websocket_endpoint(websocket: WebSocket):
+    if ws_manager is None:
+        logging.error("WebSocket connection rejected: ws_manager is None")
+        await websocket.close(code=1011, reason="WebSocketManager not initialized")
+        return
     await ws_manager.connect(websocket)
     # Auto-subscribe on connect (aggregate across legacy + scoped namespaces)
     db = SessionLocal()
@@ -1202,5 +1216,3 @@ async def daily_token_scheduler() -> None:
         except Exception as e:
             logging.error("[SCHED] Scheduler loop error: %s", e, exc_info=True)
             await asyncio.sleep(30)
-
-
