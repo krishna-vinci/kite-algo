@@ -893,31 +893,21 @@ async def get_overlay_snapshot(
 
 
 @app.post("/broker/marketwatch/nifty50/finalize-baseline")
-async def finalize_nifty50_baseline(dry_run: bool = False, target_date: Optional[str] = Query(None, description="Target date in YYYY-MM-DD format. Defaults to the last trading day.")):
+async def finalize_nifty50_baseline(dry_run: bool = False):
     """
-    Computes and stores all derived baseline metrics for all Nifty 50 instruments for a specific date.
-    This endpoint can be used for daily updates or to backfill missed days.
+    Fetches live OHLC data via /quote/ohlc and updates baseline metrics for all Nifty 50 instruments.
+    Stores: open, high, low, close (previous day), ltp (current), net_change, net_change_percent.
+    Recalculates freefloat_marketcap, return_attribution, and index_weight based on net_change.
     """
     conn = None
+    debug_info = {"errors": [], "warnings": []}
     try:
-        # Determine the target date
-        nse = mcal.get_calendar('NSE')
-        if target_date:
-            process_date = datetime.strptime(target_date, "%Y-%m-%d").date()
-        else:
-            today = datetime.now(timezone('Asia/Kolkata')).date()
-            schedule = nse.schedule(start_date=today - timedelta(days=10), end_date=today)
-            process_date = schedule.index[-1].date()
-
-        schedule_back = nse.schedule(start_date=process_date - timedelta(days=10), end_date=process_date)
-        if len(schedule_back) < 2:
-            raise HTTPException(status_code=400, detail="Not enough historical trading days to calculate change.")
-        prev_trading_date = schedule_back.index[-2].date()
-
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("SELECT instrument_token, tradingsymbol, freefloat_marketcap, index_weight FROM kite_ticker_tickers WHERE source_list = 'Nifty50'")
+            cur.execute("SELECT instrument_token, tradingsymbol, exchange, freefloat_marketcap, index_weight FROM kite_ticker_tickers WHERE source_list = 'Nifty50'")
             instruments = cur.fetchall()
+        
+        debug_info["instruments_count"] = len(instruments)
 
         db = SessionLocal()
         try:
@@ -929,42 +919,76 @@ async def finalize_nifty50_baseline(dry_run: bool = False, target_date: Optional
         finally:
             db.close()
 
+        # Build list of instrument identifiers for kite.quote()
+        instrument_keys = [f"{inst['exchange']}:{inst['tradingsymbol']}" for inst in instruments]
+        debug_info["instrument_keys_sample"] = instrument_keys[:3]
+        logging.info(f"Fetching OHLC for {len(instrument_keys)} instruments")
+        
+        # Fetch OHLC data in bulk
+        try:
+            ohlc_data = kite.quote(instrument_keys)
+            debug_info["ohlc_data_count"] = len(ohlc_data)
+            debug_info["ohlc_keys_sample"] = list(ohlc_data.keys())[:3] if ohlc_data else []
+            logging.info(f"Received OHLC data for {len(ohlc_data)} instruments")
+        except Exception as e:
+            debug_info["errors"].append(f"Kite API error: {str(e)}")
+            logging.error(f"Failed to fetch OHLC data: {e}", exc_info=True)
+            raise HTTPException(status_code=502, detail=f"Failed to fetch OHLC data: {str(e)}")
+
         updates = []
         total_new_marketcap = 0
         
         # First pass: calculate individual metrics
         for inst in instruments:
             try:
-                hist_data = kite.historical_data(inst['instrument_token'], from_date=prev_trading_date, to_date=process_date, interval='day')
-                if len(hist_data) < 2: continue
+                key = f"{inst['exchange']}:{inst['tradingsymbol']}"
+                data = ohlc_data.get(key)
+                if not data:
+                    debug_info["warnings"].append(f"No data returned for {key}")
+                    continue
+                if "ohlc" not in data:
+                    debug_info["warnings"].append(f"Missing 'ohlc' field for {key}")
+                    continue
+                if "last_price" not in data:
+                    debug_info["warnings"].append(f"Missing 'last_price' field for {key}")
+                    continue
 
-                today_data = next((d for d in hist_data if d['date'].date() == process_date), None)
-                prev_day_data = next((d for d in hist_data if d['date'].date() == prev_trading_date), None)
-
-                if not today_data or not prev_day_data: continue
-
-                baseline_close = today_data['close']
-                previous_close = prev_day_data['close']
-                change_1d = 0
-                if previous_close > 0:
-                    change_1d = (baseline_close / previous_close) - 1
+                ltp = data["last_price"]
+                previous_close = data["ohlc"]["close"]
+                open_price = data["ohlc"]["open"]
+                high_price = data["ohlc"]["high"]
+                low_price = data["ohlc"]["low"]
                 
-                new_freefloat_marketcap = (inst['freefloat_marketcap'] or 0) * (1 + change_1d)
-                return_attribution = (inst['index_weight'] or 0) * change_1d
+                net_change = ltp - previous_close
+                net_change_percent = (net_change / previous_close * 100) if previous_close > 0 else 0
+                
+                # Calculate return ratio for freefloat and attribution
+                return_ratio = net_change_percent / 100
+                # Convert Decimal to float to avoid type mismatch
+                freefloat_mc = float(inst['freefloat_marketcap'] or 0)
+                idx_weight = float(inst['index_weight'] or 0)
+                new_freefloat_marketcap = freefloat_mc * (1 + return_ratio)
+                return_attribution = idx_weight * return_ratio
                 
                 total_new_marketcap += new_freefloat_marketcap
 
                 updates.append({
                     "instrument_token": inst['instrument_token'],
-                    "change_1d": change_1d * 100,
-                    "previous_close": previous_close,
-                    "baseline_close": baseline_close,
+                    "open": open_price,
+                    "high": high_price,
+                    "low": low_price,
+                    "close": previous_close,
+                    "ltp": ltp,
+                    "net_change": net_change,
+                    "net_change_percent": net_change_percent,
                     "freefloat_marketcap": new_freefloat_marketcap,
                     "return_attribution": return_attribution,
-                    "index_weight": 0 # Placeholder for now
+                    "index_weight": 0  # Placeholder for second pass
                 })
             except Exception as e:
-                logging.warning(f"Could not process instrument {inst['tradingsymbol']}: {e}")
+                error_msg = f"Could not process instrument {inst.get('tradingsymbol', 'UNKNOWN')}: {str(e)}"
+                debug_info["errors"].append(error_msg)
+                logging.warning(error_msg)
                 continue
         
         # Second pass: calculate new index weight
@@ -972,16 +996,25 @@ async def finalize_nifty50_baseline(dry_run: bool = False, target_date: Optional
             for update in updates:
                 update['index_weight'] = (update['freefloat_marketcap'] / total_new_marketcap) * 100
 
+        logging.info(f"Processed {len(updates)} instruments successfully, {len(instruments) - len(updates)} skipped")
+        
+        debug_info["processed"] = len(updates)
+        debug_info["skipped"] = len(instruments) - len(updates)
+
         if dry_run:
-            return {"status": "success", "preview": updates}
+            return {"status": "success", "preview": updates, "debug": debug_info}
 
         with conn.cursor() as cur:
             update_query = """
                 UPDATE kite_ticker_tickers
                 SET
-                    change_1d = %(change_1d)s,
-                    previous_close = %(previous_close)s,
-                    baseline_close = %(baseline_close)s,
+                    open = %(open)s,
+                    high = %(high)s,
+                    low = %(low)s,
+                    close = %(close)s,
+                    ltp = %(ltp)s,
+                    net_change = %(net_change)s,
+                    net_change_percent = %(net_change_percent)s,
                     freefloat_marketcap = %(freefloat_marketcap)s,
                     return_attribution = %(return_attribution)s,
                     index_weight = %(index_weight)s,
@@ -993,12 +1026,21 @@ async def finalize_nifty50_baseline(dry_run: bool = False, target_date: Optional
         
         conn.commit()
         
-        return {"status": "success", "data": {"updated": len(updates), "skipped": len(instruments) - len(updates), "errors": []}}
+        return {
+            "status": "success", 
+            "data": {
+                "updated": len(updates), 
+                "skipped": len(instruments) - len(updates), 
+                "errors": debug_info["errors"]
+            },
+            "debug": debug_info
+        }
 
     except Exception as e:
         if conn:
             conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        debug_info["errors"].append(str(e))
+        raise HTTPException(status_code=500, detail={"error": str(e), "debug": debug_info})
     finally:
         if conn:
             conn.close()

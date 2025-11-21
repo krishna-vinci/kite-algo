@@ -16,12 +16,20 @@ export type NiftyInstrument = {
 	company_name: string;
 	sector: string;
 	source_list: string;
-	change_1d: number | null;
+	// OHLC baseline data
+	open: number | null;
+	high: number | null;
+	low: number | null;
+	close: number | null; // Previous day's close (baseline reference)
+	ltp: number | null; // Last traded price at baseline capture
+	net_change: number | null; // Absolute change (ltp - close)
+	net_change_percent: number | null; // Percentage change
+	// Index metrics
 	return_attribution: number | null;
 	index_weight: number | null;
 	freefloat_marketcap: number | null;
 	last_updated: string;
-	ltp: number | null;
+	// Live overlay fields (computed in frontend)
 	ltp_live?: number;
 	change_percent_live?: number;
 	ff_mc_live?: number;

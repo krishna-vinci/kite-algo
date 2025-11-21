@@ -154,6 +154,10 @@ class OHLCResponseData(BaseModel):
     high: float
     low: float
     previous_close: float
+    volume: Optional[int] = None
+    net_change: Optional[float] = None
+    net_change_percent: Optional[float] = None
+    close: Optional[float] = None
 
 
 class OHLCResponse(BaseModel):
@@ -1001,20 +1005,29 @@ def get_ohlc(
         )
 
     try:
-        ohlc_data = kite.ohlc(instruments)
+        ohlc_data = kite.quote(instruments)
         
         response_data = {}
         for instrument, data in ohlc_data.items():
             try:
                 # Ensure all required fields are present
                 if "instrument_token" in data and "last_price" in data and "ohlc" in data and "open" in data["ohlc"] and "high" in data["ohlc"] and "low" in data["ohlc"] and "close" in data["ohlc"]:
+                    last_price = data["last_price"]
+                    previous_close = data["ohlc"]["close"]
+                    net_change = last_price - previous_close
+                    net_change_percent = (net_change / previous_close * 100) if previous_close != 0 else 0
+                    
                     response_data[instrument] = {
                         "instrument_token": data["instrument_token"],
-                        "last_price": data["last_price"],
+                        "last_price": last_price,
                         "open": data["ohlc"]["open"],
                         "high": data["ohlc"]["high"],
                         "low": data["ohlc"]["low"],
-                        "previous_close": data["ohlc"]["close"],
+                        "previous_close": previous_close,
+                        "volume": data.get("volume", 0),
+                        "net_change": round(net_change, 2),
+                        "net_change_percent": round(net_change_percent, 2),
+                        "close": last_price,
                     }
             except (KeyError, TypeError):
                 # Skip instruments with missing data

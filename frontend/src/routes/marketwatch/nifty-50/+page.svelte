@@ -53,7 +53,7 @@
 			newSectors[sector] = [];
 			for (const baseline of instruments) {
 				const overlay = overlayByToken.get(baseline.instrument_token) || {};
-				const baseline_close = baseline.ltp ?? 0;
+				const baseline_close = baseline.close ?? 0;
 
 				let r = 0;
 				if (overlay.change_percent !== undefined && isFinite(overlay.change_percent)) {
@@ -64,11 +64,11 @@
 					baseline_close > 0
 				) {
 					r = overlay.last_price / baseline_close - 1;
-				} else if (baseline.change_1d != null && isFinite(baseline.change_1d)) {
-					r = baseline.change_1d / 100;
+				} else if (baseline.net_change_percent != null && isFinite(baseline.net_change_percent)) {
+					r = baseline.net_change_percent / 100;
 				}
 
-				const ltp_live = overlay.last_price ?? baseline_close;
+				const ltp_live = overlay.last_price ?? baseline.ltp ?? baseline_close;
 				const ff_mc_live = (baseline.freefloat_marketcap || 0) * (1 + r);
 
 				if (isFinite(ff_mc_live)) {

@@ -237,14 +237,21 @@ CREATE TABLE IF NOT EXISTS public.kite_ticker_tickers (
   tradingsymbol      VARCHAR(255) NOT NULL,
   company_name       VARCHAR(255),
   sector             VARCHAR(255),
-  source_list        VARCHAR(255),
-  change_1d NUMERIC(10, 4),
+  exchange           VARCHAR(20),
+  source_list        VARCHAR(255) NOT NULL,
+  -- OHLC data (close is previous day's close, used as baseline)
+  open               NUMERIC(18, 6),
+  high               NUMERIC(18, 6),
+  low                NUMERIC(18, 6),
+  close              NUMERIC(18, 6),
+  -- Current price and change metrics
+  ltp                NUMERIC(18, 6),
+  net_change         NUMERIC(18, 6),
+  net_change_percent NUMERIC(10, 4),
+  -- Index metrics
   return_attribution NUMERIC(10, 4),
-  index_weight NUMERIC(10, 4),
+  index_weight       NUMERIC(10, 4),
   freefloat_marketcap NUMERIC(20, 2),
-  previous_close NUMERIC(18, 6),
-  last_price NUMERIC(18, 6),
-  baseline_close NUMERIC(18, 6),
   last_updated       TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   PRIMARY KEY (instrument_token, source_list)
 );
