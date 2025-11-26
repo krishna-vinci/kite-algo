@@ -1,5 +1,8 @@
 <script lang="ts">
 	import { createEventDispatcher } from 'svelte';
+	import * as Table from '$lib/components/ui/table';
+	import { Checkbox } from '$lib/components/ui/checkbox';
+	import { Badge } from '$lib/components/ui/badge';
 
 	export let stocks: any[] = [];
 	export let selectedStocks: { [key: string]: boolean };
@@ -7,79 +10,53 @@
 
 	const dispatch = createEventDispatcher();
 
-	function handleCheckboxChange() {
+	function handleCheckboxChange(symbol: string, checked: boolean) {
+		selectedStocks[symbol] = checked;
 		dispatch('select', selectedStocks);
 	}
 </script>
 
-<div class="overflow-x-auto">
-	<table class="min-w-full divide-y divide-gray-200">
-		<thead class="bg-gray-50">
-			<tr>
-				<th
-					scope="col"
-					class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-				>
-					Select
-				</th>
-				<th
-					scope="col"
-					class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-				>
-					Symbol
-				</th>
-				<th
-					scope="col"
-					class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-				>
-					252-Day Return (%)
-				</th>
-				<th
-					scope="col"
-					class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-				>
-					LTP (₹)
-				</th>
-				<th
-					scope="col"
-					class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-				>
-					Shares
-				</th>
-			</tr>
-		</thead>
-		<tbody class="bg-white divide-y divide-gray-200">
+<div class="rounded-md border">
+	<Table.Root>
+		<Table.Header>
+			<Table.Row>
+				<Table.Head class="w-[50px]">Select</Table.Head>
+				<Table.Head>Symbol</Table.Head>
+				<Table.Head>252-Day Return (%)</Table.Head>
+				<Table.Head>LTP (₹)</Table.Head>
+				<Table.Head>Shares</Table.Head>
+			</Table.Row>
+		</Table.Header>
+		<Table.Body>
 			{#each stocks as stock (stock.symbol)}
-				<tr
+				<Table.Row
 					class={calculatedShares[stock.symbol] === 0 && selectedStocks[stock.symbol]
-						? 'bg-red-50'
+						? 'bg-red-50 hover:bg-red-100'
 						: ''}
 				>
-					<td class="px-6 py-4 whitespace-nowrap">
-						<input
-							type="checkbox"
-							bind:checked={selectedStocks[stock.symbol]}
-							on:change={handleCheckboxChange}
-							class="focus:ring-indigo-500 h-4 w-4 text-indigo-600 border-gray-300 rounded"
+					<Table.Cell>
+						<Checkbox
+							checked={selectedStocks[stock.symbol]}
+							onCheckedChange={(v) => handleCheckboxChange(stock.symbol, v as boolean)}
 						/>
-					</td>
-					<td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+					</Table.Cell>
+					<Table.Cell class="font-medium">
 						{stock.symbol}
 						{#if calculatedShares[stock.symbol] === 0 && selectedStocks[stock.symbol]}
 							<span class="ml-2 text-red-500 text-xs">(Too pricey)</span>
 						{/if}
-					</td>
-					<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+					</Table.Cell>
+					<Table.Cell>
 						{stock.ret.toFixed(2)}
-					</td>
-					<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+					</Table.Cell>
+					<Table.Cell>
 						{stock.ltp.toFixed(2)}
-					</td>
-					<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+					</Table.Cell>
+					<Table.Cell>
 						{calculatedShares[stock.symbol] || 0}
-					</td>
-				</tr>
+					</Table.Cell>
+				</Table.Row>
 			{/each}
-		</tbody>
-	</table>
+		</Table.Body>
+	</Table.Root>
 </div>

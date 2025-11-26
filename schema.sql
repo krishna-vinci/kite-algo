@@ -281,6 +281,10 @@ CREATE TABLE IF NOT EXISTS public.historical_candles (
 CREATE INDEX IF NOT EXISTS idx_hist_candles_token_interval_ts
   ON public.historical_candles (instrument_token, interval, ts DESC);
 
+-- Covering index for momentum scans (latest & 252nd closes per tradingsymbol)
+CREATE INDEX IF NOT EXISTS idx_kite_hist_tradingsymbol_ts
+  ON public.kite_historical_data (tradingsymbol, "timestamp" DESC);
+
 -- Table for user-specific watchlists
 CREATE TABLE IF NOT EXISTS public.user_watchlists (
   owner_id           VARCHAR(255) NOT NULL DEFAULT 'default',
@@ -450,3 +454,38 @@ CREATE TABLE IF NOT EXISTS public.strategy_events (
 
 CREATE INDEX IF NOT EXISTS idx_strat_events_strat_id ON public.strategy_events(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_strat_events_created ON public.strategy_events(created_at DESC);
+
+-- =========================================
+-- Investing Strategies Table
+-- =========================================
+
+CREATE TABLE IF NOT EXISTS public.investing_strategies (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    order_id VARCHAR(50),
+    kite_ref_tag VARCHAR(20),  -- Tag sent to Kite API (max 20 chars), format: MOM-N50-25-11-26
+    strategy_name VARCHAR(255) NOT NULL,
+    strategy_type VARCHAR(50) NOT NULL,
+    tag VARCHAR(50) NOT NULL,
+    instrument_token BIGINT NOT NULL,
+    tradingsymbol VARCHAR(255) NOT NULL,
+    exchange VARCHAR(20) DEFAULT 'NSE',
+    quantity INTEGER NOT NULL,
+    invested_amount NUMERIC(18,2),
+    entry_price NUMERIC(18,2),
+    entry_date TIMESTAMPTZ DEFAULT NOW(),
+    last_price NUMERIC(18,2),
+    pnl NUMERIC(18,2),
+    pnl_percent NUMERIC(10,2),
+    status VARCHAR(20) DEFAULT 'ACTIVE',
+    exit_date TIMESTAMPTZ,
+    exit_price NUMERIC(18,2),
+    linked_index_token BIGINT,
+    linked_index_symbol VARCHAR(255),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_investing_strategies_name ON public.investing_strategies(strategy_name);
+CREATE INDEX IF NOT EXISTS idx_investing_strategies_tag ON public.investing_strategies(tag);
+CREATE INDEX IF NOT EXISTS idx_investing_strategies_status ON public.investing_strategies(status);
+CREATE INDEX IF NOT EXISTS idx_investing_strategies_order_id ON public.investing_strategies(order_id) WHERE order_id IS NOT NULL;

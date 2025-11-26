@@ -1,5 +1,11 @@
 <script lang="ts">
 	import { createEventDispatcher } from 'svelte';
+	import * as Card from '$lib/components/ui/card';
+	import * as Alert from '$lib/components/ui/alert';
+	import { Button } from '$lib/components/ui/button';
+	import { Checkbox } from '$lib/components/ui/checkbox';
+	import { Label } from '$lib/components/ui/label';
+	import { Loader2 } from '@lucide/svelte';
 
 	export let useBasket: boolean;
 	export let allOrNone: boolean;
@@ -22,95 +28,90 @@
 	}
 </script>
 
-<div class="bg-white p-6 rounded-lg shadow-md">
-	<h2 class="text-xl font-semibold mb-4">Order Execution</h2>
+<Card.Root>
+	<Card.Header>
+		<Card.Title>Order Execution</Card.Title>
+	</Card.Header>
+	<Card.Content>
+		{#if isExecutingOrders}
+			<Alert.Root class="mb-4">
+				<Loader2 class="h-4 w-4 animate-spin" />
+				<Alert.Title>Executing Orders...</Alert.Title>
+				<Alert.Description>Please wait.</Alert.Description>
+			</Alert.Root>
+		{/if}
 
-	{#if isExecutingOrders}
-		<div
-			class="bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded relative mb-4"
-			role="alert"
-		>
-			<strong class="font-bold">Executing Orders...</strong>
-			<span class="block sm:inline">Please wait.</span>
-		</div>
-	{/if}
+		{#if orderExecutionError}
+			<Alert.Root variant="destructive" class="mb-4">
+				<Alert.Title>Error</Alert.Title>
+				<Alert.Description>{orderExecutionError}</Alert.Description>
+			</Alert.Root>
+		{/if}
 
-	{#if orderExecutionError}
-		<div
-			class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4"
-			role="alert"
-		>
-			<strong class="font-bold">Order Execution Error!</strong>
-			<span class="block sm:inline">{orderExecutionError}</span>
-		</div>
-	{/if}
+		{#if !isExecutingOrders && (successfulOrdersCount > 0 || failedOrdersCount > 0)}
+			<Alert.Root variant="default" class="mb-4 bg-green-50 border-green-200 text-green-800">
+				<Alert.Title>Order Execution Complete</Alert.Title>
+				<Alert.Description>
+					{successfulOrdersCount} successful, {failedOrdersCount} failed.
+				</Alert.Description>
+			</Alert.Root>
+		{/if}
 
-	{#if !isExecutingOrders && (successfulOrdersCount > 0 || failedOrdersCount > 0)}
-		<div
-			class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded relative mb-4"
-			role="alert"
-		>
-			<strong class="font-bold">Order Execution Complete!</strong>
-			<span class="block sm:inline">
-				{successfulOrdersCount} successful, {failedOrdersCount} failed.
-			</span>
-		</div>
-	{/if}
+		<div class="space-y-4">
+			<div class="flex items-center space-x-2">
+				<Checkbox id="useBasket" bind:checked={useBasket} />
+				<Label for="useBasket">Use basket order</Label>
+			</div>
 
-	<div class="mb-4">
-		<label class="inline-flex items-center">
-			<input
-				type="checkbox"
-				bind:checked={useBasket}
-				class="h-4 w-4 text-indigo-600 border-gray-300 rounded"
-			/>
-			<span class="ml-2 text-sm text-gray-700">Use basket order</span>
-		</label>
-		{#if useBasket}
-			<label class="inline-flex items-center mt-2 block">
-				<input
-					type="checkbox"
-					bind:checked={allOrNone}
-					class="h-4 w-4 text-indigo-600 border-gray-300 rounded"
-				/>
-				<span class="ml-2 text-sm text-gray-700">All-or-none basket (best-effort rollback)</span>
-			</label>
-			<div class="mt-3 flex gap-2">
-				<button
-					on:click={handlePreviewMargins}
-					class="flex-1 bg-gray-100 text-gray-800 py-2 px-4 rounded-md hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-gray-400 focus:ring-offset-2"
-					disabled={previewingMargins}
-				>
-					{previewingMargins ? 'Previewing...' : 'Preview Margins'}
-				</button>
-				<button
+			{#if useBasket}
+				<div class="flex items-center space-x-2 ml-6">
+					<Checkbox id="allOrNone" bind:checked={allOrNone} />
+					<Label for="allOrNone">All-or-none basket (best-effort rollback)</Label>
+				</div>
+
+				<div class="flex gap-2 mt-4">
+					<Button
+						variant="secondary"
+						class="w-full"
+						on:click={handlePreviewMargins}
+						disabled={previewingMargins}
+					>
+						{#if previewingMargins}
+							<Loader2 class="mr-2 h-4 w-4 animate-spin" />
+						{/if}
+						Preview Margins
+					</Button>
+					<Button
+						variant="default"
+						class="w-full"
+						on:click={handleExecuteOrders}
+						disabled={isExecutingOrders || previewingMargins}
+					>
+						Execute Orders
+					</Button>
+				</div>
+
+				{#if marginPreview}
+					<div class="mt-4 rounded-md bg-muted p-4 overflow-x-auto">
+						<p class="text-sm font-medium mb-2">Margin Preview:</p>
+						<pre class="text-xs">{JSON.stringify(marginPreview, null, 2)}</pre>
+					</div>
+				{:else if marginPreviewError}
+					<Alert.Root variant="destructive" class="mt-4">
+						<Alert.Title>Preview Error</Alert.Title>
+						<Alert.Description>{marginPreviewError}</Alert.Description>
+					</Alert.Root>
+				{/if}
+			{:else}
+				<Button
+					variant="default"
+					class="w-full mt-4"
 					on:click={handleExecuteOrders}
-					class="flex-1 bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
-					disabled={isExecutingOrders || previewingMargins}
+					disabled={isExecutingOrders}
 				>
 					Execute Orders
-				</button>
-			</div>
-			{#if marginPreview}
-				<div class="mt-3">
-					<p class="text-sm text-gray-600">Margin preview:</p>
-					<pre class="text-xs bg-gray-100 p-2 rounded overflow-x-auto">{JSON.stringify(
-							marginPreview,
-							null,
-							2
-						)}</pre>
-				</div>
-			{:else if marginPreviewError}
-				<div class="mt-3 text-sm text-red-600">{marginPreviewError}</div>
+				</Button>
 			{/if}
-		{:else}
-			<button
-				on:click={handleExecuteOrders}
-				class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
-				disabled={isExecutingOrders}
-			>
-				Execute Orders
-			</button>
-		{/if}
-	</div>
-</div>
+		</div>
+	</Card.Content>
+</Card.Root>

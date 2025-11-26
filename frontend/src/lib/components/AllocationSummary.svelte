@@ -1,74 +1,67 @@
 <script lang="ts">
+	import * as Card from '$lib/components/ui/card';
+	import * as Table from '$lib/components/ui/table';
+	import { Badge } from '$lib/components/ui/badge';
+
 	export let investableCapital: number;
 	export let totalAllocatedValue: number;
 	export let unallocatedCapital: number;
 	export let allocations: any[] = [];
 </script>
 
-<div class="bg-white p-6 rounded-lg shadow-md">
-	<h2 class="text-xl font-semibold mb-4">Allocation Summary</h2>
-	<div class="mb-4">
-		<p class="text-sm text-gray-600">Total Investable Capital: ₹{investableCapital.toFixed(2)}</p>
-		<p class="text-sm text-gray-600">Total Allocated Value: ₹{totalAllocatedValue.toFixed(2)}</p>
-		<p class="text-sm text-gray-600">Unallocated Capital: ₹{unallocatedCapital.toFixed(2)}</p>
-	</div>
-
-	{#if allocations.length > 0}
-		<h3 class="text-lg font-medium mb-2">Detailed Allocations:</h3>
-		<div class="overflow-x-auto">
-			<table class="min-w-full divide-y divide-gray-200">
-				<thead class="bg-gray-50">
-					<tr>
-						<th
-							scope="col"
-							class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-						>
-							Symbol
-						</th>
-						<th
-							scope="col"
-							class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-						>
-							Shares
-						</th>
-						<th
-							scope="col"
-							class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-						>
-							Allocated Value (₹)
-						</th>
-						<th
-							scope="col"
-							class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-						>
-							Status
-						</th>
-					</tr>
-				</thead>
-				<tbody class="bg-white divide-y divide-gray-200">
-					{#each allocations as allocation (allocation.symbol)}
-						<tr class={allocation.status !== 'ALLOCATED' ? 'bg-red-50' : ''}>
-							<td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-								{allocation.symbol}
-							</td>
-							<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-								{allocation.quantity}
-							</td>
-							<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-								{allocation.allocated_value.toFixed(2)}
-							</td>
-							<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-								{allocation.status}
-								{#if allocation.reason}
-									<span class="ml-2 text-red-500 text-xs">({allocation.reason})</span>
-								{/if}
-							</td>
-						</tr>
-					{/each}
-				</tbody>
-			</table>
+<Card.Root>
+	<Card.Header>
+		<Card.Title>Allocation Summary</Card.Title>
+	</Card.Header>
+	<Card.Content>
+		<div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+			<div class="p-4 bg-gray-50 rounded-md">
+				<div class="text-sm text-gray-500 mb-1">Total Investable Capital</div>
+				<div class="text-lg font-semibold">₹{investableCapital.toFixed(2)}</div>
+			</div>
+			<div class="p-4 bg-gray-50 rounded-md">
+				<div class="text-sm text-gray-500 mb-1">Total Allocated Value</div>
+				<div class="text-lg font-semibold text-green-600">₹{totalAllocatedValue.toFixed(2)}</div>
+			</div>
+			<div class="p-4 bg-gray-50 rounded-md">
+				<div class="text-sm text-gray-500 mb-1">Unallocated Capital</div>
+				<div class="text-lg font-semibold text-amber-600">₹{unallocatedCapital.toFixed(2)}</div>
+			</div>
 		</div>
-	{:else}
-		<p class="text-gray-500">No allocations calculated yet.</p>
-	{/if}
-</div>
+
+		{#if allocations.length > 0}
+			<h3 class="text-lg font-medium mb-2">Detailed Allocations</h3>
+			<div class="rounded-md border">
+				<Table.Root>
+					<Table.Header>
+						<Table.Row>
+							<Table.Head>Symbol</Table.Head>
+							<Table.Head>Shares</Table.Head>
+							<Table.Head>Allocated Value (₹)</Table.Head>
+							<Table.Head>Status</Table.Head>
+						</Table.Row>
+					</Table.Header>
+					<Table.Body>
+						{#each allocations as allocation (allocation.symbol)}
+							<Table.Row class={allocation.status !== 'ALLOCATED' ? 'bg-red-50 hover:bg-red-100' : ''}>
+								<Table.Cell class="font-medium">{allocation.symbol}</Table.Cell>
+								<Table.Cell>{allocation.quantity}</Table.Cell>
+								<Table.Cell>{allocation.allocated_value.toFixed(2)}</Table.Cell>
+								<Table.Cell>
+									<Badge variant={allocation.status === 'ALLOCATED' ? 'default' : 'destructive'}>
+										{allocation.status}
+									</Badge>
+									{#if allocation.reason}
+										<span class="ml-2 text-red-500 text-xs">({allocation.reason})</span>
+									{/if}
+								</Table.Cell>
+							</Table.Row>
+						{/each}
+					</Table.Body>
+				</Table.Root>
+			</div>
+		{:else}
+			<p class="text-muted-foreground text-center py-4">No allocations calculated yet.</p>
+		{/if}
+	</Card.Content>
+</Card.Root>

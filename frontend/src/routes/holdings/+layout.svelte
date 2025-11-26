@@ -3,7 +3,8 @@
 	const subNavItems = [
 		{ name: 'All', href: '/holdings/all' },
 		{ name: 'Equity', href: '/holdings/equity' },
-		{ name: 'Mutual funds', href: '/holdings/mutual-funds' }
+		{ name: 'Mutual funds', href: '/holdings/mutual-funds' },
+		{ name: 'Momentum', href: '/holdings/momentum' }
 	];
 </script>
 

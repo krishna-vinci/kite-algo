@@ -233,17 +233,17 @@ class OrderMarginsResponseItem(BaseModel):
     type: str
     tradingsymbol: Optional[str] = None
     exchange: Optional[Exchange] = None
-    span: float
-    exposure: float
-    option_premium: float
-    additional: float
-    bo: float
-    cash: float
-    var: float
-    pnl: Dict[str, float]
-    leverage: float
-    charges: Dict[str, Any]
-    total: float
+    span: float = 0.0
+    exposure: float = 0.0
+    option_premium: float = 0.0
+    additional: float = 0.0
+    bo: float = 0.0
+    cash: float = 0.0
+    var: float = 0.0
+    pnl: Dict[str, float] = {"realised": 0.0, "unrealised": 0.0}
+    leverage: float = 0.0
+    charges: Dict[str, Any] = {}
+    total: float = 0.0
 
     @field_validator("exchange", "tradingsymbol", mode="before")
     @classmethod
@@ -296,6 +296,28 @@ class Trade(BaseModel):
     order_timestamp: datetime
     exchange_timestamp: datetime
     fill_timestamp: datetime
+
+class BasketOrderRequest(BaseModel):
+    """Request model for placing multiple orders as a basket"""
+    orders: List[PlaceOrderRequest]
+    all_or_none: bool = False  # If True, attempt rollback on first failure
+    dry_run: bool = False  # If True, only preview margins without placing
+
+class BasketOrderResultItem(BaseModel):
+    """Result for a single order in the basket"""
+    index: int
+    tradingsymbol: str
+    order_id: Optional[str] = None
+    status: str  # "success" or "failed"
+    error: Optional[str] = None
+
+class BasketOrderResponse(BaseModel):
+    """Response for basket order placement"""
+    status: str  # "success", "partial", "failed", or "dry_run"
+    results: List[BasketOrderResultItem]
+    errors: List[Dict[str, Any]] = []
+    margins: Optional[BasketMarginsResponse] = None
+    note: Optional[str] = None
 
 def get_correlation_id(request: Request) -> str:
     """Dependency to get or generate a correlation ID."""
@@ -557,6 +579,116 @@ class OrdersService:
                 raise HTTPException(status_code=400, detail=str(e))
             raise e
 
+    async def place_basket(
+        self,
+        kite: KiteConnect,
+        req: BasketOrderRequest,
+        corr_id: str,
+        session_id: Optional[str] = None,
+        response: Response = None,
+    ) -> BasketOrderResponse:
+        """
+        Place a basket of orders sequentially.
+        - If dry_run is True, only returns margin preview.
+        - If all_or_none is True, attempts best-effort rollback on first failure.
+        Note: Market orders may execute immediately; cancellation isn't guaranteed.
+        """
+        log_ctx = self._log_context(corr_id, kite, order_count=len(req.orders))
+        logger.info("Processing basket order request", extra=log_ctx)
+
+        if not req.orders:
+            return BasketOrderResponse(status="success", results=[], errors=[])
+
+        # Dry run: preview margins only
+        if req.dry_run:
+            try:
+                margin_items = [
+                    OrderMarginInput(
+                        exchange=order.exchange,
+                        tradingsymbol=order.tradingsymbol,
+                        transaction_type=order.transaction_type,
+                        variety=order.variety,
+                        product=order.product,
+                        order_type=order.order_type,
+                        quantity=order.quantity,
+                        price=order.price or 0,
+                        trigger_price=order.trigger_price or 0,
+                    )
+                    for order in req.orders
+                ]
+                margins = self.basket_margins(kite, margin_items, consider_positions=True, corr_id=corr_id, mode="compact")
+                return BasketOrderResponse(status="dry_run", results=[], margins=margins)
+            except Exception as e:
+                logger.error("Failed to preview basket margins", extra={**log_ctx, "error": str(e)}, exc_info=True)
+                raise HTTPException(status_code=400, detail=f"Failed to preview margins: {str(e)}")
+
+        # Execute orders sequentially
+        results: List[BasketOrderResultItem] = []
+        placed: List[Dict[str, Any]] = []  # Track placed orders for rollback
+        errors: List[Dict[str, Any]] = []
+
+        for idx, order_req in enumerate(req.orders):
+            try:
+                # Place order using existing service method (with idempotency support)
+                place_result = await self.place_order(kite, order_req, corr_id, session_id=session_id, response=response)
+                
+                placed.append({"index": idx, "order_id": place_result.order_id, "variety": order_req.variety.value})
+                results.append(
+                    BasketOrderResultItem(
+                        index=idx,
+                        tradingsymbol=order_req.tradingsymbol,
+                        order_id=place_result.order_id,
+                        status="success"
+                    )
+                )
+                logger.info(
+                    f"Basket order {idx+1}/{len(req.orders)} placed",
+                    extra={**log_ctx, "order_id": place_result.order_id, "symbol": order_req.tradingsymbol}
+                )
+            except Exception as e:
+                err_msg = str(e)
+                logger.error(
+                    f"Failed to place basket order {idx+1}/{len(req.orders)}",
+                    extra={**log_ctx, "symbol": order_req.tradingsymbol, "error": err_msg},
+                    exc_info=True
+                )
+                
+                err = {"index": idx, "tradingsymbol": order_req.tradingsymbol, "error": err_msg}
+                errors.append(err)
+                results.append(
+                    BasketOrderResultItem(
+                        index=idx,
+                        tradingsymbol=order_req.tradingsymbol,
+                        status="failed",
+                        error=err_msg
+                    )
+                )
+
+                # Handle all_or_none: attempt rollback
+                if req.all_or_none:
+                    logger.info("Attempting rollback due to all_or_none policy", extra=log_ctx)
+                    for p in placed:
+                        try:
+                            self.cancel_order(kite, p["variety"], p["order_id"], corr_id)
+                            logger.info(f"Rolled back order {p['order_id']}", extra=log_ctx)
+                        except Exception as cancel_error:
+                            logger.error(
+                                f"Rollback failed for order {p['order_id']}",
+                                extra={**log_ctx, "error": str(cancel_error)},
+                                exc_info=True
+                            )
+                    
+                    return BasketOrderResponse(
+                        status="failed",
+                        results=results,
+                        errors=errors,
+                        note="Best-effort rollback attempted; some orders may already be executed."
+                    )
+
+        final_status = "success" if not errors else "partial"
+        logger.info(f"Basket order completed with status: {final_status}", extra={**log_ctx, "success_count": len(placed), "error_count": len(errors)})
+        return BasketOrderResponse(status=final_status, results=results, errors=errors)
+
 # ---------------- FastAPI Router ----------------
 router = APIRouter(tags=["orders"])
 service = OrdersService()
@@ -634,6 +766,22 @@ def get_charges_orders(items: List[ChargesOrderInput], kite: KiteConnect = Depen
 @router.get("/trigger-range", response_model=Any, description="Retrieve the buy/sell trigger range for Cover Orders.")
 def get_trigger_range(transaction_type: TransactionType, instruments: List[str] = Query(...), kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.trigger_range(kite, transaction_type, instruments, corr_id)
+
+@router.post("/orders/basket", response_model=BasketOrderResponse, description="Place multiple orders as a basket with optional dry-run and rollback support.")
+async def place_basket_orders(
+    req: BasketOrderRequest,
+    request: Request,
+    response: Response,
+    kite: KiteConnect = Depends(get_kite),
+    corr_id: str = Depends(get_correlation_id),
+):
+    """
+    Place a basket of orders sequentially.
+    - Set dry_run=true to preview margins without placing orders.
+    - Set all_or_none=true to attempt rollback on first failure (best-effort).
+    """
+    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
+    return await service.place_basket(kite, req, corr_id, sid, response)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2053,7 +2201,7 @@ async def get_ws_order_events(
                 quantity, filled_quantity, average_price, payload_json
             FROM ws_order_events
             WHERE {where_clause}
-            ORDER BY event_timestamp DESC
+            ORDER BY event_timestamp DESC, created_at DESC
             LIMIT :limit OFFSET :offset
         """)
 

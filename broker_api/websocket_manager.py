@@ -930,42 +930,13 @@ import psycopg2
 import psycopg2.extras
 from database import get_db_connection
 
-def update_ticker_data_in_db(tick_data):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            for tick in tick_data:
-                instrument_token = tick.get("instrument_token")
-                last_price = tick.get("last_price")
-                change = tick.get("change")
-
-                # Fetch the existing data to perform calculations
-                cur.execute("SELECT freefloat_marketcap, return_attribution FROM kite_ticker_tickers WHERE instrument_token = %s", (instrument_token,))
-                result = cur.fetchone()
-                if result:
-                    freefloat_marketcap, return_attribution = result
-                    
-                    # Perform calculations
-                    change_factor = (change or 0) / 100
-                    new_return_attribution = float(return_attribution or 0) + change_factor
-                    new_freefloat_marketcap = float(freefloat_marketcap or 0) * (1 + change_factor)
-
-                    # Update the database
-                    cur.execute(
-                        """
-                        UPDATE kite_ticker_tickers
-                        SET last_price = %s, change_1d = %s, return_attribution = %s, freefloat_marketcap = %s, last_updated = NOW()
-                        WHERE instrument_token = %s
-                        """,
-                        (last_price, change, new_return_attribution, new_freefloat_marketcap, instrument_token)
-                    )
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Error updating ticker data in DB: {e}")
-    finally:
-        if conn:
-            conn.close()
+async def update_ticker_data_in_db(ticks: List[Dict[str, Any]]):
+    """
+    DEPRECATED: Database updates are now handled by finalize-baseline endpoint.
+    Live tick data is stored in Redis overlay cache only.
+    This function is kept for backward compatibility but does nothing.
+    """
+    pass
 
 
 async def write_ticks_to_redis_overlay(ticks: List[Dict[str, Any]]):

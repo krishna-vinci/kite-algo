@@ -68,12 +68,27 @@
 				start_date: getStartOfDayIST()
 			});
 
-			// Deduplicate: keep only the latest event for each order_id
-			// allEvents is sorted by event_timestamp DESC, so the first occurrence is the latest.
+			// Deduplicate: keep the most terminal status for each order_id
+			// Status priority ensures COMPLETE/CANCELLED/REJECTED take precedence over OPEN/PENDING
+			const statusPriority: Record<string, number> = {
+				'COMPLETE': 5,
+				'CANCELLED': 4,
+				'REJECTED': 3,
+				'OPEN': 2,
+				'PENDING': 1
+			};
 			const uniqueOrders = new Map<string, WebhookEvent>();
 			for (const ev of allEvents) {
-				if (!uniqueOrders.has(ev.order_id)) {
+				const existing = uniqueOrders.get(ev.order_id);
+				if (!existing) {
 					uniqueOrders.set(ev.order_id, ev);
+				} else {
+					// Keep the event with higher status priority (more terminal state wins)
+					const existingPriority = statusPriority[existing.status] ?? 0;
+					const newPriority = statusPriority[ev.status] ?? 0;
+					if (newPriority > existingPriority) {
+						uniqueOrders.set(ev.order_id, ev);
+					}
 				}
 			}
 			const latestEvents = Array.from(uniqueOrders.values());

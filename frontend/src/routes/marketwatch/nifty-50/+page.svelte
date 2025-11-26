@@ -145,7 +145,11 @@
 	// --- Connection Logic ---
 	function connectWs() {
 		if (wsUnsubscribe) return;
-		const tokens = allInstruments.map((inst) => inst.instrument_token);
+		const tokens = allInstruments.map((inst) => inst.instrument_token).filter(t => t !== undefined && t !== null);
+		if (tokens.length === 0) {
+			console.warn('No tokens available for WebSocket subscription');
+			return;
+		}
 		marketwatch.subscribeToInstruments(tokens, 'quote');
 		marketwatch.connect();
 
@@ -180,7 +184,11 @@
 
 	function startHttpPoll() {
 		if (httpPollInterval) return;
-		const tokens = allInstruments.map((inst) => inst.instrument_token);
+		const tokens = allInstruments.map((inst) => inst.instrument_token).filter(t => t !== undefined && t !== null);
+		if (tokens.length === 0) {
+			console.warn('No tokens available for HTTP polling');
+			return;
+		}
 		httpPollInterval = setInterval(async () => {
 			try {
 				const tokensQuery = tokens.map((t) => `token=${t}`).join('&');
