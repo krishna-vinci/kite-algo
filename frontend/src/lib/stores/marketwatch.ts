@@ -50,19 +50,19 @@ function createMarketwatchStore() {
 	function buildWsUrl(): string {
 		if (typeof window === 'undefined') {
 			// SSR fallback - should not be called in SSR
-			return 'ws://localhost:8777/broker/ws/marketwatch';
+			return 'ws://localhost:8777/api/ws/marketwatch';
 		}
 		const base = getApiBase(); // '' or http(s)://host
 		// If base is empty or relative, derive from current location
 		if (!base || base.startsWith('/')) {
 			const loc = window.location;
 			const wsProto = loc.protocol === 'https:' ? 'wss' : 'ws';
-			return `${wsProto}://${loc.host}/broker/ws/marketwatch`;
+			return `${wsProto}://${loc.host}/api/ws/marketwatch`;
 		}
 		// Absolute base provided: convert scheme and construct ws URL
 		const wsProto = base.startsWith('https') ? 'wss' : 'ws';
 		const wsHost = base.replace(/^https?:\/\//, '');
-		return `${wsProto}://${wsHost}/broker/ws/marketwatch`;
+		return `${wsProto}://${wsHost}/api/ws/marketwatch`;
 	}
 
 	// Send action safely when connected, or queue until connection opens
@@ -88,7 +88,10 @@ function createMarketwatchStore() {
 
 	function connect() {
 		// Singleton guard: if already connected or connecting, return
-		if ((ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) || connecting) {
+		if (
+			(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) ||
+			connecting
+		) {
 			return;
 		}
 
@@ -99,7 +102,7 @@ function createMarketwatchStore() {
 
 		connecting = true;
 		connected = false;
-		
+
 		const wsUrl = buildWsUrl();
 		ws = new WebSocket(wsUrl);
 
@@ -108,10 +111,10 @@ function createMarketwatchStore() {
 			connecting = false;
 			connected = true;
 			update((state) => ({ ...state, connection: ws }));
-			
+
 			// Process any queued messages
 			processMessageQueue();
-			
+
 			// Resubscribe to all previously subscribed tokens if any
 			if (subscribedTokens.size > 0) {
 				const tokens = Array.from(subscribedTokens);
@@ -122,7 +125,7 @@ function createMarketwatchStore() {
 		ws.onmessage = (event) => {
 			try {
 				const msg = JSON.parse(event.data);
-				
+
 				// Handle different message types per backend contract
 				if (msg.type === 'ticks' && Array.isArray(msg.data)) {
 					// Batch tick data - create/update instrument entries on-the-fly
@@ -199,7 +202,7 @@ function createMarketwatchStore() {
 		if (!tokens || tokens.length === 0) return;
 
 		// Update internal state
-		tokens.forEach(token => subscribedTokens.add(token));
+		tokens.forEach((token) => subscribedTokens.add(token));
 		if (mode) desiredMode = mode;
 
 		// Send subscription message (queued if not connected)
@@ -213,7 +216,7 @@ function createMarketwatchStore() {
 		if (!tokens || tokens.length === 0) return;
 
 		// Update internal state
-		tokens.forEach(token => subscribedTokens.delete(token));
+		tokens.forEach((token) => subscribedTokens.delete(token));
 
 		// Send unsubscription message (queued if not connected)
 		sendAction('unsubscribe', { tokens });
@@ -221,7 +224,7 @@ function createMarketwatchStore() {
 		// Remove from local instruments map
 		update((state) => {
 			const newInstruments = { ...state.instruments };
-			tokens.forEach(token => delete newInstruments[token]);
+			tokens.forEach((token) => delete newInstruments[token]);
 			return { ...state, instruments: newInstruments };
 		});
 	}

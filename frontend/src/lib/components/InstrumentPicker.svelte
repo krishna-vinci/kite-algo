@@ -1,5 +1,5 @@
 <script context="module" lang="ts">
-  export type InstrumentRow = {
+	export type InstrumentRow = {
 		instrument_token: number;
 		tradingsymbol: string;
 		name?: string;
@@ -17,29 +17,29 @@
 	import { createEventDispatcher, onMount } from 'svelte';
 	import { apiFetch } from '$lib/api';
 
-  function formatExpiry(x?: string | null) {
-    if (!x) return '';
-    const d = new Date(x);
-    if (isNaN(d.getTime())) return x;
-    return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' });
-  }
-  function formatLabel(item: any) {
-    const exch = item.exchange ? ` (${item.exchange})` : '';
-    if (item.option_type) {
-      const u = item.underlying ?? '';
-      const exp = item.expiry_label ?? formatExpiry(item.expiry);
-      const strike = item.strike ?? '';
-      const ot = item.option_type ?? '';
-      return `${u} ${exp} ${strike} ${ot}${exch}`.trim();
-    }
-    if ((item.instrument_type || '').toUpperCase() === 'FUT') {
-      const u = item.underlying ?? '';
-      const exp = formatExpiry(item.expiry);
-      return `${u} ${exp} FUT${exch}`.trim();
-    }
-    const name = item.name ? ` — ${item.name}` : '';
-    return `${item.tradingsymbol}${name}${exch}`.trim();
-  }
+	function formatExpiry(x?: string | null) {
+		if (!x) return '';
+		const d = new Date(x);
+		if (isNaN(d.getTime())) return x;
+		return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' });
+	}
+	function formatLabel(item: any) {
+		const exch = item.exchange ? ` (${item.exchange})` : '';
+		if (item.option_type) {
+			const u = item.underlying ?? '';
+			const exp = item.expiry_label ?? formatExpiry(item.expiry);
+			const strike = item.strike ?? '';
+			const ot = item.option_type ?? '';
+			return `${u} ${exp} ${strike} ${ot}${exch}`.trim();
+		}
+		if ((item.instrument_type || '').toUpperCase() === 'FUT') {
+			const u = item.underlying ?? '';
+			const exp = formatExpiry(item.expiry);
+			return `${u} ${exp} FUT${exch}`.trim();
+		}
+		const name = item.name ? ` — ${item.name}` : '';
+		return `${item.tradingsymbol}${name}${exch}`.trim();
+	}
 
 	export let selected: InstrumentRow | null = null;
 	export let placeholder = 'Search eg: infy bse, nifty fut, index';
@@ -57,7 +57,7 @@
 
 	onMount(async () => {
 		try {
-			const res = await apiFetch('/broker/instruments/top-defaults');
+			const res = await apiFetch('/api/instruments/top-defaults');
 			if (res.ok) {
 				const data = await res.json();
 				topDefaults = data?.data ?? [];
@@ -83,7 +83,7 @@
 		}
 		loading = true;
 		try {
-			const url = `/broker/instruments/fuzzy-search?query=${encodeURIComponent(query)}&segment=NFO`;
+			const url = `/api/instruments/fuzzy-search?query=${encodeURIComponent(query)}&segment=NFO`;
 			const res = await apiFetch(url);
 			if (res.ok) {
 				results = await res.json();

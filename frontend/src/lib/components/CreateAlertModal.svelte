@@ -30,7 +30,7 @@
 
 	// Derived live price from WS store
 	$: livePrice = selectedInstrument
-		? $marketwatch.instruments[selectedInstrument.instrument_token]?.last_price ?? null
+		? ($marketwatch.instruments[selectedInstrument.instrument_token]?.last_price ?? null)
 		: null;
 	$: baselineCandidate = livePrice ?? fallbackPrice;
 
@@ -184,7 +184,7 @@
 				throw new Error('Waiting for live price to anchor baseline…');
 			}
 
-			const validateRes = await apiFetch('/broker/alerts/validate', {
+			const validateRes = await apiFetch('/api/alerts/validate', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
@@ -214,7 +214,7 @@
 				cooldown_sec,
 				baseline_price // snake_case to match backend
 			};
-			const res = await apiFetch('/broker/alerts', {
+			const res = await apiFetch('/api/alerts', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify(body)
@@ -240,7 +240,11 @@
 	<div class="w-full max-w-3xl rounded-lg bg-white p-8 shadow-xl" on:click|stopPropagation>
 		<header class="mb-6 flex items-center justify-between">
 			<h2 class="text-xl font-semibold text-gray-800">Create New Alert</h2>
-			<button on:click={() => dispatch('close')} class="text-gray-500 hover:text-gray-800" aria-label="Close dialog">
+			<button
+				on:click={() => dispatch('close')}
+				class="text-gray-500 hover:text-gray-800"
+				aria-label="Close dialog"
+			>
 				<svg
 					xmlns="http://www.w3.org/2000/svg"
 					class="h-6 w-6"
@@ -346,7 +350,14 @@
 
 		<footer class="mt-8 flex justify-end gap-4 border-t pt-6">
 			<button class="btn btn-secondary" on:click={() => dispatch('close')}>Cancel</button>
-			<button class="btn btn-primary" on:click={createAlert} disabled={creating || !selectedInstrument || rhs_constant === null || baselineCandidate === null}>
+			<button
+				class="btn btn-primary"
+				on:click={createAlert}
+				disabled={creating ||
+					!selectedInstrument ||
+					rhs_constant === null ||
+					baselineCandidate === null}
+			>
 				{creating ? 'Creating...' : 'Create'}
 			</button>
 		</footer>

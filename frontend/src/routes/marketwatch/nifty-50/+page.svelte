@@ -18,9 +18,7 @@
 
 	// --- Data Structures ---
 	const allInstruments: NiftyInstrument[] = Object.values(data.sectors as Sectors).flat();
-	const baselineByToken = new Map(
-		allInstruments.map((inst) => [inst.instrument_token, inst])
-	);
+	const baselineByToken = new Map(allInstruments.map((inst) => [inst.instrument_token, inst]));
 	let overlayByToken = new Map<
 		number,
 		{ last_price?: number; change_percent?: number; tick_timestamp?: number }
@@ -145,7 +143,9 @@
 	// --- Connection Logic ---
 	function connectWs() {
 		if (wsUnsubscribe) return;
-		const tokens = allInstruments.map((inst) => inst.instrument_token).filter(t => t !== undefined && t !== null);
+		const tokens = allInstruments
+			.map((inst) => inst.instrument_token)
+			.filter((t) => t !== undefined && t !== null);
 		if (tokens.length === 0) {
 			console.warn('No tokens available for WebSocket subscription');
 			return;
@@ -184,7 +184,9 @@
 
 	function startHttpPoll() {
 		if (httpPollInterval) return;
-		const tokens = allInstruments.map((inst) => inst.instrument_token).filter(t => t !== undefined && t !== null);
+		const tokens = allInstruments
+			.map((inst) => inst.instrument_token)
+			.filter((t) => t !== undefined && t !== null);
 		if (tokens.length === 0) {
 			console.warn('No tokens available for HTTP polling');
 			return;
@@ -193,7 +195,7 @@
 			try {
 				const tokensQuery = tokens.map((t) => `token=${t}`).join('&');
 				const response = await fetch(
-					`${getApiBase()}/broker/marketwatch/nifty50/overlay-snapshot?${tokensQuery}`
+					`${getApiBase()}/api/marketwatch/nifty50/overlay-snapshot?${tokensQuery}`
 				);
 				if (response.ok) {
 					const snapshotData = await response.json();
@@ -362,13 +364,14 @@
 
 						if (change_percent_live === undefined || !isFinite(change_percent_live)) {
 							// This is a sector or has invalid data
-							const displayValue = isFinite(value)
-								? format.addCommas(Math.round(value))
-								: 'N/A';
+							const displayValue = isFinite(value) ? format.addCommas(Math.round(value)) : 'N/A';
 							return `${name}<br/>Market Cap: ${displayValue}`;
 						}
 
-						const treePath = treePathInfo.map((item: any) => item.name).slice(1).join('/');
+						const treePath = treePathInfo
+							.map((item: any) => item.name)
+							.slice(1)
+							.join('/');
 
 						return [
 							`<div class="tooltip-title">${format.encodeHTML(treePath)}</div>`,
@@ -387,10 +390,7 @@
 							show: true,
 							formatter: (params: any) => {
 								const { name, data } = params;
-								if (
-									data.change_percent_live !== undefined &&
-									isFinite(data.change_percent_live)
-								) {
+								if (data.change_percent_live !== undefined && isFinite(data.change_percent_live)) {
 									return `${name}\n${data.change_percent_live.toFixed(2)}%`;
 								}
 								return name;
@@ -456,7 +456,7 @@
 	{#if Object.keys(liveSectors).length > 0}
 		<div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
 			<div class="md:col-span-2" style="height: 600px;">
-				<Chart init={init} {options} />
+				<Chart {init} {options} />
 			</div>
 			<div class="md:col-span-1 space-y-4">
 				<MarketMovers
@@ -521,9 +521,7 @@
 							>
 								{liveInstrument.change_percent_live?.toFixed(2) ?? '0.00'}%
 							</td>
-							<td class="border px-4 py-2"
-								>{liveInstrument.attribution_pp?.toFixed(2) ?? '...'}</td
-							>
+							<td class="border px-4 py-2">{liveInstrument.attribution_pp?.toFixed(2) ?? '...'}</td>
 							<td class="border px-4 py-2">
 								{liveInstrument.ff_mc_live?.toLocaleString('en-IN', {
 									maximumFractionDigits: 2

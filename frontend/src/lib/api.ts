@@ -8,16 +8,16 @@
 const SESSION_STORAGE_KEY = 'kite_session_id';
 
 export function getApiBase(): string {
-    // 1) Explicit override via env (for cross-device dev access)
-    const env = (import.meta as any).env?.VITE_API_BASE_URL as string | undefined;
-    if (env && typeof env === 'string' && env.trim().length > 0) {
-        return env.replace(/\/+$/, '');
-    }
-    
-    // 2) Always use relative URLs (empty string) in both browser and SSR
-    //    - Dev: Vite proxy handles /broker -> localhost:8777
-    //    - Prod: Caddy reverse proxy handles /broker -> backend container
-    return '';
+	// 1) Explicit override via env (for cross-device dev access)
+	const env = (import.meta as any).env?.VITE_API_BASE_URL as string | undefined;
+	if (env && typeof env === 'string' && env.trim().length > 0) {
+		return env.replace(/\/+$/, '');
+	}
+
+	// 2) Always use relative URLs (empty string) in both browser and SSR
+	//    - Dev: Vite proxy handles /api -> localhost:8777
+	//    - Prod: reverse proxy handles /api -> backend container
+	return '';
 }
 
 export function setSessionId(id: string | null | undefined) {
@@ -47,7 +47,8 @@ export function clearSessionId() {
 }
 
 export async function apiFetch(path: string, init: RequestInit = {}) {
-	const url = `${getApiBase()}${path.startsWith('/') ? path : `/${path}`}`;
+	const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+	const url = `${getApiBase()}${normalizedPath}`;
 	const headers = new Headers(init.headers || {});
 	const sid = getSessionId();
 	if (sid && !headers.has('X-Session-ID')) {
@@ -63,18 +64,18 @@ export async function apiFetch(path: string, init: RequestInit = {}) {
 
 /**
  * One-shot LTP helper. Returns last_price or null.
- * Uses existing backend route POST /broker/ltp with { instruments: ["EX:TS"] }.
+ * Uses backend route POST /api/ltp with { instruments: ["EX:TS"] }.
  */
 export async function getLtp(exchange: string, tradingsymbol: string): Promise<number | null> {
 	try {
 		const key = `${exchange}:${tradingsymbol}`;
-		const res = await apiFetch('/broker/ltp', {
+		const res = await apiFetch('/api/ltp', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ instruments: [key] })
 		});
 		if (!res.ok) return null;
-		const data = await res.json().catch(() => null) as any;
+		const data = (await res.json().catch(() => null)) as any;
 		const rec = data?.[key] ?? (data?.data ? data.data[key] : null);
 		const price = rec?.last_price ?? rec?.lastPrice ?? null;
 		if (typeof price === 'number') return price;
@@ -88,173 +89,186 @@ export async function getLtp(exchange: string, tradingsymbol: string): Promise<n
 	}
 }
 
-export async function getUserSubscriptions(scope?: 'sidebar' | 'marketwatch' | 'nfo-charts' | 'nfo-charts-layouts') {
-    const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
-    const response = await apiFetch(`/broker/user/subscriptions${qs}`);
-    if (!response.ok) {
-        throw new Error('Failed to fetch user subscriptions');
-    }
-    return response.json();
+export async function getUserSubscriptions(
+	scope?: 'sidebar' | 'marketwatch' | 'nfo-charts' | 'nfo-charts-layouts'
+) {
+	const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
+	const response = await apiFetch(`/api/user/subscriptions${qs}`);
+	if (!response.ok) {
+		throw new Error('Failed to fetch user subscriptions');
+	}
+	return response.json();
 }
 
-export async function saveUserSubscriptions(subscriptions: any, scope?: 'sidebar' | 'marketwatch' | 'nfo-charts' | 'nfo-charts-layouts') {
-    const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
-    const response = await apiFetch(`/broker/user/subscriptions${qs}`, {
-        method: 'PUT',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(subscriptions)
-    });
-    if (!response.ok) {
-        throw new Error('Failed to save user subscriptions');
-    }
-    return response.json();
+export async function saveUserSubscriptions(
+	subscriptions: any,
+	scope?: 'sidebar' | 'marketwatch' | 'nfo-charts' | 'nfo-charts-layouts'
+) {
+	const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
+	const response = await apiFetch(`/api/user/subscriptions${qs}`, {
+		method: 'PUT',
+		headers: {
+			'Content-Type': 'application/json'
+		},
+		body: JSON.stringify(subscriptions)
+	});
+	if (!response.ok) {
+		throw new Error('Failed to save user subscriptions');
+	}
+	return response.json();
 }
 
 /**
  * Alerts API
  */
 import type {
-  Alert,
-  ListAlertsResponse,
-  AlertCreateRequest,
-  AlertPatchRequest,
-  SessionsRequest,
-  WatchlistItem,
-  OptionsSessionSnapshot,
-  StopSessionResponse,
-  ErrorResponse,
-  SessionRequestItem
+	Alert,
+	ListAlertsResponse,
+	AlertCreateRequest,
+	AlertPatchRequest,
+	SessionsRequest,
+	WatchlistItem,
+	OptionsSessionSnapshot,
+	StopSessionResponse,
+	ErrorResponse,
+	SessionRequestItem
 } from '$lib/types';
 
 function toQuery(params: Record<string, string | number | boolean | undefined | null>): string {
-  const usp = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v === undefined || v === null || v === '') continue;
-    usp.set(k, String(v));
-  }
-  const qs = usp.toString();
-  return qs ? `?${qs}` : '';
+	const usp = new URLSearchParams();
+	for (const [k, v] of Object.entries(params)) {
+		if (v === undefined || v === null || v === '') continue;
+		usp.set(k, String(v));
+	}
+	const qs = usp.toString();
+	return qs ? `?${qs}` : '';
 }
 
 export async function getOptionsWatchlist(): Promise<WatchlistItem[]> {
-  const res = await apiFetch('/broker/options/sessions');
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`getOptionsWatchlist failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as WatchlistItem[];
+	const res = await apiFetch('/api/options/sessions');
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`getOptionsWatchlist failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as WatchlistItem[];
 }
 
-export async function getAlerts(params: {
-  status?: string;
-  instrument_token?: number;
-  instrument_name?: string;
-  limit?: number;
-  offset?: number;
-  sort?: 'created_at' | '-created_at' | 'updated_at' | '-updated_at';
-} = {}): Promise<ListAlertsResponse> {
-  const newParams: any = {...params};
-  if (newParams.instrument_token) {
-    newParams.instrument_name = newParams.instrument_token;
-    delete newParams.instrument_token;
-  }
-  const qs = toQuery(newParams);
-  const res = await apiFetch(`/broker/alerts${qs}`);
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Failed to fetch alerts: ${res.status} ${t}`);
-  }
-  return (await res.json()) as ListAlertsResponse;
+export async function getAlerts(
+	params: {
+		status?: string;
+		instrument_token?: number;
+		instrument_name?: string;
+		limit?: number;
+		offset?: number;
+		sort?: 'created_at' | '-created_at' | 'updated_at' | '-updated_at';
+	} = {}
+): Promise<ListAlertsResponse> {
+	const newParams: any = { ...params };
+	if (newParams.instrument_token) {
+		newParams.instrument_name = newParams.instrument_token;
+		delete newParams.instrument_token;
+	}
+	const qs = toQuery(newParams);
+	const res = await apiFetch(`/api/alerts${qs}`);
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`Failed to fetch alerts: ${res.status} ${t}`);
+	}
+	return (await res.json()) as ListAlertsResponse;
 }
 
 export async function createAlert(body: AlertCreateRequest): Promise<Alert> {
-  const res = await apiFetch('/broker/alerts', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  if (res.status === 424) {
-    // Baseline unavailable special-case for UX
-    const detail = await res.json().catch(() => null) as any;
-    const err = new Error(detail?.detail ?? 'Baseline price unavailable. Provide baseline_price or try later.');
-    (err as any).status = 424;
-    throw err;
-  }
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Create alert failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as Alert;
+	const res = await apiFetch('/api/alerts', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+	if (res.status === 424) {
+		// Baseline unavailable special-case for UX
+		const detail = (await res.json().catch(() => null)) as any;
+		const err = new Error(
+			detail?.detail ?? 'Baseline price unavailable. Provide baseline_price or try later.'
+		);
+		(err as any).status = 424;
+		throw err;
+	}
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`Create alert failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as Alert;
 }
 
 export async function patchAlert(id: string, patch: AlertPatchRequest): Promise<Alert> {
-  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(patch)
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Patch alert failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as Alert;
+	const res = await apiFetch(`/api/alerts/${encodeURIComponent(id)}`, {
+		method: 'PATCH',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(patch)
+	});
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`Patch alert failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as Alert;
 }
 
 export async function deleteAlert(id: string, hard?: boolean): Promise<Alert> {
-  const qs = toQuery({ hard: !!hard });
-  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Delete alert failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as Alert;
+	const qs = toQuery({ hard: !!hard });
+	const res = await apiFetch(`/api/alerts/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' });
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`Delete alert failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as Alert;
 }
 
 export async function duplicateAlert(id: string): Promise<Alert> {
-  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}/duplicate`, { method: 'POST' });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Duplicate alert failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as Alert;
+	const res = await apiFetch(`/api/alerts/${encodeURIComponent(id)}/duplicate`, {
+		method: 'POST'
+	});
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`Duplicate alert failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as Alert;
 }
 
 export async function pauseAlert(id: string): Promise<Alert> {
-  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}/pause`, { method: 'POST' });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Pause alert failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as Alert;
+	const res = await apiFetch(`/api/alerts/${encodeURIComponent(id)}/pause`, { method: 'POST' });
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`Pause alert failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as Alert;
 }
 
 export async function resumeAlert(id: string): Promise<Alert> {
-  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}/resume`, { method: 'POST' });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Resume alert failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as Alert;
+	const res = await apiFetch(`/api/alerts/${encodeURIComponent(id)}/resume`, { method: 'POST' });
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`Resume alert failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as Alert;
 }
 
 export async function cancelAlert(id: string): Promise<Alert> {
-  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Cancel alert failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as Alert;
+	const res = await apiFetch(`/api/alerts/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`Cancel alert failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as Alert;
 }
 
 export async function reactivateAlert(id: string): Promise<Alert> {
-  const res = await apiFetch(`/broker/alerts/${encodeURIComponent(id)}/reactivate`, { method: 'POST' });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Reactivate alert failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as Alert;
+	const res = await apiFetch(`/api/alerts/${encodeURIComponent(id)}/reactivate`, {
+		method: 'POST'
+	});
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`Reactivate alert failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as Alert;
 }
 
 /**
@@ -266,23 +280,23 @@ export async function reactivateAlert(id: string): Promise<Alert> {
  * POST /options/sessions — start/update/replace sessions
  */
 export async function postOptionsSessions(payload: SessionsRequest): Promise<WatchlistItem[]> {
-  const res = await apiFetch('/broker/options/sessions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`postOptionsSessions failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as WatchlistItem[];
+	const res = await apiFetch('/api/options/sessions', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(payload)
+	});
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`postOptionsSessions failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as WatchlistItem[];
 }
 
 export async function startOptionsSessions(
-  items: SessionRequestItem[],
-  replace = false
+	items: SessionRequestItem[],
+	replace = false
 ): Promise<WatchlistItem[]> {
-  return postOptionsSessions({ items, replace });
+	return postOptionsSessions({ items, replace });
 }
 
 /**
@@ -290,19 +304,19 @@ export async function startOptionsSessions(
  * Returns the latest snapshot. Throws error with status=404 if no active session.
  */
 export async function getOptionsSnapshot(underlying: string): Promise<OptionsSessionSnapshot> {
-  const res = await apiFetch(`/broker/options/session/${encodeURIComponent(underlying)}`);
-  if (res.status === 404) {
-    const body = await res.json().catch(() => ({}));
-    const detail = (body?.detail ?? body) as ErrorResponse | string;
-    if (typeof detail === 'object' && detail?.code === 'OPTION_SESSION_NOT_FOUND') {
-      throw detail;
-    }
-  }
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`getOptionsSnapshot failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as OptionsSessionSnapshot;
+	const res = await apiFetch(`/api/options/session/${encodeURIComponent(underlying)}`);
+	if (res.status === 404) {
+		const body = await res.json().catch(() => ({}));
+		const detail = (body?.detail ?? body) as ErrorResponse | string;
+		if (typeof detail === 'object' && detail?.code === 'OPTION_SESSION_NOT_FOUND') {
+			throw detail;
+		}
+	}
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`getOptionsSnapshot failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as OptionsSessionSnapshot;
 }
 
 /**
@@ -310,18 +324,18 @@ export async function getOptionsSnapshot(underlying: string): Promise<OptionsSes
  * Throws error with status=404 if no active session.
  */
 export async function getOptionChain(underlyingSymbol: string): Promise<OptionsSessionSnapshot> {
-  const res = await apiFetch(`/broker/options/chain/${encodeURIComponent(underlyingSymbol)}`);
-  if (res.status === 404) {
-    const detail = (await res.json().catch(() => null)) as any;
-    const err = new Error(detail?.detail ?? 'No active options session');
-    (err as any).status = 404;
-    throw err;
-  }
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`getOptionChain failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as OptionsSessionSnapshot;
+	const res = await apiFetch(`/api/options/chain/${encodeURIComponent(underlyingSymbol)}`);
+	if (res.status === 404) {
+		const detail = (await res.json().catch(() => null)) as any;
+		const err = new Error(detail?.detail ?? 'No active options session');
+		(err as any).status = 404;
+		throw err;
+	}
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`getOptionChain failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as OptionsSessionSnapshot;
 }
 
 /**
@@ -329,18 +343,18 @@ export async function getOptionChain(underlyingSymbol: string): Promise<OptionsS
  * Note: keep leading slash to avoid backend decorator missing-slash quirk.
  */
 export async function deleteOptionsSession(underlying: string): Promise<StopSessionResponse> {
-  const res = await apiFetch(`/broker/options/session/${encodeURIComponent(underlying)}`, {
-    method: 'DELETE'
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`deleteOptionsSession failed: ${res.status} ${t}`);
-  }
-  return (await res.json()) as StopSessionResponse;
+	const res = await apiFetch(`/api/options/session/${encodeURIComponent(underlying)}`, {
+		method: 'DELETE'
+	});
+	if (!res.ok) {
+		const t = await res.text().catch(() => '');
+		throw new Error(`deleteOptionsSession failed: ${res.status} ${t}`);
+	}
+	return (await res.json()) as StopSessionResponse;
 }
 
 export async function stopOptionsSession(underlying: string): Promise<StopSessionResponse> {
-  return deleteOptionsSession(underlying);
+	return deleteOptionsSession(underlying);
 }
 
 /**
@@ -348,23 +362,26 @@ export async function stopOptionsSession(underlying: string): Promise<StopSessio
  * Transforms http(s) base to ws(s) and appends /ws/options/session/{underlying}.
  */
 export function buildOptionsSessionWsUrl(underlying: string): string {
-  const base = getApiBase();
-  // If base is empty or relative, derive from window.location
-  if (!base || base.startsWith('/')) {
-    const loc = typeof window !== 'undefined' ? window.location : ({ protocol: 'http:', host: 'localhost:8777' } as any);
-    const wsProto = loc.protocol === 'https:' ? 'wss' : 'ws';
-    return `${wsProto}://${loc.host}/broker/ws/options/session/${encodeURIComponent(underlying)}`;
-  }
-  const wsProto = base.startsWith('https') ? 'wss' : 'ws';
-  const wsHost = base.replace(/^https?:\/\//, '');
-  return `${wsProto}://${wsHost}/broker/ws/options/session/${encodeURIComponent(underlying)}`;
+	const base = getApiBase();
+	// If base is empty or relative, derive from window.location
+	if (!base || base.startsWith('/')) {
+		const loc =
+			typeof window !== 'undefined'
+				? window.location
+				: ({ protocol: 'http:', host: 'localhost:8777' } as any);
+		const wsProto = loc.protocol === 'https:' ? 'wss' : 'ws';
+		return `${wsProto}://${loc.host}/api/ws/options/session/${encodeURIComponent(underlying)}`;
+	}
+	const wsProto = base.startsWith('https') ? 'wss' : 'ws';
+	const wsHost = base.replace(/^https?:\/\//, '');
+	return `${wsProto}://${wsHost}/api/ws/options/session/${encodeURIComponent(underlying)}`;
 }
 /**
  * Build SSE URL for options session stream.
  */
 export function buildOptionsSessionSseUrl(underlying: string): string {
-  const base = getApiBase(); // e.g., http://localhost:8777
-  return `${base}/broker/sse/options/session/${encodeURIComponent(underlying)}`;
+	const base = getApiBase(); // e.g., http://localhost:8777
+	return `${base}/api/sse/options/session/${encodeURIComponent(underlying)}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -372,88 +389,88 @@ export function buildOptionsSessionSseUrl(underlying: string): string {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export interface WebhookEvent {
-  id: string;
-  order_id: string;
-  user_id: string;
-  status: string;
-  event_timestamp: string;
-  received_at: string;
-  exchange: string | null;
-  tradingsymbol: string | null;
-  instrument_token: number | null;
-  transaction_type: string | null;
-  quantity: number | null;
-  filled_quantity: number | null;
-  average_price: number | null;
-  payload: Record<string, any>;
+	id: string;
+	order_id: string;
+	user_id: string;
+	status: string;
+	event_timestamp: string;
+	received_at: string;
+	exchange: string | null;
+	tradingsymbol: string | null;
+	instrument_token: number | null;
+	transaction_type: string | null;
+	quantity: number | null;
+	filled_quantity: number | null;
+	average_price: number | null;
+	payload: Record<string, any>;
 }
 
 export interface WebhookEventsResponse {
-  events: WebhookEvent[];
-  total?: number;
+	events: WebhookEvent[];
+	total?: number;
 }
 
 export interface WebhookEventsFilters {
-  order_id?: string;
-  user_id?: string;
-  status?: string;
-  start_date?: string;
-  end_date?: string;
-  limit?: number;
-  offset?: number;
+	order_id?: string;
+	user_id?: string;
+	status?: string;
+	start_date?: string;
+	end_date?: string;
+	limit?: number;
+	offset?: number;
 }
 
 /**
  * Fetch webhook events with optional filters
  */
 export async function getWebhookEvents(filters?: WebhookEventsFilters): Promise<WebhookEvent[]> {
-  const params = new URLSearchParams();
-  
-  if (filters?.order_id) params.append('order_id', filters.order_id);
-  if (filters?.user_id) params.append('user_id', filters.user_id);
-  if (filters?.status) params.append('status', filters.status);
-  if (filters?.start_date) params.append('start_date', filters.start_date);
-  if (filters?.end_date) params.append('end_date', filters.end_date);
-  if (filters?.limit) params.append('limit', filters.limit.toString());
-  if (filters?.offset) params.append('offset', filters.offset.toString());
-  
-  const qs = params.toString();
-  const path = `/broker/webhooks/orders/events${qs ? `?${qs}` : ''}`;
-  const resp = await apiFetch(path);
-  if (!resp.ok) {
-    throw new Error(`Failed to fetch webhook events: ${resp.statusText}`);
-  }
-  return resp.json();
+	const params = new URLSearchParams();
+
+	if (filters?.order_id) params.append('order_id', filters.order_id);
+	if (filters?.user_id) params.append('user_id', filters.user_id);
+	if (filters?.status) params.append('status', filters.status);
+	if (filters?.start_date) params.append('start_date', filters.start_date);
+	if (filters?.end_date) params.append('end_date', filters.end_date);
+	if (filters?.limit) params.append('limit', filters.limit.toString());
+	if (filters?.offset) params.append('offset', filters.offset.toString());
+
+	const qs = params.toString();
+	const path = `/api/webhooks/orders/events${qs ? `?${qs}` : ''}`;
+	const resp = await apiFetch(path);
+	if (!resp.ok) {
+		throw new Error(`Failed to fetch webhook events: ${resp.statusText}`);
+	}
+	return resp.json();
 }
 
 /**
  * Fetch websocket-sourced order events with optional filters
  */
 export async function getWsOrderEvents(filters?: WebhookEventsFilters): Promise<WebhookEvent[]> {
-  const params = new URLSearchParams();
-  if (filters?.order_id) params.append('order_id', filters.order_id);
-  if (filters?.user_id) params.append('user_id', filters.user_id);
-  if (filters?.status) params.append('status', filters.status);
-  if (filters?.start_date) params.append('start_date', filters.start_date);
-  if (filters?.end_date) params.append('end_date', filters.end_date);
-  if (filters?.limit) params.append('limit', String(filters.limit));
-  if (filters?.offset) params.append('offset', String(filters.offset));
-  const qs = params.toString();
-  const path = `/broker/ws/orders/events${qs ? `?${qs}` : ''}`;
-  const resp = await apiFetch(path);
-  if (!resp.ok) {
-    throw new Error(`Failed to fetch WS order events: ${resp.statusText}`);
-  }
-  return resp.json();
+	const params = new URLSearchParams();
+	if (filters?.order_id) params.append('order_id', filters.order_id);
+	if (filters?.user_id) params.append('user_id', filters.user_id);
+	if (filters?.status) params.append('status', filters.status);
+	if (filters?.start_date) params.append('start_date', filters.start_date);
+	if (filters?.end_date) params.append('end_date', filters.end_date);
+	if (filters?.limit) params.append('limit', String(filters.limit));
+	if (filters?.offset) params.append('offset', String(filters.offset));
+	const qs = params.toString();
+	const path = `/api/ws/orders/events${qs ? `?${qs}` : ''}`;
+	const resp = await apiFetch(path);
+	if (!resp.ok) {
+		throw new Error(`Failed to fetch WS order events: ${resp.statusText}`);
+	}
+	return resp.json();
 }
 
 /**
  * Build SSE URL for order events (source: 'webhook' | 'ws' | 'all')
  */
 export function buildOrderEventsSseUrl(source?: 'webhook' | 'ws' | 'all'): string {
-  const base = getApiBase();
-  const qs = source ? `?source=${source}` : '';
-  return `${base}/broker/orders/events/stream${qs}`;
+	const base = getApiBase();
+	const qs = source ? `?source=${source}` : '';
+	return `${base}/api/orders/events/stream${qs}`;
 }
 
 /**
@@ -461,10 +478,9 @@ export function buildOrderEventsSseUrl(source?: 'webhook' | 'ws' | 'all'): strin
  * Messages are raw OptionsSessionSnapshot JSON documents.
  */
 export function openOptionsSessionWS(underlying: string): WebSocket {
-  const url = buildOptionsSessionWsUrl(underlying);
-  return new WebSocket(url);
+	const url = buildOptionsSessionWsUrl(underlying);
+	return new WebSocket(url);
 }
-
 
 /**
  * Historical Candles API
@@ -586,7 +602,7 @@ export async function fetchCandles(
 	params.set('ingest', opts.ingest === false ? 'false' : 'true');
 	params.set('passthrough', opts.passthrough ? 'true' : 'false');
 
-	const url = `/broker/candles/${identifier}?${params.toString()}`;
+	const url = `/api/candles/${identifier}?${params.toString()}`;
 	const res = await apiFetch(url);
 
 	if (!res.ok) {
@@ -613,7 +629,7 @@ export async function fetchCandles(
 export async function clearCandleCache(
 	identifier: string | number
 ): Promise<{ status: string; deleted_rows: number; instrument_token: number }> {
-	const url = `/broker/candles/${identifier}/cache`;
+	const url = `/api/candles/${identifier}/cache`;
 	const res = await apiFetch(url, { method: 'DELETE' });
 
 	if (!res.ok) {
@@ -632,7 +648,7 @@ export async function getCandleCoverage(
 	timeframe: string
 ): Promise<any> {
 	const canonicalTimeframe = normalizeTimeframe(timeframe);
-	const url = `/broker/candles/${identifier}/coverage?timeframe=${canonicalTimeframe}`;
+	const url = `/api/candles/${identifier}/coverage?timeframe=${canonicalTimeframe}`;
 	const res = await apiFetch(url);
 
 	if (!res.ok) {
@@ -649,7 +665,7 @@ export async function getCandleCoverage(
 export function buildCandleStreamUrl(identifier: string | number, timeframe: string): string {
 	const canonicalTimeframe = normalizeTimeframe(timeframe);
 	const base = getApiBase();
-	return `${base}/broker/candles/stream/${identifier}?timeframe=${canonicalTimeframe}`;
+	return `${base}/api/candles/stream/${identifier}?timeframe=${canonicalTimeframe}`;
 }
 
 /**
@@ -673,15 +689,17 @@ export interface WatchlistUpsertResponse {
 /**
  * Get user's watchlist
  */
-export async function getUserWatchlist(ownerId: string = 'default'): Promise<WatchlistInstrument[]> {
-	const url = `/broker/candles/user/watchlist?owner_id=${encodeURIComponent(ownerId)}`;
+export async function getUserWatchlist(
+	ownerId: string = 'default'
+): Promise<WatchlistInstrument[]> {
+	const url = `/api/candles/user/watchlist?owner_id=${encodeURIComponent(ownerId)}`;
 	const res = await apiFetch(url);
-	
+
 	if (!res.ok) {
 		const errorText = await res.text().catch(() => 'Unknown error');
 		throw new Error(`Failed to fetch watchlist: ${res.status} ${errorText}`);
 	}
-	
+
 	return res.json();
 }
 
@@ -696,7 +714,7 @@ export async function upsertUserWatchlist(
 	ownerId: string = 'default',
 	replace: boolean = false
 ): Promise<WatchlistUpsertResponse> {
-	const url = `/broker/candles/user/watchlist?replace=${replace}`;
+	const url = `/api/candles/user/watchlist?replace=${replace}`;
 	const res = await apiFetch(url, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
@@ -705,11 +723,11 @@ export async function upsertUserWatchlist(
 			instruments
 		})
 	});
-	
+
 	if (!res.ok) {
 		const errorText = await res.text().catch(() => 'Unknown error');
 		throw new Error(`Failed to upsert watchlist: ${res.status} ${errorText}`);
 	}
-	
+
 	return res.json();
 }

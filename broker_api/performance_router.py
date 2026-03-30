@@ -9,7 +9,7 @@ from .performance_logic import calculate_performance
 from .candles_api import get_kite_db
 from .broker_api import get_db, PortfolioSnapshot, PortfolioHistory
 
-router = APIRouter()
+router = APIRouter(tags=["Performance"])
 
 # --- Existing Performance Logic ---
 

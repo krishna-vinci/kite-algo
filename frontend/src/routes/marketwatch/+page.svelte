@@ -56,7 +56,9 @@
 	// Derive websocket status from store connection
 	$: websocketStatus = $marketwatch.connection ? 'CONNECTED' : 'DISCONNECTED';
 	// Get live ticks from store
-	$: liveTicks = new Map(Object.entries($marketwatch.instruments).map(([token, data]) => [parseInt(token), data as Tick]));
+	$: liveTicks = new Map(
+		Object.entries($marketwatch.instruments).map(([token, data]) => [parseInt(token), data as Tick])
+	);
 
 	// Fetch instruments search results
 	async function fetchSearchResults(query: string) {
@@ -65,7 +67,7 @@
 			return;
 		}
 		try {
-			const url = `${getApiBase()}/broker/instruments/fuzzy-search?query=${encodeURIComponent(query)}`;
+			const url = `${getApiBase()}/api/instruments/fuzzy-search?query=${encodeURIComponent(query)}`;
 			const response = await fetch(url, { credentials: 'include' });
 			if (response.ok) {
 				searchResults = await response.json();
@@ -209,7 +211,8 @@
 				}
 
 				const validTokens = Array.from(tokens);
-				const mode = (subs && ['ltp', 'quote', 'full'].includes(subs.mode)) ? (subs.mode as Mode) : 'quote';
+				const mode =
+					subs && ['ltp', 'quote', 'full'].includes(subs.mode) ? (subs.mode as Mode) : 'quote';
 
 				if (validTokens.length > 0) {
 					// Subscribe in quote mode by default; adjust mode if needed
@@ -220,7 +223,10 @@
 				}
 			}
 		} catch (e) {
-			console.warn('Could not fetch subscriptions from server (marketwatch scope). Starting fresh.', e);
+			console.warn(
+				'Could not fetch subscriptions from server (marketwatch scope). Starting fresh.',
+				e
+			);
 		}
 
 		// Use the store to connect - singleton guard will prevent duplicate connections

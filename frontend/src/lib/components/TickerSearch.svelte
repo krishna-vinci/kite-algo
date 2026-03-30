@@ -49,7 +49,7 @@
 		loading = true;
 		searchTimeout = setTimeout(async () => {
 			try {
-				const url = `${getApiBase()}/broker/instruments/fuzzy-search?query=${encodeURIComponent(
+				const url = `${getApiBase()}/api/instruments/fuzzy-search?query=${encodeURIComponent(
 					currentQuery
 				)}`;
 				const response = await fetch(url, { credentials: 'include' });
@@ -116,7 +116,9 @@
 	/>
 
 	{#if open && (results.length > 0 || loading)}
-		<div class="absolute z-10 w-full mt-1 bg-background border rounded-md shadow-lg max-h-60 overflow-y-auto">
+		<div
+			class="absolute z-10 w-full mt-1 bg-background border rounded-md shadow-lg max-h-60 overflow-y-auto"
+		>
 			{#if loading}
 				<div class="p-2 text-sm text-muted-foreground">Searching...</div>
 			{:else}

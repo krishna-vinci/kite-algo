@@ -16,7 +16,7 @@ import type {
 	BuildPositionResponse
 } from '../types';
 
-const API_PREFIX = '/broker/strategies';
+const API_PREFIX = '/api/strategies';
 
 /**
  * Get list of all strategies with optional filters
@@ -27,17 +27,17 @@ export async function listStrategies(
 	limit: number = 50
 ): Promise<StrategyListResponse> {
 	const params = new URLSearchParams();
-	
+
 	if (status) params.append('status', status);
 	if (monitoringMode) params.append('monitoring_mode', monitoringMode);
 	params.append('limit', limit.toString());
-	
+
 	const response = await apiFetch(`${API_PREFIX}/?${params.toString()}`);
-	
+
 	if (!response.ok) {
 		throw new Error(`Failed to fetch strategies: ${response.statusText}`);
 	}
-	
+
 	return response.json();
 }
 
@@ -46,11 +46,11 @@ export async function listStrategies(
  */
 export async function getStrategy(strategyId: string): Promise<ProtectionStrategyResponse> {
 	const response = await apiFetch(`${API_PREFIX}/${strategyId}`);
-	
+
 	if (!response.ok) {
 		throw new Error(`Failed to fetch strategy: ${response.statusText}`);
 	}
-	
+
 	return response.json();
 }
 
@@ -59,11 +59,11 @@ export async function getStrategy(strategyId: string): Promise<ProtectionStrateg
  */
 export async function getEngineHealth(): Promise<EngineHealthResponse> {
 	const response = await apiFetch(`${API_PREFIX}/health`);
-	
+
 	if (!response.ok) {
 		throw new Error(`Failed to fetch engine health: ${response.statusText}`);
 	}
-	
+
 	return response.json();
 }
 
@@ -75,11 +75,11 @@ export async function getStrategyEvents(
 	limit: number = 50
 ): Promise<EventsResponse> {
 	const response = await apiFetch(`${API_PREFIX}/${strategyId}/events?limit=${limit}`);
-	
+
 	if (!response.ok) {
 		throw new Error(`Failed to fetch events: ${response.statusText}`);
 	}
-	
+
 	return response.json();
 }
 
@@ -96,12 +96,12 @@ export async function updateStrategyStatus(
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ status, reason })
 	});
-	
+
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ detail: response.statusText }));
 		throw new Error(error.detail || 'Failed to update strategy status');
 	}
-	
+
 	return response.json();
 }
 
@@ -125,12 +125,12 @@ export async function updateStrategy(
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(updates)
 	});
-	
+
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ detail: response.statusText }));
 		throw new Error(error.detail || 'Failed to update strategy');
 	}
-	
+
 	return response.json();
 }
 
@@ -143,12 +143,12 @@ export async function deleteStrategy(
 	const response = await apiFetch(`${API_PREFIX}/${strategyId}`, {
 		method: 'DELETE'
 	});
-	
+
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ detail: response.statusText }));
 		throw new Error(error.detail || 'Failed to delete strategy');
 	}
-	
+
 	return response.json();
 }
 
@@ -156,12 +156,12 @@ export async function deleteStrategy(
  * Get real-time positions snapshot
  */
 export async function getRealtimePositions(): Promise<RealtimePositionsResponse> {
-	const response = await apiFetch('/broker/positions/realtime');
-	
+	const response = await apiFetch('/api/positions/realtime');
+
 	if (!response.ok) {
 		throw new Error(`Failed to fetch positions: ${response.statusText}`);
 	}
-	
+
 	return response.json();
 }
 
@@ -170,7 +170,7 @@ export async function getRealtimePositions(): Promise<RealtimePositionsResponse>
  */
 export function buildPositionStreamUrl(): string {
 	const base = getApiBase();
-	return `${base}/broker/positions/stream`;
+	return `${base}/api/positions/stream`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -184,12 +184,12 @@ export async function getAvailableExpiries(
 	underlying: string
 ): Promise<{ underlying: string; expiries: string[]; spot_ltp: number; timestamp: string }> {
 	const response = await apiFetch(`${API_PREFIX}/available-expiries/${underlying}`);
-	
+
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ detail: response.statusText }));
 		throw new Error(error.detail || 'Failed to fetch available expiries');
 	}
-	
+
 	return response.json();
 }
 
@@ -204,14 +204,16 @@ export async function getMiniChain(
 ): Promise<MiniChainResponse> {
 	const params = new URLSearchParams({ count: count.toString() });
 	if (centerStrike) params.append('center_strike', centerStrike.toString());
-	
-	const response = await apiFetch(`${API_PREFIX}/mini-chain/${underlying}/${expiry}?${params.toString()}`);
-	
+
+	const response = await apiFetch(
+		`${API_PREFIX}/mini-chain/${underlying}/${expiry}?${params.toString()}`
+	);
+
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ detail: response.statusText }));
 		throw new Error(error.detail || 'Failed to fetch mini chain');
 	}
-	
+
 	return response.json();
 }
 
@@ -222,7 +224,7 @@ export async function suggestStrikes(
 	underlying: string,
 	expiry: string,
 	strategyType: string,
-	targetDelta: number = 0.30,
+	targetDelta: number = 0.3,
 	riskAmount?: number
 ): Promise<StrikeSuggestion> {
 	const response = await apiFetch(`${API_PREFIX}/suggest-strikes`, {
@@ -236,12 +238,12 @@ export async function suggestStrikes(
 			risk_amount: riskAmount
 		})
 	});
-	
+
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ detail: response.statusText }));
 		throw new Error(error.detail || 'Failed to suggest strikes');
 	}
-	
+
 	return response.json();
 }
 
@@ -250,20 +252,18 @@ export async function suggestStrikes(
  * If placeOrders is false, returns dry run plan
  * If placeOrders is true, executes orders and creates protection
  */
-export async function buildPosition(
-	request: BuildPositionRequest
-): Promise<BuildPositionResponse> {
+export async function buildPosition(request: BuildPositionRequest): Promise<BuildPositionResponse> {
 	const response = await apiFetch(`${API_PREFIX}/build-position`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(request)
 	});
-	
+
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ detail: response.statusText }));
 		throw new Error(error.detail || 'Failed to build position');
 	}
-	
+
 	return response.json();
 }
 
@@ -274,19 +274,17 @@ export async function buildPosition(
 /**
  * Create a new protection strategy for existing positions
  */
-export async function createProtectionStrategy(
-	request: any
-): Promise<ProtectionStrategyResponse> {
+export async function createProtectionStrategy(request: any): Promise<ProtectionStrategyResponse> {
 	const response = await apiFetch(`${API_PREFIX}/protection`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(request)
 	});
-	
+
 	if (!response.ok) {
 		const error = await response.json().catch(() => ({ detail: response.statusText }));
 		throw new Error(error.detail || 'Failed to create protection strategy');
 	}
-	
+
 	return response.json();
 }

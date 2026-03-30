@@ -1,6 +1,6 @@
 <script lang="ts">
 	console.log('🚀 [SCRIPT] NFO Charts component script loading...');
-	
+
 	import { onMount, onDestroy } from 'svelte';
 	import { browser } from '$app/environment';
 	import LightweightChart from '$lib/components/charts/LightweightChart.svelte';
@@ -175,7 +175,9 @@
 				const existingTimes = new Set(existingCandles.map((c) => c.time));
 				const uniqueNew = newCandles.filter((c) => !existingTimes.has(c.time));
 				finalCandles = [...existingCandles, ...uniqueNew].sort((a, b) => a.time - b.time);
-				console.log(`[LoadCandles] Merged: ${existingCandles.length} existing + ${uniqueNew.length} new = ${finalCandles.length} total`);
+				console.log(
+					`[LoadCandles] Merged: ${existingCandles.length} existing + ${uniqueNew.length} new = ${finalCandles.length} total`
+				);
 			}
 
 			if (finalCandles.length > MAX_CANDLE_HISTORY) {
@@ -186,8 +188,12 @@
 			candlesByTokenAndInterval.get(token)!.set(normalizedInterval, finalCandles);
 			// CRITICAL: Trigger Svelte reactivity by creating new Map reference
 			candlesByTokenAndInterval = new Map(candlesByTokenAndInterval);
-			console.log(`✅ [LoadCandles] Stored ${finalCandles.length} candles for ${key} (normalized: ${normalizedInterval})`);
-			console.log(`   Data now available at: candlesByTokenAndInterval.get(${token}).get("${normalizedInterval}")`);
+			console.log(
+				`✅ [LoadCandles] Stored ${finalCandles.length} candles for ${key} (normalized: ${normalizedInterval})`
+			);
+			console.log(
+				`   Data now available at: candlesByTokenAndInterval.get(${token}).get("${normalizedInterval}")`
+			);
 		} catch (error) {
 			console.error(`[LoadCandles] Failed to fetch candles for ${key}:`, error);
 		}
@@ -206,12 +212,15 @@
 	}
 
 	// Cache for normalized chart data to maintain array references
-	const chartDataCache = new Map<string, {
-		candles: any[];
-		ema: any[];
-		rsi: any[];
-		sourceLength: number;
-	}>();
+	const chartDataCache = new Map<
+		string,
+		{
+			candles: any[];
+			ema: any[];
+			rsi: any[];
+			sourceLength: number;
+		}
+	>();
 
 	// --- Chart Data Derivation ---
 	function getChartSeriesForToken(token: number | null, interval: string | null): SeriesSpec[] {
@@ -223,7 +232,7 @@
 
 		const key = getKey(token, interval);
 		const cached = chartDataCache.get(key);
-		
+
 		// IST offset: +5 hours 30 minutes = 19800 seconds
 		const IST_OFFSET = 19800;
 
@@ -232,13 +241,13 @@
 			// Update only the last candle in place
 			const lastSourceCandle = candles[candles.length - 1];
 			const lastCachedCandle = cached.candles[cached.candles.length - 1];
-			
+
 			lastCachedCandle.time = Math.round(Number(lastSourceCandle.time)) + IST_OFFSET;
 			lastCachedCandle.open = Number(lastSourceCandle.open);
 			lastCachedCandle.high = Number(lastSourceCandle.high);
 			lastCachedCandle.low = Number(lastSourceCandle.low);
 			lastCachedCandle.close = Number(lastSourceCandle.close);
-			
+
 			// Recompute indicators (they're small)
 			cached.ema = generateEma(candles);
 			cached.rsi = generateRsi(candles);
@@ -263,30 +272,32 @@
 		}
 
 		const data = chartDataCache.get(key)!;
-		
+
 		// Use 'setData' for full replacement, 'updateLast' only when we know only last candle changed
 		const mode = cached && cached.sourceLength === candles.length ? 'updateLast' : undefined;
-		
-		console.log(`[ChartSeries] Returning ${data.candles.length} candles with mode: ${mode || 'setData'}`);
-		
+
+		console.log(
+			`[ChartSeries] Returning ${data.candles.length} candles with mode: ${mode || 'setData'}`
+		);
+
 		return [
-			{ 
-				id: 'candles', 
-				type: 'candlestick', 
+			{
+				id: 'candles',
+				type: 'candlestick',
 				data: data.candles,
 				dataMode: mode // Use updateLast only for tick updates, not initial load
 			},
-			{ 
-				id: 'ema', 
-				type: 'line', 
-				data: data.ema, 
+			{
+				id: 'ema',
+				type: 'line',
+				data: data.ema,
 				options: { color: '#2962FF', lineWidth: 2 },
 				dataMode: mode
 			},
-			{ 
-				id: 'rsi', 
-				type: 'line', 
-				data: data.rsi, 
+			{
+				id: 'rsi',
+				type: 'line',
+				data: data.rsi,
 				options: { color: '#f44336', lineWidth: 2, pane: 1 },
 				dataMode: mode
 			}
@@ -343,9 +354,7 @@
 			return;
 		}
 		try {
-			const url = `${getApiBase()}/broker/instruments/fuzzy-search?query=${encodeURIComponent(
-				query
-			)}`;
+			const url = `${getApiBase()}/api/instruments/fuzzy-search?query=${encodeURIComponent(query)}`;
 			const response = await fetch(url, { credentials: 'include' });
 			searchResults = response.ok ? await response.json() : [];
 		} catch (error) {
@@ -369,13 +378,15 @@
 		clearTimeout(saveWatchlistTimeout);
 		saveWatchlistTimeout = setTimeout(async () => {
 			try {
-				const instruments: WatchlistInstrument[] = Array.from(subscribedInstruments.values()).map(inst => ({
-					instrument_token: inst.instrument_token,
-					tradingsymbol: inst.tradingsymbol,
-					name: inst.name,
-					exchange: inst.exchange,
-					instrument_type: inst.instrument_type
-				}));
+				const instruments: WatchlistInstrument[] = Array.from(subscribedInstruments.values()).map(
+					(inst) => ({
+						instrument_token: inst.instrument_token,
+						tradingsymbol: inst.tradingsymbol,
+						name: inst.name,
+						exchange: inst.exchange,
+						instrument_type: inst.instrument_type
+					})
+				);
 				await upsertUserWatchlist(instruments, 'nfo-charts', true);
 			} catch (e) {
 				console.warn('Failed to save watchlist:', e);
@@ -429,9 +440,11 @@
 
 		const token = instrument.instrument_token;
 		const interval = currentPaneIntervals[paneIndex];
-		
-		console.log(`🎯 [handlePaneSelect] Selected ${instrument.tradingsymbol} (${token}) with interval ${interval}`);
-		
+
+		console.log(
+			`🎯 [handlePaneSelect] Selected ${instrument.tradingsymbol} (${token}) with interval ${interval}`
+		);
+
 		// Start stream immediately - snapshot will provide initial data fast
 		startStream(token, interval);
 	}
@@ -448,7 +461,7 @@
 		const token = layouts[activeLayout][paneIndex];
 		if (token) {
 			console.log(`⏱️ [handleIntervalChange] Changed to ${interval} for token ${token}`);
-			
+
 			// Stop old stream and start new one immediately
 			const oldInterval = currentPaneIntervals[paneIndex];
 			if (oldInterval !== interval) {
@@ -461,7 +474,7 @@
 	// --- Stream Management ---
 	function startStream(token: number, interval: string) {
 		console.log(`🚀 [startStream] STARTING STREAM for ${token}|${interval}`);
-		
+
 		if (!streamManager) {
 			console.error('❌ [startStream] streamManager is null!');
 			return;
@@ -483,19 +496,23 @@
 		console.log(`[startStream] Calling streamManager.subscribe...`);
 		streamManager.subscribe(token, interval, {
 			onSnapshot: (snapshot) => {
-				console.log(`📦 [Stream] Snapshot received for ${key}:`, snapshot.candles.length, 'candles');
+				console.log(
+					`📦 [Stream] Snapshot received for ${key}:`,
+					snapshot.candles.length,
+					'candles'
+				);
 				const newCandles = parseRawCandles(snapshot.candles);
 				if (newCandles.length > 0) {
 					const normalizedInterval = normalizeTimeframe(interval);
 					if (!candlesByTokenAndInterval.has(token)) {
 						candlesByTokenAndInterval.set(token, new Map());
 					}
-					
+
 					// USE SNAPSHOT as primary data source - it's fresh from backend
 					candlesByTokenAndInterval.get(token)!.set(normalizedInterval, newCandles);
 					candlesByTokenAndInterval = new Map(candlesByTokenAndInterval);
 					console.log(`✅ [Stream] Loaded ${newCandles.length} candles from snapshot for ${key}`);
-					
+
 					// Clear cache to force chart regeneration
 					chartDataCache.delete(key);
 				}
@@ -508,23 +525,23 @@
 					candlesByTokenAndInterval.set(token, new Map());
 				}
 				const existingCandles = candlesByTokenAndInterval.get(token)!.get(normalizedInterval) ?? [];
-				
+
 				// Find or create the forming candle
-				const existingIndex = existingCandles.findIndex(c => c.time === candle.time);
-				
+				const existingIndex = existingCandles.findIndex((c) => c.time === candle.time);
+
 				if (existingIndex >= 0) {
 					// Update existing forming candle IN PLACE
 					existingCandles[existingIndex] = candle;
 				} else {
 					// New forming candle - add at end
 					existingCandles.push(candle);
-					
+
 					// Trim if exceeds max history
 					if (existingCandles.length > MAX_CANDLE_HISTORY) {
 						existingCandles.shift(); // Remove oldest
 					}
 				}
-				
+
 				// CRITICAL: Trigger Svelte reactivity
 				candlesByTokenAndInterval = new Map(candlesByTokenAndInterval);
 			},
@@ -537,10 +554,10 @@
 					candlesByTokenAndInterval.set(token, new Map());
 				}
 				const existingCandles = candlesByTokenAndInterval.get(token)!.get(normalizedInterval) ?? [];
-				
+
 				// Check if this candle already exists (update) or is new (append)
-				const existingIndex = existingCandles.findIndex(c => c.time === candle.time);
-				
+				const existingIndex = existingCandles.findIndex((c) => c.time === candle.time);
+
 				if (existingIndex >= 0) {
 					// Update existing candle IN PLACE (keeps same array reference)
 					console.log(`[Stream] Updating existing candle at index ${existingIndex}`);
@@ -550,13 +567,13 @@
 					console.log(`[Stream] Appending new candle`);
 					existingCandles.push(candle);
 					existingCandles.sort((a, b) => a.time - b.time);
-					
+
 					// Trim if exceeds max history
 					if (existingCandles.length > MAX_CANDLE_HISTORY) {
 						existingCandles.splice(0, existingCandles.length - MAX_CANDLE_HISTORY);
 					}
 				}
-				
+
 				// Trigger reactivity by creating a new Map reference
 				candlesByTokenAndInterval = new Map(candlesByTokenAndInterval);
 			},
@@ -582,7 +599,7 @@
 	// --- Reactive Stream Management ---
 	$effect(() => {
 		console.log('🔄 [Effect] Stream management effect triggered');
-		
+
 		if (!streamManager) {
 			console.warn('⚠️ [Effect] streamManager not initialized');
 			return;
@@ -595,42 +612,47 @@
 		// Get all active panes in current layout
 		const panesToManage = layouts[activeLayout];
 		const intervalsToManage = paneIntervals[activeLayout];
-		
+
 		console.log(`📊 [Effect] Active layout: ${activeLayout}`, {
 			panes: panesToManage,
 			intervals: intervalsToManage
 		});
-		
+
 		// IMPORTANT: Access candlesByTokenAndInterval to make this effect reactive to data changes
 		const dataMap = candlesByTokenAndInterval;
 		console.log('[Effect] Current data map:', {
 			tokens: Array.from(dataMap.keys()),
 			totalIntervals: Array.from(dataMap.values()).reduce((sum, m) => sum + m.size, 0)
 		});
-		
+
 		// Start streams for visible panes
 		panesToManage.forEach((token, i) => {
 			if (token) {
 				const interval = intervalsToManage[i];
 				const normalizedInterval = normalizeTimeframe(interval);
-				
+
 				// Only start if we have candle data (historical loaded)
 				const hasData = dataMap.get(token)?.has(normalizedInterval);
 				const candleCount = dataMap.get(token)?.get(normalizedInterval)?.length || 0;
 				const isSubscribed = streamManager.isSubscribed(token, interval);
-				
-				console.log(`🔍 [Effect] Pane ${i}: ${token}|${interval} (normalized: ${normalizedInterval})`, {
-					hasData,
-					candleCount,
-					isSubscribed,
-					willStart: hasData && !isSubscribed,
-					tokenInMap: dataMap.has(token),
-					intervalsForToken: dataMap.get(token) ? Array.from(dataMap.get(token)!.keys()) : []
-				});
-				
+
+				console.log(
+					`🔍 [Effect] Pane ${i}: ${token}|${interval} (normalized: ${normalizedInterval})`,
+					{
+						hasData,
+						candleCount,
+						isSubscribed,
+						willStart: hasData && !isSubscribed,
+						tokenInMap: dataMap.has(token),
+						intervalsForToken: dataMap.get(token) ? Array.from(dataMap.get(token)!.keys()) : []
+					}
+				);
+
 				// START STREAM IMMEDIATELY - don't wait for historical data
 				if (!isSubscribed) {
-					console.log(`✅ [Effect] Starting stream for ${token}|${interval} (hasData: ${hasData}, candleCount: ${candleCount})`);
+					console.log(
+						`✅ [Effect] Starting stream for ${token}|${interval} (hasData: ${hasData}, candleCount: ${candleCount})`
+					);
 					startStream(token, interval);
 				} else {
 					console.log(`ℹ️ [Effect] Already subscribed to ${token}|${interval}`);
@@ -645,14 +667,14 @@
 
 		const interval = currentPaneIntervals[paneIndex];
 		const key = getKey(token, interval);
-		
+
 		console.log(`[Refetch] Starting refetch for ${key}...`);
 
 		try {
 			// Step 1: Clear cache to force fresh data from Kite API
 			console.log(`[Refetch] Clearing cache for ${token}...`);
 			await clearCandleCache(token);
-			
+
 			// Step 2: Trigger ingestion with fresh fetch
 			console.log(`[Refetch] Triggering ingestion for ${key}...`);
 			const response = await fetchCandles(token, {
@@ -670,17 +692,18 @@
 				console.log('[Refetch] Ingestion triggered, polling for data...');
 				// Poll every 3 seconds for up to 45 seconds
 				for (let i = 0; i < 15; i++) {
-					await new Promise(resolve => setTimeout(resolve, 3000));
+					await new Promise((resolve) => setTimeout(resolve, 3000));
 					console.log(`[Refetch] Poll attempt ${i + 1}/15...`);
-					
+
 					const retryResponse = await fetchCandles(token, {
 						timeframe: interval,
 						ingest: false
 					});
-					
+
 					console.log(`[Refetch] Poll result: ${retryResponse.candles.length} candles`);
-					
-					if (retryResponse.candles.length > 10) { // Wait for substantial data
+
+					if (retryResponse.candles.length > 10) {
+						// Wait for substantial data
 						console.log('[Refetch] Data received! Loading...');
 						await loadCandles(token, interval, { replace: true });
 						console.log(`[Refetch] Success! Loaded ${retryResponse.candles.length} candles`);
@@ -755,10 +778,7 @@
 							while (newIntervalPanes.length < expectedLength) {
 								newIntervalPanes.push(defaultInterval);
 							}
-							newIntervals[layoutKey as LayoutType] = newIntervalPanes.slice(
-								0,
-								expectedLength
-							);
+							newIntervals[layoutKey as LayoutType] = newIntervalPanes.slice(0, expectedLength);
 						}
 					}
 				}
@@ -792,7 +812,7 @@
 					subscribe({ instrument_token: token, tradingsymbol: `TOKEN ${token}` } as Instrument);
 				}
 			}
-			
+
 			// NOTE: We don't load historical data separately anymore
 			// SSE snapshot will provide initial candles automatically when stream connects
 			console.log('✅ [Init] Layouts loaded. Streams will be started by reactive effect.');
@@ -838,7 +858,9 @@
 	<Tabs.Root bind:value={activeTab} class="w-full flex flex-col flex-grow">
 		<Tabs.List class="grid grid-cols-7 gap-2 w-full">
 			{#each Object.keys(LAYOUT_CONFIG) as layout}
-				<Tabs.Trigger value={layout}>{layout.charAt(0).toUpperCase() + layout.slice(1)}</Tabs.Trigger>
+				<Tabs.Trigger value={layout}
+					>{layout.charAt(0).toUpperCase() + layout.slice(1)}</Tabs.Trigger
+				>
 			{/each}
 			<Tabs.Trigger value="instruments">Instruments</Tabs.Trigger>
 		</Tabs.List>
@@ -852,8 +874,7 @@
 						<span
 							class="font-semibold {websocketStatus === 'CONNECTED'
 								? 'text-green-500'
-								: 'text-red-500'}"
-							>{websocketStatus}</span
+								: 'text-red-500'}">{websocketStatus}</span
 						>
 					</p>
 				</div>
@@ -903,7 +924,7 @@
 												LTP: {liveTicks.get(instrument.instrument_token)?.last_price?.toFixed(2) ??
 													'--'}
 												<span
-													class={liveTicks.get(instrument.instrument_token)?.change ?? 0 >= 0
+													class={(liveTicks.get(instrument.instrument_token)?.change ?? 0 >= 0)
 														? 'text-green-600'
 														: 'text-red-600'}
 												>
@@ -932,7 +953,13 @@
 			<Tabs.Content value={layout} class="flex-grow pt-2">
 				<div
 					class="grid gap-2 w-full h-full"
-					style:grid-template-columns={count > 1 && count !== 4 && count !== 6 && count !== 8 ? `repeat(${Math.min(count, 3)}, 1fr)` : count === 4 ? 'repeat(2, 1fr)' : count === 6 ? 'repeat(3, 1fr)' : '1fr'}
+					style:grid-template-columns={count > 1 && count !== 4 && count !== 6 && count !== 8
+						? `repeat(${Math.min(count, 3)}, 1fr)`
+						: count === 4
+							? 'repeat(2, 1fr)'
+							: count === 6
+								? 'repeat(3, 1fr)'
+								: '1fr'}
 					style:grid-template-rows={count > 3 ? 'repeat(2, 1fr)' : '1fr'}
 				>
 					{#each { length: count } as _, i}
@@ -965,8 +992,10 @@
 											<option {value}>{label}</option>
 										{/each}
 									</select>
-									<Button variant="ghost" size="sm" on:click={() => loadOlderCandles(token, interval)}
-										>Load Older</Button
+									<Button
+										variant="ghost"
+										size="sm"
+										on:click={() => loadOlderCandles(token, interval)}>Load Older</Button
 									>
 									<Button variant="ghost" size="sm" on:click={() => refreshCandles(token, interval)}
 										>Refresh</Button
@@ -996,7 +1025,8 @@
 														: 'bg-gray-100 text-gray-800'}"
 										>
 											{#if streamState === 'connected'}
-												<span class="inline-block w-2 h-2 bg-green-600 rounded-full animate-pulse"></span>
+												<span class="inline-block w-2 h-2 bg-green-600 rounded-full animate-pulse"
+												></span>
 												Live
 											{:else if streamState === 'connecting'}
 												<span class="inline-block w-2 h-2 bg-yellow-600 rounded-full"></span>

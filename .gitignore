@@ -1,21 +1,32 @@
 /.env
-__pycache__/charts.cpython-312.pyc
-.gitignore
-.gitignore
-__pycache__/mcp_server.cpython-312.pyc
-broker_api/__pycache__/kite_auth.cpython-312.pyc
-broker_api/__pycache__/kite_auth.cpython-312.pyc
-broker_api/__pycache__/kite_auth.cpython-312.pyc
-__pycache__/database.cpython-312.pyc
-broker_api/__pycache__/kite_auth.cpython-312.pyc
-broker_api/__pycache__/kite_auth.cpython-312.pyc
-__pycache__/main.cpython-312.pyc
-__pycache__/mcp_broker_server.cpython-313.pyc
-__pycache__/server.cpython-313.pyc
-broker_api/__pycache__/broker_api.cpython-312.pyc
-.gitignore
-__pycache__/database.cpython-313.pyc
-__pycache__/kite-mcp.cpython-313.pyc
-broker_api/__pycache__/broker_api.cpython-312.pyc
-broker_api/__pycache__/kite_auth.cpython-312.pyc
-strategies/__pycache__/momentum.cpython-312.pyc
+/.venv/
+/.python-version
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# Build output
+dist/
+build/
+frontend/build/
+.svelte-kit/
+
+# Runtime data
+kite_session.json
+meili_data/
+redis_data/
+postgres_data/
+
+# Local tooling
+.DS_Store
+.idea/
+.vscode/
+.kilocode/

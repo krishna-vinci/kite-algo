@@ -85,6 +85,19 @@ CREATE TABLE IF NOT EXISTS public.user_settings (
   last_updated       TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Auth/session storage for broker integrations
+CREATE TABLE IF NOT EXISTS public.kite_sessions (
+  session_id         VARCHAR(36) PRIMARY KEY,
+  access_token       TEXT NOT NULL,
+  created_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.fyers_sessions (
+  session_id         VARCHAR(36) PRIMARY KEY,
+  access_token       TEXT NOT NULL,
+  created_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- =========================================
 -- Unified search view
 -- =========================================
@@ -246,6 +259,7 @@ CREATE TABLE IF NOT EXISTS public.kite_ticker_tickers (
   close              NUMERIC(18, 6),
   -- Current price and change metrics
   ltp                NUMERIC(18, 6),
+  change_1d          NUMERIC(10, 4),
   net_change         NUMERIC(18, 6),
   net_change_percent NUMERIC(10, 4),
   -- Index metrics
@@ -255,6 +269,8 @@ CREATE TABLE IF NOT EXISTS public.kite_ticker_tickers (
   last_updated       TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   PRIMARY KEY (instrument_token, source_list)
 );
+
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS change_1d NUMERIC(10, 4);
 
 
 -- =========================================
@@ -280,6 +296,46 @@ CREATE TABLE IF NOT EXISTS public.historical_candles (
 -- Index for efficient querying of historical candles
 CREATE INDEX IF NOT EXISTS idx_hist_candles_token_interval_ts
   ON public.historical_candles (instrument_token, interval, ts DESC);
+
+-- Legacy historical data table still used by broker/performance/momentum flows.
+CREATE TABLE IF NOT EXISTS public.kite_historical_data (
+  instrument_token   BIGINT NOT NULL,
+  tradingsymbol      VARCHAR(255) NOT NULL,
+  "timestamp"       TIMESTAMPTZ NOT NULL,
+  interval           TEXT NOT NULL,
+  open               NUMERIC(18,6) NOT NULL,
+  high               NUMERIC(18,6) NOT NULL,
+  low                NUMERIC(18,6) NOT NULL,
+  close              NUMERIC(18,6) NOT NULL,
+  volume             BIGINT,
+  oi                 BIGINT,
+  created_at         TIMESTAMPTZ DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (instrument_token, "timestamp", interval)
+);
+
+CREATE INDEX IF NOT EXISTS idx_kite_historical_data_token_interval_ts
+  ON public.kite_historical_data (instrument_token, interval, "timestamp" DESC);
+
+-- Legacy index historical data table used by index backfill flows.
+CREATE TABLE IF NOT EXISTS public.kite_indices_historical_data (
+  instrument_token   BIGINT NOT NULL,
+  tradingsymbol      VARCHAR(255) NOT NULL,
+  "timestamp"       TIMESTAMPTZ NOT NULL,
+  interval           TEXT NOT NULL,
+  open               NUMERIC(18,6) NOT NULL,
+  high               NUMERIC(18,6) NOT NULL,
+  low                NUMERIC(18,6) NOT NULL,
+  close              NUMERIC(18,6) NOT NULL,
+  volume             BIGINT,
+  oi                 BIGINT,
+  created_at         TIMESTAMPTZ DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (instrument_token, "timestamp", interval)
+);
+
+CREATE INDEX IF NOT EXISTS idx_kite_indices_historical_data_token_interval_ts
+  ON public.kite_indices_historical_data (instrument_token, interval, "timestamp" DESC);
 
 -- Covering index for momentum scans (latest & 252nd closes per tradingsymbol)
 CREATE INDEX IF NOT EXISTS idx_kite_hist_tradingsymbol_ts
@@ -454,6 +510,36 @@ CREATE TABLE IF NOT EXISTS public.strategy_events (
 
 CREATE INDEX IF NOT EXISTS idx_strat_events_strat_id ON public.strategy_events(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_strat_events_created ON public.strategy_events(created_at DESC);
+
+-- =========================================
+-- Portfolio snapshots and history
+-- =========================================
+
+CREATE TABLE IF NOT EXISTS public.portfolio_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    "timestamp" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    strategy_name VARCHAR(255) NOT NULL,
+    symbol VARCHAR(255) NOT NULL,
+    quantity INTEGER NOT NULL,
+    purchase_price NUMERIC(18,6) NOT NULL,
+    total_value NUMERIC(18,6) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_strategy_ts
+    ON public.portfolio_snapshots(strategy_name, "timestamp" DESC);
+
+CREATE TABLE IF NOT EXISTS public.portfolio_history (
+    id BIGSERIAL PRIMARY KEY,
+    "timestamp" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    strategy_name VARCHAR(255) NOT NULL,
+    total_capital NUMERIC(18,6) NOT NULL,
+    total_value NUMERIC(18,6) NOT NULL,
+    profit_loss NUMERIC(18,6) NOT NULL,
+    percentage_change NUMERIC(18,6) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_history_strategy_ts
+    ON public.portfolio_history(strategy_name, "timestamp" DESC);
 
 -- =========================================
 -- Investing Strategies Table

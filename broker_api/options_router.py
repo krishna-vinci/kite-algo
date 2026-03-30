@@ -143,7 +143,7 @@ class SessionsRequest(BaseModel):
     replace: bool = False
 
 
-router = APIRouter(tags=["option-chain"])
+router = APIRouter(tags=["Options"])
 
 
 @router.post(

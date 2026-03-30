@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # Redis connection for caching (optional)
 try:
     redis_client = redis.Redis(
-        host=os.getenv('REDIS_HOST', 'localhost'),
+        host=os.getenv('REDIS_HOST', 'redis'),
         port=int(os.getenv('REDIS_PORT', 6379)),
         db=int(os.getenv('REDIS_DB', 0)),
         decode_responses=True,
@@ -48,7 +48,7 @@ except Exception as e:
 LTP_CACHE_TTL = 5  # 5 seconds for LTP data
 ALLOCATION_CACHE_TTL = 10  # 10 seconds for allocation calculations
 
-router = APIRouter(prefix="/momentum-portfolio", tags=["momentum"])
+router = APIRouter(prefix="/momentum-portfolio", tags=["Momentum"])
 
 @contextmanager
 def get_db_cursor():

@@ -1,37 +1,33 @@
-# Stage 1: Build the SvelteKit application
-FROM node:20-alpine AS build
+FROM node:20-alpine AS base
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+RUN npm ci
 
-RUN npm install
-
+FROM base AS dev
 COPY . .
+EXPOSE 5173
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"]
 
+FROM base AS build
+COPY . .
 RUN npm run build
 
-# Stage 2: Run the application with Node.js
-FROM node:20-alpine AS final
+FROM node:20-alpine AS production
 
 WORKDIR /app
 
-# Copy built assets
 COPY --from=build /app/build ./build
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/package-lock.json ./package-lock.json
 COPY --from=build /app/server.js ./server.js
 
-# Install production dependencies only
 RUN npm install --omit=dev
 
-# Expose port 80 (to match docker-compose mapping)
 EXPOSE 80
 ENV PORT=80
 ENV HOST=0.0.0.0
-
-# Default API_BASE_URL (can be overridden by docker-compose)
 ENV API_BASE_URL=http://finance-app:8777
 
-# Start Custom Node server (handles WS proxy + SvelteKit)
 CMD ["node", "server.js"]

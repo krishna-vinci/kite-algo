@@ -1,0 +1,17 @@
+OPENAPI_TAGS = [
+    {"name": "System", "description": "Core system and root endpoints."},
+    {"name": "Authentication", "description": "Kite login, logout, profile, holdings, and margins."},
+    {"name": "Market Data", "description": "Live quotes, LTP, and OHLC endpoints."},
+    {"name": "Instruments", "description": "Instrument import, search, enrichment, and Meilisearch operations."},
+    {"name": "Historical Data", "description": "Historical candle backfills and sync progress endpoints."},
+    {"name": "Ingestion", "description": "CSV-driven stock and Nifty ingestion workflows."},
+    {"name": "User Settings", "description": "Persisted user preferences and subscription settings."},
+    {"name": "Marketwatch", "description": "Nifty50 snapshots, baseline refresh, and realtime websocket feeds."},
+    {"name": "Orders", "description": "Order placement, previews, baskets, and realtime order events."},
+    {"name": "Options", "description": "Options session and chain endpoints."},
+    {"name": "Candles", "description": "Historical candle query and watchlist APIs."},
+    {"name": "Performance", "description": "Index and portfolio performance APIs."},
+    {"name": "Momentum", "description": "Momentum strategy endpoints."},
+    {"name": "Alerts", "description": "Price alert CRUD and event streams."},
+    {"name": "Strategies", "description": "Protected strategy and index stoploss endpoints."},
+]

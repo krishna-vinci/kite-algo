@@ -179,7 +179,10 @@ class PortfolioSnapshotCreate(BaseModel):
 
 
 # ───────── DATABASE SETUP ─────────
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://krishna:1122@db.db-net:5432/finance")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    f"postgresql://{os.getenv('DB_USER', 'postgres')}:{os.getenv('DB_PASSWORD', 'postgres')}@{os.getenv('DB_HOST', 'postgres')}:{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME', 'postgres')}"
+)
 
 # synchronous engine + session
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -1275,14 +1278,14 @@ async def _parse_and_backfill_underlying(session: Session, only_nulls: bool = Tr
         logger.error(f"Error during underlying and option_type backfill: {e}", exc_info=True)
         raise e # Re-raise to be handled by the calling endpoint
 
-@router.post("/broker/instruments/populate-underlying")
+@router.post("/instruments/populate-underlying")
 async def populate_underlying_and_option_type(db: Session = Depends(get_db)):
     """
     [DEPRECATED] Populates the 'underlying' and 'option_type' columns in the 'kite_instruments' table
     for records where 'underlying' is NULL. Designed for a one-time data backfill.
-    Please use /broker/instruments/sync-and-reindex for unified maintenance operations.
+    Please use /api/instruments/sync-and-reindex for unified maintenance operations.
     """
-    logger.info("Deprecated /broker/instruments/populate-underlying endpoint called. Redirecting to helper.")
+    logger.info("Deprecated /api/instruments/populate-underlying endpoint called. Redirecting to helper.")
     try:
         counts = await _parse_and_backfill_underlying(db, only_nulls=True)
         return {"message": "Underlying and option_type populated successfully", **counts}
@@ -1511,7 +1514,7 @@ class SyncAndReindexRequest(BaseModel):
     # refresh_from_broker=True calls an internal import/refresh function (e.g., import_all_instruments) directly if present;
     # it does not call any HTTP endpoint. If no internal refresh function exists, this endpoint still backfills
     # underlying/option_type for current DB records and reindexes Meilisearch.
-@router.post("/broker/instruments/sync-and-reindex")
+@router.post("/instruments/sync-and-reindex")
 async def sync_and_reindex_instruments(
     request: SyncAndReindexRequest,
     background_tasks: BackgroundTasks,

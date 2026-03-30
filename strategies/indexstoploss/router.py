@@ -31,7 +31,7 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["index-stoploss"])
+router = APIRouter(tags=["Strategies"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -162,7 +162,7 @@ def _create_position_snapshot(positions: List[dict]) -> List[PositionSnapshot]:
 # ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-router = APIRouter(tags=["index-stoploss"])
+router = APIRouter(tags=["Strategies"])
 
 
 @router.post("/protection", response_model=ProtectionStrategyResponse)

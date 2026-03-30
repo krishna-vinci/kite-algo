@@ -45,7 +45,7 @@
 		error = null;
 		try {
 			// Fetch momentum stocks
-			const stocksResponse = await apiFetch(`/broker/momentum-portfolio`);
+			const stocksResponse = await apiFetch(`/api/momentum-portfolio`);
 			if (!stocksResponse.ok) {
 				throw new Error(`Failed to fetch momentum stocks: ${stocksResponse.statusText}`);
 			}
@@ -58,7 +58,7 @@
 			});
 
 			// Fetch investable margin from the new endpoint
-			const marginsResponse = await apiFetch(`/broker/momentum-portfolio/investable-margin`);
+			const marginsResponse = await apiFetch(`/api/momentum-portfolio/investable-margin`);
 			if (!marginsResponse.ok) {
 				throw new Error(`Failed to fetch investable margin: ${marginsResponse.statusText}`);
 			}
@@ -79,7 +79,7 @@
 		performanceError = null;
 		try {
 			const response = await apiFetch(
-				`/broker/portfolio/performance?strategy_name=${encodeURIComponent(STRATEGY_NAME)}`
+				`/api/portfolio/performance?strategy_name=${encodeURIComponent(STRATEGY_NAME)}`
 			);
 			if (!response.ok) {
 				if (response.status === 404) {
@@ -113,7 +113,7 @@
 		const capitalForAllocation = investableMargin * (marginAllocationPercentage / 100);
 
 		try {
-			const response = await apiFetch(`/broker/momentum-portfolio/calculate-equi-allocation`, {
+			const response = await apiFetch(`/api/momentum-portfolio/calculate-equi-allocation`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
@@ -183,7 +183,7 @@
 			if (orders.length === 0) {
 				throw new Error('No valid orders to preview. Adjust allocation or selections.');
 			}
-			const resp = await apiFetch(`/broker/orders/preview_margins`, {
+			const resp = await apiFetch(`/api/orders/preview_margins`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
@@ -223,7 +223,7 @@
 
 		if (useBasket) {
 			try {
-				const resp = await apiFetch(`/broker/orders/place_basket`, {
+				const resp = await apiFetch(`/api/orders/place_basket`, {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify({
@@ -270,7 +270,7 @@
 		} else {
 			// Sequential single orders (fallback) - This path is less ideal for equi-weighting
 			// and might not be used if basket orders are preferred.
-			// For simplicity, we'll keep it but note that the backend /broker/place_single_order
+			// For simplicity, we'll keep it but note that the backend single-order path
 			// was removed. This section needs to be updated or removed.
 			orderExecutionError =
 				'Single order placement is not supported for this strategy. Please use basket orders.';
@@ -281,7 +281,7 @@
 		// If there are successful orders, create a portfolio snapshot
 		if (snapshotData.length > 0) {
 			try {
-				const snapshotResponse = await apiFetch(`/broker/portfolio/snapshot`, {
+				const snapshotResponse = await apiFetch(`/api/portfolio/snapshot`, {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify(snapshotData)
@@ -318,9 +318,7 @@
 				queryParams.append('symbols', symbol);
 			});
 
-			const response = await apiFetch(
-				`/broker/momentum-portfolio/live-ltp?${queryParams.toString()}`
-			);
+			const response = await apiFetch(`/api/momentum-portfolio/live-ltp?${queryParams.toString()}`);
 
 			if (!response.ok) {
 				throw new Error(`Failed to fetch live LTP: ${response.statusText}`);

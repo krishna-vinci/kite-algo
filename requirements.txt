@@ -23,6 +23,7 @@ yfinance
 jinja2
 python-multipart
 asyncpg
+alembic
 kiteconnect
 indexed-gzip
 fastmcp

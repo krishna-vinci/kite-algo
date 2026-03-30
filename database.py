@@ -226,10 +226,29 @@ database = Database(DATABASE_URL)
 # ───────── User Settings ─────────
 import json
 
+
+def _ensure_user_settings_table(db_session) -> None:
+    """Ensure the user_settings table exists before accessing it."""
+    from sqlalchemy import text
+
+    db_session.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS public.user_settings (
+                owner_id VARCHAR(255) PRIMARY KEY DEFAULT 'default',
+                settings_json JSONB,
+                last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+            """
+        )
+    )
+    db_session.commit()
+
 def get_user_settings(db_session, owner_id: str = "default") -> dict:
     """Fetches user settings JSON from the database."""
     from sqlalchemy import text
     try:
+        _ensure_user_settings_table(db_session)
         stmt = text("SELECT settings_json FROM user_settings WHERE owner_id = :owner_id")
         result = db_session.execute(stmt, {"owner_id": owner_id}).fetchone()
         if result and result[0]:
@@ -242,6 +261,7 @@ def update_user_settings(db_session, settings: dict, owner_id: str = "default"):
     """Upserts user settings JSON to the database."""
     from sqlalchemy import text
     try:
+        _ensure_user_settings_table(db_session)
         stmt = text("""
             INSERT INTO user_settings (owner_id, settings_json, last_updated)
             VALUES (:owner_id, :settings, NOW())

@@ -89,7 +89,7 @@
 
 	async function fetchMargins() {
 		try {
-			const response = await apiFetch(`/broker/margins`);
+			const response = await apiFetch(`/api/margins`);
 			if (!response.ok) {
 				throw new Error(`HTTP ${response.status}: ${response.statusText}`);
 			}
@@ -108,7 +108,7 @@
 	async function fetchHoldings() {
 		holdingsLoading = true;
 		try {
-			const response = await apiFetch(`/broker/holdings_kite`, {
+			const response = await apiFetch(`/api/holdings_kite`, {
 				cache: 'no-store' // Ensure fresh data is fetched
 			});
 			if (!response.ok) {
@@ -256,7 +256,7 @@
 			error: null
 		};
 		try {
-			const response = await apiFetch(`/broker/update_historical_data`, {
+			const response = await apiFetch(`/api/update_historical_data`, {
 				method: 'POST'
 			});
 			if (!response.ok) {
@@ -280,7 +280,7 @@
 
 	async function fetchHistoricalDataProgress() {
 		try {
-			const response = await apiFetch(`/broker/historical_data_progress`);
+			const response = await apiFetch(`/api/historical_data_progress`);
 			if (!response.ok) {
 				throw new Error(`HTTP ${response.status}: ${response.statusText}`);
 			}
@@ -345,7 +345,7 @@
 				<button
 					on:click={() => (error = null)}
 					class="text-destructive hover:text-destructive/80 focus:outline-none"
-				     aria-label="Clear error message"
+					aria-label="Clear error message"
 				>
 					<svg
 						class="h-5 w-5"
@@ -403,7 +403,9 @@
 					</h2>
 					<div class="flex flex-col sm:flex-row justify-between items-start sm:items-end">
 						<div class="mb-4 sm:mb-0">
-							<p class="text-4xl font-bold text-card-foreground">{formatCurrency(margins.equity.net)}</p>
+							<p class="text-4xl font-bold text-card-foreground">
+								{formatCurrency(margins.equity.net)}
+							</p>
 							<p class="text-sm text-muted-foreground">Margin Available</p>
 						</div>
 						<div class="text-left sm:text-right space-y-1">
@@ -690,19 +692,27 @@
 						</div>
 						<div class="bg-muted/50 p-4 rounded-lg shadow-sm">
 							<p class="text-sm text-muted-foreground">Current Value</p>
-							<p class="text-lg font-semibold text-foreground">{formatCurrency(totalCurrentValue)}</p>
+							<p class="text-lg font-semibold text-foreground">
+								{formatCurrency(totalCurrentValue)}
+							</p>
 						</div>
 						<div class="bg-muted/50 p-4 rounded-lg shadow-sm">
 							<p class="text-sm text-muted-foreground">Day's P&L</p>
 							<p
-								class="text-lg font-semibold {totalDayPnL >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}"
+								class="text-lg font-semibold {totalDayPnL >= 0
+									? 'text-green-600 dark:text-green-400'
+									: 'text-red-600 dark:text-red-400'}"
 							>
 								{formatCurrency(totalDayPnL)} ({formatPercentage(totalDayPnLPercentage)})
 							</p>
 						</div>
 						<div class="bg-muted/50 p-4 rounded-lg shadow-sm">
 							<p class="text-sm text-muted-foreground">Total P&L</p>
-							<p class="text-lg font-semibold {totalPnL >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}">
+							<p
+								class="text-lg font-semibold {totalPnL >= 0
+									? 'text-green-600 dark:text-green-400'
+									: 'text-red-600 dark:text-red-400'}"
+							>
 								{formatCurrency(totalPnL)} ({formatPercentage(totalPnLPercentage)})
 							</p>
 						</div>
@@ -786,7 +796,8 @@
 										<td
 											class="px-4 py-3 whitespace-nowrap text-sm text-right {holding.pnl >= 0
 												? 'text-green-600 dark:text-green-400'
-												: 'text-red-600 dark:text-red-400'} font-medium">{formatCurrency(holding.pnl)}</td
+												: 'text-red-600 dark:text-red-400'} font-medium"
+											>{formatCurrency(holding.pnl)}</td
 										>
 										<td
 											class="px-4 py-3 whitespace-nowrap text-sm text-right {holding.pnl >= 0
@@ -822,12 +833,14 @@
 									<td
 										class="px-4 py-3 whitespace-nowrap text-sm text-right {totalPnL >= 0
 											? 'text-green-600 dark:text-green-400'
-											: 'text-red-600 dark:text-red-400'}">{formatPercentage(totalPnLPercentage)}</td
+											: 'text-red-600 dark:text-red-400'}"
+										>{formatPercentage(totalPnLPercentage)}</td
 									>
 									<td
 										class="px-4 py-3 whitespace-nowrap text-sm text-right {totalDayPnL >= 0
 											? 'text-green-600 dark:text-green-400'
-											: 'text-red-600 dark:text-red-400'}">{formatPercentage(totalDayPnLPercentage)}</td
+											: 'text-red-600 dark:text-red-400'}"
+										>{formatPercentage(totalDayPnLPercentage)}</td
 									>
 								</tr>
 							</tbody>

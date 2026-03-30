@@ -18,7 +18,7 @@
 	// Check if user is logged in by checking for session cookie/header session
 	async function checkLoginStatus() {
 		try {
-			const response = await apiFetch(`/broker/profile_kite`);
+			const response = await apiFetch(`/api/profile_kite`);
 
 			if (response.ok) {
 				const profile = await response.json();
@@ -38,7 +38,7 @@
 	async function login() {
 		isLoading = true;
 		try {
-			const response = await apiFetch(`/broker/login_kite`, {
+			const response = await apiFetch(`/api/login_kite`, {
 				method: 'POST'
 			});
 
@@ -65,7 +65,7 @@
 	async function logout() {
 		isLoading = true;
 		try {
-			const response = await apiFetch(`/broker/logout_kite`, {
+			const response = await apiFetch(`/api/logout_kite`, {
 				method: 'POST'
 			});
 
