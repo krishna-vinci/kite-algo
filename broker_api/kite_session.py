@@ -22,6 +22,7 @@ class KiteSession(Base):
 
     session_id = Column(String(36), primary_key=True, index=True)
     access_token = Column(String, nullable=False)
+    broker_user_id = Column(String(64), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
@@ -75,14 +76,42 @@ def get_system_access_token(db: Session) -> Optional[str]:
     return session.access_token if session else None
 
 
-def upsert_kite_session(db: Session, session_id: str, access_token: str) -> KiteSession:
+def make_account_id(broker_user_id: Optional[str]) -> Optional[str]:
+    if not broker_user_id:
+        return None
+    value = str(broker_user_id).strip()
+    if not value:
+        return None
+    return f"kite:{value}"
+
+
+def get_session_account_id(db: Session, session_id: str) -> Optional[str]:
+    session = db.query(KiteSession).filter_by(session_id=session_id).first()
+    if not session:
+        return None
+    return make_account_id(getattr(session, "broker_user_id", None))
+
+
+def upsert_kite_session(
+    db: Session,
+    session_id: str,
+    access_token: str,
+    broker_user_id: Optional[str] = None,
+) -> KiteSession:
     session = db.query(KiteSession).filter_by(session_id=session_id).first()
     now_dt = datetime.utcnow()
     if session:
         session.access_token = access_token
+        if broker_user_id:
+            session.broker_user_id = broker_user_id
         session.created_at = now_dt
         return session
 
-    session = KiteSession(session_id=session_id, access_token=access_token, created_at=now_dt)
+    session = KiteSession(
+        session_id=session_id,
+        access_token=access_token,
+        broker_user_id=broker_user_id,
+        created_at=now_dt,
+    )
     db.add(session)
     return session

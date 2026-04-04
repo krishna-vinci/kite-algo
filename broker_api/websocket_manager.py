@@ -2,6 +2,7 @@ import logging
 import asyncio
 import json
 import os
+import time
 from typing import Dict, List, Any, Optional, Tuple, Set
 from kiteconnect import KiteTicker
 from fastapi import WebSocket
@@ -12,6 +13,7 @@ from broker_api.redis_events import get_redis, publish_event
 import uuid
 from database import SessionLocal
 from sqlalchemy import text
+from broker_api.order_runtime import order_event_runtime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -102,6 +104,8 @@ class WebSocketManager:
 
         # Feature flag to allow toggling from API
         self.order_updates_enabled: bool = True
+        self._desired_tokens_union: Set[int] = set()
+        self._last_converge_ts: float = 0.0
 
     def get_websocket_status(self) -> str:
         """Returns current KiteTicker/WebSocketManager connection status."""
@@ -176,6 +180,10 @@ class WebSocketManager:
                 self.kws.on_message = self.on_message
             except Exception:
                 pass
+            try:
+                self.kws.on_order_update = self.on_order_update
+            except Exception:
+                pass
 
             # Connect again
             self.websocket_status = "CONNECTING"
@@ -207,8 +215,9 @@ class WebSocketManager:
             prev_ref = self.token_refcount.get(token, 0)
             new_ref = max(prev_ref - 1, 0)
             if new_ref == 0:
-                # Unsubscribe from Kite if connected
-                if self.kws.is_connected():
+                external_needed = token in self._desired_tokens_union
+                # Unsubscribe from Kite if connected and no external subscriber needs it.
+                if self.kws.is_connected() and not external_needed:
                     try:
                         self.kws.unsubscribe([token])
                         logger.info("KiteTicker.unsubscribe: %s", [token])
@@ -216,7 +225,10 @@ class WebSocketManager:
                         logger.error("Error in Kite unsubscribe on disconnect: %s", e)
                 # Cleanup maps
                 self.token_refcount.pop(token, None)
-                self.token_mode_agg.pop(token, None)
+                if external_needed:
+                    self.token_mode_agg[token] = self.kws.MODE_FULL
+                else:
+                    self.token_mode_agg.pop(token, None)
             else:
                 self.token_refcount[token] = new_ref
                 # Recompute aggregate mode for remaining clients
@@ -263,7 +275,7 @@ class WebSocketManager:
             if prev_client_mode is None:
                 client.subscriptions[token] = mode
                 self.token_refcount[token] = prev_ref + 1
-                if prev_ref == 0:
+                if prev_ref == 0 and token not in self._desired_tokens_union:
                     new_sub_tokens.append(token)
             else:
                 # Upgrade client's desired mode if higher requested
@@ -331,8 +343,13 @@ class WebSocketManager:
 
             if new_ref == 0:
                 self.token_refcount.pop(token, None)
-                self.token_mode_agg.pop(token, None)
-                if self.kws.is_connected():
+                if token in self._desired_tokens_union:
+                    self.token_mode_agg[token] = self.kws.MODE_FULL
+                    if prev_agg and self.kws.MODE_FULL != prev_agg:
+                        mode_lower_tokens.append((token, prev_agg, self.kws.MODE_FULL))
+                else:
+                    self.token_mode_agg.pop(token, None)
+                if self.kws.is_connected() and token not in self._desired_tokens_union:
                     unsub_tokens_for_kite.append(token)
             else:
                 self.token_refcount[token] = new_ref
@@ -467,7 +484,14 @@ class WebSocketManager:
                 logger.error("Error scheduling Redis overlay write: %s", e, exc_info=True)
 
             # Update database with new tick data
-            update_ticker_data_in_db(ticks)
+            def schedule_overlay_db_update(ticks_snapshot):
+                task = asyncio.create_task(update_ticker_data_in_db(ticks_snapshot))
+                task.add_done_callback(self._log_background_task_error)
+
+            self.main_event_loop.call_soon_threadsafe(
+                schedule_overlay_db_update,
+                list(ticks),
+            )
 
             # Pass ticks to OptionsSessionManager if it exists
             if hasattr(self, 'options_session_manager'):
@@ -476,7 +500,8 @@ class WebSocketManager:
             # Update real-time positions with new LTP
             if hasattr(self, 'realtime_positions_service'):
                 def update_positions():
-                    asyncio.create_task(self._update_realtime_positions(ticks))
+                    task = asyncio.create_task(self._update_realtime_positions(list(ticks)))
+                    task.add_done_callback(self._log_background_task_error)
                 self.main_event_loop.call_soon_threadsafe(update_positions)
 
             # Merge into pending and let flush loop deliver
@@ -495,21 +520,7 @@ class WebSocketManager:
         try:
             if not hasattr(self, 'realtime_positions_service'):
                 return
-            
-            # We need to update positions for all active sessions
-            # For now, we'll iterate through position subscribers
-            for session_id in list(self.realtime_positions_service.position_subscribers.keys()):
-                for tick in ticks:
-                    token = tick.get("instrument_token")
-                    last_price = tick.get("last_price")
-                    
-                    if token and last_price:
-                        await self.realtime_positions_service.update_position_ltp(
-                            session_id=session_id,
-                            instrument_token=token,
-                            last_price=last_price,
-                            corr_id="websocket_tick"
-                        )
+            await self.realtime_positions_service.process_ticks(ticks, corr_id="websocket_tick")
         except Exception as e:
             logger.error(f"Error updating realtime positions: {e}", exc_info=True)
 
@@ -539,7 +550,7 @@ class WebSocketManager:
                 alert_event = {
                     "type": "alert",
                     "raw": data,
-                    "received_at": asyncio.get_event_loop().time(),
+                    "received_at": time.monotonic(),
                 }
                 # Enqueue to main loop to avoid cross-thread issues
                 def put_event():
@@ -564,12 +575,13 @@ class WebSocketManager:
                 try:
                     # v could be epoch seconds or datetime
                     if isinstance(v, (int, float)):
-                        return datetime.utcfromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S")
+                        return datetime.fromtimestamp(v, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                     if isinstance(v, datetime):
-                        return v.strftime("%Y-%m-%d %H:%M:%S")
+                        dt = v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+                        return dt.strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
                     pass
-                return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
             payload_dict = {
                 "user_id": data.get("user_id") or data.get("placed_by") or "unknown",
@@ -583,7 +595,7 @@ class WebSocketManager:
                 "status": data.get("status") or "UPDATE",
                 "status_message": data.get("status_message"),
                 "status_message_raw": data.get("status_message_raw"),
-                "order_timestamp": fmt_ts(data.get("order_timestamp") or data.get("exchange_timestamp") or datetime.utcnow()),
+                "order_timestamp": fmt_ts(data.get("order_timestamp") or data.get("exchange_timestamp") or datetime.now(timezone.utc)),
                 "exchange_update_timestamp": (fmt_ts(data.get("exchange_update_timestamp")) if data.get("exchange_update_timestamp") else None),
                 "exchange_timestamp": (fmt_ts(data.get("exchange_timestamp")) if data.get("exchange_timestamp") else None),
                 "variety": data.get("variety") or "regular",
@@ -613,55 +625,19 @@ class WebSocketManager:
 
             # Persist on main loop to avoid thread-crossing issues
             async def persist():
-                db = SessionLocal()
                 try:
-                    # Prepare values
-                    event_id = str(uuid.uuid4())
-                    # Parse timestamp string to datetime if possible
-                    evt_ts_str = payload_dict.get("order_timestamp")
-                    try:
-                        evt_ts = datetime.strptime(evt_ts_str, "%Y-%m-%d %H:%M:%S") if isinstance(evt_ts_str, str) else datetime.utcnow()
-                    except Exception:
-                        evt_ts = datetime.utcnow()
-
-                    insert_sql = text("""
-                        INSERT INTO ws_order_events (
-                            id, order_id, user_id, status, event_timestamp, received_at,
-                            exchange, tradingsymbol, instrument_token, transaction_type,
-                            quantity, filled_quantity, average_price, payload_json
-                        )
-                        VALUES (
-                            :id, :order_id, :user_id, :status, :event_ts, NOW(),
-                            :exchange, :tradingsymbol, :instrument_token, :transaction_type,
-                            :quantity, :filled_quantity, :average_price, CAST(:payload_json AS JSONB)
-                        )
-                        RETURNING id
-                    """)
-
-                    db.execute(insert_sql, {
-                        "id": event_id,
-                        "order_id": payload_dict.get("order_id"),
-                        "user_id": payload_dict.get("user_id"),
-                        "status": payload_dict.get("status"),
-                        "event_ts": evt_ts,
-                        "exchange": payload_dict.get("exchange"),
-                        "tradingsymbol": payload_dict.get("tradingsymbol"),
-                        "instrument_token": payload_dict.get("instrument_token"),
-                        "transaction_type": payload_dict.get("transaction_type"),
-                        "quantity": payload_dict.get("quantity"),
-                        "filled_quantity": payload_dict.get("filled_quantity"),
-                        "average_price": payload_dict.get("average_price"),
-                        "payload_json": json.dumps(payload_dict)
-                    })
-                    db.commit()
+                    ingest_result = await order_event_runtime.ingest_ws_event(payload_dict, corr_id="ws_order_update")
+                    if ingest_result.get("duplicate"):
+                        return
+                    evt_ts = payload_dict.get("exchange_update_timestamp") or payload_dict.get("order_timestamp") or datetime.now(timezone.utc).isoformat()
                     try:
                         await publish_event("orders.events", {
                             "source": "ws",
-                            "id": event_id,
+                            "id": ingest_result.get("canonical_event_id"),
                             "order_id": payload_dict.get("order_id"),
                             "user_id": payload_dict.get("user_id"),
                             "status": payload_dict.get("status"),
-                            "event_timestamp": evt_ts.isoformat(),
+                            "event_timestamp": evt_ts,
                             "exchange": payload_dict.get("exchange"),
                             "tradingsymbol": payload_dict.get("tradingsymbol"),
                             "instrument_token": payload_dict.get("instrument_token"),
@@ -675,15 +651,10 @@ class WebSocketManager:
                         logger.error("Failed to publish WS order event: %s", pe, exc_info=True)
                 except Exception as pe:
                     logger.error("Failed to persist WS order_update: %s", pe, exc_info=True)
-                finally:
-                    try:
-                        db.close()
-                    except Exception:
-                        pass
 
             try:
                 # Update last seen timestamp immediately
-                self.last_order_update_at = datetime.utcnow()
+                self.last_order_update_at = datetime.now(timezone.utc)
                 self.main_event_loop.call_soon_threadsafe(lambda: asyncio.create_task(persist()))
             except Exception as se:
                 logger.error("Failed to schedule WS order_update persist: %s", se, exc_info=True)
@@ -698,7 +669,7 @@ class WebSocketManager:
         # Resubscribe and reapply modes based on aggregate state
         def do_resubscribe():
             try:
-                tokens = [t for t, rc in self.token_refcount.items() if rc > 0]
+                tokens = sorted(set([t for t, rc in self.token_refcount.items() if rc > 0]) | set(self._desired_tokens_union))
                 if tokens:
                     self.kws.subscribe(tokens)
                     logger.info("KiteTicker.resubscribe: %s", tokens)
@@ -753,6 +724,8 @@ class WebSocketManager:
     # ---------------------------
     def _compute_aggregate_mode(self, token: int) -> str:
         """Compute highest requested mode across all clients for a token."""
+        if token in self._desired_tokens_union:
+            return self.kws.MODE_FULL
         agg_mode: Optional[str] = None
         for client in self.clients.values():
             m = client.subscriptions.get(token)
@@ -887,41 +860,64 @@ class WebSocketManager:
             await websocket.send_text(json.dumps(payload, default=str))
         except Exception as e:
             logger.debug("Send failed to client (ignored): %s", e)
+
+    @staticmethod
+    def _log_background_task_error(task: asyncio.Task) -> None:
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error("Background WebSocket task failed: %s", exc, exc_info=True)
+        except asyncio.CancelledError:
+            pass
     # ---------------------------
     # External subscription management for Options Sessions
     # ---------------------------
-    _desired_tokens_union: Set[int] = set()
-    _last_converge_ts: float = 0
-
     async def set_desired_tokens_union(self, desired: set[int]):
         """
         Accepts a desired set of tokens from an external manager (e.g., OptionsSessionManager),
         computes the diff, and converges the subscriptions. Rate-limited to avoid churn.
         """
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         if now - self._last_converge_ts < 5.0:  # Rate limit to once every 5s
             return
 
         self._last_converge_ts = now
         
-        current_subscriptions = set(self.token_mode_agg.keys())
-        to_subscribe = desired - current_subscriptions
-        to_unsubscribe = current_subscriptions - desired
+        current_external = set(self._desired_tokens_union)
+        to_subscribe = desired - current_external
+        to_unsubscribe = current_external - desired
 
         if to_subscribe:
             # For simplicity, subscribe with default 'full' mode to get OI data.
             # The options session manager is LTP-driven, so this is sufficient.
             # A more advanced implementation could accept modes from the manager.
-            self.kws.subscribe(list(to_subscribe))
-            self.kws.set_mode(self.kws.MODE_FULL, list(to_subscribe))
+            actual_subscribe = [token for token in to_subscribe if self.token_refcount.get(token, 0) == 0 and token not in self.token_mode_agg]
+            if actual_subscribe and self.kws.is_connected():
+                self.kws.subscribe(list(actual_subscribe))
+                self.kws.set_mode(self.kws.MODE_FULL, list(actual_subscribe))
+            mode_raise = [token for token in to_subscribe if token not in actual_subscribe]
+            if mode_raise and self.kws.is_connected():
+                self.kws.set_mode(self.kws.MODE_FULL, list(mode_raise))
             for token in to_subscribe:
                 self.token_mode_agg[token] = self.kws.MODE_FULL
             logger.info(f"[OptionsSession] Converge: Subscribed to {len(to_subscribe)} new tokens.")
 
         if to_unsubscribe:
-            self.kws.unsubscribe(list(to_unsubscribe))
+            actual_unsubscribe = [token for token in to_unsubscribe if self.token_refcount.get(token, 0) == 0]
+            if actual_unsubscribe and self.kws.is_connected():
+                self.kws.unsubscribe(list(actual_unsubscribe))
+            mode_lower: Dict[str, List[int]] = {}
             for token in to_unsubscribe:
-                self.token_mode_agg.pop(token, None)
+                if self.token_refcount.get(token, 0) > 0:
+                    new_mode = self._compute_aggregate_mode(token)
+                    self.token_mode_agg[token] = new_mode
+                    mode_lower.setdefault(new_mode, []).append(token)
+                else:
+                    self.token_mode_agg.pop(token, None)
+            for new_mode, tokens in mode_lower.items():
+                if not self.kws.is_connected():
+                    continue
+                self.kws.set_mode(new_mode, tokens)
             logger.info(f"[OptionsSession] Converge: Unsubscribed from {len(to_unsubscribe)} tokens.")
         
         self._desired_tokens_union = desired
@@ -957,11 +953,17 @@ async def write_ticks_to_redis_overlay(ticks: List[Dict[str, Any]]):
                     continue
 
                 key = f"marketwatch:overlay:{today_iso}:{token}"
+                exchange_timestamp = tick.get("exchange_timestamp") or datetime.now(timezone.utc)
+                if isinstance(exchange_timestamp, str):
+                    try:
+                        exchange_timestamp = datetime.fromisoformat(exchange_timestamp.replace("Z", "+00:00"))
+                    except Exception:
+                        exchange_timestamp = datetime.now(timezone.utc)
                 
                 payload = {
                     "instrument_token": token,
                     "last_price": float(last_price),
-                    "tick_timestamp": int(tick.get("exchange_timestamp", datetime.now(timezone.utc)).timestamp() * 1000),
+                    "tick_timestamp": int(exchange_timestamp.timestamp() * 1000),
                     "source": "ws",
                 }
                 if "change" in tick:

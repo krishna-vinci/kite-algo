@@ -92,6 +92,12 @@ CREATE TABLE IF NOT EXISTS public.kite_sessions (
   created_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+ALTER TABLE public.kite_sessions
+  ADD COLUMN IF NOT EXISTS broker_user_id VARCHAR(64);
+
+CREATE INDEX IF NOT EXISTS idx_kite_sessions_broker_user_id
+  ON public.kite_sessions (broker_user_id);
+
 CREATE TABLE IF NOT EXISTS public.fyers_sessions (
   session_id         VARCHAR(36) PRIMARY KEY,
   access_token       TEXT NOT NULL,
@@ -379,9 +385,11 @@ CREATE TABLE IF NOT EXISTS public.order_events (
   created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE public.order_events
+  ADD COLUMN IF NOT EXISTS event_fingerprint TEXT;
+
 -- Unique constraint for idempotency
-CREATE UNIQUE INDEX IF NOT EXISTS ux_order_events_unique
-  ON public.order_events (order_id, event_timestamp, status);
+DROP INDEX IF EXISTS ux_order_events_unique;
 
 -- Indexes for efficient querying
 CREATE INDEX IF NOT EXISTS idx_order_events_order_id
@@ -398,6 +406,10 @@ CREATE INDEX IF NOT EXISTS idx_order_events_timestamp
 
 CREATE INDEX IF NOT EXISTS idx_order_events_received
   ON public.order_events (received_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_order_events_event_fingerprint
+  ON public.order_events (event_fingerprint)
+  WHERE event_fingerprint IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS public.ws_order_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -417,6 +429,9 @@ CREATE TABLE IF NOT EXISTS public.ws_order_events (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE public.ws_order_events
+  ADD COLUMN IF NOT EXISTS event_fingerprint TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_ws_order_events_order_id
   ON public.ws_order_events (order_id);
 
@@ -431,6 +446,136 @@ CREATE INDEX IF NOT EXISTS idx_ws_order_events_timestamp
 
 CREATE INDEX IF NOT EXISTS idx_ws_order_events_received
   ON public.ws_order_events (received_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ws_order_events_event_fingerprint
+  ON public.ws_order_events (event_fingerprint)
+  WHERE event_fingerprint IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.canonical_order_events (
+  id BIGSERIAL PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  source_event_key TEXT NOT NULL,
+  raw_event_table TEXT,
+  raw_event_id TEXT,
+  order_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  event_timestamp TIMESTAMPTZ NOT NULL,
+  exchange_update_timestamp TIMESTAMPTZ,
+  exchange TEXT,
+  tradingsymbol TEXT,
+  instrument_token BIGINT,
+  product TEXT,
+  transaction_type TEXT,
+  quantity INT,
+  filled_quantity INT NOT NULL DEFAULT 0,
+  average_price NUMERIC(18,6),
+  payload_json JSONB NOT NULL,
+  processing_state TEXT NOT NULL DEFAULT 'pending',
+  process_attempts INT NOT NULL DEFAULT 0,
+  processing_started_at TIMESTAMPTZ,
+  last_error TEXT,
+  processed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT canonical_order_events_processing_state_chk
+    CHECK (processing_state IN ('pending','processing','processed','failed'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_canonical_order_events_source_key
+  ON public.canonical_order_events (source, source_event_key);
+
+CREATE INDEX IF NOT EXISTS idx_canonical_order_events_processing
+  ON public.canonical_order_events (processing_state, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_canonical_order_events_account_order
+  ON public.canonical_order_events (account_id, order_id, event_timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS public.order_state_projection (
+  account_id TEXT NOT NULL,
+  order_id TEXT NOT NULL,
+  latest_canonical_event_id BIGINT,
+  latest_status TEXT NOT NULL,
+  latest_event_timestamp TIMESTAMPTZ NOT NULL,
+  last_seen_filled_quantity INT NOT NULL DEFAULT 0,
+  dirty_for_trade_sync BOOLEAN NOT NULL DEFAULT FALSE,
+  needs_reconcile BOOLEAN NOT NULL DEFAULT FALSE,
+  terminal BOOLEAN NOT NULL DEFAULT FALSE,
+  exchange TEXT,
+  tradingsymbol TEXT,
+  instrument_token BIGINT,
+  product TEXT,
+  transaction_type TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (account_id, order_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_state_projection_dirty
+  ON public.order_state_projection (dirty_for_trade_sync, needs_reconcile, updated_at);
+
+CREATE TABLE IF NOT EXISTS public.order_trade_fills (
+  account_id TEXT NOT NULL,
+  trade_id TEXT NOT NULL,
+  order_id TEXT NOT NULL,
+  instrument_token BIGINT NOT NULL,
+  exchange TEXT,
+  tradingsymbol TEXT,
+  product TEXT NOT NULL,
+  transaction_type TEXT NOT NULL,
+  quantity INT NOT NULL,
+  price NUMERIC(18,6) NOT NULL,
+  fill_timestamp TIMESTAMPTZ NOT NULL,
+  applied_to_position BOOLEAN NOT NULL DEFAULT FALSE,
+  applied_at TIMESTAMPTZ,
+  payload_json JSONB,
+  PRIMARY KEY (account_id, trade_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_trade_fills_order
+  ON public.order_trade_fills (account_id, order_id);
+
+CREATE INDEX IF NOT EXISTS idx_order_trade_fills_fill_timestamp
+  ON public.order_trade_fills (account_id, fill_timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS public.account_positions (
+  account_id TEXT NOT NULL,
+  instrument_token BIGINT NOT NULL,
+  product TEXT NOT NULL,
+  exchange TEXT NOT NULL,
+  tradingsymbol TEXT NOT NULL,
+  net_quantity INT NOT NULL DEFAULT 0,
+  buy_quantity INT NOT NULL DEFAULT 0,
+  sell_quantity INT NOT NULL DEFAULT 0,
+  buy_value NUMERIC(18,6) NOT NULL DEFAULT 0,
+  sell_value NUMERIC(18,6) NOT NULL DEFAULT 0,
+  average_price NUMERIC(18,6),
+  realized_pnl NUMERIC(18,6) NOT NULL DEFAULT 0,
+  last_price NUMERIC(18,6),
+  close_price NUMERIC(18,6),
+  last_trade_price NUMERIC(18,6),
+  last_trade_at TIMESTAMPTZ,
+  last_reconciled_at TIMESTAMPTZ,
+  reconcile_version BIGINT NOT NULL DEFAULT 0,
+  last_updated_source TEXT NOT NULL DEFAULT 'reconcile',
+  version BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (account_id, instrument_token, product)
+);
+
+ALTER TABLE public.account_positions
+  ADD COLUMN IF NOT EXISTS reconcile_version BIGINT NOT NULL DEFAULT 0;
+
+ALTER TABLE public.account_positions
+  ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC(18,6) NOT NULL DEFAULT 0;
+
+ALTER TABLE public.account_positions
+  ADD COLUMN IF NOT EXISTS last_updated_source TEXT NOT NULL DEFAULT 'reconcile';
+
+CREATE INDEX IF NOT EXISTS idx_account_positions_account_token
+  ON public.account_positions (account_id, instrument_token);
+
+CREATE INDEX IF NOT EXISTS idx_account_positions_open_only
+  ON public.account_positions (account_id, instrument_token)
+  WHERE net_quantity <> 0;
 
 -- =========================================
 -- Index Stoploss Strategy Tables

@@ -206,7 +206,9 @@ def run_headless_login_and_persist_system_token(db: Session) -> str:
     Returns the redacted fingerprint (last 6 chars) of the access_token.
     """
     kite, at = login_headless()
-    upsert_kite_session(db, "system", at)
+    profile = kite.profile()
+    broker_user_id = str(profile.get("user_id") or "").strip() or None
+    upsert_kite_session(db, "system", at, broker_user_id=broker_user_id)
     fp = at[-6:] if isinstance(at, str) else ""
     logger.info("System access_token refreshed and upserted (..%s)", fp)
     return fp
@@ -851,12 +853,15 @@ def headless_login(request: Request, response: Response, db: Session = Depends(g
     except Exception as e:
         raise HTTPException(500, f"An unexpected error occurred: {e}")
 
+    profile = kite.profile()
+    broker_user_id = str(profile.get("user_id") or "").strip() or None
+
     sid = str(uuid.uuid4())
-    upsert_kite_session(db, sid, at)
+    upsert_kite_session(db, sid, at, broker_user_id=broker_user_id)
     db.commit()
 
     # Also persist/refresh system token so app startup and jobs use a consistent source
-    upsert_kite_session(db, "system", at)
+    upsert_kite_session(db, "system", at, broker_user_id=broker_user_id)
     db.commit()
     logger.info("System access token upserted via login (..%s)", (at[-6:] if isinstance(at, str) else ""))
 
@@ -878,7 +883,7 @@ def headless_login(request: Request, response: Response, db: Session = Depends(g
     )
 
     # Also return session_id so the frontend can send it in the X-Session-ID header (dev-friendly)
-    return {"session_id": sid, "profile": kite.profile(), "authenticated": True}
+    return {"session_id": sid, "profile": profile, "authenticated": True}
 
 
 # ─────────── Logout endpoint ───────────

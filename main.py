@@ -63,6 +63,7 @@ from broker_api.alerts_router import router as alerts_router
 from broker_api.performance_router import router as performance_router
 from broker_api.options_router import router as options_router
 from broker_api.candles_api import router as candles_api_router
+from broker_api.kite_mutual_funds import router as kite_mutual_funds_router
 
 
 
@@ -89,9 +90,10 @@ import server
 from broker_api.kite_auth import login_headless
 import logging
 from database import SessionLocal, database as async_db
-from broker_api.kite_session import KiteSession, build_kite_client, get_system_access_token, upsert_kite_session
+from broker_api.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, upsert_kite_session
 from broker_api.broker_api import run_headless_login_and_persist_system_token
 from broker_api.kite_auth import API_KEY
+from broker_api.order_runtime import order_event_runtime, realtime_positions_service, refresh_processing_stuck_rows
 from broker_api.websocket_manager import WebSocketManager
 from alerts.engine import AlertsEngine
 from database import get_user_settings, update_user_settings
@@ -196,6 +198,7 @@ async def combined_lifespan(app: FastAPI):
     # Perform headless login at startup and store the KiteConnect instance
     token_watcher_task = None
     scheduler_task = None
+    order_runtime_task = None
     set_component_status("app", "starting", detail="Application startup in progress")
     try:
         # Ensure the schema is applied before any other database operations
@@ -213,7 +216,11 @@ async def combined_lifespan(app: FastAPI):
                 at = system_at
                 try:
                     # Lightweight validation
-                    await asyncio.to_thread(kite.profile)
+                    profile = await asyncio.to_thread(kite.profile)
+                    broker_user_id = str((profile or {}).get("user_id") or "").strip() or None
+                    if broker_user_id:
+                        upsert_kite_session(db, "system", at, broker_user_id=broker_user_id)
+                        db.commit()
                     logging.info("Using system access_token from DB (..%s)", at[-6:] if isinstance(at, str) else "")
                     set_meta("daily_broker_login", {
                         "mode": "startup_existing_token",
@@ -225,7 +232,9 @@ async def combined_lifespan(app: FastAPI):
                     logging.warning("System token validation failed (..%s); performing headless login: %s", (at[-6:] if isinstance(at, str) else ""), e)
                     _kite, at = login_headless()
                     kite = build_kite_client(at, session_id="system")
-                    upsert_kite_session(db, "system", at)
+                    profile = await asyncio.to_thread(kite.profile)
+                    broker_user_id = str((profile or {}).get("user_id") or "").strip() or None
+                    upsert_kite_session(db, "system", at, broker_user_id=broker_user_id)
                     db.commit()
                     logging.info("Refreshed system access_token via headless login (..%s)", at[-6:] if isinstance(at, str) else "")
                     set_meta("daily_broker_login", {
@@ -238,7 +247,9 @@ async def combined_lifespan(app: FastAPI):
                 # No system token; perform headless login and persist
                 _kite, at = login_headless()
                 kite = build_kite_client(at, session_id="system")
-                upsert_kite_session(db, "system", at)
+                profile = await asyncio.to_thread(kite.profile)
+                broker_user_id = str((profile or {}).get("user_id") or "").strip() or None
+                upsert_kite_session(db, "system", at, broker_user_id=broker_user_id)
                 db.commit()
                 logging.info("Obtained system access_token via headless login (..%s)", at[-6:] if isinstance(at, str) else "")
                 set_meta("daily_broker_login", {
@@ -274,7 +285,6 @@ async def combined_lifespan(app: FastAPI):
         ws_manager = WebSocketManager(api_key=API_KEY, access_token=at, main_event_loop=main_event_loop)
         
         # Inject real-time positions service into WebSocket manager
-        from broker_api.kite_orders import realtime_positions_service
         ws_manager.realtime_positions_service = realtime_positions_service
         logging.info("Real-time positions service injected into WebSocketManager")
         
@@ -283,6 +293,58 @@ async def combined_lifespan(app: FastAPI):
         set_component_status("websocket_manager", "healthy", detail="WebSocket manager started")
         # Expose ws_manager for routers to access latest ticks
         app.state.ws_manager = ws_manager
+
+        async def _order_runtime_worker():
+            poll_seconds = max(1.0, float(os.getenv("ORDER_RUNTIME_POLL_SECONDS", "1.0")))
+            reconcile_seconds = max(15.0, float(os.getenv("POSITIONS_RECONCILE_SECONDS", "30")))
+            last_reconcile_monotonic = 0.0
+            cached_token = at
+            kite_client = build_kite_client(cached_token, session_id="system")
+            set_component_status("order_runtime_worker", "healthy", detail="Order runtime worker started")
+            await refresh_processing_stuck_rows()
+            while True:
+                try:
+                    await asyncio.sleep(poll_seconds)
+                    db = SessionLocal()
+                    try:
+                        current_token = get_system_access_token(db) or cached_token
+                        system_session = db.query(KiteSession).filter_by(session_id="system").first()
+                        broker_user_id = getattr(system_session, "broker_user_id", None)
+                    finally:
+                        db.close()
+
+                    if current_token != cached_token:
+                        kite_client = build_kite_client(current_token, session_id="system")
+                        cached_token = current_token
+
+                    processed = await order_event_runtime.process_pending_events(batch_size=100)
+                    synced = await order_event_runtime.sync_dirty_orders(kite_client, realtime_positions_service, batch_size=25)
+
+                    now_monotonic = asyncio.get_running_loop().time()
+                    account_id = make_account_id(broker_user_id)
+                    if account_id and (now_monotonic - last_reconcile_monotonic) >= reconcile_seconds:
+                        await realtime_positions_service.reconcile_account_positions(kite_client, account_id, corr_id="periodic_reconcile")
+                        last_reconcile_monotonic = now_monotonic
+
+                    heartbeat(
+                        "order_runtime_worker",
+                        detail="Processed canonical order events and synced dirty orders",
+                        meta={
+                            "processed_events": processed,
+                            "synced_orders": synced,
+                            "poll_seconds": poll_seconds,
+                            "reconcile_seconds": reconcile_seconds,
+                            "account_id": account_id,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    set_component_status("order_runtime_worker", "stopped", detail="Order runtime worker cancelled")
+                    break
+                except Exception as exc:
+                    logging.error("Order runtime worker error: %s", exc, exc_info=True)
+                    set_component_status("order_runtime_worker", "degraded", detail=str(exc))
+
+        order_runtime_task = asyncio.create_task(_order_runtime_worker())
 
         # Start background token watcher to rotate WS token when DB 'system' token changes
         async def _system_token_watcher():
@@ -368,12 +430,11 @@ async def combined_lifespan(app: FastAPI):
         try:
             from strategies.strike_selector import StrikeSelector, PositionBuilder
             from broker_api.instruments_repository import InstrumentsRepository
-            from database import get_db
             
             # Get OptionsSessionManager from app state
             osm = getattr(app.state, "options_session_manager", None)
             if osm:
-                db_session = next(get_db())
+                db_session = SessionLocal()
                 instruments_repo = InstrumentsRepository(db=db_session)
                 
                 strike_selector = StrikeSelector(osm, instruments_repo)
@@ -381,6 +442,7 @@ async def combined_lifespan(app: FastAPI):
                 
                 app.state.strike_selector = strike_selector
                 app.state.position_builder = position_builder
+                app.state.phase3_db_session = db_session
                 logging.info("Phase 3: StrikeSelector and PositionBuilder initialized")
             else:
                 logging.warning("OptionsSessionManager not available, Phase 3 components not initialized")
@@ -480,6 +542,16 @@ async def combined_lifespan(app: FastAPI):
                 pass
     except Exception:
         pass
+    # Cancel order runtime worker
+    try:
+        if 'order_runtime_task' in locals() and order_runtime_task:
+            order_runtime_task.cancel()
+            try:
+                await order_runtime_task
+            except Exception:
+                pass
+    except Exception:
+        pass
     # Stop AlertsEngine
     try:
         eng = getattr(app.state, "alerts_engine", None)
@@ -497,6 +569,14 @@ async def combined_lifespan(app: FastAPI):
             await protection_eng.stop()
             logging.info("PositionProtectionEngine stopped.")
             set_component_status("protection_engine", "stopped", detail="Position protection engine stopped")
+    except Exception:
+        pass
+
+    try:
+        phase3_db_session = getattr(app.state, "phase3_db_session", None)
+        if phase3_db_session:
+            phase3_db_session.close()
+            app.state.phase3_db_session = None
     except Exception:
         pass
 
@@ -541,6 +621,7 @@ app.include_router(ingestion_router, prefix="/api")
 app.include_router(user_settings_router, prefix="/api")
 app.include_router(marketwatch_router, prefix="/api")
 app.include_router(kite_orders_router, prefix="/api")
+app.include_router(kite_mutual_funds_router, prefix="/api")
 app.include_router(options_router, prefix="/api")
 app.include_router(candles_api_router, prefix="/api")  # Unified candles API with all historical endpoints
 app.include_router(performance_router, prefix="/api")

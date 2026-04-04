@@ -20,7 +20,8 @@ from sqlalchemy.orm import Session
 
 from .redis_events import get_redis, publish_event, pubsub_iter
 from .instruments_repository import InstrumentsRepository
-from .kite_session import KiteSession, get_kite, get_kite_session_id
+from .kite_session import KiteSession, get_kite, get_kite_session_id, get_session_account_id
+from .order_runtime import PositionPnL, order_event_runtime, realtime_positions_service
 from database import get_db
 
 # Module-level logger
@@ -584,10 +585,11 @@ class OrdersService:
         try:
             params = req.model_dump(exclude_none=True)
             variety = params.pop('variety')
+            variety_value = variety.value if isinstance(variety, Variety) else str(variety)
             order_id = await run_kite_write_action(
                 "place_order",
                 corr_id,
-                lambda: kite.place_order(variety=variety.value, **params),
+                lambda: kite.place_order(variety=variety_value, **params),
                 meta=log_ctx,
             )
             log_ctx["order_id"] = order_id
@@ -618,7 +620,7 @@ class OrdersService:
                 except Exception as redis_error:
                     logger.error("Failed to update idempotency state after exception", extra={**log_ctx, "error": str(redis_error)}, exc_info=True)
             logger.error("Failed to place order", extra={**log_ctx, "error": str(e)}, exc_info=True)
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
 
     def orders(self, kite: KiteConnect, corr_id: str) -> List[Order]:
         log_ctx = self._log_context(corr_id, kite)
@@ -1017,365 +1019,14 @@ async def place_basket_orders(
 # REAL-TIME POSITIONS TRACKING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class PositionPnL(BaseModel):
-    """Real-time position with calculated PnL"""
-    instrument_token: int
-    tradingsymbol: str
-    exchange: str
-    product: str
-    quantity: int
-    multiplier: int = 1
-    buy_quantity: int = 0
-    sell_quantity: int = 0
-    buy_value: float = 0.0
-    sell_value: float = 0.0
-    average_price: float = 0.0
-    last_price: float = 0.0
-    pnl: float = 0.0
-    realized_pnl: float = 0.0
-    unrealized_pnl: float = 0.0
-    day_change: float = 0.0
-    day_change_percentage: float = 0.0
-
-
-class RealTimePositionsService:
-    """
-    Service for real-time position tracking using:
-    - Buy/Sell values from orders/trades
-    - WebSocket LTP for real-time PnL calculation
-    - Formula: pnl = (sellValue - buyValue) + (netQuantity * lastPrice * multiplier)
-    """
-    
-    def __init__(self):
-        self.redis_key_prefix = "realtime_positions:"
-        self.position_subscribers: Dict[str, asyncio.Queue] = {}
-        self._running = False
-        self._update_task: Optional[asyncio.Task] = None
-        logger.info("RealTimePositionsService initialized")
-    
-    def _get_lot_size(self, instrument_token: int) -> int:
-        """Get lot size from database, fallback to 1"""
-        try:
-            db = next(get_db())
-            try:
-                repo = InstrumentsRepository(db)
-                lot_size = repo.get_lot_size(instrument_token)
-                return lot_size if lot_size is not None else 1
-            finally:
-                db.close()
-        except Exception as e:
-            logger.warning(f"Failed to fetch lot_size for {instrument_token}: {e}")
-            return 1
-    
-    async def initialize_positions(self, kite: KiteConnect, session_id: str, corr_id: str) -> Dict[str, PositionPnL]:
-        """
-        Initialize positions from Kite API and build tracking state.
-        This should be called once per session or when positions need refresh.
-        """
-        log_ctx = {"correlation_id": corr_id, "session_id": session_id}
-        logger.info("Initializing real-time positions", extra=log_ctx)
-        
-        try:
-            # Fetch current positions from Kite
-            positions_data = kite.positions()
-            
-            # Fetch today's trades to calculate buy/sell values accurately
-            trades = kite.trades()
-            
-            # Build position state
-            positions_map: Dict[str, PositionPnL] = {}
-            
-            # Process net positions (end of day positions)
-            for pos in positions_data.get('net', []):
-                key = f"{pos['exchange']}:{pos['tradingsymbol']}"
-                
-                # Get lot size/multiplier from database
-                multiplier = self._get_lot_size(pos['instrument_token'])
-                
-                # Calculate buy/sell values from position data
-                quantity = pos.get('quantity', 0)
-                buy_quantity = pos.get('buy_quantity', 0)
-                sell_quantity = pos.get('sell_quantity', 0)
-                buy_value = pos.get('buy_value', 0.0)
-                sell_value = pos.get('sell_value', 0.0)
-                average_price = pos.get('average_price', 0.0)
-                last_price = pos.get('last_price', 0.0)
-                
-                # Calculate PnL using Kite's formula
-                # pnl = (sellValue - buyValue) + (netQuantity * lastPrice * multiplier)
-                realized_pnl = sell_value - buy_value
-                unrealized_pnl = quantity * last_price * multiplier
-                total_pnl = realized_pnl + unrealized_pnl
-                
-                # Day change
-                day_change = pos.get('pnl', 0.0)
-                close_price = pos.get('close_price', 0.0)
-                day_change_pct = 0.0
-                if close_price and close_price > 0:
-                    day_change_pct = ((last_price - close_price) / close_price) * 100
-                
-                position = PositionPnL(
-                    instrument_token=pos['instrument_token'],
-                    tradingsymbol=pos['tradingsymbol'],
-                    exchange=pos['exchange'],
-                    product=pos['product'],
-                    quantity=quantity,
-                    multiplier=multiplier,
-                    buy_quantity=buy_quantity,
-                    sell_quantity=sell_quantity,
-                    buy_value=buy_value,
-                    sell_value=sell_value,
-                    average_price=average_price,
-                    last_price=last_price,
-                    pnl=total_pnl,
-                    realized_pnl=realized_pnl,
-                    unrealized_pnl=unrealized_pnl,
-                    day_change=day_change,
-                    day_change_percentage=day_change_pct
-                )
-                
-                positions_map[key] = position
-            
-            # Store in Redis for fast access
-            redis = get_redis()
-            redis_key = f"{self.redis_key_prefix}{session_id}"
-            
-            # Serialize positions
-            positions_json = {k: v.model_dump() for k, v in positions_map.items()}
-            await redis.set(redis_key, json.dumps(positions_json), ex=86400)  # 24 hour TTL
-            
-            logger.info(
-                f"Initialized {len(positions_map)} positions",
-                extra={**log_ctx, "position_count": len(positions_map)}
-            )
-            
-            return positions_map
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize positions: {e}", extra=log_ctx, exc_info=True)
-            raise HTTPException(status_code=502, detail=f"Failed to initialize positions: {e}")
-    
-    async def get_positions(self, session_id: str, corr_id: str) -> Dict[str, PositionPnL]:
-        """
-        Get current positions from Redis cache.
-        """
-        try:
-            redis = get_redis()
-            redis_key = f"{self.redis_key_prefix}{session_id}"
-            
-            cached = await redis.get(redis_key)
-            if not cached:
-                return {}
-            
-            positions_data = json.loads(cached)
-            positions_map = {k: PositionPnL(**v) for k, v in positions_data.items()}
-            
-            return positions_map
-            
-        except Exception as e:
-            logger.error(f"Failed to get positions: {e}", exc_info=True)
-            return {}
-    
-    async def update_position_ltp(
-        self,
-        session_id: str,
-        instrument_token: int,
-        last_price: float,
-        corr_id: str
-    ) -> Optional[PositionPnL]:
-        """
-        Update position with new LTP from WebSocket and recalculate PnL.
-        """
-        try:
-            positions = await self.get_positions(session_id, corr_id)
-            
-            # Find position with matching instrument token
-            updated_position = None
-            for key, pos in positions.items():
-                if pos.instrument_token == instrument_token:
-                    # Update LTP
-                    pos.last_price = last_price
-                    
-                    # Recalculate unrealized PnL
-                    pos.unrealized_pnl = pos.quantity * last_price * pos.multiplier
-                    pos.pnl = pos.realized_pnl + pos.unrealized_pnl
-                    
-                    # Update day change
-                    if pos.average_price > 0:
-                        pos.day_change_percentage = ((last_price - pos.average_price) / pos.average_price) * 100
-                    
-                    positions[key] = pos
-                    updated_position = pos
-                    break
-            
-            if updated_position:
-                # Save back to Redis
-                redis = get_redis()
-                redis_key = f"{self.redis_key_prefix}{session_id}"
-                positions_json = {k: v.model_dump() for k, v in positions.items()}
-                await redis.set(redis_key, json.dumps(positions_json), ex=86400)
-                
-                # Notify subscribers
-                await self._notify_subscribers(session_id, updated_position)
-            
-            return updated_position
-            
-        except Exception as e:
-            logger.error(f"Failed to update position LTP: {e}", exc_info=True)
-            return None
-    
-    async def update_position_from_order(
-        self,
-        session_id: str,
-        order: Dict[str, Any],
-        corr_id: str
-    ) -> Optional[PositionPnL]:
-        """
-        Update position when an order is filled.
-        Handles position building and exits.
-        """
-        try:
-            if order.get('status') not in ['COMPLETE', 'OPEN']:
-                return None
-            
-            positions = await self.get_positions(session_id, corr_id)
-            key = f"{order['exchange']}:{order['tradingsymbol']}"
-            
-            # Get or create position
-            position = positions.get(key)
-            if not position:
-                # Fetch lot_size from database for accurate multiplier
-                multiplier = self._get_lot_size(order['instrument_token'])
-                
-                position = PositionPnL(
-                    instrument_token=order['instrument_token'],
-                    tradingsymbol=order['tradingsymbol'],
-                    exchange=order['exchange'],
-                    product=order['product'],
-                    quantity=0,
-                    multiplier=multiplier,
-                    buy_quantity=0,
-                    sell_quantity=0,
-                    buy_value=0.0,
-                    sell_value=0.0,
-                    average_price=0.0,
-                    last_price=order.get('average_price', 0.0),
-                    pnl=0.0,
-                    realized_pnl=0.0,
-                    unrealized_pnl=0.0,
-                    day_change=0.0,
-                    day_change_percentage=0.0
-                )
-            
-            # Update position based on transaction type
-            filled_qty = order.get('filled_quantity', 0)
-            avg_price = order.get('average_price', 0.0)
-            
-            if order['transaction_type'] == 'BUY':
-                position.buy_quantity += filled_qty
-                position.buy_value += filled_qty * avg_price * position.multiplier
-                position.quantity += filled_qty
-            else:  # SELL
-                position.sell_quantity += filled_qty
-                position.sell_value += filled_qty * avg_price * position.multiplier
-                position.quantity -= filled_qty
-            
-            # Recalculate average price
-            if position.quantity != 0:
-                position.average_price = (position.buy_value - position.sell_value) / (position.quantity * position.multiplier)
-            
-            # Recalculate PnL
-            position.realized_pnl = position.sell_value - position.buy_value
-            position.unrealized_pnl = position.quantity * position.last_price * position.multiplier
-            position.pnl = position.realized_pnl + position.unrealized_pnl
-            
-            # Handle position exit (quantity becomes 0)
-            if position.quantity == 0:
-                logger.info(
-                    f"Position exited: {key}, Final PnL: {position.pnl}",
-                    extra={"correlation_id": corr_id, "session_id": session_id}
-                )
-                # Remove from active positions
-                positions.pop(key, None)
-            else:
-                positions[key] = position
-            
-            # Save to Redis
-            redis = get_redis()
-            redis_key = f"{self.redis_key_prefix}{session_id}"
-            positions_json = {k: v.model_dump() for k, v in positions.items()}
-            await redis.set(redis_key, json.dumps(positions_json), ex=86400)
-            
-            # Notify subscribers
-            await self._notify_subscribers(session_id, position)
-            
-            return position
-            
-        except Exception as e:
-            logger.error(f"Failed to update position from order: {e}", exc_info=True)
-            return None
-    
-    async def _notify_subscribers(self, session_id: str, position: PositionPnL):
-        """Notify all SSE subscribers of position update"""
-        if session_id in self.position_subscribers:
-            try:
-                queue = self.position_subscribers[session_id]
-                await queue.put(position.model_dump())
-            except Exception as e:
-                logger.error(f"Failed to notify subscribers: {e}")
-    
-    async def subscribe_to_positions(
-        self,
-        session_id: str,
-        corr_id: str
-    ) -> AsyncGenerator[str, None]:
-        """
-        SSE stream for real-time position updates.
-        """
-        # Create queue for this subscriber
-        queue = asyncio.Queue(maxsize=100)
-        self.position_subscribers[session_id] = queue
-        
-        logger.info(
-            f"New position subscriber: {session_id}",
-            extra={"correlation_id": corr_id}
-        )
-        
-        try:
-            # Send initial positions
-            positions = await self.get_positions(session_id, corr_id)
-            if positions:
-                for pos in positions.values():
-                    event_data = f"data: {json.dumps(pos.model_dump())}\n\n"
-                    yield event_data
-            
-            # Stream updates
-            while True:
-                try:
-                    # Wait for update with timeout
-                    position_data = await asyncio.wait_for(queue.get(), timeout=30.0)
-                    event_data = f"data: {json.dumps(position_data)}\n\n"
-                    yield event_data
-                except asyncio.TimeoutError:
-                    # Send keepalive
-                    yield ": keepalive\n\n"
-                    continue
-                
-        except asyncio.CancelledError:
-            logger.info(f"Position subscriber disconnected: {session_id}")
-        finally:
-            # Cleanup
-            self.position_subscribers.pop(session_id, None)
-
-
-# Global service instance
-realtime_positions_service = RealTimePositionsService()
+# Production implementation lives in broker_api.order_runtime.
 
 
 @router.post("/positions/initialize", description="Initialize real-time position tracking from Kite API")
 async def initialize_realtime_positions(
     request: Request,
     kite: KiteConnect = Depends(get_kite),
+    db: Session = Depends(get_db),
     corr_id: str = Depends(get_correlation_id)
 ):
     """
@@ -1386,10 +1037,14 @@ async def initialize_realtime_positions(
     if not sid:
         raise HTTPException(401, "Session ID required")
     
-    positions = await realtime_positions_service.initialize_positions(kite, sid, corr_id)
+    try:
+        positions = await realtime_positions_service.initialize_positions(kite, sid, corr_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     
     return {
         "status": "initialized",
+        "account_id": get_session_account_id(db, sid),
         "position_count": len(positions),
         "positions": {k: v.model_dump() for k, v in positions.items()}
     }
@@ -1398,6 +1053,7 @@ async def initialize_realtime_positions(
 @router.get("/positions/realtime", description="Get current real-time positions")
 async def get_realtime_positions(
     request: Request,
+    db: Session = Depends(get_db),
     corr_id: str = Depends(get_correlation_id)
 ):
     """
@@ -1407,7 +1063,11 @@ async def get_realtime_positions(
     if not sid:
         raise HTTPException(401, "Session ID required")
     
-    positions = await realtime_positions_service.get_positions(sid, corr_id)
+    account_id = get_session_account_id(db, sid)
+    if not account_id:
+        raise HTTPException(409, "Broker account not initialized for this session. Call /positions/initialize first.")
+
+    positions = await realtime_positions_service.get_positions(account_id, corr_id)
     
     # Calculate summary
     total_pnl = sum(pos.pnl for pos in positions.values())
@@ -1426,6 +1086,7 @@ async def get_realtime_positions(
 @router.get("/positions/stream", description="SSE stream for real-time position updates")
 async def stream_realtime_positions(
     request: Request,
+    db: Session = Depends(get_db),
     corr_id: str = Depends(get_correlation_id)
 ):
     """
@@ -1439,8 +1100,12 @@ async def stream_realtime_positions(
     if not sid:
         raise HTTPException(401, "Session ID required")
     
+    account_id = get_session_account_id(db, sid)
+    if not account_id:
+        raise HTTPException(409, "Broker account not initialized for this session. Call /positions/initialize first.")
+
     return StreamingResponse(
-        realtime_positions_service.subscribe_to_positions(sid, corr_id),
+        realtime_positions_service.subscribe_to_positions(account_id, corr_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1448,6 +1113,134 @@ async def stream_realtime_positions(
             "X-Accel-Buffering": "no"
         }
     )
+
+
+@router.post("/positions/reconcile", description="Reconcile real-time positions against broker truth")
+async def reconcile_realtime_positions(
+    request: Request,
+    kite: KiteConnect = Depends(get_kite),
+    db: Session = Depends(get_db),
+    corr_id: str = Depends(get_correlation_id),
+):
+    sid = get_kite_session_id(request)
+    if not sid:
+        raise HTTPException(401, "Session ID required")
+
+    account_id = get_session_account_id(db, sid)
+    if not account_id:
+        try:
+            positions = await realtime_positions_service.initialize_positions(kite, sid, corr_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        total_pnl = sum(pos.pnl for pos in positions.values())
+        return {
+            "status": "ok",
+            "account_id": next(iter(positions.values())).account_id if positions else None,
+            "position_count": len(positions),
+            "total_pnl": total_pnl,
+            "mode": "initialized",
+        }
+
+    count = await realtime_positions_service.reconcile_account_positions(kite, account_id, corr_id)
+    positions = await realtime_positions_service.get_positions(account_id, corr_id)
+    total_pnl = sum(pos.pnl for pos in positions.values())
+    return {
+        "status": "ok",
+        "account_id": account_id,
+        "position_count": count,
+        "cached_positions": len(positions),
+        "total_pnl": total_pnl,
+        "mode": "reconciled",
+    }
+
+
+@router.get("/order-runtime/status", description="Get canonical order runtime status")
+async def get_order_runtime_status(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    sid = get_kite_session_id(request)
+    account_id = get_session_account_id(db, sid) if sid else None
+
+    counts = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE processing_state = 'pending') AS pending_events,
+                COUNT(*) FILTER (WHERE processing_state = 'processing') AS processing_events,
+                COUNT(*) FILTER (WHERE processing_state = 'failed') AS failed_events
+            FROM canonical_order_events
+            """
+        )
+    ).fetchone()
+
+    dirty_counts = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE dirty_for_trade_sync = TRUE) AS dirty_orders,
+                COUNT(*) FILTER (WHERE needs_reconcile = TRUE) AS reconcile_orders
+            FROM order_state_projection
+            WHERE (:account_id IS NULL OR account_id = :account_id)
+            """
+        ),
+        {"account_id": account_id},
+    ).fetchone()
+
+    position_counts = db.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM account_positions
+            WHERE (:account_id IS NULL OR account_id = :account_id)
+              AND net_quantity <> 0
+            """
+        ),
+        {"account_id": account_id},
+    ).fetchone()
+
+    return {
+        "account_id": account_id,
+        "canonical_events": {
+            "pending": int(counts[0] or 0),
+            "processing": int(counts[1] or 0),
+            "failed": int(counts[2] or 0),
+        },
+        "orders": {
+            "dirty_for_trade_sync": int(dirty_counts[0] or 0),
+            "needs_reconcile": int(dirty_counts[1] or 0),
+        },
+        "positions": {
+            "open_rows": int(position_counts[0] or 0),
+        },
+    }
+
+
+@router.post("/order-runtime/process-now", description="Process canonical events and dirty orders immediately")
+async def process_order_runtime_now(
+    request: Request,
+    kite: KiteConnect = Depends(get_kite),
+    db: Session = Depends(get_db),
+    corr_id: str = Depends(get_correlation_id),
+):
+    sid = get_kite_session_id(request)
+    if not sid:
+        raise HTTPException(401, "Session ID required")
+    account_id = get_session_account_id(db, sid)
+
+    processed = await order_event_runtime.process_pending_events(batch_size=100)
+    synced = await order_event_runtime.sync_dirty_orders(kite, realtime_positions_service, batch_size=25)
+    reconciled = 0
+    if account_id:
+        reconciled = await realtime_positions_service.reconcile_account_positions(kite, account_id, corr_id)
+
+    return {
+        "status": "ok",
+        "account_id": account_id,
+        "processed_events": processed,
+        "synced_orders": synced,
+        "reconciled_positions": reconciled,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2012,46 +1805,20 @@ class WebhookService:
         Returns event ID if stored, None if duplicate.
         """
         try:
-            event_id = str(uuid.uuid4())
-            event_timestamp = payload.get_event_timestamp()
-            
-            # Prepare SQL insert with ON CONFLICT for idempotency
-            insert_sql = text("""
-                INSERT INTO order_events (
-                    id, order_id, user_id, status, event_timestamp, received_at,
-                    exchange, tradingsymbol, instrument_token, transaction_type,
-                    quantity, filled_quantity, average_price, payload_json
+            ingest_result = await order_event_runtime.ingest_webhook_event(payload, corr_id, db)
+            if ingest_result.get("duplicate"):
+                logger.info(
+                    "Duplicate webhook event detected (idempotent)",
+                    extra={
+                        "correlation_id": corr_id,
+                        "order_id": payload.order_id,
+                        "status": payload.status,
+                    }
                 )
-                VALUES (
-                    :id, :order_id, :user_id, :status, :event_timestamp, NOW(),
-                    :exchange, :tradingsymbol, :instrument_token, :transaction_type,
-                    :quantity, :filled_quantity, :average_price, CAST(:payload_json AS JSONB)
-                )
-                ON CONFLICT (order_id, event_timestamp, status) DO NOTHING
-                RETURNING id
-            """)
-            
-            result = db.execute(insert_sql, {
-                "id": event_id,
-                "order_id": payload.order_id,
-                "user_id": payload.user_id,
-                "status": payload.status,
-                "event_timestamp": event_timestamp,
-                "exchange": payload.exchange,
-                "tradingsymbol": payload.tradingsymbol,
-                "instrument_token": payload.instrument_token,
-                "transaction_type": payload.transaction_type,
-                "quantity": payload.quantity,
-                "filled_quantity": payload.filled_quantity,
-                "average_price": payload.average_price,
-                "payload_json": json.dumps(payload.model_dump())
-            })
-            
-            db.commit()
-            
-            # Check if row was actually inserted (idempotency check)
-            inserted_id = result.fetchone()
-            if inserted_id:
+                return None
+
+            event_id = str(ingest_result.get("canonical_event_id"))
+            if event_id:
                 logger.info(
                     "Webhook event stored successfully",
                     extra={
@@ -2062,19 +1829,9 @@ class WebhookService:
                     }
                 )
                 return event_id
-            else:
-                logger.info(
-                    "Duplicate webhook event detected (idempotent)",
-                    extra={
-                        "correlation_id": corr_id,
-                        "order_id": payload.order_id,
-                        "status": payload.status
-                    }
-                )
-                return None
-                
+            return None
+                 
         except Exception as e:
-            db.rollback()
             logger.error(
                 "Failed to store webhook event",
                 extra={
@@ -2266,8 +2023,10 @@ async def receive_order_postback(
         # Validate checksum
         webhook_service._validate_checksum(payload, corr_id, test_mode)
         
-        # Store event (with idempotency)
-        event_id = await webhook_service.store_event(payload, corr_id, db)
+        # Store raw + canonical event (with idempotency)
+        ingest_result = await order_event_runtime.ingest_webhook_event(payload, corr_id, db)
+        db.commit()
+        event_id = ingest_result.get("canonical_event_id")
 
         # Publish SSE event only when inserted (not duplicate)
         if event_id:
@@ -2295,13 +2054,21 @@ async def receive_order_postback(
         return {
             "status": "ok",
             "event_id": event_id,
-            "duplicate": event_id is None,
+            "duplicate": bool(ingest_result.get("duplicate", event_id is None)),
             "order_id": payload.order_id
         }
         
     except HTTPException:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         raise
     except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         logger.error(
             "Webhook processing failed",
             extra={**log_ctx, "error": str(e)},
@@ -2347,7 +2114,7 @@ async def query_webhook_events(
         offset=offset
     )
 
-@router.get("/orders/events/stream")
+@router.get("/order-events/stream")
 async def sse_order_events(request: Request, source: Optional[str] = Query(None, description="Filter by 'webhook', 'ws' or 'all'")):
     async def event_stream():
         try:
