@@ -4,60 +4,35 @@ import json
 import re
 import uuid
 import asyncio
-from datetime import datetime
+import hashlib
+from datetime import datetime, timezone
 from enum import Enum
-from typing import List, Optional, Any, Dict, AsyncGenerator
+from time import monotonic
+from typing import AsyncGenerator, Any, Callable, Dict, List, Optional
 
 import requests
+from redis.exceptions import ConnectionError as RedisConnectionError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Header, Response
 from fastapi.responses import StreamingResponse
 from kiteconnect import KiteConnect
 from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
-from sqlalchemy import Column, DateTime, String
 from sqlalchemy.orm import Session
 
 from .redis_events import get_redis, publish_event, pubsub_iter
 from .instruments_repository import InstrumentsRepository
-from database import Base, SessionLocal, get_db
+from .kite_session import KiteSession, get_kite, get_kite_session_id
+from database import get_db
 
 # Module-level logger
 logger = logging.getLogger(__name__)
 
-# API_KEY is required by the correct get_kite function
+# API_KEY is required for raw provider requests
 API_KEY = os.getenv("KITE_API_KEY")
-
-# --- Copied Dependencies from broker_api.py to avoid circular import ---
-
-class KiteSession(Base):
-    __tablename__ = "kite_sessions"
-    session_id = Column(String(36), primary_key=True, index=True)
-    access_token = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-def get_db() -> Session:
-    """Dependency to get a DB session."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def get_kite(request: Request, db: Session = Depends(get_db)) -> KiteConnect:
-    """
-    Correct dependency that resolves a KiteConnect instance via session ID
-    from either X-Session-ID header or kite_session_id cookie.
-    """
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
-    if not sid:
-        raise HTTPException(401, "Not authenticated; login first")
-    ks = db.query(KiteSession).filter_by(session_id=sid).first()
-    if not ks:
-        raise HTTPException(401, "Invalid session")
-    kite = KiteConnect(api_key=API_KEY)
-    kite.set_access_token(ks.access_token)
-    return kite
-
-# --- End of Copied Dependencies ---
+IDEMPOTENCY_PROCESSING_TTL_SECONDS = max(30, int(os.getenv("KITE_ORDER_IDEMPOTENCY_PROCESSING_TTL_SECONDS", "120")))
+IDEMPOTENCY_COMPLETED_TTL_SECONDS = max(
+    IDEMPOTENCY_PROCESSING_TTL_SECONDS,
+    int(os.getenv("KITE_ORDER_IDEMPOTENCY_COMPLETED_TTL_SECONDS", "300")),
+)
 
 # ---------------- Enums ----------------
 class Exchange(str, Enum):
@@ -326,6 +301,129 @@ def get_correlation_id(request: Request) -> str:
         corr_id = str(uuid.uuid4())
     return corr_id
 
+
+class KiteWriteThrottler:
+    def __init__(self, rate_per_second: float):
+        capped_rate = min(10.0, max(1.0, rate_per_second))
+        self.rate_per_second = capped_rate
+        self.min_interval_seconds = 1.0 / capped_rate
+        self.interval_ms = max(1, int(self.min_interval_seconds * 1000))
+        self.redis_key = os.getenv("KITE_WRITE_LIMIT_REDIS_KEY", "kite:write_limit:next_slot_ms")
+        self.redis_ttl_ms = max(5000, int(os.getenv("KITE_WRITE_LIMIT_REDIS_TTL_MS", "60000")))
+        self.require_redis = os.getenv("KITE_WRITE_LIMIT_REQUIRE_REDIS", "true").lower() == "true"
+        self.max_wait_seconds = max(1.0, float(os.getenv("KITE_WRITE_LIMIT_MAX_WAIT_SECONDS", "30")))
+        self._local_fallback_lock = asyncio.Lock()
+        self._local_next_slot_at = 0.0
+
+    _RESERVE_SLOT_SCRIPT = """
+local interval_ms = tonumber(ARGV[1])
+local ttl_ms = tonumber(ARGV[2])
+local max_wait_ms = tonumber(ARGV[3])
+local t = redis.call('TIME')
+local now_ms = (tonumber(t[1]) * 1000) + math.floor(tonumber(t[2]) / 1000)
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local scheduled_ms = now_ms
+if current > now_ms then
+    scheduled_ms = current
+end
+local wait_ms = scheduled_ms - now_ms
+if wait_ms > max_wait_ms then
+    return {-1, now_ms, wait_ms}
+end
+local next_slot_ms = scheduled_ms + interval_ms
+redis.call('PSETEX', KEYS[1], ttl_ms, tostring(next_slot_ms))
+return {scheduled_ms, now_ms, wait_ms}
+"""
+
+    async def _reserve_local_slot(self) -> tuple[float, int]:
+        async with self._local_fallback_lock:
+            now = monotonic()
+            scheduled = max(now, self._local_next_slot_at)
+            wait_seconds = max(0.0, scheduled - now)
+            queue_depth = max(0, int(round(wait_seconds / self.min_interval_seconds)))
+            if wait_seconds > self.max_wait_seconds:
+                raise HTTPException(status_code=503, detail="Order queue is too long. Please retry.")
+            self._local_next_slot_at = scheduled + self.min_interval_seconds
+            return wait_seconds, queue_depth
+
+    async def _reserve_global_slot(self) -> tuple[float, int]:
+        redis = get_redis()
+        result = await redis.eval(
+            self._RESERVE_SLOT_SCRIPT,
+            1,
+            self.redis_key,
+            self.interval_ms,
+            self.redis_ttl_ms,
+            int(self.max_wait_seconds * 1000),
+        )
+        scheduled_ms = int(result[0])
+        if scheduled_ms < 0:
+            raise HTTPException(status_code=503, detail="Order queue is too long. Please retry.")
+        now_ms = int(result[1])
+        wait_ms = max(0, int(result[2]))
+        queue_depth = max(0, int(wait_ms // self.interval_ms))
+        return wait_ms / 1000.0, queue_depth
+
+    async def execute(
+        self,
+        action_name: str,
+        corr_id: str,
+        func: Callable[[], Any],
+        *,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        limiter_mode = "redis"
+        try:
+            wait_seconds, queue_depth = await self._reserve_global_slot()
+        except (RedisConnectionError, OSError) as exc:
+            if self.require_redis:
+                logger.error(
+                    "Redis write limiter unavailable; rejecting Kite write",
+                    extra={"action": action_name, "correlation_id": corr_id, "error": str(exc), **(meta or {})},
+                )
+                raise HTTPException(status_code=503, detail="Order dispatcher unavailable. Please retry.")
+            limiter_mode = "local-fallback"
+            wait_seconds, queue_depth = await self._reserve_local_slot()
+        except Exception as exc:
+            if self.require_redis:
+                logger.error(
+                    "Unexpected Redis limiter error; rejecting Kite write",
+                    extra={"action": action_name, "correlation_id": corr_id, "error": str(exc), **(meta or {})},
+                    exc_info=True,
+                )
+                raise HTTPException(status_code=503, detail="Order dispatcher unavailable. Please retry.")
+            limiter_mode = "local-fallback"
+            wait_seconds, queue_depth = await self._reserve_local_slot()
+
+        if wait_seconds > 0:
+            logger.info(
+                "Throttling Kite write action",
+                extra={
+                    "action": action_name,
+                    "correlation_id": corr_id,
+                    "limiter_mode": limiter_mode,
+                    "wait_seconds": round(wait_seconds, 4),
+                    "queue_depth": queue_depth,
+                    **(meta or {}),
+                },
+            )
+            await asyncio.sleep(wait_seconds)
+
+        return await asyncio.to_thread(func)
+
+
+write_throttler = KiteWriteThrottler(float(os.getenv("KITE_WRITE_OPS_PER_SEC", "9")))
+
+
+async def run_kite_write_action(
+    action_name: str,
+    corr_id: str,
+    func: Callable[[], Any],
+    *,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Any:
+    return await write_throttler.execute(action_name, corr_id, func, meta=meta)
+
 # ---------------- Service Layer ----------------
 class OrdersService:
     def _log_context(self, corr_id: str, kite: KiteConnect, **kwargs) -> Dict[str, Any]:
@@ -334,6 +432,89 @@ class OrdersService:
         context = {"correlation_id": corr_id, "session_suffix": session_id}
         context.update(kwargs)
         return context
+
+    def _idempotency_redis_key(self, session_id: str, idempotency_key: str) -> str:
+        return f"idempotency:place_order:{session_id}:{idempotency_key}"
+
+    def _idempotency_body_hash(self, req: PlaceOrderRequest) -> str:
+        normalized_body = json.dumps(req.model_dump(exclude_none=True), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(normalized_body.encode("utf-8")).hexdigest()
+
+    async def _begin_idempotent_order(
+        self,
+        redis_client,
+        session_id: str,
+        idempotency_key: str,
+        body_hash: str,
+        response: Optional[Response],
+        log_ctx: Dict[str, Any],
+    ) -> tuple[Optional[str], Optional[PlaceOrderResponse]]:
+        redis_key = self._idempotency_redis_key(session_id, idempotency_key)
+        now = datetime.now(timezone.utc).isoformat()
+        pending_payload = json.dumps(
+            {
+                "status": "processing",
+                "body_hash": body_hash,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+        claimed = await redis_client.set(redis_key, pending_payload, ex=IDEMPOTENCY_PROCESSING_TTL_SECONDS, nx=True)
+        if claimed:
+            return redis_key, None
+
+        current_raw = await redis_client.get(redis_key)
+        if not current_raw:
+            raise HTTPException(status_code=503, detail="Unable to confirm idempotency state. Please retry.")
+
+        try:
+            current = json.loads(current_raw)
+        except Exception:
+            raise HTTPException(status_code=503, detail="Invalid idempotency state. Please retry.")
+
+        if current.get("body_hash") != body_hash:
+            raise HTTPException(status_code=409, detail="This idempotency key was already used for a different order request.")
+
+        status = current.get("status")
+        if status == "completed" and current.get("order_id"):
+            order_id = current["order_id"]
+            logger.info("Idempotent replay", extra={**log_ctx, "replay": True, "order_id": order_id})
+            if response:
+                response.headers["Idempotent-Replay"] = "true"
+            return redis_key, PlaceOrderResponse(order_id=order_id)
+
+        raise HTTPException(
+            status_code=409,
+            detail="An order with this idempotency key is already processing or awaiting verification.",
+        )
+
+    async def _store_completed_idempotent_order(self, redis_client, redis_key: str, body_hash: str, order_id: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(
+            {
+                "status": "completed",
+                "body_hash": body_hash,
+                "order_id": order_id,
+                "updated_at": now,
+            }
+        )
+        await redis_client.set(redis_key, payload, ex=IDEMPOTENCY_COMPLETED_TTL_SECONDS)
+
+    async def _store_uncertain_idempotent_order(self, redis_client, redis_key: str, body_hash: str, detail: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(
+            {
+                "status": "unknown",
+                "body_hash": body_hash,
+                "detail": detail[:500],
+                "updated_at": now,
+            }
+        )
+        await redis_client.set(redis_key, payload, ex=IDEMPOTENCY_COMPLETED_TTL_SECONDS)
+
+    async def _clear_idempotent_order(self, redis_client, redis_key: str) -> None:
+        await redis_client.delete(redis_key)
 
     def _raw_request(self, method: str, url: str, kite: KiteConnect, corr_id: str, **kwargs) -> Any:
         headers = {
@@ -375,39 +556,67 @@ class OrdersService:
         response: Response = None,
     ) -> PlaceOrderResponse:
         log_ctx = self._log_context(corr_id, kite, variety=req.variety.value, symbol=req.tradingsymbol)
+        redis_client = None
+        cache_key = None
+        body_hash = None
         
         if idempotency_key and session_id:
-            redis = get_redis()
-            normalized_body = json.dumps(req.model_dump(), sort_keys=True)
-            cache_key = f"idempotency:place_order:{session_id}:{idempotency_key}:{normalized_body}"
-            
             try:
-                cached_order_id = await redis.get(cache_key)
-                if cached_order_id:
-                    logger.info("Idempotent replay", extra={**log_ctx, "replay": True, "order_id": cached_order_id})
-                    if response:
-                        response.headers["Idempotent-Replay"] = "true"
-                    return PlaceOrderResponse(order_id=cached_order_id)
+                redis_client = get_redis()
+                body_hash = self._idempotency_body_hash(req)
+                cache_key, replay_response = await self._begin_idempotent_order(
+                    redis_client,
+                    session_id,
+                    idempotency_key,
+                    body_hash,
+                    response,
+                    log_ctx,
+                )
+                if replay_response:
+                    return replay_response
+            except HTTPException:
+                raise
             except Exception as e:
-                logger.error("Redis GET failed for idempotency check", extra={**log_ctx, "error": str(e)}, exc_info=True)
+                logger.error("Redis idempotency guard failed", extra={**log_ctx, "error": str(e)}, exc_info=True)
+                raise HTTPException(status_code=503, detail="Idempotency service unavailable. Please retry.")
 
         logger.info("Placing new order", extra=log_ctx)
         try:
             params = req.model_dump(exclude_none=True)
             variety = params.pop('variety')
-            order_id = kite.place_order(variety=variety.value, **params)
+            order_id = await run_kite_write_action(
+                "place_order",
+                corr_id,
+                lambda: kite.place_order(variety=variety.value, **params),
+                meta=log_ctx,
+            )
             log_ctx["order_id"] = order_id
 
-            if idempotency_key and session_id:
+            if redis_client and cache_key and body_hash:
                 try:
-                    await redis.set(cache_key, order_id, ex=120)
+                    await self._store_completed_idempotent_order(redis_client, cache_key, body_hash, order_id)
                     logger.info("Cached new order for idempotency", extra=log_ctx)
                 except Exception as e:
                     logger.error("Redis SET failed for idempotency cache", extra={**log_ctx, "error": str(e)}, exc_info=True)
 
             logger.info("Order placed successfully", extra=log_ctx)
             return PlaceOrderResponse(order_id=order_id)
+        except HTTPException as e:
+            if redis_client and cache_key:
+                try:
+                    if e.status_code in {400, 401, 403, 404, 409, 422}:
+                        await self._clear_idempotent_order(redis_client, cache_key)
+                    else:
+                        await self._store_uncertain_idempotent_order(redis_client, cache_key, body_hash or "", str(e.detail))
+                except Exception as redis_error:
+                    logger.error("Failed to update idempotency state after HTTP error", extra={**log_ctx, "error": str(redis_error)}, exc_info=True)
+            raise
         except Exception as e:
+            if redis_client and cache_key:
+                try:
+                    await self._store_uncertain_idempotent_order(redis_client, cache_key, body_hash or "", str(e))
+                except Exception as redis_error:
+                    logger.error("Failed to update idempotency state after exception", extra={**log_ctx, "error": str(redis_error)}, exc_info=True)
             logger.error("Failed to place order", extra={**log_ctx, "error": str(e)}, exc_info=True)
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -492,7 +701,7 @@ class OrdersService:
             logger.error("Failed to retrieve positions", extra={**log_ctx, "error": str(e)}, exc_info=True)
             raise HTTPException(status_code=502, detail="Failed to retrieve positions from provider.")
 
-    def modify_order(self, kite: KiteConnect, variety: str, order_id: str, req: ModifyOrderRequest, corr_id: str, parent_order_id: Optional[str] = None) -> dict:
+    async def modify_order(self, kite: KiteConnect, variety: str, order_id: str, req: ModifyOrderRequest, corr_id: str, parent_order_id: Optional[str] = None) -> dict:
         log_ctx = self._log_context(corr_id, kite, variety=variety, order_id=order_id, parent_order_id=parent_order_id)
         logger.info("Modifying order", extra=log_ctx)
         try:
@@ -500,7 +709,12 @@ class OrdersService:
             if parent_order_id:
                 payload['parent_order_id'] = parent_order_id
             
-            result = self._raw_request("PUT", f"https://api.kite.trade/orders/{variety}/{order_id}", kite, corr_id, json=payload)
+            result = await run_kite_write_action(
+                "modify_order",
+                corr_id,
+                lambda: self._raw_request("PUT", f"https://api.kite.trade/orders/{variety}/{order_id}", kite, corr_id, json=payload),
+                meta=log_ctx,
+            )
             return {"order_id": result.get("data", {}).get("order_id", order_id)}
         except Exception as e:
             logger.error("Failed to modify order", extra={**log_ctx, "error": str(e)}, exc_info=True)
@@ -508,7 +722,7 @@ class OrdersService:
                 raise HTTPException(status_code=400, detail=str(e))
             raise e
 
-    def cancel_order(self, kite: KiteConnect, variety: str, order_id: str, corr_id: str, parent_order_id: Optional[str] = None) -> dict:
+    async def cancel_order(self, kite: KiteConnect, variety: str, order_id: str, corr_id: str, parent_order_id: Optional[str] = None) -> dict:
         log_ctx = self._log_context(corr_id, kite, variety=variety, order_id=order_id, parent_order_id=parent_order_id)
         logger.info("Cancelling order", extra=log_ctx)
         try:
@@ -516,7 +730,12 @@ class OrdersService:
             if parent_order_id:
                 params['parent_order_id'] = parent_order_id
 
-            result = self._raw_request("DELETE", f"https://api.kite.trade/orders/{variety}/{order_id}", kite, corr_id, params=params)
+            result = await run_kite_write_action(
+                "cancel_order",
+                corr_id,
+                lambda: self._raw_request("DELETE", f"https://api.kite.trade/orders/{variety}/{order_id}", kite, corr_id, params=params),
+                meta=log_ctx,
+            )
             return {"order_id": result.get("data", {}).get("order_id", order_id)}
         except Exception as e:
             logger.error("Failed to cancel order", extra={**log_ctx, "error": str(e)}, exc_info=True)
@@ -585,6 +804,7 @@ class OrdersService:
         req: BasketOrderRequest,
         corr_id: str,
         session_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         response: Response = None,
     ) -> BasketOrderResponse:
         """
@@ -630,7 +850,15 @@ class OrdersService:
         for idx, order_req in enumerate(req.orders):
             try:
                 # Place order using existing service method (with idempotency support)
-                place_result = await self.place_order(kite, order_req, corr_id, session_id=session_id, response=response)
+                child_idempotency_key = f"{idempotency_key}:{idx}" if idempotency_key and session_id else None
+                place_result = await self.place_order(
+                    kite,
+                    order_req,
+                    corr_id,
+                    idempotency_key=child_idempotency_key,
+                    session_id=session_id,
+                    response=response,
+                )
                 
                 placed.append({"index": idx, "order_id": place_result.order_id, "variety": order_req.variety.value})
                 results.append(
@@ -669,7 +897,7 @@ class OrdersService:
                     logger.info("Attempting rollback due to all_or_none policy", extra=log_ctx)
                     for p in placed:
                         try:
-                            self.cancel_order(kite, p["variety"], p["order_id"], corr_id)
+                            await self.cancel_order(kite, p["variety"], p["order_id"], corr_id)
                             logger.info(f"Rolled back order {p['order_id']}", extra=log_ctx)
                         except Exception as cancel_error:
                             logger.error(
@@ -702,7 +930,7 @@ async def place_order(
     idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key", description="Client-generated key for idempotent retries."),
     corr_id: str = Depends(get_correlation_id),
 ):
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
+    sid = get_kite_session_id(request)
     return await service.place_order(kite, req, corr_id, idempotency_key, sid, response)
 
 @router.get("/orders", response_model=List[Order], description="Retrieve the list of all orders for the day.")
@@ -731,7 +959,7 @@ def get_positions(kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(
 
 # Phase 2 Endpoints
 @router.put("/orders/{variety}/{order_id}", response_model=dict, description="Modify an open/pending order.")
-def modify_order(
+async def modify_order(
     variety: str,
     order_id: str,
     req: ModifyOrderRequest,
@@ -739,17 +967,17 @@ def modify_order(
     kite: KiteConnect = Depends(get_kite),
     corr_id: str = Depends(get_correlation_id),
 ):
-    return service.modify_order(kite, variety, order_id, req, corr_id, parent_order_id)
+    return await service.modify_order(kite, variety, order_id, req, corr_id, parent_order_id)
 
 @router.delete("/orders/{variety}/{order_id}", response_model=dict, description="Cancel an open/pending order.")
-def cancel_order(
+async def cancel_order(
     variety: str,
     order_id: str,
     parent_order_id: Optional[str] = Query(None, description="Required for Cover Orders if cancelling the SL leg."),
     kite: KiteConnect = Depends(get_kite),
     corr_id: str = Depends(get_correlation_id),
 ):
-    return service.cancel_order(kite, variety, order_id, corr_id, parent_order_id)
+    return await service.cancel_order(kite, variety, order_id, corr_id, parent_order_id)
 
 @router.post("/margins/orders", response_model=List[OrderMarginsResponseItem], description="Calculate margins for a list of orders.")
 def get_order_margins(items: List[OrderMarginInput], mode: Optional[str] = Query(None, enum=["compact", "full"]), kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
@@ -773,6 +1001,7 @@ async def place_basket_orders(
     request: Request,
     response: Response,
     kite: KiteConnect = Depends(get_kite),
+    idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key", description="Client-generated key for idempotent basket retries."),
     corr_id: str = Depends(get_correlation_id),
 ):
     """
@@ -780,8 +1009,8 @@ async def place_basket_orders(
     - Set dry_run=true to preview margins without placing orders.
     - Set all_or_none=true to attempt rollback on first failure (best-effort).
     """
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
-    return await service.place_basket(kite, req, corr_id, sid, response)
+    sid = get_kite_session_id(request)
+    return await service.place_basket(kite, req, corr_id, sid, idempotency_key, response)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1153,7 +1382,7 @@ async def initialize_realtime_positions(
     Initialize real-time position tracking.
     Fetches current positions from Kite API and sets up tracking state.
     """
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
+    sid = get_kite_session_id(request)
     if not sid:
         raise HTTPException(401, "Session ID required")
     
@@ -1174,7 +1403,7 @@ async def get_realtime_positions(
     """
     Get current real-time positions with calculated PnL.
     """
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
+    sid = get_kite_session_id(request)
     if not sid:
         raise HTTPException(401, "Session ID required")
     
@@ -1206,7 +1435,7 @@ async def stream_realtime_positions(
     - Orders are filled
     - Positions are exited
     """
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
+    sid = get_kite_session_id(request)
     if not sid:
         raise HTTPException(401, "Session ID required")
     
@@ -1392,7 +1621,7 @@ class GTTService:
             logger.error(f"GTT request failed", extra={**log_ctx, "error": str(e)}, exc_info=True)
             raise HTTPException(status_code=502, detail="An unexpected error occurred with the provider.")
 
-    def place_gtt(self, kite: KiteConnect, req: PlaceGTTRequest, corr_id: str) -> PlaceGTTResponse:
+    async def place_gtt(self, kite: KiteConnect, req: PlaceGTTRequest, corr_id: str) -> PlaceGTTResponse:
         """Place a GTT trigger"""
         log_ctx = self._log_context(corr_id, kite, gtt_type=req.type.value, symbol=req.condition.tradingsymbol)
         logger.info("Placing GTT trigger", extra=log_ctx)
@@ -1405,12 +1634,17 @@ class GTTService:
                 "orders": [order.model_dump() for order in req.orders]
             }
 
-            result = self._raw_request(
-                "POST",
-                "https://api.kite.trade/gtt/triggers",
-                kite,
+            result = await run_kite_write_action(
+                "place_gtt",
                 corr_id,
-                json=payload
+                lambda: self._raw_request(
+                    "POST",
+                    "https://api.kite.trade/gtt/triggers",
+                    kite,
+                    corr_id,
+                    json=payload,
+                ),
+                meta=log_ctx,
             )
 
             trigger_id = result.get("data", {}).get("trigger_id")
@@ -1469,7 +1703,7 @@ class GTTService:
             logger.error("Failed to retrieve GTT", extra={**log_ctx, "error": str(e)}, exc_info=True)
             raise HTTPException(status_code=502, detail=f"Failed to retrieve GTT trigger {trigger_id}")
 
-    def modify_gtt(self, kite: KiteConnect, trigger_id: int, req: ModifyGTTRequest, corr_id: str) -> PlaceGTTResponse:
+    async def modify_gtt(self, kite: KiteConnect, trigger_id: int, req: ModifyGTTRequest, corr_id: str) -> PlaceGTTResponse:
         """Modify a GTT trigger"""
         log_ctx = self._log_context(corr_id, kite, trigger_id=trigger_id, gtt_type=req.type.value)
         logger.info("Modifying GTT trigger", extra=log_ctx)
@@ -1482,12 +1716,17 @@ class GTTService:
                 "orders": [order.model_dump() for order in req.orders]
             }
 
-            result = self._raw_request(
-                "PUT",
-                f"https://api.kite.trade/gtt/triggers/{trigger_id}",
-                kite,
+            result = await run_kite_write_action(
+                "modify_gtt",
                 corr_id,
-                json=payload
+                lambda: self._raw_request(
+                    "PUT",
+                    f"https://api.kite.trade/gtt/triggers/{trigger_id}",
+                    kite,
+                    corr_id,
+                    json=payload,
+                ),
+                meta=log_ctx,
             )
 
             modified_trigger_id = result.get("data", {}).get("trigger_id")
@@ -1500,17 +1739,22 @@ class GTTService:
                 raise HTTPException(status_code=400, detail=str(e))
             raise e
 
-    def delete_gtt(self, kite: KiteConnect, trigger_id: int, corr_id: str) -> DeleteGTTResponse:
+    async def delete_gtt(self, kite: KiteConnect, trigger_id: int, corr_id: str) -> DeleteGTTResponse:
         """Delete a GTT trigger"""
         log_ctx = self._log_context(corr_id, kite, trigger_id=trigger_id)
         logger.info("Deleting GTT trigger", extra=log_ctx)
 
         try:
-            result = self._raw_request(
-                "DELETE",
-                f"https://api.kite.trade/gtt/triggers/{trigger_id}",
-                kite,
-                corr_id
+            result = await run_kite_write_action(
+                "delete_gtt",
+                corr_id,
+                lambda: self._raw_request(
+                    "DELETE",
+                    f"https://api.kite.trade/gtt/triggers/{trigger_id}",
+                    kite,
+                    corr_id,
+                ),
+                meta=log_ctx,
             )
 
             deleted_trigger_id = result.get("data", {}).get("trigger_id")
@@ -1528,7 +1772,7 @@ class GTTService:
 gtt_service = GTTService()
 
 @router.post("/gtt/triggers", response_model=PlaceGTTResponse, description="Place a GTT (Good Till Triggered) order")
-def place_gtt_trigger(
+async def place_gtt_trigger(
     req: PlaceGTTRequest,
     kite: KiteConnect = Depends(get_kite),
     corr_id: str = Depends(get_correlation_id)
@@ -1539,7 +1783,7 @@ def place_gtt_trigger(
     - **single**: Single trigger value, executes first order when reached
     - **two-leg**: Two trigger values (OCO - One Cancels Other), executes corresponding order
     """
-    return gtt_service.place_gtt(kite, req, corr_id)
+    return await gtt_service.place_gtt(kite, req, corr_id)
 
 @router.get("/gtt/triggers", response_model=List[GTTTrigger], description="Retrieve all GTT triggers")
 def get_gtt_triggers(
@@ -1570,7 +1814,7 @@ def get_gtt_trigger(
     return gtt_service.get_gtt(kite, trigger_id, corr_id)
 
 @router.put("/gtt/triggers/{trigger_id}", response_model=PlaceGTTResponse, description="Modify a GTT trigger")
-def modify_gtt_trigger(
+async def modify_gtt_trigger(
     trigger_id: int,
     req: ModifyGTTRequest,
     kite: KiteConnect = Depends(get_kite),
@@ -1581,16 +1825,16 @@ def modify_gtt_trigger(
     
     Recommended: Fetch the trigger using GET /gtt/triggers/{id}, modify values, and send to this endpoint.
     """
-    return gtt_service.modify_gtt(kite, trigger_id, req, corr_id)
+    return await gtt_service.modify_gtt(kite, trigger_id, req, corr_id)
 
 @router.delete("/gtt/triggers/{trigger_id}", response_model=DeleteGTTResponse, description="Delete a GTT trigger")
-def delete_gtt_trigger(
+async def delete_gtt_trigger(
     trigger_id: int,
     kite: KiteConnect = Depends(get_kite),
     corr_id: str = Depends(get_correlation_id)
 ):
     """Delete an active GTT trigger."""
-    return gtt_service.delete_gtt(kite, trigger_id, corr_id)
+    return await gtt_service.delete_gtt(kite, trigger_id, corr_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

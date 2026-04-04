@@ -6,6 +6,7 @@
  */
 
 const SESSION_STORAGE_KEY = 'kite_session_id';
+const AUTH_RETRY_HEADER = 'X-App-Auth-Retry';
 
 export function getApiBase(): string {
 	// 1) Explicit override via env (for cross-device dev access)
@@ -59,7 +60,23 @@ export async function apiFetch(path: string, init: RequestInit = {}) {
 		...init,
 		headers
 	};
-	return fetch(url, opts);
+	const response = await fetch(url, opts);
+	const isAuthEndpoint = normalizedPath.startsWith('/api/auth/');
+	const alreadyRetried = headers.get(AUTH_RETRY_HEADER) === '1';
+	if (response.status === 401 && !isAuthEndpoint && !alreadyRetried) {
+		const refreshResponse = await fetch(`${getApiBase()}/api/auth/refresh`, {
+			method: 'POST',
+			credentials: 'include'
+		});
+		if (refreshResponse.ok) {
+			headers.set(AUTH_RETRY_HEADER, '1');
+			return fetch(url, {
+				...opts,
+				headers
+			});
+		}
+	}
+	return response;
 }
 
 /**

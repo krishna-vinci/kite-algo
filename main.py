@@ -32,9 +32,12 @@ from psycopg2 import extras
 import logging
 from datetime import datetime, date # Import date for CURRENT_DATE
 from zoneinfo import ZoneInfo
+from auth_service import auth_exempt_path, get_optional_app_user
+from runtime_monitor import heartbeat, install_log_buffer, set_component_status, set_meta
 
 # Configure logging for the main application
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+install_log_buffer()
 
 # Suppress INFO level logs from httpx for specific API calls
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -86,7 +89,7 @@ import server
 from broker_api.kite_auth import login_headless
 import logging
 from database import SessionLocal, database as async_db
-from broker_api.broker_api import KiteSession, get_system_access_token, upsert_kite_session
+from broker_api.kite_session import KiteSession, build_kite_client, get_system_access_token, upsert_kite_session
 from broker_api.broker_api import run_headless_login_and_persist_system_token
 from broker_api.kite_auth import API_KEY
 from broker_api.websocket_manager import WebSocketManager
@@ -155,9 +158,7 @@ class MCPAuthWrapper:
                 try:
                     ks = db.query(KiteSession).filter_by(session_id=sid).first()
                     if ks:
-                        from kiteconnect import KiteConnect
-                        kite = KiteConnect(api_key=API_KEY)
-                        kite.set_access_token(ks.access_token)
+                        kite = build_kite_client(ks.access_token, session_id=sid)
                         ctx_token = server.set_request_kite(kite)
                 finally:
                     db.close()
@@ -195,6 +196,7 @@ async def combined_lifespan(app: FastAPI):
     # Perform headless login at startup and store the KiteConnect instance
     token_watcher_task = None
     scheduler_task = None
+    set_component_status("app", "starting", detail="Application startup in progress")
     try:
         # Ensure the schema is applied before any other database operations
         run_schema_migrations()
@@ -207,26 +209,44 @@ async def combined_lifespan(app: FastAPI):
             # Prefer explicit "system" session_id token
             system_at = get_system_access_token(db)
             if system_at:
-                from kiteconnect import KiteConnect
-                kite = KiteConnect(api_key=API_KEY)
-                kite.set_access_token(system_at)
+                kite = build_kite_client(system_at, session_id="system")
                 at = system_at
                 try:
                     # Lightweight validation
-                    kite.profile()
+                    await asyncio.to_thread(kite.profile)
                     logging.info("Using system access_token from DB (..%s)", at[-6:] if isinstance(at, str) else "")
+                    set_meta("daily_broker_login", {
+                        "mode": "startup_existing_token",
+                        "last_success_at": datetime.utcnow().isoformat(),
+                        "token_suffix": at[-6:] if isinstance(at, str) else "",
+                        "status": "healthy",
+                    })
                 except Exception as e:
                     logging.warning("System token validation failed (..%s); performing headless login: %s", (at[-6:] if isinstance(at, str) else ""), e)
-                    kite, at = login_headless()
+                    _kite, at = login_headless()
+                    kite = build_kite_client(at, session_id="system")
                     upsert_kite_session(db, "system", at)
                     db.commit()
                     logging.info("Refreshed system access_token via headless login (..%s)", at[-6:] if isinstance(at, str) else "")
+                    set_meta("daily_broker_login", {
+                        "mode": "startup_refresh",
+                        "last_success_at": datetime.utcnow().isoformat(),
+                        "token_suffix": at[-6:] if isinstance(at, str) else "",
+                        "status": "healthy",
+                    })
             else:
                 # No system token; perform headless login and persist
-                kite, at = login_headless()
+                _kite, at = login_headless()
+                kite = build_kite_client(at, session_id="system")
                 upsert_kite_session(db, "system", at)
                 db.commit()
                 logging.info("Obtained system access_token via headless login (..%s)", at[-6:] if isinstance(at, str) else "")
+                set_meta("daily_broker_login", {
+                    "mode": "startup_new_login",
+                    "last_success_at": datetime.utcnow().isoformat(),
+                    "token_suffix": at[-6:] if isinstance(at, str) else "",
+                    "status": "healthy",
+                })
         finally:
             try:
                 if db:
@@ -250,7 +270,7 @@ async def combined_lifespan(app: FastAPI):
         # Initialize and start the WebSocketManager with the selected token
         logging.info("Initializing WebSocketManager...")
         # Get the main event loop to pass to the WebSocketManager
-        main_event_loop = asyncio.get_event_loop()
+        main_event_loop = asyncio.get_running_loop()
         ws_manager = WebSocketManager(api_key=API_KEY, access_token=at, main_event_loop=main_event_loop)
         
         # Inject real-time positions service into WebSocket manager
@@ -260,6 +280,7 @@ async def combined_lifespan(app: FastAPI):
         
         ws_manager.start()
         logging.info("WebSocketManager started.")
+        set_component_status("websocket_manager", "healthy", detail="WebSocket manager started")
         # Expose ws_manager for routers to access latest ticks
         app.state.ws_manager = ws_manager
 
@@ -267,9 +288,11 @@ async def combined_lifespan(app: FastAPI):
         async def _system_token_watcher():
             poll_seconds = int(os.getenv("SYSTEM_TOKEN_POLL_SEC", "45"))
             last_token = at
+            set_component_status("system_token_watcher", "healthy", detail="Watching for system token changes")
             while True:
                 try:
                     await asyncio.sleep(max(30, min(poll_seconds, 60)))
+                    heartbeat("system_token_watcher", detail="Polling for token changes", meta={"poll_seconds": poll_seconds})
                     _db = SessionLocal()
                     try:
                         new_token = get_system_access_token(_db)
@@ -280,11 +303,24 @@ async def combined_lifespan(app: FastAPI):
                         new_fp = (new_token[-6:] if isinstance(new_token, str) else "")
                         logging.info("System token change detected; rotating WS token (..%s -> ..%s)", old_fp, new_fp)
                         ws_manager.reinit_with_token(new_token)
+                        server.mcp_kite_instance = build_kite_client(new_token, session_id="system")
+                        aggregator = getattr(app.state, "candle_aggregator", None)
+                        if aggregator and getattr(aggregator, "running", False):
+                            await aggregator.stop()
+                            await aggregator.start(
+                                access_token=new_token,
+                                intervals=list(getattr(aggregator, "intervals", []) or []),
+                                owner_scope=getattr(aggregator, "owner_scope", "all"),
+                                refresh_seconds=getattr(aggregator, "refresh_seconds", 30),
+                            )
+                        set_component_status("websocket_manager", "healthy", detail="WebSocket token rotated", meta={"token_suffix": new_fp})
                         last_token = new_token
                 except asyncio.CancelledError:
+                    set_component_status("system_token_watcher", "stopped", detail="Token watcher cancelled")
                     break
                 except Exception as e:
                     logging.error("Token watcher error: %s", e, exc_info=True)
+                    set_component_status("system_token_watcher", "degraded", detail=str(e))
                     # Continue watching
                     continue
 
@@ -294,6 +330,7 @@ async def combined_lifespan(app: FastAPI):
         if not daily_token_ready.is_set():
             daily_token_ready.set()
         logging.info("[GATE] Initialized and open at startup (will close at next 07:31 IST)")
+        set_meta("daily_token_gate", {"ready": True, "last_changed_at": datetime.utcnow().isoformat()})
         scheduler_task = asyncio.create_task(daily_token_scheduler())
 
         # Start AlertsEngine (Phase 0) after WS manager and async DB are ready
@@ -302,8 +339,10 @@ async def combined_lifespan(app: FastAPI):
             alerts_engine.start()
             app.state.alerts_engine = alerts_engine
             logging.info("AlertsEngine started (interval_ms=%s)", getattr(alerts_engine, "interval_ms", None))
+            set_component_status("alerts_engine", "healthy", detail="Alerts engine started")
         except Exception as e:
             logging.error("Failed to start AlertsEngine: %s", e, exc_info=True)
+            set_component_status("alerts_engine", "degraded", detail=str(e))
         
         # Start PositionProtectionEngine (Phase 1) after AlertsEngine
         try:
@@ -320,8 +359,10 @@ async def combined_lifespan(app: FastAPI):
             protection_engine.start()
             app.state.protection_engine = protection_engine
             logging.info("PositionProtectionEngine started (500ms interval)")
+            set_component_status("protection_engine", "healthy", detail="Position protection engine started")
         except Exception as e:
             logging.error("Failed to start PositionProtectionEngine: %s", e, exc_info=True)
+            set_component_status("protection_engine", "degraded", detail=str(e))
         
         # Initialize Phase 3: StrikeSelector and PositionBuilder
         try:
@@ -393,22 +434,33 @@ async def combined_lifespan(app: FastAPI):
                 )
                 logging.info("Candle Aggregator started successfully with all intervals")
                 app.state.candle_aggregator = aggregator
+                set_component_status("candle_aggregator", "healthy", detail="Candle aggregator started")
             else:
                 logging.info("Candle Aggregator already running")
+                set_component_status("candle_aggregator", "healthy", detail="Candle aggregator already running")
         except Exception as e:
             logging.error("Failed to start Candle Aggregator: %s", e, exc_info=True)
+            set_component_status("candle_aggregator", "degraded", detail=str(e))
     except Exception as e:
         logging.error(f"Failed to initialize MCP Kite instance or WebSocketManager: {e}", exc_info=True)
+        set_meta("daily_broker_login", {
+            "status": "degraded",
+            "last_error": str(e),
+            "last_failure_at": datetime.utcnow().isoformat(),
+        })
         # Depending on the desired behavior, you might want to exit the application
         # or proceed without a valid Kite instance for MCP.
         # For now, we'll log the error and continue.
         server.mcp_kite_instance = None
+
+    set_component_status("app", "healthy", detail="Application startup complete")
 
     async with mcp_app.lifespan(app):
         yield
     
     # Cleanup on shutdown
     # Cancel token watcher first
+    set_component_status("app", "stopping", detail="Application shutdown in progress")
     try:
         if 'token_watcher_task' in locals() and token_watcher_task:
             token_watcher_task.cancel()
@@ -434,6 +486,7 @@ async def combined_lifespan(app: FastAPI):
         if eng:
             await eng.stop()
             logging.info("AlertsEngine stopped.")
+            set_component_status("alerts_engine", "stopped", detail="Alerts engine stopped")
     except Exception:
         pass
     
@@ -443,6 +496,7 @@ async def combined_lifespan(app: FastAPI):
         if protection_eng:
             await protection_eng.stop()
             logging.info("PositionProtectionEngine stopped.")
+            set_component_status("protection_engine", "stopped", detail="Position protection engine stopped")
     except Exception:
         pass
 
@@ -453,6 +507,7 @@ async def combined_lifespan(app: FastAPI):
             logging.info("Stopping Candle Aggregator...")
             await aggregator.stop()
             logging.info("Candle Aggregator stopped.")
+            set_component_status("candle_aggregator", "stopped", detail="Candle aggregator stopped")
     except Exception as e:
         logging.error("Error stopping Candle Aggregator: %s", e, exc_info=True)
 
@@ -460,6 +515,9 @@ async def combined_lifespan(app: FastAPI):
         logging.info("Stopping WebSocketManager...")
         ws_manager.stop()
         logging.info("WebSocketManager stopped.")
+        set_component_status("websocket_manager", "stopped", detail="WebSocket manager stopped")
+
+    set_component_status("app", "stopped", detail="Application shutdown complete")
 
 
 app = FastAPI(title="Kite App API", lifespan=combined_lifespan, openapi_tags=OPENAPI_TAGS)
@@ -517,6 +575,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def app_auth_guard(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS" or not path.startswith("/api") or auth_exempt_path(path):
+        return await call_next(request)
+
+    user = get_optional_app_user(request)
+    if user is None:
+        return JSONResponse(status_code=401, content={"detail": "App authentication required"})
+
+    request.state.app_user = user
+    return await call_next(request)
+
 @app.get("/", tags=["System"])
 async def root():
     return {"message": "Welcome to Kite App API!"}
@@ -545,6 +617,7 @@ async def daily_token_scheduler() -> None:
       - Triggers dependent daily jobs (e.g., instruments refresh)
     """
     tz = ZoneInfo("Asia/Kolkata")
+    set_component_status("daily_token_scheduler", "healthy", detail="Daily token scheduler started")
     while True:
         try:
             now = datetime.now(tz)
@@ -553,15 +626,26 @@ async def daily_token_scheduler() -> None:
                 next_run += timedelta(days=1)
             sleep_sec = max(1, int((next_run - now).total_seconds()))
             logging.info("[SCHED] Next daily headless login scheduled at %s", next_run.strftime("%Y-%m-%d %H:%M:%S %Z%z"))
+            set_meta("daily_token_scheduler", {
+                "next_run": next_run.isoformat(),
+                "sleep_seconds": sleep_sec,
+                "last_heartbeat": datetime.utcnow().isoformat(),
+            })
+            heartbeat("daily_token_scheduler", detail="Scheduler sleeping until next run", meta={"next_run": next_run.isoformat()})
             await asyncio.sleep(sleep_sec)
 
             # Begin rotation
             logging.info("[SCHED] 07:31 IST reached; clearing gate and refreshing system token")
             daily_token_ready.clear()
+            set_meta("daily_token_gate", {"ready": False, "last_changed_at": datetime.utcnow().isoformat()})
+            set_component_status("daily_token_scheduler", "running", detail="Refreshing daily system token")
 
             # Retry loop until success
+            retry_count = 0
             while True:
                 try:
+                    retry_count += 1
+                    heartbeat("daily_token_scheduler", detail="Attempting headless broker login", meta={"attempt": retry_count})
                     db = SessionLocal()
                     try:
                         fp = run_headless_login_and_persist_system_token(db)
@@ -569,21 +653,43 @@ async def daily_token_scheduler() -> None:
                     finally:
                         db.close()
                     logging.info("[SCHED] System access_token rotated (..%s)", fp)
+                    set_meta("daily_broker_login", {
+                        "mode": "daily_scheduler",
+                        "status": "healthy",
+                        "last_success_at": datetime.utcnow().isoformat(),
+                        "attempts": retry_count,
+                        "token_suffix": fp,
+                    })
                     break
                 except Exception as e:
                     logging.warning("[SCHED] Headless login failed: %s; retrying in 30s", e)
+                    set_component_status("daily_token_scheduler", "degraded", detail=f"Headless login failed: {e}", meta={"attempt": retry_count})
+                    set_meta("daily_broker_login", {
+                        "mode": "daily_scheduler",
+                        "status": "degraded",
+                        "last_error": str(e),
+                        "last_failure_at": datetime.utcnow().isoformat(),
+                        "attempts": retry_count,
+                    })
                     await asyncio.sleep(30)
 
             # Open gate
             daily_token_ready.set()
             logging.info("[GATE] Opened after successful token refresh")
+            set_meta("daily_token_gate", {"ready": True, "last_changed_at": datetime.utcnow().isoformat()})
+            set_component_status("daily_token_scheduler", "healthy", detail="Daily token refresh completed")
 
             # Kick off dependent daily jobs (fire-and-forget)
             # No dependent jobs for token refresh; other schedulers handle their own updates.
 
         except asyncio.CancelledError:
             logging.info("[SCHED] Daily token scheduler cancelled")
+            if not daily_token_ready.is_set():
+                daily_token_ready.set()
+                set_meta("daily_token_gate", {"ready": True, "last_changed_at": datetime.utcnow().isoformat()})
+            set_component_status("daily_token_scheduler", "stopped", detail="Daily token scheduler cancelled")
             break
         except Exception as e:
             logging.error("[SCHED] Scheduler loop error: %s", e, exc_info=True)
+            set_component_status("daily_token_scheduler", "degraded", detail=str(e))
             await asyncio.sleep(30)

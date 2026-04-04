@@ -21,8 +21,8 @@ from sqlalchemy import text
 from .candle_storage import CandleStorage, IST
 from .candle_aggregator import get_aggregator, SUPPORTED_INTERVALS
 from .candle_ingestion import CandleIngestion, IngestionScheduler
-from .kite_auth import get_kite, API_KEY
-from .kite_orders import KiteSession
+from .kite_auth import API_KEY
+from .kite_session import KiteSession, build_kite_client
 from .instruments_repository import InstrumentsRepository
 from database import get_db, get_db_connection
 
@@ -122,7 +122,7 @@ class DBCandlesResponse(BaseModel):
 
 # ===== Authentication =====
 
-def get_kite_db(db: Session = Depends(get_db)) -> KiteConnect:
+async def get_kite_db(db: Session = Depends(get_db)) -> KiteConnect:
     """
     Dependency to get a KiteConnect instance initialized with the system access token from the database.
     """
@@ -135,10 +135,9 @@ def get_kite_db(db: Session = Depends(get_db)) -> KiteConnect:
     access_token = system_session.access_token
 
     try:
-        kite = KiteConnect(api_key=API_KEY)
-        kite.set_access_token(access_token)
+        kite = build_kite_client(access_token, session_id="system")
         # Test call to verify credentials
-        kite.profile()
+        await asyncio.to_thread(kite.profile)
         return kite
     except Exception as e:
         logger.error(f"Failed to initialize KiteConnect or verify credentials with system token: {e}")

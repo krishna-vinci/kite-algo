@@ -1,113 +1,150 @@
-<script>
+<script lang="ts">
 	import { onMount } from 'svelte';
-	import { apiFetch, getApiBase, setSessionId, clearSessionId } from '$lib/api';
+	import { goto } from '$app/navigation';
+	import { apiFetch, clearSessionId, setSessionId } from '$lib/api';
 
-	// State variables
-	let isLoggedIn = false;
+	type SessionStatus = {
+		app?: { authenticated?: boolean; user?: { username: string; role: string } | null };
+		broker?: { connected?: boolean };
+	};
+
+	let appAuthenticated = false;
+	let brokerConnected = false;
 	let userName = '';
+	let brokerName = '';
 	let isLoading = false;
+	let errorMessage = '';
 
-	// API base URL resolved dynamically for cross-device access
-	const API_BASE_URL = getApiBase();
-
-	// Check login status on component mount
 	onMount(async () => {
-		checkLoginStatus();
+		await refreshStatus();
 	});
 
-	// Check if user is logged in by checking for session cookie/header session
-	async function checkLoginStatus() {
+	async function refreshStatus() {
 		try {
-			const response = await apiFetch(`/api/profile_kite`);
-
-			if (response.ok) {
-				const profile = await response.json();
-				isLoggedIn = true;
-				userName = profile.user_shortname || profile.user_name || profile.email || 'User';
-			} else {
-				isLoggedIn = false;
-				userName = '';
+			const res = await apiFetch('/api/auth/session-status');
+			if (res.ok) {
+				const data = (await res.json()) as SessionStatus;
+				appAuthenticated = !!data?.app?.authenticated;
+				userName = data?.app?.user?.username || '';
+				brokerConnected = !!data?.broker?.connected;
+				if (appAuthenticated) {
+					await refreshBrokerProfile();
+				}
+				return;
 			}
 		} catch (error) {
-			isLoggedIn = false;
-			userName = '';
+			console.error('Failed to refresh auth status', error);
+		}
+		appAuthenticated = false;
+		brokerConnected = false;
+		userName = '';
+		brokerName = '';
+	}
+
+	async function refreshBrokerProfile() {
+		try {
+			const response = await apiFetch('/api/profile_kite');
+			if (response.ok) {
+				const profile = await response.json();
+				brokerConnected = true;
+				brokerName = profile.user_shortname || profile.user_name || profile.email || 'Broker connected';
+			} else {
+				brokerConnected = false;
+				brokerName = '';
+			}
+		} catch {
+			brokerConnected = false;
+			brokerName = '';
 		}
 	}
 
-	// Login function
-	async function login() {
+	async function appLogout() {
 		isLoading = true;
 		try {
-			const response = await apiFetch(`/api/login_kite`, {
-				method: 'POST'
-			});
-
-			if (response.ok) {
-				const data = await response.json();
-				// Store session_id so subsequent requests include X-Session-ID header (dev-friendly across devices)
-				if (data?.session_id) {
-					setSessionId(data.session_id);
-				}
-				isLoggedIn = true;
-				userName =
-					data.profile?.user_shortname || data.profile?.user_name || data.profile?.email || 'User';
-			} else {
-				console.error('Login failed:', response.status);
-			}
-		} catch (error) {
-			console.error('Login error:', error);
+			await apiFetch('/api/auth/logout', { method: 'POST' });
+			clearSessionId();
+			appAuthenticated = false;
+			brokerConnected = false;
+			userName = '';
+			brokerName = '';
+			await goto('/login');
 		} finally {
 			isLoading = false;
 		}
 	}
 
-	// Logout function
-	async function logout() {
+	async function brokerLogin() {
+		isLoading = true;
+		errorMessage = '';
+		try {
+			const response = await apiFetch('/api/login_kite', { method: 'POST' });
+			if (!response.ok) {
+				errorMessage = 'Broker connect failed';
+				return;
+			}
+			const data = await response.json();
+			if (data?.session_id) {
+				setSessionId(data.session_id);
+			}
+			brokerConnected = true;
+			brokerName =
+				data.profile?.user_shortname || data.profile?.user_name || data.profile?.email || 'Broker connected';
+		} catch (error) {
+			console.error('Broker login error', error);
+			errorMessage = 'Broker connect failed';
+		} finally {
+			isLoading = false;
+		}
+	}
+
+	async function brokerLogout() {
 		isLoading = true;
 		try {
-			const response = await apiFetch(`/api/logout_kite`, {
-				method: 'POST'
-			});
-
-			if (response.ok) {
-				// Clear header-based session fallback
-				clearSessionId();
-				isLoggedIn = false;
-				userName = '';
-			} else {
-				console.error('Logout failed:', response.status);
-			}
-		} catch (error) {
-			console.error('Logout error:', error);
+			await apiFetch('/api/logout_kite', { method: 'POST' });
+			clearSessionId();
+			brokerConnected = false;
+			brokerName = '';
 		} finally {
 			isLoading = false;
 		}
 	}
 </script>
 
-<div class="flex items-center space-x-2">
-	{#if isLoggedIn}
-		<div class="flex items-center space-x-2">
-			<span class="text-foreground font-medium">Hello, {userName}</span>
+<div class="flex items-center gap-2 text-sm">
+	{#if appAuthenticated}
+		<div class="flex flex-col items-end leading-tight">
+			<span class="font-medium text-foreground">App: {userName}</span>
+			<span class={brokerConnected ? 'text-emerald-600' : 'text-amber-600'}>
+				Broker: {brokerConnected ? brokerName || 'connected' : 'not connected'}
+			</span>
+		</div>
+		{#if brokerConnected}
 			<button
-				on:click={logout}
-				class="bg-destructive hover:bg-destructive/90 text-white px-3 py-1.5 text-sm rounded-md transition-colors duration-200 disabled:opacity-50"
+				on:click={brokerLogout}
+				class="rounded-md border px-3 py-1.5"
 				disabled={isLoading}
 			>
-				{isLoading ? 'Logging out...' : 'Logout'}
+				Disconnect Broker
 			</button>
-		</div>
-	{:else}
+		{:else}
+			<button
+				on:click={brokerLogin}
+				class="rounded-md bg-primary px-3 py-1.5 text-primary-foreground"
+				disabled={isLoading}
+			>
+				Connect Broker
+			</button>
+		{/if}
 		<button
-			on:click={login}
-			class="bg-primary hover:bg-primary/90 text-primary-foreground px-3 py-1.5 text-sm rounded-md transition-colors duration-200 disabled:opacity-50"
+			on:click={appLogout}
+			class="rounded-md bg-destructive px-3 py-1.5 text-white"
 			disabled={isLoading}
 		>
-			{isLoading ? 'Logging in...' : 'Login'}
+			App Logout
 		</button>
 	{/if}
 </div>
 
-<style>
-	/* Add any additional styling here if needed */
-</style>
+{#if errorMessage}
+	<div class="mt-1 text-xs text-destructive">{errorMessage}</div>
+{/if}

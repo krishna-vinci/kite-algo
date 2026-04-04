@@ -14,7 +14,7 @@ from kiteconnect import KiteConnect
 from pydantic import BaseModel
 
 from broker_api.broker_api import get_kite
-from broker_api.kite_orders import realtime_positions_service
+from broker_api.kite_orders import get_correlation_id, realtime_positions_service, run_kite_write_action
 from database import get_db_connection
 from .models import (
     CreateProtectionRequest,
@@ -161,8 +161,6 @@ def _create_position_snapshot(positions: List[dict]) -> List[PositionSnapshot]:
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
-
-router = APIRouter(tags=["Strategies"])
 
 
 @router.post("/protection", response_model=ProtectionStrategyResponse)
@@ -1129,7 +1127,8 @@ async def suggest_strikes(
 async def build_position(
     req: BuildPositionRequest,
     request: Request,
-    kite: KiteConnect = Depends(get_kite)
+    kite: KiteConnect = Depends(get_kite),
+    corr_id: str = Depends(get_correlation_id),
 ):
     """
     Build position with optional protection strategy.
@@ -1184,32 +1183,39 @@ async def build_position(
         for order in plan['orders']:
             try:
                 # Place order via Kite
-                order_id = kite.place_order(
-                    variety=kite.VARIETY_REGULAR,
-                    exchange=kite.EXCHANGE_NFO,
-                    tradingsymbol=order['tradingsymbol'],
-                    transaction_type=order['transaction_type'],
-                    quantity=order['quantity'],
-                    product=kite.PRODUCT_MIS,
-                    order_type=kite.ORDER_TYPE_MARKET
+                order_id = await run_kite_write_action(
+                    "indexstoploss_place_order",
+                    corr_id,
+                    lambda _order=order: kite.place_order(
+                        variety=kite.VARIETY_REGULAR,
+                        exchange=kite.EXCHANGE_NFO,
+                        tradingsymbol=_order['tradingsymbol'],
+                        transaction_type=_order['transaction_type'],
+                        quantity=_order['quantity'],
+                        product=kite.PRODUCT_MIS,
+                        order_type=kite.ORDER_TYPE_MARKET,
+                    ),
+                    meta={"strategy_type": req.strategy_type, "underlying": req.underlying, "tradingsymbol": order['tradingsymbol']},
                 )
-                
-                orders_placed.append({
-                    "order_id": order_id,
-                    "tradingsymbol": order['tradingsymbol'],
-                    "transaction_type": order['transaction_type'],
-                    "quantity": order['quantity'],
-                    "status": "placed"
-                })
-                
-                logger.info(f"Order placed: {order_id} for {order['tradingsymbol']}")
-                
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Failed to place order for {order['tradingsymbol']}: {e}")
                 orders_failed.append({
                     "tradingsymbol": order['tradingsymbol'],
                     "error": str(e)
                 })
+                continue
+
+            orders_placed.append({
+                "order_id": order_id,
+                "tradingsymbol": order['tradingsymbol'],
+                "transaction_type": order['transaction_type'],
+                "quantity": order['quantity'],
+                "status": "placed"
+            })
+
+            logger.info(f"Order placed: {order_id} for {order['tradingsymbol']}")
         
         # If all orders failed, return error
         if not orders_placed:
@@ -1261,7 +1267,8 @@ async def build_position(
 @router.get("/positions/realtime-summary")
 async def get_realtime_positions_summary(
     request: Request,
-    kite: KiteConnect = Depends(get_kite)
+    kite: KiteConnect = Depends(get_kite),
+    corr_id: str = Depends(get_correlation_id),
 ):
     """
     Get real-time positions with PnL calculated using:
@@ -1276,12 +1283,12 @@ async def get_realtime_positions_summary(
             raise HTTPException(401, "Session ID required")
         
         # Get positions from real-time service
-        positions = await realtime_positions_service.get_positions(sid, "indexstoploss")
+        positions = await realtime_positions_service.get_positions(sid, corr_id)
         
         # If no positions in cache, initialize from Kite API
         if not positions:
             logger.info("No cached positions, initializing from Kite API")
-            positions = await realtime_positions_service.initialize_positions(kite, sid, "indexstoploss")
+            positions = await realtime_positions_service.initialize_positions(kite, sid, corr_id)
         
         # Calculate summary
         total_pnl = sum(pos.pnl for pos in positions.values())

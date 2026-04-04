@@ -1,6 +1,6 @@
 OPENAPI_TAGS = [
-    {"name": "System", "description": "Core system and root endpoints."},
-    {"name": "Authentication", "description": "Kite login, logout, profile, holdings, and margins."},
+    {"name": "System", "description": "Core system, runtime status, scheduler health, and log endpoints."},
+    {"name": "Authentication", "description": "App JWT auth plus Kite broker login, logout, profile, holdings, and margins."},
     {"name": "Market Data", "description": "Live quotes, LTP, and OHLC endpoints."},
     {"name": "Instruments", "description": "Instrument import, search, enrichment, and Meilisearch operations."},
     {"name": "Historical Data", "description": "Historical candle backfills and sync progress endpoints."},

@@ -68,9 +68,10 @@ historical_data_update_progress = {
 from sqlalchemy import Column, String, DateTime, inspect
 from sqlalchemy.orm import Session
 
-from fastapi import APIRouter, Depends, Response, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, Response, HTTPException, Request, Query, Body
 
 from .kite_auth import login_headless
+from .kite_session import KiteSession, build_kite_client, get_kite, get_system_access_token, upsert_kite_session
 from kiteconnect import KiteConnect
 from database import SessionLocal, Base
 from fastapi import WebSocket, WebSocketDisconnect
@@ -126,7 +127,7 @@ import uuid
 from database import SessionLocal  # Your DB session factory
 from database import FyersSession
 
-from broker_api.kite_auth import login_headless, get_kite
+from broker_api.kite_auth import login_headless
 from broker_api.kite_auth import API_KEY
 from . import kite_orders
 from . import options_router
@@ -197,33 +198,6 @@ from database import database
 sessions: Dict[str, str] = {}
 
 # ───────── ORM MODELS ─────────
-
-class KiteSession(Base):
-    __tablename__ = "kite_sessions"
-    session_id    = Column(String(36), primary_key=True, index=True)
-    access_token  = Column(String, nullable=False)
-    created_at    = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-# ---- Centralized helpers for system token (DB is source of truth) ----
-def upsert_kite_session(db: Session, session_id: str, access_token: str) -> "KiteSession":
-    """
-    If a KiteSession with session_id exists, update access_token and created_at=now().
-    Else insert a new row. Caller is responsible for commit.
-    """
-    obj = db.query(KiteSession).filter_by(session_id=session_id).first()
-    now_dt = datetime.utcnow()
-    if obj:
-        obj.access_token = access_token
-        obj.created_at = now_dt
-        return obj
-    obj = KiteSession(session_id=session_id, access_token=access_token, created_at=now_dt)
-    db.add(obj)
-    return obj
-
-def get_system_access_token(db: Session) -> Optional[str]:
-    """Return access_token for session_id == 'system' if exists, else None."""
-    ks = db.query(KiteSession).filter_by(session_id="system").first()
-    return ks.access_token if ks else None
 
 def run_headless_login_and_persist_system_token(db: Session) -> str:
     """
@@ -815,8 +789,7 @@ async def sync_and_reindex_orchestrator(
                     logger.warning("No system access token found for instrument refresh. Skipping.")
                     refreshed_count = 0
                 else:
-                    kite_instance = KiteConnect(api_key=API_KEY)
-                    kite_instance.set_access_token(access_token)
+                    kite_instance = build_kite_client(access_token, session_id="system")
                     
                     # Call import_all_instruments directly
                     refresh_results = await import_all_instruments(kite_instance)
@@ -866,24 +839,6 @@ async def sync_and_reindex_orchestrator(
 
 ######kite
 
-# ─────────── Helper to load Kite client ───────────
-def get_kite(request: Request, db: Session = Depends(get_db)) -> KiteConnect:
-    # Support session via header (for dev cross-origin) or cookie
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
-    if not sid:
-        raise HTTPException(401, "Not authenticated; login first")
-    ks = db.query(KiteSession).filter_by(session_id=sid).first()
-    if not ks:
-        raise HTTPException(401, "Invalid session")
-    kite = KiteConnect(api_key=API_KEY)
-    kite.set_access_token(ks.access_token)
-    return kite
-
-
-
-
-
-
 # ─────────── Login endpoint ───────────
 @router.post("/login_kite")
 def headless_login(request: Request, response: Response, db: Session = Depends(get_db)):
@@ -897,7 +852,7 @@ def headless_login(request: Request, response: Response, db: Session = Depends(g
         raise HTTPException(500, f"An unexpected error occurred: {e}")
 
     sid = str(uuid.uuid4())
-    db.add(KiteSession(session_id=sid, access_token=at))
+    upsert_kite_session(db, sid, at)
     db.commit()
 
     # Also persist/refresh system token so app startup and jobs use a consistent source
@@ -919,10 +874,11 @@ def headless_login(request: Request, response: Response, db: Session = Depends(g
         httponly=True,
         secure=is_secure,
         samesite="none" if is_secure else "lax",
+        path="/",
     )
 
     # Also return session_id so the frontend can send it in the X-Session-ID header (dev-friendly)
-    return {"session_id": sid, "access_token": at, "profile": kite.profile()}
+    return {"session_id": sid, "profile": kite.profile(), "authenticated": True}
 
 
 # ─────────── Logout endpoint ───────────
@@ -932,7 +888,7 @@ def logout(response: Response, request: Request, db: Session = Depends(get_db)):
     if sid:
         db.query(KiteSession).filter_by(session_id=sid).delete()
         db.commit()
-    response.delete_cookie("kite_session_id")
+    response.delete_cookie("kite_session_id", path="/")
     return {"message": "Logged out"}
 
 
@@ -1123,9 +1079,8 @@ async def import_instruments_for_exchange(exchange: str, kite: KiteConnect):
 
 # ─────────── Instruments endpoints ───────────
 
-@router.post("/import_instruments/all")
 async def import_all_instruments(kite: KiteConnect = Depends(get_kite)):
-    """Import all instruments from major exchanges"""
+    """Import all instruments from major exchanges for internal maintenance flows."""
     exchanges = ["NSE", "NFO", "BSE", "BFO", "MCX"]
     results = []
     
@@ -1137,47 +1092,6 @@ async def import_all_instruments(kite: KiteConnect = Depends(get_kite)):
             results.append({"exchange": exchange, "error": str(e)})
     
     return {"message": "Imported all instruments", "results": results}
-
-@router.get("/instruments/nse")
-async def get_nse_instruments():
-    """Get NSE equity instruments"""
-    query = "SELECT * FROM kite_instruments WHERE exchange = 'NSE' AND instrument_type = 'EQ' ORDER BY tradingsymbol"
-    results = await database.fetch_all(query)
-    return results
-
-@router.get("/instruments/nfo")
-async def get_nfo_instruments():
-    """Get NFO instruments"""
-    query = "SELECT * FROM kite_instruments WHERE exchange = 'NFO' ORDER BY tradingsymbol"
-    results = await database.fetch_all(query)
-    return results
-
-@router.get("/instruments/commodity")
-async def get_commodity_instruments():
-    """Get commodity instruments"""
-    query = "SELECT * FROM kite_instruments WHERE exchange IN ('MCX', 'BFO') ORDER BY tradingsymbol"
-    results = await database.fetch_all(query)
-    return results
-
-@router.get("/instruments/search/{symbol}")
-async def search_instruments(symbol: str):
-    """Search instruments by symbol"""
-    query = "SELECT * FROM kite_instruments WHERE tradingsymbol ILIKE :symbol ORDER BY tradingsymbol"
-    results = await database.fetch_all(query, {"symbol": f"%{symbol}%"})
-    return results
-
-@router.post("/instruments/meili/reindex")
-async def trigger_meilisearch_reindex():
-    """
-    Triggers a full reindex of instruments into Meilisearch.
-    """
-    logger.info("Meilisearch reindex endpoint triggered.")
-    try:
-        stats = await meili_reindex_instruments()
-        return {"status": "success", "message": "Meilisearch reindex initiated.", "stats": stats}
-    except Exception as e:
-        logger.error(f"Error triggering Meilisearch reindex: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to trigger Meilisearch reindex: {e}")
 
 @router.get("/instruments/meili/health")
 async def get_meilisearch_health():
@@ -1277,20 +1191,6 @@ async def _parse_and_backfill_underlying(session: Session, only_nulls: bool = Tr
         session.rollback()
         logger.error(f"Error during underlying and option_type backfill: {e}", exc_info=True)
         raise e # Re-raise to be handled by the calling endpoint
-
-@router.post("/instruments/populate-underlying")
-async def populate_underlying_and_option_type(db: Session = Depends(get_db)):
-    """
-    [DEPRECATED] Populates the 'underlying' and 'option_type' columns in the 'kite_instruments' table
-    for records where 'underlying' is NULL. Designed for a one-time data backfill.
-    Please use /api/instruments/sync-and-reindex for unified maintenance operations.
-    """
-    logger.info("Deprecated /api/instruments/populate-underlying endpoint called. Redirecting to helper.")
-    try:
-        counts = await _parse_and_backfill_underlying(db, only_nulls=True)
-        return {"message": "Underlying and option_type populated successfully", **counts}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error populating underlying and option_type: {e}")
 
 async def sql_fallback_fuzzy_search(query: str, limit: int = 50, parsed: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
@@ -1482,8 +1382,7 @@ async def get_anchor_price_for_underlying(underlying_symbol: str) -> Optional[fl
             logger.warning(f"No system access token found for LTP fetch of {underlying_symbol}")
             return None
 
-        kite = KiteConnect(api_key=API_KEY)
-        kite.set_access_token(access_token)
+        kite = build_kite_client(access_token, session_id="system")
         
         # Set a short timeout to avoid blocking the search request for too long
         kite.set_timeout(5)
@@ -1507,7 +1406,7 @@ async def get_anchor_price_for_underlying(underlying_symbol: str) -> Optional[fl
 
 
 class SyncAndReindexRequest(BaseModel):
-    refresh_from_broker: bool = False
+    refresh_from_broker: bool = True
     backfill_only_nulls: bool = True
     reindex: bool = True
 
@@ -1516,15 +1415,18 @@ class SyncAndReindexRequest(BaseModel):
     # underlying/option_type for current DB records and reindexes Meilisearch.
 @router.post("/instruments/sync-and-reindex")
 async def sync_and_reindex_instruments(
-    request: SyncAndReindexRequest,
     background_tasks: BackgroundTasks,
+    request: Optional[SyncAndReindexRequest] = Body(default=None),
     db: Session = Depends(get_db),
     # kite: KiteConnect = Depends(get_kite) # KiteConnect instance is handled internally by orchestrator for refresh
 ):
     """
-    Orchestrates optional instrument refresh, backfill of underlying/option_type, and Meilisearch reindex.
+    Orchestrates instrument refresh from broker, backfill of underlying/option_type, and Meilisearch reindex.
+
+    If the request body is omitted, this performs the full maintenance flow by default.
     """
     try:
+        request = request or SyncAndReindexRequest()
         # Delegate to the centralized orchestrator
         results = await sync_and_reindex_orchestrator(
             session=db,
