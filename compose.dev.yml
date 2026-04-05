@@ -173,7 +173,6 @@ services:
       NODE_ENV: development
       VITE_API_TARGET: http://finance-app:8777
       VITE_MARKET_RUNTIME_TARGET: http://market-runtime:8780
-      VITE_MARKET_RUNTIME_WS_URL: ws://localhost:18780/ws/marketwatch
     command:
       - npm
       - run

@@ -51,13 +51,25 @@ function createMarketwatchStore() {
 			// SSR fallback - should not be called in SSR
 			return 'ws://localhost:5173/ws/marketwatch';
 		}
-		const runtimeWs = import.meta.env.VITE_MARKET_RUNTIME_WS_URL as string | undefined;
-		if (runtimeWs) {
-			return runtimeWs;
-		}
+
 		const loc = window.location;
 		const wsProto = loc.protocol === 'https:' ? 'wss' : 'ws';
-		return `${wsProto}://${loc.host}/ws/marketwatch`;
+		const sameHostRuntimeUrl = `${wsProto}://${loc.host}/ws/marketwatch`;
+		const isLocalBrowserHost = ['localhost', '127.0.0.1'].includes(loc.hostname);
+		const runtimeWs = import.meta.env.VITE_MARKET_RUNTIME_WS_URL as string | undefined;
+		if (runtimeWs) {
+			try {
+				const parsed = new URL(runtimeWs);
+				const isLocalRuntimeHost = ['localhost', '127.0.0.1'].includes(parsed.hostname);
+				if (!isLocalBrowserHost && isLocalRuntimeHost) {
+					return sameHostRuntimeUrl;
+				}
+				return runtimeWs;
+			} catch {
+				return sameHostRuntimeUrl;
+			}
+		}
+		return sameHostRuntimeUrl;
 	}
 
 	// Send action safely when connected, or queue until connection opens
