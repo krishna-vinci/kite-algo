@@ -105,11 +105,7 @@ Do not use this file for frontend work.
   - `mf_orders` ✅ returned empty list for current account
   - `mf_sips` ✅ returned empty list for current account
 - Tightened `MFInstrument` model using live provider fields (`plan`, `scheme_type`, `settlement_type`, `dividend_type`, `last_price`, `last_price_date`)
-- Replaced Meilisearch-backed instrument suggestions with a PostgreSQL `pg_trgm` search path:
-  - added `instruments_search_index` plus trigram/filter indexes
-  - added Alembic migration `20260405_000002_pg_trgm_search_index.py` for existing deployments
-  - `/api/instruments/fuzzy-search` now uses parser-driven PostgreSQL ranking with a base SQL fallback
-  - compose no longer requires a Meilisearch service for backend instrument search
+- Evaluated a PostgreSQL `pg_trgm` search migration for instruments, but rejected it because duplicating search state inside Postgres increased DB footprint and risked competing with order/runtime workloads
 - Reduced FastAPI startup memory pressure by removing or lazy-loading heavyweight imports that were not needed at app boot (`pandas`, `numpy`, `yfinance`, `scipy`, chart-only modules)
 
 ## Skill usage
@@ -213,27 +209,23 @@ Authoritative docs:
 ---
 
 ### 5) Instrument search + backend startup efficiency
-Status: **PostgreSQL `pg_trgm` migration implemented; broker-query ranking verification still needed**
+Status: **Meilisearch remains active; alternate search engine evaluation is deferred**
 
 Current behavior:
 
-- instrument suggestions no longer depend on Meilisearch at runtime
-- PostgreSQL now owns broker-style fuzzy search via `pg_trgm`, `instruments_search_index`, parser-derived filters, and explicit ranking
-- search bootstrap runs during app startup to ensure the search index table is populated when instrument source rows already exist
-- `/api/instruments/search/health` reports PostgreSQL search-index status; `/api/instruments/meili/health` is currently retained as a backward-compatible alias
-- a plain SQL fallback remains available if the trigram-backed path is unavailable or misconfigured
+- instrument suggestions still run through Meilisearch while search-engine replacement is evaluated
+- PostgreSQL should remain focused on canonical backend data (orders, positions, runtime state, etc.) and should not host a duplicated search index for instruments
 - FastAPI startup no longer eagerly imports several heavy data/chart packages that are not needed for most requests
 
 Remaining work:
 
 - verify top broker-style query ordering against real expected results (`nifty`, `bank nifty`, strike + CE/PE flows, common typos)
-- tune ranking/alias logic if Swagger/manual validation shows regressions versus previous Meilisearch behavior
-- consider follow-up cleanup to remove now-dead Meilisearch helper code and obsolete environment variables once rollout confidence is high
+- if search-engine evaluation resumes later, require a measured RAM win and acceptable broker-style ranking before replacing Meilisearch
 
 Expected operational effect:
 
-- removes the separate Meilisearch container memory footprint from normal backend deployments
 - reduces FastAPI baseline RSS by avoiding unnecessary scientific/chart imports at startup
+- keeps Postgres isolated from instrument-search experiments so order/runtime workloads stay unaffected
 
 ---
 

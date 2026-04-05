@@ -104,8 +104,7 @@ from sqlalchemy import (
     Numeric,
     DateTime,
     Table,
-    select,
-    text
+    select
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -339,15 +338,11 @@ async def _startup():
 
     await database.connect()
     
-    # Ensure PostgreSQL instrument search index is ready for standalone router startup.
+    # Ensure Meilisearch index is set up
     try:
-        session = SessionLocal()
-        try:
-            ensure_instruments_search_index(session)
-        finally:
-            session.close()
+        ensure_instruments_index()
     except Exception as e:
-        logger.error(f"Failed to ensure PostgreSQL instrument search index on startup: {e}", exc_info=True)
+        logger.error(f"Failed to ensure Meilisearch index on startup: {e}", exc_info=True)
     
     # Daily instruments update scheduling is managed by main; no internal scheduler here
 
@@ -540,275 +535,33 @@ def ensure_instruments_index():
         logger.error(f"Error applying Meilisearch index settings: {e}", exc_info=True)
 
 
-def rebuild_instruments_search_index(session: Session) -> Dict[str, int]:
-    """Rebuild the PostgreSQL-backed instrument search index from source tables."""
-    session.execute(text("DELETE FROM public.instruments_search_index"))
-    session.execute(
-        text(
-            """
-            WITH base AS (
-                SELECT
-                    instrument_token,
-                    exchange_token,
-                    tradingsymbol,
-                    name,
-                    last_price,
-                    expiry,
-                    strike,
-                    tick_size,
-                    lot_size,
-                    instrument_type,
-                    segment,
-                    exchange,
-                    underlying,
-                    option_type,
-                    last_updated
-                FROM public.kite_instruments
-                UNION ALL
-                SELECT
-                    instrument_token,
-                    exchange_token,
-                    tradingsymbol,
-                    name,
-                    last_price,
-                    expiry,
-                    strike,
-                    tick_size,
-                    lot_size,
-                    instrument_type,
-                    segment,
-                    exchange,
-                    NULL::VARCHAR(255) AS underlying,
-                    NULL::VARCHAR(10) AS option_type,
-                    last_updated
-                FROM public.kite_indices
-            ),
-            normalized AS (
-                SELECT
-                    instrument_token,
-                    exchange_token,
-                    tradingsymbol,
-                    name,
-                    last_price,
-                    expiry,
-                    strike,
-                    tick_size,
-                    lot_size,
-                    CASE
-                        WHEN upper(coalesce(segment, '')) = 'INDICES' THEN 'INDEX'
-                        ELSE instrument_type
-                    END AS instrument_type,
-                    CASE
-                        WHEN upper(coalesce(segment, '')) = 'INDICES' THEN 'INDICES'
-                        ELSE segment
-                    END AS segment,
-                    exchange,
-                    CASE
-                        WHEN upper(coalesce(segment, '')) = 'INDICES' THEN
-                            CASE
-                                WHEN position('BANK' IN upper(coalesce(tradingsymbol, ''))) > 0 THEN 'BANKNIFTY'
-                                WHEN position('FINNIFTY' IN upper(coalesce(tradingsymbol, ''))) > 0 THEN 'FINNIFTY'
-                                WHEN position('SENSEX' IN upper(coalesce(tradingsymbol, ''))) > 0 THEN 'SENSEX'
-                                WHEN position('NIFTY' IN upper(coalesce(tradingsymbol, ''))) > 0 THEN 'NIFTY'
-                                ELSE regexp_replace(split_part(upper(coalesce(tradingsymbol, '')), ' ', 1), '[^A-Z0-9]', '', 'g')
-                            END
-                        ELSE upper(coalesce(underlying, ''))
-                    END AS underlying,
-                    CASE
-                        WHEN upper(coalesce(segment, '')) = 'INDICES' THEN NULL
-                        ELSE option_type
-                    END AS option_type,
-                    last_updated
-                FROM base
-            ),
-            enriched AS (
-                SELECT
-                    instrument_token,
-                    exchange_token,
-                    tradingsymbol,
-                    name,
-                    last_price,
-                    expiry,
-                    strike,
-                    tick_size,
-                    lot_size,
-                    instrument_type,
-                    segment,
-                    exchange,
-                    underlying,
-                    option_type,
-                    last_updated,
-                    CASE
-                        WHEN instrument_type IN ('CE', 'PE') OR option_type IN ('CE', 'PE') THEN 'OPT'
-                        WHEN instrument_type = 'FUT' THEN 'FUT'
-                        ELSE 'NONE'
-                    END AS derivative_kind,
-                    CASE WHEN expiry IS NOT NULL THEN extract(epoch FROM (expiry::timestamp AT TIME ZONE 'UTC'))::BIGINT END AS expiry_ts,
-                    CASE WHEN expiry IS NOT NULL THEN extract(year FROM expiry)::INTEGER END AS expiry_year,
-                    CASE WHEN expiry IS NOT NULL THEN extract(month FROM expiry)::INTEGER END AS expiry_month,
-                    CASE WHEN expiry IS NOT NULL THEN to_char(expiry, 'DD-Mon-YYYY') END AS expiry_label,
-                    CASE
-                        WHEN segment = 'INDICES' OR instrument_type = 'INDEX' THEN 1
-                        WHEN instrument_type = 'FUT' THEN 2
-                        WHEN instrument_type = 'EQ' AND option_type IS NULL THEN 3
-                        WHEN option_type IN ('CE', 'PE') THEN 4
-                        ELSE 9
-                    END AS type_rank,
-                    CASE
-                        WHEN position('BANKNIFTY' IN upper(coalesce(underlying, ''))) > 0 OR position('BANK' IN upper(coalesce(underlying, ''))) > 0 THEN 100
-                        WHEN position('FINNIFTY' IN upper(coalesce(underlying, ''))) > 0 THEN 100
-                        WHEN position('SENSEX' IN upper(coalesce(underlying, ''))) > 0 THEN 100
-                        WHEN position('NIFTY' IN upper(coalesce(underlying, ''))) > 0 THEN 100
-                        ELSE 0
-                    END AS boost_score,
-                    ARRAY_REMOVE(
-                        ARRAY_REMOVE(
-                            ARRAY[
-                                upper(coalesce(tradingsymbol, '')),
-                                upper(coalesce(name, '')),
-                                upper(coalesce(underlying, '')),
-                                CASE WHEN position('BANKNIFTY' IN upper(coalesce(underlying, ''))) > 0 OR position('BANK' IN upper(coalesce(underlying, ''))) > 0 THEN 'BANKNIFTY' END,
-                                CASE WHEN position('BANKNIFTY' IN upper(coalesce(underlying, ''))) > 0 OR position('BANK' IN upper(coalesce(underlying, ''))) > 0 THEN 'NIFTY BANK' END,
-                                CASE WHEN position('BANKNIFTY' IN upper(coalesce(underlying, ''))) > 0 OR position('BANK' IN upper(coalesce(underlying, ''))) > 0 THEN 'BANK NIFTY' END,
-                                CASE WHEN position('FINNIFTY' IN upper(coalesce(underlying, ''))) > 0 THEN 'FINNIFTY' END,
-                                CASE WHEN position('FINNIFTY' IN upper(coalesce(underlying, ''))) > 0 THEN 'FIN NIFTY' END,
-                                CASE WHEN position('SENSEX' IN upper(coalesce(underlying, ''))) > 0 THEN 'SENSEX' END,
-                                CASE WHEN position('NIFTY' IN upper(coalesce(underlying, ''))) > 0 THEN 'NIFTY' END,
-                                CASE WHEN position('NIFTY' IN upper(coalesce(underlying, ''))) > 0 THEN 'NIFTY 50' END,
-                                CASE WHEN position('NIFTY' IN upper(coalesce(underlying, ''))) > 0 THEN 'NIFTY50' END
-                            ],
-                            NULL
-                        ),
-                        ''
-                    ) AS aliases
-                FROM normalized
-            )
-            INSERT INTO public.instruments_search_index (
-                instrument_token,
-                exchange_token,
-                tradingsymbol,
-                name,
-                last_price,
-                expiry,
-                strike,
-                tick_size,
-                lot_size,
-                instrument_type,
-                segment,
-                exchange,
-                underlying,
-                option_type,
-                last_updated,
-                derivative_kind,
-                expiry_ts,
-                expiry_year,
-                expiry_month,
-                expiry_label,
-                type_rank,
-                boost_score,
-                aliases,
-                search_text
-            )
-            SELECT
-                instrument_token,
-                exchange_token,
-                tradingsymbol,
-                name,
-                last_price,
-                expiry,
-                strike,
-                tick_size,
-                lot_size,
-                instrument_type,
-                segment,
-                exchange,
-                underlying,
-                option_type,
-                last_updated,
-                derivative_kind,
-                expiry_ts,
-                expiry_year,
-                expiry_month,
-                expiry_label,
-                type_rank,
-                boost_score,
-                aliases,
-                upper(array_to_string(aliases, ' ')) AS search_text
-            FROM enriched
-            """
-        )
-    )
-    session.commit()
-    indexed_count = int(session.execute(text("SELECT COUNT(*) FROM public.instruments_search_index")).scalar() or 0)
-    return {"total": indexed_count}
-
-
-def ensure_instruments_search_index(session: Session) -> Dict[str, Any]:
-    """Ensure the PostgreSQL instrument search index is populated."""
-    source_count = int(
-        session.execute(
-            text(
-                "SELECT ((SELECT COUNT(*) FROM public.kite_instruments) + (SELECT COUNT(*) FROM public.kite_indices))"
-            )
-        ).scalar()
-        or 0
-    )
-    indexed_count = int(session.execute(text("SELECT COUNT(*) FROM public.instruments_search_index")).scalar() or 0)
-    rebuilt = False
-    if source_count > 0 and indexed_count == 0:
-        indexed_count = rebuild_instruments_search_index(session)["total"]
-        rebuilt = True
-    return {"source_count": source_count, "indexed_count": indexed_count, "rebuilt": rebuilt}
-
-# ─────────── Meilisearch reindex pipeline ───────────
-async def meili_reindex_instruments():
-    """
-    Queries both kite_instruments and kite_indices tables, builds documents,
-    and upserts them into the Meilisearch 'instruments' index.
-    """
-    # Ensure index settings are up-to-date before reindexing
-    ensure_instruments_index()
-
-    client = get_meili_client(admin=True)
-    index = client.index("instruments")
-
-    # SQL query to combine data from both tables
+async def fetch_instrument_search_records() -> List[Dict[str, Any]]:
     sql_query = """
         SELECT
             instrument_token, exchange_token, tradingsymbol, name, last_price,
-            expiry, strike, tick_size, lot_size, instrument_type, segment, exchange,
-            underlying, option_type, last_updated
+            expiry, strike, tick_size, lot_size, instrument_type, segment,
+            exchange, underlying, option_type, last_updated
         FROM kite_instruments
         UNION ALL
         SELECT
             instrument_token, exchange_token, tradingsymbol, name, last_price,
-            expiry, strike, tick_size, lot_size, instrument_type, segment, exchange,
+            expiry, strike, tick_size, lot_size, instrument_type, segment,
+            exchange,
             NULL AS underlying, NULL AS option_type, last_updated
         FROM kite_indices;
     """
-    
-    logger.info("Fetching instruments from PostgreSQL for Meilisearch reindexing...")
+    logger.info("Fetching instruments from PostgreSQL for search indexing...")
     db_records = await database.fetch_all(sql_query)
-    
-    documents = []
-    
-    # Month abbreviations to numbers mapping
-    month_abbr_to_num = {name.lower(): i for i, name in enumerate(calendar.month_abbr) if i}
-    
-    # Regex to extract underlying symbol from tradingsymbol for stock derivatives
-    # Matches prefix before YYMON (e.g., RELIANCE25OCT) or YYM (e.g., RELIANCE25O)
-    # This regex is designed to be non-greedy and capture the stock symbol part.
-    # It looks for a pattern like 'DDMMM' or 'DDM' where D is digit, M is month char.
-    # Example: RELIANCE25OCT2600CE -> RELIANCE
-    # Example: NIFTY25OCT -> NIFTY
-    # Example: TCS25O -> TCS
-    underlying_symbol_regex = re.compile(r"^([A-Z0-9.&-]+?)(?:\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]?\d*|(?:\d{2}[JFMASOND][\dCEPE]*))", re.IGNORECASE)
+    return [dict(record) for record in db_records]
 
-    # Helper functions for Meilisearch document enrichment
+
+def build_instrument_search_documents(db_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    documents = []
+
     def _format_expiry_label(dt: Optional[date]) -> Optional[str]:
-        if not dt: return None
+        if not dt:
+            return None
         try:
-            # Use datetime.strftime for consistent formatting, even if input is date
             return dt.strftime("%d-%b-%Y")
         except Exception:
             return None
@@ -818,10 +571,14 @@ async def meili_reindex_instruments():
         instrument_type = str(doc.get("instrument_type", "")).upper()
         option_type = str(doc.get("option_type", "")).upper()
 
-        if segment == "INDICES" or instrument_type == "INDEX": return 1
-        if instrument_type == "FUT": return 2
-        if instrument_type == "EQ" and not option_type: return 3
-        if option_type in ("CE", "PE"): return 4
+        if segment == "INDICES" or instrument_type == "INDEX":
+            return 1
+        if instrument_type == "FUT":
+            return 2
+        if instrument_type == "EQ" and not option_type:
+            return 3
+        if option_type in ("CE", "PE"):
+            return 4
         return 9
 
     def _boost_and_aliases(underlying: str, tradingsymbol: str, name: Optional[str]) -> Tuple[int, List[str]]:
@@ -841,66 +598,57 @@ async def meili_reindex_instruments():
         elif "NIFTY" in u:
             boost = 100
             base_aliases.extend(["NIFTY", "NIFTY50", "NIFTY 50"])
-        
-        # Add tradingsymbol and name to aliases, ensuring uniqueness
+
         all_aliases = set(base_aliases)
         if tradingsymbol:
             all_aliases.add(tradingsymbol.upper())
         if name:
             all_aliases.add(name.upper())
-        
+
         return boost, list(all_aliases)
 
     for record in db_records:
         doc = {
-            "id": str(record["instrument_token"]), # Meili primary key
+            "id": str(record["instrument_token"]),
             "instrument_token": record["instrument_token"],
             "exchange_token": record["exchange_token"],
             "tradingsymbol": record["tradingsymbol"],
             "name": record["name"],
             "last_price": float(record["last_price"]) if record["last_price"] is not None else None,
-            "expiry": record["expiry"].isoformat() if record["expiry"] else None, # ISO date string
+            "expiry": record["expiry"].isoformat() if record["expiry"] else None,
             "strike": float(record["strike"]) if record["strike"] is not None else None,
             "tick_size": float(record["tick_size"]) if record["tick_size"] is not None else None,
             "lot_size": int(record["lot_size"]) if record["lot_size"] is not None else None,
             "instrument_type": record["instrument_type"],
             "segment": record["segment"],
             "exchange": record["exchange"],
-            "underlying": record["underlying"], # New field
-            "option_type": record["option_type"], # New field
-            "last_updated": record["last_updated"].isoformat() if record["last_updated"] else None, # ISO string
-            # The following fields are for backward compatibility with existing fuzzy search logic
-            "underlying_symbol": record["underlying"], # For existing fuzzy search
-            "derivative_kind": "NONE", # Will be set below
-            "expiry_ts": None, # Will be set below
-            "expiry_year": None, # Will be set below
-            "expiry_month": None, # Will be set below
-            "expiry_label": None, # New field
-            "type_rank": 9, # New field, default to 9
-            "boost_score": 0, # New field, default to 0
-            "aliases": [], # New field
+            "underlying": record["underlying"],
+            "option_type": record["option_type"],
+            "last_updated": record["last_updated"].isoformat() if record["last_updated"] else None,
+            "underlying_symbol": record["underlying"],
+            "derivative_kind": "NONE",
+            "expiry_ts": None,
+            "expiry_year": None,
+            "expiry_month": None,
+            "expiry_label": None,
+            "type_rank": 9,
+            "boost_score": 0,
+            "aliases": [],
         }
 
         instrument_type = record["instrument_type"]
         segment = record["segment"]
         tradingsymbol = record["tradingsymbol"]
         expiry_date = record["expiry"]
-        strike_price = record["strike"]
- 
-        # Normalization for INDICES rows:
-        # Ensure indices are represented with consistent fields for Meilisearch documents,
-        # and derive a usable 'underlying' when missing to improve recall for base queries.
+
         seg_up = (segment or "").upper() if segment else None
         if seg_up == "INDICES":
-            # Force canonical values for indices
             doc["instrument_type"] = "INDEX"
             doc["segment"] = "INDICES"
             doc["option_type"] = None
             doc["expiry"] = None
             doc["strike"] = None
-            # Derive a simple underlying from tradingsymbol when absent
             up_ts = (tradingsymbol or "").upper()
-            derived_underlying = None
             if "BANK" in up_ts:
                 derived_underlying = "BANKNIFTY"
             elif "NIFTY" in up_ts:
@@ -910,45 +658,49 @@ async def meili_reindex_instruments():
             elif "FINNIFTY" in up_ts:
                 derived_underlying = "FINNIFTY"
             else:
-                # Fallback: take first token and strip non-alphanumerics
                 first_word = up_ts.split()[0] if up_ts.split() else up_ts
                 cleaned = re.sub(r'[^A-Z0-9]', '', first_word)
                 derived_underlying = cleaned if cleaned else up_ts
             doc["underlying"] = derived_underlying
-            # Keep underlying_symbol in sync for compatibility
             doc["underlying_symbol"] = doc["underlying"]
-            # reflect the normalized instrument_type for downstream logic
             instrument_type = doc["instrument_type"]
-        else:
-            # Keep instrument_type as read from DB for non-indices
-            instrument_type = record["instrument_type"]
- 
-        # Determine derivative_kind
+
         if instrument_type in {"CE", "PE"}:
             doc["derivative_kind"] = "OPT"
         elif instrument_type == "FUT":
             doc["derivative_kind"] = "FUT"
 
-        # Set expiry related fields
         if expiry_date:
-            # Convert expiry date to UTC datetime at 00:00 and then to epoch seconds
-            # Using pytz.utc to ensure it's timezone-aware
             expiry_utc = datetime.combine(expiry_date, datetime.min.time(), tzinfo=pytz.utc)
             doc["expiry_ts"] = int(expiry_utc.timestamp())
             doc["expiry_year"] = expiry_date.year
             doc["expiry_month"] = expiry_date.month
-            doc["expiry_label"] = _format_expiry_label(expiry_date) # Assign expiry_label
+            doc["expiry_label"] = _format_expiry_label(expiry_date)
 
-        # Assign type_rank
         doc["type_rank"] = _type_rank(doc)
-
-        # Assign boost_score and aliases
         underlying_for_aliases = doc.get("underlying") or tradingsymbol
         boost, alias_list = _boost_and_aliases(underlying_for_aliases, tradingsymbol, doc.get("name"))
         doc["boost_score"] = boost
-        doc["aliases"] = list(set(alias_list)) # Ensure uniqueness
+        doc["aliases"] = list(set(alias_list))
 
         documents.append(doc)
+
+    return documents
+
+# ─────────── Meilisearch reindex pipeline ───────────
+async def meili_reindex_instruments():
+    """
+    Queries both kite_instruments and kite_indices tables, builds documents,
+    and upserts them into the Meilisearch 'instruments' index.
+    """
+    # Ensure index settings are up-to-date before reindexing
+    ensure_instruments_index()
+
+    client = get_meili_client(admin=True)
+    index = client.index("instruments")
+
+    db_records = await fetch_instrument_search_records()
+    documents = build_instrument_search_documents(db_records)
 
     total_documents = len(documents)
     if not total_documents:
@@ -993,7 +745,7 @@ async def sync_and_reindex_orchestrator(
     background_tasks: Optional[BackgroundTasks] = None
 ) -> Dict[str, Optional[int]]:
     """
-    Orchestrates optional instrument refresh, backfill of underlying/option_type, and PostgreSQL search index rebuild.
+    Orchestrates optional instrument refresh, backfill of underlying/option_type, and Meilisearch reindex.
     """
     refreshed_count: Optional[int] = None
     backfilled_counts: Dict[str, int] = {"processed": 0, "updated": 0, "skipped": 0}
@@ -1039,14 +791,14 @@ async def sync_and_reindex_orchestrator(
         backfilled_counts = await _parse_and_backfill_underlying(session, only_nulls=backfill_only_nulls)
         logger.info(f"Backfill completed: Processed {backfilled_counts['processed']}, Updated {backfilled_counts['updated']}, Skipped {backfilled_counts['skipped']}.")
 
-        # 3. Rebuild PostgreSQL search index
+        # 3. Reindex Meilisearch
         if reindex:
-            logger.info("Initiating PostgreSQL instruments search index rebuild (orchestrator)...")
-            reindex_stats = rebuild_instruments_search_index(session)
+            logger.info("Initiating Meilisearch reindex (orchestrator)...")
+            reindex_stats = await meili_reindex_instruments()
             indexed_count = reindex_stats.get("total")
-            logger.info(f"PostgreSQL instruments search index rebuild completed. Total indexed: {indexed_count}.")
+            logger.info(f"Meilisearch reindex completed. Total indexed: {indexed_count}.")
         else:
-            logger.info("PostgreSQL instruments search index rebuild skipped as per orchestrator request.")
+            logger.info("Meilisearch reindex skipped as per orchestrator request.")
 
         return {
             "refreshed": refreshed_count,
@@ -1322,23 +1074,20 @@ async def import_all_instruments(kite: KiteConnect = Depends(get_kite)):
 
 @router.get("/instruments/meili/health")
 async def get_meilisearch_health():
-    """Backward-compatible health endpoint for the PostgreSQL search index."""
+    """
+    Returns the health status of the Meilisearch service.
+    """
     try:
-        session = SessionLocal()
-        try:
-            status = ensure_instruments_search_index(session)
-        finally:
-            session.close()
-        return {
-            "status": "ok",
-            "engine": "postgres_pg_trgm",
-            "source_count": status["source_count"],
-            "indexed_count": status["indexed_count"],
-            "rebuilt": status["rebuilt"],
-        }
+        client = get_meili_client(admin=False)
+        health = client.health()
+        if health.get("status") == "available":
+            return {"status": "ok"}
+        else:
+            return {"status": "error", "detail": health}
     except Exception as e:
-        logger.error(f"Error checking PostgreSQL instrument search health: {e}", exc_info=True)
+        logger.error(f"Error checking Meilisearch health: {e}", exc_info=True)
         return {"status": "error", "detail": str(e)}
+
 
 async def _parse_and_backfill_underlying(session: Session, only_nulls: bool = True) -> Dict[str, int]:
     """
@@ -1425,175 +1174,18 @@ async def _parse_and_backfill_underlying(session: Session, only_nulls: bool = Tr
 
 async def sql_fallback_fuzzy_search(query: str, limit: int = 50, parsed: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
-    PostgreSQL pg_trgm-backed instrument search using structured predicates.
+    SQL-based fuzzy search using structured predicates if provided.
+    Also applies LIKE on name/tradingsymbol as a safety net.
     """
-    q_text = (query or "").strip()
-    if not q_text:
-        return []
-
-    parsed = parsed or {}
-    search_q = (parsed.get("residual") or "").strip() or parsed.get("underlying") or q_text
-    search_q_upper = search_q.upper()
-    q_text_upper = q_text.upper()
-    contains_upper = f"%{search_q_upper}%"
-    prefix_pattern = f"{search_q_upper}%"
-    similarity_threshold = 0.08 if len(search_q_upper) <= 3 else 0.18
-
-    params: Dict[str, Any] = {
-        "limit": limit,
-        "search_q": search_q_upper,
-        "q_text": q_text_upper,
-        "contains": f"%{search_q}%",
-        "contains_upper": contains_upper,
-        "prefix": f"{search_q}%",
-        "prefix_upper": prefix_pattern,
-        "similarity_threshold": similarity_threshold,
-        "has_underlying": 1 if parsed.get("underlying") else 0,
-        "underlying": (parsed.get("underlying") or "").upper(),
-        "has_option_type": 1 if parsed.get("option_type") else 0,
-        "option_type": parsed.get("option_type"),
-        "has_strike": 1 if parsed.get("strike") is not None else 0,
-        "strike": float(parsed.get("strike") or 0),
-    }
-
-    explicit_derivative = bool(
-        parsed.get("option_type")
-        or parsed.get("derivative_kind")
-        or parsed.get("expiry_date")
-        or (parsed.get("expiry_year") and parsed.get("expiry_month"))
-        or (parsed.get("strike") is not None)
-        or ("FUT" in (parsed.get("instrument_type") or ""))
-    )
-
-    filters = []
-    if not explicit_derivative:
-        filters.append("option_type IS NULL")
-
-    if parsed.get("underlying"):
-        filters.append("underlying = :underlying")
-    if parsed.get("option_type"):
-        filters.append("option_type = :option_type")
-    if parsed.get("instrument_type"):
-        filters.append("instrument_type = :instrument_type")
-        params["instrument_type"] = parsed["instrument_type"]
-    if parsed.get("exchange"):
-        filters.append("exchange = :exchange")
-        params["exchange"] = parsed["exchange"]
-
-    strike = parsed.get("strike")
-    if strike is not None and not parsed.get("option_type"):
-        if "option_type IS NULL" in filters:
-            filters.remove("option_type IS NULL")
-        filters.append("(option_type = 'CE' OR option_type = 'PE')")
-        filters.append("strike BETWEEN :strike_low AND :strike_high")
-        params["strike_low"] = float(strike) - 50.0
-        params["strike_high"] = float(strike) + 50.0
-    elif strike is not None:
-        filters.append("strike = :strike")
-
-    if parsed.get("expiry_date"):
-        filters.append("expiry = :expiry_date")
-        params["expiry_date"] = parsed["expiry_date"]
-    elif parsed.get("expiry_year") and parsed.get("expiry_month"):
-        start, end = month_window(parsed["expiry_year"], parsed["expiry_month"])
-        filters.append("expiry >= :start_date AND expiry < :end_date")
-        params["start_date"] = start
-        params["end_date"] = end
-
-    if len(search_q_upper) <= 2:
-        search_predicate = "(tradingsymbol ILIKE :prefix OR tradingsymbol ILIKE :contains OR coalesce(name, '') ILIKE :contains OR search_text LIKE :contains_upper)"
-    else:
-        search_predicate = """
-        (
-            tradingsymbol ILIKE :prefix
-            OR tradingsymbol ILIKE :contains
-            OR coalesce(name, '') ILIKE :contains
-            OR search_text LIKE :contains_upper
-            OR similarity(search_text, :search_q) >= :similarity_threshold
-        )
-        """
-
-    where_clause = " AND ".join([*filters, search_predicate]) if filters else search_predicate
-
-    sql = f"""
-        WITH candidates AS (
-            SELECT
-                instrument_token,
-                exchange_token,
-                tradingsymbol,
-                name,
-                last_price,
-                expiry,
-                strike,
-                tick_size,
-                lot_size,
-                instrument_type,
-                segment,
-                exchange,
-                underlying,
-                option_type,
-                boost_score,
-                type_rank,
-                expiry_ts,
-                similarity(search_text, :search_q) AS similarity_score,
-                CASE
-                    WHEN upper(tradingsymbol) = :q_text THEN 0
-                    WHEN upper(tradingsymbol) LIKE :prefix_upper THEN 1
-                    WHEN :has_underlying = 1 AND coalesce(underlying, '') = :underlying THEN 2
-                    WHEN search_text LIKE :contains_upper THEN 3
-                    ELSE 4
-                END AS match_rank,
-                CASE
-                    WHEN :has_option_type = 1 AND option_type = :option_type THEN 0
-                    ELSE 1
-                END AS option_rank,
-                CASE
-                    WHEN :has_strike = 1 AND strike IS NOT NULL THEN abs(strike - :strike)
-                    ELSE 0
-                END AS strike_distance
-            FROM public.instruments_search_index
-            WHERE {where_clause}
-        )
-        SELECT
-            instrument_token,
-            exchange_token,
-            tradingsymbol,
-            name,
-            last_price,
-            expiry,
-            strike,
-            tick_size,
-            lot_size,
-            instrument_type,
-            segment,
-            exchange,
-            underlying,
-            option_type
-        FROM candidates
-        ORDER BY
-            match_rank ASC,
-            option_rank ASC,
-            CASE WHEN :has_underlying = 1 AND coalesce(underlying, '') = :underlying THEN 0 ELSE 1 END ASC,
-            CASE WHEN :has_strike = 1 THEN strike_distance ELSE 0 END ASC,
-            boost_score DESC,
-            type_rank ASC,
-            similarity_score DESC,
-            expiry_ts ASC NULLS LAST,
-            length(tradingsymbol) ASC
-        LIMIT :limit
-    """
-
-    rows = await database.fetch_all(sql, params)
-    return [dict(row) for row in rows]
-
-
-async def sql_fallback_structured_base(query: str, limit: int = 50, parsed: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """Non-pg_trgm fallback search over the base instruments view."""
     if not (query or "").strip():
         return []
 
-    params = {"limit": limit, "contains": f"%{query}%"}
-    where_conditions = ["(tradingsymbol ILIKE :contains OR name ILIKE :contains)"]
+    params = {"limit": limit}
+    # Safety net LIKEs
+    base_like = ["(tradingsymbol ILIKE :contains OR name ILIKE :contains)"]
+    params["contains"] = f"%{query}%"
+
+    where_conditions = list(base_like)
 
     if parsed:
         if parsed.get("underlying"):
@@ -1620,13 +1212,49 @@ async def sql_fallback_structured_base(query: str, limit: int = 50, parsed: Opti
             params["start_date"] = start
             params["end_date"] = end
 
+    where_clause = " AND ".join(where_conditions)
+
     sql = f"""
         SELECT
             instrument_token, exchange_token, tradingsymbol, name, last_price,
             expiry, strike, tick_size, lot_size, instrument_type, segment,
             exchange, underlying, option_type
-        FROM public.instruments_search_v
-        WHERE {' AND '.join(where_conditions)}
+        FROM (
+          SELECT
+            instrument_token,
+            exchange_token,
+            tradingsymbol,
+            name,
+            last_price,
+            expiry,
+            strike,
+            tick_size,
+            lot_size,
+            instrument_type,
+            segment,
+            exchange,
+            underlying,
+            option_type
+          FROM public.kite_instruments
+          UNION ALL
+          SELECT
+            instrument_token,
+            exchange_token,
+            tradingsymbol,
+            name,
+            last_price,
+            expiry,
+            strike,
+            tick_size,
+            lot_size,
+            instrument_type,
+            segment,
+            exchange,
+            NULL::VARCHAR(255) AS underlying,
+            NULL::VARCHAR(10) AS option_type
+          FROM public.kite_indices
+        ) AS instruments_search_v
+        WHERE {where_clause}
         ORDER BY
             CASE
                 WHEN tradingsymbol ILIKE :exact_q THEN 1
@@ -1645,7 +1273,9 @@ async def sql_fallback_structured_base(query: str, limit: int = 50, parsed: Opti
 
 async def sql_fallback_plain(query: str, limit: int = 50) -> List[Dict[str, Any]]:
     """
-    Plain SQL fallback for unstructured queries without pg_trgm/search-index dependency.
+    Plain SQL fallback for zero-hit Meili responses on unstructured queries.
+    - Prefix match on tradingsymbol OR contains match on name.
+    - Order by LENGTH(tradingsymbol) ASC to prioritize tight symbol matches.
     """
     q_text = (query or "").strip()
     if not q_text:
@@ -1662,7 +1292,41 @@ async def sql_fallback_plain(query: str, limit: int = 50) -> List[Dict[str, Any]
             instrument_token, exchange_token, tradingsymbol, name, last_price,
             expiry, strike, tick_size, lot_size, instrument_type, segment,
             exchange, underlying, option_type
-        FROM public.instruments_search_v
+        FROM (
+          SELECT
+            instrument_token,
+            exchange_token,
+            tradingsymbol,
+            name,
+            last_price,
+            expiry,
+            strike,
+            tick_size,
+            lot_size,
+            instrument_type,
+            segment,
+            exchange,
+            underlying,
+            option_type
+          FROM public.kite_instruments
+          UNION ALL
+          SELECT
+            instrument_token,
+            exchange_token,
+            tradingsymbol,
+            name,
+            last_price,
+            expiry,
+            strike,
+            tick_size,
+            lot_size,
+            instrument_type,
+            segment,
+            exchange,
+            NULL::VARCHAR(255) AS underlying,
+            NULL::VARCHAR(10) AS option_type
+          FROM public.kite_indices
+        ) AS instruments_search_v
         WHERE tradingsymbol ILIKE :prefix OR name ILIKE :contains
         ORDER BY LENGTH(tradingsymbol) ASC
         LIMIT :limit
@@ -1728,7 +1392,7 @@ class SyncAndReindexRequest(BaseModel):
 
     # refresh_from_broker=True calls an internal import/refresh function (e.g., import_all_instruments) directly if present;
     # it does not call any HTTP endpoint. If no internal refresh function exists, this endpoint still backfills
-    # underlying/option_type for current DB records and rebuilds the PostgreSQL search index.
+    # underlying/option_type for current DB records and reindexes Meilisearch.
 @router.post("/instruments/sync-and-reindex")
 async def sync_and_reindex_instruments(
     background_tasks: BackgroundTasks,
@@ -1737,7 +1401,7 @@ async def sync_and_reindex_instruments(
     # kite: KiteConnect = Depends(get_kite) # KiteConnect instance is handled internally by orchestrator for refresh
 ):
     """
-    Orchestrates instrument refresh from broker, backfill of underlying/option_type, and PostgreSQL search index rebuild.
+    Orchestrates instrument refresh from broker, backfill of underlying/option_type, and Meilisearch reindex.
 
     If the request body is omitted, this performs the full maintenance flow by default.
     """
@@ -1762,10 +1426,101 @@ async def fuzzy_search_instruments(
     query: Optional[str] = Query(None, alias="query"),
     limit: int = 50
 ):
-    """PostgreSQL pg_trgm-backed instrument suggestion endpoint."""
+    def _sanitize_sort(index, sort_list: list[str]) -> list[str]:
+        try:
+            settings = index.get_settings()
+            allowed = set(settings.get("sortableAttributes") or [])
+            sanitized = [s for s in (sort_list or []) if (s.split(":")[0] in allowed)]
+            if len(sanitized) != len(sort_list or []):
+                logger.info(f"sanitized_sort={sanitized} allowed={allowed}")
+            return sanitized
+        except Exception as e:
+            logger.exception("Failed to sanitize sort, returning empty list.")
+            return []  # fallback: no sort
+    """
+    Fuzzy search endpoint with Meilisearch-first and robust SQL fallback.
+    Changes:
+    - Accepts both 'q' and 'query'.
+    - Short query guard (<=3): skip parsing; plain Meili search with no filter.
+    - Always fallback to SQL when Meili returns zero hits.
+    - Always return 200 with a list (possibly empty).
+    """
     q_text = (q or query or "").strip()
     if not q_text:
         return []
+
+    try:
+        client = get_meili_client(admin=False)
+        index = client.index("instruments")
+    except Exception:
+        logger.exception(f"Failed to init Meili client for q='{q_text}'. Falling back to SQL (plain). mode=sql_fallback_plain")
+        rows = await sql_fallback_plain(q_text, limit)
+        logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
+        return rows
+
+    # Short query guard: <= 3 characters -> skip structured parsing entirely
+    if len(q_text) <= 3:
+        try:
+            options = {
+                "limit": limit,
+                "sort": ["boost_score:desc","type_rank:asc","expiry_ts:asc"],
+                "attributesToRetrieve": [
+                    'instrument_token', 'exchange_token', 'tradingsymbol', 'name',
+                    'last_price', 'expiry', 'strike', 'tick_size', 'lot_size',
+                    'instrument_type', 'segment', 'exchange', 'underlying', 'option_type'
+                ]
+            }
+            # Pre-sanitize sort against current index settings to avoid invalid_search_sort
+            try:
+                sanitized = _sanitize_sort(index, options.get("sort"))
+                if not sanitized:
+                    options.pop("sort", None)
+                else:
+                    options["sort"] = sanitized
+            except Exception:
+                # On any settings error, drop sort to avoid invalid_search_sort
+                options.pop("sort", None)
+            try:
+                result = index.search(q_text, options)
+            except meilisearch.errors.MeilisearchApiError as e:
+                msg = str(e)
+                if "invalid_search_sort" in msg or "not sortable" in msg:
+                    logger.warning(f"Meili search failed with invalid sort for q='{q_text}'. Sanitizing and retrying.")
+                    options["sort"] = _sanitize_sort(index, options.get("sort"))
+                    try:
+                        result = index.search(q_text, options)
+                    except Exception:
+                        logger.error(f"Meili retry failed for q='{q_text}' after sanitizing. Retrying without sort.")
+                        options.pop("sort", None)
+                        result = index.search(q_text, options)
+                elif "invalid_search_filter" in msg or "not filterable" in msg:
+                    logger.warning(f"Meili search failed with invalid filter settings for q='{q_text}'. Resetting index settings and retrying.")
+                    try:
+                        # Attempt self-heal: re-apply index settings
+                        ensure_instruments_index()
+                        # Reacquire index handle and retry with same options
+                        index = client.index("instruments")
+                        result = index.search(q_text, options)
+                    except Exception:
+                        # Final attempt: drop any filters/sorts and try plain search
+                        logger.error(f"Meili retry failed for q='{q_text}' after resetting settings. Retrying without filter/sort.")
+                        options.pop("filter", None)
+                        options.pop("sort", None)
+                        result = index.search(q_text, options)
+                else:
+                    raise
+            hits = result.get("hits", [])
+            logger.info(f"q='{q_text}' mode=meili_q_only meili_hits={len(hits)}")
+            if not hits:
+                rows = await sql_fallback_plain(q_text, limit)
+                logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
+                return rows
+            return hits
+        except Exception:
+            logger.exception(f"Meili error for short query q='{q_text}'. Falling back to SQL (plain). mode=sql_fallback_plain")
+            rows = await sql_fallback_plain(q_text, limit)
+            logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
+            return rows
 
     # Longer queries: try to parse for structured filters
     parsed = {}
@@ -1774,14 +1529,141 @@ async def fuzzy_search_instruments(
         logger.info(f"q='{q_text}' parsed={json.dumps(parsed, default=str)}")
     except Exception:
         logger.exception(f"Parser error for q='{q_text}'. Proceeding without filters.")
+
+    options = {
+        "limit": limit,
+        "attributesToRetrieve": [
+            'instrument_token', 'exchange_token', 'tradingsymbol', 'name',
+            'last_price', 'expiry', 'strike', 'tick_size', 'lot_size',
+            'instrument_type', 'segment', 'exchange', 'underlying', 'option_type'
+        ]
+    }
+    
+    filter_clauses = []
+
+    # Determine if the user explicitly asked for derivatives
+    explicit_derivative = bool(
+        parsed.get("option_type")
+        or parsed.get("derivative_kind")
+        or parsed.get("expiry_date")
+        or (parsed.get("expiry_year") and parsed.get("expiry_month"))
+        or (parsed.get("strike") is not None)
+        or ("FUT" in (parsed.get("instrument_type") or ""))
+    )
+
+    # For base queries (no explicit derivatives), exclude options so index/equity/futures surface
+    if not explicit_derivative:
+        filter_clauses.append("option_type IS NULL")
+        # Prefer major indices and futures first for base queries
+        options["sort"] = ["boost_score:desc","type_rank:asc","expiry_ts:asc"]
+
+    # Numeric strike without CE/PE => both legs in a band, sorted by expiry then strike
+    strike = parsed.get("strike")
+    if (strike is not None) and not parsed.get("option_type"):
+        # If a strike is provided without CE/PE, we should look for options, not exclude them.
+        # So, we remove the "option_type IS NULL" filter if it was added.
+        if "option_type IS NULL" in filter_clauses:
+            filter_clauses.remove("option_type IS NULL")
+        filter_clauses.append('(option_type = "CE" OR option_type = "PE")')
+        tol = 50
+        filter_clauses.append(f"(strike >= {int(strike - tol)} AND strike <= {int(strike + tol)})")
+        # Prefer expiry_ts for sorting if available
+        options["sort"] = ["expiry_ts:asc", "strike:asc"]
+
+    # Add other parsed filters
+    # This reuses the existing build_meili_filter logic but integrates it into the new clause system
+    if parsed:
+        # We handle strike and option_type manually above, so we can create a temporary parsed dict without them
+        # to avoid double-filtering.
+        temp_parsed = parsed.copy()
+        temp_parsed.pop("strike", None)
+        # We don't pop option_type because if it's present, it should be used.
+        # The logic above for strike handling only applies when option_type is NOT specified.
+        
+        # The original build_meili_filter is fine to reuse for other attributes
+        additional_filters = build_meili_filter(temp_parsed)
+        if additional_filters:
+            filter_clauses.extend(additional_filters)
+
+    filter_str = " AND ".join(filter_clauses) if filter_clauses else None
+    resid = parsed.get("residual") if parsed else None
+    search_q = resid or q_text
+
     try:
-        rows = await sql_fallback_fuzzy_search(q_text, limit, parsed)
-        logger.info(f"q='{q_text}' mode=postgres_trgm sql_rows={len(rows)}")
+        if filter_str:
+            options["filter"] = filter_str
+
+        # Pre-sanitize sort against index settings to avoid invalid_search_sort
+        if "sort" in options:
+            try:
+                sanitized = _sanitize_sort(index, options.get("sort"))
+                if not sanitized:
+                    options.pop("sort", None)
+                else:
+                    options["sort"] = sanitized
+            except Exception:
+                options.pop("sort", None)
+        
+        try:
+            result = index.search(search_q, options)
+        except meilisearch.errors.MeilisearchApiError as e:
+            msg = str(e)
+            if "invalid_search_sort" in msg or "not sortable" in msg:
+                logger.warning(f"Meili search failed with invalid sort for q='{q_text}'. Sanitizing and retrying.")
+                options["sort"] = _sanitize_sort(index, options.get("sort"))
+                try:
+                    result = index.search(search_q, options)
+                except Exception:
+                    logger.error(f"Meili retry failed for q='{q_text}' after sanitizing. Retrying without sort.")
+                    options.pop("sort", None)
+                    result = index.search(search_q, options)
+            elif "invalid_search_filter" in msg or "not filterable" in msg:
+                logger.warning(f"Meili search failed with invalid filter for q='{q_text}' filter='{filter_str}'. Attempting index settings reset.")
+                try:
+                    # Self-heal: ensure index has correct filterableAttributes, wait for task, then retry
+                    ensure_instruments_index()
+                    index = client.index("instruments")
+                    result = index.search(search_q, options)
+                except Exception:
+                    logger.error(f"Meili retry failed for q='{q_text}' after resetting settings. Retrying without filter.")
+                    # Drop the filter and retry as plain query
+                    options.pop("filter", None)
+                    try:
+                        result = index.search(search_q, options)
+                    except Exception:
+                        # Give up on Meili path; let caller fallback to SQL
+                        raise
+            else:
+                raise
+        hits = result.get("hits", [])
+        mode = "meili_filtered" if filter_str else "meili_q_only"
+        logger.info(f"q='{q_text}' mode={mode} meili_hits={len(hits)}")
+
+        if not hits:
+            # Always fallback to SQL whenever Meili hits are zero
+            if filter_str:
+                rows = await sql_fallback_fuzzy_search(q_text, limit, parsed)
+                logger.info(f"q='{q_text}' mode=sql_fallback_structured sql_rows={len(rows)}")
+                return rows
+            else:
+                rows = await sql_fallback_plain(q_text, limit)
+                logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
+                return rows
+
+        return hits
+    except (meilisearch.errors.MeilisearchCommunicationError, requests.exceptions.ConnectionError, httpx.ConnectError):
+        logger.exception(f"Meili connection error for q='{q_text}'. Falling back to SQL (prefer structured if available).")
+        if filter_str:
+            rows = await sql_fallback_fuzzy_search(q_text, limit, parsed)
+            logger.info(f"q='{q_text}' mode=sql_fallback_structured sql_rows={len(rows)}")
+        else:
+            rows = await sql_fallback_plain(q_text, limit)
+            logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
         return rows
     except Exception:
-        logger.exception(f"PostgreSQL instrument search failed for q='{q_text}'. Falling back to base SQL search.")
-        rows = await sql_fallback_structured_base(q_text, limit, parsed)
-        logger.info(f"q='{q_text}' mode=sql_fallback_base sql_rows={len(rows)}")
+        logger.exception(f"Unexpected Meili error for q='{q_text}'. Falling back to SQL (plain).")
+        rows = await sql_fallback_plain(q_text, limit)
+        logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
         return rows
 
 # ─────────── Daily update functionality ───────────
@@ -1817,7 +1699,7 @@ async def schedule_daily_instruments_update():
 
 async def update_all_instruments_daily():
     """
-    Runs unified instruments maintenance: optional refresh from broker, backfill underlying/option_type, and PostgreSQL search index rebuild via sync_and_reindex_orchestrator().
+    Runs unified instruments maintenance: optional refresh from broker, backfill underlying/option_type, and Meilisearch reindex via sync_and_reindex_orchestrator().
     """
     logger.info("Daily instruments maintenance job started.")
     db = None

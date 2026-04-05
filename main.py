@@ -264,7 +264,7 @@ async def combined_lifespan(app: FastAPI):
         server.mcp_kite_instance = kite
         logging.info("MCP Kite instance initialized successfully.")
 
-        # Ensure async DB is connected (required for instrument search bootstrap and other async ops)
+        # Ensure async DB is connected (required for Meilisearch reindex and other async ops)
         try:
             # Check if 'is_connected' property exists (databases < 0.8.0) or just connect
             # 'databases' library usually handles idempotency of connect()
@@ -486,21 +486,29 @@ async def combined_lifespan(app: FastAPI):
         # TODO: alerts_poll_worker needs to be implemented.
         # asyncio.create_task(alerts_poll_worker(API_KEY, alerts_ntfy_url))
 
-        # Ensure PostgreSQL instrument search index exists on startup (and bootstrap rebuild if empty)
+        # Ensure Meilisearch index exists on startup (and bootstrap reindex if empty)
         try:
-            bootstrap_db = SessionLocal()
+            # Quick fix: force-reset settings on every startup
+            reset_meili_settings()
+            logger.info("Meilisearch index 'instruments' ensured on startup")
             try:
-                search_status = ensure_instruments_search_index(bootstrap_db)
-            finally:
-                bootstrap_db.close()
-            logger.info(
-                "PostgreSQL instrument search index ready (indexed=%s source=%s rebuilt=%s)",
-                search_status.get("indexed_count"),
-                search_status.get("source_count"),
-                search_status.get("rebuilt"),
-            )
+                client = get_meili_client(admin=True)
+                index = client.index("instruments")
+                stats = index.get_stats() if hasattr(index, "get_stats") else index.stats()
+                # Handle both dict (older versions) and IndexStats object (newer versions)
+                if isinstance(stats, dict):
+                    num_docs = (stats.get("numberOfDocuments") or stats.get("number_of_documents") or 0)
+                else:
+                    # Try camelCase first then snake_case attributes
+                    num_docs = getattr(stats, "numberOfDocuments", getattr(stats, "number_of_documents", 0))
+
+                if int(num_docs) == 0:
+                    logger.info("Meilisearch 'instruments' index is empty; triggering bootstrap reindex...")
+                    await meili_reindex_instruments()
+            except Exception as ie:
+                logger.exception("Startup Meilisearch reindex-if-empty check failed: %s", ie)
         except Exception as e:
-            logger.exception("Failed to ensure PostgreSQL instrument search index on startup: %s", e)
+            logger.exception("Failed to ensure Meilisearch index on startup: %s", e)
 
         # Auto-start Candle Aggregator with all supported intervals
         try:
@@ -659,10 +667,23 @@ app.include_router(momentum_router, prefix="/api")
 app.include_router(alerts_router, prefix="/api/alerts")
 app.include_router(indexstoploss_router, prefix="/api/strategies")
 
-from broker_api.broker_api import ensure_instruments_search_index
+from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def reset_meili_settings():
+    """
+    Force-applies the latest index settings from the Python codebase to Meilisearch.
+    This is a quick fix for ensuring settings are synchronized on startup.
+    """
+    try:
+        logger.info("Attempting to reset Meilisearch index settings...")
+        ensure_instruments_index()
+        logger.info("Meilisearch index settings reset successfully.")
+    except Exception as e:
+        logger.error(f"Failed to reset Meilisearch settings: {e}", exc_info=True)
 
 # Add CORS middleware for frontend (production: single allowed origin)
 app.add_middleware(

@@ -78,9 +78,6 @@ CREATE INDEX IF NOT EXISTS idx_kite_indices_tradingsymbol
 CREATE INDEX IF NOT EXISTS idx_kite_indices_segment
   ON public.kite_indices (segment);
 
--- Enable trigram search support for lightweight broker-style instrument search.
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
 -- Table for single-user settings (e.g., marketwatch subscriptions)
 CREATE TABLE IF NOT EXISTS public.user_settings (
   owner_id           VARCHAR(255) PRIMARY KEY DEFAULT 'default',
@@ -154,61 +151,6 @@ CREATE OR REPLACE VIEW public.instruments_search_v AS
     NULL::VARCHAR(10)  AS option_type,
     idx.last_updated
   FROM public.kite_indices idx;
-
--- =========================================
--- PostgreSQL-backed instrument search index
--- =========================================
-
-CREATE TABLE IF NOT EXISTS public.instruments_search_index (
-  instrument_token BIGINT PRIMARY KEY,
-  exchange_token BIGINT,
-  tradingsymbol VARCHAR(255) NOT NULL,
-  name VARCHAR(255),
-  last_price DOUBLE PRECISION,
-  expiry DATE,
-  strike DOUBLE PRECISION,
-  tick_size DOUBLE PRECISION,
-  lot_size INTEGER,
-  instrument_type VARCHAR(32),
-  segment VARCHAR(32),
-  exchange VARCHAR(16),
-  underlying VARCHAR(255),
-  option_type VARCHAR(10),
-  last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  derivative_kind VARCHAR(16),
-  expiry_ts BIGINT,
-  expiry_year INTEGER,
-  expiry_month INTEGER,
-  expiry_label VARCHAR(32),
-  type_rank INTEGER NOT NULL DEFAULT 9,
-  boost_score INTEGER NOT NULL DEFAULT 0,
-  aliases TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-  search_text TEXT NOT NULL DEFAULT ''
-);
-
-CREATE INDEX IF NOT EXISTS idx_instruments_search_index_underlying
-  ON public.instruments_search_index (underlying);
-
-CREATE INDEX IF NOT EXISTS idx_instruments_search_index_exchange
-  ON public.instruments_search_index (exchange);
-
-CREATE INDEX IF NOT EXISTS idx_instruments_search_index_type_exchange
-  ON public.instruments_search_index (instrument_type, exchange);
-
-CREATE INDEX IF NOT EXISTS idx_instruments_search_index_underlying_opt_exp_strike
-  ON public.instruments_search_index (underlying, option_type, expiry, strike);
-
-CREATE INDEX IF NOT EXISTS idx_instruments_search_index_expiry_ts
-  ON public.instruments_search_index (expiry_ts);
-
-CREATE INDEX IF NOT EXISTS idx_instruments_search_index_search_text_trgm
-  ON public.instruments_search_index USING gin (search_text gin_trgm_ops);
-
-CREATE INDEX IF NOT EXISTS idx_instruments_search_index_tradingsymbol_trgm
-  ON public.instruments_search_index USING gin (tradingsymbol gin_trgm_ops);
-
-CREATE INDEX IF NOT EXISTS idx_instruments_search_index_name_trgm
-  ON public.instruments_search_index USING gin (name gin_trgm_ops);
 
 -- =========================================
 -- Alerts schema (user-defined alerts)
