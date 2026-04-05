@@ -7,9 +7,11 @@ const app = express();
 // Configuration
 const PORT = process.env.PORT || 80;
 const API_BASE_URL = process.env.API_BASE_URL || 'http://finance-app:8777';
+const MARKET_RUNTIME_URL = process.env.MARKET_RUNTIME_URL || 'http://market-runtime:8780';
 
 console.log(`Starting custom server on port ${PORT}`);
 console.log(`Proxying /api, /mcp, /llm to ${API_BASE_URL}`);
+console.log(`Proxying /ws/marketwatch to ${MARKET_RUNTIME_URL}`);
 
 // Proxy /api, /mcp, /llm requests (handles both HTTP API and WebSockets)
 // We use a single middleware mounted at root with pathFilter to avoid Express stripping prefixes.
@@ -20,6 +22,16 @@ app.use(
 		changeOrigin: true,
 		ws: true, // Enable WebSocket proxying
 		pathFilter: ['/api', '/mcp', '/llm'],
+		logLevel: 'debug'
+	})
+);
+
+app.use(
+	createProxyMiddleware({
+		target: MARKET_RUNTIME_URL,
+		changeOrigin: true,
+		ws: true,
+		pathFilter: ['/ws/marketwatch'],
 		logLevel: 'debug'
 	})
 );

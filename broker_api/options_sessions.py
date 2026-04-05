@@ -6,12 +6,12 @@ from typing import Any, Dict, List, Optional, Set
 import numpy as np
 
 from broker_api.instruments_repository import InstrumentsRepository
+from broker_api.market_runtime_client import MarketDataRuntime
 from broker_api.options_greeks import (
     black76_greeks,
     implied_vol_from_price_black76,
 )
 from broker_api.redis_events import get_redis, publish_event
-from broker_api.websocket_manager import WebSocketManager
 
 
 # Configure logging
@@ -272,7 +272,7 @@ class OptionsSession:
         """
         # 1. Get spot LTP. If unavailable, we can still proceed but all
         #    expiry-level calculations will be skipped.
-        spot_tick = self.manager.ws_manager.latest_ticks.get(self.spot_token)
+        spot_tick = self.manager.market_data.latest_ticks.get(self.spot_token)
         spot_ltp = (
             spot_tick.get("last_price")
             if spot_tick and "last_price" in spot_tick
@@ -343,7 +343,7 @@ class OptionsSession:
                         if not inst:
                             continue
 
-                        tick = self.manager.ws_manager.latest_ticks.get(inst["instrument_token"])
+                        tick = self.manager.market_data.latest_ticks.get(inst["instrument_token"])
                         ltp = tick.get("last_price") if tick else None
                         
                         greeks = {}
@@ -453,7 +453,7 @@ class OptionsSession:
                         if not inst:
                             continue
 
-                        tick = self.manager.ws_manager.latest_ticks.get(
+                        tick = self.manager.market_data.latest_ticks.get(
                             inst["instrument_token"]
                         )
                         ltp = tick.get("last_price") if tick else None
@@ -529,11 +529,11 @@ class OptionsSession:
 
         ce_ltp, pe_ltp = None, None
         if ce_inst:
-            tick = self.manager.ws_manager.latest_ticks.get(ce_inst["instrument_token"])
+            tick = self.manager.market_data.latest_ticks.get(ce_inst["instrument_token"])
             if tick:
                 ce_ltp = tick.get("last_price")
         if pe_inst:
-            tick = self.manager.ws_manager.latest_ticks.get(pe_inst["instrument_token"])
+            tick = self.manager.market_data.latest_ticks.get(pe_inst["instrument_token"])
             if tick:
                 pe_ltp = tick.get("last_price")
 
@@ -591,12 +591,13 @@ class OptionsSessionManager:
     """
 
     def __init__(
-        self, ws_manager: WebSocketManager, instrument_repo: InstrumentsRepository
+        self, market_data: MarketDataRuntime, instrument_repo: InstrumentsRepository
     ):
-        self.ws_manager = ws_manager
+        self.market_data = market_data
         self.instrument_repo = instrument_repo
         self.sessions: Dict[str, OptionsSession] = {}
         self.client_queues: Dict[str, List[asyncio.Queue]] = {}
+        self.owner_id = "backend:options-sessions"
 
     async def start_sessions(
         self, items: List[Dict[str, Any]], replace: bool = False
@@ -695,7 +696,7 @@ class OptionsSessionManager:
 
     async def _converge_subscriptions(self):
         """
-        Computes the union of all desired tokens and updates the WebSocketManager.
+        Computes the union of all desired tokens and updates the market runtime.
         """
         global_union: Set[int] = set()
         for session in self.sessions.values():
@@ -711,13 +712,13 @@ class OptionsSessionManager:
             # For now, just truncate
             global_union = set(list(global_union)[:TOKEN_CAP])
 
-        # This method needs to be added to WebSocketManager
-        if hasattr(self.ws_manager, "set_desired_tokens_union"):
-            await self.ws_manager.set_desired_tokens_union(global_union)
-        else:
-            logger.error(
-                "WebSocketManager is missing 'set_desired_tokens_union' method."
+        if global_union:
+            await self.market_data.set_owner_subscriptions(
+                self.owner_id,
+                {int(token): "full" for token in global_union},
             )
+        else:
+            await self.market_data.delete_owner(self.owner_id)
 
     async def register_client(self, underlying: str) -> asyncio.Queue:
         """
@@ -740,12 +741,6 @@ class OptionsSessionManager:
 
     def on_ticks(self, ticks: List[Dict[str, Any]]):
         """
-        Callback from WebSocketManager to receive ticks.
-        This method now only updates the tick data. The actual computation
-        is driven by the scheduled _run_cadence loop to prevent excessive
-        CPU usage from high-frequency tick updates.
+        Legacy no-op retained for compatibility with older call sites.
         """
-        # The ws_manager.latest_ticks dictionary is already updated by the
-        # WebSocketManager before this callback is invoked.
-        # No further action is needed here.
         pass

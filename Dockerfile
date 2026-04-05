@@ -13,7 +13,7 @@ COPY api ./api
 COPY alembic ./alembic
 COPY broker_api ./broker_api
 COPY strategies ./strategies
-COPY alembic.ini charts.py database.py main.py server.py schema.sql ./
+COPY alembic.ini auth_service.py charts.py database.py main.py runtime_monitor.py server.py schema.sql ./
 COPY ind_nifty50list.csv ind_nifty500list.csv ind_niftylargemidcap250list.csv nifty50_data.csv ./
 
 EXPOSE 8777

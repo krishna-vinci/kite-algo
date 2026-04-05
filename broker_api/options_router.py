@@ -19,7 +19,6 @@ from sqlalchemy.orm import Session
 from database import SessionLocal, get_db
 from broker_api.instruments_repository import InstrumentsRepository
 from broker_api.options_sessions import OptionsSessionManager
-from broker_api.websocket_manager import WebSocketManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -119,12 +118,13 @@ def get_options_session_manager(request: Request) -> OptionsSessionManager:
     """
     if not hasattr(request.app.state, "options_session_manager"):
         logger.info("Initializing OptionsSessionManager...")
-        ws_manager = request.app.state.ws_manager
+        market_data_runtime = getattr(request.app.state, "market_data_runtime", None)
+        if market_data_runtime is None:
+            raise HTTPException(status_code=503, detail="Market runtime not available")
         instrument_repo = InstrumentsRepository(db=SessionLocal)
         request.app.state.options_session_manager = OptionsSessionManager(
-            ws_manager, instrument_repo
+            market_data_runtime, instrument_repo
         )
-        ws_manager.options_session_manager = request.app.state.options_session_manager
     return request.app.state.options_session_manager
 
 

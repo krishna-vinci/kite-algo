@@ -65,6 +65,7 @@ services:
     build:
       context: ./market-runtime
       dockerfile: Dockerfile
+      target: dev
     container_name: kite-market-runtime-dev
     restart: unless-stopped
     env_file:
@@ -171,6 +172,7 @@ services:
     environment:
       NODE_ENV: development
       VITE_API_TARGET: http://finance-app:8777
+      VITE_MARKET_RUNTIME_TARGET: http://market-runtime:8780
       VITE_MARKET_RUNTIME_WS_URL: ws://localhost:18780/ws/marketwatch
     command:
       - npm

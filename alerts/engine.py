@@ -43,10 +43,11 @@ class AlertsEngine:
     - Evaluate crossing logic and persist events/updates
     """
 
-    def __init__(self, db, ws_manager, app=None):
+    def __init__(self, db, market_data_runtime, app=None):
         self.db = db
-        self.ws_manager = ws_manager
+        self.market_data_runtime = market_data_runtime
         self.app = app
+        self.owner_id = "backend:alerts-engine"
 
         # Timings
         self.interval_ms: int = self._get_int_env(
@@ -75,7 +76,7 @@ class AlertsEngine:
         # Last time we persisted a non-trigger price per alert id (throttling)
         self._last_persist_ts: Dict[str, float] = {}
 
-        # WS status tracking to re-assert subscriptions on reconnect
+        # Runtime status tracking for observability
         self._last_ws_status: Optional[str] = None
 
         logger.info(
@@ -114,7 +115,7 @@ class AlertsEngine:
             except Exception:
                 pass
         self._task = None
-        # Best-effort unsubscribe engine-owned tokens if no clients are on them
+        # Best-effort unsubscribe engine-owned tokens
         await self._engine_unsubscribe_all_safe()
         logger.info("[ALERTS-ENGINE] stopped")
 
@@ -131,7 +132,7 @@ class AlertsEngine:
             while self._running:
                 await asyncio.sleep(interval)
 
-                # Re-assert engine subscriptions on WS reconnect
+                # Track runtime status changes for observability
                 await self._handle_ws_reconnect()
 
                 # Periodic active-set refresh
@@ -407,91 +408,43 @@ class AlertsEngine:
                 logger.exception("[ALERTS-ENGINE] refresh loop failed; continuing")
 
     async def _reconcile_engine_subscriptions(self, desired_tokens: Set[int]) -> None:
-        # Filter to tokens with zero client refcount
-        client_map: Dict[int, int] = getattr(self.ws_manager, "token_refcount", {}) or {}
-        desired = {t for t in desired_tokens if int(client_map.get(t, 0) or 0) == 0}
-
-        # Determine deltas
-        add = sorted(list(desired - self._engine_subscribed_tokens))
-        remove = sorted(list(self._engine_subscribed_tokens - desired))
-
-        if add:
-            await self._engine_subscribe_safe(add)
-            self._engine_subscribed_tokens.update(add)
-
-        if remove:
-            await self._engine_unsubscribe_safe(remove)
-            for t in remove:
-                self._engine_subscribed_tokens.discard(t)
+        desired = {int(token) for token in desired_tokens}
+        try:
+            if desired:
+                await self.market_data_runtime.set_owner_subscriptions(
+                    self.owner_id,
+                    {token: "ltp" for token in desired},
+                )
+            else:
+                await self.market_data_runtime.delete_owner(self.owner_id)
+            self._engine_subscribed_tokens = desired
+        except Exception:
+            logger.error("[ALERTS-ENGINE] runtime subscription reconcile failed", exc_info=True)
 
     async def _engine_subscribe_safe(self, tokens: List[int]) -> None:
-        if not tokens:
-            return
-        # Ensure WS connected
-        try:
-            if self.ws_manager and getattr(self.ws_manager, "kws", None) and self.ws_manager.kws.is_connected():
-                # Subscribe
-                try:
-                    self.ws_manager.kws.subscribe(tokens)
-                    logger.info("[ALERTS-ENGINE] subscribe tokens=%s", tokens)
-                except Exception as e:
-                    logger.error("[ALERTS-ENGINE] subscribe failed: %s", e)
-
-                # Set mode to ltp ONLY for tokens not already tracked with an aggregate mode
-                token_mode_agg: Dict[int, str] = getattr(self.ws_manager, "token_mode_agg", {}) or {}
-                set_mode_tokens = [t for t in tokens if t not in token_mode_agg]
-                if set_mode_tokens:
-                    try:
-                        self.ws_manager.kws.set_mode("ltp", set_mode_tokens)
-                        logger.info("[ALERTS-ENGINE] set_mode ltp tokens=%s", set_mode_tokens)
-                    except Exception as e:
-                        logger.error("[ALERTS-ENGINE] set_mode(ltp) failed: %s", e)
-            else:
-                logger.debug("[ALERTS-ENGINE] skip subscribe; WS not connected")
-        except Exception as e:
-            logger.error("[ALERTS-ENGINE] subscribe unexpected error: %s", e, exc_info=True)
+        await self._reconcile_engine_subscriptions(self._engine_subscribed_tokens | {int(token) for token in tokens})
 
     async def _engine_unsubscribe_safe(self, tokens: List[int]) -> None:
-        if not tokens:
-            return
-        try:
-            # Unsubscribe only when WS is connected
-            if self.ws_manager and getattr(self.ws_manager, "kws", None) and self.ws_manager.kws.is_connected():
-                # Double-check no clients currently hold the token
-                client_map: Dict[int, int] = getattr(self.ws_manager, "token_refcount", {}) or {}
-                safe_tokens = [t for t in tokens if int(client_map.get(t, 0) or 0) == 0]
-                if not safe_tokens:
-                    return
-                try:
-                    self.ws_manager.kws.unsubscribe(safe_tokens)
-                    logger.info("[ALERTS-ENGINE] unsubscribe tokens=%s", safe_tokens)
-                except Exception as e:
-                    logger.error("[ALERTS-ENGINE] unsubscribe failed: %s", e)
-        except Exception as e:
-            logger.error("[ALERTS-ENGINE] unsubscribe unexpected error: %s", e, exc_info=True)
+        remaining = self._engine_subscribed_tokens - {int(token) for token in tokens}
+        await self._reconcile_engine_subscriptions(remaining)
 
     async def _engine_unsubscribe_all_safe(self) -> None:
         if not self._engine_subscribed_tokens:
             return
-        await self._engine_unsubscribe_safe(sorted(list(self._engine_subscribed_tokens)))
+        try:
+            await self.market_data_runtime.delete_owner(self.owner_id)
+        except Exception:
+            logger.warning("[ALERTS-ENGINE] failed to remove runtime owner %s", self.owner_id, exc_info=True)
         self._engine_subscribed_tokens.clear()
 
     async def _handle_ws_reconnect(self) -> None:
         try:
-            status = None
-            if self.ws_manager and hasattr(self.ws_manager, "get_websocket_status"):
-                status = self.ws_manager.get_websocket_status()
+            status = self.market_data_runtime.get_websocket_status()
 
             if status != self._last_ws_status:
                 prev_status = self._last_ws_status
                 self._last_ws_status = status
-                logger.info("[ALERTS-ENGINE] WS status change: %s -> %s", prev_status, status)
-
-                # On transition to CONNECTED, reconcile all engine subscriptions
-                if prev_status != "CONNECTED" and status == "CONNECTED":
-                    logger.info("[ALERTS-ENGINE] WS reconnected; reconciling all engine subscriptions")
-                    desired_tokens = set(self._alerts_by_token.keys())
-                    await self._reconcile_engine_subscriptions(desired_tokens)
+                logger.info("[ALERTS-ENGINE] runtime status change: %s -> %s", prev_status, status)
         except Exception as e:
             logger.error("[ALERTS-ENGINE] _handle_ws_reconnect failed: %s", e, exc_info=True)
 
@@ -505,7 +458,7 @@ class AlertsEngine:
 
     def _get_latest_price(self, token: int) -> Optional[float]:
         try:
-            lt: Dict[int, Dict[str, Any]] = getattr(self.ws_manager, "latest_ticks", {}) or {}
+            lt: Dict[int, Dict[str, Any]] = getattr(self.market_data_runtime, "latest_ticks", {}) or {}
             tick = lt.get(int(token))
             if isinstance(tick, dict):
                 lp = tick.get("last_price")

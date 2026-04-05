@@ -281,16 +281,11 @@ async def create_protection_strategy(
         
         logger.info(f"Strategy created: {strategy_id}")
         
-        # 4. Subscribe to tokens in WebSocket
-        tokens_to_subscribe = []
-        
-        # Subscribe to index token
-        if req.index_instrument_token:
-            tokens_to_subscribe.append(req.index_instrument_token)
-        
-        if tokens_to_subscribe:
-            engine.ws_manager.subscribe(tokens_to_subscribe)
-            logger.info(f"Subscribed to tokens: {tokens_to_subscribe}")
+        # 4. Refresh engine subscriptions immediately
+        try:
+            await engine.refresh_now()
+        except Exception:
+            logger.warning("Failed to refresh protection engine subscriptions immediately", exc_info=True)
         
         # 5. Log creation event
         event_query = """
@@ -460,8 +455,8 @@ async def health_check(request: Request):
         
         conn.close()
         
-        # Get WebSocket status
-        ws_status = "connected" if engine.ws_manager.get_websocket_status() == "CONNECTED" else "disconnected"
+        # Get runtime status
+        ws_status = engine.market_data_runtime.get_websocket_status().lower()
         
         return EngineHealthResponse(
             status="healthy" if stats['running'] else "stopped",

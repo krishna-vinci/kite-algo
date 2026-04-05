@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 
 import psycopg2.extras
 import redis.asyncio as redis
-from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, WebSocket
 from fastapi.responses import JSONResponse
 from kiteconnect import KiteConnect
 from pydantic import BaseModel
@@ -13,12 +13,10 @@ from pydantic import BaseModel
 from broker_api.kite_auth import API_KEY
 from broker_api.redis_events import get_redis
 from broker_api.broker_api import get_system_access_token
-from database import SessionLocal, get_db_connection, get_user_settings
+from database import SessionLocal, get_db_connection
 
 
 router = APIRouter(tags=["Marketwatch"])
-
-VALID_MODES = {"ltp", "quote", "full"}
 
 
 class OverlaySnapshotTick(BaseModel):
@@ -34,68 +32,6 @@ class OverlaySnapshotTick(BaseModel):
 class OverlaySnapshotResponse(BaseModel):
     status: str
     data: Dict[str, OverlaySnapshotTick]
-
-
-def _extract_tokens_from_subs(_subs: dict, token_set: set[int]) -> int:
-    if not _subs or not isinstance(_subs, dict):
-        return 0
-    token_count = 0
-    for group in _subs.get("groups", []) or []:
-        if not group or not isinstance(group, dict):
-            continue
-        if isinstance(group.get("tokens"), list):
-            for t in group["tokens"]:
-                try:
-                    token_set.add(int(t))
-                    token_count += 1
-                except (ValueError, TypeError):
-                    pass
-        elif isinstance(group.get("instruments"), list):
-            for inst in group["instruments"]:
-                token = (inst or {}).get("instrument_token") or (inst or {}).get("token")
-                if token is None:
-                    continue
-                try:
-                    token_set.add(int(token))
-                    token_count += 1
-                except (ValueError, TypeError):
-                    pass
-
-    if isinstance(_subs.get("layouts"), dict):
-        for tokens in _subs["layouts"].values():
-            if isinstance(tokens, list):
-                for t in tokens:
-                    if t is not None:
-                        try:
-                            token_set.add(int(t))
-                            token_count += 1
-                        except (ValueError, TypeError):
-                            pass
-    return token_count
-
-
-def _build_initial_subscriptions_from_settings(settings: dict) -> Dict[int, str]:
-    token_set: set[int] = set()
-    legacy = settings.get("subscriptions")
-    sb = settings.get("subscriptions_sidebar")
-    mw = settings.get("subscriptions_marketwatch")
-    nfo = settings.get("subscriptions_nfo-charts")
-    nfo_layouts = settings.get("subscriptions_nfo-charts-layouts")
-
-    for candidate in (legacy, sb, mw, nfo, nfo_layouts):
-        if isinstance(candidate, dict):
-            _extract_tokens_from_subs(candidate, token_set)
-
-    mode = None
-    for candidate in (nfo, nfo_layouts, legacy, sb, mw):
-        if isinstance(candidate, dict):
-            candidate_mode = candidate.get("mode")
-            if candidate_mode in VALID_MODES:
-                mode = candidate_mode
-                if mode == "full":
-                    break
-
-    return {int(token): (mode or "quote") for token in token_set}
 
 
 @router.get("/nifty50")
@@ -306,56 +242,11 @@ async def finalize_nifty50_baseline(dry_run: bool = False):
 
 @router.websocket("/ws/marketwatch")
 async def websocket_endpoint(websocket: WebSocket):
-    manager = getattr(websocket.app.state, "ws_manager", None)
-    if manager is None:
-        logging.error("WebSocket connection rejected: ws_manager is None")
-        await websocket.close(code=1011, reason="WebSocketManager not initialized")
-        return
-
-    await manager.connect(websocket)
-    db = SessionLocal()
-    try:
-        settings = get_user_settings(db) or {}
-        initial_subscriptions = _build_initial_subscriptions_from_settings(settings)
-        if initial_subscriptions:
-            all_tokens = list(initial_subscriptions.keys())
-            initial_mode = next(iter(initial_subscriptions.values()), "quote")
-            await manager.subscribe(websocket, all_tokens, initial_mode)
-    finally:
-        db.close()
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-            action = data.get("action")
-            if not action:
-                await websocket.send_text(json.dumps({"type": "error", "message": "Missing action"}))
-                continue
-
-            if action == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
-                continue
-
-            tokens = data.get("tokens") or []
-            mode = data.get("mode")
-            if tokens and isinstance(tokens, list):
-                try:
-                    tokens = [int(t) for t in tokens]
-                except Exception:
-                    await websocket.send_text(json.dumps({"type": "error", "message": "Invalid tokens"}))
-                    continue
-
-            if action == "subscribe" and tokens:
-                await manager.subscribe(websocket, tokens, mode)
-            elif action == "unsubscribe" and tokens:
-                await manager.unsubscribe(websocket, tokens)
-            elif action == "set_mode" and tokens and mode:
-                await manager.set_mode(websocket, tokens, mode)
-            else:
-                await websocket.send_text(json.dumps({"type": "error", "message": "Invalid action"}))
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        logging.info("Client disconnected.")
-    except Exception as e:
-        logging.error("Error in websocket endpoint: %s", e, exc_info=True)
-        manager.disconnect(websocket)
+    await websocket.accept()
+    await websocket.send_json(
+        {
+            "type": "error",
+            "message": "Legacy Python marketwatch websocket has been removed. Connect directly to the Go market-runtime /ws/marketwatch endpoint.",
+        }
+    )
+    await websocket.close(code=1013, reason="Use Go market-runtime websocket")

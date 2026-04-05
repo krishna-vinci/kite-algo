@@ -68,7 +68,7 @@ def session_status(request: Request, db: Session = Depends(get_db)):
     broker_connected = False
     if sid:
         broker_connected = db.query(KiteSession).filter_by(session_id=sid).first() is not None
-    ws_manager = getattr(request.app.state, "ws_manager", None)
+    market_data_runtime = getattr(request.app.state, "market_data_runtime", None)
     daily_gate = getattr(request.app.state, "daily_token_ready", None)
     return {
         "app": {
@@ -84,8 +84,8 @@ def session_status(request: Request, db: Session = Depends(get_db)):
             "components": get_components(),
             "meta": get_meta(),
             "websocket": {
-                "status": ws_manager.get_websocket_status() if ws_manager else "unavailable",
-                "last_order_update_at": getattr(ws_manager, "last_order_update_at", None),
+                "status": market_data_runtime.get_websocket_status() if market_data_runtime else "unavailable",
+                "last_order_update_at": getattr(market_data_runtime, "last_order_update_at", None),
             },
             "daily_token_gate": {
                 "ready": bool(daily_gate.is_set()) if daily_gate else False,
@@ -97,14 +97,14 @@ def session_status(request: Request, db: Session = Depends(get_db)):
 @router.get("/system/runtime", tags=["System"])
 def runtime_status(request: Request):
     require_app_user(request)
-    ws_manager = getattr(request.app.state, "ws_manager", None)
+    market_data_runtime = getattr(request.app.state, "market_data_runtime", None)
     daily_gate = getattr(request.app.state, "daily_token_ready", None)
     return {
         "components": get_components(),
         "meta": get_meta(),
         "websocket": {
-            "status": ws_manager.get_websocket_status() if ws_manager else "unavailable",
-            "last_order_update_at": getattr(ws_manager, "last_order_update_at", None),
+            "status": market_data_runtime.get_websocket_status() if market_data_runtime else "unavailable",
+            "last_order_update_at": getattr(market_data_runtime, "last_order_update_at", None),
         },
         "daily_token_gate": {
             "ready": bool(daily_gate.is_set()) if daily_gate else False,

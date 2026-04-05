@@ -1,6 +1,5 @@
 import { writable } from 'svelte/store';
 import type { Instrument } from '$lib/types';
-import { getApiBase } from '$lib/api';
 
 // Extended interface to support live tick data on-the-fly
 interface TickData {
@@ -50,19 +49,15 @@ function createMarketwatchStore() {
 	function buildWsUrl(): string {
 		if (typeof window === 'undefined') {
 			// SSR fallback - should not be called in SSR
-			return 'ws://localhost:8777/api/ws/marketwatch';
+			return 'ws://localhost:5173/ws/marketwatch';
 		}
-		const base = getApiBase(); // '' or http(s)://host
-		// If base is empty or relative, derive from current location
-		if (!base || base.startsWith('/')) {
-			const loc = window.location;
-			const wsProto = loc.protocol === 'https:' ? 'wss' : 'ws';
-			return `${wsProto}://${loc.host}/api/ws/marketwatch`;
+		const runtimeWs = import.meta.env.VITE_MARKET_RUNTIME_WS_URL as string | undefined;
+		if (runtimeWs) {
+			return runtimeWs;
 		}
-		// Absolute base provided: convert scheme and construct ws URL
-		const wsProto = base.startsWith('https') ? 'wss' : 'ws';
-		const wsHost = base.replace(/^https?:\/\//, '');
-		return `${wsProto}://${wsHost}/api/ws/marketwatch`;
+		const loc = window.location;
+		const wsProto = loc.protocol === 'https:' ? 'wss' : 'ws';
+		return `${wsProto}://${loc.host}/ws/marketwatch`;
 	}
 
 	// Send action safely when connected, or queue until connection opens

@@ -17,7 +17,6 @@ from typing import Dict, List, Optional, Any, Set
 from uuid import UUID
 
 from broker_api.kite_orders import OrdersService, PlaceOrderRequest, TransactionType, Variety, Product, OrderType, Validity, Exchange
-from broker_api.websocket_manager import WebSocketManager
 from database import Database
 
 logger = logging.getLogger(__name__)
@@ -41,7 +40,7 @@ class PositionProtectionEngine:
     def __init__(
         self,
         db: Database,
-        ws_manager: WebSocketManager,
+        market_data_runtime,
         orders_service: OrdersService,
         app: Any,
         interval_ms: int = 500,
@@ -52,16 +51,17 @@ class PositionProtectionEngine:
         
         Args:
             db: Async database connection
-            ws_manager: WebSocket manager for price feeds
+            market_data_runtime: Go market-runtime adapter for price feeds
             orders_service: Order placement service
             app: FastAPI app instance (for state access)
             interval_ms: Evaluation loop interval (default 500ms)
             refresh_interval_sec: DB refresh interval (default 5s)
         """
         self.db = db
-        self.ws_manager = ws_manager
+        self.market_data_runtime = market_data_runtime
         self.orders_service = orders_service
         self.app = app
+        self.owner_id = "backend:protection-engine"
         self.interval_ms = interval_ms
         self.refresh_interval_sec = refresh_interval_sec
         
@@ -146,8 +146,8 @@ class PositionProtectionEngine:
                 # 1. Refresh strategies from DB if needed
                 await self._refresh_strategies_if_needed()
                 
-                # 2. Get latest price data from WebSocket
-                latest_ticks = self.ws_manager.latest_ticks
+                # 2. Get latest price data from market runtime cache
+                latest_ticks = self.market_data_runtime.latest_ticks
                 
                 # 3. Evaluate each active strategy
                 for strategy_id, strategy in list(self._strategies.items()):
@@ -824,89 +824,48 @@ class PositionProtectionEngine:
         return None
     
     async def _update_engine_subscriptions(self, desired_tokens: Set[int]):
-        """Update engine subscriptions based on required tokens (only for tokens not used by clients)"""
-        # Filter out tokens that clients are already subscribed to
-        client_map: Dict[int, int] = getattr(self.ws_manager, "token_refcount", {}) or {}
-        desired = {t for t in desired_tokens if int(client_map.get(t, 0) or 0) == 0}
-        
-        # Determine deltas
-        add = sorted(list(desired - self._engine_subscribed_tokens))
-        remove = sorted(list(self._engine_subscribed_tokens - desired))
-        
-        if add:
-            await self._engine_subscribe_safe(add)
-            self._engine_subscribed_tokens.update(add)
-        
-        if remove:
-            await self._engine_unsubscribe_safe(remove)
-            for t in remove:
-                self._engine_subscribed_tokens.discard(t)
+        """Update runtime owner subscriptions for protection tokens."""
+        desired = {int(token) for token in desired_tokens}
+        try:
+            if desired:
+                await self.market_data_runtime.set_owner_subscriptions(
+                    self.owner_id,
+                    {token: "ltp" for token in desired},
+                )
+            else:
+                await self.market_data_runtime.delete_owner(self.owner_id)
+            self._engine_subscribed_tokens = desired
+        except Exception:
+            logger.error("[PROTECTION-ENGINE] runtime subscription reconcile failed", exc_info=True)
     
     async def _engine_subscribe_safe(self, tokens: List[int]):
-        """Subscribe to tokens at KiteTicker level (backend subscription)"""
-        if not tokens:
-            return
-        try:
-            if self.ws_manager and getattr(self.ws_manager, "kws", None) and self.ws_manager.kws.is_connected():
-                # Subscribe
-                try:
-                    self.ws_manager.kws.subscribe(tokens)
-                    logger.info(f"[PROTECTION-ENGINE] subscribe tokens={tokens}")
-                except Exception as e:
-                    logger.error(f"[PROTECTION-ENGINE] subscribe failed: {e}")
-                
-                # Set mode to ltp ONLY for tokens not already tracked with an aggregate mode
-                token_mode_agg: Dict[int, str] = getattr(self.ws_manager, "token_mode_agg", {}) or {}
-                set_mode_tokens = [t for t in tokens if t not in token_mode_agg]
-                if set_mode_tokens:
-                    try:
-                        self.ws_manager.kws.set_mode("ltp", set_mode_tokens)
-                        logger.info(f"[PROTECTION-ENGINE] set_mode ltp tokens={set_mode_tokens}")
-                    except Exception as e:
-                        logger.error(f"[PROTECTION-ENGINE] set_mode(ltp) failed: {e}")
-            else:
-                logger.debug("[PROTECTION-ENGINE] skip subscribe; WS not connected")
-        except Exception as e:
-            logger.error(f"[PROTECTION-ENGINE] subscribe unexpected error: {e}", exc_info=True)
+        await self._update_engine_subscriptions(self._engine_subscribed_tokens | {int(token) for token in tokens})
     
     async def _engine_unsubscribe_safe(self, tokens: List[int]):
-        """Unsubscribe from tokens at KiteTicker level (backend unsubscription)"""
-        if not tokens:
-            return
-        try:
-            if self.ws_manager and getattr(self.ws_manager, "kws", None) and self.ws_manager.kws.is_connected():
-                # Double-check no clients currently hold the token
-                client_map: Dict[int, int] = getattr(self.ws_manager, "token_refcount", {}) or {}
-                safe_tokens = [t for t in tokens if int(client_map.get(t, 0) or 0) == 0]
-                if not safe_tokens:
-                    return
-                try:
-                    self.ws_manager.kws.unsubscribe(safe_tokens)
-                    logger.info(f"[PROTECTION-ENGINE] unsubscribe tokens={safe_tokens}")
-                except Exception as e:
-                    logger.error(f"[PROTECTION-ENGINE] unsubscribe failed: {e}")
-        except Exception as e:
-            logger.error(f"[PROTECTION-ENGINE] unsubscribe unexpected error: {e}", exc_info=True)
+        await self._update_engine_subscriptions(self._engine_subscribed_tokens - {int(token) for token in tokens})
     
     async def _engine_unsubscribe_all_safe(self):
         """Unsubscribe from all engine-owned tokens"""
         if not self._engine_subscribed_tokens:
             return
-        await self._engine_unsubscribe_safe(sorted(list(self._engine_subscribed_tokens)))
+        try:
+            await self.market_data_runtime.delete_owner(self.owner_id)
+        except Exception:
+            logger.warning("[PROTECTION-ENGINE] failed to remove runtime owner %s", self.owner_id, exc_info=True)
         self._engine_subscribed_tokens.clear()
     
     async def _handle_ws_reconnect(self):
-        """Re-assert engine subscriptions on WebSocket reconnect"""
+        """Track market runtime status changes for observability."""
         try:
-            current_status = self.ws_manager.get_websocket_status()
-            if current_status == "CONNECTED" and self._last_ws_status != "CONNECTED":
-                # WS just reconnected - re-subscribe to engine tokens
-                if self._engine_subscribed_tokens:
-                    logger.info(f"[PROTECTION-ENGINE] WS reconnected, re-subscribing to {len(self._engine_subscribed_tokens)} tokens")
-                    await self._engine_subscribe_safe(sorted(list(self._engine_subscribed_tokens)))
+            current_status = self.market_data_runtime.get_websocket_status()
+            if current_status != self._last_ws_status:
+                logger.info("[PROTECTION-ENGINE] runtime status change: %s -> %s", self._last_ws_status, current_status)
             self._last_ws_status = current_status
         except Exception as e:
             logger.error(f"[PROTECTION-ENGINE] handle_ws_reconnect error: {e}", exc_info=True)
+
+    async def refresh_now(self):
+        await self._load_active_strategies()
     
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics"""

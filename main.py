@@ -91,15 +91,15 @@ from broker_api.kite_auth import login_headless
 import logging
 from database import SessionLocal, database as async_db
 from broker_api.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, upsert_kite_session
-from broker_api.market_runtime_client import market_runtime_enabled
+from broker_api.market_runtime_client import MarketDataRuntime, market_runtime_enabled
 from broker_api.broker_api import run_headless_login_and_persist_system_token
 from broker_api.kite_auth import API_KEY
 from broker_api.order_runtime import order_event_runtime, realtime_positions_service, refresh_processing_stuck_rows
-from broker_api.websocket_manager import WebSocketManager
 from alerts.engine import AlertsEngine
 from database import get_user_settings, update_user_settings
 from pydantic import BaseModel
 import csv
+from sqlalchemy import text
 
 class UserSubscriptions(BaseModel):
     groups: List[dict]
@@ -118,8 +118,8 @@ class OverlaySnapshotResponse(BaseModel):
     status: str
     data: Dict[str, OverlaySnapshotTick]
 
-# Global instance for the WebSocketManager
-ws_manager: Optional[WebSocketManager] = None
+# Global instance for the Go market runtime bridge
+market_data_runtime: Optional[MarketDataRuntime] = None
 
 # Daily gating event (set once headless login succeeds; cleared before daily rotation)
 daily_token_ready: asyncio.Event = asyncio.Event()
@@ -195,11 +195,12 @@ def run_schema_migrations() -> None:
 # 2. Combine the lifespans
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
-    global ws_manager
+    global market_data_runtime
     # Perform headless login at startup and store the KiteConnect instance
     token_watcher_task = None
     scheduler_task = None
     order_runtime_task = None
+    positions_runtime_task = None
     set_component_status("app", "starting", detail="Application startup in progress")
     try:
         # Ensure the schema is applied before any other database operations
@@ -284,21 +285,24 @@ async def combined_lifespan(app: FastAPI):
         except Exception as e:
              logging.error(f"Failed to connect to async database: {e}")
 
-        # Initialize and start the WebSocketManager with the selected token
-        logging.info("Initializing WebSocketManager...")
-        # Get the main event loop to pass to the WebSocketManager
-        main_event_loop = asyncio.get_running_loop()
-        ws_manager = WebSocketManager(api_key=API_KEY, access_token=at, main_event_loop=main_event_loop)
-        
-        # Inject real-time positions service into WebSocket manager
-        ws_manager.realtime_positions_service = realtime_positions_service
-        logging.info("Real-time positions service injected into WebSocketManager")
-        
-        ws_manager.start()
-        logging.info("WebSocketManager started.")
-        set_component_status("websocket_manager", "healthy", detail="WebSocket manager started")
-        # Expose ws_manager for routers to access latest ticks
-        app.state.ws_manager = ws_manager
+        if not market_runtime_enabled():
+            raise RuntimeError("MARKET_RUNTIME_ENABLED must be true because Python WebSocketManager has been retired")
+
+        logging.info("Initializing Go market runtime bridge...")
+        market_data_runtime = MarketDataRuntime(realtime_positions_service=realtime_positions_service)
+        await market_data_runtime.start()
+        app.state.market_data_runtime = market_data_runtime
+        runtime_status = dict(getattr(market_data_runtime, "runtime_status", {}) or {})
+        set_component_status(
+            "market_runtime",
+            runtime_status.get("status", "healthy"),
+            detail="Go market runtime bridge started",
+            meta={
+                "active_shards": runtime_status.get("active_shards"),
+                "effective_tokens": runtime_status.get("effective_tokens"),
+            },
+        )
+        set_component_status("websocket_manager", "stopped", detail="Retired; Go market runtime is the only websocket owner")
 
         async def _order_runtime_worker():
             poll_seconds = max(1.0, float(os.getenv("ORDER_RUNTIME_POLL_SECONDS", "1.0")))
@@ -352,7 +356,50 @@ async def combined_lifespan(app: FastAPI):
 
         order_runtime_task = asyncio.create_task(_order_runtime_worker())
 
-        # Start background token watcher to rotate WS token when DB 'system' token changes
+        async def _positions_runtime_subscription_worker():
+            owner_id = "backend:realtime-positions"
+            poll_seconds = max(5.0, float(os.getenv("POSITIONS_RUNTIME_SUBS_POLL_SECONDS", "10")))
+            set_component_status("positions_runtime_subscriptions", "healthy", detail="Syncing runtime subscriptions for active positions")
+            while True:
+                try:
+                    db = SessionLocal()
+                    try:
+                        rows = db.execute(
+                            text(
+                                """
+                                SELECT DISTINCT instrument_token
+                                FROM account_positions
+                                WHERE net_quantity <> 0
+                                  AND instrument_token IS NOT NULL
+                                """
+                            )
+                        ).fetchall()
+                    finally:
+                        db.close()
+
+                    subscriptions = {int(row[0]): "ltp" for row in rows if row and row[0] is not None}
+                    if subscriptions:
+                        await market_data_runtime.set_owner_subscriptions(owner_id, subscriptions)
+                    else:
+                        await market_data_runtime.delete_owner(owner_id)
+
+                    heartbeat(
+                        "positions_runtime_subscriptions",
+                        detail="Synced runtime subscriptions for active positions",
+                        meta={"tracked_tokens": len(subscriptions), "poll_seconds": poll_seconds},
+                    )
+                    await asyncio.sleep(poll_seconds)
+                except asyncio.CancelledError:
+                    set_component_status("positions_runtime_subscriptions", "stopped", detail="Positions runtime subscription worker cancelled")
+                    break
+                except Exception as exc:
+                    logging.error("Positions runtime subscription worker error: %s", exc, exc_info=True)
+                    set_component_status("positions_runtime_subscriptions", "degraded", detail=str(exc))
+                    await asyncio.sleep(poll_seconds)
+
+        positions_runtime_task = asyncio.create_task(_positions_runtime_subscription_worker())
+
+        # Start background token watcher so MCP-facing system client follows DB token rotation.
         async def _system_token_watcher():
             poll_seconds = int(os.getenv("SYSTEM_TOKEN_POLL_SEC", "45"))
             last_token = at
@@ -369,19 +416,9 @@ async def combined_lifespan(app: FastAPI):
                     if new_token and new_token != last_token:
                         old_fp = (last_token[-6:] if isinstance(last_token, str) else "")
                         new_fp = (new_token[-6:] if isinstance(new_token, str) else "")
-                        logging.info("System token change detected; rotating WS token (..%s -> ..%s)", old_fp, new_fp)
-                        ws_manager.reinit_with_token(new_token)
+                        logging.info("System token change detected; market runtime will rotate from DB token (..%s -> ..%s)", old_fp, new_fp)
                         server.mcp_kite_instance = build_kite_client(new_token, session_id="system")
-                        aggregator = getattr(app.state, "candle_aggregator", None)
-                        if aggregator and getattr(aggregator, "running", False) and not market_runtime_enabled():
-                            await aggregator.stop()
-                            await aggregator.start(
-                                access_token=new_token,
-                                intervals=list(getattr(aggregator, "intervals", []) or []),
-                                owner_scope=getattr(aggregator, "owner_scope", "all"),
-                                refresh_seconds=getattr(aggregator, "refresh_seconds", 30),
-                            )
-                        set_component_status("websocket_manager", "healthy", detail="WebSocket token rotated", meta={"token_suffix": new_fp})
+                        set_component_status("market_runtime", "healthy", detail="Market runtime observing rotated system token", meta={"token_suffix": new_fp})
                         last_token = new_token
                 except asyncio.CancelledError:
                     set_component_status("system_token_watcher", "stopped", detail="Token watcher cancelled")
@@ -401,9 +438,9 @@ async def combined_lifespan(app: FastAPI):
         set_meta("daily_token_gate", {"ready": True, "last_changed_at": datetime.utcnow().isoformat()})
         scheduler_task = asyncio.create_task(daily_token_scheduler())
 
-        # Start AlertsEngine (Phase 0) after WS manager and async DB are ready
+        # Start AlertsEngine after the market runtime bridge and async DB are ready
         try:
-            alerts_engine = AlertsEngine(async_db, ws_manager, app)
+            alerts_engine = AlertsEngine(async_db, market_data_runtime, app)
             alerts_engine.start()
             app.state.alerts_engine = alerts_engine
             logging.info("AlertsEngine started (interval_ms=%s)", getattr(alerts_engine, "interval_ms", None))
@@ -420,7 +457,7 @@ async def combined_lifespan(app: FastAPI):
             orders_service = OrdersService()
             protection_engine = PositionProtectionEngine(
                 db=async_db,
-                ws_manager=ws_manager,
+                market_data_runtime=market_data_runtime,
                 orders_service=orders_service,
                 app=app
             )
@@ -453,10 +490,10 @@ async def combined_lifespan(app: FastAPI):
         except Exception as e:
             logging.error("Failed to initialize Phase 3 components: %s", e, exc_info=True)
 
-        # Start alert dispatcher (WS text messages) and 2s polling fallback
+        # Start alert dispatcher and polling fallback (not yet implemented in runtime form)
         alerts_ntfy_url = os.getenv("KITE_ALERTS_NTFY_URL") or os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
-        # TODO: alert_event_dispatcher needs to be implemented. See broker_api/websocket_manager.py:487
-        # asyncio.create_task(alert_event_dispatcher(ws_manager, alerts_ntfy_url))
+        # TODO: alert_event_dispatcher needs a market-runtime-backed implementation.
+        # asyncio.create_task(alert_event_dispatcher(market_data_runtime, alerts_ntfy_url))
         # TODO: alerts_poll_worker needs to be implemented.
         # asyncio.create_task(alerts_poll_worker(API_KEY, alerts_ntfy_url))
 
@@ -508,11 +545,12 @@ async def combined_lifespan(app: FastAPI):
             logging.error("Failed to start Candle Aggregator: %s", e, exc_info=True)
             set_component_status("candle_aggregator", "degraded", detail=str(e))
     except Exception as e:
-        logging.error(f"Failed to initialize MCP Kite instance or WebSocketManager: {e}", exc_info=True)
+        logging.error(f"Failed to initialize broker bootstrap or market runtime: {e}", exc_info=True)
         startup_status = "degraded"
         startup_detail = f"Broker startup degraded: {e}"
         set_component_status("broker_bootstrap", "degraded", detail=str(e))
-        set_component_status("websocket_manager", "degraded", detail="WebSocket manager unavailable because broker bootstrap failed")
+        set_component_status("market_runtime", "degraded", detail="Go market runtime unavailable because broker bootstrap failed")
+        set_component_status("websocket_manager", "stopped", detail="Retired; Go market runtime is required")
         set_meta("daily_broker_login", {
             "status": "degraded",
             "last_error": str(e),
@@ -520,8 +558,8 @@ async def combined_lifespan(app: FastAPI):
         })
         # Depending on the desired behavior, you might want to exit the application
         # or proceed without a valid Kite instance for MCP.
-        # For now, we'll log the error and continue.
         server.mcp_kite_instance = None
+        raise
 
     set_component_status("app", startup_status, detail=startup_detail)
 
@@ -560,6 +598,16 @@ async def combined_lifespan(app: FastAPI):
                 pass
     except Exception:
         pass
+    # Cancel positions runtime worker
+    try:
+        if 'positions_runtime_task' in locals() and positions_runtime_task:
+            positions_runtime_task.cancel()
+            try:
+                await positions_runtime_task
+            except Exception:
+                pass
+    except Exception:
+        pass
     # Stop AlertsEngine
     try:
         eng = getattr(app.state, "alerts_engine", None)
@@ -591,11 +639,12 @@ async def combined_lifespan(app: FastAPI):
     except Exception as e:
         logging.error("Error stopping Candle Aggregator: %s", e, exc_info=True)
 
-    if ws_manager:
-        logging.info("Stopping WebSocketManager...")
-        ws_manager.stop()
-        logging.info("WebSocketManager stopped.")
-        set_component_status("websocket_manager", "stopped", detail="WebSocket manager stopped")
+    if market_data_runtime:
+        logging.info("Stopping Go market runtime bridge...")
+        await market_data_runtime.stop()
+        logging.info("Go market runtime bridge stopped.")
+        set_component_status("market_runtime", "stopped", detail="Go market runtime bridge stopped")
+        set_component_status("websocket_manager", "stopped", detail="Retired; Go market runtime is the only websocket owner")
 
     set_component_status("app", "stopped", detail="Application shutdown complete")
 

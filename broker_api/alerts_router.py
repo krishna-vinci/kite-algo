@@ -45,15 +45,13 @@ class AlertPatch(BaseModel):
     notes: Optional[str] = None
     one_time: Optional[bool] = None
 
-def _get_ws_baseline(request: Request, instrument_token: int) -> Optional[float]:
+async def _get_runtime_baseline(request: Request, instrument_token: int) -> Optional[float]:
     try:
-        ws_mgr = getattr(request.app.state, "ws_manager", None)
-        if ws_mgr and getattr(ws_mgr, "latest_ticks", None):
-            tick = ws_mgr.latest_ticks.get(int(instrument_token))
-            if isinstance(tick, dict):
-                lp = tick.get("last_price")
-                if lp is not None:
-                    return float(lp)
+        runtime = getattr(request.app.state, "market_data_runtime", None)
+        if runtime is not None:
+            price = await runtime.get_last_price(int(instrument_token))
+            if price is not None:
+                return float(price)
     except Exception:
         pass
     return None
@@ -86,7 +84,7 @@ async def create_alert(req: Request, body: AlertCreate):
         # Resolve baseline
         baseline_price = body.baseline_price
         if baseline_price is None:
-            baseline_price = _get_ws_baseline(req, body.instrument_token)
+            baseline_price = await _get_runtime_baseline(req, body.instrument_token)
         if baseline_price is None:
             # No baseline available and not provided explicitly -> 424
             raise HTTPException(
@@ -118,7 +116,7 @@ async def create_alert(req: Request, body: AlertCreate):
         "notes": body.notes,
     }
     # Seed last_evaluated_price with best-known price at creation
-    initial_ltp = _get_ws_baseline(req, body.instrument_token)
+    initial_ltp = await _get_runtime_baseline(req, body.instrument_token)
     if initial_ltp is None:
         initial_ltp = baseline_price
 
@@ -331,7 +329,7 @@ async def _insert_alert_event(request: Request, alert_row: Any, event_type: str)
     Best-effort event insert; failures are logged and ignored.
     """
     try:
-        price = _get_ws_baseline(request, int(alert_row["instrument_token"]))
+        price = await _get_runtime_baseline(request, int(alert_row["instrument_token"]))
     except Exception:
         price = None
 

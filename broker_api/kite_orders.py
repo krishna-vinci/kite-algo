@@ -2212,29 +2212,29 @@ async def sse_order_events(request: Request, source: Optional[str] = Query(None,
 
 @router.post("/ws/orders/updates/enable")
 async def enable_ws_order_updates(request: Request):
-    mgr = getattr(request.app.state, "ws_manager", None)
-    if not mgr:
-        raise HTTPException(status_code=503, detail="WebSocket manager not available")
-    mgr.order_updates_enabled = True
+    runtime = getattr(request.app.state, "market_data_runtime", None)
+    if not runtime:
+        raise HTTPException(status_code=503, detail="Market runtime not available")
+    runtime.order_updates_enabled = True
     return {"status": "ok", "enabled": True}
 
 @router.post("/ws/orders/updates/disable")
 async def disable_ws_order_updates(request: Request):
-    mgr = getattr(request.app.state, "ws_manager", None)
-    if not mgr:
-        raise HTTPException(status_code=503, detail="WebSocket manager not available")
-    mgr.order_updates_enabled = False
+    runtime = getattr(request.app.state, "market_data_runtime", None)
+    if not runtime:
+        raise HTTPException(status_code=503, detail="Market runtime not available")
+    runtime.order_updates_enabled = False
     return {"status": "ok", "enabled": False}
 
 @router.get("/ws/orders/updates/status")
 async def ws_order_updates_status(request: Request):
-    mgr = getattr(request.app.state, "ws_manager", None)
-    if not mgr:
-        raise HTTPException(status_code=503, detail="WebSocket manager not available")
+    runtime = getattr(request.app.state, "market_data_runtime", None)
+    if not runtime:
+        raise HTTPException(status_code=503, detail="Market runtime not available")
     return {
-        "enabled": bool(getattr(mgr, "order_updates_enabled", False)),
-        "ws_status": mgr.get_websocket_status() if hasattr(mgr, "get_websocket_status") else "unknown",
-        "last_order_update_at": getattr(mgr, "last_order_update_at", None),
+        "enabled": bool(getattr(runtime, "order_updates_enabled", False)),
+        "ws_status": runtime.get_websocket_status() if hasattr(runtime, "get_websocket_status") else "unknown",
+        "last_order_update_at": getattr(runtime, "last_order_update_at", None),
     }
 
 @router.get("/ws/orders/events", response_model=List[OrderEventResponse])

@@ -29,5 +29,6 @@ EXPOSE 80
 ENV PORT=80
 ENV HOST=0.0.0.0
 ENV API_BASE_URL=http://finance-app:8777
+ENV MARKET_RUNTIME_URL=http://market-runtime:8780
 
 CMD ["node", "server.js"]
