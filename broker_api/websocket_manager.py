@@ -9,6 +9,7 @@ from fastapi import WebSocket
 from asyncio import AbstractEventLoop
 from datetime import datetime, timezone
 import redis.asyncio as redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 from broker_api.redis_events import get_redis, publish_event
 import uuid
 from database import SessionLocal
@@ -722,9 +723,9 @@ class WebSocketManager:
     # ---------------------------
     # Internal helpers
     # ---------------------------
-    def _compute_aggregate_mode(self, token: int) -> str:
+    def _compute_aggregate_mode(self, token: int, *, include_external: bool = True) -> str:
         """Compute highest requested mode across all clients for a token."""
-        if token in self._desired_tokens_union:
+        if include_external and token in self._desired_tokens_union:
             return self.kws.MODE_FULL
         agg_mode: Optional[str] = None
         for client in self.clients.values():
@@ -909,7 +910,7 @@ class WebSocketManager:
             mode_lower: Dict[str, List[int]] = {}
             for token in to_unsubscribe:
                 if self.token_refcount.get(token, 0) > 0:
-                    new_mode = self._compute_aggregate_mode(token)
+                    new_mode = self._compute_aggregate_mode(token, include_external=False)
                     self.token_mode_agg[token] = new_mode
                     mode_lower.setdefault(new_mode, []).append(token)
                 else:
@@ -973,7 +974,7 @@ async def write_ticks_to_redis_overlay(ticks: List[Dict[str, Any]]):
             
             await pipe.execute()
             
-    except redis.exceptions.ConnectionError as e:
+    except RedisConnectionError as e:
         logger.warning("Redis connection error in overlay write: %s", e)
     except Exception as e:
         logger.error("Error writing ticks to Redis overlay: %s", e, exc_info=True)

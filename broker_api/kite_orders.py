@@ -60,6 +60,10 @@ class Product(str, Enum):
     NRML = "NRML"
     MTF = "MTF"
 
+class PositionType(str, Enum):
+    DAY = "day"
+    OVERNIGHT = "overnight"
+
 class OrderType(str, Enum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
@@ -149,6 +153,25 @@ class ModifyOrderRequest(BaseModel):
 
 class CancelOrderResponse(BaseModel):
     order_id: str
+
+class ConvertPositionRequest(BaseModel):
+    exchange: Exchange
+    tradingsymbol: str
+    transaction_type: TransactionType
+    position_type: PositionType
+    quantity: int = Field(gt=0)
+    old_product: Product
+    new_product: Product
+
+    @model_validator(mode='after')
+    def validate_conversion(self) -> 'ConvertPositionRequest':
+        if self.old_product == self.new_product:
+            raise ValueError("old_product and new_product must be different.")
+        return self
+
+class ConvertPositionResponse(BaseModel):
+    status: str = "success"
+    data: Any
 
 class Order(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -703,6 +726,40 @@ class OrdersService:
             logger.error("Failed to retrieve positions", extra={**log_ctx, "error": str(e)}, exc_info=True)
             raise HTTPException(status_code=502, detail="Failed to retrieve positions from provider.")
 
+    async def convert_position(
+        self,
+        kite: KiteConnect,
+        req: ConvertPositionRequest,
+        corr_id: str,
+    ) -> ConvertPositionResponse:
+        log_ctx = self._log_context(
+            corr_id,
+            kite,
+            exchange=req.exchange.value,
+            tradingsymbol=req.tradingsymbol,
+            transaction_type=req.transaction_type.value,
+            position_type=req.position_type.value,
+            quantity=req.quantity,
+            old_product=req.old_product.value,
+            new_product=req.new_product.value,
+        )
+        logger.info("Converting position", extra=log_ctx)
+        try:
+            payload = req.model_dump(mode="python")
+            result = await run_kite_write_action(
+                "convert_position",
+                corr_id,
+                lambda: kite.convert_position(**payload),
+                meta=log_ctx,
+            )
+            logger.info("Position converted successfully", extra=log_ctx)
+            return ConvertPositionResponse(data=result)
+        except Exception as e:
+            logger.error("Failed to convert position", extra={**log_ctx, "error": str(e)}, exc_info=True)
+            if isinstance(e, HTTPException):
+                raise e
+            raise HTTPException(status_code=400, detail=str(e))
+
     async def modify_order(self, kite: KiteConnect, variety: str, order_id: str, req: ModifyOrderRequest, corr_id: str, parent_order_id: Optional[str] = None) -> dict:
         log_ctx = self._log_context(corr_id, kite, variety=variety, order_id=order_id, parent_order_id=parent_order_id)
         logger.info("Modifying order", extra=log_ctx)
@@ -958,6 +1015,14 @@ def get_trades(kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get
 @router.get("/positions", response_model=Any, description="Retrieve the current holdings and positions.")
 def get_positions(kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.positions(kite, corr_id)
+
+@router.post("/positions/convert", response_model=ConvertPositionResponse, description="Convert an open position from one product type to another.")
+async def convert_position(
+    req: ConvertPositionRequest,
+    kite: KiteConnect = Depends(get_kite),
+    corr_id: str = Depends(get_correlation_id),
+):
+    return await service.convert_position(kite, req, corr_id)
 
 # Phase 2 Endpoints
 @router.put("/orders/{variety}/{order_id}", response_model=dict, description="Modify an open/pending order.")

@@ -2,13 +2,14 @@
 Provides a repository for querying instrument data from the database.
 """
 import calendar
+from contextlib import contextmanager
 from datetime import date, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database import get_db
+from database import SessionLocal
 
 
 class InstrumentsRepository:
@@ -16,8 +17,28 @@ class InstrumentsRepository:
     A schema-aware repository for efficient options lookups.
     """
 
-    def __init__(self, db: Session = next(get_db())):
+    def __init__(self, db: Optional[Session | Callable[[], Session]] = None):
         self.db = db
+
+    @contextmanager
+    def _session_scope(self) -> Iterator[Session]:
+        if callable(self.db):
+            session = self.db()
+            try:
+                yield session
+            finally:
+                session.close()
+            return
+
+        if self.db is not None:
+            yield self.db
+            return
+
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
 
     def normalize_underlying_symbol(self, input_symbol: str) -> tuple[str, str]:
         """
@@ -45,8 +66,9 @@ class InstrumentsRepository:
                 "SELECT instrument_token FROM kite_instruments WHERE exchange='NSE' AND instrument_type='EQ' AND tradingsymbol=:ts LIMIT 1"
             )
 
-        result = self.db.execute(query, {"ts": spot_tradingsymbol}).scalar_one_or_none()
-        return result
+        with self._session_scope() as db:
+            result = db.execute(query, {"ts": spot_tradingsymbol}).scalar_one_or_none()
+            return result
 
     def get_expiries(self, underlying: str, today: date) -> List[date]:
         """
@@ -59,10 +81,11 @@ class InstrumentsRepository:
             AND expiry >= :today ORDER BY expiry ASC
             """
         )
-        result = self.db.execute(
-            query, {"underlying": underlying, "today": today}
-        ).fetchall()
-        return [row[0] for row in result]
+        with self._session_scope() as db:
+            result = db.execute(
+                query, {"underlying": underlying, "today": today}
+            ).fetchall()
+            return [row[0] for row in result]
 
     def classify_weekly_monthly(
         self, expiries: List[date]
@@ -117,10 +140,11 @@ class InstrumentsRepository:
             GROUP BY 1 ORDER BY 1 ASC
             """
         )
-        result = self.db.execute(
-            query, {"underlying": underlying, "today": today}
-        ).mappings()
-        return {row["ym"]: row["expiries"] for row in result}
+        with self._session_scope() as db:
+            result = db.execute(
+                query, {"underlying": underlying, "today": today}
+            ).mappings()
+            return {row["ym"]: row["expiries"] for row in result}
 
     def pick_monthly_per_month(
         self, grouped: Dict[date, List[date]]
@@ -166,10 +190,11 @@ class InstrumentsRepository:
             AND instrument_type IN ('CE','PE') ORDER BY strike ASC
             """
         )
-        result = self.db.execute(
-            query, {"underlying": underlying, "expiry": expiry}
-        ).fetchall()
-        return [row[0] for row in result]
+        with self._session_scope() as db:
+            result = db.execute(
+                query, {"underlying": underlying, "expiry": expiry}
+            ).fetchall()
+            return [row[0] for row in result]
 
     def get_option_instruments_for_strikes(
         self, underlying: str, expiry: date, strikes: List[float]
@@ -187,11 +212,12 @@ class InstrumentsRepository:
             AND strike IN :strikes AND instrument_type IN ('CE', 'PE')
             """
         )
-        result = self.db.execute(
-            query,
-            {"underlying": underlying, "expiry": expiry, "strikes": tuple(strikes)},
-        ).mappings().all()
-        return [dict(row) for row in result]
+        with self._session_scope() as db:
+            result = db.execute(
+                query,
+                {"underlying": underlying, "expiry": expiry, "strikes": tuple(strikes)},
+            ).mappings().all()
+            return [dict(row) for row in result]
 
     def derive_strike_step(self, strikes: List[float]) -> Optional[float]:
         """
@@ -295,5 +321,6 @@ class InstrumentsRepository:
             WHERE instrument_token = :token LIMIT 1
             """
         )
-        result = self.db.execute(query, {"token": instrument_token}).scalar_one_or_none()
-        return result
+        with self._session_scope() as db:
+            result = db.execute(query, {"token": instrument_token}).scalar_one_or_none()
+            return result

@@ -18,6 +18,8 @@ from database import SessionLocal, get_db_connection, get_user_settings
 
 router = APIRouter(tags=["Marketwatch"])
 
+VALID_MODES = {"ltp", "quote", "full"}
+
 
 class OverlaySnapshotTick(BaseModel):
     instrument_token: int
@@ -32,6 +34,68 @@ class OverlaySnapshotTick(BaseModel):
 class OverlaySnapshotResponse(BaseModel):
     status: str
     data: Dict[str, OverlaySnapshotTick]
+
+
+def _extract_tokens_from_subs(_subs: dict, token_set: set[int]) -> int:
+    if not _subs or not isinstance(_subs, dict):
+        return 0
+    token_count = 0
+    for group in _subs.get("groups", []) or []:
+        if not group or not isinstance(group, dict):
+            continue
+        if isinstance(group.get("tokens"), list):
+            for t in group["tokens"]:
+                try:
+                    token_set.add(int(t))
+                    token_count += 1
+                except (ValueError, TypeError):
+                    pass
+        elif isinstance(group.get("instruments"), list):
+            for inst in group["instruments"]:
+                token = (inst or {}).get("instrument_token") or (inst or {}).get("token")
+                if token is None:
+                    continue
+                try:
+                    token_set.add(int(token))
+                    token_count += 1
+                except (ValueError, TypeError):
+                    pass
+
+    if isinstance(_subs.get("layouts"), dict):
+        for tokens in _subs["layouts"].values():
+            if isinstance(tokens, list):
+                for t in tokens:
+                    if t is not None:
+                        try:
+                            token_set.add(int(t))
+                            token_count += 1
+                        except (ValueError, TypeError):
+                            pass
+    return token_count
+
+
+def _build_initial_subscriptions_from_settings(settings: dict) -> Dict[int, str]:
+    token_set: set[int] = set()
+    legacy = settings.get("subscriptions")
+    sb = settings.get("subscriptions_sidebar")
+    mw = settings.get("subscriptions_marketwatch")
+    nfo = settings.get("subscriptions_nfo-charts")
+    nfo_layouts = settings.get("subscriptions_nfo-charts-layouts")
+
+    for candidate in (legacy, sb, mw, nfo, nfo_layouts):
+        if isinstance(candidate, dict):
+            _extract_tokens_from_subs(candidate, token_set)
+
+    mode = None
+    for candidate in (nfo, nfo_layouts, legacy, sb, mw):
+        if isinstance(candidate, dict):
+            candidate_mode = candidate.get("mode")
+            if candidate_mode in VALID_MODES:
+                mode = candidate_mode
+                if mode == "full":
+                    break
+
+    return {int(token): (mode or "quote") for token in token_set}
 
 
 @router.get("/nifty50")
@@ -252,66 +316,11 @@ async def websocket_endpoint(websocket: WebSocket):
     db = SessionLocal()
     try:
         settings = get_user_settings(db) or {}
-
-        def _extract_tokens_from_subs(_subs: dict, token_set: set[int]) -> int:
-            if not _subs or not isinstance(_subs, dict):
-                return 0
-            token_count = 0
-            for group in _subs.get("groups", []) or []:
-                if not group or not isinstance(group, dict):
-                    continue
-                if isinstance(group.get("tokens"), list):
-                    for t in group["tokens"]:
-                        try:
-                            token_set.add(int(t))
-                            token_count += 1
-                        except (ValueError, TypeError):
-                            pass
-                elif isinstance(group.get("instruments"), list):
-                    for inst in group["instruments"]:
-                        token = (inst or {}).get("instrument_token") or (inst or {}).get("token")
-                        if token is None:
-                            continue
-                        try:
-                            token_set.add(int(token))
-                            token_count += 1
-                        except (ValueError, TypeError):
-                            pass
-
-            if isinstance(_subs.get("layouts"), dict):
-                for tokens in _subs["layouts"].values():
-                    if isinstance(tokens, list):
-                        for t in tokens:
-                            if t is not None:
-                                try:
-                                    token_set.add(int(t))
-                                    token_count += 1
-                                except (ValueError, TypeError):
-                                    pass
-            return token_count
-
-        token_set: set[int] = set()
-        legacy = settings.get("subscriptions")
-        sb = settings.get("subscriptions_sidebar")
-        mw = settings.get("subscriptions_marketwatch")
-        nfo = settings.get("subscriptions_nfo-charts")
-        nfo_layouts = settings.get("subscriptions_nfo-charts-layouts")
-
-        for candidate in (legacy, sb, mw, nfo, nfo_layouts):
-            if isinstance(candidate, dict):
-                _extract_tokens_from_subs(candidate, token_set)
-
-        all_tokens = list(token_set)
-        if all_tokens:
-            mode = None
-            for candidate in (nfo, nfo_layouts, legacy, sb, mw):
-                if isinstance(candidate, dict):
-                    m = candidate.get("mode")
-                    if m in {"ltp", "quote", "full"}:
-                        mode = m
-                        if mode == "full":
-                            break
-            await manager.subscribe(websocket, all_tokens, mode or "quote")
+        initial_subscriptions = _build_initial_subscriptions_from_settings(settings)
+        if initial_subscriptions:
+            all_tokens = list(initial_subscriptions.keys())
+            initial_mode = next(iter(initial_subscriptions.values()), "quote")
+            await manager.subscribe(websocket, all_tokens, initial_mode)
     finally:
         db.close()
 

@@ -30,3 +30,6 @@ postgres_data/
 .idea/
 .vscode/
 .kilocode/
+
+# Local SDK references
+gokiteconnect/

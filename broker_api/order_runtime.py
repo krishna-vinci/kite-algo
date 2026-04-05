@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database import SessionLocal
+from database import SessionLocal, engine
 from .redis_events import get_redis, publish_event, pubsub_iter
 from .kite_session import KiteSession, get_session_account_id, make_account_id
 
@@ -498,11 +498,11 @@ class CanonicalOrderEventRuntime:
         positions_service: "RealTimePositionsService",
         batch_size: int = 25,
     ) -> int:
-        db = SessionLocal()
+        db = await _acquire_advisory_lock_session(POSITION_RECONCILE_LOCK_ID, timeout_seconds=5.0)
+        if db is None:
+            return 0
+        invalidate_connection = False
         try:
-            if not await _wait_for_advisory_lock(db, POSITION_RECONCILE_LOCK_ID, timeout_seconds=5.0):
-                db.rollback()
-                return 0
             rows = db.execute(
                 text(
                     """
@@ -552,9 +552,10 @@ class CanonicalOrderEventRuntime:
             try:
                 _release_advisory_lock(db, POSITION_RECONCILE_LOCK_ID)
             except Exception as exc:
+                invalidate_connection = True
                 logger.error("Failed to release position runtime lock after dirty sync: %s", exc, exc_info=True)
             finally:
-                db.close()
+                _close_locked_session(db, invalidate_connection=invalidate_connection)
 
     def _store_trade_fills(
         self,
@@ -842,11 +843,11 @@ class RealTimePositionsService:
             return 0
         positions_data = await asyncio.to_thread(kite.positions)
         trades = await asyncio.to_thread(kite.trades)
-        db = SessionLocal()
+        db = await _acquire_advisory_lock_session(POSITION_RECONCILE_LOCK_ID, timeout_seconds=5.0)
+        if db is None:
+            return 0
+        invalidate_connection = False
         try:
-            if not await _wait_for_advisory_lock(db, POSITION_RECONCILE_LOCK_ID, timeout_seconds=5.0):
-                db.rollback()
-                return 0
             rows = positions_data.get("net", []) if isinstance(positions_data, dict) else []
             reconcile_version = int(datetime.now(timezone.utc).timestamp() * 1000)
             count = 0
@@ -933,9 +934,10 @@ class RealTimePositionsService:
             try:
                 _release_advisory_lock(db, POSITION_RECONCILE_LOCK_ID)
             except Exception as exc:
+                invalidate_connection = True
                 logger.error("Failed to release position reconcile lock: %s", exc, exc_info=True)
             finally:
-                db.close()
+                _close_locked_session(db, invalidate_connection=invalidate_connection)
 
         await self.sync_account_cache_from_db(account_id)
         await self.publish_snapshot(account_id, reason="reconcile")
@@ -1130,14 +1132,43 @@ def _release_advisory_lock(db: Session, lock_id: int) -> None:
     db.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
 
 
-async def _wait_for_advisory_lock(db: Session, lock_id: int, timeout_seconds: float = 5.0) -> bool:
+async def _acquire_advisory_lock_session(lock_id: int, timeout_seconds: float = 5.0) -> Optional[Session]:
     deadline = asyncio.get_running_loop().time() + max(0.1, timeout_seconds)
     while True:
-        if _try_advisory_lock(db, lock_id):
-            return True
+        connection = engine.connect()
+        db = Session(bind=connection)
+        db.info["_advisory_lock_connection"] = connection
+        acquired = False
+        try:
+            if _try_advisory_lock(db, lock_id):
+                acquired = True
+                return db
+            db.rollback()
+        finally:
+            if not acquired:
+                _close_locked_session(db)
         if asyncio.get_running_loop().time() >= deadline:
-            return False
+            return None
         await asyncio.sleep(0.1)
+
+
+def _close_locked_session(db: Optional[Session], *, invalidate_connection: bool = False) -> None:
+    if db is None:
+        return
+    connection = db.info.pop("_advisory_lock_connection", None)
+    try:
+        db.close()
+    finally:
+        if connection is not None:
+            try:
+                if invalidate_connection:
+                    connection.invalidate()
+            except Exception:
+                pass
+            try:
+                connection.close()
+            except Exception:
+                pass
 
 
 async def refresh_processing_stuck_rows() -> None:

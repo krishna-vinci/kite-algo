@@ -52,7 +52,7 @@ def _get_strike_selector(request: Request):
         # Lazy initialization
         from strategies.strike_selector import StrikeSelector
         from broker_api.instruments_repository import InstrumentsRepository
-        from database import get_db
+        from database import SessionLocal
         
         # Get OptionsSessionManager (will be created if not exists)
         osm = getattr(request.app.state, "options_session_manager", None)
@@ -62,8 +62,7 @@ def _get_strike_selector(request: Request):
                 detail="Options session manager not available. Start an options session first."
             )
         
-        db_session = next(get_db())
-        instruments_repo = InstrumentsRepository(db=db_session)
+        instruments_repo = InstrumentsRepository(db=SessionLocal)
         request.app.state.strike_selector = StrikeSelector(osm, instruments_repo)
         logger.info("StrikeSelector initialized")
     
@@ -76,13 +75,12 @@ def _get_position_builder(request: Request):
         # Lazy initialization - requires StrikeSelector
         from strategies.strike_selector import PositionBuilder
         from broker_api.instruments_repository import InstrumentsRepository
-        from database import get_db
+        from database import SessionLocal
         
         # Get StrikeSelector (will be created if not exists)
         strike_selector = _get_strike_selector(request)
         
-        db_session = next(get_db())
-        instruments_repo = InstrumentsRepository(db=db_session)
+        instruments_repo = InstrumentsRepository(db=SessionLocal)
         request.app.state.position_builder = PositionBuilder(strike_selector, instruments_repo)
         logger.info("PositionBuilder initialized")
     

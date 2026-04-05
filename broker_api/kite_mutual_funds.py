@@ -80,7 +80,13 @@ class MFInstrument(BaseModel):
     tradingsymbol: Optional[str] = None
     amc: Optional[str] = None
     name: Optional[str] = None
+    plan: Optional[str] = None
     category: Optional[str] = None
+    scheme_type: Optional[str] = None
+    settlement_type: Optional[str] = None
+    dividend_type: Optional[str] = None
+    last_price: Optional[float] = None
+    last_price_date: Optional[str] = None
     purchase_allowed: Optional[bool] = None
     redemption_allowed: Optional[bool] = None
     minimum_purchase_amount: Optional[float] = None

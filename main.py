@@ -91,6 +91,7 @@ from broker_api.kite_auth import login_headless
 import logging
 from database import SessionLocal, database as async_db
 from broker_api.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, upsert_kite_session
+from broker_api.market_runtime_client import market_runtime_enabled
 from broker_api.broker_api import run_headless_login_and_persist_system_token
 from broker_api.kite_auth import API_KEY
 from broker_api.order_runtime import order_event_runtime, realtime_positions_service, refresh_processing_stuck_rows
@@ -207,6 +208,8 @@ async def combined_lifespan(app: FastAPI):
         at = None
         kite = None
         db = None
+        startup_status = "healthy"
+        startup_detail = "Application startup complete"
         try:
             db = SessionLocal()
             # Prefer explicit "system" session_id token
@@ -228,6 +231,7 @@ async def combined_lifespan(app: FastAPI):
                         "token_suffix": at[-6:] if isinstance(at, str) else "",
                         "status": "healthy",
                     })
+                    set_component_status("broker_bootstrap", "healthy", detail="Validated persisted system broker token")
                 except Exception as e:
                     logging.warning("System token validation failed (..%s); performing headless login: %s", (at[-6:] if isinstance(at, str) else ""), e)
                     _kite, at = login_headless()
@@ -243,6 +247,7 @@ async def combined_lifespan(app: FastAPI):
                         "token_suffix": at[-6:] if isinstance(at, str) else "",
                         "status": "healthy",
                     })
+                    set_component_status("broker_bootstrap", "healthy", detail="Refreshed expired system broker token at startup")
             else:
                 # No system token; perform headless login and persist
                 _kite, at = login_headless()
@@ -258,6 +263,7 @@ async def combined_lifespan(app: FastAPI):
                     "token_suffix": at[-6:] if isinstance(at, str) else "",
                     "status": "healthy",
                 })
+                set_component_status("broker_bootstrap", "healthy", detail="Performed startup broker login and persisted system token")
         finally:
             try:
                 if db:
@@ -367,7 +373,7 @@ async def combined_lifespan(app: FastAPI):
                         ws_manager.reinit_with_token(new_token)
                         server.mcp_kite_instance = build_kite_client(new_token, session_id="system")
                         aggregator = getattr(app.state, "candle_aggregator", None)
-                        if aggregator and getattr(aggregator, "running", False):
+                        if aggregator and getattr(aggregator, "running", False) and not market_runtime_enabled():
                             await aggregator.stop()
                             await aggregator.start(
                                 access_token=new_token,
@@ -434,15 +440,13 @@ async def combined_lifespan(app: FastAPI):
             # Get OptionsSessionManager from app state
             osm = getattr(app.state, "options_session_manager", None)
             if osm:
-                db_session = SessionLocal()
-                instruments_repo = InstrumentsRepository(db=db_session)
+                instruments_repo = InstrumentsRepository(db=SessionLocal)
                 
                 strike_selector = StrikeSelector(osm, instruments_repo)
                 position_builder = PositionBuilder(strike_selector, instruments_repo)
                 
                 app.state.strike_selector = strike_selector
                 app.state.position_builder = position_builder
-                app.state.phase3_db_session = db_session
                 logging.info("Phase 3: StrikeSelector and PositionBuilder initialized")
             else:
                 logging.warning("OptionsSessionManager not available, Phase 3 components not initialized")
@@ -505,6 +509,10 @@ async def combined_lifespan(app: FastAPI):
             set_component_status("candle_aggregator", "degraded", detail=str(e))
     except Exception as e:
         logging.error(f"Failed to initialize MCP Kite instance or WebSocketManager: {e}", exc_info=True)
+        startup_status = "degraded"
+        startup_detail = f"Broker startup degraded: {e}"
+        set_component_status("broker_bootstrap", "degraded", detail=str(e))
+        set_component_status("websocket_manager", "degraded", detail="WebSocket manager unavailable because broker bootstrap failed")
         set_meta("daily_broker_login", {
             "status": "degraded",
             "last_error": str(e),
@@ -515,7 +523,7 @@ async def combined_lifespan(app: FastAPI):
         # For now, we'll log the error and continue.
         server.mcp_kite_instance = None
 
-    set_component_status("app", "healthy", detail="Application startup complete")
+    set_component_status("app", startup_status, detail=startup_detail)
 
     async with mcp_app.lifespan(app):
         yield
@@ -569,14 +577,6 @@ async def combined_lifespan(app: FastAPI):
             await protection_eng.stop()
             logging.info("PositionProtectionEngine stopped.")
             set_component_status("protection_engine", "stopped", detail="Position protection engine stopped")
-    except Exception:
-        pass
-
-    try:
-        phase3_db_session = getattr(app.state, "phase3_db_session", None)
-        if phase3_db_session:
-            phase3_db_session.close()
-            app.state.phase3_db_session = None
     except Exception:
         pass
 

@@ -16,7 +16,7 @@ from fastapi import (
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from database import get_db
+from database import SessionLocal, get_db
 from broker_api.instruments_repository import InstrumentsRepository
 from broker_api.options_sessions import OptionsSessionManager
 from broker_api.websocket_manager import WebSocketManager
@@ -120,7 +120,7 @@ def get_options_session_manager(request: Request) -> OptionsSessionManager:
     if not hasattr(request.app.state, "options_session_manager"):
         logger.info("Initializing OptionsSessionManager...")
         ws_manager = request.app.state.ws_manager
-        instrument_repo = InstrumentsRepository(db=next(get_db()))
+        instrument_repo = InstrumentsRepository(db=SessionLocal)
         request.app.state.options_session_manager = OptionsSessionManager(
             ws_manager, instrument_repo
         )
