@@ -1,7 +1,6 @@
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-import yfinance as yf
 import math
 from pydantic import BaseModel
 from typing import List, Union
@@ -44,6 +43,8 @@ def get_ticker_data(
     interval: str = Query("1d"), 
     ema_periods: str = Query("9,14,50")
 ):
+    import yfinance as yf
+
     stock = yf.Ticker(ticker)
     # Determine how far back to fetch based on interval
     if interval in ["15m", "60m"]:

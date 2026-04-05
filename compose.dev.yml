@@ -36,31 +36,6 @@ services:
       timeout: 5s
       retries: 10
 
-  meilisearch:
-    image: getmeili/meilisearch:v1.12
-    container_name: kite-meilisearch-dev
-    restart: unless-stopped
-    environment:
-      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-aMasterKey}
-      MEILI_NO_ANALYTICS: "true"
-    ports:
-      - "17700:7700"
-    volumes:
-      - meili_dev_data:/meili_data
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "wget",
-          "--no-verbose",
-          "--tries=1",
-          "--spider",
-          "http://127.0.0.1:7700/health",
-        ]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-
   market-runtime:
     build:
       context: ./market-runtime
@@ -125,7 +100,6 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_URL: redis://redis:6379/0
-      MEILI_URL: http://meilisearch:7700
       MARKET_RUNTIME_ENABLED: "true"
       MARKET_RUNTIME_HTTP_URL: http://market-runtime:8780
       PYTHONUNBUFFERED: "1"
@@ -141,8 +115,6 @@ services:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      meilisearch:
         condition: service_healthy
     healthcheck:
       test:
@@ -203,5 +175,4 @@ services:
 volumes:
   postgres_dev_data:
   redis_dev_data:
-  meili_dev_data:
   frontend_node_modules:

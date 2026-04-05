@@ -1,7 +1,6 @@
 import csv
 import logging
 
-import pandas as pd
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from psycopg2 import extras
@@ -21,6 +20,8 @@ CSV_FILES = {
 def process_csv_data(csv_file_path: str, source_list_name: str):
     data = []
     try:
+        import pandas as pd
+
         df = pd.read_csv(csv_file_path)
         for _, row in df.iterrows():
             data.append(
