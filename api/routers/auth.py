@@ -62,14 +62,16 @@ def app_me(request: Request):
 
 
 @router.get("/auth/session-status", tags=["Authentication"])
-def session_status(request: Request, db: Session = Depends(get_db)):
+async def session_status(request: Request, db: Session = Depends(get_db)):
     user = require_app_user(request)
     sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
     broker_connected = False
     if sid:
         broker_connected = db.query(KiteSession).filter_by(session_id=sid).first() is not None
     market_data_runtime = getattr(request.app.state, "market_data_runtime", None)
+    algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
     daily_gate = getattr(request.app.state, "daily_token_ready", None)
+    algo_runtime = await algo_runtime_service.status() if algo_runtime_service else None
     return {
         "app": {
             "authenticated": user is not None,
@@ -90,14 +92,16 @@ def session_status(request: Request, db: Session = Depends(get_db)):
             "daily_token_gate": {
                 "ready": bool(daily_gate.is_set()) if daily_gate else False,
             },
+            "algo_runtime": algo_runtime,
         },
     }
 
 
 @router.get("/system/runtime", tags=["System"])
-def runtime_status(request: Request):
+async def runtime_status(request: Request):
     require_app_user(request)
     market_data_runtime = getattr(request.app.state, "market_data_runtime", None)
+    algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
     daily_gate = getattr(request.app.state, "daily_token_ready", None)
     return {
         "components": get_components(),
@@ -109,6 +113,7 @@ def runtime_status(request: Request):
         "daily_token_gate": {
             "ready": bool(daily_gate.is_set()) if daily_gate else False,
         },
+        "algo_runtime": await algo_runtime_service.status() if algo_runtime_service else None,
     }
 
 

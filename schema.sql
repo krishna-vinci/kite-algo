@@ -578,6 +578,72 @@ CREATE INDEX IF NOT EXISTS idx_account_positions_open_only
   WHERE net_quantity <> 0;
 
 -- =========================================
+-- Modular Algo Runtime Tables
+-- =========================================
+
+CREATE TABLE IF NOT EXISTS public.algo_instances (
+  instance_id TEXT PRIMARY KEY,
+  algo_type TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'enabled',
+  config_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  dependency_spec_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT algo_instances_status_check CHECK (status IN ('enabled', 'running', 'paused', 'stopped', 'error'))
+);
+
+ALTER TABLE public.algo_instances
+  ADD COLUMN IF NOT EXISTS algo_type TEXT;
+
+ALTER TABLE public.algo_instances
+  ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'enabled';
+
+ALTER TABLE public.algo_instances
+  ADD COLUMN IF NOT EXISTS config_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE public.algo_instances
+  ADD COLUMN IF NOT EXISTS dependency_spec_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE public.algo_instances
+  ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE public.algo_instances
+  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE public.algo_instances
+  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS idx_algo_instances_status
+  ON public.algo_instances (status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_algo_instances_type
+  ON public.algo_instances (algo_type, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.algo_instance_checkpoints (
+  instance_id TEXT PRIMARY KEY REFERENCES public.algo_instances(instance_id) ON DELETE CASCADE,
+  last_evaluated_at TIMESTAMPTZ,
+  last_action_json JSONB,
+  state_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE public.algo_instance_checkpoints
+  ADD COLUMN IF NOT EXISTS last_evaluated_at TIMESTAMPTZ;
+
+ALTER TABLE public.algo_instance_checkpoints
+  ADD COLUMN IF NOT EXISTS last_action_json JSONB;
+
+ALTER TABLE public.algo_instance_checkpoints
+  ADD COLUMN IF NOT EXISTS state_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE public.algo_instance_checkpoints
+  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE INDEX IF NOT EXISTS idx_algo_checkpoints_updated
+  ON public.algo_instance_checkpoints (updated_at DESC);
+
+-- =========================================
 -- Index Stoploss Strategy Tables
 -- =========================================
 

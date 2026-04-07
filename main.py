@@ -533,6 +533,86 @@ async def combined_lifespan(app: FastAPI):
         except Exception as e:
             logging.error("Failed to start Candle Aggregator: %s", e, exc_info=True)
             set_component_status("candle_aggregator", "degraded", detail=str(e))
+
+        # Initialize modular algo runtime service scaffold after market/candle/options services are ready
+        try:
+            from algo_runtime.kernel import AlgoKernel
+            from algo_runtime.intent_bridge import IntentBridge, KiteOrdersIntentHandler
+            from algo_runtime.indicators import BuiltInIndicatorReader
+            from algo_runtime.registry import AlgoRegistry
+            from algo_runtime.repository import SqlAlchemyAlgoRepository
+            from algo_runtime.service import AlgoRuntimeService
+            from algo_runtime.snapshot_builder import (
+                DependencyFilteredSnapshotBuilder,
+                OptionsSnapshotReader,
+                OrderProjectionReader,
+                PositionsSnapshotReader,
+                RedisCandleDataReader,
+                RuntimeMarketDataReader,
+            )
+            from algo_runtime.state_store import InMemoryAlgoStateStore
+            from broker_api.candle_aggregator import INTERVAL_SECONDS
+            from broker_api.candle_storage import CandleStorage
+            from broker_api.redis_events import get_redis
+            from strategies.modular import register_builtin_algos
+
+            options_session_manager = getattr(app.state, "options_session_manager", None)
+            strike_selector = getattr(app.state, "strike_selector", None)
+            algo_registry = AlgoRegistry()
+            register_builtin_algos(algo_registry)
+
+            snapshot_builder = DependencyFilteredSnapshotBuilder(
+                market_reader=RuntimeMarketDataReader(market_data_runtime),
+                candle_reader=RedisCandleDataReader(
+                    redis_client=get_redis(),
+                    candle_storage=CandleStorage,
+                    interval_seconds=INTERVAL_SECONDS,
+                ),
+                indicator_reader=BuiltInIndicatorReader(),
+                options_reader=OptionsSnapshotReader(options_session_manager, strike_selector) if options_session_manager else None,
+                positions_reader=PositionsSnapshotReader(realtime_positions_service),
+                orders_reader=OrderProjectionReader(),
+            )
+            algo_runtime_service = AlgoRuntimeService(
+                AlgoKernel(
+                    registry=algo_registry,
+                    repository=SqlAlchemyAlgoRepository(),
+                    state_store=InMemoryAlgoStateStore(),
+                    snapshot_builder=snapshot_builder,
+                    intent_bridge=IntentBridge(order_intent_handler=KiteOrdersIntentHandler()),
+                )
+            )
+            await algo_runtime_service.start()
+            app.state.algo_runtime_service = algo_runtime_service
+            algo_status = await algo_runtime_service.status()
+            load_summary = algo_status.get("load_summary", {})
+            active_count = int(load_summary.get("active_count") or 0)
+            loaded_count = int(load_summary.get("loaded_count") or 0)
+            skipped = load_summary.get("skipped", []) or []
+            algo_component_status = "healthy"
+            algo_detail = "Modular algo runtime scaffold started"
+            if active_count > 0 and loaded_count == 0:
+                algo_component_status = "degraded"
+                algo_detail = "Algo runtime started but no active instances could be loaded"
+            elif skipped:
+                algo_component_status = "degraded"
+                algo_detail = "Algo runtime started with skipped instances"
+            set_component_status(
+                "algo_runtime",
+                algo_component_status,
+                detail=algo_detail,
+                meta={
+                    "instance_count": algo_status.get("instance_count", 0),
+                    "registered_types": algo_status.get("registered_types", []),
+                    "active_count": active_count,
+                    "loaded_count": loaded_count,
+                    "skipped": skipped,
+                    "instances": algo_status.get("instances", []),
+                },
+            )
+        except Exception as e:
+            logging.error("Failed to initialize modular algo runtime: %s", e, exc_info=True)
+            set_component_status("algo_runtime", "degraded", detail=str(e))
     except Exception as e:
         logging.error(f"Failed to initialize broker bootstrap or market runtime: {e}", exc_info=True)
         startup_status = "degraded"
@@ -627,6 +707,15 @@ async def combined_lifespan(app: FastAPI):
             set_component_status("candle_aggregator", "stopped", detail="Candle aggregator stopped")
     except Exception as e:
         logging.error("Error stopping Candle Aggregator: %s", e, exc_info=True)
+
+    # Stop modular algo runtime service
+    try:
+        algo_runtime_service = getattr(app.state, "algo_runtime_service", None)
+        if algo_runtime_service:
+            await algo_runtime_service.stop()
+            set_component_status("algo_runtime", "stopped", detail="Modular algo runtime stopped")
+    except Exception:
+        pass
 
     if market_data_runtime:
         logging.info("Stopping Go market runtime bridge...")
