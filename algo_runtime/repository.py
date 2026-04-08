@@ -11,7 +11,7 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from database import SessionLocal
-from .models import AlgoCheckpoint, AlgoInstance, AlgoLifecycleState
+from .models import AlgoCheckpoint, AlgoInstance, AlgoLifecycleState, ExecutionMode
 
 
 class AlgoInstanceRepository(Protocol):
@@ -148,7 +148,7 @@ class SqlAlchemyAlgoRepository:
             rows = db.execute(
                 text(
                     """
-                    SELECT instance_id, algo_type, status, config_json, dependency_spec_json, metadata_json, created_at, updated_at
+                    SELECT instance_id, algo_type, status, execution_mode, config_json, dependency_spec_json, metadata_json, created_at, updated_at
                     FROM public.algo_instances
                     WHERE status IN ('enabled', 'running', 'paused')
                     ORDER BY created_at ASC
@@ -165,7 +165,7 @@ class SqlAlchemyAlgoRepository:
             row = db.execute(
                 text(
                     """
-                    SELECT instance_id, algo_type, status, config_json, dependency_spec_json, metadata_json, created_at, updated_at
+                    SELECT instance_id, algo_type, status, execution_mode, config_json, dependency_spec_json, metadata_json, created_at, updated_at
                     FROM public.algo_instances
                     WHERE instance_id = :instance_id
                     """
@@ -186,6 +186,7 @@ class SqlAlchemyAlgoRepository:
                         instance_id,
                         algo_type,
                         status,
+                        execution_mode,
                         config_json,
                         dependency_spec_json,
                         metadata_json,
@@ -195,6 +196,7 @@ class SqlAlchemyAlgoRepository:
                         :instance_id,
                         :algo_type,
                         :status,
+                        :execution_mode,
                         CAST(:config_json AS JSONB),
                         CAST(:dependency_spec_json AS JSONB),
                         CAST(:metadata_json AS JSONB),
@@ -204,17 +206,19 @@ class SqlAlchemyAlgoRepository:
                     ON CONFLICT (instance_id) DO UPDATE SET
                         algo_type = EXCLUDED.algo_type,
                         status = EXCLUDED.status,
+                        execution_mode = EXCLUDED.execution_mode,
                         config_json = EXCLUDED.config_json,
                         dependency_spec_json = EXCLUDED.dependency_spec_json,
                         metadata_json = EXCLUDED.metadata_json,
                         updated_at = EXCLUDED.updated_at
-                    RETURNING instance_id, algo_type, status, config_json, dependency_spec_json, metadata_json, created_at, updated_at
+                    RETURNING instance_id, algo_type, status, execution_mode, config_json, dependency_spec_json, metadata_json, created_at, updated_at
                     """
                 ),
                 {
                     "instance_id": instance.instance_id,
                     "algo_type": instance.algo_type,
                     "status": instance.status.value,
+                    "execution_mode": instance.execution_mode.value,
                     "config_json": _json_dumps(instance.config),
                     "dependency_spec_json": instance.dependency_spec.model_dump_json(),
                     "metadata_json": _json_dumps(instance.metadata),
@@ -240,7 +244,7 @@ class SqlAlchemyAlgoRepository:
                     SET status = :status,
                         updated_at = :updated_at
                     WHERE instance_id = :instance_id
-                    RETURNING instance_id, algo_type, status, config_json, dependency_spec_json, metadata_json, created_at, updated_at
+                    RETURNING instance_id, algo_type, status, execution_mode, config_json, dependency_spec_json, metadata_json, created_at, updated_at
                     """
                 ),
                 {
@@ -341,6 +345,7 @@ class SqlAlchemyAlgoRepository:
             instance_id=str(payload["instance_id"]),
             algo_type=str(payload["algo_type"]),
             status=AlgoLifecycleState(str(payload["status"])),
+            execution_mode=ExecutionMode(str(payload.get("execution_mode") or ExecutionMode.LIVE.value)),
             config=_decode_json_field(payload.get("config_json")) or {},
             dependency_spec=_decode_json_field(payload.get("dependency_spec_json")) or {},
             metadata=_decode_json_field(payload.get("metadata_json")) or {},

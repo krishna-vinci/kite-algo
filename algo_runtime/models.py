@@ -19,6 +19,12 @@ class AlgoLifecycleState(str, Enum):
     ERROR = "error"
 
 
+class ExecutionMode(str, Enum):
+    LIVE = "live"
+    PAPER = "paper"
+    DRY_RUN = "dry_run"
+
+
 class TriggerType(str, Enum):
     TICK = "tick"
     CANDLE_CLOSE = "candle_close"
@@ -291,6 +297,7 @@ class AlgoInstance(BaseModel):
     instance_id: str
     algo_type: str
     status: AlgoLifecycleState = AlgoLifecycleState.ENABLED
+    execution_mode: ExecutionMode = ExecutionMode.LIVE
     config: Dict[str, Any] = Field(default_factory=dict)
     dependency_spec: DependencySpec = Field(default_factory=DependencySpec)
     metadata: Dict[str, Any] = Field(default_factory=dict)

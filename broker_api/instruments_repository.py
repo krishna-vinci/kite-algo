@@ -324,3 +324,27 @@ class InstrumentsRepository:
         with self._session_scope() as db:
             result = db.execute(query, {"token": instrument_token}).scalar_one_or_none()
             return result
+
+    def get_instrument_by_exchange_symbol(self, exchange: str, tradingsymbol: str) -> Optional[Dict[str, object]]:
+        """
+        Look up a single instrument by exchange and tradingsymbol.
+
+        Returns a minimal normalized mapping used by execution paths.
+        """
+        query = text(
+            """
+            SELECT instrument_token, exchange, tradingsymbol, lot_size, instrument_type, last_price, tick_size
+            FROM kite_instruments
+            WHERE exchange = :exchange AND tradingsymbol = :tradingsymbol
+            LIMIT 1
+            """
+        )
+        with self._session_scope() as db:
+            row = db.execute(
+                query,
+                {
+                    "exchange": str(exchange or "").strip().upper(),
+                    "tradingsymbol": str(tradingsymbol or "").strip().upper(),
+                },
+            ).mappings().first()
+            return dict(row) if row else None

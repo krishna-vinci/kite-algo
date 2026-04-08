@@ -585,12 +585,14 @@ CREATE TABLE IF NOT EXISTS public.algo_instances (
   instance_id TEXT PRIMARY KEY,
   algo_type TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'enabled',
+  execution_mode TEXT NOT NULL DEFAULT 'live',
   config_json JSONB NOT NULL DEFAULT '{}'::jsonb,
   dependency_spec_json JSONB NOT NULL DEFAULT '{}'::jsonb,
   metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT algo_instances_status_check CHECK (status IN ('enabled', 'running', 'paused', 'stopped', 'error'))
+  CONSTRAINT algo_instances_status_check CHECK (status IN ('enabled', 'running', 'paused', 'stopped', 'error')),
+  CONSTRAINT algo_instances_execution_mode_check CHECK (execution_mode IN ('live', 'paper', 'dry_run'))
 );
 
 ALTER TABLE public.algo_instances
@@ -598,6 +600,15 @@ ALTER TABLE public.algo_instances
 
 ALTER TABLE public.algo_instances
   ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'enabled';
+
+ALTER TABLE public.algo_instances
+  ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT 'live';
+
+ALTER TABLE public.algo_instances
+  DROP CONSTRAINT IF EXISTS algo_instances_execution_mode_check;
+
+ALTER TABLE public.algo_instances
+  ADD CONSTRAINT algo_instances_execution_mode_check CHECK (execution_mode IN ('live', 'paper', 'dry_run'));
 
 ALTER TABLE public.algo_instances
   ADD COLUMN IF NOT EXISTS config_json JSONB NOT NULL DEFAULT '{}'::jsonb;
@@ -642,6 +653,158 @@ ALTER TABLE public.algo_instance_checkpoints
 
 CREATE INDEX IF NOT EXISTS idx_algo_checkpoints_updated
   ON public.algo_instance_checkpoints (updated_at DESC);
+
+-- =========================================
+-- Paper Runtime Tables
+-- =========================================
+
+CREATE TABLE IF NOT EXISTS public.paper_accounts (
+  account_scope TEXT PRIMARY KEY,
+  currency TEXT NOT NULL DEFAULT 'INR',
+  starting_balance NUMERIC(18,6) NOT NULL DEFAULT 0,
+  available_funds NUMERIC(18,6) NOT NULL DEFAULT 0,
+  blocked_funds NUMERIC(18,6) NOT NULL DEFAULT 0,
+  realized_pnl NUMERIC(18,6) NOT NULL DEFAULT 0,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.paper_orders (
+  account_scope TEXT NOT NULL,
+  order_id TEXT NOT NULL,
+  instrument_token BIGINT NOT NULL,
+  exchange TEXT NOT NULL DEFAULT 'NSE',
+  tradingsymbol TEXT,
+  product TEXT NOT NULL DEFAULT 'MIS',
+  transaction_type TEXT NOT NULL,
+  order_type TEXT NOT NULL DEFAULT 'market',
+  quantity INT NOT NULL,
+  filled_quantity INT NOT NULL DEFAULT 0,
+  pending_quantity INT NOT NULL DEFAULT 0,
+  price NUMERIC(18,6),
+  trigger_price NUMERIC(18,6),
+  average_price NUMERIC(18,6),
+  status TEXT NOT NULL DEFAULT 'pending',
+  placed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  PRIMARY KEY (account_scope, order_id),
+  CONSTRAINT fk_paper_order_account FOREIGN KEY (account_scope)
+    REFERENCES public.paper_accounts(account_scope) ON DELETE CASCADE,
+  CONSTRAINT paper_order_transaction_type_check CHECK (transaction_type IN ('buy', 'sell')),
+  CONSTRAINT paper_order_type_check CHECK (order_type IN ('market', 'limit', 'sl', 'sl_m')),
+  CONSTRAINT paper_order_status_check CHECK (status IN ('pending', 'open', 'partially_filled', 'filled', 'cancelled', 'rejected', 'expired')),
+  CONSTRAINT paper_order_qty_check CHECK (quantity > 0 AND filled_quantity >= 0 AND pending_quantity >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_orders_account_status_updated
+  ON public.paper_orders (account_scope, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_paper_orders_account_token_status
+  ON public.paper_orders (account_scope, instrument_token, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_paper_orders_pending_token
+  ON public.paper_orders (account_scope, instrument_token, placed_at)
+  WHERE status IN ('pending', 'open', 'partially_filled');
+
+CREATE TABLE IF NOT EXISTS public.paper_trades (
+  account_scope TEXT NOT NULL,
+  trade_id TEXT NOT NULL,
+  order_id TEXT NOT NULL,
+  instrument_token BIGINT NOT NULL,
+  transaction_type TEXT NOT NULL,
+  quantity INT NOT NULL,
+  price NUMERIC(18,6) NOT NULL,
+  trade_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  PRIMARY KEY (account_scope, trade_id),
+  CONSTRAINT paper_trade_transaction_type_check CHECK (transaction_type IN ('buy', 'sell')),
+  CONSTRAINT paper_trade_qty_check CHECK (quantity > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_trades_order
+  ON public.paper_trades (account_scope, order_id, trade_timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_paper_trades_token
+  ON public.paper_trades (account_scope, instrument_token, trade_timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS public.paper_positions (
+  account_scope TEXT NOT NULL,
+  instrument_token BIGINT NOT NULL,
+  product TEXT NOT NULL DEFAULT 'MIS',
+  exchange TEXT NOT NULL DEFAULT 'NSE',
+  tradingsymbol TEXT,
+  net_quantity INT NOT NULL DEFAULT 0,
+  average_price NUMERIC(18,6) NOT NULL DEFAULT 0,
+  buy_quantity INT NOT NULL DEFAULT 0,
+  sell_quantity INT NOT NULL DEFAULT 0,
+  buy_value NUMERIC(18,6) NOT NULL DEFAULT 0,
+  sell_value NUMERIC(18,6) NOT NULL DEFAULT 0,
+  realized_pnl NUMERIC(18,6) NOT NULL DEFAULT 0,
+  unrealized_pnl NUMERIC(18,6) NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  PRIMARY KEY (account_scope, instrument_token, product),
+  CONSTRAINT fk_paper_position_account FOREIGN KEY (account_scope)
+    REFERENCES public.paper_accounts(account_scope) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_positions_account_updated
+  ON public.paper_positions (account_scope, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_paper_positions_open_only
+  ON public.paper_positions (account_scope, instrument_token)
+  WHERE net_quantity <> 0;
+
+CREATE TABLE IF NOT EXISTS public.paper_position_lots (
+  account_scope TEXT NOT NULL,
+  lot_id TEXT NOT NULL,
+  instrument_token BIGINT NOT NULL,
+  product TEXT NOT NULL DEFAULT 'MIS',
+  source_trade_id TEXT NOT NULL,
+  source_order_id TEXT,
+  open_quantity INT NOT NULL,
+  remaining_quantity INT NOT NULL,
+  entry_price NUMERIC(18,6) NOT NULL,
+  opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  closed_at TIMESTAMPTZ,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  PRIMARY KEY (account_scope, lot_id),
+  CONSTRAINT fk_paper_lot_account FOREIGN KEY (account_scope)
+    REFERENCES public.paper_accounts(account_scope) ON DELETE CASCADE,
+  CONSTRAINT paper_position_lot_qty_check CHECK (open_quantity > 0 AND remaining_quantity >= 0 AND remaining_quantity <= open_quantity)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_position_lots_opened
+  ON public.paper_position_lots (account_scope, instrument_token, product, opened_at);
+
+CREATE INDEX IF NOT EXISTS idx_paper_position_lots_source_trade
+  ON public.paper_position_lots (account_scope, source_trade_id);
+
+CREATE TABLE IF NOT EXISTS public.paper_fund_ledger (
+  entry_id BIGSERIAL PRIMARY KEY,
+  account_scope TEXT NOT NULL,
+  entry_type TEXT NOT NULL,
+  amount NUMERIC(18,6) NOT NULL,
+  balance_after NUMERIC(18,6),
+  reference_type TEXT,
+  reference_id TEXT,
+  notes TEXT,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT fk_paper_fund_account FOREIGN KEY (account_scope)
+    REFERENCES public.paper_accounts(account_scope) ON DELETE CASCADE,
+  CONSTRAINT paper_fund_entry_type_check CHECK (entry_type IN ('credit', 'debit', 'reserve', 'release', 'adjustment'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_fund_ledger_account_created
+  ON public.paper_fund_ledger (account_scope, created_at DESC, entry_id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_paper_fund_ledger_reference
+  ON public.paper_fund_ledger (account_scope, reference_type, reference_id)
+  WHERE reference_id IS NOT NULL;
 
 -- =========================================
 -- Index Stoploss Strategy Tables

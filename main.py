@@ -529,6 +529,7 @@ async def combined_lifespan(app: FastAPI):
                 set_component_status("candle_aggregator", "healthy", detail="Candle aggregator started")
             else:
                 logging.info("Candle Aggregator already running")
+                app.state.candle_aggregator = aggregator
                 set_component_status("candle_aggregator", "healthy", detail="Candle aggregator already running")
         except Exception as e:
             logging.error("Failed to start Candle Aggregator: %s", e, exc_info=True)
@@ -536,6 +537,7 @@ async def combined_lifespan(app: FastAPI):
 
         # Initialize modular algo runtime service scaffold after market/candle/options services are ready
         try:
+            from algo_runtime.live import AlgoRuntimeLiveWorker
             from algo_runtime.kernel import AlgoKernel
             from algo_runtime.intent_bridge import IntentBridge, KiteOrdersIntentHandler
             from algo_runtime.indicators import BuiltInIndicatorReader
@@ -554,6 +556,7 @@ async def combined_lifespan(app: FastAPI):
             from broker_api.candle_aggregator import INTERVAL_SECONDS
             from broker_api.candle_storage import CandleStorage
             from broker_api.redis_events import get_redis
+            from paper_runtime import DryRunIntentHandler, PaperIntentHandler, PaperMarketEngine, PaperTradingService
             from strategies.modular import register_builtin_algos
 
             options_session_manager = getattr(app.state, "options_session_manager", None)
@@ -573,17 +576,38 @@ async def combined_lifespan(app: FastAPI):
                 positions_reader=PositionsSnapshotReader(realtime_positions_service),
                 orders_reader=OrderProjectionReader(),
             )
+            paper_runtime_service = PaperTradingService(market_data_runtime=market_data_runtime)
+            app.state.paper_runtime_service = paper_runtime_service
             algo_runtime_service = AlgoRuntimeService(
                 AlgoKernel(
                     registry=algo_registry,
                     repository=SqlAlchemyAlgoRepository(),
                     state_store=InMemoryAlgoStateStore(),
                     snapshot_builder=snapshot_builder,
-                    intent_bridge=IntentBridge(order_intent_handler=KiteOrdersIntentHandler()),
+                    intent_bridge=IntentBridge(
+                        live_order_intent_handler=KiteOrdersIntentHandler(),
+                        paper_order_intent_handler=PaperIntentHandler(paper_runtime_service),
+                        dry_run_order_intent_handler=DryRunIntentHandler(),
+                    ),
                 )
             )
             await algo_runtime_service.start()
             app.state.algo_runtime_service = algo_runtime_service
+            algo_runtime_live_worker = AlgoRuntimeLiveWorker(
+                service=algo_runtime_service,
+                market_data_runtime=market_data_runtime,
+                candle_aggregator=getattr(app.state, "candle_aggregator", None),
+            )
+            await algo_runtime_live_worker.start()
+            app.state.algo_runtime_live_worker = algo_runtime_live_worker
+            paper_market_engine = PaperMarketEngine(
+                service=paper_runtime_service,
+                market_data_runtime=market_data_runtime,
+                redis_client=get_redis(),
+            )
+            await paper_market_engine.start()
+            app.state.paper_market_engine = paper_market_engine
+            set_component_status("paper_runtime", "healthy", detail="Paper runtime started", meta={"market_engine": paper_market_engine.status()})
             algo_status = await algo_runtime_service.status()
             load_summary = algo_status.get("load_summary", {})
             active_count = int(load_summary.get("active_count") or 0)
@@ -608,6 +632,7 @@ async def combined_lifespan(app: FastAPI):
                     "loaded_count": loaded_count,
                     "skipped": skipped,
                     "instances": algo_status.get("instances", []),
+                    "live_worker": algo_runtime_live_worker.status(),
                 },
             )
         except Exception as e:
@@ -709,6 +734,21 @@ async def combined_lifespan(app: FastAPI):
         logging.error("Error stopping Candle Aggregator: %s", e, exc_info=True)
 
     # Stop modular algo runtime service
+    try:
+        algo_runtime_live_worker = getattr(app.state, "algo_runtime_live_worker", None)
+        if algo_runtime_live_worker:
+            await algo_runtime_live_worker.stop()
+    except Exception:
+        pass
+
+    try:
+        paper_market_engine = getattr(app.state, "paper_market_engine", None)
+        if paper_market_engine:
+            await paper_market_engine.stop()
+            set_component_status("paper_runtime", "stopped", detail="Paper runtime stopped")
+    except Exception:
+        pass
+
     try:
         algo_runtime_service = getattr(app.state, "algo_runtime_service", None)
         if algo_runtime_service:

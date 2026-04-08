@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Protocol, Tuple
 
 from fastapi import Response
@@ -11,11 +12,11 @@ from broker_api.kite_session import KiteSession, build_kite_client
 
 from database import SessionLocal
 
-from .models import NoopAction, NotifyAction, OrderIntent, StatePatchAction
+from .models import ExecutionMode, NoopAction, NotifyAction, OrderIntent, StatePatchAction
 
 
 class OrderIntentHandler(Protocol):
-    async def handle(self, intent: OrderIntent) -> Dict[str, Any]: ...
+    async def handle(self, intent: OrderIntent, *, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]: ...
 
 
 class KiteOrdersIntentHandler:
@@ -23,7 +24,7 @@ class KiteOrdersIntentHandler:
         self.orders_service = orders_service or OrdersService()
         self.session_factory = session_factory
 
-    async def handle(self, intent: OrderIntent) -> Dict[str, Any]:
+    async def handle(self, intent: OrderIntent, *, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = dict(intent.payload)
         session_id = str(payload.get("session_id") or "").strip()
         if not session_id:
@@ -45,7 +46,7 @@ class KiteOrdersIntentHandler:
                 session_id=session_id,
                 response=response,
             )
-            return {"intent_type": intent.intent_type, "result": result.model_dump(mode="json")}
+            return {"mode": "live", "intent_type": intent.intent_type, "result": result.model_dump(mode="json")}
 
         if intent.intent_type == "place_basket":
             basket_payload = payload.get("basket") or payload
@@ -58,7 +59,7 @@ class KiteOrdersIntentHandler:
                 idempotency_key=idempotency_key,
                 response=response,
             )
-            return {"intent_type": intent.intent_type, "result": result.model_dump(mode="json")}
+            return {"mode": "live", "intent_type": intent.intent_type, "result": result.model_dump(mode="json")}
 
         raise ValueError(f"Unsupported order intent type '{intent.intent_type}'")
 
@@ -78,11 +79,25 @@ class IntentBridge:
         self,
         *,
         order_intent_handler: Optional[OrderIntentHandler] = None,
+        live_order_intent_handler: Optional[OrderIntentHandler] = None,
+        paper_order_intent_handler: Optional[OrderIntentHandler] = None,
+        dry_run_order_intent_handler: Optional[OrderIntentHandler] = None,
         notification_handler: Optional[Callable[[NotifyAction], Awaitable[None]]] = None,
+        dedupe_cache_limit: int = 5000,
     ) -> None:
         self.order_intent_handler = order_intent_handler
+        self.live_order_intent_handler = live_order_intent_handler or order_intent_handler
+        self.paper_order_intent_handler = paper_order_intent_handler
+        self.dry_run_order_intent_handler = dry_run_order_intent_handler
         self.notification_handler = notification_handler
-        self._dedupe_results: Dict[str, Dict[str, Any]] = {}
+        self.dedupe_cache_limit = max(100, int(dedupe_cache_limit))
+        self._dedupe_results: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+
+    def _dedupe_cache_key(self, *, intent: OrderIntent, execution_mode: ExecutionMode, context: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not intent.dedupe_key:
+            return None
+        instance_id = str((context or {}).get("instance_id") or "")
+        return f"{execution_mode.value}:{instance_id}:{intent.dedupe_key}"
 
     def split_actions(
         self,
@@ -105,7 +120,20 @@ class IntentBridge:
 
         return order_intents, notifications, state_patches, noops
 
-    async def execute(self, actions: Iterable[NotifyAction | OrderIntent | StatePatchAction | NoopAction]) -> Dict[str, Any]:
+    def _handler_for_mode(self, execution_mode: ExecutionMode) -> Optional[OrderIntentHandler]:
+        if execution_mode == ExecutionMode.PAPER:
+            return self.paper_order_intent_handler
+        if execution_mode == ExecutionMode.DRY_RUN:
+            return self.dry_run_order_intent_handler
+        return self.live_order_intent_handler or self.order_intent_handler
+
+    async def execute(
+        self,
+        actions: Iterable[NotifyAction | OrderIntent | StatePatchAction | NoopAction],
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.LIVE,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         order_intents, notifications, state_patches, noops = self.split_actions(actions)
 
         notification_count = 0
@@ -116,23 +144,29 @@ class IntentBridge:
 
         order_results: List[Dict[str, Any]] = []
         for intent in order_intents:
-            if intent.dedupe_key and intent.dedupe_key in self._dedupe_results:
+            cache_key = self._dedupe_cache_key(intent=intent, execution_mode=execution_mode, context=context)
+            if cache_key and cache_key in self._dedupe_results:
+                self._dedupe_results.move_to_end(cache_key)
                 order_results.append(
                     {
                         "intent_type": intent.intent_type,
                         "dedupe_key": intent.dedupe_key,
                         "status": "deduped",
-                        "result": self._dedupe_results[intent.dedupe_key],
+                        "result": self._dedupe_results[cache_key],
                     }
                 )
                 continue
 
-            if self.order_intent_handler is None:
-                raise ValueError("Order intent handler is not configured")
+            handler = self._handler_for_mode(execution_mode)
+            if handler is None:
+                raise ValueError(f"Order intent handler is not configured for execution_mode '{execution_mode.value}'")
 
-            result = await self.order_intent_handler.handle(intent)
-            if intent.dedupe_key:
-                self._dedupe_results[intent.dedupe_key] = result
+            result = await handler.handle(intent, context=context)
+            if cache_key:
+                self._dedupe_results[cache_key] = result
+                self._dedupe_results.move_to_end(cache_key)
+                while len(self._dedupe_results) > self.dedupe_cache_limit:
+                    self._dedupe_results.popitem(last=False)
             order_results.append(
                 {
                     "intent_type": intent.intent_type,
@@ -143,6 +177,7 @@ class IntentBridge:
             )
 
         return {
+            "execution_mode": execution_mode.value,
             "order_results": order_results,
             "notification_count": notification_count,
             "state_patch_count": len(state_patches),

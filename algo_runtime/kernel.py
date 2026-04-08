@@ -118,7 +118,15 @@ class AlgoKernel:
                 for action in normalized_actions:
                     if isinstance(action, StatePatchAction):
                         pending_state.update(action.patch)
-                execution = await self.intent_bridge.execute(normalized_actions) if self.intent_bridge else None
+                execution = (
+                    await self.intent_bridge.execute(
+                        normalized_actions,
+                        execution_mode=instance.execution_mode,
+                        context=instance.model_dump(mode="json"),
+                    )
+                    if self.intent_bridge
+                    else None
+                )
                 await self.state_store.set_hot_state(instance.instance_id, pending_state)
                 checkpoint = AlgoCheckpoint(
                     instance_id=instance.instance_id,
@@ -142,11 +150,12 @@ class AlgoKernel:
                 }
                 results.append(
                     {
-                        "instance_id": instance.instance_id,
-                        "algo_type": instance.algo_type,
-                        "action_count": len(normalized_actions),
-                        "actions": [_action_to_payload(action) for action in normalized_actions],
-                        "execution": execution,
+                    "instance_id": instance.instance_id,
+                    "algo_type": instance.algo_type,
+                    "execution_mode": instance.execution_mode.value,
+                    "action_count": len(normalized_actions),
+                    "actions": [_action_to_payload(action) for action in normalized_actions],
+                    "execution": execution,
                     }
                 )
             except Exception as exc:
@@ -162,6 +171,7 @@ class AlgoKernel:
                     {
                         "instance_id": instance.instance_id,
                         "algo_type": instance.algo_type,
+                        "execution_mode": instance.execution_mode.value,
                         "action_count": 0,
                         "actions": [],
                         "execution": None,

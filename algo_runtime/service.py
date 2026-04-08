@@ -42,6 +42,7 @@ class AlgoRuntimeService:
                     "instance_id": instance.instance_id,
                     "algo_type": instance.algo_type,
                     "lifecycle_state": instance.status.value,
+                    "execution_mode": instance.execution_mode.value,
                     "pause_reason": instance.metadata.get("pause_reason") or runtime_view.get("pause_reason"),
                     "error_reason": instance.metadata.get("error_reason") or runtime_view.get("error_reason"),
                     "last_evaluated_at": (

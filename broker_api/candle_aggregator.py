@@ -81,6 +81,8 @@ class CandleAggregator:
         # State
         self.running: bool = False
         self.subscribed_tokens: Set[int] = set()
+        self.external_token_sources: Dict[str, Set[int]] = {}
+        self._subscription_lock = asyncio.Lock()
         self.candle_states: Dict[Tuple[int, str], CandleState] = {}  # (token, interval) -> state
         
         # Background tasks
@@ -199,9 +201,20 @@ class CandleAggregator:
             'owner_id': self.owner_id,
             'intervals': self.intervals,
             'subscribed_tokens': len(self.subscribed_tokens),
+            'external_token_count': len(self._external_tokens()),
+            'external_owner_count': len(self.external_token_sources),
             'active_candles': len(self.candle_states),
             'stats': self.stats
         }
+
+    async def set_external_tokens(self, owner_id: str, tokens: Set[int] | List[int]) -> None:
+        normalized = {int(token) for token in (tokens or []) if token is not None}
+        if normalized:
+            self.external_token_sources[str(owner_id)] = normalized
+        else:
+            self.external_token_sources.pop(str(owner_id), None)
+        if self.running:
+            await self._refresh_subscriptions()
     
     # ===== WebSocket Callbacks =====
     
@@ -571,37 +584,38 @@ class CandleAggregator:
     
     async def _refresh_subscriptions(self):
         """Refresh WebSocket subscriptions based on current watchlist."""
-        try:
-            # Get desired tokens from watchlist
-            desired_tokens = await self._get_watchlist_tokens()
+        async with self._subscription_lock:
+            try:
+                desired_tokens = await self._get_watchlist_tokens()
+                desired_tokens.update(self._external_tokens())
 
-            if self.source == "market_runtime":
-                await self._sync_market_runtime_subscriptions(desired_tokens)
+                if self.source == "market_runtime":
+                    await self._sync_market_runtime_subscriptions(desired_tokens)
+                    self.subscribed_tokens = desired_tokens
+                    self.stats['last_subscription_refresh'] = datetime.now(timezone.utc).isoformat()
+                    return
+
+                if not self.kws or not self.kws.is_connected():
+                    logger.warning("WebSocket not connected, skipping subscription refresh")
+                    return
+
+                to_subscribe = list(desired_tokens - self.subscribed_tokens)
+                to_unsubscribe = list(self.subscribed_tokens - desired_tokens)
+
+                if to_subscribe:
+                    self.kws.subscribe(to_subscribe)
+                    self.kws.set_mode(self.kws.MODE_FULL, to_subscribe)
+                    logger.info(f"Subscribed to {len(to_subscribe)} new tokens")
+
+                if to_unsubscribe:
+                    self.kws.unsubscribe(to_unsubscribe)
+                    logger.info(f"Unsubscribed from {len(to_unsubscribe)} tokens")
+
                 self.subscribed_tokens = desired_tokens
                 self.stats['last_subscription_refresh'] = datetime.now(timezone.utc).isoformat()
-                return
 
-            if not self.kws or not self.kws.is_connected():
-                logger.warning("WebSocket not connected, skipping subscription refresh")
-                return
-
-            to_subscribe = list(desired_tokens - self.subscribed_tokens)
-            to_unsubscribe = list(self.subscribed_tokens - desired_tokens)
-
-            if to_subscribe:
-                self.kws.subscribe(to_subscribe)
-                self.kws.set_mode(self.kws.MODE_FULL, to_subscribe)
-                logger.info(f"Subscribed to {len(to_subscribe)} new tokens")
-
-            if to_unsubscribe:
-                self.kws.unsubscribe(to_unsubscribe)
-                logger.info(f"Unsubscribed from {len(to_unsubscribe)} tokens")
-
-            self.subscribed_tokens = desired_tokens
-            self.stats['last_subscription_refresh'] = datetime.now(timezone.utc).isoformat()
-            
-        except Exception as e:
-            logger.error(f"Error refreshing subscriptions: {e}", exc_info=True)
+            except Exception as e:
+                logger.error(f"Error refreshing subscriptions: {e}", exc_info=True)
 
     async def _sync_market_runtime_subscriptions(self, desired_tokens: Set[int]):
         """Sync current desired tokens to the market-runtime using full mode."""
@@ -634,6 +648,12 @@ class CandleAggregator:
         except Exception as e:
             logger.error(f"Failed to fetch watchlist tokens: {e}", exc_info=True)
             return set()
+
+    def _external_tokens(self) -> Set[int]:
+        tokens: Set[int] = set()
+        for owner_tokens in self.external_token_sources.values():
+            tokens.update(int(token) for token in owner_tokens)
+        return tokens
 
 
 # Global singleton instance

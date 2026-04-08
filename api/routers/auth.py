@@ -4,6 +4,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from algo_runtime.admin import list_instances as list_algo_runtime_instances_impl
+from algo_runtime.admin import refresh_runtime as refresh_algo_runtime_impl
+from algo_runtime.admin import update_instance_status as update_algo_runtime_instance_status_impl
+from algo_runtime.admin import upsert_instance as upsert_algo_runtime_instance_impl
+from algo_runtime.models import AlgoInstance, AlgoLifecycleState, DependencySpec, ExecutionMode
 from auth_service import (
     AppUser,
     clear_auth_cookies,
@@ -31,6 +36,50 @@ class AppLoginRequest(BaseModel):
 class AppUserResponse(BaseModel):
     username: str
     role: str
+
+
+class AlgoRuntimeInstanceUpsertRequest(BaseModel):
+    instance_id: str = Field(min_length=1)
+    algo_type: str = Field(min_length=1)
+    status: AlgoLifecycleState = AlgoLifecycleState.ENABLED
+    execution_mode: ExecutionMode = ExecutionMode.LIVE
+    config: dict = Field(default_factory=dict)
+    dependency_spec: DependencySpec = Field(default_factory=DependencySpec)
+    metadata: dict = Field(default_factory=dict)
+
+
+class AlgoRuntimeInstanceStatusRequest(BaseModel):
+    status: AlgoLifecycleState
+
+
+class PaperAccountResetRequest(BaseModel):
+    starting_balance: float | None = None
+    force: bool = False
+
+
+class PaperAccountUpsertRequest(BaseModel):
+    starting_balance: float | None = None
+
+
+async def _active_paper_instance_ids_for_scope(request: Request, account_scope: str) -> list[str] | None:
+    algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
+    if not algo_runtime_service:
+        return None
+    repository = getattr(getattr(algo_runtime_service, "kernel", None), "repository", None)
+    if repository is None:
+        return None
+
+    active_instances = await repository.list_active_instances()
+    normalized_scope = str(account_scope or "").strip()
+    blocking_statuses = {AlgoLifecycleState.ENABLED, AlgoLifecycleState.RUNNING}
+    blocked_instance_ids = [
+        instance.instance_id
+        for instance in active_instances
+        if instance.execution_mode == ExecutionMode.PAPER
+        and instance.status in blocking_statuses
+        and str(getattr(instance.dependency_spec, "account_scope", "") or "").strip() == normalized_scope
+    ]
+    return sorted(set(blocked_instance_ids))
 
 
 @router.post("/auth/login", tags=["Authentication"])
@@ -70,6 +119,8 @@ async def session_status(request: Request, db: Session = Depends(get_db)):
         broker_connected = db.query(KiteSession).filter_by(session_id=sid).first() is not None
     market_data_runtime = getattr(request.app.state, "market_data_runtime", None)
     algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    paper_market_engine = getattr(request.app.state, "paper_market_engine", None)
     daily_gate = getattr(request.app.state, "daily_token_ready", None)
     algo_runtime = await algo_runtime_service.status() if algo_runtime_service else None
     return {
@@ -93,6 +144,10 @@ async def session_status(request: Request, db: Session = Depends(get_db)):
                 "ready": bool(daily_gate.is_set()) if daily_gate else False,
             },
             "algo_runtime": algo_runtime,
+            "paper_runtime": {
+                "available": paper_runtime_service is not None,
+                "market_engine": paper_market_engine.status() if paper_market_engine else None,
+            },
         },
     }
 
@@ -102,6 +157,8 @@ async def runtime_status(request: Request):
     require_app_user(request)
     market_data_runtime = getattr(request.app.state, "market_data_runtime", None)
     algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    paper_market_engine = getattr(request.app.state, "paper_market_engine", None)
     daily_gate = getattr(request.app.state, "daily_token_ready", None)
     return {
         "components": get_components(),
@@ -114,7 +171,177 @@ async def runtime_status(request: Request):
             "ready": bool(daily_gate.is_set()) if daily_gate else False,
         },
         "algo_runtime": await algo_runtime_service.status() if algo_runtime_service else None,
+        "paper_runtime": {
+            "available": paper_runtime_service is not None,
+            "market_engine": paper_market_engine.status() if paper_market_engine else None,
+        },
     }
+
+
+@router.get("/system/algo-runtime/instances", tags=["System"])
+async def list_algo_runtime_instances(request: Request):
+    require_app_user(request)
+    algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
+    if not algo_runtime_service:
+        raise HTTPException(status_code=503, detail="Algo runtime is not available")
+    live_worker = getattr(request.app.state, "algo_runtime_live_worker", None)
+    return await list_algo_runtime_instances_impl(algo_runtime_service, live_worker=live_worker)
+
+
+@router.post("/system/algo-runtime/instances/upsert", tags=["System"])
+async def upsert_algo_runtime_instance(request: Request, payload: AlgoRuntimeInstanceUpsertRequest):
+    require_app_user(request)
+    algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
+    if not algo_runtime_service:
+        raise HTTPException(status_code=503, detail="Algo runtime is not available")
+    live_worker = getattr(request.app.state, "algo_runtime_live_worker", None)
+    instance = AlgoInstance(
+        instance_id=payload.instance_id,
+        algo_type=payload.algo_type,
+        status=payload.status,
+        execution_mode=payload.execution_mode,
+        config=payload.config,
+        dependency_spec=payload.dependency_spec,
+        metadata=payload.metadata,
+    )
+    return await upsert_algo_runtime_instance_impl(algo_runtime_service, instance, live_worker=live_worker)
+
+
+@router.post("/system/algo-runtime/instances/{instance_id}/status", tags=["System"])
+async def update_algo_runtime_instance_status(request: Request, instance_id: str, payload: AlgoRuntimeInstanceStatusRequest):
+    require_app_user(request)
+    algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
+    if not algo_runtime_service:
+        raise HTTPException(status_code=503, detail="Algo runtime is not available")
+    live_worker = getattr(request.app.state, "algo_runtime_live_worker", None)
+    updated = await update_algo_runtime_instance_status_impl(
+        algo_runtime_service,
+        instance_id=instance_id,
+        status=payload.status,
+        live_worker=live_worker,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Algo runtime instance not found")
+    return updated
+
+
+@router.post("/system/algo-runtime/refresh", tags=["System"])
+async def refresh_algo_runtime(request: Request):
+    require_app_user(request)
+    algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
+    if not algo_runtime_service:
+        raise HTTPException(status_code=503, detail="Algo runtime is not available")
+    live_worker = getattr(request.app.state, "algo_runtime_live_worker", None)
+    return await refresh_algo_runtime_impl(algo_runtime_service, live_worker=live_worker)
+
+
+@router.get("/system/paper/accounts/{account_scope}", tags=["System"])
+async def get_paper_account_summary(request: Request, account_scope: str):
+    require_app_user(request)
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if not paper_runtime_service:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+    return await paper_runtime_service.get_account_summary(account_scope)
+
+
+@router.post("/system/paper/accounts/{account_scope}/reset", tags=["System"])
+async def reset_paper_account(request: Request, account_scope: str, payload: PaperAccountResetRequest):
+    require_app_user(request)
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    paper_market_engine = getattr(request.app.state, "paper_market_engine", None)
+    if not paper_runtime_service:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+
+    if not payload.force:
+        active_instance_ids = await _active_paper_instance_ids_for_scope(request, account_scope)
+        if active_instance_ids is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": "Reset blocked: algo runtime visibility is unavailable; retry later or use force=true if you intentionally want to bypass the guard",
+                    "account_scope": account_scope,
+                },
+            )
+        if active_instance_ids:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Reset blocked: active paper algo instances are using this account_scope",
+                    "account_scope": account_scope,
+                    "active_instance_ids": active_instance_ids,
+                },
+            )
+
+    result = await paper_runtime_service.reset_account(account_scope, starting_balance=payload.starting_balance)
+    if paper_market_engine:
+        await paper_market_engine.sync_subscriptions()
+    return result
+
+
+@router.post("/system/paper/accounts/{account_scope}/upsert", tags=["System"])
+async def upsert_paper_account(request: Request, account_scope: str, payload: PaperAccountUpsertRequest):
+    require_app_user(request)
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if not paper_runtime_service:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+    account = await paper_runtime_service.ensure_account(account_scope, starting_balance=payload.starting_balance)
+    return {"account": account.model_dump(mode="json")}
+
+
+@router.get("/system/paper/orders", tags=["System"])
+async def list_paper_orders(
+    request: Request,
+    account_scope: str = Query(...),
+    strategy_tag: Optional[str] = Query(default=None),
+    algo_instance_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+):
+    require_app_user(request)
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if not paper_runtime_service:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+    items = await paper_runtime_service.list_orders(
+        account_scope,
+        strategy_tag=strategy_tag,
+        algo_instance_id=algo_instance_id,
+        limit=limit,
+    )
+    return {"items": [item.model_dump(mode="json") for item in items]}
+
+
+@router.get("/system/paper/trades", tags=["System"])
+async def list_paper_trades(
+    request: Request,
+    account_scope: str = Query(...),
+    strategy_tag: Optional[str] = Query(default=None),
+    algo_instance_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=2000),
+):
+    require_app_user(request)
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if not paper_runtime_service:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+    items = await paper_runtime_service.list_trades(
+        account_scope,
+        strategy_tag=strategy_tag,
+        algo_instance_id=algo_instance_id,
+        limit=limit,
+    )
+    return {"items": [item.model_dump(mode="json") for item in items]}
+
+
+@router.get("/system/paper/positions", tags=["System"])
+async def list_paper_positions(
+    request: Request,
+    account_scope: str = Query(...),
+    only_open: bool = Query(default=False),
+):
+    require_app_user(request)
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if not paper_runtime_service:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+    items = await paper_runtime_service.list_positions(account_scope, only_open=only_open)
+    return {"items": [item.model_dump(mode="json") for item in items]}
 
 
 @router.get("/system/logs", tags=["System"])
