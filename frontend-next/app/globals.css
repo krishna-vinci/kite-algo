@@ -1,0 +1,100 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  --bg: #0f1117;
+  --bg-soft: #161820;
+  --panel: #1a1d27;
+  --panel-hover: #1f2230;
+  --border-soft: #232636;
+  --text: #e2e4ea;
+  --muted: #8b8fa4;
+  --dim: #5a5e72;
+  --accent: #f97316;
+  --accent-soft: rgba(249, 115, 22, 0.1);
+  --accent-border: rgba(249, 115, 22, 0.3);
+  --green: #34d399;
+  --green-soft: rgba(52, 211, 153, 0.08);
+  --red: #f87171;
+  --red-soft: rgba(248, 113, 113, 0.08);
+  --blue: #60a5fa;
+  --blue-soft: rgba(96, 165, 250, 0.1);
+  --blue-border: rgba(96, 165, 250, 0.25);
+  --yellow: #fbbf24;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card: var(--panel);
+  --card-foreground: var(--text);
+  --popover: var(--panel);
+  --popover-foreground: var(--text);
+  --primary: var(--accent);
+  --primary-foreground: #ffffff;
+  --secondary: var(--bg-soft);
+  --secondary-foreground: var(--text);
+  --destructive: var(--red);
+  --radius: 0.5rem;
+  --border: #2a2d3a;
+  --input: #2a2d3a;
+  --ring: var(--accent);
+  --muted-foreground: var(--muted);
+  --accent-foreground: var(--text);
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    box-sizing: border-box;
+  }
+
+  html,
+  body {
+    background: var(--bg);
+    color: var(--text);
+  }
+
+  body {
+    @apply antialiased;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+
+  ::selection {
+    background: var(--accent-soft);
+    color: var(--text);
+  }
+}
