@@ -214,7 +214,8 @@ services:
       - frontend_next_node_modules:/app/node_modules
     environment:
       NODE_ENV: development
-      NEXT_PUBLIC_API_BASE_URL: http://finance-app:8777
+      BACKEND_INTERNAL_URL: http://finance-app:8777
+      NEXT_PUBLIC_API_BASE_URL: ""
       NEXT_PUBLIC_MARKET_RUNTIME_URL: http://market-runtime:8780
       WATCHPACK_POLLING: "true"
     command:

@@ -127,6 +127,7 @@ class AlgoKernel:
                     if self.intent_bridge
                     else None
                 )
+                desired_status = pending_state.get("_instance_status")
                 await self.state_store.set_hot_state(instance.instance_id, pending_state)
                 checkpoint = AlgoCheckpoint(
                     instance_id=instance.instance_id,
@@ -137,6 +138,16 @@ class AlgoKernel:
                 )
                 await self.state_store.set_checkpoint(checkpoint)
                 await self.repository.save_checkpoint(checkpoint)
+                if desired_status:
+                    try:
+                        desired_state = AlgoLifecycleState(str(desired_status))
+                    except ValueError:
+                        desired_state = None
+                    if desired_state is not None and desired_state != instance.status:
+                        updated_instance = await self.repository.update_status(instance.instance_id, desired_state)
+                        if updated_instance is not None:
+                            self.instances[instance.instance_id] = updated_instance
+                            instance = updated_instance
                 self.instance_runtime[instance.instance_id] = {
                     **self.instance_runtime.get(instance.instance_id, {}),
                     "lifecycle_state": instance.status.value,

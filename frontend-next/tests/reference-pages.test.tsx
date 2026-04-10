@@ -19,9 +19,9 @@ describe("reference pages", () => {
   it("renders the options strategy builder", () => {
     render(<OptionsPage />);
 
-    expect(screen.getByRole("heading", { name: "Strategy builder" })).toBeInTheDocument();
-    expect(screen.getByLabelText("delta search")).toHaveValue("0.30");
-    expect(screen.getByText("Option chain")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /strategy-aware options workspace/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /strategy builder/i })).toBeInTheDocument();
+    expect(screen.getByText(/sessions are auto-started/i)).toBeInTheDocument();
   });
 
   it("renders the tmux-style algos page", () => {

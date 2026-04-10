@@ -1,4 +1,25 @@
+"use client";
+
+import { useEffect, useState } from "react";
+
+function formatIstNow() {
+  return new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(new Date());
+}
+
 export function TopBar({ title }: Readonly<{ title: string }>) {
+  const [time, setTime] = useState(formatIstNow());
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setTime(formatIstNow()), 1000);
+    return () => window.clearInterval(interval);
+  }, []);
+
   return (
     <header className="flex h-10 items-center gap-2 border-b border-[var(--border)] bg-[var(--panel)] px-4">
       <span className="text-[12px] font-bold tracking-[0.03em] text-[var(--text)]">{title.toUpperCase()}</span>
@@ -16,8 +37,8 @@ export function TopBar({ title }: Readonly<{ title: string }>) {
         <span className="h-[5px] w-[5px] rounded-full bg-[var(--green)]" />BNIFTY auto
       </span>
       <span className="flex-1" />
-      <span className="rounded-[4px] border border-[var(--border)] px-2 py-0.5 text-[10px] text-[var(--muted)]">paper</span>
-      <span className="text-[11px] text-[var(--dim)]">09:42:18</span>
+      <span className="rounded-[4px] border border-[var(--border)] px-2 py-0.5 text-[10px] text-[var(--muted)]">paper · IST</span>
+      <span className="font-mono text-[11px] text-[var(--dim)]">{time}</span>
     </header>
   );
 }

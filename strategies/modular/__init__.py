@@ -2,6 +2,7 @@ from .bracket_stoploss import ModularBracketStoplossAlgo
 from .combined_premium_stoploss import ModularCombinedPremiumStoplossAlgo
 from .ema_monitor import ModularEmaMonitorAlgo
 from .index_stoploss import ModularIndexStoplossAlgo
+from .runtime_option_strategy import RuntimeManagedOptionStrategyAlgo
 
 
 def register_builtin_algos(registry) -> None:
@@ -9,6 +10,7 @@ def register_builtin_algos(registry) -> None:
     registry.register(ModularBracketStoplossAlgo)
     registry.register(ModularEmaMonitorAlgo)
     registry.register(ModularCombinedPremiumStoplossAlgo)
+    registry.register(RuntimeManagedOptionStrategyAlgo)
 
 
 __all__ = [
@@ -16,5 +18,6 @@ __all__ = [
     "ModularCombinedPremiumStoplossAlgo",
     "ModularEmaMonitorAlgo",
     "ModularIndexStoplossAlgo",
+    "RuntimeManagedOptionStrategyAlgo",
     "register_builtin_algos",
 ]

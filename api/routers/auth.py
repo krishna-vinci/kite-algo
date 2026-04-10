@@ -61,6 +61,24 @@ class PaperAccountUpsertRequest(BaseModel):
     starting_balance: float | None = None
 
 
+class PaperOrderPayload(BaseModel):
+    exchange: str = Field(min_length=1)
+    tradingsymbol: str = Field(min_length=1)
+    product: str = Field(min_length=1)
+    transaction_type: str = Field(min_length=1)
+    order_type: str = Field(min_length=1)
+    quantity: int = Field(gt=0)
+    price: float | None = None
+    trigger_price: float | None = None
+
+
+class PaperBasketRequest(BaseModel):
+    orders: list[PaperOrderPayload] = Field(min_length=1)
+    all_or_none: bool = True
+    strategy_tag: str | None = None
+    notes: str | None = None
+
+
 async def _active_paper_instance_ids_for_scope(request: Request, account_scope: str) -> list[str] | None:
     algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
     if not algo_runtime_service:
@@ -112,7 +130,7 @@ def app_me(request: Request):
 
 @router.get("/auth/session-status", tags=["Authentication"])
 async def session_status(request: Request, db: Session = Depends(get_db)):
-    user = require_app_user(request)
+    user = get_optional_app_user(request)
     sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
     broker_connected = False
     if sid:
@@ -150,6 +168,28 @@ async def session_status(request: Request, db: Session = Depends(get_db)):
             },
         },
     }
+
+
+@router.post("/system/paper/accounts/{account_scope}/basket", tags=["System"])
+async def place_paper_basket(request: Request, account_scope: str, payload: PaperBasketRequest):
+    require_app_user(request)
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if not paper_runtime_service:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+
+    result = await paper_runtime_service.place_basket(
+        account_scope=account_scope,
+        basket_payload={
+            "orders": [order.model_dump(mode="json") for order in payload.orders],
+            "all_or_none": payload.all_or_none,
+        },
+        attribution={
+            "source": "frontend-next-options",
+            "strategy_tag": payload.strategy_tag,
+            "notes": payload.notes,
+        },
+    )
+    return result
 
 
 @router.get("/system/runtime", tags=["System"])

@@ -1,7 +1,14 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { toast } from "sonner";
+import { AppAuthPanel } from "@/components/options/app-auth-panel";
+import type { RuntimeStatus } from "@/components/options/types";
 import { KpiCard } from "@/components/operator/kpi-card";
 import { Panel } from "@/components/operator/panel";
 import { SectionLabel } from "@/components/operator/section-label";
 import { StatusBadge } from "@/components/operator/status-badge";
+import { fetchRuntimeStatus, loginApp } from "@/lib/options/api";
 
 const metrics = [
   { label: "Index", value: "25,304.60", delta: "+0.42%", note: "mock market snapshot" },
@@ -23,10 +30,55 @@ const watchlist = [
   { symbol: "FINNIFTY", bias: "bearish", price: "24,207.85" },
 ];
 
+function fallbackStatus(): RuntimeStatus {
+  return { brokerConnected: false, websocketStatus: "degraded", paperAvailable: true, appAuthenticated: false };
+}
+
 export default function DashboardPage() {
+  const [status, setStatus] = useState<RuntimeStatus>(fallbackStatus());
+  const [loginPending, setLoginPending] = useState(false);
+
+  useEffect(() => {
+    let disposed = false;
+    async function load() {
+      try {
+        const next = await fetchRuntimeStatus();
+        if (!disposed) {
+          setStatus(next);
+        }
+      } catch {
+        if (!disposed) {
+          setStatus(fallbackStatus());
+        }
+      }
+    }
+    void load();
+    const interval = window.setInterval(load, 30000);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  async function handleLogin(payload: { username: string; password: string }) {
+    setLoginPending(true);
+    try {
+      await loginApp(payload);
+      const refreshed = await fetchRuntimeStatus();
+      setStatus(refreshed);
+      toast.success("Dashboard sign-in successful");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Login failed");
+    } finally {
+      setLoginPending(false);
+    }
+  }
+
   return (
     <div className="space-y-4 pb-4">
-      <Panel eyebrow="dashboard" title="Operator overview">
+      {!status.appAuthenticated ? <AppAuthPanel onLogin={handleLogin} pending={loginPending} compact /> : null}
+
+      <Panel eyebrow="dashboard" title="Operator overview" action={<StatusBadge tone={status.appAuthenticated ? "positive" : "warning"}>{status.appAuthenticated ? "signed in" : "sign in required"}</StatusBadge>}>
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
           {metrics.map((item) => (
             <KpiCard key={item.label} {...item} />
@@ -59,12 +111,7 @@ export default function DashboardPage() {
               </div>
             ))}
           </div>
-          <SectionLabel
-            className="mt-4"
-            eyebrow="session"
-            title="Locked console state"
-            description="Dashboard content stays static and mock-driven while the shell keeps the terminal-style frame consistent across routes."
-          />
+          <SectionLabel className="mt-4" eyebrow="session" title="Console state" description={status.appAuthenticated ? "App auth is active. Options page can use real backend flows and paper execution." : "Sign in here first so the options workspace can use real sessions, broker status, and paper execution."} />
         </Panel>
       </div>
     </div>

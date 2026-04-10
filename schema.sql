@@ -885,6 +885,27 @@ CREATE TABLE IF NOT EXISTS public.strategy_events (
 CREATE INDEX IF NOT EXISTS idx_strat_events_strat_id ON public.strategy_events(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_strat_events_created ON public.strategy_events(created_at DESC);
 
+CREATE TABLE IF NOT EXISTS public.option_strategy_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    underlying VARCHAR(32) NOT NULL,
+    expiry DATE NOT NULL,
+    user_intent VARCHAR(128) NOT NULL,
+    inferred_structure VARCHAR(128) NOT NULL,
+    inferred_family VARCHAR(64) NOT NULL,
+    execution_mode VARCHAR(16) NOT NULL CHECK (execution_mode IN ('dry_run', 'paper', 'live')),
+    status VARCHAR(32) NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'success', 'partial', 'failed')),
+    selected_legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    canonical_strategy JSONB NOT NULL DEFAULT '{}'::jsonb,
+    order_plan JSONB NOT NULL DEFAULT '{}'::jsonb,
+    execution_result JSONB,
+    algo_instance_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_option_strategy_runs_created ON public.option_strategy_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_option_strategy_runs_mode_status ON public.option_strategy_runs(execution_mode, status, updated_at DESC);
+
 -- =========================================
 -- Portfolio snapshots and history
 -- =========================================
