@@ -12,6 +12,7 @@ __pycache__/
 # Node
 node_modules/
 frontend/node_modules/
+/frontend/
 
 # Build output
 dist/
@@ -33,3 +34,29 @@ postgres_data/
 
 # Local SDK references
 gokiteconnect/
+
+# OpenCode
+.opencode/
+
+# Documentation
+documents/
+kite-docs/
+features-doc/
+
+# Local reference clones / scratch files
+kite-go/
+kite-python/
+market-runtime/README.md
+scripts/
+
+# Agent Skills
+.agents/
+
+
+# External reference projects
+openalgo/
+openalgo/openalgo/
+
+
+# tests
+tests/
