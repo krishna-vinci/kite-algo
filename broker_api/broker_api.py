@@ -127,6 +127,7 @@ from broker_api.kite_auth import login_headless
 from broker_api.kite_auth import API_KEY
 from . import kite_orders
 from . import options_router
+from auth_service import require_app_user
 
 
 
@@ -818,6 +819,7 @@ async def sync_and_reindex_orchestrator(
 # ─────────── Login endpoint ───────────
 @router.post("/login_kite")
 def headless_login(request: Request, response: Response, db: Session = Depends(get_db)):
+    require_app_user(request)
     try:
         kite, at = login_headless()
     except ValueError as e:
@@ -863,6 +865,7 @@ def headless_login(request: Request, response: Response, db: Session = Depends(g
 # ─────────── Logout endpoint ───────────
 @router.post("/logout_kite")
 def logout(response: Response, request: Request, db: Session = Depends(get_db)):
+    require_app_user(request)
     sid = request.cookies.get("kite_session_id")
     if sid:
         db.query(KiteSession).filter_by(session_id=sid).delete()

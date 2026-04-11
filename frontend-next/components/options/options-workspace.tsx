@@ -12,14 +12,17 @@ import { StrategyBuilderPanel } from "@/components/options/strategy-builder-pane
 import type { CandlePoint, ChartTimeframe, LivePosition, MiniChainSnapshot, NiftyImpactRow, OptionSessionSnapshot, RuntimeStatus, Underlying } from "@/components/options/types";
 import { WorkspaceTabs } from "@/components/options/workspace-tabs";
 import {
+  buildCandlesStreamUrl,
+  buildOptionsSessionSseUrl,
   ensureOptionsSessions,
   fetchCandles,
-  fetchMiniChain,
   fetchNifty50Impact,
   fetchOptionSession,
   fetchRealtimePositions,
   fetchRuntimeStatus,
   loginToBroker,
+  mergeOptionSessionSnapshot,
+  normalizeOptionSessionSnapshot,
 } from "@/lib/options/api";
 
 const INDEX_TOKENS: Record<Underlying, string> = {
@@ -30,13 +33,19 @@ const INDEX_TOKENS: Record<Underlying, string> = {
 function createFallbackRuntimeStatus(): RuntimeStatus {
   return {
     brokerConnected: false,
+    brokerStatus: "unknown",
+    brokerMode: "system",
+    brokerLastSuccessAt: null,
+    brokerLastFailureAt: null,
+    brokerLastError: null,
+    brokerNextRefreshAt: null,
     websocketStatus: "degraded",
     paperAvailable: true,
     appAuthenticated: false,
   };
 }
 
-function createFallbackMiniChain(underlying: Underlying): MiniChainSnapshot {
+function createFallbackMiniChain(underlying: Underlying, expiry = "2026-04-30"): MiniChainSnapshot {
   const spotPrice = underlying === "BANKNIFTY" ? 48240 : 23460;
   const gap = underlying === "BANKNIFTY" ? 100 : 50;
   const atmStrike = Math.round(spotPrice / gap) * gap;
@@ -74,7 +83,7 @@ function createFallbackMiniChain(underlying: Underlying): MiniChainSnapshot {
 
   return {
     underlying,
-    expiry: "2026-04-30",
+    expiry,
     spotPrice,
     atmStrike,
     strikes,
@@ -83,42 +92,163 @@ function createFallbackMiniChain(underlying: Underlying): MiniChainSnapshot {
 
 function createFallbackSession(underlying: Underlying): OptionSessionSnapshot {
   const mini = createFallbackMiniChain(underlying);
+  const rows = mini.strikes.map((row) => ({
+    strike: row.strike,
+    ce: row.ce
+      ? {
+          token: row.ce.instrumentToken,
+          tsym: row.ce.tradingSymbol,
+          ltp: row.ce.ltp,
+          iv: row.ce.iv,
+          oi: row.ce.oi ?? null,
+          delta: row.ce.delta,
+          gamma: row.ce.gamma,
+          theta: row.ce.theta,
+          vega: row.ce.vega,
+        }
+      : null,
+    pe: row.pe
+      ? {
+          token: row.pe.instrumentToken,
+          tsym: row.pe.tradingSymbol,
+          ltp: row.pe.ltp,
+          iv: row.pe.iv,
+          oi: row.pe.oi ?? null,
+          delta: row.pe.delta,
+          gamma: row.pe.gamma,
+          theta: row.pe.theta,
+          vega: row.pe.vega,
+        }
+      : null,
+    isAtm: row.isAtm,
+  }));
   return {
     underlying,
     spotLtp: mini.spotPrice,
     atmStrike: mini.atmStrike,
     expiries: [mini.expiry],
-    rows: mini.strikes.map((row) => ({
+    perExpiry: {
+      [mini.expiry]: {
+        forward: mini.spotPrice,
+        sigmaExpiry: null,
+        atmStrike: mini.atmStrike,
+        strikes: mini.strikes.map((row) => row.strike),
+        rows,
+      },
+    },
+    rows,
+    updatedAt: null,
+  };
+}
+
+type CandleStreamSnapshotEvent = {
+  instrument_token: number;
+  interval: string;
+  candles: unknown[][];
+};
+
+type CandleStreamUpdateEvent = {
+  event: "tick" | "candle";
+  instrument_token: number;
+  interval: string;
+  candle: unknown[];
+};
+
+function parseStreamCandle(candle: unknown[]): CandlePoint | null {
+  if (!Array.isArray(candle) || candle.length < 6) {
+    return null;
+  }
+  const timeValue = candle[0];
+  const isoMillis = typeof timeValue === "string" ? Date.parse(timeValue) : Number(timeValue) * 1000;
+  if (!Number.isFinite(isoMillis)) {
+    return null;
+  }
+  const open = Number(candle[1]);
+  const high = Number(candle[2]);
+  const low = Number(candle[3]);
+  const close = Number(candle[4]);
+  const volume = Number(candle[5] ?? 0);
+  if (![open, high, low, close, volume].every(Number.isFinite)) {
+    return null;
+  }
+  return {
+    time: Math.floor(isoMillis / 1000),
+    open,
+    high,
+    low,
+    close,
+    volume,
+  };
+}
+
+function mergeCandleSeries(current: CandlePoint[], incoming: CandlePoint[]): CandlePoint[] {
+  if (incoming.length === 0) {
+    return current;
+  }
+  const merged = new Map<number, CandlePoint>();
+  for (const candle of current) {
+    merged.set(candle.time, candle);
+  }
+  for (const candle of incoming) {
+    merged.set(candle.time, candle);
+  }
+  return Array.from(merged.values()).sort((left, right) => left.time - right.time);
+}
+
+function toMiniChainSnapshot(session: OptionSessionSnapshot | null | undefined, expiry: string | null): MiniChainSnapshot | null {
+  if (!session || !expiry) {
+    return null;
+  }
+  const expiryData = session.perExpiry[expiry];
+  if (!expiryData) {
+    return null;
+  }
+  return {
+    underlying: session.underlying,
+    expiry,
+    spotPrice: session.spotLtp ?? 0,
+    atmStrike: expiryData.atmStrike ?? session.atmStrike ?? 0,
+    strikes: expiryData.rows.map((row) => ({
       strike: row.strike,
+      isAtm: Boolean(row.isAtm),
       ce: row.ce
         ? {
-            token: row.ce.instrumentToken,
-            tsym: row.ce.tradingSymbol,
-            ltp: row.ce.ltp,
-            iv: row.ce.iv,
-            oi: row.ce.oi ?? null,
-            delta: row.ce.delta,
-            gamma: row.ce.gamma,
-            theta: row.ce.theta,
-            vega: row.ce.vega,
+            instrumentToken: row.ce.token,
+            tradingSymbol: row.ce.tsym,
+            ltp: row.ce.ltp ?? 0,
+            lotSize: row.ce.lotSize ?? (session.underlying === "BANKNIFTY" ? 15 : 25),
+            delta: row.ce.delta ?? 0,
+            gamma: row.ce.gamma ?? 0,
+            theta: row.ce.theta ?? 0,
+            vega: row.ce.vega ?? 0,
+            iv: row.ce.iv ?? 0,
+            oi: row.ce.oi ?? undefined,
           }
         : null,
       pe: row.pe
         ? {
-            token: row.pe.instrumentToken,
-            tsym: row.pe.tradingSymbol,
-            ltp: row.pe.ltp,
-            iv: row.pe.iv,
-            oi: row.pe.oi ?? null,
-            delta: row.pe.delta,
-            gamma: row.pe.gamma,
-            theta: row.pe.theta,
-            vega: row.pe.vega,
+            instrumentToken: row.pe.token,
+            tradingSymbol: row.pe.tsym,
+            ltp: row.pe.ltp ?? 0,
+            lotSize: row.pe.lotSize ?? (session.underlying === "BANKNIFTY" ? 15 : 25),
+            delta: row.pe.delta ?? 0,
+            gamma: row.pe.gamma ?? 0,
+            theta: row.pe.theta ?? 0,
+            vega: row.pe.vega ?? 0,
+            iv: row.pe.iv ?? 0,
+            oi: row.pe.oi ?? undefined,
           }
         : null,
-      isAtm: row.isAtm,
     })),
   };
+}
+
+function readForwardPrice(session: OptionSessionSnapshot | null | undefined) {
+  if (!session) {
+    return null;
+  }
+  const firstExpiry = session.expiries[0];
+  return firstExpiry ? session.perExpiry[firstExpiry]?.forward ?? null : null;
 }
 
 function createFallbackPositions(): LivePosition[] {
@@ -168,7 +298,6 @@ export function OptionsWorkspace() {
   const [loginPending, setLoginPending] = useState(false);
   const [expiries, setExpiries] = useState<string[]>(["2026-04-30"]);
   const [selectedExpiry, setSelectedExpiry] = useState("2026-04-30");
-  const [chain, setChain] = useState<MiniChainSnapshot | null>(createFallbackMiniChain("NIFTY"));
   const [sessions, setSessions] = useState<Record<Underlying, OptionSessionSnapshot>>({
     NIFTY: createFallbackSession("NIFTY"),
     BANKNIFTY: createFallbackSession("BANKNIFTY"),
@@ -181,9 +310,9 @@ export function OptionsWorkspace() {
   const [drawerType, setDrawerType] = useState<"call" | "put">("call");
   const [drawerSide, setDrawerSide] = useState<"long" | "short">("long");
   const [drawerVersion, setDrawerVersion] = useState(0);
-  const [chainLoading, setChainLoading] = useState(false);
   const [chartLoading, setChartLoading] = useState(false);
   const [chartCandles, setChartCandles] = useState<Record<Underlying, CandlePoint[]>>({ NIFTY: [], BANKNIFTY: [] });
+  const [liveCandles, setLiveCandles] = useState<Record<Underlying, CandlePoint | null>>({ NIFTY: null, BANKNIFTY: null });
 
   useEffect(() => {
     if (!runtimeStatus.appAuthenticated) {
@@ -226,90 +355,88 @@ export function OptionsWorkspace() {
   }, [runtimeStatus.appAuthenticated]);
 
   useEffect(() => {
-    let disposed = false;
+    if (!runtimeStatus.appAuthenticated) {
+      return;
+    }
 
-    async function loadUnderlying() {
-      if (!runtimeStatus.appAuthenticated) {
-        setChain(createFallbackMiniChain(underlying));
-        return;
-      }
-      setChainLoading(true);
+    let disposed = false;
+    const streams: EventSource[] = [];
+
+    async function primeSessions() {
       try {
         await ensureOptionsSessions();
-        const sessionSnapshot = await fetchOptionSession(underlying);
-
+        const results = await Promise.allSettled((Object.keys(INDEX_TOKENS) as Underlying[]).map((item) => fetchOptionSession(item)));
         if (disposed) {
           return;
         }
+        setSessions((current) => {
+          const next = { ...current };
+          results.forEach((result, index) => {
+            if (result.status === "fulfilled") {
+              const key = (Object.keys(INDEX_TOKENS) as Underlying[])[index];
+              next[key] = mergeOptionSessionSnapshot(current[key], result.value);
+            }
+          });
+          return next;
+        });
+      } catch {
+        if (!disposed) {
+          toast.error("Unable to load live option snapshots.");
+        }
+      }
+    }
 
-        setSessions((current) => ({ ...current, [underlying]: sessionSnapshot }));
-        setExpiries(sessionSnapshot.expiries.length > 0 ? sessionSnapshot.expiries : [createFallbackMiniChain(underlying).expiry]);
-        const expiryToUse = sessionSnapshot.expiries[0] ?? createFallbackMiniChain(underlying).expiry;
-        setSelectedExpiry(expiryToUse);
+    void primeSessions();
 
+    for (const item of Object.keys(INDEX_TOKENS) as Underlying[]) {
+      const source = new EventSource(buildOptionsSessionSseUrl(item), { withCredentials: true });
+      source.onmessage = (event) => {
         try {
-          const mini = await fetchMiniChain(underlying, expiryToUse, sessionSnapshot.atmStrike ?? undefined);
+          const payload = JSON.parse(event.data) as { type?: string } & Record<string, unknown>;
+          if (payload.type === "error") {
+            return;
+          }
+          const snapshot = normalizeOptionSessionSnapshot(payload as never);
           if (!disposed) {
-            setChain(mini);
+            setSessions((current) => ({ ...current, [item]: mergeOptionSessionSnapshot(current[item], snapshot) }));
           }
         } catch {
-          if (!disposed) {
-            setChain(createFallbackMiniChain(underlying));
-          }
+          // ignore malformed keep-alive payloads
         }
-      } catch {
-        if (!disposed) {
-          setExpiries([createFallbackMiniChain(underlying).expiry]);
-          setSelectedExpiry(createFallbackMiniChain(underlying).expiry);
-          setChain(createFallbackMiniChain(underlying));
-        }
-      } finally {
-        if (!disposed) {
-          setChainLoading(false);
-        }
-      }
+      };
+      streams.push(source);
     }
 
-    void loadUnderlying();
     return () => {
       disposed = true;
+      streams.forEach((source) => source.close());
     };
-  }, [runtimeStatus.appAuthenticated, underlying]);
+  }, [runtimeStatus.appAuthenticated]);
 
   useEffect(() => {
-    let disposed = false;
-    async function refreshMiniChain() {
-      if (!runtimeStatus.appAuthenticated) {
-        return;
-      }
-      if (!selectedExpiry) {
-        return;
-      }
-      try {
-        const next = await fetchMiniChain(underlying, selectedExpiry);
-        if (!disposed) {
-          setChain(next);
-        }
-      } catch {
-        if (!disposed) {
-          setChain((current) => current ?? createFallbackMiniChain(underlying));
-        }
-      }
+    const session = sessions[underlying];
+    const fallbackExpiry = createFallbackMiniChain(underlying).expiry;
+    const nextExpiries = session?.expiries?.length ? session.expiries : [fallbackExpiry];
+    setExpiries(nextExpiries);
+    setSelectedExpiry((current) => (nextExpiries.includes(current) ? current : nextExpiries[0] ?? fallbackExpiry));
+  }, [sessions, underlying]);
+
+  useEffect(() => {
+    if (!runtimeStatus.appAuthenticated) {
+      setChartLoading(false);
+      setChartCandles({ NIFTY: [], BANKNIFTY: [] });
+      setLiveCandles({ NIFTY: null, BANKNIFTY: null });
+      return;
     }
 
-    void refreshMiniChain();
-    return () => {
-      disposed = true;
-    };
-  }, [runtimeStatus.appAuthenticated, selectedExpiry, underlying]);
-
-  useEffect(() => {
     let disposed = false;
+    const streams: EventSource[] = [];
+
+    // Clear stale candle data when timeframe changes
+    setChartCandles({ NIFTY: [], BANKNIFTY: [] });
+    setLiveCandles({ NIFTY: null, BANKNIFTY: null });
 
     async function loadCharts() {
-      if (!runtimeStatus.appAuthenticated) {
-        return;
-      }
       setChartLoading(true);
       try {
         const toIso = new Date().toISOString();
@@ -321,7 +448,10 @@ export function OptionsWorkspace() {
           fetchCandles({ identifier: INDEX_TOKENS.BANKNIFTY, timeframe, fromIso, toIso }),
         ]);
         if (!disposed) {
-          setChartCandles({ NIFTY: nifty, BANKNIFTY: banknifty });
+          setChartCandles((current) => ({
+            NIFTY: mergeCandleSeries(nifty, current.NIFTY),
+            BANKNIFTY: mergeCandleSeries(banknifty, current.BANKNIFTY),
+          }));
         }
       } catch {
         if (!disposed) {
@@ -335,15 +465,58 @@ export function OptionsWorkspace() {
     }
 
     void loadCharts();
-    const interval = window.setInterval(loadCharts, 15000);
+
+    for (const [item, token] of Object.entries(INDEX_TOKENS) as Array<[Underlying, string]>) {
+      const source = new EventSource(buildCandlesStreamUrl(token, timeframe), { withCredentials: true });
+      source.addEventListener("snapshot", (event) => {
+        try {
+          const payload = JSON.parse((event as MessageEvent).data) as CandleStreamSnapshotEvent;
+          const incoming = payload.candles.map(parseStreamCandle).filter((value): value is CandlePoint => Boolean(value));
+          if (!disposed) {
+            // SSE snapshot provides fresh historical base, overwriting any stale leftovers
+            setChartCandles((current) => ({ ...current, [item]: mergeCandleSeries(current[item], incoming) }));
+            setLiveCandles((current) => ({ ...current, [item]: incoming[incoming.length - 1] ?? current[item] }));
+          }
+        } catch {
+          // ignore malformed snapshot payloads
+        }
+      });
+      const handleCandleUpdate = (event: Event) => {
+        try {
+          const payload = JSON.parse((event as MessageEvent).data) as CandleStreamUpdateEvent;
+          const nextCandle = parseStreamCandle(payload.candle);
+          if (!nextCandle || disposed) {
+            return;
+          }
+          setChartCandles((current) => ({ ...current, [item]: mergeCandleSeries(current[item], [nextCandle]) }));
+          setLiveCandles((current) => ({ ...current, [item]: nextCandle }));
+        } catch {
+          // ignore malformed update payloads
+        }
+      };
+      source.addEventListener("tick", handleCandleUpdate);
+      source.addEventListener("candle", handleCandleUpdate);
+      streams.push(source);
+    }
+
     return () => {
       disposed = true;
-      window.clearInterval(interval);
+      streams.forEach((source) => source.close());
     };
   }, [runtimeStatus.appAuthenticated, timeframe]);
 
   const primarySession = sessions.NIFTY;
   const secondarySession = sessions.BANKNIFTY;
+  const chain = useMemo(() => {
+    const liveChain = toMiniChainSnapshot(sessions[underlying], selectedExpiry);
+    if (liveChain) {
+      return liveChain;
+    }
+    return createFallbackMiniChain(underlying, selectedExpiry || undefined);
+  }, [selectedExpiry, sessions, underlying]);
+  const chainLoading = runtimeStatus.appAuthenticated && !toMiniChainSnapshot(sessions[underlying], selectedExpiry);
+  const primaryForward = useMemo(() => readForwardPrice(primarySession), [primarySession]);
+  const secondaryForward = useMemo(() => readForwardPrice(secondarySession), [secondarySession]);
 
   const primaryPrice = useMemo(() => {
     const candles = chartCandles.NIFTY;
@@ -376,6 +549,7 @@ export function OptionsWorkspace() {
     setLoginPending(true);
     try {
       const response = await loginToBroker();
+      setRuntimeStatus(await fetchRuntimeStatus());
       toast.success(response.authenticated ? "Broker session refreshed" : "Broker login request sent");
     } catch {
       toast.error("Broker login failed");
@@ -399,14 +573,10 @@ export function OptionsWorkspace() {
             {item}
           </button>
         ))}
-        <span className="ml-auto text-[11px] text-[var(--muted)]">Sessions are auto-started and monitored in the background.</span>
+        <span className="ml-auto text-[10px] text-[var(--dim)]">auto-managed sessions</span>
       </div>
 
-      {!runtimeStatus.appAuthenticated ? (
-        <div className="rounded-2xl border border-[var(--yellow)]/30 bg-[var(--yellow)]/10 px-4 py-3 text-[12px] text-[var(--muted)]">
-          App login is required for real chain data, historical candles, dry-runs, and paper execution. Sign in from the dashboard first.
-        </div>
-      ) : null}
+      {/* Auth warning is now shown inline in the header StatusPill area */}
 
       <ChartStrip
         chartHeight={chartHeight}
@@ -415,8 +585,8 @@ export function OptionsWorkspace() {
         onChartHeightChange={setChartHeight}
         onSplitPercentChange={setSplitPercent}
         onTimeframeChange={setTimeframe}
-        primary={{ label: "NIFTY", price: primaryPrice, changePercent: primaryChange, candles: chartCandles.NIFTY, loading: chartLoading }}
-        secondary={{ label: "BANKNIFTY", price: secondaryPrice, changePercent: secondaryChange, candles: chartCandles.BANKNIFTY, loading: chartLoading }}
+        primary={{ label: "NIFTY", price: primaryPrice, changePercent: primaryChange, forwardPrice: primaryForward, candles: chartCandles.NIFTY, liveCandle: liveCandles.NIFTY, loading: chartLoading }}
+        secondary={{ label: "BANKNIFTY", price: secondaryPrice, changePercent: secondaryChange, forwardPrice: secondaryForward, candles: chartCandles.BANKNIFTY, liveCandle: liveCandles.BANKNIFTY, loading: chartLoading }}
       />
 
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg)]/60">
@@ -447,7 +617,6 @@ export function OptionsWorkspace() {
               underlying={underlying}
               expiry={selectedExpiry}
               currentSpot={chain?.spotPrice ?? primaryPrice ?? 0}
-              deltaFilter={deltaFilter}
               chain={chain}
               appAuthenticated={runtimeStatus.appAuthenticated}
               paperAvailable={runtimeStatus.paperAvailable}

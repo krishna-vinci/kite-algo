@@ -12,22 +12,17 @@ export function NiftyImpactPanel({ rows }: NiftyImpactPanelProps) {
   return (
     <section className="flex h-full min-h-0 flex-col rounded-2xl border border-[var(--border)] bg-[var(--panel)]">
       <div className="border-b border-[var(--border)] px-3 py-2">
-        <p className="text-[10px] uppercase tracking-[0.24em] text-[var(--dim)]">nifty 50 impact</p>
-        <h2 className="mt-1 text-sm font-semibold text-[var(--text)]">Weightage-driven index contribution context</h2>
+        <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-[var(--dim)]">nifty 50 impact</p>
       </div>
-      <div className="grid gap-3 px-3 py-3 lg:grid-cols-[0.9fr_1.1fr]">
+      <div className="grid gap-3 px-3 py-3 lg:grid-cols-1">
         <div className="rounded-xl border border-[var(--border-soft)] bg-[var(--bg)]/70 p-3">
           <div className="flex items-center justify-between text-[11px]">
-            <span className="text-[var(--green)]">bull weight {positive.toFixed(2)}%</span>
-            <span className="text-[var(--muted)]">vs</span>
-            <span className="text-[var(--red)]">bear weight {negative.toFixed(2)}%</span>
+            <span className="text-[var(--green)]">bull {positive.toFixed(1)}%</span>
+            <span className="text-[var(--red)]">bear {negative.toFixed(1)}%</span>
           </div>
-          <div className="mt-3 h-3 overflow-hidden rounded-full bg-[var(--red-soft)]">
+          <div className="mt-2 h-2 overflow-hidden rounded-full bg-[var(--red-soft)]">
             <div className="h-full bg-[var(--green)]" style={{ width: `${positive / Math.max(positive + negative, 1) * 100}%` }} />
           </div>
-        </div>
-        <div className="rounded-xl border border-[var(--border-soft)] bg-[var(--bg)]/70 p-3 text-[11px] text-[var(--muted)]">
-          This panel uses the existing DB-backed Nifty 50 table to keep index-level context visible while trading options.
         </div>
       </div>
       <div className="overflow-auto px-3 pb-3">

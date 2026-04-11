@@ -16,6 +16,21 @@ export class ApiClientError extends Error {
 
 let refreshPromise: Promise<void> | null = null;
 
+function redirectToLogin() {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (window.location.pathname === "/login") {
+    return;
+  }
+  const next = `${window.location.pathname}${window.location.search}`;
+  const loginUrl = new URL("/login", window.location.origin);
+  if (next && next !== "/") {
+    loginUrl.searchParams.set("next", next);
+  }
+  window.location.assign(loginUrl.toString());
+}
+
 async function refreshAppSession() {
   if (!refreshPromise) {
     refreshPromise = fetch("/api/auth/refresh", {
@@ -39,7 +54,11 @@ export async function apiFetch<T>(
   input: string,
   options: ApiFetchOptions = {},
 ): Promise<T> {
-  const { json, baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "", headers, ...init } = options;
+  const defaultBaseUrl =
+    typeof window === "undefined"
+      ? (process.env.NEXT_PUBLIC_API_BASE_URL ?? "")
+      : "";
+  const { json, baseUrl = defaultBaseUrl, headers, ...init } = options;
   const requestInit: RequestInit = {
     ...init,
     credentials: init.credentials ?? "include",
@@ -58,6 +77,7 @@ export async function apiFetch<T>(
       await refreshAppSession();
       response = await fetch(`${baseUrl}${input}`, requestInit);
     } catch {
+      redirectToLogin();
       // let the original 401 handling below raise a typed error
     }
   }

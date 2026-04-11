@@ -192,8 +192,10 @@ services:
     restart: unless-stopped
     environment:
       NODE_ENV: production
-      NEXT_PUBLIC_API_BASE_URL: http://finance-app:8777
-      NEXT_PUBLIC_MARKET_RUNTIME_URL: http://market-runtime:8780
+      BACKEND_INTERNAL_URL: http://finance-app:8777
+      MARKET_RUNTIME_URL: http://market-runtime:8780
+      NEXT_PUBLIC_API_BASE_URL: ""
+      NEXT_PUBLIC_MARKET_RUNTIME_URL: ""
     ports:
       - "13000:3000"
     depends_on:

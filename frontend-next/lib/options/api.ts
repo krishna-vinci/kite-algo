@@ -8,13 +8,20 @@ import type {
   NiftyImpactRow,
   OptionSessionSnapshot,
   RuntimeStatus,
+  SnapshotOptionSide,
   Underlying,
 } from "@/components/options/types";
 import { apiFetch } from "@/lib/api/client";
 
 type SessionStatusResponse = {
   app?: { authenticated?: boolean };
-  broker?: { connected?: boolean };
+  broker?: {
+    connected?: boolean;
+    status?: "connected" | "reconnecting" | "degraded" | "disconnected" | "unknown";
+    mode?: "system";
+    last_login?: { last_success_at?: string | null; last_failure_at?: string | null; last_error?: string | null };
+    scheduler?: { next_run?: string | null };
+  };
   runtime?: { websocket?: { status?: string }; paper_runtime?: { available?: boolean } };
 };
 
@@ -22,16 +29,21 @@ type SessionSnapshotResponse = {
   underlying: string;
   spot_ltp?: number | null;
   expiries: string[];
+  updated_at?: string | null;
   per_expiry: Record<
     string,
     {
+      forward?: number | null;
+      sigma_expiry?: number | null;
       atm_strike?: number | null;
+      strikes?: number[];
       rows: Array<{
         strike: number;
         CE?: {
           token: number;
           tsym: string;
           ltp?: number | null;
+          lot_size?: number | null;
           iv?: number | null;
           oi?: number | null;
           delta?: number | null;
@@ -43,6 +55,7 @@ type SessionSnapshotResponse = {
           token: number;
           tsym: string;
           ltp?: number | null;
+          lot_size?: number | null;
           iv?: number | null;
           oi?: number | null;
           delta?: number | null;
@@ -173,52 +186,136 @@ export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
   const response = await apiFetch<SessionStatusResponse>("/api/auth/session-status");
   return {
     brokerConnected: Boolean(response.broker?.connected),
+    brokerStatus: response.broker?.status ?? "unknown",
+    brokerMode: response.broker?.mode ?? "system",
+    brokerLastSuccessAt: response.broker?.last_login?.last_success_at ?? null,
+    brokerLastFailureAt: response.broker?.last_login?.last_failure_at ?? null,
+    brokerLastError: response.broker?.last_login?.last_error ?? null,
+    brokerNextRefreshAt: response.broker?.scheduler?.next_run ?? null,
     websocketStatus: response.runtime?.websocket?.status ?? "unknown",
     paperAvailable: Boolean(response.runtime?.paper_runtime?.available),
     appAuthenticated: Boolean(response.app?.authenticated),
   };
 }
 
-export async function fetchOptionSession(underlying: Underlying): Promise<OptionSessionSnapshot> {
-  const response = await apiFetch<SessionSnapshotResponse>(`/api/options/session/${underlying}`);
-  const expiry = response.expiries[0];
-  const expiryData = response.per_expiry?.[expiry] ?? { rows: [], atm_strike: null };
+export function normalizeOptionSessionSnapshot(response: SessionSnapshotResponse): OptionSessionSnapshot {
+  const expiries = response.expiries ?? [];
+  const normalizedPerExpiry = Object.fromEntries(
+    Object.entries(response.per_expiry ?? {}).map(([expiry, expiryData]) => [
+      expiry,
+      {
+        forward: expiryData.forward ?? null,
+        sigmaExpiry: expiryData.sigma_expiry ?? null,
+        atmStrike: expiryData.atm_strike ?? null,
+        strikes: expiryData.strikes ?? [],
+        rows: expiryData.rows.map((row) => ({
+          strike: row.strike,
+          ce: row.CE
+            ? {
+                token: row.CE.token,
+                tsym: row.CE.tsym,
+                ltp: row.CE.ltp ?? null,
+                lotSize: row.CE.lot_size ?? null,
+                iv: row.CE.iv ?? null,
+                oi: row.CE.oi ?? null,
+                delta: row.CE.delta ?? null,
+                gamma: row.CE.gamma ?? null,
+                theta: row.CE.theta ?? null,
+                vega: row.CE.vega ?? null,
+              }
+            : null,
+          pe: row.PE
+            ? {
+                token: row.PE.token,
+                tsym: row.PE.tsym,
+                ltp: row.PE.ltp ?? null,
+                lotSize: row.PE.lot_size ?? null,
+                iv: row.PE.iv ?? null,
+                oi: row.PE.oi ?? null,
+                delta: row.PE.delta ?? null,
+                gamma: row.PE.gamma ?? null,
+                theta: row.PE.theta ?? null,
+                vega: row.PE.vega ?? null,
+              }
+            : null,
+          isAtm: row.strike === expiryData.atm_strike,
+        })),
+      },
+    ]),
+  );
+  const primaryExpiry = expiries[0];
+  const primaryExpiryData = primaryExpiry ? normalizedPerExpiry[primaryExpiry] : undefined;
   return {
     underlying: response.underlying,
     spotLtp: response.spot_ltp ?? null,
-    atmStrike: expiryData.atm_strike ?? null,
-    expiries: response.expiries ?? [],
-    rows: expiryData.rows.map((row) => ({
-      strike: row.strike,
-      ce: row.CE
-        ? {
-            token: row.CE.token,
-            tsym: row.CE.tsym,
-            ltp: row.CE.ltp ?? null,
-            iv: row.CE.iv ?? null,
-            oi: row.CE.oi ?? null,
-            delta: row.CE.delta ?? null,
-            gamma: row.CE.gamma ?? null,
-            theta: row.CE.theta ?? null,
-            vega: row.CE.vega ?? null,
-          }
-        : null,
-      pe: row.PE
-        ? {
-            token: row.PE.token,
-            tsym: row.PE.tsym,
-            ltp: row.PE.ltp ?? null,
-            iv: row.PE.iv ?? null,
-            oi: row.PE.oi ?? null,
-            delta: row.PE.delta ?? null,
-            gamma: row.PE.gamma ?? null,
-            theta: row.PE.theta ?? null,
-            vega: row.PE.vega ?? null,
-          }
-        : null,
-      isAtm: row.strike === expiryData.atm_strike,
-    })),
+    atmStrike: primaryExpiryData?.atmStrike ?? null,
+    expiries,
+    perExpiry: normalizedPerExpiry,
+    rows: primaryExpiryData?.rows ?? [],
+    updatedAt: response.updated_at ?? null,
   };
+}
+
+function mergeSnapshotSide(
+  previous: SnapshotOptionSide | null | undefined,
+  next: SnapshotOptionSide | null | undefined,
+): SnapshotOptionSide | null {
+  if (!next) {
+    return null;
+  }
+  if (!previous) {
+    return next;
+  }
+  return {
+    ...previous,
+    ...next,
+    lotSize: next.lotSize ?? previous.lotSize ?? null,
+  };
+}
+
+export function mergeOptionSessionSnapshot(
+  previous: OptionSessionSnapshot | null | undefined,
+  next: OptionSessionSnapshot,
+): OptionSessionSnapshot {
+  if (!previous) {
+    return next;
+  }
+
+  const previousPerExpiry = previous.perExpiry ?? {};
+  const mergedPerExpiry = Object.fromEntries(
+    Object.entries(next.perExpiry ?? {}).map(([expiry, expiryData]) => {
+      const previousRowsByStrike = new Map(
+        (previousPerExpiry[expiry]?.rows ?? []).map((row) => [row.strike, row]),
+      );
+
+      return [
+        expiry,
+        {
+          ...expiryData,
+          rows: expiryData.rows.map((row) => {
+            const previousRow = previousRowsByStrike.get(row.strike);
+            return {
+              ...row,
+              ce: mergeSnapshotSide(previousRow?.ce, row.ce),
+              pe: mergeSnapshotSide(previousRow?.pe, row.pe),
+            };
+          }),
+        },
+      ];
+    }),
+  );
+
+  const primaryExpiry = next.expiries[0];
+  return {
+    ...next,
+    perExpiry: mergedPerExpiry,
+    rows: primaryExpiry ? mergedPerExpiry[primaryExpiry]?.rows ?? next.rows : next.rows,
+  };
+}
+
+export async function fetchOptionSession(underlying: Underlying): Promise<OptionSessionSnapshot> {
+  const response = await apiFetch<SessionSnapshotResponse>(`/api/options/session/${underlying}`);
+  return normalizeOptionSessionSnapshot(response);
 }
 
 export async function fetchAvailableExpiries(underlying: Underlying): Promise<string[]> {
@@ -411,15 +508,68 @@ export async function fetchNifty50Impact(): Promise<NiftyImpactRow[]> {
   );
 }
 
+/**
+ * Normalize UI timeframe aliases to backend canonical timeframe strings.
+ * Must match backend's TIMEFRAME_ALIASES in candles_api.py.
+ */
+const TIMEFRAME_ALIASES: Record<string, string> = {
+  "1m": "minute",
+  min: "minute",
+  minute: "minute",
+  "3m": "3minute",
+  "3minute": "3minute",
+  "5m": "5minute",
+  "5minute": "5minute",
+  "10m": "10minute",
+  "10minute": "10minute",
+  "15m": "15minute",
+  "15minute": "15minute",
+  "30m": "30minute",
+  "30minute": "30minute",
+  "60m": "60minute",
+  "1h": "60minute",
+  "60minute": "60minute",
+  "1d": "day",
+  day: "day",
+};
+
+function publicApiBaseUrl() {
+  return typeof window === "undefined" ? (process.env.NEXT_PUBLIC_API_BASE_URL ?? "") : "";
+}
+
+export function normalizeTimeframe(timeframe: string): string {
+  const normalized = TIMEFRAME_ALIASES[timeframe.toLowerCase()];
+  if (normalized) {
+    return normalized;
+  }
+  const validTimeframes = ["minute", "3minute", "5minute", "10minute", "15minute", "30minute", "60minute", "day"];
+  if (validTimeframes.includes(timeframe)) {
+    return timeframe;
+  }
+  throw new Error(`Invalid timeframe alias: "${timeframe}"`);
+}
+
 export async function fetchCandles(payload: { identifier: string; timeframe: ChartTimeframe; fromIso: string; toIso: string }): Promise<CandlePoint[]> {
+  const canonicalTimeframe = normalizeTimeframe(payload.timeframe);
   const params = new URLSearchParams({
-    timeframe: payload.timeframe,
+    timeframe: canonicalTimeframe,
     from: payload.fromIso,
     to: payload.toIso,
     ingest: "true",
   });
   const response = await apiFetch<CandlesApiResponse>(`/api/candles/${encodeURIComponent(payload.identifier)}?${params.toString()}`);
   return response.candles ?? [];
+}
+
+export function buildCandlesStreamUrl(identifier: string, timeframe: ChartTimeframe): string {
+  const canonicalTimeframe = normalizeTimeframe(timeframe);
+  const base = publicApiBaseUrl();
+  return `${base}/api/candles/stream/${encodeURIComponent(identifier)}?timeframe=${encodeURIComponent(canonicalTimeframe)}`;
+}
+
+export function buildOptionsSessionSseUrl(underlying: Underlying): string {
+  const base = publicApiBaseUrl();
+  return `${base}/api/sse/options/session/${encodeURIComponent(underlying)}`;
 }
 
 export async function executePaperBasket(payload: {

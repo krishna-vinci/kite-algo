@@ -38,10 +38,7 @@ export function OptionChainPanel({
   return (
     <section className="flex h-full min-h-0 flex-col rounded-2xl border border-[var(--border)] bg-[var(--panel)]">
       <div className="flex flex-wrap items-center gap-3 border-b border-[var(--border)] px-3 py-2">
-        <div>
-          <p className="text-[10px] uppercase tracking-[0.24em] text-[var(--dim)]">option chain</p>
-          <h2 className="mt-1 text-sm font-semibold text-[var(--text)]">{underlying} live chain</h2>
-        </div>
+        <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-[var(--dim)]">{underlying} chain</p>
         <label className="ml-auto flex items-center gap-2 text-[11px] text-[var(--muted)]">
           expiry
           <select value={expiry} onChange={(event) => onExpiryChange(event.currentTarget.value)} className="rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-[var(--text)]">
@@ -67,7 +64,18 @@ export function OptionChainPanel({
         </label>
       </div>
       <div className="overflow-auto px-3 py-3">
-        {loading ? <p className="text-[var(--muted)]">Loading live chain…</p> : null}
+        {loading && (
+          <div className="space-y-2">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <div key={i} className="h-8 animate-pulse rounded bg-[var(--border-soft)]" />
+            ))}
+          </div>
+        )}
+        {!loading && filteredRows.length === 0 && (
+          <div className="flex items-center justify-center py-8">
+            <span className="text-[11px] text-[var(--muted)]">no strikes match filter</span>
+          </div>
+        )}
         <table className="min-w-full border-collapse text-[11px]">
           <thead className="sticky top-0 bg-[var(--panel)] text-[9px] uppercase tracking-[0.16em] text-[var(--dim)]">
             <tr>

@@ -31,7 +31,7 @@ export function WorkspaceTabs({ activeTab, onTabChange }: WorkspaceTabsProps) {
           </button>
         );
       })}
-      <div className="ml-auto text-[10px] uppercase tracking-[0.18em] text-[var(--dim)]">zero context loss</div>
+      {/* spacer — keeps tab row compact */}
     </nav>
   );
 }

@@ -28,6 +28,66 @@ from runtime_monitor import get_components, get_logs, get_meta
 router = APIRouter()
 
 
+def _build_system_broker_status(request: Request, db: Session) -> dict:
+    meta = get_meta()
+    broker_meta = meta.get("daily_broker_login", {}) or {}
+    scheduler_meta = meta.get("daily_token_scheduler", {}) or {}
+    scheduler_component = get_components().get("daily_token_scheduler", {}) or {}
+    gate_ready = bool(getattr(getattr(request.app.state, "daily_token_ready", None), "is_set", lambda: False)())
+
+    system_session = db.query(KiteSession).filter_by(session_id="system").first()
+    raw_status = str(broker_meta.get("status") or scheduler_component.get("status") or "unknown").lower()
+    scheduler_status = str(scheduler_component.get("status") or "unknown").lower()
+
+    if scheduler_status == "running":
+        status = "reconnecting"
+    elif raw_status == "degraded":
+        status = "degraded"
+    elif system_session and gate_ready:
+        status = "connected"
+    elif system_session:
+        status = "reconnecting"
+    else:
+        status = "disconnected"
+
+    token_suffix = None
+    if system_session and getattr(system_session, "access_token", None):
+        token_suffix = system_session.access_token[-6:]
+    elif broker_meta.get("token_suffix"):
+        token_suffix = broker_meta.get("token_suffix")
+
+    return {
+        "connected": status == "connected",
+        "status": status,
+        "mode": "system",
+        "automation": {
+            "enabled": True,
+            "requires_manual_totp_entry": False,
+        },
+        "system_session": {
+            "present": system_session is not None,
+            "updated_at": system_session.created_at.isoformat() if system_session and system_session.created_at else None,
+            "token_suffix": token_suffix,
+        },
+        "last_login": {
+            "last_success_at": broker_meta.get("last_success_at"),
+            "last_failure_at": broker_meta.get("last_failure_at"),
+            "last_error": broker_meta.get("last_error"),
+            "attempts": broker_meta.get("attempts"),
+        },
+        "scheduler": {
+            "status": scheduler_status,
+            "detail": scheduler_component.get("detail"),
+            "next_run": scheduler_meta.get("next_run"),
+            "sleep_seconds": scheduler_meta.get("sleep_seconds"),
+            "last_heartbeat": scheduler_component.get("last_heartbeat") or scheduler_meta.get("last_heartbeat"),
+        },
+        "gate": {
+            "ready": gate_ready,
+        },
+    }
+
+
 class AppLoginRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
@@ -131,10 +191,20 @@ def app_me(request: Request):
 @router.get("/auth/session-status", tags=["Authentication"])
 async def session_status(request: Request, db: Session = Depends(get_db)):
     user = get_optional_app_user(request)
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
-    broker_connected = False
-    if sid:
-        broker_connected = db.query(KiteSession).filter_by(session_id=sid).first() is not None
+    broker_status = _build_system_broker_status(request, db)
+    broker = {
+        "connected": broker_status["connected"],
+        "status": broker_status["status"],
+        "mode": broker_status["mode"],
+        "last_login": {
+            "last_success_at": broker_status["last_login"]["last_success_at"],
+            "last_failure_at": broker_status["last_login"]["last_failure_at"] if user else None,
+            "last_error": broker_status["last_login"]["last_error"] if user else None,
+        },
+        "scheduler": {
+            "next_run": broker_status["scheduler"]["next_run"],
+        },
+    }
     market_data_runtime = getattr(request.app.state, "market_data_runtime", None)
     algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
     paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
@@ -148,8 +218,7 @@ async def session_status(request: Request, db: Session = Depends(get_db)):
             "configured_admin": get_configured_app_username(),
         },
         "broker": {
-            "connected": broker_connected,
-            "session_id": sid if broker_connected else None,
+            **broker,
         },
         "runtime": {
             "components": get_components(),
@@ -397,50 +466,9 @@ def runtime_logs(
 @router.get("/system/broker-login-health", tags=["System"])
 def broker_login_health(request: Request, db: Session = Depends(get_db)):
     require_app_user(request)
-
-    meta = get_meta()
-    broker_meta = meta.get("daily_broker_login", {}) or {}
-    scheduler_meta = meta.get("daily_token_scheduler", {}) or {}
-    gate_meta = meta.get("daily_token_gate", {}) or {}
-    scheduler_component = get_components().get("daily_token_scheduler", {}) or {}
-
-    system_session = db.query(KiteSession).filter_by(session_id="system").first()
-    status = broker_meta["status"] if "status" in broker_meta else scheduler_component.get("status", "unknown")
-    token_suffix = None
-    if system_session and getattr(system_session, "access_token", None):
-        token_suffix = system_session.access_token[-6:]
-    elif broker_meta.get("token_suffix"):
-        token_suffix = broker_meta.get("token_suffix")
-
+    broker_status = _build_system_broker_status(request, db)
     return {
-        "status": status,
-        "automation": {
-            "enabled": True,
-            "mode": broker_meta.get("mode", "headless_login_with_stored_totp"),
-            "requires_manual_totp_entry": False,
-        },
-        "system_session": {
-            "present": system_session is not None,
-            "updated_at": system_session.created_at.isoformat() if system_session and system_session.created_at else None,
-            "token_suffix": token_suffix,
-        },
-        "last_login": {
-            "last_success_at": broker_meta.get("last_success_at"),
-            "last_failure_at": broker_meta.get("last_failure_at"),
-            "last_error": broker_meta.get("last_error"),
-            "attempts": broker_meta.get("attempts"),
-        },
-        "scheduler": {
-            "status": scheduler_component.get("status", "unknown"),
-            "detail": scheduler_component.get("detail"),
-            "next_run": scheduler_meta.get("next_run"),
-            "sleep_seconds": scheduler_meta.get("sleep_seconds"),
-            "last_heartbeat": scheduler_component.get("last_heartbeat") or scheduler_meta.get("last_heartbeat"),
-        },
-        "gate": {
-            "ready": bool(getattr(getattr(request.app.state, "daily_token_ready", None), "is_set", lambda: False)()),
-            "last_changed_at": gate_meta.get("last_changed_at"),
-        },
+        **broker_status,
         "notes": [
             "Automatic login uses stored Kite credentials and TOTP secret on the backend.",
             "This avoids daily manual TOTP entry, but still depends on Zerodha's web login flow remaining compatible.",

@@ -23,24 +23,31 @@ function StatusPill({ label, value, tone }: Readonly<{ label: string; value: str
   );
 }
 
+function brokerTone(status: RuntimeStatus["brokerStatus"]): "neutral" | "positive" | "negative" {
+  if (status === "connected") return "positive";
+  if (status === "degraded" || status === "disconnected") return "negative";
+  return "neutral";
+}
+
 export function OptionsHeader({ status, onBrokerLogin, loginPending }: OptionsHeaderProps) {
+  const brokerLabel = status.brokerStatus === "connected" ? "on" : status.brokerStatus;
   return (
     <header className="flex flex-wrap items-center gap-2 rounded-2xl border border-[var(--border)] bg-[var(--panel)] px-3 py-2">
-      <div>
-        <p className="text-[10px] uppercase tracking-[0.24em] text-[var(--dim)]">options command deck</p>
-        <h1 className="mt-1 text-lg font-semibold text-[var(--text)]">Strategy-aware options workspace</h1>
-      </div>
+      <h1 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--text)]">Options</h1>
       <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
-        <StatusPill label="broker" value={status.brokerConnected ? "connected" : "disconnected"} tone={status.brokerConnected ? "positive" : "negative"} />
-        <StatusPill label="ws" value={status.websocketStatus} tone={status.websocketStatus === "connected" ? "positive" : "neutral"} />
-        <StatusPill label="paper" value={status.paperAvailable ? "ready" : "unavailable"} tone={status.paperAvailable ? "positive" : "negative"} />
+        <StatusPill label="broker" value={brokerLabel} tone={brokerTone(status.brokerStatus)} />
+        <StatusPill label="ws" value={status.websocketStatus === "connected" ? "on" : status.websocketStatus} tone={status.websocketStatus === "connected" ? "positive" : "neutral"} />
+        <StatusPill label="paper" value={status.paperAvailable ? "on" : "off"} tone={status.paperAvailable ? "positive" : "negative"} />
+        {status.brokerStatus !== "connected" && (
+          <span className="rounded-md border border-[var(--yellow)]/30 px-2 py-1 text-[10px] text-[var(--yellow)]">system broker {status.brokerStatus}</span>
+        )}
         <button
           type="button"
           onClick={onBrokerLogin}
           disabled={loginPending}
-          className="rounded-md border border-[var(--accent-border)] bg-[var(--accent-soft)] px-3 py-2 text-[11px] font-semibold text-[var(--accent)] transition hover:bg-[var(--accent)]/15 disabled:cursor-not-allowed disabled:opacity-70"
+          className="cursor-pointer rounded-md border border-[var(--accent-border)] bg-[var(--accent-soft)] px-3 py-1.5 text-[10px] font-semibold text-[var(--accent)] transition-colors duration-200 hover:bg-[var(--accent)]/15 disabled:cursor-not-allowed disabled:opacity-70"
         >
-          {loginPending ? "Connecting…" : "Login to broker"}
+          {loginPending ? "Refreshing…" : "Refresh broker"}
         </button>
       </div>
     </header>

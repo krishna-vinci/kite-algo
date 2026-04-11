@@ -90,6 +90,12 @@ export type PayoffSummary = {
 
 export type RuntimeStatus = {
   brokerConnected: boolean;
+  brokerStatus: "connected" | "reconnecting" | "degraded" | "disconnected" | "unknown";
+  brokerMode: "system";
+  brokerLastSuccessAt: string | null;
+  brokerLastFailureAt: string | null;
+  brokerLastError: string | null;
+  brokerNextRefreshAt: string | null;
   websocketStatus: string;
   paperAvailable: boolean;
   appAuthenticated: boolean;
@@ -99,6 +105,7 @@ export type SnapshotOptionSide = {
   token: number;
   tsym: string;
   ltp: number | null;
+  lotSize?: number | null;
   iv: number | null;
   oi: number | null;
   delta: number | null;
@@ -114,12 +121,22 @@ export type SnapshotChainRow = {
   isAtm?: boolean;
 };
 
+export type OptionSessionExpirySnapshot = {
+  forward: number | null;
+  sigmaExpiry: number | null;
+  atmStrike: number | null;
+  strikes: number[];
+  rows: SnapshotChainRow[];
+};
+
 export type OptionSessionSnapshot = {
   underlying: string;
   spotLtp: number | null;
   atmStrike: number | null;
   expiries: string[];
+  perExpiry: Record<string, OptionSessionExpirySnapshot>;
   rows: SnapshotChainRow[];
+  updatedAt?: string | null;
 };
 
 export type MiniChainRow = {

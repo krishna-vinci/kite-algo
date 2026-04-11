@@ -38,8 +38,8 @@ class AlertsEngine:
     Responsibilities:
     - Periodic evaluation loop (default 500ms; env ALERT_ENGINE_INTERVAL_MS, fallback ALERTS_EVAL_MS)
     - Periodic refresh of active alerts set from DB (default 5s; env ALERT_ENGINE_REFRESH_SEC)
-    - Maintain server-side subscriptions for tokens with active alerts when no clients are subscribed
-      using the existing WebSocketManager (ltp mode only, and never downgrades client-requested modes)
+    - Maintain server-side subscriptions for tokens with active alerts via the Go market-runtime
+      owner registry (ltp mode only, and never downgrades stronger owner-requested modes)
     - Evaluate crossing logic and persist events/updates
     """
 

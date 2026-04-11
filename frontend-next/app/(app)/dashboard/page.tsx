@@ -1,14 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { toast } from "sonner";
-import { AppAuthPanel } from "@/components/options/app-auth-panel";
 import type { RuntimeStatus } from "@/components/options/types";
 import { KpiCard } from "@/components/operator/kpi-card";
 import { Panel } from "@/components/operator/panel";
 import { SectionLabel } from "@/components/operator/section-label";
 import { StatusBadge } from "@/components/operator/status-badge";
-import { fetchRuntimeStatus, loginApp } from "@/lib/options/api";
+import { fetchRuntimeStatus } from "@/lib/options/api";
 
 const metrics = [
   { label: "Index", value: "25,304.60", delta: "+0.42%", note: "mock market snapshot" },
@@ -31,12 +29,36 @@ const watchlist = [
 ];
 
 function fallbackStatus(): RuntimeStatus {
-  return { brokerConnected: false, websocketStatus: "degraded", paperAvailable: true, appAuthenticated: false };
+  return {
+    brokerConnected: false,
+    brokerStatus: "unknown",
+    brokerMode: "system",
+    brokerLastSuccessAt: null,
+    brokerLastFailureAt: null,
+    brokerLastError: null,
+    brokerNextRefreshAt: null,
+    websocketStatus: "degraded",
+    paperAvailable: true,
+    appAuthenticated: false,
+  };
+}
+
+function formatDateTime(value: string | null) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
 }
 
 export default function DashboardPage() {
   const [status, setStatus] = useState<RuntimeStatus>(fallbackStatus());
-  const [loginPending, setLoginPending] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -60,24 +82,8 @@ export default function DashboardPage() {
     };
   }, []);
 
-  async function handleLogin(payload: { username: string; password: string }) {
-    setLoginPending(true);
-    try {
-      await loginApp(payload);
-      const refreshed = await fetchRuntimeStatus();
-      setStatus(refreshed);
-      toast.success("Dashboard sign-in successful");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Login failed");
-    } finally {
-      setLoginPending(false);
-    }
-  }
-
   return (
     <div className="space-y-4 pb-4">
-      {!status.appAuthenticated ? <AppAuthPanel onLogin={handleLogin} pending={loginPending} compact /> : null}
-
       <Panel eyebrow="dashboard" title="Operator overview" action={<StatusBadge tone={status.appAuthenticated ? "positive" : "warning"}>{status.appAuthenticated ? "signed in" : "sign in required"}</StatusBadge>}>
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
           {metrics.map((item) => (
@@ -111,7 +117,31 @@ export default function DashboardPage() {
               </div>
             ))}
           </div>
-          <SectionLabel className="mt-4" eyebrow="session" title="Console state" description={status.appAuthenticated ? "App auth is active. Options page can use real backend flows and paper execution." : "Sign in here first so the options workspace can use real sessions, broker status, and paper execution."} />
+          <SectionLabel className="mt-4" eyebrow="session" title="Console state" description="App auth protects operator access only. Live broker/runtime ownership stays on the backend system session so UI logout does not stop active algos." />
+        </Panel>
+
+        <Panel eyebrow="broker" title="System broker session">
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="rounded-2xl border border-border/60 bg-background/60 px-4 py-3">
+              <p className="text-xs uppercase tracking-[0.2em] text-foreground/40">status</p>
+              <p className="mt-2 font-mono text-lg text-foreground/90">{status.brokerStatus}</p>
+              <p className="mt-2 text-xs text-foreground/60">Mode: {status.brokerMode}. This session is backend-owned and should stay separate from browser auth.</p>
+            </div>
+            <div className="rounded-2xl border border-border/60 bg-background/60 px-4 py-3">
+              <p className="text-xs uppercase tracking-[0.2em] text-foreground/40">refresh cadence</p>
+              <p className="mt-2 font-mono text-lg text-foreground/90">08:00 IST daily</p>
+              <p className="mt-2 text-xs text-foreground/60">Next scheduled refresh: {formatDateTime(status.brokerNextRefreshAt)}</p>
+            </div>
+            <div className="rounded-2xl border border-border/60 bg-background/60 px-4 py-3">
+              <p className="text-xs uppercase tracking-[0.2em] text-foreground/40">last success</p>
+              <p className="mt-2 font-mono text-lg text-foreground/90">{formatDateTime(status.brokerLastSuccessAt)}</p>
+            </div>
+            <div className="rounded-2xl border border-border/60 bg-background/60 px-4 py-3">
+              <p className="text-xs uppercase tracking-[0.2em] text-foreground/40">last failure</p>
+              <p className="mt-2 font-mono text-lg text-foreground/90">{formatDateTime(status.brokerLastFailureAt)}</p>
+              <p className="mt-2 text-xs text-foreground/60">{status.brokerLastError ?? "No recent broker login error recorded."}</p>
+            </div>
+          </div>
         </Panel>
       </div>
     </div>

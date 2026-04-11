@@ -275,7 +275,7 @@ async def combined_lifespan(app: FastAPI):
              logging.error(f"Failed to connect to async database: {e}")
 
         if not market_runtime_enabled():
-            raise RuntimeError("MARKET_RUNTIME_ENABLED must be true because Python WebSocketManager has been retired")
+            raise RuntimeError("MARKET_RUNTIME_ENABLED must be true because the Go market-runtime is the only websocket owner")
 
         logging.info("Initializing Go market runtime bridge...")
         market_data_runtime = MarketDataRuntime(realtime_positions_service=realtime_positions_service)
@@ -291,7 +291,6 @@ async def combined_lifespan(app: FastAPI):
                 "effective_tokens": runtime_status.get("effective_tokens"),
             },
         )
-        set_component_status("websocket_manager", "stopped", detail="Retired; Go market runtime is the only websocket owner")
 
         async def _order_runtime_worker():
             poll_seconds = max(1.0, float(os.getenv("ORDER_RUNTIME_POLL_SECONDS", "1.0")))
@@ -423,7 +422,7 @@ async def combined_lifespan(app: FastAPI):
         app.state.daily_token_ready = daily_token_ready
         if not daily_token_ready.is_set():
             daily_token_ready.set()
-        logging.info("[GATE] Initialized and open at startup (will close at next 07:31 IST)")
+        logging.info("[GATE] Initialized and open at startup (will close at next 08:00 IST)")
         set_meta("daily_token_gate", {"ready": True, "last_changed_at": datetime.utcnow().isoformat()})
         scheduler_task = asyncio.create_task(daily_token_scheduler())
 
@@ -437,26 +436,6 @@ async def combined_lifespan(app: FastAPI):
         except Exception as e:
             logging.error("Failed to start AlertsEngine: %s", e, exc_info=True)
             set_component_status("alerts_engine", "degraded", detail=str(e))
-        
-        # Start PositionProtectionEngine (Phase 1) after AlertsEngine
-        try:
-            from strategies.indexstoploss.index_stoploss_algo import PositionProtectionEngine
-            from broker_api.kite_orders import OrdersService
-            
-            orders_service = OrdersService()
-            protection_engine = PositionProtectionEngine(
-                db=async_db,
-                market_data_runtime=market_data_runtime,
-                orders_service=orders_service,
-                app=app
-            )
-            protection_engine.start()
-            app.state.protection_engine = protection_engine
-            logging.info("PositionProtectionEngine started (500ms interval)")
-            set_component_status("protection_engine", "healthy", detail="Position protection engine started")
-        except Exception as e:
-            logging.error("Failed to start PositionProtectionEngine: %s", e, exc_info=True)
-            set_component_status("protection_engine", "degraded", detail=str(e))
         
         # Initialize Phase 3: StrikeSelector and PositionBuilder
         try:
@@ -644,7 +623,6 @@ async def combined_lifespan(app: FastAPI):
         startup_detail = f"Broker startup degraded: {e}"
         set_component_status("broker_bootstrap", "degraded", detail=str(e))
         set_component_status("market_runtime", "degraded", detail="Go market runtime unavailable because broker bootstrap failed")
-        set_component_status("websocket_manager", "stopped", detail="Retired; Go market runtime is required")
         set_meta("daily_broker_login", {
             "status": "degraded",
             "last_error": str(e),
@@ -712,16 +690,6 @@ async def combined_lifespan(app: FastAPI):
     except Exception:
         pass
     
-    # Stop PositionProtectionEngine
-    try:
-        protection_eng = getattr(app.state, "protection_engine", None)
-        if protection_eng:
-            await protection_eng.stop()
-            logging.info("PositionProtectionEngine stopped.")
-            set_component_status("protection_engine", "stopped", detail="Position protection engine stopped")
-    except Exception:
-        pass
-
     # Stop Candle Aggregator
     try:
         aggregator = getattr(app.state, "candle_aggregator", None)
@@ -762,7 +730,6 @@ async def combined_lifespan(app: FastAPI):
         await market_data_runtime.stop()
         logging.info("Go market runtime bridge stopped.")
         set_component_status("market_runtime", "stopped", detail="Go market runtime bridge stopped")
-        set_component_status("websocket_manager", "stopped", detail="Retired; Go market runtime is the only websocket owner")
 
     set_component_status("app", "stopped", detail="Application shutdown complete")
 
@@ -859,7 +826,7 @@ async def ensure_daily_token_ready(timeout: float = 900.0) -> None:
 async def daily_token_scheduler() -> None:
     """
     Runs forever:
-      - Sleeps until 07:31 Asia/Kolkata
+      - Sleeps until 08:00 Asia/Kolkata
       - Clears gate, performs headless login + persist 'system' token with retries
       - Sets gate on success
       - Triggers dependent daily jobs (e.g., instruments refresh)
@@ -869,7 +836,7 @@ async def daily_token_scheduler() -> None:
     while True:
         try:
             now = datetime.now(tz)
-            next_run = now.replace(hour=7, minute=31, second=0, microsecond=0)
+            next_run = now.replace(hour=8, minute=0, second=0, microsecond=0)
             if now >= next_run:
                 next_run += timedelta(days=1)
             sleep_sec = max(1, int((next_run - now).total_seconds()))
@@ -883,7 +850,7 @@ async def daily_token_scheduler() -> None:
             await asyncio.sleep(sleep_sec)
 
             # Begin rotation
-            logging.info("[SCHED] 07:31 IST reached; clearing gate and refreshing system token")
+            logging.info("[SCHED] 08:00 IST reached; clearing gate and refreshing system token")
             daily_token_ready.clear()
             set_meta("daily_token_gate", {"ready": False, "last_changed_at": datetime.utcnow().isoformat()})
             set_component_status("daily_token_scheduler", "running", detail="Refreshing daily system token")

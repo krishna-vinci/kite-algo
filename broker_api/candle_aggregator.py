@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 import httpx
-from kiteconnect import KiteTicker
 import pytz
 from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -57,7 +56,7 @@ class CandleState:
 class CandleAggregator:
     """
     Real-time candle aggregator that:
-    1. Subscribes to live ticks via KiteTicker
+    1. Consumes normalized live ticks from the Go market-runtime
     2. Aggregates ticks into candles for multiple intervals
     3. Writes forming candles to Redis
     4. Publishes completed candles to Redis Pub/Sub
@@ -68,10 +67,7 @@ class CandleAggregator:
         self.api_key = api_key
         self.access_token: Optional[str] = None
         self.redis = None
-        self.kws: Optional[KiteTicker] = None
-        self.loop: Optional[asyncio.AbstractEventLoop] = None  # Store main event loop
         self.owner_id: Optional[str] = None
-        self.source: str = "kite_websocket"
         
         # Configuration
         self.intervals: List[str] = []
@@ -119,39 +115,19 @@ class CandleAggregator:
         if not self.intervals:
             raise ValueError("No valid intervals provided")
         
-        # Store the current event loop
-        self.loop = asyncio.get_running_loop()
-        
         # Initialize Redis
         self.redis = get_redis()
-
-        self.source = "market_runtime" if market_runtime_enabled() else "kite_websocket"
+        if not market_runtime_enabled():
+            raise RuntimeError("CandleAggregator requires MARKET_RUNTIME_ENABLED=true because the Go market-runtime is the only websocket owner")
         self.owner_id = f"candles:{self.owner_scope}:{uuid4()}"
 
-        if self.source == "kite_websocket":
-            # Initialize KiteTicker
-            self.kws = KiteTicker(self.api_key, access_token)
-            self.kws.on_ticks = self._on_ticks
-            self.kws.on_connect = self._on_connect
-            self.kws.on_close = self._on_close
-            self.kws.on_error = self._on_error
-
-            # Connect WebSocket (threaded mode)
-            self.kws.connect(threaded=True)
-        else:
-            self.kws = None
-
         self.running = True
-        
-        # Give WebSocket time to connect
-        await asyncio.sleep(2)
-        
+
         # Start background tasks
         self.tasks['watchlist_refresh'] = asyncio.create_task(self._watchlist_refresh_loop())
         self.tasks['persist_loop'] = asyncio.create_task(self._persist_loop())
-        if self.source == "market_runtime":
-            self.tasks['runtime_ticks'] = asyncio.create_task(self._market_runtime_tick_loop())
-            self.tasks['runtime_lease'] = asyncio.create_task(self._market_runtime_lease_loop())
+        self.tasks['runtime_ticks'] = asyncio.create_task(self._market_runtime_tick_loop())
+        self.tasks['runtime_lease'] = asyncio.create_task(self._market_runtime_lease_loop())
         
         logger.info(f"Aggregator started for intervals: {self.intervals}")
     
@@ -172,12 +148,7 @@ class CandleAggregator:
                     pass
         self.tasks.clear()
         
-        # Disconnect WebSocket
-        if self.kws and self.kws.is_connected():
-            if self.subscribed_tokens:
-                self.kws.unsubscribe(list(self.subscribed_tokens))
-            self.kws.stop()
-        elif self.source == "market_runtime" and self.owner_id:
+        if self.owner_id:
             try:
                 client = await get_market_runtime_client()
                 await client.delete_owner(self.owner_id)
@@ -197,7 +168,7 @@ class CandleAggregator:
         """Get current aggregator status."""
         return {
             'running': self.running,
-            'source': self.source,
+            'source': 'market_runtime',
             'owner_id': self.owner_id,
             'intervals': self.intervals,
             'subscribed_tokens': len(self.subscribed_tokens),
@@ -216,35 +187,6 @@ class CandleAggregator:
         if self.running:
             await self._refresh_subscriptions()
     
-    # ===== WebSocket Callbacks =====
-    
-    def _on_ticks(self, ws, ticks: List[Dict]):
-        """Handle incoming ticks."""
-        try:
-            if self.loop and self.loop.is_running():
-                asyncio.run_coroutine_threadsafe(self._process_ticks(ticks), self.loop)
-        except Exception as e:
-            logger.error(f"Error scheduling tick processing: {e}", exc_info=True)
-    
-    def _on_connect(self, ws, response):
-        """Handle WebSocket connection."""
-        logger.info("Aggregator WebSocket connected")
-        
-        # Resubscribe to tokens on reconnect
-        if self.subscribed_tokens:
-            tokens = list(self.subscribed_tokens)
-            ws.subscribe(tokens)
-            ws.set_mode(ws.MODE_FULL, tokens)
-            logger.info(f"Resubscribed to {len(tokens)} tokens on reconnect")
-    
-    def _on_close(self, ws, code, reason):
-        """Handle WebSocket close."""
-        logger.warning(f"Aggregator WebSocket closed: {code} - {reason}")
-    
-    def _on_error(self, ws, code, reason):
-        """Handle WebSocket error."""
-        logger.error(f"Aggregator WebSocket error: {code} - {reason}")
-    
     # ===== Tick Processing =====
     
     async def _process_ticks(self, ticks: List[Dict]):
@@ -257,8 +199,7 @@ class CandleAggregator:
                 if not token or not last_price:
                     continue
 
-                if self.source == "market_runtime":
-                    self.stats['last_runtime_tick'] = datetime.now(timezone.utc).isoformat()
+                self.stats['last_runtime_tick'] = datetime.now(timezone.utc).isoformat()
                 
                 # Get timestamp (prefer exchange_timestamp)
                 tick_ts = self._normalize_tick_timestamp(tick.get("exchange_timestamp"))
@@ -583,34 +524,12 @@ class CandleAggregator:
                 await asyncio.sleep(self.refresh_seconds)
     
     async def _refresh_subscriptions(self):
-        """Refresh WebSocket subscriptions based on current watchlist."""
+        """Refresh runtime subscriptions based on current watchlist and external owners."""
         async with self._subscription_lock:
             try:
                 desired_tokens = await self._get_watchlist_tokens()
                 desired_tokens.update(self._external_tokens())
-
-                if self.source == "market_runtime":
-                    await self._sync_market_runtime_subscriptions(desired_tokens)
-                    self.subscribed_tokens = desired_tokens
-                    self.stats['last_subscription_refresh'] = datetime.now(timezone.utc).isoformat()
-                    return
-
-                if not self.kws or not self.kws.is_connected():
-                    logger.warning("WebSocket not connected, skipping subscription refresh")
-                    return
-
-                to_subscribe = list(desired_tokens - self.subscribed_tokens)
-                to_unsubscribe = list(self.subscribed_tokens - desired_tokens)
-
-                if to_subscribe:
-                    self.kws.subscribe(to_subscribe)
-                    self.kws.set_mode(self.kws.MODE_FULL, to_subscribe)
-                    logger.info(f"Subscribed to {len(to_subscribe)} new tokens")
-
-                if to_unsubscribe:
-                    self.kws.unsubscribe(to_unsubscribe)
-                    logger.info(f"Unsubscribed from {len(to_unsubscribe)} tokens")
-
+                await self._sync_market_runtime_subscriptions(desired_tokens)
                 self.subscribed_tokens = desired_tokens
                 self.stats['last_subscription_refresh'] = datetime.now(timezone.utc).isoformat()
 

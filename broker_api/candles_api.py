@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Literal
 import json
+from uuid import uuid4
 import pytz
 import psycopg2
 from psycopg2.extras import execute_values
@@ -363,9 +364,22 @@ async def stream_candles(
     
     instrument_token = await resolve_identifier(identifier, db)
     interval = normalize_timeframe(timeframe)
+    stream_owner_id = f"candles-sse:{instrument_token}:{interval}:{uuid4().hex}"
     
     async def event_generator():
         redis = get_redis()
+        aggregator = get_aggregator(API_KEY)
+
+        try:
+            await aggregator.set_external_tokens(stream_owner_id, {instrument_token})
+        except Exception as e:
+            logger.warning(
+                "Failed to register external candle subscription for %s|%s: %s",
+                instrument_token,
+                interval,
+                e,
+                exc_info=True,
+            )
         
         # Send initial snapshot from database
         now_utc = datetime.now(timezone.utc)
@@ -517,6 +531,16 @@ async def stream_candles(
                 await pubsub_task
             except asyncio.CancelledError:
                 pass
+            try:
+                await aggregator.set_external_tokens(stream_owner_id, set())
+            except Exception as e:
+                logger.warning(
+                    "Failed to clear external candle subscription for %s|%s: %s",
+                    instrument_token,
+                    interval,
+                    e,
+                    exc_info=True,
+                )
     
     return StreamingResponse(
         event_generator(),

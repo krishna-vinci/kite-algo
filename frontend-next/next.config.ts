@@ -7,10 +7,15 @@ const nextConfig: NextConfig = {
   },
   async rewrites() {
     const backend = process.env.BACKEND_INTERNAL_URL ?? "http://localhost:18777";
+    const marketRuntime = process.env.MARKET_RUNTIME_URL ?? process.env.NEXT_PUBLIC_MARKET_RUNTIME_URL ?? "http://localhost:8780";
     return [
       {
         source: "/api/:path*",
         destination: `${backend}/api/:path*`,
+      },
+      {
+        source: "/ws/:path*",
+        destination: `${marketRuntime}/ws/:path*`,
       },
     ];
   },

@@ -1,15 +1,17 @@
 "use client";
 
 import { useEffect, useMemo, useRef } from "react";
-import { CandlestickSeries, createChart, type IChartApi, type ISeriesApi, type Logical, type LogicalRange, type Time } from "lightweight-charts";
+import { CandlestickSeries, createChart, type IChartApi, type ISeriesApi, type Logical, type Time } from "lightweight-charts";
 import type { CandlePoint, ChartTimeframe } from "@/components/options/types";
 
 type LightweightChartPanelProps = Readonly<{
   label: string;
   price: number | null;
   changePercent: number | null;
+  forwardPrice: number | null;
   timeframe: ChartTimeframe;
   candles: CandlePoint[];
+  liveCandle?: CandlePoint | null;
   loading?: boolean;
   onTimeframeChange: (value: ChartTimeframe) => void;
 }>;
@@ -26,15 +28,15 @@ function formatSeriesData(candles: CandlePoint[]) {
   }));
 }
 
-export function LightweightChartPanel({ label, price, changePercent, timeframe, candles, loading = false, onTimeframeChange }: LightweightChartPanelProps) {
+export function LightweightChartPanel({ label, price, changePercent, forwardPrice, timeframe, candles, liveCandle = null, loading = false, onTimeframeChange }: LightweightChartPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const initializedRef = useRef(false);
-  const userInteractedRef = useRef(false);
-  const visibleRangeRef = useRef<LogicalRange | null>(null);
   const lastTimeframeRef = useRef<ChartTimeframe>(timeframe);
   const formattedCandles = useMemo(() => formatSeriesData(candles), [candles]);
+  const formattedLiveCandle = useMemo(() => (liveCandle ? formatSeriesData([liveCandle])[0] ?? null : null), [liveCandle]);
+  const futureBasis = price !== null && forwardPrice !== null ? forwardPrice - price : null;
 
   useEffect(() => {
     if (!containerRef.current || typeof ResizeObserver === "undefined") {
@@ -69,28 +71,11 @@ export function LightweightChartPanel({ label, price, changePercent, timeframe, 
     });
     seriesRef.current = candleSeries;
 
-    chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-      if (initializedRef.current && range) {
-        visibleRangeRef.current = range;
-        userInteractedRef.current = true;
-      }
-    });
-
-    const observer = new ResizeObserver(() => {
-      if (userInteractedRef.current && visibleRangeRef.current) {
-        chart.timeScale().setVisibleLogicalRange(visibleRangeRef.current);
-      }
-    });
-    observer.observe(containerRef.current);
-
     return () => {
-      observer.disconnect();
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
       initializedRef.current = false;
-      userInteractedRef.current = false;
-      visibleRangeRef.current = null;
     };
   }, []);
 
@@ -103,39 +88,46 @@ export function LightweightChartPanel({ label, price, changePercent, timeframe, 
       timeScale: { borderColor: "#232636", timeVisible: timeframe !== "1d" },
     });
 
-    seriesRef.current.setData(formattedCandles);
-
     const timeframeChanged = lastTimeframeRef.current !== timeframe;
     lastTimeframeRef.current = timeframe;
 
     if (formattedCandles.length === 0) {
+      seriesRef.current.setData([]);
+      initializedRef.current = false;
       return;
     }
 
+    seriesRef.current.setData(formattedCandles);
     if (!initializedRef.current || timeframeChanged) {
       const lastIndex = formattedCandles.length - 1;
       const barsToShow = Math.min(15, formattedCandles.length);
       const range = { from: Math.max(0, lastIndex - barsToShow + 1) as Logical, to: (lastIndex + 0.5) as Logical };
       chartRef.current.timeScale().setVisibleLogicalRange(range);
-      visibleRangeRef.current = range;
-      userInteractedRef.current = false;
-      initializedRef.current = true;
+    }
+    initializedRef.current = true;
+  }, [formattedCandles, timeframe]);
+
+  useEffect(() => {
+    if (!seriesRef.current || !chartRef.current || !initializedRef.current || !formattedLiveCandle) {
       return;
     }
 
-    if (userInteractedRef.current && visibleRangeRef.current) {
-      chartRef.current.timeScale().setVisibleLogicalRange(visibleRangeRef.current);
-    }
-  }, [formattedCandles, timeframe]);
+    seriesRef.current.update(formattedLiveCandle);
+  }, [formattedLiveCandle, timeframe]);
 
   return (
     <section className="relative h-full rounded-2xl border border-[var(--border)] bg-[var(--panel)] p-3">
-      <div className="mb-3 flex items-center gap-2 border-b border-[var(--border-soft)] pb-2">
+      <div className="mb-2 flex items-center gap-2 border-b border-[var(--border-soft)] pb-2">
         <span className="text-xs font-medium uppercase tracking-[0.18em] text-[var(--dim)]">{label}</span>
+        {candles.length > 0 && !loading && <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--green)]" title="live" />}
         <span className="font-mono text-sm text-[var(--text)]">{price === null ? "—" : price.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</span>
         <span className={`font-mono text-[11px] ${changePercent === null ? "text-[var(--dim)]" : changePercent >= 0 ? "text-[var(--green)]" : "text-[var(--red)]"}`}>
           {changePercent === null ? "—" : `${changePercent >= 0 ? "+" : ""}${changePercent.toFixed(2)}%`}
         </span>
+        <span className="mx-1 h-[18px] w-px bg-[var(--border-soft)]" />
+        <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--dim)]">fut</span>
+        <span className="font-mono text-[11px] text-[var(--blue)]">{forwardPrice === null ? "—" : forwardPrice.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</span>
+        {futureBasis !== null ? <span className="font-mono text-[10px] text-[var(--muted)]">{futureBasis >= 0 ? "+" : ""}{futureBasis.toFixed(2)}</span> : null}
         <div className="ml-auto flex items-center gap-1 overflow-x-auto">
           {timeframes.map((item) => (
             <button
@@ -150,8 +142,17 @@ export function LightweightChartPanel({ label, price, changePercent, timeframe, 
         </div>
       </div>
       <div ref={containerRef} className="h-[calc(100%-2.7rem)] min-h-24" />
-      {loading ? <div className="absolute inset-x-3 bottom-3 rounded-md border border-[var(--accent-border)] bg-[var(--accent-soft)] px-2 py-1 text-[10px] text-[var(--accent)]">loading candles…</div> : null}
-      {!loading && candles.length === 0 ? <div className="absolute inset-x-3 bottom-3 rounded-md border border-[var(--border)] bg-[var(--bg)]/90 px-2 py-1 text-[10px] text-[var(--muted)]">sign in to load historical + live candles</div> : null}
+      {loading && (
+        <div className="absolute inset-x-3 bottom-3 flex items-center gap-2 rounded-md border border-[var(--accent-border)] bg-[var(--accent-soft)] px-2 py-1 text-[10px] text-[var(--accent)]">
+          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--accent)]" />
+          loading…
+        </div>
+      )}
+      {!loading && candles.length === 0 && (
+        <div className="absolute inset-0 flex items-center justify-center">
+          <span className="rounded-md border border-[var(--border)] bg-[var(--bg)]/90 px-3 py-2 text-[10px] text-[var(--muted)]">no candle data</span>
+        </div>
+      )}
     </section>
   );
 }

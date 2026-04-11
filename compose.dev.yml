@@ -215,8 +215,9 @@ services:
     environment:
       NODE_ENV: development
       BACKEND_INTERNAL_URL: http://finance-app:8777
+      MARKET_RUNTIME_URL: http://market-runtime:8780
       NEXT_PUBLIC_API_BASE_URL: ""
-      NEXT_PUBLIC_MARKET_RUNTIME_URL: http://market-runtime:8780
+      NEXT_PUBLIC_MARKET_RUNTIME_URL: ""
       WATCHPACK_POLLING: "true"
     command:
       - npm
