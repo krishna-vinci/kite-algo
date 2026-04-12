@@ -79,7 +79,7 @@ import server
 from broker_api.kite_auth import login_headless
 import logging
 from database import SessionLocal, database as async_db
-from broker_api.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, upsert_kite_session
+from broker_api.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
 from broker_api.market_runtime_client import MarketDataRuntime, market_runtime_enabled
 from broker_api.broker_api import run_headless_login_and_persist_system_token
 from broker_api.kite_auth import API_KEY
@@ -212,7 +212,7 @@ async def combined_lifespan(app: FastAPI):
                     profile = await asyncio.to_thread(kite.profile)
                     broker_user_id = str((profile or {}).get("user_id") or "").strip() or None
                     if broker_user_id:
-                        upsert_kite_session(db, "system", at, broker_user_id=broker_user_id)
+                        rotate_broker_access_token(db, at, broker_user_id=broker_user_id)
                         db.commit()
                     logging.info("Using system access_token from DB (..%s)", at[-6:] if isinstance(at, str) else "")
                     set_meta("daily_broker_login", {
@@ -228,7 +228,7 @@ async def combined_lifespan(app: FastAPI):
                     kite = build_kite_client(at, session_id="system")
                     profile = await asyncio.to_thread(kite.profile)
                     broker_user_id = str((profile or {}).get("user_id") or "").strip() or None
-                    upsert_kite_session(db, "system", at, broker_user_id=broker_user_id)
+                    rotate_broker_access_token(db, at, broker_user_id=broker_user_id)
                     db.commit()
                     logging.info("Refreshed system access_token via headless login (..%s)", at[-6:] if isinstance(at, str) else "")
                     set_meta("daily_broker_login", {
@@ -244,7 +244,7 @@ async def combined_lifespan(app: FastAPI):
                 kite = build_kite_client(at, session_id="system")
                 profile = await asyncio.to_thread(kite.profile)
                 broker_user_id = str((profile or {}).get("user_id") or "").strip() or None
-                upsert_kite_session(db, "system", at, broker_user_id=broker_user_id)
+                rotate_broker_access_token(db, at, broker_user_id=broker_user_id)
                 db.commit()
                 logging.info("Obtained system access_token via headless login (..%s)", at[-6:] if isinstance(at, str) else "")
                 set_meta("daily_broker_login", {

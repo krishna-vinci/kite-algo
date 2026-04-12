@@ -67,7 +67,7 @@ from sqlalchemy.orm import Session
 from fastapi import APIRouter, Depends, Response, HTTPException, Request, Query, Body
 
 from .kite_auth import login_headless
-from .kite_session import KiteSession, build_kite_client, get_kite, get_system_access_token, upsert_kite_session
+from .kite_session import KiteSession, build_kite_client, get_kite, get_system_access_token, rotate_broker_access_token, upsert_kite_session
 from kiteconnect import KiteConnect
 from database import SessionLocal, Base
 from fastapi import WebSocket, WebSocketDisconnect
@@ -205,9 +205,9 @@ def run_headless_login_and_persist_system_token(db: Session) -> str:
     kite, at = login_headless()
     profile = kite.profile()
     broker_user_id = str(profile.get("user_id") or "").strip() or None
-    upsert_kite_session(db, "system", at, broker_user_id=broker_user_id)
+    rotated_sessions = rotate_broker_access_token(db, at, broker_user_id=broker_user_id)
     fp = at[-6:] if isinstance(at, str) else ""
-    logger.info("System access_token refreshed and upserted (..%s)", fp)
+    logger.info("System access_token refreshed and propagated (..%s, updated_sessions=%s)", fp, rotated_sessions)
     return fp
 
 
@@ -837,7 +837,7 @@ def headless_login(request: Request, response: Response, db: Session = Depends(g
     db.commit()
 
     # Also persist/refresh system token so app startup and jobs use a consistent source
-    upsert_kite_session(db, "system", at, broker_user_id=broker_user_id)
+    rotate_broker_access_token(db, at, broker_user_id=broker_user_id)
     db.commit()
     logger.info("System access token upserted via login (..%s)", (at[-6:] if isinstance(at, str) else ""))
 
@@ -881,7 +881,6 @@ def logout(response: Response, request: Request, db: Session = Depends(get_db)):
 
 
 
-# ─────────── Profile & holdings ───────────
 @router.get("/profile_kite")
 def profile(kite: KiteConnect = Depends(get_kite)):
     return kite.profile()

@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi import Depends, HTTPException, Request
 from kiteconnect import KiteConnect
-from sqlalchemy import Column, DateTime, String
+from sqlalchemy import Column, DateTime, String, or_
 from sqlalchemy.orm import Session
 
 from database import Base, get_db
@@ -68,6 +68,23 @@ def get_kite(request: Request, db: Session = Depends(get_db)) -> KiteConnect:
     if not session:
         raise HTTPException(status_code=401, detail="Invalid session")
 
+    system_session = db.query(KiteSession).filter_by(session_id="system").first()
+    if system_session and getattr(system_session, "access_token", None):
+        session_broker_user_id = str(getattr(session, "broker_user_id", "") or "").strip() or None
+        system_broker_user_id = str(getattr(system_session, "broker_user_id", "") or "").strip() or None
+        if system_broker_user_id and (not session_broker_user_id or session_broker_user_id == system_broker_user_id):
+            if session.access_token != system_session.access_token or session_broker_user_id != system_broker_user_id:
+                try:
+                    session.access_token = system_session.access_token
+                    if system_broker_user_id:
+                        session.broker_user_id = system_broker_user_id
+                    session.created_at = datetime.utcnow()
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.warning("Failed to sync session token from system token", exc_info=True)
+            return build_kite_client(system_session.access_token, session_id="system")
+
     return build_kite_client(session.access_token, session_id=session_id)
 
 
@@ -115,3 +132,34 @@ def upsert_kite_session(
     )
     db.add(session)
     return session
+
+
+def rotate_broker_access_token(
+    db: Session,
+    access_token: str,
+    broker_user_id: Optional[str] = None,
+) -> int:
+    """
+    Keep the system token and all active sessions for the same broker account in sync.
+    Returns the number of updated non-system sessions.
+    """
+    upsert_kite_session(db, "system", access_token, broker_user_id=broker_user_id)
+
+    if not broker_user_id:
+        return 0
+
+    now_dt = datetime.utcnow()
+    updated = 0
+    rows = db.query(KiteSession).filter(
+        KiteSession.session_id != "system",
+        or_(
+            KiteSession.broker_user_id == broker_user_id,
+            KiteSession.broker_user_id.is_(None),
+        ),
+    ).all()
+    for session in rows:
+        session.access_token = access_token
+        session.broker_user_id = broker_user_id
+        session.created_at = now_dt
+        updated += 1
+    return updated
