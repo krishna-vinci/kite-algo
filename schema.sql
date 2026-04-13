@@ -257,7 +257,17 @@ CREATE TABLE IF NOT EXISTS public.kite_ticker_tickers (
   company_name       VARCHAR(255),
   sector             VARCHAR(255),
   exchange           VARCHAR(20),
+  isin_code          VARCHAR(32),
+  series             VARCHAR(32),
   source_list        VARCHAR(255) NOT NULL,
+  source_url         TEXT,
+  weight_source      VARCHAR(128),
+  baseline_close     NUMERIC(18, 6),
+  baseline_index_weight NUMERIC(10, 4),
+  baseline_freefloat_marketcap NUMERIC(20, 2),
+  baseline_ff_factor NUMERIC(24, 10),
+  baseline_as_of_date DATE,
+  needs_weight_review BOOLEAN NOT NULL DEFAULT FALSE,
   -- OHLC data (close is previous day's close, used as baseline)
   open               NUMERIC(18, 6),
   high               NUMERIC(18, 6),
@@ -272,11 +282,36 @@ CREATE TABLE IF NOT EXISTS public.kite_ticker_tickers (
   return_attribution NUMERIC(10, 4),
   index_weight       NUMERIC(10, 4),
   freefloat_marketcap NUMERIC(20, 2),
+  points_contribution NUMERIC(18, 4),
   last_updated       TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  last_refreshed_at  TIMESTAMP WITH TIME ZONE,
   PRIMARY KEY (instrument_token, source_list)
 );
 
 ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS change_1d NUMERIC(10, 4);
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS isin_code VARCHAR(32);
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS series VARCHAR(32);
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS source_url TEXT;
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS weight_source VARCHAR(128);
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS points_contribution NUMERIC(18, 4);
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS last_refreshed_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_close NUMERIC(18, 6);
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_index_weight NUMERIC(10, 4);
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_freefloat_marketcap NUMERIC(20, 2);
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_ff_factor NUMERIC(24, 10);
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_as_of_date DATE;
+ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS needs_weight_review BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS public.index_refresh_state (
+  source_list VARCHAR(255) PRIMARY KEY,
+  last_constituent_refresh_at TIMESTAMP WITH TIME ZONE,
+  last_live_refresh_at TIMESTAMP WITH TIME ZONE,
+  added_symbols_json TEXT,
+  removed_symbols_json TEXT,
+  needs_review BOOLEAN NOT NULL DEFAULT FALSE,
+  last_error TEXT,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
 
 
 -- =========================================

@@ -1,10 +1,12 @@
+import { IndexBaselinesPanel } from "@/components/settings/index-baselines-panel";
 import { Panel } from "@/components/operator/panel";
 import { SectionLabel } from "@/components/operator/section-label";
 import { StatusBadge } from "@/components/operator/status-badge";
 
 const sidebarItems = [
+  ["Index baselines", "live"],
   ["Trading defaults", "active"],
-  ["Protection defaults", "live"],
+  ["Protection defaults", "mock"],
   ["Sessions", "3"],
   ["Notifications", "mock"],
 ];
@@ -45,7 +47,7 @@ export default function SettingsPage() {
           {sidebarItems.map(([label, tag], index) => (
             <a
               key={label}
-              href={`#${label.toLowerCase().replace(/\s+/g, "-")}`}
+              href={`#${label!.toLowerCase().replace(/\s+/g, "-")}`}
               aria-current={index === 0 ? "page" : undefined}
               className={[
                 "flex items-center justify-between rounded-2xl border px-3 py-3 text-sm transition-colors",
@@ -62,6 +64,9 @@ export default function SettingsPage() {
       </aside>
 
       <div className="space-y-4">
+        {/* Index baselines — live operator section */}
+        <IndexBaselinesPanel />
+
         <Panel id="trading-defaults" eyebrow="trading" title="Trading defaults" action={<StatusBadge tone="positive">locked</StatusBadge>}>
           <div className="grid gap-3 md:grid-cols-2">
             {tradingDefaults.map(([label, value]) => (

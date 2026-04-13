@@ -77,6 +77,12 @@ from server import mcp
 from contextlib import asynccontextmanager
 import server
 from broker_api.kite_auth import login_headless
+from broker_api.index_ingestion import (
+    get_index_refresh_state,
+    list_supported_index_source_lists,
+    refresh_live_metrics_for_indices,
+    refresh_supported_indices,
+)
 import logging
 from database import SessionLocal, database as async_db
 from broker_api.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
@@ -188,6 +194,7 @@ async def combined_lifespan(app: FastAPI):
     # Perform headless login at startup and store the KiteConnect instance
     token_watcher_task = None
     scheduler_task = None
+    index_refresh_task = None
     order_runtime_task = None
     positions_runtime_task = None
     set_component_status("app", "starting", detail="Application startup in progress")
@@ -425,6 +432,14 @@ async def combined_lifespan(app: FastAPI):
         logging.info("[GATE] Initialized and open at startup (will close at next 08:00 IST)")
         set_meta("daily_token_gate", {"ready": True, "last_changed_at": datetime.utcnow().isoformat()})
         scheduler_task = asyncio.create_task(daily_token_scheduler())
+        index_refresh_task = asyncio.create_task(monthly_index_refresh_scheduler())
+        try:
+            startup_index_result = await asyncio.to_thread(refresh_live_metrics_for_indices, ["Nifty50", "NiftyBank"])
+            set_meta("index_runtime_startup_refresh", {"last_result": startup_index_result, "last_success_at": datetime.utcnow().isoformat()})
+            set_component_status("index_runtime_refresh", "healthy", detail="Startup index runtime refresh completed")
+        except Exception as e:
+            logging.error("Failed startup index runtime refresh: %s", e, exc_info=True)
+            set_component_status("index_runtime_refresh", "degraded", detail=str(e))
 
         # Start AlertsEngine after the market runtime bridge and async DB are ready
         try:
@@ -656,6 +671,16 @@ async def combined_lifespan(app: FastAPI):
             scheduler_task.cancel()
             try:
                 await scheduler_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel monthly index refresh scheduler
+    try:
+        if 'index_refresh_task' in locals() and index_refresh_task:
+            index_refresh_task.cancel()
+            try:
+                await index_refresh_task
             except Exception:
                 pass
     except Exception:
@@ -908,3 +933,72 @@ async def daily_token_scheduler() -> None:
             logging.error("[SCHED] Scheduler loop error: %s", e, exc_info=True)
             set_component_status("daily_token_scheduler", "degraded", detail=str(e))
             await asyncio.sleep(30)
+
+
+async def monthly_index_refresh_scheduler() -> None:
+    tz = ZoneInfo("Asia/Kolkata")
+    source_lists = list_supported_index_source_lists()
+    set_component_status("index_refresh_scheduler", "healthy", detail="Monthly index refresh scheduler started")
+    while True:
+        try:
+            persisted_state = await asyncio.to_thread(get_index_refresh_state, "Nifty50")
+            persisted_month = None
+            persisted_refresh_at = persisted_state.get("last_constituent_refresh_at")
+            if persisted_refresh_at:
+                persisted_month = persisted_refresh_at.astimezone(tz).strftime("%Y-%m")
+            now = datetime.now(tz)
+            next_run = now.replace(hour=6, minute=30, second=0, microsecond=0)
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            sleep_sec = max(1, int((next_run - now).total_seconds()))
+            set_meta(
+                "index_refresh_scheduler",
+                {
+                    "next_run": next_run.isoformat(),
+                    "sleep_seconds": sleep_sec,
+                    "last_success_month": persisted_month,
+                    "source_lists": source_lists,
+                },
+            )
+            heartbeat(
+                "index_refresh_scheduler",
+                detail="Scheduler sleeping until next refresh window",
+                meta={"next_run": next_run.isoformat(), "last_success_month": persisted_month},
+            )
+            await asyncio.sleep(sleep_sec)
+
+            month_key = datetime.now(tz).strftime("%Y-%m")
+            if month_key == persisted_month:
+                continue
+
+            set_component_status("index_refresh_scheduler", "running", detail=f"Refreshing official index datasets for {month_key}")
+            result = await asyncio.to_thread(refresh_supported_indices, source_lists)
+            if result.get("status") == "error":
+                raise RuntimeError(json.dumps(result))
+            runtime_result = await asyncio.to_thread(refresh_live_metrics_for_indices, ["Nifty50", "NiftyBank"])
+
+            set_meta(
+                "index_refresh_scheduler",
+                {
+                    "last_success_month": month_key,
+                    "last_success_at": datetime.utcnow().isoformat(),
+                    "last_result": result,
+                    "last_runtime_result": runtime_result,
+                },
+            )
+            set_component_status("index_refresh_scheduler", "healthy", detail=f"Monthly index refresh completed for {month_key}")
+        except asyncio.CancelledError:
+            set_component_status("index_refresh_scheduler", "stopped", detail="Monthly index refresh scheduler cancelled")
+            break
+        except Exception as e:
+            logging.error("[SCHED] Monthly index refresh failed: %s", e, exc_info=True)
+            set_component_status("index_refresh_scheduler", "degraded", detail=str(e))
+            set_meta(
+                "index_refresh_scheduler",
+                {
+                    "last_failure_at": datetime.utcnow().isoformat(),
+                    "last_error": str(e),
+                    "last_success_month": persisted_month,
+                },
+            )
+            await asyncio.sleep(300)

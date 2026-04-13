@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -7,16 +8,26 @@ import psycopg2.extras
 import redis.asyncio as redis
 from fastapi import APIRouter, HTTPException, Query, WebSocket
 from fastapi.responses import JSONResponse
-from kiteconnect import KiteConnect
 from pydantic import BaseModel
 
-from broker_api.kite_auth import API_KEY
+from broker_api.index_ingestion import (
+    ensure_fresh_live_metrics,
+    get_index_refresh_state,
+    normalize_source_list,
+    refresh_live_metrics,
+)
 from broker_api.redis_events import get_redis
-from broker_api.broker_api import get_system_access_token
-from database import SessionLocal, get_db_connection
+from database import get_db_connection
 
 
 router = APIRouter(tags=["Marketwatch"])
+
+
+def _validated_source_list(source_list: str) -> str:
+    try:
+        return normalize_source_list(source_list)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 class OverlaySnapshotTick(BaseModel):
@@ -34,13 +45,20 @@ class OverlaySnapshotResponse(BaseModel):
     data: Dict[str, OverlaySnapshotTick]
 
 
-@router.get("/nifty50")
-async def get_nifty50_data():
+async def _get_index_data(source_list: str):
     conn = None
     try:
+        if source_list in {"Nifty50", "NiftyBank"}:
+            try:
+                await asyncio.to_thread(ensure_fresh_live_metrics, source_list)
+            except Exception:
+                logging.warning("Failed to auto-refresh live metrics for %s", source_list, exc_info=True)
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("SELECT * FROM kite_ticker_tickers WHERE source_list = 'Nifty50' ORDER BY sector")
+            cur.execute(
+                "SELECT * FROM kite_ticker_tickers WHERE source_list = %s ORDER BY sector, index_weight DESC NULLS LAST, tradingsymbol",
+                (source_list,),
+            )
             sectors = {}
             for row in cur.fetchall():
                 sectors.setdefault(row["sector"], []).append(dict(row))
@@ -52,12 +70,22 @@ async def get_nifty50_data():
             conn.close()
 
 
-@router.get(
-    "/marketwatch/nifty50/overlay-snapshot",
-    response_model=OverlaySnapshotResponse,
-    summary="Get a snapshot of the latest live ticks from the Redis overlay cache.",
-)
-async def get_overlay_snapshot(token: Optional[List[int]] = Query(None, description="List of instrument tokens to fetch.")):
+@router.get("/nifty50")
+async def get_nifty50_data():
+    return await _get_index_data("Nifty50")
+
+
+@router.get("/indices/{source_list}")
+async def get_index_data(source_list: str):
+    return await _get_index_data(_validated_source_list(source_list))
+
+
+@router.get("/indices/{source_list}/status")
+async def get_index_status(source_list: str):
+    return get_index_refresh_state(_validated_source_list(source_list))
+
+
+async def _get_overlay_snapshot(source_list: str, token: Optional[List[int]] = Query(None, description="List of instrument tokens to fetch.")):
     if token and (len(token) == 0 or len(token) > 2000):
         return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid token count"})
 
@@ -70,7 +98,7 @@ async def get_overlay_snapshot(token: Optional[List[int]] = Query(None, descript
         if not target_tokens:
             conn = get_db_connection()
             with conn.cursor() as cur:
-                cur.execute("SELECT instrument_token FROM kite_ticker_tickers WHERE source_list = 'Nifty50'")
+                cur.execute("SELECT instrument_token FROM kite_ticker_tickers WHERE source_list = %s", (source_list,))
                 target_tokens = [row[0] for row in cur.fetchall()]
 
         keys = [f"marketwatch:overlay:{today_iso}:{t}" for t in target_tokens]
@@ -132,112 +160,43 @@ async def get_overlay_snapshot(token: Optional[List[int]] = Query(None, descript
             conn.close()
 
 
+@router.get(
+    "/marketwatch/{source_list}/overlay-snapshot",
+    response_model=OverlaySnapshotResponse,
+    summary="Get a snapshot of the latest live ticks from the Redis overlay cache for an index.",
+)
+async def get_index_overlay_snapshot(
+    source_list: str,
+    token: Optional[List[int]] = Query(None, description="List of instrument tokens to fetch."),
+):
+    return await _get_overlay_snapshot(_validated_source_list(source_list), token)
+
+
+@router.get(
+    "/marketwatch/nifty50/overlay-snapshot",
+    response_model=OverlaySnapshotResponse,
+    summary="Get a snapshot of the latest live ticks from the Redis overlay cache.",
+)
+async def get_overlay_snapshot(token: Optional[List[int]] = Query(None, description="List of instrument tokens to fetch.")):
+    return await _get_overlay_snapshot("Nifty50", token)
+
+
+@router.post("/marketwatch/{source_list}/finalize-baseline")
+async def finalize_index_baseline(source_list: str, dry_run: bool = False):
+    if dry_run:
+        return {
+            "status": "success",
+            "message": "Dry-run is not supported for the live metric refresh flow.",
+            "source_list": _validated_source_list(source_list),
+        }
+    result = refresh_live_metrics(_validated_source_list(source_list))
+    status_code = 200 if result["status"] != "error" else 500
+    return JSONResponse(status_code=status_code, content=result)
+
+
 @router.post("/marketwatch/nifty50/finalize-baseline")
 async def finalize_nifty50_baseline(dry_run: bool = False):
-    conn = None
-    debug_info = {"errors": [], "warnings": []}
-    try:
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(
-                "SELECT instrument_token, tradingsymbol, exchange, freefloat_marketcap, index_weight FROM kite_ticker_tickers WHERE source_list = 'Nifty50'"
-            )
-            instruments = cur.fetchall()
-
-        db = SessionLocal()
-        try:
-            access_token = get_system_access_token(db)
-            if not access_token:
-                raise HTTPException(status_code=500, detail="System access token not available.")
-            kite = KiteConnect(api_key=API_KEY)
-            kite.set_access_token(access_token)
-        finally:
-            db.close()
-
-        instrument_keys = [f"{inst['exchange']}:{inst['tradingsymbol']}" for inst in instruments]
-        try:
-            ohlc_data = kite.quote(instrument_keys)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Failed to fetch OHLC data: {str(e)}")
-
-        updates = []
-        total_new_marketcap = 0
-        for inst in instruments:
-            try:
-                key = f"{inst['exchange']}:{inst['tradingsymbol']}"
-                data = ohlc_data.get(key)
-                if not data or "ohlc" not in data or "last_price" not in data:
-                    continue
-
-                ltp = data["last_price"]
-                previous_close = data["ohlc"]["close"]
-                open_price = data["ohlc"]["open"]
-                high_price = data["ohlc"]["high"]
-                low_price = data["ohlc"]["low"]
-                net_change = ltp - previous_close
-                net_change_percent = (net_change / previous_close * 100) if previous_close > 0 else 0
-                return_ratio = net_change_percent / 100
-                freefloat_mc = float(inst["freefloat_marketcap"] or 0)
-                idx_weight = float(inst["index_weight"] or 0)
-                new_freefloat_marketcap = freefloat_mc * (1 + return_ratio)
-                return_attribution = idx_weight * return_ratio
-                total_new_marketcap += new_freefloat_marketcap
-                updates.append(
-                    {
-                        "instrument_token": inst["instrument_token"],
-                        "open": open_price,
-                        "high": high_price,
-                        "low": low_price,
-                        "close": previous_close,
-                        "ltp": ltp,
-                        "net_change": net_change,
-                        "net_change_percent": net_change_percent,
-                        "freefloat_marketcap": new_freefloat_marketcap,
-                        "return_attribution": return_attribution,
-                        "index_weight": 0,
-                    }
-                )
-            except Exception as e:
-                debug_info["errors"].append(str(e))
-
-        if total_new_marketcap > 0:
-            for update in updates:
-                update["index_weight"] = (update["freefloat_marketcap"] / total_new_marketcap) * 100
-
-        if dry_run:
-            return {"status": "success", "preview": updates, "debug": debug_info}
-
-        with conn.cursor() as cur:
-            psycopg2.extras.execute_batch(
-                cur,
-                """
-                UPDATE kite_ticker_tickers
-                SET
-                    open = %(open)s,
-                    high = %(high)s,
-                    low = %(low)s,
-                    close = %(close)s,
-                    ltp = %(ltp)s,
-                    net_change = %(net_change)s,
-                    net_change_percent = %(net_change_percent)s,
-                    freefloat_marketcap = %(freefloat_marketcap)s,
-                    return_attribution = %(return_attribution)s,
-                    index_weight = %(index_weight)s,
-                    last_updated = NOW()
-                WHERE instrument_token = %(instrument_token)s AND source_list = 'Nifty50';
-                """,
-                updates,
-            )
-        conn.commit()
-
-        return {"status": "success", "data": {"updated": len(updates), "errors": debug_info["errors"]}}
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        raise HTTPException(status_code=500, detail={"error": str(e), "debug": debug_info})
-    finally:
-        if conn:
-            conn.close()
+    return await finalize_index_baseline("Nifty50", dry_run=dry_run)
 
 
 @router.websocket("/ws/marketwatch")

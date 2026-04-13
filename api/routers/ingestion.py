@@ -1,184 +1,101 @@
-import csv
 import logging
+from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
-from psycopg2 import extras
+from pydantic import BaseModel
 
-from database import get_db_connection
+from broker_api.index_ingestion import (
+    NIFTY50_MANUAL_BASELINES,
+    NIFTYBANK_MANUAL_BASELINES,
+    SOURCE_LIST_NIFTY50,
+    SOURCE_LIST_NIFTY500,
+    SOURCE_LIST_NIFTYBANK,
+    apply_manual_baseline_seed,
+    list_supported_index_source_lists,
+    normalize_source_list,
+    refresh_live_metrics_for_indices,
+    refresh_supported_indices,
+)
 
 
 router = APIRouter(tags=["Ingestion"])
 
-CSV_FILES = {
-    "ind_nifty50list.csv": "Nifty50",
-    "ind_niftylargemidcap250list.csv": "NiftyLargeMidcap250",
-    "ind_nifty500list.csv": "Nifty500",
-}
+
+class ManualBaselineItem(BaseModel):
+    symbol: str
+    weight: float
+    freefloat_marketcap: Optional[float] = None
 
 
-def process_csv_data(csv_file_path: str, source_list_name: str):
-    data = []
-    try:
-        import pandas as pd
-
-        df = pd.read_csv(csv_file_path)
-        for _, row in df.iterrows():
-            data.append(
-                {
-                    "symbol": row["Symbol"],
-                    "company_name": row["Company Name"],
-                    "sector": row["Industry"],
-                    "source_list": source_list_name,
-                }
-            )
-        logging.info("Successfully processed %s entries from %s.", len(data), csv_file_path)
-    except FileNotFoundError:
-        logging.error("CSV file not found: %s", csv_file_path)
-    except KeyError as e:
-        logging.error("Missing expected column in %s: %s", csv_file_path, e)
-    except Exception as e:
-        logging.error("Error processing %s: %s", csv_file_path, e)
-    return data
+class ManualBaselineRequest(BaseModel):
+    entries: List[ManualBaselineItem]
+    force: bool = False
+    normalized_total: float = 100.0
+    normalize_freefloat: bool = True
 
 
-def clean_value(value_str):
-    if not value_str:
-        return None
-    try:
-        return float(str(value_str).replace("%", "").replace(",", ""))
-    except ValueError:
-        logging.warning("Could not convert %r to float.", value_str)
-        return None
+def _normalize_many(source_lists: Optional[List[str]]) -> List[str]:
+    if not source_lists:
+        return list_supported_index_source_lists()
+    normalized: List[str] = []
+    for item in source_lists:
+        try:
+            normalized.append(normalize_source_list(item))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return normalized
 
 
 @router.post("/ingest-stock-data")
-async def ingest_stock_data_endpoint():
-    logging.info("FastAPI endpoint /api/ingest-stock-data triggered.")
-
-    all_csv_entries = []
-    for file_path, source_name in CSV_FILES.items():
-        all_csv_entries.extend(process_csv_data(file_path, source_name))
-
-    if not all_csv_entries:
-        raise HTTPException(status_code=500, detail="No data processed from CSV files.")
-
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=extras.DictCursor) as cur:
-            cur.execute(
-                "SELECT tradingsymbol, instrument_token, instrument_type FROM kite_instruments WHERE instrument_type = 'EQ' AND exchange = 'NSE';"
-            )
-            kite_instruments_data = {row["tradingsymbol"]: row for row in cur.fetchall()}
-
-        if not kite_instruments_data:
-            raise HTTPException(status_code=500, detail="No equity instruments found in kite_instruments table.")
-
-        inserted_count = 0
-        unmatched_count = 0
-
-        with conn.cursor() as cur:
-            for entry in all_csv_entries:
-                symbol = entry["symbol"]
-                if symbol in kite_instruments_data:
-                    instrument_token = kite_instruments_data[symbol]["instrument_token"]
-                    cur.execute(
-                        """
-                        INSERT INTO kite_ticker_tickers (instrument_token, tradingsymbol, company_name, sector, source_list)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (instrument_token, source_list) DO NOTHING;
-                        """,
-                        (
-                            instrument_token,
-                            symbol,
-                            entry["company_name"],
-                            entry["sector"],
-                            entry["source_list"],
-                        ),
-                    )
-                    inserted_count += 1
-                else:
-                    unmatched_count += 1
-                    logging.warning(
-                        "Symbol %r from %r not found in kite_instruments (instrument_type='EQ').",
-                        symbol,
-                        entry["source_list"],
-                    )
-
-            conn.commit()
-
-        return JSONResponse(
-            content={
-                "message": "Data ingestion and synchronization completed successfully.",
-                "inserted_records": inserted_count,
-                "unmatched_symbols": unmatched_count,
-            }
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.critical("An unhandled error occurred during ingestion: %s", e)
-        raise HTTPException(status_code=500, detail=f"Internal server error during ingestion: {e}")
-    finally:
-        if conn:
-            conn.close()
+async def ingest_stock_data_endpoint(source_list: Optional[List[str]] = Query(None, alias="source_list")):
+    logging.info("Official index ingestion triggered for source_list=%s", source_list)
+    result = refresh_supported_indices(_normalize_many(source_list))
+    status_code = 200 if result["status"] != "error" else 500
+    return JSONResponse(status_code=status_code, content=result)
 
 
 @router.post("/update-nifty50-data")
-async def update_nifty50_data_endpoint():
-    conn = None
-    cur = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+async def update_nifty50_data_endpoint(include_nifty500: bool = False):
+    target_lists = [SOURCE_LIST_NIFTY50, SOURCE_LIST_NIFTYBANK]
+    if include_nifty500:
+        target_lists.append(SOURCE_LIST_NIFTY500)
+    result = refresh_live_metrics_for_indices(target_lists)
+    status_code = 200 if result["status"] != "error" else 500
+    return JSONResponse(status_code=status_code, content=result)
 
-        with open("nifty50_data.csv", "r", encoding="utf-8") as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                ticker = row.get("Ticker")
-                if not ticker or not ticker.strip():
-                    continue
 
-                params = {
-                    "tradingsymbol": ticker.strip(),
-                    "change_1d": clean_value(row.get("1D change")),
-                    "return_attribution": clean_value(row.get("Return attribution")),
-                    "index_weight": clean_value(row.get("Index weight")),
-                    "freefloat_marketcap": clean_value(row.get("Free float marketcap")),
-                }
+@router.post("/indices/refresh")
+async def refresh_indices_endpoint(source_list: Optional[List[str]] = Query(None, alias="source_list")):
+    result = refresh_supported_indices(_normalize_many(source_list))
+    status_code = 200 if result["status"] != "error" else 500
+    return JSONResponse(status_code=status_code, content=result)
 
-                cur.execute(
-                    """
-                    UPDATE kite_ticker_tickers
-                    SET
-                        change_1d = %(change_1d)s,
-                        return_attribution = %(return_attribution)s,
-                        index_weight = %(index_weight)s,
-                        freefloat_marketcap = %(freefloat_marketcap)s,
-                        last_updated = NOW()
-                    WHERE tradingsymbol = %(tradingsymbol)s AND source_list = 'Nifty50';
-                    """,
-                    params,
-                )
 
-                if cur.rowcount == 0:
-                    logging.warning(
-                        "No row found for tradingsymbol %r with source_list 'Nifty50'.",
-                        params["tradingsymbol"],
-                    )
+@router.post("/indices/{source_list}/baseline")
+async def seed_index_baseline_endpoint(source_list: str, payload: ManualBaselineRequest):
+    normalized = _normalize_many([source_list])[0]
+    baselines = {item.symbol.strip(): {"weight": item.weight, "freefloat_marketcap": item.freefloat_marketcap} for item in payload.entries}
+    result = apply_manual_baseline_seed(
+        normalized,
+        baselines,
+        force=payload.force,
+        normalized_total=payload.normalized_total,
+        normalize_freefloat=payload.normalize_freefloat,
+    )
+    status_code = 200 if result["status"] != "error" else 500
+    return JSONResponse(status_code=status_code, content=result)
 
-        conn.commit()
-        return JSONResponse(content={"message": "Nifty50 data updated successfully."})
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="nifty50_data.csv not found.")
-    except Exception as e:
-        logging.error("An error occurred during the database update: %s", e)
-        if conn:
-            conn.rollback()
-        raise HTTPException(status_code=500, detail=f"An error occurred during the database update: {e}")
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
+
+@router.post("/indices/nifty50/baseline/default")
+async def seed_default_nifty50_baseline(force: bool = False):
+    result = apply_manual_baseline_seed(SOURCE_LIST_NIFTY50, NIFTY50_MANUAL_BASELINES, force=force)
+    status_code = 200 if result["status"] != "error" else 500
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@router.post("/indices/niftybank/baseline/default")
+async def seed_default_niftybank_baseline(force: bool = False):
+    result = apply_manual_baseline_seed(SOURCE_LIST_NIFTYBANK, NIFTYBANK_MANUAL_BASELINES, force=force)
+    status_code = 200 if result["status"] != "error" else 500
+    return JSONResponse(status_code=status_code, content=result)
