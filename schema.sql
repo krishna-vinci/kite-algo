@@ -1005,3 +1005,228 @@ CREATE INDEX IF NOT EXISTS idx_investing_strategies_name ON public.investing_str
 CREATE INDEX IF NOT EXISTS idx_investing_strategies_tag ON public.investing_strategies(tag);
 CREATE INDEX IF NOT EXISTS idx_investing_strategies_status ON public.investing_strategies(status);
 CREATE INDEX IF NOT EXISTS idx_investing_strategies_order_id ON public.investing_strategies(order_id) WHERE order_id IS NOT NULL;
+
+-- =========================================
+-- Trading Journal Tables
+-- =========================================
+
+CREATE TABLE IF NOT EXISTS public.journal_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_family TEXT NOT NULL,
+    strategy_name TEXT,
+    entry_surface TEXT,
+    execution_mode TEXT NOT NULL CHECK (execution_mode IN ('live', 'paper', 'dry_run')),
+    account_ref TEXT,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'open', 'closed', 'cancelled', 'reviewed')),
+    benchmark_id TEXT NOT NULL DEFAULT 'NIFTY50',
+    capital_basis_type TEXT NOT NULL CHECK (capital_basis_type IN ('cash_deployed', 'margin_used', 'notional', 'portfolio_nav')),
+    capital_committed NUMERIC(18,6),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ended_at TIMESTAMPTZ,
+    review_state TEXT NOT NULL DEFAULT 'pending' CHECK (review_state IN ('pending', 'in_progress', 'reviewed', 'waived')),
+    source_summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT journal_runs_strategy_family_chk CHECK (strategy_family IN ('options_strategy', 'indicator_strategy', 'investment_strategy', 'discretionary_strategy'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_runs_family_started
+    ON public.journal_runs (strategy_family, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_runs_status_started
+    ON public.journal_runs (status, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_runs_benchmark_started
+    ON public.journal_runs (benchmark_id, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_runs_entry_surface
+    ON public.journal_runs (entry_surface, started_at DESC)
+    WHERE entry_surface IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.journal_run_legs (
+    id BIGSERIAL PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES public.journal_runs(id) ON DELETE CASCADE,
+    instrument_token BIGINT,
+    exchange TEXT,
+    tradingsymbol TEXT,
+    product TEXT,
+    leg_role TEXT,
+    direction TEXT CHECK (direction IN ('long', 'short')),
+    opened_quantity INT NOT NULL DEFAULT 0,
+    closed_quantity INT NOT NULL DEFAULT 0,
+    net_quantity INT NOT NULL DEFAULT 0,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_run_legs_run
+    ON public.journal_run_legs (run_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_journal_run_legs_token
+    ON public.journal_run_legs (instrument_token)
+    WHERE instrument_token IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.journal_source_links (
+    id BIGSERIAL PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES public.journal_runs(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    source_key_2 TEXT,
+    linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT journal_source_links_source_type_chk CHECK (source_type IN ('live_order', 'paper_trade', 'paper_order', 'option_strategy_run', 'algo_instance', 'investing_strategy'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_source_links_run
+    ON public.journal_source_links (run_id, linked_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_source_links_source_key
+    ON public.journal_source_links (source_type, source_key, COALESCE(source_key_2, ''));
+
+CREATE TABLE IF NOT EXISTS public.journal_execution_facts (
+    id BIGSERIAL PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES public.journal_runs(id) ON DELETE CASCADE,
+    leg_id BIGINT REFERENCES public.journal_run_legs(id) ON DELETE SET NULL,
+    source_type TEXT NOT NULL,
+    source_fact_key TEXT NOT NULL,
+    order_id TEXT,
+    trade_id TEXT,
+    fill_timestamp TIMESTAMPTZ NOT NULL,
+    side TEXT NOT NULL,
+    quantity INT NOT NULL,
+    price NUMERIC(18,6) NOT NULL,
+    gross_cash_flow NUMERIC(18,6),
+    fees_amount NUMERIC(18,6) NOT NULL DEFAULT 0,
+    taxes_amount NUMERIC(18,6) NOT NULL DEFAULT 0,
+    slippage_amount NUMERIC(18,6) NOT NULL DEFAULT 0,
+    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_execution_facts_source_fact
+    ON public.journal_execution_facts (source_type, source_fact_key);
+
+CREATE INDEX IF NOT EXISTS idx_journal_execution_facts_run_time
+    ON public.journal_execution_facts (run_id, fill_timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS public.journal_decision_events (
+    id BIGSERIAL PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES public.journal_runs(id) ON DELETE CASCADE,
+    decision_type TEXT NOT NULL CHECK (decision_type IN ('thesis', 'entry', 'adjustment', 'risk_change', 'exit', 'algo_trigger', 'review')),
+    actor_type TEXT NOT NULL CHECK (actor_type IN ('user', 'system', 'algo')),
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    summary TEXT,
+    context_json JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_decision_events_run_time
+    ON public.journal_decision_events (run_id, occurred_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.journal_rules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    family_scope TEXT,
+    strategy_scope TEXT,
+    title TEXT NOT NULL,
+    rule_type TEXT NOT NULL CHECK (rule_type IN ('universal', 'strategy_specific', 'risk_execution', 'psychological')),
+    enforcement_level TEXT NOT NULL CHECK (enforcement_level IN ('hard_block', 'soft_warning', 'review_only')),
+    status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'active', 'reinforced', 'decaying', 'retired')),
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_rules_scope
+    ON public.journal_rules (family_scope, strategy_scope, status);
+
+CREATE TABLE IF NOT EXISTS public.journal_rule_evidence (
+    id BIGSERIAL PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES public.journal_runs(id) ON DELETE CASCADE,
+    rule_id UUID NOT NULL REFERENCES public.journal_rules(id) ON DELETE CASCADE,
+    result TEXT NOT NULL CHECK (result IN ('followed', 'violated', 'overridden', 'not_applicable')),
+    notes TEXT,
+    evidence_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_rule_evidence_run
+    ON public.journal_rule_evidence (run_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_rule_evidence_rule
+    ON public.journal_rule_evidence (rule_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.benchmark_definitions (
+    benchmark_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    source_list TEXT NOT NULL DEFAULT 'Nifty50',
+    instrument_token BIGINT,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.benchmark_daily_prices (
+    benchmark_id TEXT NOT NULL REFERENCES public.benchmark_definitions(benchmark_id) ON DELETE CASCADE,
+    trading_day DATE NOT NULL,
+    open NUMERIC(18,6),
+    high NUMERIC(18,6),
+    low NUMERIC(18,6),
+    close NUMERIC(18,6) NOT NULL,
+    daily_return NUMERIC(18,10),
+    source TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (benchmark_id, trading_day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_benchmark_daily_prices_day
+    ON public.benchmark_daily_prices (trading_day DESC, benchmark_id);
+
+INSERT INTO public.benchmark_definitions (benchmark_id, name, source_list, metadata_json)
+VALUES ('NIFTY50', 'Nifty 50', 'Nifty50', '{}'::jsonb)
+ON CONFLICT (benchmark_id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.journal_equity_points (
+    id BIGSERIAL PRIMARY KEY,
+    subject_type TEXT NOT NULL CHECK (subject_type IN ('run', 'family', 'strategy', 'portfolio')),
+    subject_id TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    as_of TIMESTAMPTZ NOT NULL,
+    starting_equity NUMERIC(18,6),
+    ending_equity NUMERIC(18,6) NOT NULL,
+    realized_pnl NUMERIC(18,6) NOT NULL DEFAULT 0,
+    unrealized_pnl NUMERIC(18,6) NOT NULL DEFAULT 0,
+    cash_flow NUMERIC(18,6) NOT NULL DEFAULT 0,
+    fees NUMERIC(18,6) NOT NULL DEFAULT 0,
+    return_pct NUMERIC(18,10),
+    benchmark_return_pct NUMERIC(18,10),
+    excess_return_pct NUMERIC(18,10),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_equity_points_subject_slot
+    ON public.journal_equity_points (subject_type, subject_id, interval, as_of);
+
+CREATE INDEX IF NOT EXISTS idx_journal_equity_points_subject_time
+    ON public.journal_equity_points (subject_type, subject_id, as_of DESC);
+
+CREATE TABLE IF NOT EXISTS public.journal_metric_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    window TEXT NOT NULL,
+    calc_version TEXT NOT NULL,
+    computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metrics_json JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_metric_snapshots_subject_window_version
+    ON public.journal_metric_snapshots (subject_type, subject_id, window, calc_version);
+
+CREATE INDEX IF NOT EXISTS idx_journal_metric_snapshots_lookup
+    ON public.journal_metric_snapshots (subject_type, subject_id, computed_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.journal_projection_state (
+    projector_name TEXT PRIMARY KEY,
+    cursor_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

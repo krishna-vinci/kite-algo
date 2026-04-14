@@ -14,4 +14,5 @@ OPENAPI_TAGS = [
     {"name": "Momentum", "description": "Momentum strategy endpoints."},
     {"name": "Alerts", "description": "Price alert CRUD and event streams."},
     {"name": "Strategies", "description": "Protected strategy and index stoploss endpoints."},
+    {"name": "Trading Journal", "description": "Backend-only trading journal runs, source links, decision events, and summary analytics."},
 ]

@@ -20,4 +20,16 @@ describe("AppShell", () => {
     expect(screen.getByText("positions")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Custom Display" })).toBeInTheDocument();
   });
+
+  it("includes Journal in the navigation rail", () => {
+    render(
+      <AppShell navigation={navigation} activeHref="/dashboard">
+        <div>content</div>
+      </AppShell>,
+    );
+
+    const journalLink = screen.getByTitle("Journal");
+    expect(journalLink).toBeInTheDocument();
+    expect(journalLink).toHaveAttribute("href", "/journal");
+  });
 });
