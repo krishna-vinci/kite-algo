@@ -35,6 +35,7 @@ class AlgoKernel:
         snapshot_builder: SnapshotBuilder | None = None,
         dependency_aggregator: DependencyAggregator | None = None,
         intent_bridge: IntentBridge | None = None,
+        journal_service: Any | None = None,
     ) -> None:
         self.registry = registry
         self.repository = repository
@@ -42,6 +43,7 @@ class AlgoKernel:
         self.snapshot_builder = snapshot_builder or SnapshotBuilder()
         self.dependency_aggregator = dependency_aggregator or DependencyAggregator()
         self.intent_bridge = intent_bridge
+        self.journal_service = journal_service
         self.instances: Dict[str, AlgoInstance] = {}
         self.modules: Dict[str, Any] = {}
         self.instance_runtime: Dict[str, Dict[str, Any]] = {}
@@ -167,7 +169,14 @@ class AlgoKernel:
                     "action_count": len(normalized_actions),
                     "actions": [_action_to_payload(action) for action in normalized_actions],
                     "execution": execution,
-                    }
+                     }
+                )
+                await self._record_journal_trigger_decision(
+                    instance=instance,
+                    trigger=trigger,
+                    normalized_actions=normalized_actions,
+                    execution=execution,
+                    error=None,
                 )
             except Exception as exc:
                 logger.error("Algo trigger dispatch failed for %s: %s", instance.instance_id, exc, exc_info=True)
@@ -189,4 +198,62 @@ class AlgoKernel:
                         "error": str(exc),
                     }
                 )
+                await self._record_journal_trigger_decision(
+                    instance=instance,
+                    trigger=trigger,
+                    normalized_actions=[],
+                    execution=None,
+                    error=str(exc),
+                )
         return results
+
+    def _resolve_instance_journal_run_id(self, instance: AlgoInstance) -> str | None:
+        if self.journal_service is None:
+            return None
+        metadata = dict(instance.metadata or {})
+        dependency_spec = instance.dependency_spec.model_dump(mode="json") if instance.dependency_spec else {}
+        return self.journal_service.resolve_run_id(
+            journal_run_id=metadata.get("journal_run_id") or dependency_spec.get("journal_run_id"),
+            journal_ref=metadata.get("journal_ref") or dependency_spec.get("journal_ref"),
+        )
+
+    async def _record_journal_trigger_decision(
+        self,
+        *,
+        instance: AlgoInstance,
+        trigger: TriggerEvent,
+        normalized_actions: List[Any],
+        execution: Any,
+        error: str | None,
+    ) -> None:
+        try:
+            run_id = self._resolve_instance_journal_run_id(instance)
+            if not run_id or self.journal_service is None:
+                return
+            from journaling.models import JournalDecisionEvent
+
+            self.journal_service.append_decision_event(
+                run_id,
+                JournalDecisionEvent(
+                    run_id=run_id,
+                    decision_type="algo_trigger",
+                    actor_type="algo",
+                    summary=(
+                        f"{instance.algo_type} handled {trigger.trigger_type.value} trigger"
+                        if error is None
+                        else f"{instance.algo_type} failed handling {trigger.trigger_type.value} trigger"
+                    ),
+                    context={
+                        "instance_id": instance.instance_id,
+                        "algo_type": instance.algo_type,
+                        "execution_mode": instance.execution_mode.value,
+                        "trigger": trigger.model_dump(mode="json", by_alias=True),
+                        "action_count": len(normalized_actions),
+                        "actions": [_action_to_payload(action) for action in normalized_actions],
+                        "execution": execution,
+                        "error": error,
+                    },
+                ),
+            )
+        except Exception:
+            logger.warning("Failed to record journal trigger decision for %s", instance.instance_id, exc_info=True)

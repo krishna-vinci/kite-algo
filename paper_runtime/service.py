@@ -45,6 +45,7 @@ class PaperTradingService:
         market_data_runtime: Any | None = None,
         margin_engine: PaperMarginEngine | None = None,
         charges_calculator: PaperChargesCalculator | None = None,
+        journal_service: Any | None = None,
         default_starting_balance: Decimal | str | float = Decimal("1000000"),
     ) -> None:
         self.repository = repository or SqlAlchemyPaperRepository()
@@ -52,6 +53,7 @@ class PaperTradingService:
         self.market_data_runtime = market_data_runtime
         self.margin_engine = margin_engine or PaperMarginEngine()
         self.charges_calculator = charges_calculator or PaperChargesCalculator()
+        self.journal_service = journal_service
         self.default_starting_balance = Decimal(str(default_starting_balance))
         self._account_locks: Dict[str, asyncio.Lock] = {}
 
@@ -91,6 +93,7 @@ class PaperTradingService:
             return await self._place_order_locked(account_scope=account_scope, order_payload=order_payload, attribution=attribution)
 
     async def _place_order_locked(self, *, account_scope: str, order_payload: Dict[str, Any], attribution: Dict[str, Any]) -> Dict[str, Any]:
+        attribution = self._merged_attribution(attribution, (order_payload or {}).get("metadata"))
         request = self._normalize_order_request(order_payload)
         account = await self.ensure_account(account_scope)
         instrument = await asyncio.to_thread(
@@ -153,6 +156,7 @@ class PaperTradingService:
             },
         )
         order = await asyncio.to_thread(self.repository.insert_order, order)
+        await self._record_journal_order(order)
         account = await self._apply_account_delta(account, reserve_delta=incremental_margin, reserve_entry=order.order_id)
         await publish_event("paper.orders.events", paper_order_event_payload(event_type="accepted", order=order))
         order = await self._persist_stop_limit_trigger_state(order=order, request=request, market_snapshot=market_snapshot)
@@ -173,12 +177,17 @@ class PaperTradingService:
     async def _place_basket_locked(self, *, account_scope: str, basket_payload: Dict[str, Any], attribution: Dict[str, Any]) -> Dict[str, Any]:
         orders = list((basket_payload or {}).get("orders") or [])
         all_or_none = bool((basket_payload or {}).get("all_or_none"))
+        attribution = self._merged_attribution(attribution, (basket_payload or {}).get("metadata"))
         if all_or_none:
             return await self._place_basket_all_or_none_atomic(account_scope=account_scope, orders=orders, attribution=attribution)
         results: List[Dict[str, Any]] = []
         failures: List[Dict[str, Any]] = []
         for raw_order in orders:
-            result = await self._place_order_locked(account_scope=account_scope, order_payload=raw_order, attribution=attribution)
+            result = await self._place_order_locked(
+                account_scope=account_scope,
+                order_payload=raw_order,
+                attribution=self._merged_attribution(attribution, (raw_order or {}).get("metadata")),
+            )
             results.append(result)
             if result.get("status") == "rejected":
                 failures.append(result)
@@ -191,6 +200,7 @@ class PaperTradingService:
         prepared: List[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = []
         for raw_order in orders:
             request = self._normalize_order_request(raw_order)
+            order_attribution = self._merged_attribution(attribution, (raw_order or {}).get("metadata"))
             instrument = await asyncio.to_thread(
                 self.instruments_repository.get_instrument_by_exchange_symbol,
                 request["exchange"],
@@ -205,7 +215,7 @@ class PaperTradingService:
                 )
                 return {"mode": "paper", "status": "failed", "results": [], "errors": [rejected]}
             market_snapshot = await self._market_snapshot(int(instrument["instrument_token"]))
-            prepared.append((request, instrument, market_snapshot))
+            prepared.append((request, instrument, market_snapshot, order_attribution))
 
         staged_events: List[Tuple[str, Dict[str, Any]]] = []
         staged_results: List[Dict[str, Any]] = []
@@ -227,7 +237,7 @@ class PaperTradingService:
                         )
                     )
 
-                for request, instrument, market_snapshot in prepared:
+                for request, instrument, market_snapshot, order_attribution in prepared:
                     result, account = self._place_order_locked_uow(
                         uow=uow,
                         account_scope=account_scope,
@@ -235,7 +245,7 @@ class PaperTradingService:
                         request=request,
                         instrument=instrument,
                         market_snapshot=market_snapshot,
-                        attribution=attribution,
+                        attribution=order_attribution,
                         staged_events=staged_events,
                     )
                     staged_results.append(result)
@@ -247,6 +257,13 @@ class PaperTradingService:
 
         for topic, payload in staged_events:
             await publish_event(topic, payload)
+        for result in staged_results:
+            order_payload = result.get("order") or {}
+            trade_payload = result.get("trade") or {}
+            if order_payload:
+                await self._record_journal_order(PaperOrder.model_validate(order_payload))
+            if trade_payload:
+                await self._record_journal_trade(PaperTrade.model_validate(trade_payload))
         return {"mode": "paper", "status": "success", "results": staged_results, "errors": []}
 
     async def process_tick(self, tick: Dict[str, Any]) -> None:
@@ -322,13 +339,63 @@ class PaperTradingService:
         return await asyncio.to_thread(self.repository.list_active_market_tokens)
 
     def _attribution(self, intent: Any, instance_context: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = dict(instance_context.get("metadata") or {})
+        dependency_spec = dict(instance_context.get("dependency_spec") or {})
         return {
             "algo_instance_id": instance_context.get("instance_id"),
             "algo_type": instance_context.get("algo_type"),
             "strategy_tag": instance_context.get("algo_type"),
             "intent_type": intent.intent_type,
             "dedupe_key": getattr(intent, "dedupe_key", None),
+            "journal_run_id": metadata.get("journal_run_id") or dependency_spec.get("journal_run_id"),
+            "journal_ref": metadata.get("journal_ref") or dependency_spec.get("journal_ref"),
         }
+    
+    def _merged_attribution(self, attribution: Dict[str, Any], *metadata_sources: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        merged = dict(attribution or {})
+        for metadata in metadata_sources:
+            if not metadata:
+                continue
+            for key in ("journal_run_id", "journal_ref"):
+                if key not in merged or merged.get(key) in (None, ""):
+                    value = metadata.get(key)
+                    if value not in (None, ""):
+                        merged[key] = value
+        return merged
+
+    def _resolve_journal_run_id(self, attribution: Optional[Dict[str, Any]]) -> Optional[str]:
+        if self.journal_service is None:
+            return None
+        payload = dict(attribution or {})
+        try:
+            return self.journal_service.resolve_run_id(
+                journal_run_id=payload.get("journal_run_id"),
+                journal_ref=payload.get("journal_ref"),
+            )
+        except Exception:
+            return None
+
+    async def _record_journal_order(self, order: PaperOrder) -> None:
+        run_id = self._resolve_journal_run_id(order.metadata)
+        if not run_id or self.journal_service is None:
+            return
+        await asyncio.to_thread(self.journal_service.record_paper_order, run_id=run_id, order_id=order.order_id)
+
+    async def _record_journal_trade(self, trade: PaperTrade) -> None:
+        run_id = self._resolve_journal_run_id(trade.metadata)
+        if not run_id or self.journal_service is None:
+            return
+        await asyncio.to_thread(
+            self.journal_service.record_paper_trade,
+            run_id=run_id,
+            trade_id=trade.trade_id,
+            order_id=trade.order_id,
+            trade_timestamp=trade.trade_timestamp,
+            side=str(trade.transaction_type),
+            quantity=int(trade.quantity),
+            price=trade.price,
+            payload=dict(trade.metadata or {}),
+        )
 
     async def _market_snapshot(self, instrument_token: int) -> Dict[str, Any]:
         if self.market_data_runtime is None:
@@ -494,6 +561,7 @@ class PaperTradingService:
                 metadata=dict(order.metadata or {}),
             ),
         )
+        await self._record_journal_trade(trade)
         new_position.metadata["margin_in_use"] = str(new_margin)
         new_position.metadata["last_price"] = str(fill_price)
         new_position = await asyncio.to_thread(self.repository.upsert_position, new_position)

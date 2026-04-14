@@ -50,6 +50,44 @@ ALLOCATION_CACHE_TTL = 10  # 10 seconds for allocation calculations
 
 router = APIRouter(prefix="/momentum-portfolio", tags=["Momentum"])
 
+
+def _get_journal_service_from_request(request: Optional[Request]):
+    if request is None:
+        return None
+    app = getattr(request, "app", None)
+    state = getattr(app, "state", None)
+    return getattr(state, "journal_service", None) if state is not None else None
+
+
+def _ensure_momentum_journal_run(
+    request: Optional[Request],
+    *,
+    strategy_name: str,
+    tag: str,
+    linked_index_symbol: str,
+    cycle_type: str,
+) -> Optional[str]:
+    journal_service = _get_journal_service_from_request(request)
+    if journal_service is None:
+        return None
+    try:
+        return journal_service.ensure_investment_run(
+            portfolio_tag=tag,
+            strategy_name=strategy_name,
+            execution_mode="live",
+            source_key_2=strategy_name,
+            metadata={
+                "investment_strategy": {
+                    "tag": tag,
+                    "linked_index_symbol": linked_index_symbol,
+                    "cycle_type": cycle_type,
+                }
+            },
+        )
+    except Exception as exc:
+        logger.warning("Failed to ensure journal run for momentum tag %s: %s", tag, exc)
+        return None
+
 @contextmanager
 def get_db_cursor():
     """
@@ -407,6 +445,7 @@ class EnterPortfolioRequest(BaseModel):
 @router.post("/enter")
 async def enter_portfolio_endpoint(
     req: EnterPortfolioRequest,
+    request: Request,
     kite: KiteConnect = Depends(get_kite)
 ):
     """
@@ -509,12 +548,21 @@ async def enter_portfolio_endpoint(
                     status_code=400, 
                     detail=f"No COMPLETE BUY orders found. WebSocket records: {ws_records}"
                 )
+
+            journal_run_id = _ensure_momentum_journal_run(
+                request,
+                strategy_name=req.strategy_name,
+                tag=tag,
+                linked_index_symbol=req.linked_index_symbol,
+                cycle_type="portfolio_enter",
+            )
             
         return {
             "status": "success", 
             "message": f"Portfolio '{tag}' saved with {inserted_count} holdings.", 
             "tag": tag,
-            "holdings_count": inserted_count
+            "holdings_count": inserted_count,
+            "journal_run_id": journal_run_id,
         }
 
     except HTTPException:
@@ -547,6 +595,7 @@ class PlaceAndEnterResponse(BaseModel):
     order_results: List[Dict[str, Any]]
     portfolio_tag: str
     total_invested: float
+    journal_run_id: Optional[str] = None
 
 
 @router.post("/place-and-enter", response_model=PlaceAndEnterResponse)
@@ -706,8 +755,17 @@ async def place_orders_and_enter_portfolio(
             message = "All orders failed - no holdings created"
         
         logger.info(f"[PLACE-AND-ENTER] Complete: status={status}, holdings={len(successful_holdings)}, invested={total_invested}")
+        journal_run_id = None
+        if successful_holdings:
+            journal_run_id = _ensure_momentum_journal_run(
+                request,
+                strategy_name=req.strategy_name,
+                tag=tag,
+                linked_index_symbol=req.linked_index_symbol,
+                cycle_type="place_and_enter",
+            )
         
-        return PlaceAndEnterResponse(
+        response = PlaceAndEnterResponse(
             status=status,
             message=message,
             orders_placed=orders_placed,
@@ -715,7 +773,10 @@ async def place_orders_and_enter_portfolio(
             order_results=[r.model_dump() for r in order_response.results],
             portfolio_tag=tag,
             total_invested=round(total_invested, 2)
-        )
+        ).model_dump(mode="json")
+        if journal_run_id:
+            response["journal_run_id"] = journal_run_id
+        return response
 
     except HTTPException:
         raise
@@ -1230,7 +1291,7 @@ class RebalanceExecutionRequest(BaseModel):
     linked_index_symbol: str = "NIFTY 50"
 
 @router.post("/execute-rebalance")
-async def execute_rebalance_endpoint(req: RebalanceExecutionRequest):
+async def execute_rebalance_endpoint(req: RebalanceExecutionRequest, request: Request):
     """
     Execute rebalance by placing basket orders and updating database state.
     Handles exits, adjustments, and new entries.
@@ -1382,13 +1443,24 @@ async def execute_rebalance_endpoint(req: RebalanceExecutionRequest):
         total_orders = len(sell_results) + len(buy_results)
         successful_orders = len([r for r in sell_results + buy_results if r.get('status') == 'success'])
         
+        journal_run_id = None
+        if req.entries:
+            journal_run_id = _ensure_momentum_journal_run(
+                request,
+                strategy_name=req.strategy_name,
+                tag=req.tag or f"MOMENTUM_{datetime.now().strftime('%Y_%m_%d')}",
+                linked_index_symbol=req.linked_index_symbol,
+                cycle_type="rebalance",
+            )
+
         return {
             "status": "success" if successful_orders == total_orders else "partial",
             "message": f"Rebalance executed: {successful_orders}/{total_orders} orders successful",
             "sell_results": sell_results,
             "buy_results": buy_results,
             "successful_count": successful_orders,
-            "total_count": total_orders
+            "total_count": total_orders,
+            "journal_run_id": journal_run_id,
         }
         
     except Exception as e:

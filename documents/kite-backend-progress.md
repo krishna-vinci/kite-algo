@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-04-05
+Last updated: 2026-04-14
 
 ## Scope
 
@@ -24,6 +24,20 @@ Do not use this file for frontend work.
 
 ## Newly implemented in current branch
 
+- Added the next trading journal backend slice:
+  - new `journaling/service.py` for run orchestration, source links, decision events, benchmark daily-price refresh, and run summary/benchmark comparison queries
+  - new `journaling/runtime.py` restart-safe helper that persists projection cursor state and periodically refreshes benchmark data / recent run summaries without Celery
+  - new backend-only journal router in `api/routers/journal.py` for create/update run, append decision events, link sources, run detail/list, and summary endpoints
+  - wired the journal router into `main.py` and added an OpenAPI tag
+  - added operator scripts `scripts/backfill_trading_journal.py` and `scripts/recompute_journal_metrics.py`
+  - added focused journal service/router/runtime tests
+  - added bounded phase-2 attribution hooks for option-strategy auto-linking, paper runtime journal refs, algo-trigger decision capture, and momentum investment-tag linkage
+- Completed the current trading journal backend scope:
+  - aggregate journal summaries for day/week/month/year/since-inception
+  - aggregate benchmark comparison endpoint and summary alias endpoint used by the frontend
+  - calendar, trades, strategies, review queue, rules, and insights backend routes
+  - safer review-state validation and paginated run/trade route support
+  - stronger option-strategy lifecycle syncing from `option_strategy_runs` into journal state
 - Added websocket re-architecture documentation for a unified Go market-runtime service in `documents/websocket-runtime/`
 - Extended the local `kite-backend-progress` skill so websocket work must also consult and maintain the websocket-runtime docs
 - Added initial Go market-runtime scaffold in `market-runtime/` with:

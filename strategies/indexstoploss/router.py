@@ -66,7 +66,9 @@ def _get_position_builder(request: Request):
 
 def _get_option_strategy_store(request: Request) -> OptionStrategyStore:
     if not hasattr(request.app.state, "option_strategy_store"):
-        request.app.state.option_strategy_store = OptionStrategyStore()
+        request.app.state.option_strategy_store = OptionStrategyStore(
+            journal_service=getattr(request.app.state, "journal_service", None),
+        )
     return request.app.state.option_strategy_store
 
 
@@ -215,6 +217,7 @@ class BuildPositionRequest(BaseModel):
     risk_amount: Optional[float] = None
     protection_config: Optional[Dict[str, Any]] = None
     current_spot: Optional[float] = None
+    entry_surface: Optional[str] = None
     execution_mode: Optional[StrategyExecutionMode] = None
     account_scope: str = "default"
     enable_runtime_monitoring: bool = True
@@ -353,9 +356,21 @@ async def build_position(
             selected_legs=plan.get("strategy_legs") or [item.model_dump(mode="json") for item in (req.selected_strikes or [])],
             canonical_strategy=strategy_preview,
             order_plan=plan,
+            entry_surface=req.entry_surface,
         )
+        journal_run_id = strategy_store.get_linked_journal_run_id(strategy_id)
 
         runtime_instance = _build_runtime_instance_for_plan(request, req, plan, strategy_id, strategy_preview, execution_mode)
+        if runtime_instance is not None and journal_run_id:
+            runtime_instance = runtime_instance.model_copy(
+                update={
+                    "metadata": {
+                        **runtime_instance.metadata,
+                        "journal_run_id": journal_run_id,
+                        "journal_ref": f"option_strategy_run:{strategy_id}",
+                    }
+                }
+            )
         if runtime_instance is not None and execution_mode == StrategyExecutionMode.LIVE.value:
             runtime_instance = runtime_instance.model_copy(update={"status": AlgoLifecycleState.PAUSED})
         algo_instance_id = await _arm_runtime_monitoring(request, runtime_instance)
@@ -386,6 +401,8 @@ async def build_position(
                     "strategy_tag": strategy_preview["inferred_structure"],
                     "option_strategy_id": strategy_id,
                     "algo_instance_id": algo_instance_id,
+                    "journal_run_id": journal_run_id,
+                    "journal_ref": f"option_strategy_run:{strategy_id}",
                     "notes": f"options-page:{strategy_preview['user_intent']}",
                 },
             )
@@ -402,6 +419,7 @@ async def build_position(
                 "mode": StrategyExecutionMode.PAPER.value,
                 "status": status,
                 "strategy_id": strategy_id,
+                "journal_run_id": journal_run_id,
                 "algo_instance_id": algo_instance_id,
                 "strategy": strategy_preview,
                 "plan": plan,
@@ -463,6 +481,7 @@ async def build_position(
                 "orders_failed": orders_failed,
                 "strategy": strategy_preview,
                 "strategy_id": strategy_id,
+                "journal_run_id": journal_run_id,
                 "algo_instance_id": algo_instance_id,
                 "message": "All orders failed to place",
             }
@@ -486,6 +505,7 @@ async def build_position(
             "orders_placed": orders_placed,
             "orders_failed": orders_failed,
             "strategy_id": strategy_id,
+            "journal_run_id": journal_run_id,
             "algo_instance_id": algo_instance_id,
             "strategy": strategy_preview,
             "plan": plan,

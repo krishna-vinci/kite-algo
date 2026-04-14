@@ -43,6 +43,9 @@ from api.routers.historical import router as historical_router
 from api.routers.ingestion import router as ingestion_router
 from api.routers.user_settings import router as user_settings_router
 from api.routers.marketwatch import router as marketwatch_router
+from journaling.runtime import JournalRuntimeWorker
+from api.routers.journal import router as journal_router
+from journaling.service import JournalService
 
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -197,6 +200,7 @@ async def combined_lifespan(app: FastAPI):
     index_refresh_task = None
     order_runtime_task = None
     positions_runtime_task = None
+    journal_runtime_worker = None
     set_component_status("app", "starting", detail="Application startup in progress")
     try:
         # Ensure the schema is applied before any other database operations
@@ -270,6 +274,11 @@ async def combined_lifespan(app: FastAPI):
 
         server.mcp_kite_instance = kite
         logging.info("MCP Kite instance initialized successfully.")
+        app.state.journal_service = JournalService()
+        journal_runtime_worker = JournalRuntimeWorker(service=app.state.journal_service)
+        await journal_runtime_worker.start()
+        app.state.journal_runtime_worker = journal_runtime_worker
+        set_component_status("journal_runtime", "healthy", detail="Trading journal runtime worker started")
 
         # Ensure async DB is connected (required for Meilisearch reindex and other async ops)
         try:
@@ -570,7 +579,10 @@ async def combined_lifespan(app: FastAPI):
                 positions_reader=PositionsSnapshotReader(realtime_positions_service),
                 orders_reader=OrderProjectionReader(),
             )
-            paper_runtime_service = PaperTradingService(market_data_runtime=market_data_runtime)
+            paper_runtime_service = PaperTradingService(
+                market_data_runtime=market_data_runtime,
+                journal_service=getattr(app.state, "journal_service", None),
+            )
             app.state.paper_runtime_service = paper_runtime_service
             algo_runtime_service = AlgoRuntimeService(
                 AlgoKernel(
@@ -578,6 +590,7 @@ async def combined_lifespan(app: FastAPI):
                     repository=SqlAlchemyAlgoRepository(),
                     state_store=InMemoryAlgoStateStore(),
                     snapshot_builder=snapshot_builder,
+                    journal_service=getattr(app.state, "journal_service", None),
                     intent_bridge=IntentBridge(
                         live_order_intent_handler=KiteOrdersIntentHandler(),
                         paper_order_intent_handler=PaperIntentHandler(paper_runtime_service),
@@ -728,6 +741,14 @@ async def combined_lifespan(app: FastAPI):
 
     # Stop modular algo runtime service
     try:
+        journal_runtime_worker = getattr(app.state, "journal_runtime_worker", None)
+        if journal_runtime_worker:
+            await journal_runtime_worker.stop()
+            set_component_status("journal_runtime", "stopped", detail="Trading journal runtime worker stopped")
+    except Exception:
+        pass
+
+    try:
         algo_runtime_live_worker = getattr(app.state, "algo_runtime_live_worker", None)
         if algo_runtime_live_worker:
             await algo_runtime_live_worker.stop()
@@ -779,6 +800,7 @@ app.include_router(historical_router, prefix="/api")
 app.include_router(ingestion_router, prefix="/api")
 app.include_router(user_settings_router, prefix="/api")
 app.include_router(marketwatch_router, prefix="/api")
+app.include_router(journal_router, prefix="/api")
 app.include_router(kite_orders_router, prefix="/api")
 app.include_router(kite_mutual_funds_router, prefix="/api")
 app.include_router(options_router, prefix="/api")
