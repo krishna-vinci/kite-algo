@@ -2,20 +2,17 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
-import { ChartStrip } from "@/components/options/chart-strip";
 import { FloatingOrderTicket } from "@/components/options/floating-order-ticket";
 import { NiftyImpactPanel } from "@/components/options/nifty-impact-panel";
 import { OptionChainPanel } from "@/components/options/option-chain-panel";
 import { OptionsHeader } from "@/components/options/options-header";
 import { PositionsDock } from "@/components/options/positions-dock";
 import { StrategyBuilderPanel } from "@/components/options/strategy-builder-panel";
-import type { CandlePoint, ChartTimeframe, LivePosition, MiniChainSnapshot, NiftyImpactRow, OptionSessionSnapshot, RuntimeStatus, Underlying } from "@/components/options/types";
+import type { LivePosition, MiniChainSnapshot, NiftyImpactRow, OptionSessionSnapshot, RuntimeStatus, Underlying } from "@/components/options/types";
 import { WorkspaceTabs } from "@/components/options/workspace-tabs";
 import {
-  buildCandlesStreamUrl,
   buildOptionsSessionSseUrl,
   ensureOptionsSessions,
-  fetchCandles,
   fetchNifty50Impact,
   fetchOptionSession,
   fetchRealtimePositions,
@@ -141,60 +138,6 @@ function createFallbackSession(underlying: Underlying): OptionSessionSnapshot {
   };
 }
 
-type CandleStreamSnapshotEvent = {
-  instrument_token: number;
-  interval: string;
-  candles: unknown[][];
-};
-
-type CandleStreamUpdateEvent = {
-  event: "tick" | "candle";
-  instrument_token: number;
-  interval: string;
-  candle: unknown[];
-};
-
-function parseStreamCandle(candle: unknown[]): CandlePoint | null {
-  if (!Array.isArray(candle) || candle.length < 6) {
-    return null;
-  }
-  const timeValue = candle[0];
-  const isoMillis = typeof timeValue === "string" ? Date.parse(timeValue) : Number(timeValue) * 1000;
-  if (!Number.isFinite(isoMillis)) {
-    return null;
-  }
-  const open = Number(candle[1]);
-  const high = Number(candle[2]);
-  const low = Number(candle[3]);
-  const close = Number(candle[4]);
-  const volume = Number(candle[5] ?? 0);
-  if (![open, high, low, close, volume].every(Number.isFinite)) {
-    return null;
-  }
-  return {
-    time: Math.floor(isoMillis / 1000),
-    open,
-    high,
-    low,
-    close,
-    volume,
-  };
-}
-
-function mergeCandleSeries(current: CandlePoint[], incoming: CandlePoint[]): CandlePoint[] {
-  if (incoming.length === 0) {
-    return current;
-  }
-  const merged = new Map<number, CandlePoint>();
-  for (const candle of current) {
-    merged.set(candle.time, candle);
-  }
-  for (const candle of incoming) {
-    merged.set(candle.time, candle);
-  }
-  return Array.from(merged.values()).sort((left, right) => left.time - right.time);
-}
-
 function toMiniChainSnapshot(session: OptionSessionSnapshot | null | undefined, expiry: string | null): MiniChainSnapshot | null {
   if (!session || !expiry) {
     return null;
@@ -287,12 +230,34 @@ function createFallbackImpact(): NiftyImpactRow[] {
   ];
 }
 
+function SpotTicker({ label, price, forwardPrice }: Readonly<{ label: string; price: number | null; forwardPrice: number | null }>) {
+  const basis = price !== null && forwardPrice !== null ? forwardPrice - price : null;
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="text-[10px] uppercase tracking-[0.14em] text-[var(--dim)]">{label}</span>
+      <span className="font-mono text-xs text-[var(--text)]">
+        {price === null ? "—" : price.toLocaleString("en-IN", { maximumFractionDigits: 2 })}
+      </span>
+      {forwardPrice !== null && (
+        <>
+          <span className="text-[9px] uppercase text-[var(--dim)]">f</span>
+          <span className="font-mono text-[11px] text-[var(--blue)]">
+            {forwardPrice.toLocaleString("en-IN", { maximumFractionDigits: 2 })}
+          </span>
+        </>
+      )}
+      {basis !== null && (
+        <span className="font-mono text-[10px] text-[var(--muted)]">
+          {basis >= 0 ? "+" : ""}{basis.toFixed(1)}
+        </span>
+      )}
+    </div>
+  );
+}
+
 export function OptionsWorkspace() {
   const [activeTab, setActiveTab] = useState<"chain" | "builder" | "impact">("builder");
   const [underlying, setUnderlying] = useState<Underlying>("NIFTY");
-  const [chartHeight, setChartHeight] = useState(240);
-  const [splitPercent, setSplitPercent] = useState(50);
-  const [timeframe, setTimeframe] = useState<ChartTimeframe>("15m");
   const [deltaFilter, setDeltaFilter] = useState(0.3);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>(createFallbackRuntimeStatus());
   const [loginPending, setLoginPending] = useState(false);
@@ -310,9 +275,6 @@ export function OptionsWorkspace() {
   const [drawerType, setDrawerType] = useState<"call" | "put">("call");
   const [drawerSide, setDrawerSide] = useState<"long" | "short">("long");
   const [drawerVersion, setDrawerVersion] = useState(0);
-  const [chartLoading, setChartLoading] = useState(false);
-  const [chartCandles, setChartCandles] = useState<Record<Underlying, CandlePoint[]>>({ NIFTY: [], BANKNIFTY: [] });
-  const [liveCandles, setLiveCandles] = useState<Record<Underlying, CandlePoint | null>>({ NIFTY: null, BANKNIFTY: null });
 
   useEffect(() => {
     if (!runtimeStatus.appAuthenticated) {
@@ -421,90 +383,6 @@ export function OptionsWorkspace() {
     setSelectedExpiry((current) => (nextExpiries.includes(current) ? current : nextExpiries[0] ?? fallbackExpiry));
   }, [sessions, underlying]);
 
-  useEffect(() => {
-    if (!runtimeStatus.appAuthenticated) {
-      setChartLoading(false);
-      setChartCandles({ NIFTY: [], BANKNIFTY: [] });
-      setLiveCandles({ NIFTY: null, BANKNIFTY: null });
-      return;
-    }
-
-    let disposed = false;
-    const streams: EventSource[] = [];
-
-    // Clear stale candle data when timeframe changes
-    setChartCandles({ NIFTY: [], BANKNIFTY: [] });
-    setLiveCandles({ NIFTY: null, BANKNIFTY: null });
-
-    async function loadCharts() {
-      setChartLoading(true);
-      try {
-        const toIso = new Date().toISOString();
-        const fromDate = new Date();
-        fromDate.setMonth(fromDate.getMonth() - 3);
-        const fromIso = fromDate.toISOString();
-        const [nifty, banknifty] = await Promise.all([
-          fetchCandles({ identifier: INDEX_TOKENS.NIFTY, timeframe, fromIso, toIso }),
-          fetchCandles({ identifier: INDEX_TOKENS.BANKNIFTY, timeframe, fromIso, toIso }),
-        ]);
-        if (!disposed) {
-          setChartCandles((current) => ({
-            NIFTY: mergeCandleSeries(nifty, current.NIFTY),
-            BANKNIFTY: mergeCandleSeries(banknifty, current.BANKNIFTY),
-          }));
-        }
-      } catch {
-        if (!disposed) {
-          toast.error("Unable to load live candles. Check auth/session and candles API.");
-        }
-      } finally {
-        if (!disposed) {
-          setChartLoading(false);
-        }
-      }
-    }
-
-    void loadCharts();
-
-    for (const [item, token] of Object.entries(INDEX_TOKENS) as Array<[Underlying, string]>) {
-      const source = new EventSource(buildCandlesStreamUrl(token, timeframe), { withCredentials: true });
-      source.addEventListener("snapshot", (event) => {
-        try {
-          const payload = JSON.parse((event as MessageEvent).data) as CandleStreamSnapshotEvent;
-          const incoming = payload.candles.map(parseStreamCandle).filter((value): value is CandlePoint => Boolean(value));
-          if (!disposed) {
-            // SSE snapshot provides fresh historical base, overwriting any stale leftovers
-            setChartCandles((current) => ({ ...current, [item]: mergeCandleSeries(current[item], incoming) }));
-            setLiveCandles((current) => ({ ...current, [item]: incoming[incoming.length - 1] ?? current[item] }));
-          }
-        } catch {
-          // ignore malformed snapshot payloads
-        }
-      });
-      const handleCandleUpdate = (event: Event) => {
-        try {
-          const payload = JSON.parse((event as MessageEvent).data) as CandleStreamUpdateEvent;
-          const nextCandle = parseStreamCandle(payload.candle);
-          if (!nextCandle || disposed) {
-            return;
-          }
-          setChartCandles((current) => ({ ...current, [item]: mergeCandleSeries(current[item], [nextCandle]) }));
-          setLiveCandles((current) => ({ ...current, [item]: nextCandle }));
-        } catch {
-          // ignore malformed update payloads
-        }
-      };
-      source.addEventListener("tick", handleCandleUpdate);
-      source.addEventListener("candle", handleCandleUpdate);
-      streams.push(source);
-    }
-
-    return () => {
-      disposed = true;
-      streams.forEach((source) => source.close());
-    };
-  }, [runtimeStatus.appAuthenticated, timeframe]);
-
   const primarySession = sessions.NIFTY;
   const secondarySession = sessions.BANKNIFTY;
   const chain = useMemo(() => {
@@ -515,31 +393,11 @@ export function OptionsWorkspace() {
     return createFallbackMiniChain(underlying, selectedExpiry || undefined);
   }, [selectedExpiry, sessions, underlying]);
   const chainLoading = runtimeStatus.appAuthenticated && !toMiniChainSnapshot(sessions[underlying], selectedExpiry);
-  const primaryForward = useMemo(() => readForwardPrice(primarySession), [primarySession]);
-  const secondaryForward = useMemo(() => readForwardPrice(secondarySession), [secondarySession]);
+  const primaryForward = useMemo(() => (runtimeStatus.appAuthenticated ? readForwardPrice(primarySession) : null), [primarySession, runtimeStatus.appAuthenticated]);
+  const secondaryForward = useMemo(() => (runtimeStatus.appAuthenticated ? readForwardPrice(secondarySession) : null), [secondarySession, runtimeStatus.appAuthenticated]);
 
-  const primaryPrice = useMemo(() => {
-    const candles = chartCandles.NIFTY;
-    return candles.length > 0 ? candles[candles.length - 1]?.close ?? null : runtimeStatus.appAuthenticated ? primarySession?.spotLtp ?? null : null;
-  }, [chartCandles.NIFTY, primarySession?.spotLtp, runtimeStatus.appAuthenticated]);
-  const secondaryPrice = useMemo(() => {
-    const candles = chartCandles.BANKNIFTY;
-    return candles.length > 0 ? candles[candles.length - 1]?.close ?? null : runtimeStatus.appAuthenticated ? secondarySession?.spotLtp ?? null : null;
-  }, [chartCandles.BANKNIFTY, runtimeStatus.appAuthenticated, secondarySession?.spotLtp]);
-  const primaryChange = useMemo(() => {
-    const candles = chartCandles.NIFTY;
-    if (candles.length < 2) return null;
-    const previous = candles[candles.length - 2]?.close ?? candles[0]?.close;
-    const latest = candles[candles.length - 1]?.close;
-    return previous ? ((latest - previous) / previous) * 100 : null;
-  }, [chartCandles.NIFTY]);
-  const secondaryChange = useMemo(() => {
-    const candles = chartCandles.BANKNIFTY;
-    if (candles.length < 2) return null;
-    const previous = candles[candles.length - 2]?.close ?? candles[0]?.close;
-    const latest = candles[candles.length - 1]?.close;
-    return previous ? ((latest - previous) / previous) * 100 : null;
-  }, [chartCandles.BANKNIFTY]);
+  const primaryPrice = useMemo(() => (runtimeStatus.appAuthenticated ? primarySession?.spotLtp ?? null : null), [primarySession?.spotLtp, runtimeStatus.appAuthenticated]);
+  const secondaryPrice = useMemo(() => (runtimeStatus.appAuthenticated ? secondarySession?.spotLtp ?? null : null), [secondarySession?.spotLtp, runtimeStatus.appAuthenticated]);
 
   async function handleBrokerLogin() {
     if (!runtimeStatus.appAuthenticated) {
@@ -559,9 +417,10 @@ export function OptionsWorkspace() {
   }
 
   return (
-    <div className="flex h-[calc(100vh-5.5rem)] min-h-[48rem] flex-col gap-2 pb-2">
+    <div className="flex h-[calc(100vh-5.5rem)] min-h-[36rem] flex-col gap-2 pb-2">
       <OptionsHeader status={runtimeStatus} onBrokerLogin={handleBrokerLogin} loginPending={loginPending} />
 
+      {/* Underlying selector + compact spot ticker */}
       <div className="flex items-center gap-2 rounded-2xl border border-[var(--border)] bg-[var(--panel)] px-3 py-2">
         {(["NIFTY", "BANKNIFTY"] as Underlying[]).map((item) => (
           <button
@@ -573,21 +432,12 @@ export function OptionsWorkspace() {
             {item}
           </button>
         ))}
+        <span className="mx-2 h-[18px] w-px bg-[var(--border-soft)]" />
+        <SpotTicker label="NIFTY" price={primaryPrice} forwardPrice={primaryForward} />
+        <span className="mx-1 h-[18px] w-px bg-[var(--border-soft)]" />
+        <SpotTicker label="BNF" price={secondaryPrice} forwardPrice={secondaryForward} />
         <span className="ml-auto text-[10px] text-[var(--dim)]">auto-managed sessions</span>
       </div>
-
-      {/* Auth warning is now shown inline in the header StatusPill area */}
-
-      <ChartStrip
-        chartHeight={chartHeight}
-        splitPercent={splitPercent}
-        timeframe={timeframe}
-        onChartHeightChange={setChartHeight}
-        onSplitPercentChange={setSplitPercent}
-        onTimeframeChange={setTimeframe}
-        primary={{ label: "NIFTY", price: primaryPrice, changePercent: primaryChange, forwardPrice: primaryForward, candles: chartCandles.NIFTY, liveCandle: liveCandles.NIFTY, loading: chartLoading }}
-        secondary={{ label: "BANKNIFTY", price: secondaryPrice, changePercent: secondaryChange, forwardPrice: secondaryForward, candles: chartCandles.BANKNIFTY, liveCandle: liveCandles.BANKNIFTY, loading: chartLoading }}
-      />
 
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg)]/60">
         <WorkspaceTabs activeTab={activeTab} onTabChange={setActiveTab} />

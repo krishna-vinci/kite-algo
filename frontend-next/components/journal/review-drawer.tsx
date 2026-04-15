@@ -188,6 +188,8 @@ export function ReviewDrawer({ runId, onClose, onUpdated }: ReviewDrawerProps) {
                 onChange={(e) => setNotes(e.target.value)}
                 placeholder="Add your review notes here..."
                 rows={4}
+                name="journal-review-notes"
+                autoComplete="off"
                 className="w-full rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-sm text-foreground/90 placeholder:text-foreground/30 focus:border-primary/40 focus:outline-none"
               />
             </Panel>

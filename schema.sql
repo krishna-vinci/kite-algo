@@ -1213,14 +1213,27 @@ CREATE TABLE IF NOT EXISTS public.journal_metric_snapshots (
     id BIGSERIAL PRIMARY KEY,
     subject_type TEXT NOT NULL,
     subject_id TEXT NOT NULL,
-    window TEXT NOT NULL,
+    time_window TEXT NOT NULL,
     calc_version TEXT NOT NULL,
     computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     metrics_json JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'journal_metric_snapshots'
+          AND column_name = 'window'
+    ) THEN
+        EXECUTE 'ALTER TABLE public.journal_metric_snapshots RENAME COLUMN "window" TO time_window';
+    END IF;
+END $$;
+
 CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_metric_snapshots_subject_window_version
-    ON public.journal_metric_snapshots (subject_type, subject_id, window, calc_version);
+    ON public.journal_metric_snapshots (subject_type, subject_id, time_window, calc_version);
 
 CREATE INDEX IF NOT EXISTS idx_journal_metric_snapshots_lookup
     ON public.journal_metric_snapshots (subject_type, subject_id, computed_at DESC);

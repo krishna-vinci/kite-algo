@@ -868,10 +868,10 @@ class JournalRepository:
                         SUM(COALESCE(jms.metrics_json ->> 'net_pnl', '0')::numeric) AS net_pnl,
                         SUM(COALESCE(jms.metrics_json ->> 'total_fees', '0')::numeric) AS total_fees
                     FROM public.journal_runs jr
-                    LEFT JOIN public.journal_metric_snapshots jms
-                      ON jms.subject_type = 'run'
-                     AND jms.subject_id = CAST(jr.id AS text)
-                     AND jms.window = 'since_inception'
+                     LEFT JOIN public.journal_metric_snapshots jms
+                       ON jms.subject_type = 'run'
+                      AND jms.subject_id = CAST(jr.id AS text)
+                      AND jms.time_window = 'since_inception'
                     WHERE (:strategy_family IS NULL OR jr.strategy_family = :strategy_family)
                     GROUP BY jr.strategy_family, COALESCE(jr.strategy_name, 'Unspecified')
                     ORDER BY latest_started_at DESC NULLS LAST
@@ -916,10 +916,10 @@ class JournalRepository:
                     LEFT JOIN public.journal_execution_facts jef ON jef.run_id = jr.id
                     LEFT JOIN public.journal_decision_events jde ON jde.run_id = jr.id
                     LEFT JOIN public.journal_source_links jsl ON jsl.run_id = jr.id
-                    LEFT JOIN public.journal_metric_snapshots jms
-                      ON jms.subject_type = 'run'
-                     AND jms.subject_id = CAST(jr.id AS text)
-                     AND jms.window = 'since_inception'
+                     LEFT JOIN public.journal_metric_snapshots jms
+                       ON jms.subject_type = 'run'
+                      AND jms.subject_id = CAST(jr.id AS text)
+                      AND jms.time_window = 'since_inception'
                     WHERE jr.review_state IN ('pending', 'in_progress')
                       AND (:review_state IS NULL OR jr.review_state = :review_state)
                     GROUP BY jr.id, jms.metrics_json
@@ -1091,7 +1091,7 @@ class JournalRepository:
                     INSERT INTO public.journal_metric_snapshots (
                         subject_type,
                         subject_id,
-                        window,
+                        time_window,
                         calc_version,
                         computed_at,
                         metrics_json
@@ -1103,7 +1103,7 @@ class JournalRepository:
                         :computed_at,
                         CAST(:metrics_json AS jsonb)
                     )
-                    ON CONFLICT (subject_type, subject_id, window, calc_version) DO UPDATE
+                    ON CONFLICT (subject_type, subject_id, time_window, calc_version) DO UPDATE
                     SET computed_at = EXCLUDED.computed_at,
                         metrics_json = EXCLUDED.metrics_json
                     RETURNING id
@@ -1325,7 +1325,7 @@ class JournalRepository:
                     FROM public.journal_metric_snapshots
                     WHERE subject_type = :subject_type
                       AND subject_id = :subject_id
-                      AND (:window IS NULL OR window = :window)
+                      AND (:window IS NULL OR time_window = :window)
                       AND (:calc_version IS NULL OR calc_version = :calc_version)
                     ORDER BY computed_at DESC, id DESC
                     LIMIT 1
@@ -1483,7 +1483,7 @@ class JournalRepository:
             id=payload.get("id"),
             subject_type=payload.get("subject_type"),
             subject_id=payload.get("subject_id"),
-            window=payload.get("window"),
+            window=payload.get("time_window") or payload.get("window"),
             calc_version=payload.get("calc_version"),
             computed_at=payload.get("computed_at") or datetime.utcnow(),
             metrics=_decode_json_field(payload.get("metrics_json")) or {},

@@ -62,7 +62,7 @@ export function RuleEditorDialog({ rule, mode, onClose, onSaved }: RuleEditorDia
           {mode === "create" ? "New rule" : "Edit rule"}
         </h2>
 
-        <form onSubmit={handleSubmit} className="mt-4 space-y-4">
+        <form onSubmit={handleSubmit} autoComplete="off" className="mt-4 space-y-4">
           <div>
             <label htmlFor="rule-title" className="block text-[10px] uppercase tracking-[0.35em] text-foreground/40">
               Title
@@ -74,6 +74,8 @@ export function RuleEditorDialog({ rule, mode, onClose, onSaved }: RuleEditorDia
               onChange={(e) => setTitle(e.target.value)}
               placeholder="e.g. Never average down on losing positions"
               required
+              name="journal-rule-title"
+              autoComplete="off"
               className="mt-1 w-full rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-sm text-foreground/90 placeholder:text-foreground/30 focus:border-primary/40 focus:outline-none"
             />
           </div>
@@ -88,6 +90,8 @@ export function RuleEditorDialog({ rule, mode, onClose, onSaved }: RuleEditorDia
               onChange={(e) => setDescription(e.target.value)}
               placeholder="Explain the rule rationale and conditions..."
               rows={3}
+              name="journal-rule-description"
+              autoComplete="off"
               className="mt-1 w-full rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-sm text-foreground/90 placeholder:text-foreground/30 focus:border-primary/40 focus:outline-none"
             />
           </div>
@@ -101,6 +105,8 @@ export function RuleEditorDialog({ rule, mode, onClose, onSaved }: RuleEditorDia
                 id="rule-category"
                 value={category}
                 onChange={(e) => setCategory(e.target.value)}
+                name="journal-rule-category"
+                autoComplete="off"
                 className="mt-1 w-full rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-sm text-foreground/90 focus:border-primary/40 focus:outline-none"
               >
                 {CATEGORIES.map((c) => (
@@ -120,6 +126,8 @@ export function RuleEditorDialog({ rule, mode, onClose, onSaved }: RuleEditorDia
                   id="rule-state"
                   value={state}
                   onChange={(e) => setState(e.target.value as RuleState)}
+                  name="journal-rule-state"
+                  autoComplete="off"
                   className="mt-1 w-full rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-sm text-foreground/90 focus:border-primary/40 focus:outline-none"
                 >
                   {RULE_STATES.map((s) => (

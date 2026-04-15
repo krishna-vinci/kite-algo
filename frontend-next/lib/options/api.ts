@@ -184,15 +184,17 @@ export async function loginToBroker(): Promise<{ authenticated?: boolean; sessio
 
 export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
   const response = await apiFetch<SessionStatusResponse>("/api/auth/session-status");
+  const brokerStatus = response.broker?.status ? response.broker.status.toLowerCase() : "unknown";
+  const websocketStatus = response.runtime?.websocket?.status ? response.runtime.websocket.status.toLowerCase() : "unknown";
   return {
     brokerConnected: Boolean(response.broker?.connected),
-    brokerStatus: response.broker?.status ?? "unknown",
+    brokerStatus: brokerStatus as RuntimeStatus["brokerStatus"],
     brokerMode: response.broker?.mode ?? "system",
     brokerLastSuccessAt: response.broker?.last_login?.last_success_at ?? null,
     brokerLastFailureAt: response.broker?.last_login?.last_failure_at ?? null,
     brokerLastError: response.broker?.last_login?.last_error ?? null,
     brokerNextRefreshAt: response.broker?.scheduler?.next_run ?? null,
-    websocketStatus: response.runtime?.websocket?.status ?? "unknown",
+    websocketStatus: websocketStatus,
     paperAvailable: Boolean(response.runtime?.paper_runtime?.available),
     appAuthenticated: Boolean(response.app?.authenticated),
   };

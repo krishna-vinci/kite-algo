@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { CandlestickSeries, createChart, type IChartApi, type ISeriesApi, type Logical, type Time } from "lightweight-charts";
 import type { CandlePoint, ChartTimeframe } from "@/components/options/types";
 
-type LightweightChartPanelProps = Readonly<{
+type QuickTradeChartPanelProps = Readonly<{
   label: string;
   price: number | null;
   changePercent: number | null;
@@ -12,15 +12,14 @@ type LightweightChartPanelProps = Readonly<{
   timeframe: ChartTimeframe;
   candles: CandlePoint[];
   liveCandle?: CandlePoint | null;
-  /** Monotonic counter that bumps when history data has been replaced (REST fetch or snapshot). */
-  historyGeneration?: number;
+  historyGeneration: number;
   loading?: boolean;
   onTimeframeChange: (value: ChartTimeframe) => void;
 }>;
 
-const timeframes: ChartTimeframe[] = ["5m", "15m", "60m", "1d"];
+const TIMEFRAMES: ChartTimeframe[] = ["5m", "15m", "60m", "1d"];
 
-function formatSeriesData(candles: CandlePoint[]) {
+function toSeriesData(candles: CandlePoint[]) {
   return candles.map((candle) => ({
     time: Math.floor(candle.time) as Time,
     open: candle.open,
@@ -30,16 +29,46 @@ function formatSeriesData(candles: CandlePoint[]) {
   }));
 }
 
-export function LightweightChartPanel({ label, price, changePercent, forwardPrice, timeframe, candles, liveCandle = null, historyGeneration = 0, loading = false, onTimeframeChange }: LightweightChartPanelProps) {
+function mergeLiveBar(history: ReturnType<typeof toSeriesData>, liveBar: ReturnType<typeof toSeriesData>[number] | null) {
+  if (!liveBar) {
+    return history;
+  }
+  const next = [...history];
+  const lastIndex = next.length - 1;
+  if (lastIndex >= 0 && Number(next[lastIndex]?.time) === Number(liveBar.time)) {
+    next[lastIndex] = liveBar;
+    return next;
+  }
+  if (lastIndex >= 0 && Number(next[lastIndex]?.time) > Number(liveBar.time)) {
+    return next;
+  }
+  next.push(liveBar);
+  return next;
+}
+
+export function QuickTradeChartPanel({
+  label,
+  price,
+  changePercent,
+  forwardPrice,
+  timeframe,
+  candles,
+  liveCandle = null,
+  historyGeneration,
+  loading = false,
+  onTimeframeChange,
+}: QuickTradeChartPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const appliedGenerationRef = useRef(-1);
+  const appliedGenerationRef = useRef<number>(-1);
+  const lastSeriesTimeRef = useRef<number | null>(null);
   const lastTimeframeRef = useRef<ChartTimeframe>(timeframe);
-  const formattedCandles = useMemo(() => formatSeriesData(candles), [candles]);
-  const formattedLiveCandle = useMemo(() => (liveCandle ? formatSeriesData([liveCandle])[0] ?? null : null), [liveCandle]);
+
+  const seriesData = useMemo(() => toSeriesData(candles), [candles]);
+  const liveBar = useMemo(() => (liveCandle ? toSeriesData([liveCandle])[0] ?? null : null), [liveCandle]);
+  const displaySeriesData = useMemo(() => mergeLiveBar(seriesData, liveBar), [seriesData, liveBar]);
   const futureBasis = price !== null && forwardPrice !== null ? forwardPrice - price : null;
-  const realtimeActive = !loading && formattedLiveCandle !== null;
 
   useEffect(() => {
     if (!containerRef.current || typeof ResizeObserver === "undefined") {
@@ -63,26 +92,27 @@ export function LightweightChartPanel({ label, price, changePercent, forwardPric
         vertLine: { color: "rgba(249,115,22,0.3)" },
       },
     });
-    chartRef.current = chart;
 
-    const candleSeries = chart.addSeries(CandlestickSeries, {
+    const series = chart.addSeries(CandlestickSeries, {
       upColor: "#34d399",
       downColor: "#f87171",
       wickUpColor: "#34d399",
       wickDownColor: "#f87171",
       borderVisible: false,
     });
-    seriesRef.current = candleSeries;
+
+    chartRef.current = chart;
+    seriesRef.current = series;
 
     return () => {
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
       appliedGenerationRef.current = -1;
+      lastSeriesTimeRef.current = null;
     };
   }, []);
 
-  // ----- HISTORY DATA: setData only on generation or timeframe change -----
   useEffect(() => {
     if (!chartRef.current || !seriesRef.current) {
       return;
@@ -95,41 +125,56 @@ export function LightweightChartPanel({ label, price, changePercent, forwardPric
     const timeframeChanged = lastTimeframeRef.current !== timeframe;
     lastTimeframeRef.current = timeframe;
 
-    if (formattedCandles.length === 0) {
+    if (displaySeriesData.length === 0) {
       seriesRef.current.setData([]);
       appliedGenerationRef.current = historyGeneration;
+      lastSeriesTimeRef.current = null;
       return;
     }
 
-    // Only call setData when history has actually been replaced
-    const generationChanged = appliedGenerationRef.current !== historyGeneration;
-    if (generationChanged || timeframeChanged) {
-      seriesRef.current.setData(formattedCandles);
+    if (appliedGenerationRef.current !== historyGeneration || timeframeChanged) {
+      seriesRef.current.setData(displaySeriesData);
       appliedGenerationRef.current = historyGeneration;
+      lastSeriesTimeRef.current = Number(displaySeriesData[displaySeriesData.length - 1]?.time ?? 0);
 
-      // Scroll to show latest bars on first load or timeframe change
-      const lastIndex = formattedCandles.length - 1;
-      const barsToShow = Math.min(15, formattedCandles.length);
-      const range = { from: Math.max(0, lastIndex - barsToShow + 1) as Logical, to: (lastIndex + 0.5) as Logical };
-      chartRef.current.timeScale().setVisibleLogicalRange(range);
+      const lastIndex = displaySeriesData.length - 1;
+      const barsToShow = Math.min(15, displaySeriesData.length);
+      chartRef.current.timeScale().setVisibleLogicalRange({
+        from: Math.max(0, lastIndex - barsToShow + 1) as Logical,
+        to: (lastIndex + 0.5) as Logical,
+      });
     }
-  }, [formattedCandles, timeframe, historyGeneration]);
+  }, [displaySeriesData, historyGeneration, timeframe]);
 
-  // ----- REALTIME: update() for live forming bar from SSE ticks -----
   useEffect(() => {
-    if (!seriesRef.current || !chartRef.current || appliedGenerationRef.current < 0 || !formattedLiveCandle) {
+    if (!seriesRef.current || !chartRef.current || !liveBar) {
       return;
     }
 
-    seriesRef.current.update(formattedLiveCandle);
+    const liveTime = Number(liveBar.time);
+    const lastApplied = lastSeriesTimeRef.current;
+    if (lastApplied !== null && liveTime < lastApplied) {
+      return;
+    }
+
+    seriesRef.current.update(liveBar);
+    lastSeriesTimeRef.current = liveTime;
     chartRef.current.timeScale().scrollToRealTime();
-  }, [formattedLiveCandle]);
+  }, [liveBar]);
+
+  useEffect(() => {
+    if (!seriesRef.current || !chartRef.current || !liveBar || appliedGenerationRef.current < 0) {
+      return;
+    }
+    seriesRef.current.setData(displaySeriesData);
+    chartRef.current.timeScale().scrollToRealTime();
+    lastSeriesTimeRef.current = Number(displaySeriesData[displaySeriesData.length - 1]?.time ?? lastSeriesTimeRef.current ?? 0);
+  }, [displaySeriesData, liveBar]);
 
   return (
     <section className="relative h-full rounded-2xl border border-[var(--border)] bg-[var(--panel)] p-3">
       <div className="mb-2 flex items-center gap-2 border-b border-[var(--border-soft)] pb-2">
         <span className="text-xs font-medium uppercase tracking-[0.18em] text-[var(--dim)]">{label}</span>
-        {realtimeActive && !loading && <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--green)]" title="live" />}
         <span className="font-mono text-sm text-[var(--text)]">{price === null ? "—" : price.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</span>
         <span className={`font-mono text-[11px] ${changePercent === null ? "text-[var(--dim)]" : changePercent >= 0 ? "text-[var(--green)]" : "text-[var(--red)]"}`}>
           {changePercent === null ? "—" : `${changePercent >= 0 ? "+" : ""}${changePercent.toFixed(2)}%`}
@@ -139,7 +184,7 @@ export function LightweightChartPanel({ label, price, changePercent, forwardPric
         <span className="font-mono text-[11px] text-[var(--blue)]">{forwardPrice === null ? "—" : forwardPrice.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</span>
         {futureBasis !== null ? <span className="font-mono text-[10px] text-[var(--muted)]">{futureBasis >= 0 ? "+" : ""}{futureBasis.toFixed(2)}</span> : null}
         <div className="ml-auto flex items-center gap-1 overflow-x-auto">
-          {timeframes.map((item) => (
+          {TIMEFRAMES.map((item) => (
             <button
               key={item}
               type="button"
