@@ -47,6 +47,25 @@ def create_tables_if_not_exists(conn):
     
     # Create Position Protection System tables if they don't exist
     _create_position_protection_tables(conn)
+    _ensure_option_strategy_runs_compatibility(conn)
+
+
+def _ensure_option_strategy_runs_compatibility(conn):
+    """Backfill additive columns for older option_strategy_runs tables."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                ALTER TABLE public.option_strategy_runs
+                ADD COLUMN IF NOT EXISTS algo_instance_id TEXT
+                """
+            )
+        conn.commit()
+        logging.info("Option strategy run compatibility checks applied successfully.")
+    except Exception as e:
+        logging.error(f"Error applying option strategy compatibility checks: {e}")
+        conn.rollback()
+        raise
 
 def _create_position_protection_tables(conn):
     """Creates Position Protection System tables if they don't exist."""

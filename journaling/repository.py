@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
@@ -31,6 +32,8 @@ from .models import (
 def _row_mapping(row: Any) -> Dict[str, Any]:
     if row is None:
         return {}
+    if isinstance(row, Mapping):
+        return dict(row)
     if hasattr(row, "_mapping"):
         return dict(row._mapping)
     if isinstance(row, dict):

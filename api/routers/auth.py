@@ -22,7 +22,9 @@ from auth_service import (
 from broker_api import broker_api
 from broker_api.kite_session import KiteSession
 from database import get_db
+from strategies.option_strategy.store import OptionStrategyStore
 from runtime_monitor import get_components, get_logs, get_meta
+from strategies.option_strategy.runtime_updates import apply_protection_patch
 
 
 router = APIRouter()
@@ -137,6 +139,19 @@ class PaperBasketRequest(BaseModel):
     all_or_none: bool = True
     strategy_tag: str | None = None
     notes: str | None = None
+
+
+class PaperStrategyExitRequest(BaseModel):
+    strategy_id: str = Field(min_length=1)
+
+
+class PaperStrategyRiskUpdateRequest(BaseModel):
+    combined_premium_target: float | None = None
+    combined_premium_stoploss: float | None = None
+    basket_mtm_target: float | None = None
+    basket_mtm_stoploss: float | None = None
+    index_lower_boundary: float | None = None
+    index_upper_boundary: float | None = None
 
 
 async def _active_paper_instance_ids_for_scope(request: Request, account_scope: str) -> list[str] | None:
@@ -451,6 +466,131 @@ async def list_paper_positions(
         raise HTTPException(status_code=503, detail="Paper runtime is not available")
     items = await paper_runtime_service.list_positions(account_scope, only_open=only_open)
     return {"items": [item.model_dump(mode="json") for item in items]}
+
+
+@router.get("/system/paper/strategies", tags=["System"])
+async def list_paper_strategies(request: Request, account_scope: str = Query(...)):
+    require_app_user(request)
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if not paper_runtime_service:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+
+    summary = await paper_runtime_service.get_strategy_summary(account_scope)
+    option_strategy_store = getattr(request.app.state, "option_strategy_store", None)
+    if option_strategy_store is None:
+        option_strategy_store = OptionStrategyStore(journal_service=getattr(request.app.state, "journal_service", None))
+        request.app.state.option_strategy_store = option_strategy_store
+
+    for strategy in summary.get("strategies", []):
+        run_id = strategy.get("strategy_id")
+        if not run_id or str(run_id).startswith("manual:"):
+            continue
+        run = option_strategy_store.get_run(str(run_id))
+        if run is None:
+            continue
+        canonical = dict(run.get("canonical_strategy") or {})
+        prefs = dict(canonical.get("protection_preferences") or {})
+        strategy["mode"] = run.get("execution_mode") or strategy.get("mode") or "paper"
+        strategy["risk_controls"] = {
+            "index_lower_boundary": prefs.get("index_lower_boundary"),
+            "index_upper_boundary": prefs.get("index_upper_boundary"),
+            "combined_premium_target": prefs.get("combined_premium_target"),
+            "combined_premium_stoploss": prefs.get("combined_premium_stoploss"),
+            "basket_mtm_target": prefs.get("basket_mtm_target"),
+            "basket_mtm_stoploss": prefs.get("basket_mtm_stoploss"),
+        }
+        strategy["capabilities"] = {
+            "can_edit_risk": bool(strategy.get("is_open")) and strategy.get("mode") == "paper",
+            "edit_risk_reason": None if (bool(strategy.get("is_open")) and strategy.get("mode") == "paper") else "Only open paper strategies support runtime risk edits",
+        }
+    return summary
+
+
+@router.patch("/system/paper/strategies/{strategy_id}/risk", tags=["System"])
+async def update_paper_strategy_risk(
+    request: Request,
+    strategy_id: str,
+    payload: PaperStrategyRiskUpdateRequest,
+    account_scope: str = Query(default="default"),
+):
+    require_app_user(request)
+    option_strategy_store = getattr(request.app.state, "option_strategy_store", None)
+    if option_strategy_store is None:
+        option_strategy_store = OptionStrategyStore(journal_service=getattr(request.app.state, "journal_service", None))
+        request.app.state.option_strategy_store = option_strategy_store
+
+    run = option_strategy_store.get_run(strategy_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Option strategy not found")
+    if str(run.get("execution_mode") or "") != "paper":
+        raise HTTPException(status_code=409, detail="Only paper strategies can be edited from this route")
+
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if not paper_runtime_service:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+    summary = await paper_runtime_service.get_strategy_summary(account_scope)
+    strategy = next((item for item in summary.get("strategies", []) if str(item.get("strategy_id")) == strategy_id), None)
+    if strategy is None:
+        raise HTTPException(status_code=404, detail="Paper strategy summary not found")
+    if not bool(strategy.get("is_open")):
+        raise HTTPException(status_code=409, detail="Risk can only be edited while the strategy is open")
+
+    patch = {field: getattr(payload, field) for field in payload.model_fields_set}
+    updated = apply_protection_patch(run, patch)
+    option_strategy_store.update_canonical_strategy(strategy_id, canonical_strategy=updated["canonical_strategy"])
+
+    algo_runtime_service = getattr(request.app.state, "algo_runtime_service", None)
+    live_worker = getattr(request.app.state, "algo_runtime_live_worker", None)
+    algo_instance_id = run.get("algo_instance_id")
+    if algo_runtime_service and algo_instance_id:
+        existing_instance = await algo_runtime_service.kernel.repository.get_instance(str(algo_instance_id))
+        if existing_instance is not None:
+            next_config = dict(existing_instance.config or {})
+            next_config.update(updated["runtime_config"])
+            await upsert_algo_runtime_instance_impl(
+                algo_runtime_service,
+                existing_instance.model_copy(update={"config": next_config}),
+                live_worker=live_worker,
+            )
+
+    return {
+        "strategy_id": strategy_id,
+        **updated,
+    }
+
+
+@router.post("/system/paper/accounts/{account_scope}/exit-strategy", tags=["System"])
+async def exit_paper_strategy(request: Request, account_scope: str, payload: PaperStrategyExitRequest):
+    require_app_user(request)
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if not paper_runtime_service:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+
+    option_strategy_store = getattr(request.app.state, "option_strategy_store", None)
+    if option_strategy_store is None:
+        option_strategy_store = OptionStrategyStore(journal_service=getattr(request.app.state, "journal_service", None))
+        request.app.state.option_strategy_store = option_strategy_store
+
+    strategy_run = option_strategy_store.get_run(payload.strategy_id)
+    if strategy_run is None:
+        raise HTTPException(status_code=404, detail="Option strategy not found")
+
+    result = await paper_runtime_service.exit_strategy(account_scope=account_scope, strategy_id=payload.strategy_id)
+
+    algo_instance_id = strategy_run.get("algo_instance_id")
+    if result.get("status") != "noop":
+        option_strategy_store.mark_exited(payload.strategy_id, execution_result=result, algo_instance_id=algo_instance_id)
+        service = getattr(request.app.state, "algo_runtime_service", None)
+        if service and algo_instance_id:
+            live_worker = getattr(request.app.state, "algo_runtime_live_worker", None)
+            await update_algo_runtime_instance_status_impl(
+                service,
+                instance_id=algo_instance_id,
+                status=AlgoLifecycleState.STOPPED,
+                live_worker=live_worker,
+            )
+
+    return result
 
 
 @router.get("/system/logs", tags=["System"])

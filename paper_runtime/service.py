@@ -21,6 +21,7 @@ from .models import (
     PaperOrderStatus,
     PaperOrderType,
     PaperPosition,
+    PaperPositionLotAttribution,
     PaperTrade,
 )
 from .repository import SqlAlchemyPaperRepository
@@ -301,6 +302,245 @@ class PaperTradingService:
     async def list_positions(self, account_scope: str, *, only_open: bool = False) -> List[PaperPosition]:
         return await asyncio.to_thread(self.repository.list_positions, account_scope, only_open=only_open)
 
+    async def get_strategy_summary(self, account_scope: str) -> Dict[str, Any]:
+        account = await self.ensure_account(account_scope)
+        positions = await self.list_positions(account_scope, only_open=False)
+        orders = await asyncio.to_thread(self.repository.list_orders, account_scope, limit=1000)
+        trades = await asyncio.to_thread(self.repository.list_trades, account_scope, limit=2000)
+
+        open_positions = [position for position in positions if int(position.net_quantity) != 0]
+        strategy_groups: Dict[str, Dict[str, Any]] = {}
+
+        def ensure_group(strategy_id: str, *, fallback_label: str = "Manual strategy") -> Dict[str, Any]:
+            group = strategy_groups.get(strategy_id)
+            if group is None:
+                group = {
+                    "strategy_id": strategy_id,
+                    "display_name": fallback_label,
+                    "mode": "paper",
+                    "strategy_tag": None,
+                    "algo_instance_id": None,
+                    "status": "closed",
+                    "is_open": False,
+                    "leg_count": 0,
+                    "open_leg_count": 0,
+                    "net_quantity": 0,
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": 0.0,
+                    "margin_in_use": 0.0,
+                    "last_updated_at": None,
+                    "last_event_at": None,
+                    "risk_controls": {},
+                    "capabilities": {"can_edit_risk": False, "edit_risk_reason": "No editable risk controls available"},
+                    "positions": [],
+                    "orders": [],
+                    "trades": [],
+                    "timeline": [],
+                }
+                strategy_groups[strategy_id] = group
+            return group
+
+        for position in positions:
+            metadata = self._position_strategy_metadata(position, orders=orders, trades=trades)
+            strategy_id = str(
+                metadata.get("option_strategy_id")
+                or metadata.get("strategy_id")
+                or metadata.get("algo_instance_id")
+                or f"manual:{position.instrument_token}:{position.product}"
+            )
+            tag = str(metadata.get("strategy_tag") or "")
+            display_name = tag.replace("_", " ").title() if tag else (position.tradingsymbol or strategy_id)
+            group = ensure_group(strategy_id, fallback_label=display_name)
+            group["strategy_tag"] = group["strategy_tag"] or (tag or None)
+            group["algo_instance_id"] = group["algo_instance_id"] or metadata.get("algo_instance_id")
+            group["leg_count"] += 1
+            if int(position.net_quantity) != 0:
+                group["open_leg_count"] += 1
+                group["status"] = "open"
+                group["is_open"] = True
+            group["net_quantity"] += int(position.net_quantity)
+            group["unrealized_pnl"] += float(position.unrealized_pnl)
+            group["realized_pnl"] += float(position.realized_pnl)
+            group["margin_in_use"] += float(metadata.get("margin_in_use") or 0)
+            updated_at = position.updated_at.isoformat() if position.updated_at else None
+            if updated_at and (group["last_updated_at"] is None or updated_at > group["last_updated_at"]):
+                group["last_updated_at"] = updated_at
+            if updated_at and (group["last_event_at"] is None or updated_at > group["last_event_at"]):
+                group["last_event_at"] = updated_at
+            group["positions"].append(
+                {
+                    "instrument_token": position.instrument_token,
+                    "tradingsymbol": position.tradingsymbol,
+                    "product": position.product,
+                    "exchange": position.exchange,
+                    "net_quantity": int(position.net_quantity),
+                    "average_price": float(position.average_price),
+                    "last_price": float(metadata.get("last_price") or 0),
+                    "unrealized_pnl": float(position.unrealized_pnl),
+                    "realized_pnl": float(position.realized_pnl),
+                    "side": "LONG" if int(position.net_quantity) > 0 else ("SHORT" if int(position.net_quantity) < 0 else "FLAT"),
+                    "metadata": metadata,
+                }
+            )
+            group["timeline"].append(
+                {
+                    "kind": "position_mark",
+                    "timestamp": updated_at,
+                    "label": f"{position.tradingsymbol or position.instrument_token} mark updated",
+                }
+            )
+
+        for order in orders:
+            metadata = dict(order.metadata or {})
+            strategy_id = str(
+                metadata.get("option_strategy_id")
+                or metadata.get("strategy_id")
+                or metadata.get("algo_instance_id")
+                or f"manual:{order.instrument_token}:{order.product}"
+            )
+            tag = str(metadata.get("strategy_tag") or "")
+            display_name = tag.replace("_", " ").title() if tag else (order.tradingsymbol or strategy_id)
+            group = ensure_group(strategy_id, fallback_label=display_name)
+            group["strategy_tag"] = group["strategy_tag"] or (tag or None)
+            group["algo_instance_id"] = group["algo_instance_id"] or metadata.get("algo_instance_id")
+            group["orders"].append(
+                {
+                    "order_id": order.order_id,
+                    "tradingsymbol": order.tradingsymbol,
+                    "transaction_type": str(order.transaction_type),
+                    "quantity": int(order.quantity),
+                    "status": str(order.status),
+                    "average_price": float(order.average_price) if order.average_price is not None else None,
+                    "placed_at": order.placed_at.isoformat() if order.placed_at else None,
+                    "metadata": metadata,
+                }
+            )
+            placed_at = order.placed_at.isoformat() if order.placed_at else None
+            if placed_at and (group["last_event_at"] is None or placed_at > group["last_event_at"]):
+                group["last_event_at"] = placed_at
+            group["timeline"].append(
+                {
+                    "kind": "order",
+                    "timestamp": placed_at,
+                    "label": f"{order.transaction_type} {order.tradingsymbol or order.instrument_token} {order.status}",
+                }
+            )
+
+        for trade in trades:
+            metadata = dict(trade.metadata or {})
+            strategy_id = str(
+                metadata.get("option_strategy_id")
+                or metadata.get("strategy_id")
+                or metadata.get("algo_instance_id")
+                or f"manual:{trade.instrument_token}"
+            )
+            tag = str(metadata.get("strategy_tag") or "")
+            display_name = tag.replace("_", " ").title() if tag else strategy_id
+            group = ensure_group(strategy_id, fallback_label=display_name)
+            group["strategy_tag"] = group["strategy_tag"] or (tag or None)
+            group["algo_instance_id"] = group["algo_instance_id"] or metadata.get("algo_instance_id")
+            group["trades"].append(
+                {
+                    "trade_id": trade.trade_id,
+                    "order_id": trade.order_id,
+                    "instrument_token": trade.instrument_token,
+                    "transaction_type": str(trade.transaction_type),
+                    "quantity": int(trade.quantity),
+                    "price": float(trade.price),
+                    "trade_timestamp": trade.trade_timestamp.isoformat() if trade.trade_timestamp else None,
+                    "metadata": metadata,
+                }
+            )
+            trade_timestamp = trade.trade_timestamp.isoformat() if trade.trade_timestamp else None
+            if trade_timestamp and (group["last_event_at"] is None or trade_timestamp > group["last_event_at"]):
+                group["last_event_at"] = trade_timestamp
+            group["timeline"].append(
+                {
+                    "kind": "trade",
+                    "timestamp": trade_timestamp,
+                    "label": f"{trade.transaction_type} fill {trade.quantity} @ {float(trade.price):.2f}",
+                }
+            )
+
+        for group in strategy_groups.values():
+            if not group["is_open"]:
+                group["status"] = "closed"
+
+        grouped = sorted(
+            strategy_groups.values(),
+            key=lambda item: (not item["is_open"], -(len(item["timeline"]) or 0), item["last_event_at"] or ""),
+        )
+
+        return {
+            "account": {
+                "account_scope": account.account_scope,
+                "currency": account.currency,
+                "starting_balance": float(account.starting_balance),
+                "available_funds": float(account.available_funds),
+                "blocked_funds": float(account.blocked_funds),
+                "realized_pnl": float(account.realized_pnl),
+                "unrealized_pnl": float(sum(Decimal(position.unrealized_pnl) for position in open_positions)),
+                "open_position_count": len(open_positions),
+            },
+            "strategies": grouped,
+        }
+
+    async def exit_strategy(self, *, account_scope: str, strategy_id: str) -> Dict[str, Any]:
+        normalized_strategy_id = str(strategy_id or "").strip()
+        if not normalized_strategy_id:
+            raise ValueError("strategy_id is required")
+
+        open_positions = await self.list_positions(account_scope, only_open=True)
+        orders = await asyncio.to_thread(self.repository.list_orders, account_scope, limit=1000)
+        trades = await asyncio.to_thread(self.repository.list_trades, account_scope, limit=2000)
+        linked_positions = [
+            position
+            for position in open_positions
+            if str((meta := self._position_strategy_metadata(position, orders=orders, trades=trades)).get("option_strategy_id") or meta.get("strategy_id") or meta.get("algo_instance_id") or "")
+            == normalized_strategy_id
+        ]
+        if not linked_positions:
+            return {"mode": "paper", "status": "noop", "strategy_id": normalized_strategy_id, "results": [], "message": "No open paper positions found for strategy"}
+
+        exit_orders = []
+        algo_instance_id = None
+        strategy_tag = None
+        for position in linked_positions:
+            metadata = self._position_strategy_metadata(position, orders=orders, trades=trades)
+            algo_instance_id = algo_instance_id or metadata.get("algo_instance_id")
+            strategy_tag = strategy_tag or metadata.get("strategy_tag")
+            side = "BUY" if int(position.net_quantity) < 0 else "SELL"
+            exit_orders.append(
+                {
+                    "exchange": position.exchange,
+                    "tradingsymbol": position.tradingsymbol,
+                    "product": position.product,
+                    "transaction_type": side,
+                    "order_type": "MARKET",
+                    "quantity": abs(int(position.net_quantity)),
+                    "metadata": {
+                        "option_strategy_id": normalized_strategy_id,
+                        "algo_instance_id": algo_instance_id,
+                        "strategy_tag": strategy_tag,
+                        "exit_for": normalized_strategy_id,
+                    },
+                }
+            )
+
+        result = await self.place_basket(
+            account_scope=account_scope,
+            basket_payload={"orders": exit_orders, "all_or_none": True},
+            attribution={
+                "source": "paper-page-exit",
+                "strategy_tag": strategy_tag,
+                "option_strategy_id": normalized_strategy_id,
+                "algo_instance_id": algo_instance_id,
+                "notes": f"exit-strategy:{normalized_strategy_id}",
+            },
+        )
+        result["strategy_id"] = normalized_strategy_id
+        return result
+
     async def get_account_summary(self, account_scope: str) -> Dict[str, Any]:
         account = await self.ensure_account(account_scope)
         positions = await self.list_positions(account_scope, only_open=True)
@@ -356,7 +596,7 @@ class PaperTradingService:
         for metadata in metadata_sources:
             if not metadata:
                 continue
-            for key in ("journal_run_id", "journal_ref"):
+            for key in ("journal_run_id", "journal_ref", "option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag"):
                 if key not in merged or merged.get(key) in (None, ""):
                     value = metadata.get(key)
                     if value not in (None, ""):
@@ -562,8 +802,41 @@ class PaperTradingService:
             ),
         )
         await self._record_journal_trade(trade)
+        lot_side = self._paper_side_value(order.transaction_type)
+        if lot_side == PaperOrderSide.BUY.value:
+            await asyncio.to_thread(
+                self.repository.upsert_position_lot,
+                PaperPositionLotAttribution(
+                    account_scope=order.account_scope,
+                    lot_id=f"PLOT-{uuid.uuid4().hex[:12].upper()}",
+                    instrument_token=order.instrument_token,
+                    product=order.product,
+                    source_trade_id=trade.trade_id,
+                    source_order_id=order.order_id,
+                    open_quantity=order.quantity,
+                    remaining_quantity=order.quantity,
+                    entry_price=fill_price,
+                    opened_at=trade.trade_timestamp,
+                    metadata=dict(order.metadata or {}),
+                ),
+            )
+        else:
+            await self._consume_position_lots(
+                account_scope=order.account_scope,
+                instrument_token=order.instrument_token,
+                product=order.product,
+                quantity=order.quantity,
+            )
         new_position.metadata["margin_in_use"] = str(new_margin)
         new_position.metadata["last_price"] = str(fill_price)
+        new_position.metadata.update(
+            {
+                key: value
+                for key, value in dict(order.metadata or {}).items()
+                if key in {"option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag", "journal_run_id", "journal_ref", "source", "notes"}
+                and value not in (None, "")
+            }
+        )
         new_position = await asyncio.to_thread(self.repository.upsert_position, new_position)
         await publish_event("paper.orders.events", paper_order_event_payload(event_type="filled", order=completed))
         await publish_event("paper.trades.events", paper_trade_event_payload(event_type="filled", trade=trade))
@@ -742,8 +1015,41 @@ class PaperTradingService:
                 metadata=dict(order.metadata or {}),
             )
         )
+        lot_side = self._paper_side_value(order.transaction_type)
+        if lot_side == PaperOrderSide.BUY.value:
+            uow.upsert_position_lot(
+                PaperPositionLotAttribution(
+                    account_scope=order.account_scope,
+                    lot_id=f"PLOT-{uuid.uuid4().hex[:12].upper()}",
+                    instrument_token=order.instrument_token,
+                    product=order.product,
+                    source_trade_id=trade.trade_id,
+                    source_order_id=order.order_id,
+                    open_quantity=order.quantity,
+                    remaining_quantity=order.quantity,
+                    entry_price=fill_price,
+                    opened_at=trade.trade_timestamp,
+                    metadata=dict(order.metadata or {}),
+                )
+            )
+        else:
+            self._consume_position_lots_uow(
+                uow,
+                account_scope=order.account_scope,
+                instrument_token=order.instrument_token,
+                product=order.product,
+                quantity=order.quantity,
+            )
         new_position.metadata["margin_in_use"] = str(new_margin)
         new_position.metadata["last_price"] = str(fill_price)
+        new_position.metadata.update(
+            {
+                key: value
+                for key, value in dict(order.metadata or {}).items()
+                if key in {"option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag", "journal_run_id", "journal_ref", "source", "notes"}
+                and value not in (None, "")
+            }
+        )
         new_position = uow.upsert_position(new_position)
 
         staged_events.append(("paper.orders.events", paper_order_event_payload(event_type="filled", order=completed)))
@@ -850,6 +1156,53 @@ class PaperTradingService:
         )
         return new_account
 
+    async def _consume_position_lots(self, *, account_scope: str, instrument_token: int, product: str, quantity: int) -> None:
+        remaining = max(0, int(quantity))
+        if remaining <= 0:
+            return
+        lots = await asyncio.to_thread(
+            self.repository.list_open_position_lots,
+            account_scope,
+            instrument_token=instrument_token,
+            product=product,
+        )
+        for lot in lots:
+            if remaining <= 0:
+                break
+            available = int(lot.remaining_quantity)
+            if available <= 0:
+                continue
+            consumed = min(available, remaining)
+            updated = lot.model_copy(
+                update={
+                    "remaining_quantity": available - consumed,
+                    "closed_at": _utcnow() if available - consumed == 0 else lot.closed_at,
+                }
+            )
+            await asyncio.to_thread(self.repository.upsert_position_lot, updated)
+            remaining -= consumed
+
+    def _consume_position_lots_uow(self, uow: Any, *, account_scope: str, instrument_token: int, product: str, quantity: int) -> None:
+        remaining = max(0, int(quantity))
+        if remaining <= 0:
+            return
+        lots = uow.list_open_position_lots(account_scope, instrument_token=instrument_token, product=product)
+        for lot in lots:
+            if remaining <= 0:
+                break
+            available = int(lot.remaining_quantity)
+            if available <= 0:
+                continue
+            consumed = min(available, remaining)
+            updated = lot.model_copy(
+                update={
+                    "remaining_quantity": available - consumed,
+                    "closed_at": _utcnow() if available - consumed == 0 else lot.closed_at,
+                }
+            )
+            uow.upsert_position_lot(updated)
+            remaining -= consumed
+
     async def _apply_cash_delta(
         self,
         account: PaperAccount,
@@ -903,6 +1256,40 @@ class PaperTradingService:
         if algo_instance_id and str(metadata.get("algo_instance_id") or "") != algo_instance_id:
             return False
         return True
+
+    def _position_strategy_metadata(
+        self,
+        position: PaperPosition,
+        *,
+        orders: List[PaperOrder],
+        trades: List[PaperTrade],
+    ) -> Dict[str, Any]:
+        metadata = dict(position.metadata or {})
+        if any(metadata.get(key) not in (None, "") for key in ("option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag")):
+            return metadata
+
+        candidates: List[tuple[datetime, Dict[str, Any]]] = []
+        for order in orders:
+            if order.instrument_token != position.instrument_token or order.product != position.product:
+                continue
+            order_meta = dict(order.metadata or {})
+            if not any(order_meta.get(key) not in (None, "") for key in ("option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag")):
+                continue
+            candidates.append((order.updated_at or order.placed_at or _utcnow(), order_meta))
+        for trade in trades:
+            if trade.instrument_token != position.instrument_token:
+                continue
+            trade_meta = dict(trade.metadata or {})
+            if not any(trade_meta.get(key) not in (None, "") for key in ("option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag")):
+                continue
+            candidates.append((trade.trade_timestamp or _utcnow(), trade_meta))
+
+        if not candidates:
+            return metadata
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        inferred = dict(candidates[0][1])
+        inferred.update(metadata)
+        return inferred
 
     def _should_fill_immediately(self, order: PaperOrder, *, request: Dict[str, Any], market_snapshot: Dict[str, Any]) -> bool:
         return self._request_should_fill_immediately(request=request, market_snapshot=market_snapshot)

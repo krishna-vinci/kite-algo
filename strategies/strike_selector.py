@@ -417,7 +417,17 @@ class PositionBuilder:
         self.selector = strike_selector
         self.repo = instruments_repo
 
+    def _resolve_lot_size(self, strike: Dict[str, Any]) -> int:
+        instrument_token = strike.get("instrument_token") or strike.get("token")
+        resolved = self.repo.get_lot_size(instrument_token) if instrument_token else None
+        if resolved:
+            return int(resolved)
+        fallback = strike.get("lot_size") or 1
+        return max(1, int(fallback))
+
     def _manual_strategy_leg(self, strike: Dict[str, Any]) -> Dict[str, Any]:
+        lot_size = self._resolve_lot_size(strike)
+        lots = max(1, int(strike.get("lots") or 1))
         return {
             "instrument_token": strike["instrument_token"],
             "tradingsymbol": strike["tradingsymbol"],
@@ -425,9 +435,9 @@ class PositionBuilder:
             "option_type": strike["option_type"],
             "transaction_type": strike["transaction_type"],
             "ltp": strike["ltp"],
-            "lot_size": strike["lot_size"],
-            "lots": strike["lots"],
-            "quantity": strike["lot_size"] * strike["lots"],
+            "lot_size": lot_size,
+            "lots": lots,
+            "quantity": lot_size * lots,
         }
 
     def _suggestion_strategy_leg(self, leg: Dict[str, Any], quantity: int) -> Dict[str, Any]:
@@ -472,7 +482,9 @@ class PositionBuilder:
         total_premium = 0
         
         for strike in selected_strikes:
-            qty = strike['lot_size'] * strike['lots']
+            lot_size = self._resolve_lot_size(strike)
+            lots = max(1, int(strike.get('lots') or 1))
+            qty = lot_size * lots
             premium = strike['ltp'] * qty
             
             # Credit for SELL, debit for BUY
@@ -487,8 +499,8 @@ class PositionBuilder:
                 'exchange': 'NFO',
                 'transaction_type': strike['transaction_type'],
                 'quantity': qty,
-                'lot_size': strike['lot_size'],
-                'lots': strike['lots'],
+                'lot_size': lot_size,
+                'lots': lots,
                 'product': 'MIS',
                 'order_type': 'MARKET',
                 'price': 0,

@@ -25,12 +25,12 @@ from broker_api.kite_orders import get_correlation_id, realtime_positions_servic
 from broker_api.kite_session import get_kite_session_id, get_session_account_id
 from database import SessionLocal
 from strategies.option_strategy import (
-    OptionStrategyStore,
     StrategyExecutionMode,
     StrategyProtectionPreferences,
-    build_runtime_option_instance,
     compile_option_strategy_preview,
 )
+from strategies.option_strategy.runtime import build_runtime_option_instance
+from strategies.option_strategy.store import OptionStrategyStore
 
 logger = logging.getLogger(__name__)
 

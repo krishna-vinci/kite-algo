@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
@@ -17,6 +18,7 @@ from .models import (
     PaperOrder,
     PaperOrderStatus,
     PaperPosition,
+    PaperPositionLotAttribution,
     PaperTrade,
 )
 
@@ -24,6 +26,8 @@ from .models import (
 def _row_mapping(row: Any) -> Dict[str, Any]:
     if row is None:
         return {}
+    if isinstance(row, Mapping):
+        return dict(row)
     if hasattr(row, "_mapping"):
         return dict(row._mapping)
     if isinstance(row, dict):
@@ -358,6 +362,50 @@ class SqlAlchemyPaperRepository:
                 {"instrument_token": instrument_token},
             ).fetchall()
             return [self._position_from_row(row) for row in rows]
+        finally:
+            db.close()
+
+    def upsert_position_lot(self, lot: PaperPositionLotAttribution) -> PaperPositionLotAttribution:
+        db = self.session_factory()
+        try:
+            row = self._upsert_position_lot_row(db, lot)
+            db.commit()
+            return self._position_lot_from_row(row)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def list_open_position_lots(
+        self,
+        account_scope: str,
+        *,
+        instrument_token: Optional[int] = None,
+        product: Optional[str] = None,
+    ) -> List[PaperPositionLotAttribution]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT account_scope, lot_id, instrument_token, product, source_trade_id, source_order_id,
+                           open_quantity, remaining_quantity, entry_price, opened_at, closed_at, metadata_json
+                    FROM public.paper_position_lots
+                    WHERE account_scope = :account_scope
+                      AND remaining_quantity > 0
+                      AND (:instrument_token IS NULL OR instrument_token = :instrument_token)
+                      AND (:product IS NULL OR product = :product)
+                    ORDER BY opened_at ASC, lot_id ASC
+                    """
+                ),
+                {
+                    "account_scope": account_scope,
+                    "instrument_token": instrument_token,
+                    "product": product,
+                },
+            ).fetchall()
+            return [self._position_lot_from_row(row) for row in rows]
         finally:
             db.close()
 
@@ -780,6 +828,68 @@ class SqlAlchemyPaperRepository:
             },
         ).fetchone()
 
+    def _upsert_position_lot_row(self, db: Session, lot: PaperPositionLotAttribution) -> Any:
+        return db.execute(
+            text(
+                """
+                INSERT INTO public.paper_position_lots (
+                    account_scope,
+                    lot_id,
+                    instrument_token,
+                    product,
+                    source_trade_id,
+                    source_order_id,
+                    open_quantity,
+                    remaining_quantity,
+                    entry_price,
+                    opened_at,
+                    closed_at,
+                    metadata_json
+                ) VALUES (
+                    :account_scope,
+                    :lot_id,
+                    :instrument_token,
+                    :product,
+                    :source_trade_id,
+                    :source_order_id,
+                    :open_quantity,
+                    :remaining_quantity,
+                    :entry_price,
+                    :opened_at,
+                    :closed_at,
+                    CAST(:metadata_json AS JSONB)
+                )
+                ON CONFLICT (account_scope, lot_id) DO UPDATE SET
+                    instrument_token = EXCLUDED.instrument_token,
+                    product = EXCLUDED.product,
+                    source_trade_id = EXCLUDED.source_trade_id,
+                    source_order_id = EXCLUDED.source_order_id,
+                    open_quantity = EXCLUDED.open_quantity,
+                    remaining_quantity = EXCLUDED.remaining_quantity,
+                    entry_price = EXCLUDED.entry_price,
+                    opened_at = EXCLUDED.opened_at,
+                    closed_at = EXCLUDED.closed_at,
+                    metadata_json = EXCLUDED.metadata_json
+                RETURNING account_scope, lot_id, instrument_token, product, source_trade_id, source_order_id,
+                          open_quantity, remaining_quantity, entry_price, opened_at, closed_at, metadata_json
+                """
+            ),
+            {
+                "account_scope": lot.account_scope,
+                "lot_id": lot.lot_id,
+                "instrument_token": lot.instrument_token,
+                "product": lot.product,
+                "source_trade_id": lot.source_trade_id,
+                "source_order_id": lot.source_order_id,
+                "open_quantity": lot.open_quantity,
+                "remaining_quantity": lot.remaining_quantity,
+                "entry_price": lot.entry_price,
+                "opened_at": lot.opened_at,
+                "closed_at": lot.closed_at,
+                "metadata_json": _json_dumps(lot.metadata),
+            },
+        ).fetchone()
+
     def _account_from_row(self, row: Any) -> PaperAccount:
         payload = _row_mapping(row)
         return PaperAccount(
@@ -867,6 +977,23 @@ class SqlAlchemyPaperRepository:
             created_at=payload.get("created_at"),
         )
 
+    def _position_lot_from_row(self, row: Any) -> PaperPositionLotAttribution:
+        payload = _row_mapping(row)
+        return PaperPositionLotAttribution(
+            account_scope=str(payload["account_scope"]),
+            lot_id=str(payload["lot_id"]),
+            instrument_token=int(payload["instrument_token"]),
+            product=str(payload.get("product") or "MIS"),
+            source_trade_id=str(payload["source_trade_id"]),
+            source_order_id=payload.get("source_order_id"),
+            open_quantity=int(payload["open_quantity"]),
+            remaining_quantity=int(payload.get("remaining_quantity") or 0),
+            entry_price=payload["entry_price"],
+            opened_at=payload.get("opened_at"),
+            closed_at=payload.get("closed_at"),
+            metadata=_decode_json_field(payload.get("metadata_json")) or {},
+        )
+
 
 class PaperRepositoryUnitOfWork:
     def __init__(self, *, repository: SqlAlchemyPaperRepository, db: Session) -> None:
@@ -906,3 +1033,35 @@ class PaperRepositoryUnitOfWork:
     def append_fund_ledger_entry(self, entry: PaperFundLedgerEntry) -> PaperFundLedgerEntry:
         row = self.repository._append_fund_ledger_entry_row(self.db, entry)
         return self.repository._fund_ledger_from_row(row)
+
+    def upsert_position_lot(self, lot: PaperPositionLotAttribution) -> PaperPositionLotAttribution:
+        row = self.repository._upsert_position_lot_row(self.db, lot)
+        return self.repository._position_lot_from_row(row)
+
+    def list_open_position_lots(
+        self,
+        account_scope: str,
+        *,
+        instrument_token: Optional[int] = None,
+        product: Optional[str] = None,
+    ) -> List[PaperPositionLotAttribution]:
+        rows = self.db.execute(
+            text(
+                """
+                SELECT account_scope, lot_id, instrument_token, product, source_trade_id, source_order_id,
+                       open_quantity, remaining_quantity, entry_price, opened_at, closed_at, metadata_json
+                FROM public.paper_position_lots
+                WHERE account_scope = :account_scope
+                  AND remaining_quantity > 0
+                  AND (:instrument_token IS NULL OR instrument_token = :instrument_token)
+                  AND (:product IS NULL OR product = :product)
+                ORDER BY opened_at ASC, lot_id ASC
+                """
+            ),
+            {
+                "account_scope": account_scope,
+                "instrument_token": instrument_token,
+                "product": product,
+            },
+        ).fetchall()
+        return [self.repository._position_lot_from_row(row) for row in rows]

@@ -32,3 +32,4 @@ redis
 mibian
 numba
 PyJWT
+pytest

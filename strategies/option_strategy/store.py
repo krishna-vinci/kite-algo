@@ -187,3 +187,35 @@ class OptionStrategyStore:
             return dict(row) if row else None
         finally:
             session.close()
+
+    def mark_exited(self, run_id: str, *, execution_result: Dict[str, Any], algo_instance_id: str | None = None) -> None:
+        self.update_execution_result(
+            run_id,
+            status="exited",
+            execution_result=execution_result,
+            algo_instance_id=algo_instance_id,
+        )
+
+    def update_canonical_strategy(self, run_id: str, *, canonical_strategy: Dict[str, Any]) -> None:
+        session = self._session_factory()
+        try:
+            session.execute(
+                text(
+                    """
+                    UPDATE public.option_strategy_runs
+                    SET canonical_strategy = CAST(:canonical_strategy AS jsonb),
+                        updated_at = NOW()
+                    WHERE id = CAST(:run_id AS uuid)
+                    """
+                ),
+                {
+                    "run_id": run_id,
+                    "canonical_strategy": json.dumps(canonical_strategy),
+                },
+            )
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
