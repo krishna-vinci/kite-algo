@@ -290,14 +290,22 @@ def _load_instrument_map(conn, symbols: Sequence[str]) -> Dict[str, Dict[str, An
             """
             SELECT tradingsymbol, instrument_token, exchange
             FROM kite_instruments
-            WHERE exchange = 'NSE' AND instrument_type = 'EQ' AND tradingsymbol = ANY(%s)
+            WHERE instrument_type = 'EQ'
+              AND exchange IN ('NSE', 'BSE')
+              AND tradingsymbol = ANY(%s)
+            ORDER BY tradingsymbol,
+                     CASE WHEN exchange = 'NSE' THEN 0 ELSE 1 END,
+                     instrument_token
             """,
             (list(symbols),),
         )
-        return {
-            row[0]: {"tradingsymbol": row[0], "instrument_token": row[1], "exchange": row[2]}
-            for row in cur.fetchall()
-        }
+        instrument_map: Dict[str, Dict[str, Any]] = {}
+        for row in cur.fetchall():
+            instrument_map.setdefault(
+                row[0],
+                {"tradingsymbol": row[0], "instrument_token": row[1], "exchange": row[2]},
+            )
+        return instrument_map
 
 
 def _load_existing_rows(conn, source_list: str) -> Dict[str, Dict[str, Any]]:

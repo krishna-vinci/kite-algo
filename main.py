@@ -997,7 +997,7 @@ async def monthly_index_refresh_scheduler() -> None:
             result = await asyncio.to_thread(refresh_supported_indices, source_lists)
             if result.get("status") == "error":
                 raise RuntimeError(json.dumps(result))
-            runtime_result = await asyncio.to_thread(refresh_live_metrics_for_indices, ["Nifty50", "NiftyBank"])
+            runtime_result = await asyncio.to_thread(refresh_live_metrics_for_indices, source_lists)
 
             set_meta(
                 "index_refresh_scheduler",

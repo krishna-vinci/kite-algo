@@ -1,15 +1,18 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { QuickTradeChartStrip } from "@/components/quick-trade/quick-trade-chart-strip";
-import type { Underlying, OptionSessionSnapshot, RuntimeStatus } from "@/components/options/types";
+import type { Underlying, OptionSessionSnapshot } from "@/components/options/types";
+import { CompactTradingDock } from "@/features/trading/components/compact-trading-dock";
+import { MarketQuoteStrip } from "@/features/trading/components/market-quote-strip";
+import { useTradingConsoleData } from "@/features/trading/hooks/use-trading-console-data";
 import { useQuickTradeCandles } from "@/hooks/use-quick-trade-candles";
 import {
   buildOptionsSessionSseUrl,
   ensureOptionsSessions,
   fetchOptionSession,
-  fetchRuntimeStatus,
   loginToBroker,
   mergeOptionSessionSnapshot,
   normalizeOptionSessionSnapshot,
@@ -24,44 +27,6 @@ const QUICK_TRADE_TOKENS = {
   NIFTY: "256265",
   GOLDM_FUT: "124881671",
 } as const;
-
-function createFallbackRuntimeStatus(): RuntimeStatus {
-  return {
-    brokerConnected: false,
-    brokerStatus: "unknown",
-    brokerMode: "system",
-    brokerLastSuccessAt: null,
-    brokerLastFailureAt: null,
-    brokerLastError: null,
-    brokerNextRefreshAt: null,
-    websocketStatus: "degraded",
-    paperAvailable: true,
-    appAuthenticated: false,
-  };
-}
-
-function createFallbackSession(underlying: Underlying): OptionSessionSnapshot {
-  const spotPrice = underlying === "BANKNIFTY" ? 48240 : 23460;
-  const gap = underlying === "BANKNIFTY" ? 100 : 50;
-  const atmStrike = Math.round(spotPrice / gap) * gap;
-  return {
-    underlying,
-    spotLtp: spotPrice,
-    atmStrike,
-    expiries: ["2026-04-30"],
-    perExpiry: {
-      "2026-04-30": {
-        forward: spotPrice + 12,
-        sigmaExpiry: null,
-        atmStrike,
-        strikes: [],
-        rows: [],
-      },
-    },
-    rows: [],
-    updatedAt: null,
-  };
-}
 
 function StatusDot({ label, ok }: Readonly<{ label: string; ok: boolean }>) {
   return (
@@ -82,30 +47,18 @@ function DebugValue({ label, value }: Readonly<{ label: string; value: string }>
 }
 
 export function QuickTradeWorkspace() {
+  const queryClient = useQueryClient();
+  const tradingSnapshot = useTradingConsoleData();
+  const runtimeStatus = tradingSnapshot.runtime;
   const [chartHeight, setChartHeight] = useState(360);
   const [splitPercent, setSplitPercent] = useState(50);
-  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>(createFallbackRuntimeStatus());
   const [loginPending, setLoginPending] = useState(false);
-  const [sessions, setSessions] = useState<Record<Underlying, OptionSessionSnapshot>>({
-    NIFTY: createFallbackSession("NIFTY"),
-    BANKNIFTY: createFallbackSession("BANKNIFTY"),
+  const [sessions, setSessions] = useState<Record<Underlying, OptionSessionSnapshot | null>>({
+    NIFTY: null,
+    BANKNIFTY: null,
   });
 
   const { chartCandles, liveCandles, latestPrices, referenceCloses, debugCounts, chartLoading, timeframe, setTimeframe, liveConnected, lastUpdateAt, historyGeneration } = useQuickTradeCandles(runtimeStatus.appAuthenticated, QUICK_TRADE_TOKENS);
-
-  // --- runtime status polling ---
-  useEffect(() => {
-    let disposed = false;
-    async function poll() {
-      try {
-        const status = await fetchRuntimeStatus();
-        if (!disposed) setRuntimeStatus(status);
-      } catch { /* ignore */ }
-    }
-    void poll();
-    const interval = window.setInterval(poll, 15000);
-    return () => { disposed = true; window.clearInterval(interval); };
-  }, []);
 
   // --- SSE for option session (forward prices) ---
   useEffect(() => {
@@ -239,7 +192,7 @@ export function QuickTradeWorkspace() {
     setLoginPending(true);
     try {
       const response = await loginToBroker();
-      setRuntimeStatus(await fetchRuntimeStatus());
+      await queryClient.invalidateQueries({ queryKey: ["trading", "runtime-status"] });
       toast.success(response.authenticated ? "Broker session refreshed" : "Broker login request sent");
     } catch {
       toast.error("Broker login failed");
@@ -270,6 +223,10 @@ export function QuickTradeWorkspace() {
           )}
         </div>
       </header>
+
+      <div className="rounded-2xl border border-[var(--border)] bg-[var(--panel)] px-3 py-2">
+        <MarketQuoteStrip quotes={tradingSnapshot.quotes} compact />
+      </div>
 
       <section className="grid grid-cols-2 gap-x-3 gap-y-1 rounded-xl border border-[var(--border)] bg-[var(--panel)]/70 px-3 py-2 md:grid-cols-4 xl:grid-cols-8">
         <DebugValue label="tf" value={timeframe} />
@@ -315,6 +272,8 @@ export function QuickTradeWorkspace() {
           fillHeight
         />
       </div>
+
+      <CompactTradingDock workspace="/quick-trade" paper={tradingSnapshot.paper} broker={tradingSnapshot.broker} />
     </div>
   );
 }

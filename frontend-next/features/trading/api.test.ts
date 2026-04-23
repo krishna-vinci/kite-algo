@@ -46,6 +46,7 @@ describe("normalizePaperStrategySummary", () => {
     });
 
     expect(summary.activeStrategyCount).toBe(1);
+    expect(summary.account.availableFunds).toBe(82000);
     expect(summary.strategies[0].capabilities.canEditRisk).toBe(true);
     expect(summary.strategies[1].isOpen).toBe(false);
   });

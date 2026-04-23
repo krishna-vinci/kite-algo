@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Panel } from "@/components/operator/panel";
 import { StatusBadge } from "@/components/operator/status-badge";
 import type { TradingStrategyGroup } from "@/features/trading/types";
@@ -8,7 +8,20 @@ import { RiskAdjustmentSheet } from "./risk-adjustment-sheet";
 
 type StrategyGroupsPanelProps = {
   strategies: TradingStrategyGroup[];
+  emptyCopy?: string;
+  renderActions?: (strategy: TradingStrategyGroup) => ReactNode;
 };
+
+function formatUpdatedAt(value?: string | null) {
+  if (!value) {
+    return null;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return date.toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
+}
 
 function formatCurrency(value: number) {
   const sign = value >= 0 ? "+" : "";
@@ -28,14 +41,18 @@ function riskSummary(s: TradingStrategyGroup) {
   return parts.length > 0 ? parts.join(" · ") : "No risk controls set";
 }
 
-export function StrategyGroupsPanel({ strategies }: StrategyGroupsPanelProps) {
+export function StrategyGroupsPanel({
+  strategies,
+  emptyCopy = "No strategies loaded",
+  renderActions,
+}: StrategyGroupsPanelProps) {
   const [editTarget, setEditTarget] = useState<TradingStrategyGroup | null>(null);
 
   return (
     <>
-      <Panel eyebrow="strategies" title="Strategy groups" data-testid="strategy-groups-panel">
+        <Panel eyebrow="strategies" title="Strategy groups" data-testid="strategy-groups-panel">
         {strategies.length === 0 && (
-          <p className="py-4 text-center text-sm text-foreground/40">No strategies loaded</p>
+          <p className="py-4 text-center text-sm text-foreground/40">{emptyCopy}</p>
         )}
         <div className="space-y-3">
           {strategies.map((s) => (
@@ -61,6 +78,14 @@ export function StrategyGroupsPanel({ strategies }: StrategyGroupsPanelProps) {
                 </div>
               </div>
 
+              {(s.strategyTag || s.algoInstanceId || s.lastUpdatedAt) && (
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] text-foreground/40">
+                  {s.strategyTag ? <span>{s.strategyTag}</span> : null}
+                  {s.algoInstanceId ? <span className="font-mono">algo {s.algoInstanceId}</span> : null}
+                  {formatUpdatedAt(s.lastUpdatedAt) ? <span>updated {formatUpdatedAt(s.lastUpdatedAt)}</span> : null}
+                </div>
+              )}
+
               {/* P&L row */}
               <div className="mt-2 flex items-center gap-4 text-xs">
                 <span className="text-foreground/50">
@@ -80,14 +105,17 @@ export function StrategyGroupsPanel({ strategies }: StrategyGroupsPanelProps) {
               {/* Risk controls summary */}
               <div className="mt-2 flex items-center justify-between gap-2">
                 <p className="font-mono text-[11px] text-foreground/40">{riskSummary(s)}</p>
-                {s.capabilities.canEditRisk && (
-                  <button
-                    onClick={() => setEditTarget(s)}
-                    className="rounded-md border border-border/50 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-foreground/60 hover:border-primary/40 hover:text-foreground/80"
-                  >
-                    Edit risk
-                  </button>
-                )}
+                <div className="flex items-center gap-2">
+                  {renderActions?.(s)}
+                  {s.capabilities.canEditRisk && (
+                    <button
+                      onClick={() => setEditTarget(s)}
+                      className="rounded-md border border-border/50 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-foreground/60 hover:border-primary/40 hover:text-foreground/80"
+                    >
+                      Edit risk
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           ))}

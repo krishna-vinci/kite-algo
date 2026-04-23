@@ -39,12 +39,17 @@ export type TradingTradeRow = Record<string, unknown>;
 export type TradingStrategyGroup = {
   strategyId: string;
   displayName: string;
+  strategyTag?: string | null;
+  algoInstanceId?: string | null;
   mode: TradingMode;
   status: string;
   isOpen: boolean;
   openLegCount: number;
+  netQuantity?: number;
   realizedPnl: number;
   unrealizedPnl: number;
+  marginInUse?: number;
+  lastUpdatedAt?: string | null;
   riskControls: StrategyRiskControls;
   capabilities: StrategyCapabilities;
   positions: TradingPositionRow[];
@@ -53,8 +58,20 @@ export type TradingStrategyGroup = {
   timeline: TradingTimelineItem[];
 };
 
+export type TradingPaperAccount = {
+  accountScope: string;
+  currency: string;
+  startingBalance: number;
+  availableFunds: number;
+  blockedFunds: number;
+  realizedPnl: number;
+  unrealizedPnl: number;
+  openPositionCount: number;
+};
+
 export type TradingPaperSummary = {
   accountScope: string;
+  account: TradingPaperAccount;
   activeStrategyCount: number;
   strategies: TradingStrategyGroup[];
 };

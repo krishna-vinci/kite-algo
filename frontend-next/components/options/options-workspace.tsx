@@ -1,22 +1,23 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { FloatingOrderTicket } from "@/components/options/floating-order-ticket";
 import { NiftyImpactPanel } from "@/components/options/nifty-impact-panel";
 import { OptionChainPanel } from "@/components/options/option-chain-panel";
 import { OptionsHeader } from "@/components/options/options-header";
-import { PositionsDock } from "@/components/options/positions-dock";
 import { StrategyBuilderPanel } from "@/components/options/strategy-builder-panel";
-import type { LivePosition, MiniChainSnapshot, NiftyImpactRow, OptionSessionSnapshot, RuntimeStatus, Underlying } from "@/components/options/types";
+import type { MiniChainSnapshot, NiftyImpactRow, OptionSessionSnapshot, Underlying } from "@/components/options/types";
 import { WorkspaceTabs } from "@/components/options/workspace-tabs";
+import { CompactTradingDock } from "@/features/trading/components/compact-trading-dock";
+import { MarketQuoteStrip } from "@/features/trading/components/market-quote-strip";
+import { useTradingConsoleData } from "@/features/trading/hooks/use-trading-console-data";
 import {
   buildOptionsSessionSseUrl,
   ensureOptionsSessions,
   fetchNifty50Impact,
   fetchOptionSession,
-  fetchRealtimePositions,
-  fetchRuntimeStatus,
   loginToBroker,
   mergeOptionSessionSnapshot,
   normalizeOptionSessionSnapshot,
@@ -26,117 +27,6 @@ const INDEX_TOKENS: Record<Underlying, string> = {
   NIFTY: "256265",
   BANKNIFTY: "260105",
 };
-
-function createFallbackRuntimeStatus(): RuntimeStatus {
-  return {
-    brokerConnected: false,
-    brokerStatus: "unknown",
-    brokerMode: "system",
-    brokerLastSuccessAt: null,
-    brokerLastFailureAt: null,
-    brokerLastError: null,
-    brokerNextRefreshAt: null,
-    websocketStatus: "degraded",
-    paperAvailable: true,
-    appAuthenticated: false,
-  };
-}
-
-function createFallbackMiniChain(underlying: Underlying, expiry = "2026-04-30"): MiniChainSnapshot {
-  const spotPrice = underlying === "BANKNIFTY" ? 48240 : 23460;
-  const gap = underlying === "BANKNIFTY" ? 100 : 50;
-  const atmStrike = Math.round(spotPrice / gap) * gap;
-  const strikes = Array.from({ length: 11 }, (_, index) => {
-    const strike = atmStrike + (index - 5) * gap;
-    return {
-      strike,
-      isAtm: strike === atmStrike,
-      ce: {
-        instrumentToken: strike + 1,
-        tradingSymbol: `${underlying}${strike}CE`,
-        ltp: Math.max(12, 120 - Math.abs(strike - atmStrike) * 0.6),
-        lotSize: underlying === "BANKNIFTY" ? 15 : 25,
-        delta: Math.max(0.05, 0.52 - Math.abs(strike - atmStrike) / (gap * 12)),
-        gamma: 0.03,
-        theta: -2.1,
-        vega: 5.5,
-        iv: 14.8,
-        oi: 1200 + index * 80,
-      },
-      pe: {
-        instrumentToken: strike + 2,
-        tradingSymbol: `${underlying}${strike}PE`,
-        ltp: Math.max(12, 118 - Math.abs(strike - atmStrike) * 0.55),
-        lotSize: underlying === "BANKNIFTY" ? 15 : 25,
-        delta: -Math.max(0.05, 0.5 - Math.abs(strike - atmStrike) / (gap * 12)),
-        gamma: 0.03,
-        theta: -2.05,
-        vega: 5.2,
-        iv: 14.4,
-        oi: 1100 + index * 75,
-      },
-    };
-  });
-
-  return {
-    underlying,
-    expiry,
-    spotPrice,
-    atmStrike,
-    strikes,
-  };
-}
-
-function createFallbackSession(underlying: Underlying): OptionSessionSnapshot {
-  const mini = createFallbackMiniChain(underlying);
-  const rows = mini.strikes.map((row) => ({
-    strike: row.strike,
-    ce: row.ce
-      ? {
-          token: row.ce.instrumentToken,
-          tsym: row.ce.tradingSymbol,
-          ltp: row.ce.ltp,
-          iv: row.ce.iv,
-          oi: row.ce.oi ?? null,
-          delta: row.ce.delta,
-          gamma: row.ce.gamma,
-          theta: row.ce.theta,
-          vega: row.ce.vega,
-        }
-      : null,
-    pe: row.pe
-      ? {
-          token: row.pe.instrumentToken,
-          tsym: row.pe.tradingSymbol,
-          ltp: row.pe.ltp,
-          iv: row.pe.iv,
-          oi: row.pe.oi ?? null,
-          delta: row.pe.delta,
-          gamma: row.pe.gamma,
-          theta: row.pe.theta,
-          vega: row.pe.vega,
-        }
-      : null,
-    isAtm: row.isAtm,
-  }));
-  return {
-    underlying,
-    spotLtp: mini.spotPrice,
-    atmStrike: mini.atmStrike,
-    expiries: [mini.expiry],
-    perExpiry: {
-      [mini.expiry]: {
-        forward: mini.spotPrice,
-        sigmaExpiry: null,
-        atmStrike: mini.atmStrike,
-        strikes: mini.strikes.map((row) => row.strike),
-        rows,
-      },
-    },
-    rows,
-    updatedAt: null,
-  };
-}
 
 function toMiniChainSnapshot(session: OptionSessionSnapshot | null | undefined, expiry: string | null): MiniChainSnapshot | null {
   if (!session || !expiry) {
@@ -194,41 +84,6 @@ function readForwardPrice(session: OptionSessionSnapshot | null | undefined) {
   return firstExpiry ? session.perExpiry[firstExpiry]?.forward ?? null : null;
 }
 
-function createFallbackPositions(): LivePosition[] {
-  return [
-    {
-      key: "nifty-short-call",
-      tradingSymbol: "NIFTY 23500 CE",
-      exchange: "NFO",
-      product: "MIS",
-      quantity: -25,
-      averagePrice: 122.4,
-      lastPrice: 108.6,
-      pnl: 345,
-      badge: "naked",
-    },
-    {
-      key: "nifty-short-put",
-      tradingSymbol: "NIFTY 23400 PE",
-      exchange: "NFO",
-      product: "MIS",
-      quantity: -25,
-      averagePrice: 114.2,
-      lastPrice: 120.8,
-      pnl: -165,
-      badge: "unmanaged",
-    },
-  ];
-}
-
-function createFallbackImpact(): NiftyImpactRow[] {
-  return [
-    { symbol: "HDFCBANK", sector: "Banks", weight: 13.2, changePercent: 1.1, contribution: 0.15 },
-    { symbol: "RELIANCE", sector: "Energy", weight: 8.7, changePercent: -0.45, contribution: -0.04 },
-    { symbol: "ICICIBANK", sector: "Banks", weight: 8.2, changePercent: 0.62, contribution: 0.05 },
-    { symbol: "TCS", sector: "IT", weight: 4.1, changePercent: -0.22, contribution: -0.01 },
-  ];
-}
 
 function SpotTicker({ label, price, forwardPrice }: Readonly<{ label: string; price: number | null; forwardPrice: number | null }>) {
   const basis = price !== null && forwardPrice !== null ? forwardPrice - price : null;
@@ -256,20 +111,20 @@ function SpotTicker({ label, price, forwardPrice }: Readonly<{ label: string; pr
 }
 
 export function OptionsWorkspace() {
+  const queryClient = useQueryClient();
+  const tradingSnapshot = useTradingConsoleData();
+  const runtimeStatus = tradingSnapshot.runtime;
   const [activeTab, setActiveTab] = useState<"chain" | "builder" | "impact">("builder");
   const [underlying, setUnderlying] = useState<Underlying>("NIFTY");
   const [deltaFilter, setDeltaFilter] = useState(0.3);
-  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>(createFallbackRuntimeStatus());
   const [loginPending, setLoginPending] = useState(false);
-  const [expiries, setExpiries] = useState<string[]>(["2026-04-30"]);
-  const [selectedExpiry, setSelectedExpiry] = useState("2026-04-30");
-  const [sessions, setSessions] = useState<Record<Underlying, OptionSessionSnapshot>>({
-    NIFTY: createFallbackSession("NIFTY"),
-    BANKNIFTY: createFallbackSession("BANKNIFTY"),
+  const [expiries, setExpiries] = useState<string[]>([]);
+  const [selectedExpiry, setSelectedExpiry] = useState("");
+  const [sessions, setSessions] = useState<Record<Underlying, OptionSessionSnapshot | null>>({
+    NIFTY: null,
+    BANKNIFTY: null,
   });
-  const [positions, setPositions] = useState<LivePosition[]>(createFallbackPositions());
-  const [impactRows, setImpactRows] = useState<NiftyImpactRow[]>(createFallbackImpact());
-  const [dockExpanded, setDockExpanded] = useState(false);
+  const [impactRows, setImpactRows] = useState<NiftyImpactRow[]>([]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerStrike, setDrawerStrike] = useState<number | null>(null);
   const [drawerType, setDrawerType] = useState<"call" | "put">("call");
@@ -284,32 +139,28 @@ export function OptionsWorkspace() {
   }, [runtimeStatus.appAuthenticated]);
 
   useEffect(() => {
+    if (!runtimeStatus.appAuthenticated) {
+      setImpactRows([]);
+      return;
+    }
+
     let disposed = false;
 
-    async function loadStaticPanels() {
-      const [statusResult, impactResult, positionsResult] = await Promise.allSettled([
-        fetchRuntimeStatus(),
-        runtimeStatus.appAuthenticated ? fetchNifty50Impact() : Promise.resolve(createFallbackImpact()),
-        runtimeStatus.appAuthenticated ? fetchRealtimePositions() : Promise.resolve(createFallbackPositions()),
-      ]);
-
-      if (disposed) {
-        return;
-      }
-
-      if (statusResult.status === "fulfilled") {
-        setRuntimeStatus(statusResult.value);
-      }
-      if (impactResult.status === "fulfilled" && impactResult.value.length > 0) {
-        setImpactRows(impactResult.value);
-      }
-      if (positionsResult.status === "fulfilled" && positionsResult.value.length > 0) {
-        setPositions(positionsResult.value);
+    async function loadImpact() {
+      try {
+        const rows = await fetchNifty50Impact();
+        if (!disposed) {
+          setImpactRows(rows);
+        }
+      } catch {
+        if (!disposed) {
+          setImpactRows([]);
+        }
       }
     }
 
-    void loadStaticPanels();
-    const interval = window.setInterval(loadStaticPanels, 15000);
+    void loadImpact();
+    const interval = window.setInterval(loadImpact, 15000);
     return () => {
       disposed = true;
       window.clearInterval(interval);
@@ -377,27 +228,30 @@ export function OptionsWorkspace() {
 
   useEffect(() => {
     const session = sessions[underlying];
-    const fallbackExpiry = createFallbackMiniChain(underlying).expiry;
-    const nextExpiries = session?.expiries?.length ? session.expiries : [fallbackExpiry];
+    const nextExpiries = session?.expiries?.length ? session.expiries : [];
     setExpiries(nextExpiries);
-    setSelectedExpiry((current) => (nextExpiries.includes(current) ? current : nextExpiries[0] ?? fallbackExpiry));
+    setSelectedExpiry((current) => (nextExpiries.includes(current) ? current : nextExpiries[0] ?? ""));
   }, [sessions, underlying]);
 
   const primarySession = sessions.NIFTY;
   const secondarySession = sessions.BANKNIFTY;
+  const quoteBySymbol = Object.fromEntries(tradingSnapshot.quotes.map((quote) => [quote.symbol, quote])) as Record<string, typeof tradingSnapshot.quotes[number]>;
   const chain = useMemo(() => {
     const liveChain = toMiniChainSnapshot(sessions[underlying], selectedExpiry);
-    if (liveChain) {
-      return liveChain;
-    }
-    return createFallbackMiniChain(underlying, selectedExpiry || undefined);
+    return liveChain;
   }, [selectedExpiry, sessions, underlying]);
   const chainLoading = runtimeStatus.appAuthenticated && !toMiniChainSnapshot(sessions[underlying], selectedExpiry);
   const primaryForward = useMemo(() => (runtimeStatus.appAuthenticated ? readForwardPrice(primarySession) : null), [primarySession, runtimeStatus.appAuthenticated]);
   const secondaryForward = useMemo(() => (runtimeStatus.appAuthenticated ? readForwardPrice(secondarySession) : null), [secondarySession, runtimeStatus.appAuthenticated]);
 
-  const primaryPrice = useMemo(() => (runtimeStatus.appAuthenticated ? primarySession?.spotLtp ?? null : null), [primarySession?.spotLtp, runtimeStatus.appAuthenticated]);
-  const secondaryPrice = useMemo(() => (runtimeStatus.appAuthenticated ? secondarySession?.spotLtp ?? null : null), [secondarySession?.spotLtp, runtimeStatus.appAuthenticated]);
+  const primaryPrice = useMemo(
+    () => (runtimeStatus.appAuthenticated ? primarySession?.spotLtp ?? quoteBySymbol.NIFTY?.lastPrice ?? null : null),
+    [primarySession?.spotLtp, quoteBySymbol.NIFTY?.lastPrice, runtimeStatus.appAuthenticated],
+  );
+  const secondaryPrice = useMemo(
+    () => (runtimeStatus.appAuthenticated ? secondarySession?.spotLtp ?? quoteBySymbol.BANKNIFTY?.lastPrice ?? null : null),
+    [quoteBySymbol.BANKNIFTY?.lastPrice, runtimeStatus.appAuthenticated, secondarySession?.spotLtp],
+  );
 
   async function handleBrokerLogin() {
     if (!runtimeStatus.appAuthenticated) {
@@ -407,7 +261,7 @@ export function OptionsWorkspace() {
     setLoginPending(true);
     try {
       const response = await loginToBroker();
-      setRuntimeStatus(await fetchRuntimeStatus());
+      await queryClient.invalidateQueries({ queryKey: ["trading", "runtime-status"] });
       toast.success(response.authenticated ? "Broker session refreshed" : "Broker login request sent");
     } catch {
       toast.error("Broker login failed");
@@ -436,7 +290,8 @@ export function OptionsWorkspace() {
         <SpotTicker label="NIFTY" price={primaryPrice} forwardPrice={primaryForward} />
         <span className="mx-1 h-[18px] w-px bg-[var(--border-soft)]" />
         <SpotTicker label="BNF" price={secondaryPrice} forwardPrice={secondaryForward} />
-        <span className="ml-auto text-[10px] text-[var(--dim)]">auto-managed sessions</span>
+        <span className="ml-auto hidden text-[10px] text-[var(--dim)] lg:inline">canonical paper + broker state</span>
+        <MarketQuoteStrip quotes={tradingSnapshot.quotes} compact className="hidden xl:flex" />
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg)]/60">
@@ -479,7 +334,7 @@ export function OptionsWorkspace() {
         </div>
       </div>
 
-      <PositionsDock positions={positions} expanded={dockExpanded} onToggle={() => setDockExpanded((value) => !value)} />
+      <CompactTradingDock workspace="/options" paper={tradingSnapshot.paper} broker={tradingSnapshot.broker} />
     </div>
   );
 }

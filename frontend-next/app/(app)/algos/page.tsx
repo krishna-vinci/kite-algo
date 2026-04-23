@@ -1,73 +1,55 @@
+"use client";
+
+import Link from "next/link";
+
 import { Panel } from "@/components/operator/panel";
 import { StatusBadge } from "@/components/operator/status-badge";
-
-const processes = [
-  { pid: "2184", name: "straddle-watcher", state: "running", cpu: "8%", mem: "142MB" },
-  { pid: "2241", name: "risk-guardian", state: "sleeping", cpu: "1%", mem: "88MB" },
-  { pid: "2299", name: "exit-router", state: "running", cpu: "6%", mem: "116MB" },
-];
-
-const logs = [
-  "09:12:01  boot sequence complete",
-  "09:12:07  worker shard 3 attached",
-  "09:12:12  trailing stop recalculated",
-  "09:12:19  queue depth stable",
-  "09:12:24  awaiting next signal",
-];
+import { BrokerPositionsPanel } from "@/features/trading/components/broker-positions-panel";
+import { MarketQuoteStrip } from "@/features/trading/components/market-quote-strip";
+import { RuntimeHealthCard } from "@/features/trading/components/runtime-health-card";
+import { StrategyGroupsPanel } from "@/features/trading/components/strategy-groups-panel";
+import { useTradingConsoleData } from "@/features/trading/hooks/use-trading-console-data";
 
 export default function AlgosPage() {
-  return (
-    <div className="grid gap-4 pb-4 xl:grid-cols-[1.05fr_0.95fr]">
-      <Panel eyebrow="tmux" title="Process manager">
-        <div className="rounded-2xl border border-border/60 bg-background/60 p-3 font-mono text-sm">
-          <div className="flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-[0.35em] text-foreground/40">
-            <span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-1 text-primary">session 01</span>
-            <span>window 3</span>
-            <span>layout: monitor</span>
-          </div>
-          <div className="mt-4 space-y-2">
-            {processes.map((process) => (
-              <div key={process.pid} className="grid grid-cols-[72px_1fr_96px_72px_72px] gap-2 rounded-xl border border-border/60 px-3 py-2">
-                <span className="text-foreground/40">[{process.pid}]</span>
-                <span className="text-primary">{process.name}</span>
-                <span>{process.state}</span>
-                <span>{process.cpu}</span>
-                <span>{process.mem}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-        <div className="mt-4 flex flex-wrap gap-2 text-xs">
-          <StatusBadge tone="positive">attach</StatusBadge>
-          <StatusBadge tone="neutral">split pane</StatusBadge>
-          <StatusBadge tone="warning">hot reload pending</StatusBadge>
-        </div>
-      </Panel>
+  const snapshot = useTradingConsoleData();
+  const activeStrategies = snapshot.paper.strategies.filter((strategy) => strategy.isOpen);
 
-      <Panel eyebrow="logs" title="Live task stream">
-        <div className="rounded-2xl border border-border/60 bg-background/60 p-4 font-mono text-sm leading-7">
-          {logs.map((line) => (
-            <div key={line} className="flex gap-3">
-              <span className="text-foreground/40">$</span>
-              <span className="text-foreground/80">{line}</span>
-            </div>
-          ))}
-        </div>
-        <div className="mt-4 grid gap-3 sm:grid-cols-3">
-          <div className="rounded-2xl border border-border/60 bg-background/60 p-3">
-            <p className="text-[10px] uppercase tracking-[0.35em] text-foreground/40">keybinding</p>
-            <p className="mt-2 font-mono text-sm text-primary">Ctrl+b split</p>
+  return (
+    <div className="grid gap-4 pb-4 xl:grid-cols-[0.95fr_1.05fr]">
+      <div className="space-y-4">
+        <Panel
+          eyebrow="algos"
+          title="Algo runtime overview"
+          action={<StatusBadge tone={snapshot.runtime.brokerConnected ? "positive" : "warning"}>{snapshot.runtime.brokerStatus}</StatusBadge>}
+        >
+          <p className="text-sm text-foreground/60">
+            This page now reads the same canonical runtime, paper-strategy, and broker-position truth as the Trading Console.
+          </p>
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            <Link href="/trading" className="rounded-full border border-primary/30 bg-primary/10 px-3 py-2 text-xs font-medium uppercase tracking-[0.24em] text-primary">
+              Open trading console
+            </Link>
+            <span className="text-xs text-foreground/50">{activeStrategies.length} active strategy runs · {snapshot.broker.activeCount} live broker positions</span>
           </div>
-          <div className="rounded-2xl border border-border/60 bg-background/60 p-3">
-            <p className="text-[10px] uppercase tracking-[0.35em] text-foreground/40">worker</p>
-            <p className="mt-2 font-mono text-sm text-primary">3 active</p>
-          </div>
-          <div className="rounded-2xl border border-border/60 bg-background/60 p-3">
-            <p className="text-[10px] uppercase tracking-[0.35em] text-foreground/40">queue</p>
-            <p className="mt-2 font-mono text-sm text-primary">2 pending</p>
-          </div>
-        </div>
-      </Panel>
+          <MarketQuoteStrip quotes={snapshot.quotes} compact className="mt-4" />
+        </Panel>
+
+        <RuntimeHealthCard runtime={snapshot.runtime} />
+        <BrokerPositionsPanel broker={snapshot.broker} />
+      </div>
+
+      <StrategyGroupsPanel
+        strategies={snapshot.paper.strategies}
+        emptyCopy="No active algo-linked strategy runs are available yet. Launch an options paper strategy or open the Trading Console for full ledgers."
+        renderActions={() => (
+          <Link
+            href="/trading"
+            className="rounded-md border border-border/50 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-foreground/60 hover:border-primary/40 hover:text-foreground/80"
+          >
+            Inspect
+          </Link>
+        )}
+      />
     </div>
   );
 }

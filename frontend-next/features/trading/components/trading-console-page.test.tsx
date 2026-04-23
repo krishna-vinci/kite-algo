@@ -22,6 +22,16 @@ const MOCK_SNAPSHOT: TradingConsoleSnapshot = {
   ],
   paper: {
     accountScope: "default",
+    account: {
+      accountScope: "default",
+      currency: "INR",
+      startingBalance: 100000,
+      availableFunds: 82000,
+      blockedFunds: 18000,
+      realizedPnl: 1200,
+      unrealizedPnl: -350,
+      openPositionCount: 1,
+    },
     activeStrategyCount: 1,
     strategies: [
       {

@@ -1,5 +1,6 @@
 import type { RuntimeStatus } from "@/components/options/types";
 import type {
+  TradingPaperAccount,
   StrategyCapabilities,
   TradingBrokerPosition,
   TradingBrokerSnapshot,
@@ -115,12 +116,17 @@ function normalizeStrategy(item: Record<string, unknown>): TradingStrategyGroup 
   return {
     strategyId: String(item.strategy_id ?? "unknown"),
     displayName: String(item.display_name ?? item.strategy_id ?? "Unnamed strategy"),
+    strategyTag: typeof item.strategy_tag === "string" ? item.strategy_tag : null,
+    algoInstanceId: typeof item.algo_instance_id === "string" ? item.algo_instance_id : null,
     mode: (item.mode === "live" || item.mode === "dry_run" ? item.mode : "paper") as TradingStrategyGroup["mode"],
     status: String(item.status ?? "unknown"),
     isOpen: Boolean(item.is_open ?? (typeof item.open_leg_count === "number" && item.open_leg_count > 0)),
     openLegCount: typeof item.open_leg_count === "number" ? item.open_leg_count : 0,
+    netQuantity: typeof item.net_quantity === "number" ? item.net_quantity : 0,
     realizedPnl: typeof item.realized_pnl === "number" ? item.realized_pnl : 0,
     unrealizedPnl: typeof item.unrealized_pnl === "number" ? item.unrealized_pnl : 0,
+    marginInUse: typeof item.margin_in_use === "number" ? item.margin_in_use : 0,
+    lastUpdatedAt: typeof item.last_updated_at === "string" ? item.last_updated_at : null,
     riskControls: normalizeRiskControls(item.risk_controls),
     capabilities: normalizeCapabilities(item.capabilities),
     positions: Array.isArray(item.positions) ? item.positions : [],
@@ -130,10 +136,25 @@ function normalizeStrategy(item: Record<string, unknown>): TradingStrategyGroup 
   };
 }
 
-export function normalizePaperStrategySummary(response: PaperStrategySummaryResponse): TradingPaperSummary {
-  const strategies = (response?.strategies ?? []).map((item) => normalizeStrategy(item));
+function normalizePaperAccount(response: PaperStrategySummaryResponse): TradingPaperAccount {
   return {
     accountScope: response?.account?.account_scope ?? "default",
+    currency: response?.account?.currency ?? "INR",
+    startingBalance: response?.account?.starting_balance ?? 0,
+    availableFunds: response?.account?.available_funds ?? 0,
+    blockedFunds: response?.account?.blocked_funds ?? 0,
+    realizedPnl: response?.account?.realized_pnl ?? 0,
+    unrealizedPnl: response?.account?.unrealized_pnl ?? 0,
+    openPositionCount: response?.account?.open_position_count ?? 0,
+  };
+}
+
+export function normalizePaperStrategySummary(response: PaperStrategySummaryResponse): TradingPaperSummary {
+  const strategies = (response?.strategies ?? []).map((item) => normalizeStrategy(item));
+  const account = normalizePaperAccount(response);
+  return {
+    accountScope: account.accountScope,
+    account,
     activeStrategyCount: strategies.filter((item) => item.isOpen).length,
     strategies,
   };
@@ -189,5 +210,17 @@ export async function updatePaperStrategyRisk(
   return apiFetch(`/api/system/paper/strategies/${encodeURIComponent(strategyId)}/risk?account_scope=${encodeURIComponent(accountScope)}`, {
     method: "PATCH",
     json: payload,
+  });
+}
+
+export async function exitPaperStrategy(accountScope: string, strategyId: string): Promise<{
+  status: string;
+  strategy_id: string;
+  results?: unknown[];
+  message?: string;
+}> {
+  return apiFetch(`/api/system/paper/accounts/${encodeURIComponent(accountScope)}/exit-strategy`, {
+    method: "POST",
+    json: { strategy_id: strategyId },
   });
 }

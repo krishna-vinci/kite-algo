@@ -10,6 +10,16 @@ describe("CompactTradingDock", () => {
         workspace="/dashboard"
         paper={{
           accountScope: "default",
+          account: {
+            accountScope: "default",
+            currency: "INR",
+            startingBalance: 100000,
+            availableFunds: 82000,
+            blockedFunds: 18000,
+            realizedPnl: 0,
+            unrealizedPnl: 1500,
+            openPositionCount: 2,
+          },
           activeStrategyCount: 1,
           strategies: [
             {

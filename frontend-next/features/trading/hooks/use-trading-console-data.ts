@@ -29,7 +29,21 @@ export function useTradingConsoleData(): TradingConsoleSnapshot {
     () => ({
       runtime: runtimeQuery.data ?? FALLBACK_RUNTIME,
       quotes: market.quotes,
-      paper: paperQuery.data ?? { accountScope: "default", activeStrategyCount: 0, strategies: [] },
+      paper: paperQuery.data ?? {
+        accountScope: "default",
+        account: {
+          accountScope: "default",
+          currency: "INR",
+          startingBalance: 0,
+          availableFunds: 0,
+          blockedFunds: 0,
+          realizedPnl: 0,
+          unrealizedPnl: 0,
+          openPositionCount: 0,
+        },
+        activeStrategyCount: 0,
+        strategies: [],
+      },
       broker: brokerQuery.data ?? { positions: [], activeCount: 0 },
     }),
     [brokerQuery.data, market.quotes, paperQuery.data, runtimeQuery.data],
