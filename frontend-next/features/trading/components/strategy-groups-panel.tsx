@@ -29,16 +29,12 @@ function formatCurrency(value: number) {
 }
 
 function riskSummary(s: TradingStrategyGroup) {
-  const parts: string[] = [];
-  const r = s.riskControls;
-  if (r.combinedPremiumStoploss !== null) parts.push(`SL ${r.combinedPremiumStoploss}`);
-  if (r.combinedPremiumTarget !== null) parts.push(`TGT ${r.combinedPremiumTarget}`);
-  if (r.basketMtmStoploss !== null) parts.push(`MTM-SL ${r.basketMtmStoploss}`);
-  if (r.basketMtmTarget !== null) parts.push(`MTM-TGT ${r.basketMtmTarget}`);
-  if (r.indexLowerBoundary !== null || r.indexUpperBoundary !== null) {
-    parts.push(`Bounds ${r.indexLowerBoundary ?? "—"}–${r.indexUpperBoundary ?? "—"}`);
+  if (s.summaryFields.length === 0) {
+    return "No summary fields available";
   }
-  return parts.length > 0 ? parts.join(" · ") : "No risk controls set";
+  return s.summaryFields
+    .map((field) => `${field.label} ${field.value ?? "—"}${field.unit ? ` ${field.unit}` : ""}`)
+    .join(" · ");
 }
 
 export function StrategyGroupsPanel({
@@ -57,7 +53,7 @@ export function StrategyGroupsPanel({
         <div className="space-y-3">
           {strategies.map((s) => (
             <div
-              key={s.strategyId}
+              key={s.strategyRunId}
               className="rounded-xl border border-border/50 bg-background/50 px-4 py-3"
             >
               {/* Header row */}
@@ -81,6 +77,7 @@ export function StrategyGroupsPanel({
               {(s.strategyTag || s.algoInstanceId || s.lastUpdatedAt) && (
                 <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] text-foreground/40">
                   {s.strategyTag ? <span>{s.strategyTag}</span> : null}
+                  <span className="font-mono">run {s.strategyRunId}</span>
                   {s.algoInstanceId ? <span className="font-mono">algo {s.algoInstanceId}</span> : null}
                   {formatUpdatedAt(s.lastUpdatedAt) ? <span>updated {formatUpdatedAt(s.lastUpdatedAt)}</span> : null}
                 </div>
@@ -107,7 +104,7 @@ export function StrategyGroupsPanel({
                 <p className="font-mono text-[11px] text-foreground/40">{riskSummary(s)}</p>
                 <div className="flex items-center gap-2">
                   {renderActions?.(s)}
-                  {s.capabilities.canEditRisk && (
+                  {s.capabilities.canEditRisk && s.capabilities.riskSchema.length > 0 && (
                     <button
                       onClick={() => setEditTarget(s)}
                       className="rounded-md border border-border/50 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-foreground/60 hover:border-primary/40 hover:text-foreground/80"
@@ -128,9 +125,9 @@ export function StrategyGroupsPanel({
           onOpenChange={(open) => {
             if (!open) setEditTarget(null);
           }}
-          strategyId={editTarget.strategyId}
+          strategyId={editTarget.strategyRunId}
           displayName={editTarget.displayName}
-          riskControls={editTarget.riskControls}
+          riskSchema={editTarget.capabilities.riskSchema}
         />
       )}
     </>

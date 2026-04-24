@@ -204,6 +204,7 @@ export type BuilderLeg = OptionLeg & {
 export type DryRunPlan = {
   mode: "dry_run" | "execution";
   message: string;
+  strategyRunId?: string;
   strategyId?: string;
   strategy?: CanonicalStrategyPreview;
   orders?: Array<{

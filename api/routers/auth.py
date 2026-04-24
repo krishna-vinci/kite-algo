@@ -24,7 +24,7 @@ from broker_api.kite_session import KiteSession
 from database import get_db
 from strategies.option_strategy.store import OptionStrategyStore
 from runtime_monitor import get_components, get_logs, get_meta
-from strategies.option_strategy.runtime_updates import apply_protection_patch
+from strategies.option_strategy.runtime_updates import apply_protection_patch, build_option_run_capabilities, build_option_run_summary_fields
 
 
 router = APIRouter()
@@ -483,26 +483,55 @@ async def list_paper_strategies(request: Request, account_scope: str = Query(...
 
     for strategy in summary.get("strategies", []):
         run_id = strategy.get("strategy_id")
-        if not run_id or str(run_id).startswith("manual:"):
+        if not run_id:
             continue
-        run = option_strategy_store.get_run(str(run_id))
+        if str(run_id).startswith("manual:"):
+            strategy["capabilities"] = {
+                **dict(strategy.get("capabilities") or {}),
+                "can_edit_risk": False,
+                "edit_risk_reason": "Manual paper activity does not support runtime risk edits",
+                "can_exit_strategy": False,
+                "exit_reason": "Strategy-level exit is unavailable for manual paper activity",
+                "allowed_actions": [],
+                "risk_schema": [],
+            }
+            strategy["summary_fields"] = []
+            continue
+        if str(run_id).startswith("unsupported:"):
+            strategy["capabilities"] = {
+                **dict(strategy.get("capabilities") or {}),
+                "can_edit_risk": False,
+                "edit_risk_reason": "Unsupported shared positions do not support runtime risk edits",
+                "can_exit_strategy": False,
+                "exit_reason": strategy.get("capabilities", {}).get("exit_reason")
+                or "Strategy-level exit is disabled because the open position attribution is ambiguous",
+                "allowed_actions": [],
+                "risk_schema": [],
+            }
+            strategy["summary_fields"] = []
+            continue
+        run = option_strategy_store.get_strategy_run(str(run_id)) if hasattr(option_strategy_store, "get_strategy_run") else option_strategy_store.get_run(str(run_id))
         if run is None:
+            strategy["capabilities"] = {
+                **dict(strategy.get("capabilities") or {}),
+                "can_edit_risk": False,
+                "edit_risk_reason": "Runtime monitoring is unavailable for this paper strategy",
+                "can_exit_strategy": False,
+                "exit_reason": "Strategy-level exit requires a monitored paper strategy",
+                "allowed_actions": [],
+                "risk_schema": [],
+            }
+            strategy["summary_fields"] = []
             continue
         canonical = dict(run.get("canonical_strategy") or {})
-        prefs = dict(canonical.get("protection_preferences") or {})
         strategy["mode"] = run.get("execution_mode") or strategy.get("mode") or "paper"
-        strategy["risk_controls"] = {
-            "index_lower_boundary": prefs.get("index_lower_boundary"),
-            "index_upper_boundary": prefs.get("index_upper_boundary"),
-            "combined_premium_target": prefs.get("combined_premium_target"),
-            "combined_premium_stoploss": prefs.get("combined_premium_stoploss"),
-            "basket_mtm_target": prefs.get("basket_mtm_target"),
-            "basket_mtm_stoploss": prefs.get("basket_mtm_stoploss"),
-        }
-        strategy["capabilities"] = {
-            "can_edit_risk": bool(strategy.get("is_open")) and strategy.get("mode") == "paper",
-            "edit_risk_reason": None if (bool(strategy.get("is_open")) and strategy.get("mode") == "paper") else "Only open paper strategies support runtime risk edits",
-        }
+        strategy["summary_fields"] = build_option_run_summary_fields(canonical)
+        strategy["capabilities"] = build_option_run_capabilities(
+            run,
+            canonical_strategy=canonical,
+            is_open=bool(strategy.get("is_open")),
+            mode=str(strategy.get("mode") or "paper"),
+        )
     return summary
 
 
@@ -519,7 +548,7 @@ async def update_paper_strategy_risk(
         option_strategy_store = OptionStrategyStore(journal_service=getattr(request.app.state, "journal_service", None))
         request.app.state.option_strategy_store = option_strategy_store
 
-    run = option_strategy_store.get_run(strategy_id)
+    run = option_strategy_store.get_strategy_run(strategy_id) if hasattr(option_strategy_store, "get_strategy_run") else option_strategy_store.get_run(strategy_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Option strategy not found")
     if str(run.get("execution_mode") or "") != "paper":
@@ -566,14 +595,20 @@ async def exit_paper_strategy(request: Request, account_scope: str, payload: Pap
     if not paper_runtime_service:
         raise HTTPException(status_code=503, detail="Paper runtime is not available")
 
+    normalized_strategy_id = str(payload.strategy_id or "").strip()
+    if normalized_strategy_id.startswith("manual:"):
+        raise HTTPException(status_code=409, detail="Strategy-level exit is unavailable for manual paper activity")
+    if normalized_strategy_id.startswith("unsupported:"):
+        raise HTTPException(status_code=409, detail="Strategy-level exit is disabled because the open position attribution is ambiguous")
+
     option_strategy_store = getattr(request.app.state, "option_strategy_store", None)
     if option_strategy_store is None:
         option_strategy_store = OptionStrategyStore(journal_service=getattr(request.app.state, "journal_service", None))
         request.app.state.option_strategy_store = option_strategy_store
 
-    strategy_run = option_strategy_store.get_run(payload.strategy_id)
+    strategy_run = option_strategy_store.get_strategy_run(payload.strategy_id) if hasattr(option_strategy_store, "get_strategy_run") else option_strategy_store.get_run(payload.strategy_id)
     if strategy_run is None:
-        raise HTTPException(status_code=404, detail="Option strategy not found")
+        raise HTTPException(status_code=409, detail="Strategy-level exit requires a monitored paper strategy")
 
     result = await paper_runtime_service.exit_strategy(account_scope=account_scope, strategy_id=payload.strategy_id)
 

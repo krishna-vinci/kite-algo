@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useState } from "react";
-import type { StrategyRiskControls } from "@/features/trading/types";
+import { useCallback, useMemo, useState } from "react";
+import type { StrategyRiskField } from "@/features/trading/types";
 import { updatePaperStrategyRisk } from "@/features/trading/api";
 
 type RiskAdjustmentSheetProps = {
@@ -9,35 +9,21 @@ type RiskAdjustmentSheetProps = {
   onOpenChange: (open: boolean) => void;
   strategyId: string;
   displayName: string;
-  riskControls: StrategyRiskControls;
+  riskSchema: StrategyRiskField[];
 };
-
-type FieldDef = {
-  key: keyof StrategyRiskControls;
-  apiKey: string;
-  label: string;
-};
-
-const FIELDS: FieldDef[] = [
-  { key: "combinedPremiumTarget", apiKey: "combined_premium_target", label: "Premium target" },
-  { key: "combinedPremiumStoploss", apiKey: "combined_premium_stoploss", label: "Premium stoploss" },
-  { key: "basketMtmTarget", apiKey: "basket_mtm_target", label: "Basket MTM target" },
-  { key: "basketMtmStoploss", apiKey: "basket_mtm_stoploss", label: "Basket MTM stoploss" },
-  { key: "indexLowerBoundary", apiKey: "index_lower_boundary", label: "Index lower boundary" },
-  { key: "indexUpperBoundary", apiKey: "index_upper_boundary", label: "Index upper boundary" },
-];
 
 export function RiskAdjustmentSheet({
   open,
   onOpenChange,
   strategyId,
   displayName,
-  riskControls,
+  riskSchema,
 }: RiskAdjustmentSheetProps) {
+  const editableFields = useMemo(() => riskSchema.filter((field) => field.key && field.type !== "boolean"), [riskSchema]);
   const [values, setValues] = useState<Record<string, string>>(() => {
     const init: Record<string, string> = {};
-    for (const f of FIELDS) {
-      init[f.key] = riskControls[f.key]?.toString() ?? "";
+    for (const field of editableFields) {
+      init[field.key] = field.value == null ? "" : String(field.value);
     }
     return init;
   });
@@ -49,9 +35,9 @@ export function RiskAdjustmentSheet({
     setError(null);
     try {
       const payload: Record<string, number | null> = {};
-      for (const f of FIELDS) {
-        const raw = values[f.key]?.trim();
-        payload[f.apiKey] = raw ? Number(raw) : null;
+      for (const field of editableFields) {
+        const raw = values[field.key]?.trim();
+        payload[field.key] = raw ? Number(raw) : null;
       }
       await updatePaperStrategyRisk(strategyId, payload);
       onOpenChange(false);
@@ -60,7 +46,7 @@ export function RiskAdjustmentSheet({
     } finally {
       setSaving(false);
     }
-  }, [strategyId, values, onOpenChange]);
+  }, [editableFields, strategyId, values, onOpenChange]);
 
   if (!open) return null;
 
@@ -82,13 +68,19 @@ export function RiskAdjustmentSheet({
         </div>
 
         <div className="space-y-3">
-          {FIELDS.map((f) => (
-            <div key={f.key} className="flex items-center gap-3">
-              <label className="w-40 text-xs text-foreground/60">{f.label}</label>
+          {editableFields.length === 0 ? (
+            <p className="text-xs text-foreground/50">No editable risk fields are available for this run.</p>
+          ) : null}
+          {editableFields.map((field) => (
+            <div key={field.key} className="flex items-center gap-3">
+              <label className="w-40 text-xs text-foreground/60">
+                {field.label}
+                {field.unit ? <span className="ml-1 text-foreground/40">{field.unit}</span> : null}
+              </label>
               <input
-                type="number"
-                value={values[f.key] ?? ""}
-                onChange={(e) => setValues((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                type={field.type === "number" ? "number" : "text"}
+                value={values[field.key] ?? ""}
+                onChange={(e) => setValues((prev) => ({ ...prev, [field.key]: e.target.value }))}
                 className="flex-1 rounded-md border border-border/60 bg-background/60 px-2 py-1.5 font-mono text-sm text-foreground outline-none focus:border-primary/50"
                 placeholder="—"
               />
@@ -107,7 +99,7 @@ export function RiskAdjustmentSheet({
           </button>
           <button
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || editableFields.length === 0}
             className="rounded-md bg-primary/90 px-4 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary disabled:opacity-50"
           >
             {saving ? "Saving…" : "Save"}

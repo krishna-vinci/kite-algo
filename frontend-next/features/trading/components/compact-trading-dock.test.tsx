@@ -23,6 +23,7 @@ describe("CompactTradingDock", () => {
           activeStrategyCount: 1,
           strategies: [
             {
+              strategyRunId: "run-1",
               strategyId: "run-1",
               displayName: "Short Straddle",
               mode: "paper",
@@ -31,15 +32,8 @@ describe("CompactTradingDock", () => {
               openLegCount: 2,
               realizedPnl: 0,
               unrealizedPnl: 1500,
-              riskControls: {
-                indexLowerBoundary: null,
-                indexUpperBoundary: null,
-                combinedPremiumTarget: null,
-                combinedPremiumStoploss: null,
-                basketMtmTarget: null,
-                basketMtmStoploss: null,
-              },
-              capabilities: { canEditRisk: true, editRiskReason: null },
+              summaryFields: [],
+              capabilities: { canEditRisk: true, editRiskReason: null, canExitStrategy: true, exitReason: null, allowedActions: ["edit_risk", "exit_strategy"], riskSchema: [] },
               positions: [],
               orders: [],
               trades: [],

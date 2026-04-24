@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type {
   BuilderLeg,
@@ -12,6 +13,7 @@ import type {
   Underlying,
 } from "@/components/options/types";
 import { PayoffChart } from "@/components/options/payoff-chart";
+import { ModeSafetyBanner } from "@/features/trading/components/mode-safety-banner";
 import { buildPositionDryRun, executePaperOptionStrategy, previewOptionStrategy } from "@/lib/options/api";
 
 type StrategyBuilderPanelProps = Readonly<{
@@ -174,6 +176,7 @@ function greekCell(label: string, value: number, color?: string) {
 }
 
 export function StrategyBuilderPanel({ underlying, expiry, currentSpot, chain, appAuthenticated, paperAvailable }: StrategyBuilderPanelProps) {
+  const queryClient = useQueryClient();
   const [templateId, setTemplateId] = useState(templates[0].id);
   const [legs, setLegs] = useState<BuilderLeg[]>([]);
   const [lotMultiplier, setLotMultiplier] = useState(1);
@@ -527,7 +530,8 @@ export function StrategyBuilderPanel({ underlying, expiry, currentSpot, chain, a
       if (result.strategy) {
         setStrategyPreview(result.strategy);
       }
-      toast.success(result.strategyId ? `Paper strategy ${result.status} · ${result.strategyId}` : `Paper strategy ${result.status}`);
+      await queryClient.invalidateQueries({ queryKey: ["trading", "paper-summary", "default"] });
+      toast.success(result.strategyRunId ? `Paper strategy ${result.status} · ${result.strategyRunId}` : `Paper strategy ${result.status}`);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Paper execution failed");
     } finally {
@@ -590,6 +594,27 @@ export function StrategyBuilderPanel({ underlying, expiry, currentSpot, chain, a
 
         {/* ════════ LHS: Legs, Risk Controls, Actions ════════ */}
         <div className="flex flex-col gap-2">
+
+          <div className="grid gap-2 xl:grid-cols-3">
+            <ModeSafetyBanner
+              mode="preview"
+              compact
+              title="Preview"
+              description="Backend-derived structure and risk defaults. No order intent is sent."
+            />
+            <ModeSafetyBanner
+              mode="dry_run"
+              compact
+              title="Dry run"
+              description="Builds an execution plan only. Review orders and margin before any paper action."
+            />
+            <ModeSafetyBanner
+              mode="paper"
+              compact
+              title="Paper execution"
+              description="Simulated strategy run using live prices. Live execution is intentionally not exposed here."
+            />
+          </div>
 
           {/* ── Legs ── */}
           <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg)]/70 p-2">
@@ -673,6 +698,7 @@ export function StrategyBuilderPanel({ underlying, expiry, currentSpot, chain, a
             >
               {paperSubmitting ? "Sending…" : "Paper execute"}
             </button>
+            <span className="text-[10px] text-[var(--dim)]">Live orders stay disabled in this workspace until a dedicated execution flow exists.</span>
             {previewLoading && (
               <span className="flex items-center gap-1 text-[10px] text-[var(--muted)]">
                 <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--accent)]" />
@@ -719,7 +745,7 @@ export function StrategyBuilderPanel({ underlying, expiry, currentSpot, chain, a
           {plan && (
             <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg)]/70 p-2 text-[11px]">
               <p className="text-[var(--text)]">{plan.message}</p>
-              {plan.strategyId && <p className="mt-0.5 text-[10px] text-[var(--muted)]">ID: {plan.strategyId}</p>}
+              {plan.strategyRunId && <p className="mt-0.5 text-[10px] text-[var(--muted)]">Run: {plan.strategyRunId}</p>}
               {plan.orders && plan.orders.length > 0 && (
                 <div className="mt-1.5 rounded border border-[var(--border)] bg-[var(--panel)] p-1.5">
                   <ul className="space-y-0.5">

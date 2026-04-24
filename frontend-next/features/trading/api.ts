@@ -2,9 +2,10 @@ import type { RuntimeStatus } from "@/components/options/types";
 import type {
   TradingPaperAccount,
   StrategyCapabilities,
+  StrategySummaryField,
   TradingBrokerPosition,
   TradingBrokerSnapshot,
-  StrategyRiskControls,
+  StrategyRiskField,
   TradingPaperSummary,
   TradingStrategyGroup,
   TradingTimelineItem,
@@ -63,16 +64,22 @@ export type BrokerPositionsResponse = {
   >;
 };
 
-function normalizeRiskControls(raw: unknown): StrategyRiskControls {
-  const value = (raw ?? {}) as Record<string, unknown>;
-  return {
-    indexLowerBoundary: typeof value.index_lower_boundary === "number" ? value.index_lower_boundary : null,
-    indexUpperBoundary: typeof value.index_upper_boundary === "number" ? value.index_upper_boundary : null,
-    combinedPremiumTarget: typeof value.combined_premium_target === "number" ? value.combined_premium_target : null,
-    combinedPremiumStoploss: typeof value.combined_premium_stoploss === "number" ? value.combined_premium_stoploss : null,
-    basketMtmTarget: typeof value.basket_mtm_target === "number" ? value.basket_mtm_target : null,
-    basketMtmStoploss: typeof value.basket_mtm_stoploss === "number" ? value.basket_mtm_stoploss : null,
-  };
+function normalizeSummaryFields(raw: unknown): StrategySummaryField[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+    .map((item) => ({
+      key: typeof item.key === "string" ? item.key : "unknown",
+      label: typeof item.label === "string" ? item.label : String(item.key ?? "Unknown field"),
+      value:
+        typeof item.value === "number" || typeof item.value === "string" || item.value == null
+          ? (item.value as number | string | null)
+          : null,
+      unit: typeof item.unit === "string" ? item.unit : null,
+      group: typeof item.group === "string" ? item.group : null,
+    }));
 }
 
 function normalizeCapabilities(raw: unknown): StrategyCapabilities {
@@ -80,6 +87,28 @@ function normalizeCapabilities(raw: unknown): StrategyCapabilities {
   return {
     canEditRisk: Boolean(value.can_edit_risk),
     editRiskReason: typeof value.edit_risk_reason === "string" ? value.edit_risk_reason : null,
+    canExitStrategy: Boolean(value.can_exit_strategy),
+    exitReason: typeof value.exit_reason === "string" ? value.exit_reason : null,
+    allowedActions: Array.isArray(value.allowed_actions) ? value.allowed_actions.filter((item): item is string => typeof item === "string") : [],
+    riskSchema: Array.isArray(value.risk_schema)
+      ? value.risk_schema
+          .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+          .map(
+            (item): StrategyRiskField => ({
+              key: typeof item.key === "string" ? item.key : "unknown",
+              label: typeof item.label === "string" ? item.label : String(item.key ?? "Unknown field"),
+              type: typeof item.type === "string" ? item.type : "number",
+              unit: typeof item.unit === "string" ? item.unit : null,
+              group: typeof item.group === "string" ? item.group : null,
+              required: Boolean(item.required),
+              recommended: Boolean(item.recommended),
+              value:
+                typeof item.value === "number" || typeof item.value === "string" || item.value == null
+                  ? (item.value as number | string | null)
+                  : null,
+            }),
+          )
+      : [],
   };
 }
 
@@ -113,8 +142,10 @@ export function normalizeRuntimeStatus(response: SessionStatusResponse): Runtime
 }
 
 function normalizeStrategy(item: Record<string, unknown>): TradingStrategyGroup {
+  const strategyRunId = String(item.strategy_run_id ?? item.strategy_id ?? "unknown");
   return {
-    strategyId: String(item.strategy_id ?? "unknown"),
+    strategyRunId,
+    strategyId: strategyRunId,
     displayName: String(item.display_name ?? item.strategy_id ?? "Unnamed strategy"),
     strategyTag: typeof item.strategy_tag === "string" ? item.strategy_tag : null,
     algoInstanceId: typeof item.algo_instance_id === "string" ? item.algo_instance_id : null,
@@ -127,7 +158,7 @@ function normalizeStrategy(item: Record<string, unknown>): TradingStrategyGroup 
     unrealizedPnl: typeof item.unrealized_pnl === "number" ? item.unrealized_pnl : 0,
     marginInUse: typeof item.margin_in_use === "number" ? item.margin_in_use : 0,
     lastUpdatedAt: typeof item.last_updated_at === "string" ? item.last_updated_at : null,
-    riskControls: normalizeRiskControls(item.risk_controls),
+    summaryFields: normalizeSummaryFields(item.summary_fields),
     capabilities: normalizeCapabilities(item.capabilities),
     positions: Array.isArray(item.positions) ? item.positions : [],
     orders: Array.isArray(item.orders) ? item.orders : [],

@@ -55,9 +55,9 @@ export default function PaperPage() {
   }, [summary]);
 
   async function handleExitStrategy(strategy: TradingStrategyGroup) {
-    setExitingStrategyId(strategy.strategyId);
+    setExitingStrategyId(strategy.strategyRunId);
     try {
-      const result = await exitPaperStrategy(ACCOUNT_SCOPE, strategy.strategyId);
+      const result = await exitPaperStrategy(ACCOUNT_SCOPE, strategy.strategyRunId);
       toast.success(result.status === "noop" ? result.message ?? "No open positions for strategy" : `Exited strategy · ${strategy.displayName}`);
       await queryClient.invalidateQueries({ queryKey: ["trading", "paper-summary", ACCOUNT_SCOPE] });
     } catch (err) {
@@ -110,10 +110,11 @@ export default function PaperPage() {
               <button
                 type="button"
                 onClick={() => void handleExitStrategy(strategy)}
-                disabled={!strategy.isOpen || exitingStrategyId === strategy.strategyId}
+                disabled={!strategy.isOpen || !strategy.capabilities.canExitStrategy || exitingStrategyId === strategy.strategyRunId}
+                title={!strategy.capabilities.canExitStrategy ? strategy.capabilities.exitReason ?? "Strategy exit unavailable" : undefined}
                 className="rounded-md border border-rose-400/30 bg-rose-400/10 px-2 py-1 text-[10px] font-medium uppercase tracking-[0.18em] text-rose-300 disabled:cursor-not-allowed disabled:opacity-40"
               >
-                {exitingStrategyId === strategy.strategyId ? "Exiting…" : "Exit"}
+                {exitingStrategyId === strategy.strategyRunId ? "Exiting…" : "Exit"}
               </button>
             )}
           />
@@ -121,11 +122,11 @@ export default function PaperPage() {
           <Panel eyebrow="activity" title="Orders and fills">
             <div className="space-y-4">
               {(summary?.strategies ?? []).slice(0, 6).map((strategy) => (
-                <div key={`${strategy.strategyId}:activity`} className="rounded-2xl border border-border/60 bg-background/60 p-4">
+                <div key={`${strategy.strategyRunId}:activity`} className="rounded-2xl border border-border/60 bg-background/60 p-4">
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <p className="text-sm font-semibold tracking-tight">{strategy.displayName}</p>
-                      <p className="font-mono text-[11px] text-foreground/50">{strategy.strategyId}</p>
+                      <p className="font-mono text-[11px] text-foreground/50">{strategy.strategyRunId}</p>
                     </div>
                     <StatusBadge tone={toneForPnl(strategy.unrealizedPnl)}>{strategy.orders.length} orders</StatusBadge>
                   </div>

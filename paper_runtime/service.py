@@ -316,6 +316,7 @@ class PaperTradingService:
             if group is None:
                 group = {
                     "strategy_id": strategy_id,
+                    "strategy_run_id": strategy_id,
                     "display_name": fallback_label,
                     "mode": "paper",
                     "strategy_tag": None,
@@ -330,8 +331,13 @@ class PaperTradingService:
                     "margin_in_use": 0.0,
                     "last_updated_at": None,
                     "last_event_at": None,
-                    "risk_controls": {},
-                    "capabilities": {"can_edit_risk": False, "edit_risk_reason": "No editable risk controls available"},
+                    "summary_fields": [],
+                    "capabilities": {
+                        "can_edit_risk": False,
+                        "edit_risk_reason": "No editable risk controls available",
+                        "can_exit_strategy": False,
+                        "exit_reason": "Strategy-level exit requires a monitored paper strategy id",
+                    },
                     "positions": [],
                     "orders": [],
                     "trades": [],
@@ -341,18 +347,15 @@ class PaperTradingService:
             return group
 
         for position in positions:
-            metadata = self._position_strategy_metadata(position, orders=orders, trades=trades)
-            strategy_id = str(
-                metadata.get("option_strategy_id")
-                or metadata.get("strategy_id")
-                or metadata.get("algo_instance_id")
-                or f"manual:{position.instrument_token}:{position.product}"
-            )
+            metadata = await self._strategy_group_metadata_for_position(position, orders=orders, trades=trades)
+            strategy_id = str(metadata.get("_group_strategy_id") or self._strategy_identity(metadata) or f"manual:{position.instrument_token}:{position.product}")
             tag = str(metadata.get("strategy_tag") or "")
-            display_name = tag.replace("_", " ").title() if tag else (position.tradingsymbol or strategy_id)
+            display_name = str(metadata.get("_group_display_name") or (tag.replace("_", " ").title() if tag else (position.tradingsymbol or strategy_id)))
             group = ensure_group(strategy_id, fallback_label=display_name)
+            group["strategy_run_id"] = group.get("strategy_run_id") or strategy_id
             group["strategy_tag"] = group["strategy_tag"] or (tag or None)
             group["algo_instance_id"] = group["algo_instance_id"] or metadata.get("algo_instance_id")
+            group["capabilities"] = self._merge_group_capabilities(group["capabilities"], metadata)
             group["leg_count"] += 1
             if int(position.net_quantity) != 0:
                 group["open_leg_count"] += 1
@@ -393,7 +396,8 @@ class PaperTradingService:
         for order in orders:
             metadata = dict(order.metadata or {})
             strategy_id = str(
-                metadata.get("option_strategy_id")
+                metadata.get("strategy_run_id")
+                or metadata.get("option_strategy_id")
                 or metadata.get("strategy_id")
                 or metadata.get("algo_instance_id")
                 or f"manual:{order.instrument_token}:{order.product}"
@@ -401,6 +405,7 @@ class PaperTradingService:
             tag = str(metadata.get("strategy_tag") or "")
             display_name = tag.replace("_", " ").title() if tag else (order.tradingsymbol or strategy_id)
             group = ensure_group(strategy_id, fallback_label=display_name)
+            group["strategy_run_id"] = group.get("strategy_run_id") or strategy_id
             group["strategy_tag"] = group["strategy_tag"] or (tag or None)
             group["algo_instance_id"] = group["algo_instance_id"] or metadata.get("algo_instance_id")
             group["orders"].append(
@@ -429,7 +434,8 @@ class PaperTradingService:
         for trade in trades:
             metadata = dict(trade.metadata or {})
             strategy_id = str(
-                metadata.get("option_strategy_id")
+                metadata.get("strategy_run_id")
+                or metadata.get("option_strategy_id")
                 or metadata.get("strategy_id")
                 or metadata.get("algo_instance_id")
                 or f"manual:{trade.instrument_token}"
@@ -437,6 +443,7 @@ class PaperTradingService:
             tag = str(metadata.get("strategy_tag") or "")
             display_name = tag.replace("_", " ").title() if tag else strategy_id
             group = ensure_group(strategy_id, fallback_label=display_name)
+            group["strategy_run_id"] = group.get("strategy_run_id") or strategy_id
             group["strategy_tag"] = group["strategy_tag"] or (tag or None)
             group["algo_instance_id"] = group["algo_instance_id"] or metadata.get("algo_instance_id")
             group["trades"].append(
@@ -489,16 +496,31 @@ class PaperTradingService:
         normalized_strategy_id = str(strategy_id or "").strip()
         if not normalized_strategy_id:
             raise ValueError("strategy_id is required")
+        if normalized_strategy_id.startswith("manual:"):
+            return {
+                "mode": "paper",
+                "status": "blocked",
+                "strategy_id": normalized_strategy_id,
+                "results": [],
+                "message": "Strategy-level exit is unavailable for manual paper activity",
+            }
+        if normalized_strategy_id.startswith("unsupported:"):
+            return {
+                "mode": "paper",
+                "status": "blocked",
+                "strategy_id": normalized_strategy_id,
+                "results": [],
+                "message": "Strategy-level exit is disabled because the open position attribution is ambiguous",
+            }
 
         open_positions = await self.list_positions(account_scope, only_open=True)
         orders = await asyncio.to_thread(self.repository.list_orders, account_scope, limit=1000)
         trades = await asyncio.to_thread(self.repository.list_trades, account_scope, limit=2000)
-        linked_positions = [
-            position
-            for position in open_positions
-            if str((meta := self._position_strategy_metadata(position, orders=orders, trades=trades)).get("option_strategy_id") or meta.get("strategy_id") or meta.get("algo_instance_id") or "")
-            == normalized_strategy_id
-        ]
+        linked_positions = []
+        for position in open_positions:
+            metadata = await self._strategy_group_metadata_for_position(position, orders=orders, trades=trades)
+            if str(metadata.get("_group_strategy_id") or self._strategy_identity(metadata) or "") == normalized_strategy_id:
+                linked_positions.append(position)
         if not linked_positions:
             return {"mode": "paper", "status": "noop", "strategy_id": normalized_strategy_id, "results": [], "message": "No open paper positions found for strategy"}
 
@@ -512,17 +534,18 @@ class PaperTradingService:
             side = "BUY" if int(position.net_quantity) < 0 else "SELL"
             exit_orders.append(
                 {
-                    "exchange": position.exchange,
-                    "tradingsymbol": position.tradingsymbol,
-                    "product": position.product,
-                    "transaction_type": side,
-                    "order_type": "MARKET",
-                    "quantity": abs(int(position.net_quantity)),
-                    "metadata": {
-                        "option_strategy_id": normalized_strategy_id,
-                        "algo_instance_id": algo_instance_id,
-                        "strategy_tag": strategy_tag,
-                        "exit_for": normalized_strategy_id,
+                        "exchange": position.exchange,
+                        "tradingsymbol": position.tradingsymbol,
+                        "product": position.product,
+                        "transaction_type": side,
+                        "order_type": "MARKET",
+                        "quantity": abs(int(position.net_quantity)),
+                        "metadata": {
+                            "strategy_run_id": normalized_strategy_id,
+                            "option_strategy_id": normalized_strategy_id,
+                            "algo_instance_id": algo_instance_id,
+                            "strategy_tag": strategy_tag,
+                            "exit_for": normalized_strategy_id,
                     },
                 }
             )
@@ -533,6 +556,7 @@ class PaperTradingService:
             attribution={
                 "source": "paper-page-exit",
                 "strategy_tag": strategy_tag,
+                "strategy_run_id": normalized_strategy_id,
                 "option_strategy_id": normalized_strategy_id,
                 "algo_instance_id": algo_instance_id,
                 "notes": f"exit-strategy:{normalized_strategy_id}",
@@ -596,7 +620,7 @@ class PaperTradingService:
         for metadata in metadata_sources:
             if not metadata:
                 continue
-            for key in ("journal_run_id", "journal_ref", "option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag"):
+            for key in ("journal_run_id", "journal_ref", "strategy_run_id", "option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag"):
                 if key not in merged or merged.get(key) in (None, ""):
                     value = metadata.get(key)
                     if value not in (None, ""):
@@ -833,7 +857,7 @@ class PaperTradingService:
             {
                 key: value
                 for key, value in dict(order.metadata or {}).items()
-                if key in {"option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag", "journal_run_id", "journal_ref", "source", "notes"}
+                if key in {"strategy_run_id", "option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag", "journal_run_id", "journal_ref", "source", "notes"}
                 and value not in (None, "")
             }
         )
@@ -1046,7 +1070,7 @@ class PaperTradingService:
             {
                 key: value
                 for key, value in dict(order.metadata or {}).items()
-                if key in {"option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag", "journal_run_id", "journal_ref", "source", "notes"}
+                if key in {"strategy_run_id", "option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag", "journal_run_id", "journal_ref", "source", "notes"}
                 and value not in (None, "")
             }
         )
@@ -1265,7 +1289,7 @@ class PaperTradingService:
         trades: List[PaperTrade],
     ) -> Dict[str, Any]:
         metadata = dict(position.metadata or {})
-        if any(metadata.get(key) not in (None, "") for key in ("option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag")):
+        if any(metadata.get(key) not in (None, "") for key in ("strategy_run_id", "option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag")):
             return metadata
 
         candidates: List[tuple[datetime, Dict[str, Any]]] = []
@@ -1273,14 +1297,14 @@ class PaperTradingService:
             if order.instrument_token != position.instrument_token or order.product != position.product:
                 continue
             order_meta = dict(order.metadata or {})
-            if not any(order_meta.get(key) not in (None, "") for key in ("option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag")):
+            if not any(order_meta.get(key) not in (None, "") for key in ("strategy_run_id", "option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag")):
                 continue
             candidates.append((order.updated_at or order.placed_at or _utcnow(), order_meta))
         for trade in trades:
             if trade.instrument_token != position.instrument_token:
                 continue
             trade_meta = dict(trade.metadata or {})
-            if not any(trade_meta.get(key) not in (None, "") for key in ("option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag")):
+            if not any(trade_meta.get(key) not in (None, "") for key in ("strategy_run_id", "option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag")):
                 continue
             candidates.append((trade.trade_timestamp or _utcnow(), trade_meta))
 
@@ -1290,6 +1314,119 @@ class PaperTradingService:
         inferred = dict(candidates[0][1])
         inferred.update(metadata)
         return inferred
+
+    async def _strategy_group_metadata_for_position(
+        self,
+        position: PaperPosition,
+        *,
+        orders: List[PaperOrder],
+        trades: List[PaperTrade],
+    ) -> Dict[str, Any]:
+        metadata = dict(position.metadata or {})
+        if int(position.net_quantity) != 0:
+            lots = await asyncio.to_thread(
+                self.repository.list_open_position_lots,
+                position.account_scope,
+                instrument_token=position.instrument_token,
+                product=position.product,
+            )
+            if lots:
+                resolved = self._resolve_open_position_lot_grouping(position, lots)
+                if resolved is not None:
+                    resolved.update(
+                        {
+                            key: value
+                            for key, value in metadata.items()
+                            if key not in resolved and value not in (None, "")
+                        }
+                    )
+                    return resolved
+        inferred = self._position_strategy_metadata(position, orders=orders, trades=trades)
+        if any(
+            inferred.get(key) not in (None, "")
+            for key in ("strategy_run_id", "option_strategy_id", "strategy_id", "algo_instance_id", "strategy_tag")
+        ):
+            inferred.setdefault("can_exit_strategy", False)
+            inferred.setdefault("exit_reason", "Strategy-level exit requires a monitored paper strategy id")
+            return inferred
+        fallback = dict(inferred)
+        fallback.update(
+            {
+                "_group_strategy_id": f"manual:{position.instrument_token}:{position.product}",
+                "_group_display_name": f"Manual basket · {position.tradingsymbol or position.instrument_token}",
+                "can_exit_strategy": False,
+                "exit_reason": "Strategy-level exit is unavailable for manual paper activity",
+            }
+        )
+        return fallback
+
+    def _resolve_open_position_lot_grouping(
+        self,
+        position: PaperPosition,
+        lots: List[PaperPositionLotAttribution],
+    ) -> Dict[str, Any] | None:
+        identities: Dict[str, Dict[str, Any]] = {}
+        missing_identity = False
+        for lot in lots:
+            metadata = dict(lot.metadata or {})
+            identity = self._strategy_identity(metadata)
+            if not identity:
+                missing_identity = True
+                continue
+            current = identities.get(identity)
+            if current is None or (lot.opened_at or _utcnow()) >= (current.get("_opened_at") or _utcnow()):
+                identities[identity] = {
+                    **metadata,
+                    "_opened_at": lot.opened_at,
+                }
+
+        if len(identities) == 1 and not missing_identity:
+            resolved = dict(next(iter(identities.values())))
+            resolved.pop("_opened_at", None)
+            resolved.setdefault("can_exit_strategy", False)
+            resolved.setdefault("exit_reason", "Strategy-level exit requires a monitored paper strategy id")
+            return resolved
+
+        if len(identities) > 1:
+            strategy_ids = sorted(identities.keys())
+            return {
+                "_group_strategy_id": f"unsupported:{position.instrument_token}:{position.product}",
+                "_group_display_name": f"Unsupported shared position · {position.tradingsymbol or position.instrument_token}",
+                "strategy_tag": None,
+                "algo_instance_id": None,
+                "can_exit_strategy": False,
+                "exit_reason": f"Strategy-level exit is disabled because this open position is shared across multiple strategy ids: {', '.join(strategy_ids)}",
+            }
+
+        if missing_identity:
+            return {
+                "_group_strategy_id": f"manual:{position.instrument_token}:{position.product}",
+                "_group_display_name": f"Manual basket · {position.tradingsymbol or position.instrument_token}",
+                "strategy_tag": None,
+                "algo_instance_id": None,
+                "can_exit_strategy": False,
+                "exit_reason": "Strategy-level exit is unavailable for manual paper activity",
+            }
+        return None
+
+    def _strategy_identity(self, metadata: Dict[str, Any]) -> str | None:
+        for key in ("strategy_run_id", "option_strategy_id", "strategy_id", "algo_instance_id"):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                return value
+        return None
+
+    def _merge_group_capabilities(self, current: Dict[str, Any], metadata: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(current or {})
+        if "can_edit_risk" in metadata:
+            merged["can_edit_risk"] = bool(metadata.get("can_edit_risk"))
+        if metadata.get("edit_risk_reason") not in (None, ""):
+            merged["edit_risk_reason"] = metadata.get("edit_risk_reason")
+        if "can_exit_strategy" in metadata:
+            merged["can_exit_strategy"] = bool(metadata.get("can_exit_strategy"))
+        if metadata.get("exit_reason") not in (None, ""):
+            merged["exit_reason"] = metadata.get("exit_reason")
+        return merged
 
     def _should_fill_immediately(self, order: PaperOrder, *, request: Dict[str, Any], market_snapshot: Dict[str, Any]) -> bool:
         return self._request_should_fill_immediately(request=request, market_snapshot=market_snapshot)

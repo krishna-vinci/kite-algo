@@ -188,6 +188,9 @@ class OptionStrategyStore:
         finally:
             session.close()
 
+    def get_strategy_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        return self.get_run(run_id)
+
     def mark_exited(self, run_id: str, *, execution_result: Dict[str, Any], algo_instance_id: str | None = None) -> None:
         self.update_execution_result(
             run_id,

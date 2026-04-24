@@ -118,6 +118,7 @@ type BuildPositionResponse = {
     estimated_margin?: number;
     estimated_cost?: number;
   };
+  strategy_run_id?: string;
   strategy_id?: string;
   status?: string;
   orders_placed?: unknown[];
@@ -413,7 +414,8 @@ export async function buildPositionDryRun(payload: {
   return {
     mode: "dry_run",
     message: response.message,
-    strategyId: response.strategy_id,
+    strategyRunId: response.strategy_run_id ?? response.strategy_id,
+    strategyId: response.strategy_run_id ?? response.strategy_id,
     strategy: response.strategy,
     orders: response.plan?.orders,
     estimatedMargin: response.plan?.estimated_margin,
@@ -454,7 +456,7 @@ export async function executePaperOptionStrategy(payload: {
   selectedLegs: Array<Record<string, unknown>>;
   protectionConfig?: Record<string, unknown>;
   currentSpot?: number;
-}): Promise<{ mode: string; status: string; strategyId?: string; strategy?: CanonicalStrategyPreview; message: string }> {
+}): Promise<{ mode: string; status: string; strategyRunId?: string; strategyId?: string; strategy?: CanonicalStrategyPreview; message: string }> {
   const response = await apiFetch<BuildPositionResponse>("/api/strategies/build-position", {
     method: "POST",
     json: {
@@ -473,7 +475,8 @@ export async function executePaperOptionStrategy(payload: {
   return {
     mode: response.mode,
     status: response.status ?? "unknown",
-    strategyId: response.strategy_id,
+    strategyRunId: response.strategy_run_id ?? response.strategy_id,
+    strategyId: response.strategy_run_id ?? response.strategy_id,
     strategy: response.strategy,
     message: response.message,
   };

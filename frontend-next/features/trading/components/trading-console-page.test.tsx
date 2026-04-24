@@ -35,6 +35,7 @@ const MOCK_SNAPSHOT: TradingConsoleSnapshot = {
     activeStrategyCount: 1,
     strategies: [
       {
+        strategyRunId: "strat-1",
         strategyId: "strat-1",
         displayName: "Iron Condor NIFTY",
         mode: "paper",
@@ -43,15 +44,13 @@ const MOCK_SNAPSHOT: TradingConsoleSnapshot = {
         openLegCount: 4,
         realizedPnl: 1200,
         unrealizedPnl: -350,
-        riskControls: {
-          indexLowerBoundary: 24800,
-          indexUpperBoundary: 25800,
-          combinedPremiumTarget: 80,
-          combinedPremiumStoploss: 160,
-          basketMtmTarget: null,
-          basketMtmStoploss: null,
-        },
-        capabilities: { canEditRisk: true, editRiskReason: null },
+        summaryFields: [
+          { key: "index_lower_boundary", label: "Index lower boundary", value: 24800, unit: null, group: "emergency" },
+          { key: "index_upper_boundary", label: "Index upper boundary", value: 25800, unit: null, group: "emergency" },
+          { key: "combined_premium_target", label: "Premium target", value: 80, unit: "pts", group: "primary" },
+          { key: "combined_premium_stoploss", label: "Premium stoploss", value: 160, unit: "pts", group: "primary" },
+        ],
+        capabilities: { canEditRisk: true, editRiskReason: null, canExitStrategy: true, exitReason: null, allowedActions: ["edit_risk", "exit_strategy"], riskSchema: [] },
         positions: [],
         orders: [],
         trades: [],

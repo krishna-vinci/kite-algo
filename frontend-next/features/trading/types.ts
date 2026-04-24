@@ -12,18 +12,32 @@ export type MarketQuote = {
   connected: boolean;
 };
 
-export type StrategyRiskControls = {
-  indexLowerBoundary: number | null;
-  indexUpperBoundary: number | null;
-  combinedPremiumTarget: number | null;
-  combinedPremiumStoploss: number | null;
-  basketMtmTarget: number | null;
-  basketMtmStoploss: number | null;
-};
-
 export type StrategyCapabilities = {
   canEditRisk: boolean;
   editRiskReason: string | null;
+  canExitStrategy: boolean;
+  exitReason: string | null;
+  allowedActions: string[];
+  riskSchema: StrategyRiskField[];
+};
+
+export type StrategyRiskField = {
+  key: string;
+  label: string;
+  type: string;
+  unit?: string | null;
+  group?: string | null;
+  required?: boolean;
+  recommended?: boolean;
+  value?: number | string | null;
+};
+
+export type StrategySummaryField = {
+  key: string;
+  label: string;
+  value?: number | string | null;
+  unit?: string | null;
+  group?: string | null;
 };
 
 export type TradingTimelineItem = {
@@ -37,6 +51,7 @@ export type TradingOrderRow = Record<string, unknown>;
 export type TradingTradeRow = Record<string, unknown>;
 
 export type TradingStrategyGroup = {
+  strategyRunId: string;
   strategyId: string;
   displayName: string;
   strategyTag?: string | null;
@@ -50,7 +65,7 @@ export type TradingStrategyGroup = {
   unrealizedPnl: number;
   marginInUse?: number;
   lastUpdatedAt?: string | null;
-  riskControls: StrategyRiskControls;
+  summaryFields: StrategySummaryField[];
   capabilities: StrategyCapabilities;
   positions: TradingPositionRow[];
   orders: TradingOrderRow[];

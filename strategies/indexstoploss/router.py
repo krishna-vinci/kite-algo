@@ -399,6 +399,7 @@ async def build_position(
                 attribution={
                     "source": "frontend-next-options",
                     "strategy_tag": strategy_preview["inferred_structure"],
+                    "strategy_run_id": strategy_id,
                     "option_strategy_id": strategy_id,
                     "algo_instance_id": algo_instance_id,
                     "journal_run_id": journal_run_id,
@@ -418,6 +419,7 @@ async def build_position(
             return {
                 "mode": StrategyExecutionMode.PAPER.value,
                 "status": status,
+                "strategy_run_id": strategy_id,
                 "strategy_id": strategy_id,
                 "journal_run_id": journal_run_id,
                 "algo_instance_id": algo_instance_id,
@@ -443,7 +445,13 @@ async def build_position(
                         product=kite.PRODUCT_MIS,
                         order_type=kite.ORDER_TYPE_MARKET,
                     ),
-                    meta={"strategy_type": req.strategy_type, "underlying": req.underlying, "tradingsymbol": order["tradingsymbol"]},
+                    meta={
+                        "strategy_run_id": strategy_id,
+                        "strategy_id": strategy_id,
+                        "strategy_type": req.strategy_type,
+                        "underlying": req.underlying,
+                        "tradingsymbol": order["tradingsymbol"],
+                    },
                 )
             except HTTPException:
                 raise
@@ -459,6 +467,7 @@ async def build_position(
                     "transaction_type": order["transaction_type"],
                     "quantity": order["quantity"],
                     "status": "placed",
+                    "strategy_run_id": strategy_id,
                 }
             )
 
@@ -468,6 +477,7 @@ async def build_position(
                 strategy_id,
                 status="failed",
                 execution_result={
+                    "strategy_run_id": strategy_id,
                     "orders_placed": [],
                     "orders_failed": orders_failed,
                     "message": "All orders failed to place",
@@ -479,6 +489,7 @@ async def build_position(
                 "status": "failed",
                 "orders_placed": [],
                 "orders_failed": orders_failed,
+                "strategy_run_id": strategy_id,
                 "strategy": strategy_preview,
                 "strategy_id": strategy_id,
                 "journal_run_id": journal_run_id,
@@ -492,6 +503,7 @@ async def build_position(
             strategy_id,
             status="success" if not orders_failed else "partial",
             execution_result={
+                "strategy_run_id": strategy_id,
                 "orders_placed": orders_placed,
                 "orders_failed": orders_failed,
                 "message": f"Executed {len(orders_placed)}/{len(plan['orders'])} orders successfully",
@@ -504,6 +516,7 @@ async def build_position(
             "status": "success" if not orders_failed else "partial",
             "orders_placed": orders_placed,
             "orders_failed": orders_failed,
+            "strategy_run_id": strategy_id,
             "strategy_id": strategy_id,
             "journal_run_id": journal_run_id,
             "algo_instance_id": algo_instance_id,
@@ -519,7 +532,10 @@ async def build_position(
                 _get_option_strategy_store(request).update_execution_result(
                     strategy_id,
                     status="failed",
-                    execution_result={"message": str(exc.detail) if hasattr(exc, "detail") else str(exc)},
+                    execution_result={
+                        "strategy_run_id": strategy_id,
+                        "message": str(exc.detail) if hasattr(exc, "detail") else str(exc),
+                    },
                     algo_instance_id=algo_instance_id,
                 )
             except Exception:
@@ -533,7 +549,7 @@ async def build_position(
                 _get_option_strategy_store(request).update_execution_result(
                     strategy_id,
                     status="failed",
-                    execution_result={"message": str(e)},
+                    execution_result={"strategy_run_id": strategy_id, "message": str(e)},
                     algo_instance_id=algo_instance_id,
                 )
             except Exception:

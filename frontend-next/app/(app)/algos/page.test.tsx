@@ -36,6 +36,7 @@ vi.mock("@/features/trading/hooks/use-trading-console-data", () => ({
       activeStrategyCount: 1,
       strategies: [
         {
+          strategyRunId: "run-1",
           strategyId: "run-1",
           displayName: "Runtime Short Straddle",
           strategyTag: "options_runtime",
@@ -49,15 +50,8 @@ vi.mock("@/features/trading/hooks/use-trading-console-data", () => ({
           unrealizedPnl: 1200,
           marginInUse: 14000,
           lastUpdatedAt: "2026-04-16T09:00:00Z",
-          riskControls: {
-            indexLowerBoundary: null,
-            indexUpperBoundary: null,
-            combinedPremiumTarget: null,
-            combinedPremiumStoploss: null,
-            basketMtmTarget: null,
-            basketMtmStoploss: null,
-          },
-          capabilities: { canEditRisk: true, editRiskReason: null },
+          summaryFields: [],
+          capabilities: { canEditRisk: true, editRiskReason: null, canExitStrategy: true, exitReason: null, allowedActions: ["edit_risk", "exit_strategy"], riskSchema: [] },
           positions: [],
           orders: [],
           trades: [],

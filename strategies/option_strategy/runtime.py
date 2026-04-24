@@ -63,6 +63,7 @@ def build_runtime_option_instance(*,
         config=config.model_dump(mode='json'),
         dependency_spec=dependency_spec,
         metadata={
+            'strategy_run_id': strategy_id,
             'strategy_id': strategy_id,
             'strategy_family': preview.inferred_family.value if hasattr(preview.inferred_family, 'value') else str(preview.inferred_family),
             'strategy_structure': preview.inferred_structure,
