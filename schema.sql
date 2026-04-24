@@ -842,6 +842,70 @@ CREATE INDEX IF NOT EXISTS idx_paper_fund_ledger_reference
   WHERE reference_id IS NOT NULL;
 
 -- =========================================
+-- Algo Worker API Tables
+-- =========================================
+
+CREATE TABLE IF NOT EXISTS public.algo_worker_tokens (
+  token_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  account_scope TEXT,
+  allowed_modes JSONB NOT NULL DEFAULT '["paper", "dry_run"]'::jsonb,
+  allowed_actions JSONB NOT NULL DEFAULT '[]'::jsonb,
+  allowed_templates JSONB NOT NULL DEFAULT '[]'::jsonb,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+  heartbeat_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ,
+  last_used_at TIMESTAMPTZ,
+  last_heartbeat_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_algo_worker_tokens_status
+  ON public.algo_worker_tokens (status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.algo_worker_runs (
+  strategy_run_id TEXT PRIMARY KEY,
+  token_id TEXT NOT NULL,
+  template_id TEXT NOT NULL,
+  account_scope TEXT NOT NULL,
+  execution_mode TEXT NOT NULL CHECK (execution_mode IN ('paper', 'dry_run', 'live')),
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'paused', 'exiting', 'closed', 'failed')),
+  summary_fields_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  risk_schema_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  allowed_actions_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  runtime_state_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  closed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_algo_worker_runs_account_status
+  ON public.algo_worker_runs (account_scope, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_algo_worker_runs_token
+  ON public.algo_worker_runs (token_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.algo_worker_intents (
+  intent_id BIGSERIAL PRIMARY KEY,
+  token_id TEXT NOT NULL,
+  strategy_run_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  intent_type TEXT NOT NULL,
+  request_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT NOT NULL,
+  result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (strategy_run_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_algo_worker_intents_run_created
+  ON public.algo_worker_intents (strategy_run_id, created_at DESC);
+
+-- =========================================
 -- Index Stoploss Strategy Tables
 -- =========================================
 

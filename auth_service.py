@@ -198,6 +198,8 @@ def clear_auth_cookies(response: Response) -> None:
 
 
 def auth_exempt_path(path: str) -> bool:
+    if path.startswith("/api/algo-workers/worker"):
+        return True
     return path in {
         "/api/auth/login",
         "/api/auth/refresh",

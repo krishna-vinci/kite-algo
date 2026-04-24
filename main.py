@@ -43,6 +43,7 @@ from api.routers.historical import router as historical_router
 from api.routers.ingestion import router as ingestion_router
 from api.routers.user_settings import router as user_settings_router
 from api.routers.marketwatch import router as marketwatch_router
+from api.routers.algo_workers import router as algo_workers_router
 from journaling.runtime import JournalRuntimeWorker
 from api.routers.journal import router as journal_router
 from journaling.service import JournalService
@@ -800,6 +801,7 @@ app.include_router(historical_router, prefix="/api")
 app.include_router(ingestion_router, prefix="/api")
 app.include_router(user_settings_router, prefix="/api")
 app.include_router(marketwatch_router, prefix="/api")
+app.include_router(algo_workers_router, prefix="/api")
 app.include_router(journal_router, prefix="/api")
 app.include_router(kite_orders_router, prefix="/api")
 app.include_router(kite_mutual_funds_router, prefix="/api")
