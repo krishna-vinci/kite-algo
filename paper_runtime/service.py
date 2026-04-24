@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from broker_api.instruments_repository import InstrumentsRepository
 from broker_api.redis_events import publish_event
+from execution_accounting.contracts import signed_cash_flow
 
 from .charges import PaperChargesCalculator
 from .events import paper_order_event_payload, paper_position_event_payload, paper_trade_event_payload
@@ -124,13 +125,14 @@ class PaperTradingService:
         hypothetical = self._apply_fill_to_position(account_scope=account_scope, position=existing_position, request=request, fill_price=reference_price, instrument=instrument)
         new_margin = self._position_margin(hypothetical, instrument_type=instrument.get("instrument_type"), reference_price=reference_price)
         incremental_margin = max(new_margin - old_margin, Decimal("0"))
-        estimated_charges = self.charges_calculator.estimate(
+        cost_contract = self.charges_calculator.estimate_contract(
             price=reference_price,
             quantity=request["quantity"],
             instrument_type=instrument.get("instrument_type"),
             exchange=request["exchange"],
             product=request["product"],
         )
+        estimated_charges = cost_contract.total_charges
         required_cash = incremental_margin + estimated_charges
         if account.available_funds < required_cash:
             return await self._reject_order(account_scope, request, attribution, reason="Insufficient paper funds or margin")
@@ -152,6 +154,7 @@ class PaperTradingService:
                 **attribution,
                 "reserved_margin": str(incremental_margin),
                 "estimated_charges": str(estimated_charges),
+                "cost_contract": cost_contract.journal_payload(),
                 "instrument_type": str(instrument.get("instrument_type") or ""),
                 "lot_size": lot_size,
             },
@@ -649,6 +652,17 @@ class PaperTradingService:
         run_id = self._resolve_journal_run_id(trade.metadata)
         if not run_id or self.journal_service is None:
             return
+        metadata = dict(trade.metadata or {})
+        estimated_charges = Decimal(str(metadata.get("estimated_charges") or "0"))
+        cost_contract = metadata.get("cost_contract") if isinstance(metadata.get("cost_contract"), dict) else {}
+        taxes_amount = Decimal(str(cost_contract.get("total_taxes") or "0"))
+        total_charges = Decimal(str(cost_contract.get("total_charges") or estimated_charges))
+        fees_amount = total_charges - taxes_amount
+        gross_cash_flow = signed_cash_flow(
+            side=str(trade.transaction_type),
+            price=Decimal(trade.price),
+            quantity=int(trade.quantity),
+        )
         await asyncio.to_thread(
             self.journal_service.record_paper_trade,
             run_id=run_id,
@@ -658,7 +672,11 @@ class PaperTradingService:
             side=str(trade.transaction_type),
             quantity=int(trade.quantity),
             price=trade.price,
-            payload=dict(trade.metadata or {}),
+            gross_cash_flow=gross_cash_flow,
+            fees_amount=fees_amount,
+            taxes_amount=taxes_amount,
+            slippage_amount=Decimal("0"),
+            payload=metadata,
         )
 
     async def _market_snapshot(self, instrument_token: int) -> Dict[str, Any]:
@@ -912,13 +930,14 @@ class PaperTradingService:
         hypothetical = self._apply_fill_to_position(account_scope=account_scope, position=existing_position, request=request, fill_price=reference_price, instrument=instrument)
         new_margin = self._position_margin(hypothetical, instrument_type=instrument.get("instrument_type"), reference_price=reference_price)
         incremental_margin = max(new_margin - old_margin, Decimal("0"))
-        estimated_charges = self.charges_calculator.estimate(
+        cost_contract = self.charges_calculator.estimate_contract(
             price=reference_price,
             quantity=request["quantity"],
             instrument_type=instrument.get("instrument_type"),
             exchange=request["exchange"],
             product=request["product"],
         )
+        estimated_charges = cost_contract.total_charges
         required_cash = incremental_margin + estimated_charges
         if account.available_funds < required_cash:
             return self._build_rejected_result(account_scope, request, attribution, reason="Insufficient paper funds or margin"), account
@@ -940,6 +959,7 @@ class PaperTradingService:
                 **attribution,
                 "reserved_margin": str(incremental_margin),
                 "estimated_charges": str(estimated_charges),
+                "cost_contract": cost_contract.journal_payload(),
                 "instrument_type": str(instrument.get("instrument_type") or ""),
                 "lot_size": lot_size,
             },

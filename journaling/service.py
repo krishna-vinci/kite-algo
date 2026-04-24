@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from sqlalchemy import text
 
+from execution_accounting.contracts import signed_cash_flow
+
 from .benchmark import compare_return_series
 from .metrics import (
     average_loss,
@@ -896,6 +898,10 @@ class JournalService:
         side: str,
         quantity: int,
         price: Any,
+        gross_cash_flow: Optional[Any] = None,
+        fees_amount: Any = ZERO,
+        taxes_amount: Any = ZERO,
+        slippage_amount: Any = ZERO,
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.link_source(
@@ -907,6 +913,16 @@ class JournalService:
                 source_key_2=str(order_id) if order_id else None,
             ),
         )
+        price_decimal = _to_decimal(price)
+        computed_cash_flow = (
+            _to_decimal(gross_cash_flow)
+            if gross_cash_flow is not None
+            else signed_cash_flow(
+                side=side,
+                price=price_decimal,
+                quantity=int(quantity),
+            )
+        )
         self.repository.insert_execution_fact(
             JournalExecutionFact(
                 run_id=run_id,
@@ -917,7 +933,11 @@ class JournalService:
                 fill_timestamp=trade_timestamp,
                 side=side,
                 quantity=int(quantity),
-                price=_to_decimal(price),
+                price=price_decimal,
+                gross_cash_flow=computed_cash_flow,
+                fees_amount=_to_decimal(fees_amount),
+                taxes_amount=_to_decimal(taxes_amount),
+                slippage_amount=_to_decimal(slippage_amount),
                 payload=payload or {},
             )
         )
