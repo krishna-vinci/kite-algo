@@ -1,120 +1,143 @@
 # Algo Worker Development Guide
 
-This guide is the contract for building fully automated strategies outside the main app while still using Kite Algo for account scope, paper/live execution, position grouping, risk edits, exits, and journaling attribution.
+This is the practical coding guide for building external algo strategies that use Kite Algo for execution, grouping, risk edits, exits, accounting, and journaling.
 
-The main app owns execution. The worker owns decisions.
-
-## Current Boundary
-
-The worker API supports:
-
-- `paper`
-- `dry_run`
-- `live`
-
-Live mode is intentionally strict. A token must explicitly allow `live`, the run must use a real broker account scope such as `kite:AB1234`, and the run metadata must include strategy attribution fields before any broker order can be submitted.
-
-## Mental Model
-
-Every automated strategy should create one `strategy_run_id` and send all orders, risk updates, and exits through that run.
-
-Use this shape:
+The rule is simple:
 
 ```text
-algo worker process
-  -> creates strategy run
-  -> receives or computes signals
-  -> submits idempotent order intents
-  -> patches run risk when the strategy changes stops or targets
-  -> exits the strategy run
-
-Kite Algo backend
-  -> authenticates worker token
-  -> validates paper/dry-run/live scope
-  -> sends paper orders to the paper runtime
-  -> sends live orders through the broker order service with accounting attribution
-  -> attributes every trade to strategy_run_id
-  -> closes the run as one grouped strategy
+strategy worker owns decisions
+Kite Algo backend owns execution, grouping, attribution, accounting, and exits
 ```
 
-Do not let a worker call broker or paper-runtime internals directly. The worker should only call the worker API.
+Workers should only call the public worker API, preferably through the Python SDK in `sdk/python/kite_algo_worker`. Workers must not call broker internals, database tables, paper-runtime internals, or manually craft broker attribution.
 
-## Token Setup
+## Install/use the SDK
 
-Open the Kite Algo settings page and use `Algo worker access`.
+### Recommended: install from a Git tag on remote strategy servers
 
-Recommended token setup:
-
-- `name`: a short worker name, for example `mean-reversion-paper`
-- `account_scope`: the account this worker can use:
-  - paper: for example `kite:paper-a`
-  - live: the broker account ref, for example `kite:AB1234`
-- `allowed_modes`: use `paper,dry_run` for development; add `live` only for workers permitted to place real broker orders
-- `allowed_templates`: optional comma-separated templates, for example `mean-reversion, option-master`
-
-The raw token is shown once. Store it in the worker environment:
+Once the SDK changes are committed and tagged, remote servers can install the exact SDK version directly from Git:
 
 ```bash
-export KITE_ALGO_API_BASE="http://localhost:8000"
-export KITE_ALGO_WORKER_TOKEN="kwa_..."
+python3 -m pip install \
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.1.0#subdirectory=sdk/python"
 ```
 
-The worker must send:
-
-```text
-Authorization: Bearer $KITE_ALGO_WORKER_TOKEN
-```
-
-## API Lifecycle
-
-### 1. Health Check
+HTTPS form:
 
 ```bash
-curl "$KITE_ALGO_API_BASE/api/algo-workers/worker/health" \
-  -H "Authorization: Bearer $KITE_ALGO_WORKER_TOKEN"
+python3 -m pip install \
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.1.0#subdirectory=sdk/python"
 ```
 
-Use this at startup. Fail fast if the token is invalid, revoked, expired, or scoped incorrectly.
+Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.1.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
 
-### 2. Create a Strategy Run
-
-Create one run before submitting orders.
+Create the tag from the repository root after committing the SDK:
 
 ```bash
-curl -X POST "$KITE_ALGO_API_BASE/api/algo-workers/worker/runs" \
-  -H "Authorization: Bearer $KITE_ALGO_WORKER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "strategy_run_id": "run_mean_reversion_20260424_001",
-    "template_id": "mean-reversion",
-    "account_scope": "kite:paper-a",
-    "execution_mode": "paper",
-    "summary_fields": [
-      {"key": "symbol", "label": "Symbol", "value": "NIFTY 50"},
-      {"key": "regime", "label": "Regime", "value": "mean-reversion"}
-    ],
-    "risk_schema": [
-      {"key": "stop_loss_pct", "label": "Stop loss %", "type": "number", "value": 1.2, "editable": true},
-      {"key": "target_pct", "label": "Target %", "type": "number", "value": 2.4, "editable": true},
-      {"key": "max_position_qty", "label": "Max quantity", "type": "number", "value": 10, "editable": false}
-    ],
-    "allowed_actions": ["edit_risk", "exit_strategy"],
-    "runtime_state": {
-      "risk": {
-        "stop_loss_pct": 1.2,
-        "target_pct": 2.4,
-        "max_position_qty": 10
-      }
-    },
-    "metadata": {
-      "worker_version": "1.0.0"
-    }
-  }'
+git tag -a kite-algo-worker-v0.1.0 -m "kite-algo-worker v0.1.0"
+git push origin kite-algo-worker-v0.1.0
 ```
 
-Use stable `strategy_run_id` values. If the worker restarts, it should recover the existing run instead of creating unrelated positions.
+### Local development install
 
-For live runs, `metadata` must include:
+From a strategy project or virtualenv:
+
+```bash
+python3 -m pip install -e /path/to/kite-algo/sdk/python
+```
+
+During local development from this repository:
+
+```bash
+export PYTHONPATH="$PWD/sdk/python:$PYTHONPATH"
+```
+
+Minimal worker:
+
+```python
+from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, equity_market_order
+
+client = KiteAlgoWorkerClient(AlgoWorkerConfig(
+    base_url="http://localhost:8000",
+    token="kwa_...",
+))
+
+run = client.create_run(
+    strategy_run_id="run_mean_reversion_20260425_001",
+    template_id="mean-reversion",
+    account_scope="kite:paper-a",
+    execution_mode="paper",
+    runtime_state={"risk": {"stop_loss_pct": 1.2}},
+    metadata={"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+)
+
+order = equity_market_order("INFY", "BUY", 1)
+client.place_order(run["strategy_run_id"], order, "run_mean_reversion_20260425_001:entry:001")
+```
+
+## Environment variables
+
+Recommended variables for examples and production workers:
+
+| Variable | Purpose | Safe default |
+| --- | --- | --- |
+| `KITE_ALGO_API_BASE` | Backend base URL, for example `http://localhost:8000` | `http://localhost:8000` |
+| `KITE_ALGO_WORKER_TOKEN` | Raw worker token. Sent as `Authorization: Bearer <token>` | required |
+| `KITE_ALGO_ACCOUNT_SCOPE` | Account scope such as `kite:paper-a` or live `kite:<broker_user_id>` | `kite:paper-a` |
+| `KITE_ALGO_EXECUTION_MODE` | `dry_run`, `paper`, or `live` | `dry_run` in examples |
+| `KITE_ALGO_RUN_ID` | Stable strategy run id for restart recovery | strategy-specific |
+| `KITE_ALGO_ENABLE_LIVE` | Explicit live acknowledgement in examples | unset / false |
+| `KITE_ALGO_TIMEOUT` | HTTP timeout seconds | `10` |
+
+Store tokens in environment or a secret manager. Never commit raw worker tokens.
+
+## Worker API and SDK lifecycle
+
+All strategy activity should happen under one stable `strategy_run_id` per strategy lifecycle.
+
+1. `health()` at startup to verify the token.
+2. `create_run(...)` once per strategy lifecycle. Reuse the same `strategy_run_id` after restarts.
+3. `place_order(...)` or `place_basket(...)` with explicit idempotency keys for every intent.
+4. `patch_risk(...)` whenever stops, targets, model thresholds, or exposure controls change.
+5. `heartbeat(...)` from long-running workers.
+6. `get_run(...)` after restarts, mutations, and exits.
+7. `exit_run(...)` to close the grouped strategy run.
+
+The SDK maps to public endpoints only:
+
+| SDK method | Worker endpoint |
+| --- | --- |
+| `health()` | `GET /api/algo-workers/worker/health` |
+| `heartbeat(...)` | `POST /api/algo-workers/worker/heartbeat` |
+| `create_run(...)` | `POST /api/algo-workers/worker/runs` |
+| `get_run(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}` |
+| `place_order(...)` / `place_basket(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/intents` |
+| `patch_risk(...)` | `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/risk` |
+| `exit_run(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/exit` |
+
+## Execution modes: dry_run vs paper vs live
+
+### `dry_run`
+
+- Does not place broker orders.
+- Accepts and stores worker intent payloads so you can verify strategy decisions and request shapes.
+- Good for first local development and CI-style smoke runs.
+
+### `paper`
+
+- Does not place broker orders.
+- Sends orders to the paper runtime and proves strategy behavior, grouping, risk patching, exits, and grouped P&L.
+- Use paper before enabling any live worker token.
+
+### `live`
+
+- Places real broker orders only when the worker token explicitly allows `live`, the run uses a real broker account scope such as `kite:AB1234`, and live metadata is present.
+- Proves broker order placement, fills, margin/charges, and live journaling only after real validation.
+- Keep live enablement environment-gated in worker code. The repository also includes `scripts/live_worker_e2e_validation.py` for explicit live validation.
+
+## Strategy run metadata
+
+For live runs, metadata must include:
 
 ```json
 {
@@ -124,290 +147,236 @@ For live runs, `metadata` must include:
 }
 ```
 
-Valid `strategy_family` values are `options_strategy`, `indicator_strategy`, `investment_strategy`, and `discretionary_strategy`. `entry_surface` is optional and defaults to `algo_worker`, but setting it helps audit where live orders came from.
+Valid `strategy_family` values:
 
-### 3. Submit an Order Intent
+- `options_strategy`
+- `indicator_strategy`
+- `investment_strategy`
+- `discretionary_strategy`
 
-All order placement goes through `intents`. Every intent must have an `idempotency_key`.
+`entry_surface` is optional but recommended for auditability.
 
-For paper runs, the payload can use the paper runtime's accepted order shape. For live runs, each order must use the broker order shape accepted by the backend order API:
+## Full supported order catalog
 
-```json
-{
-  "exchange": "NSE",
-  "tradingsymbol": "INFY",
-  "transaction_type": "BUY",
-  "variety": "regular",
-  "product": "CNC",
-  "order_type": "MARKET",
-  "quantity": 1,
-  "validity": "DAY"
-}
-```
+Worker live orders must match `broker_api.kite_orders.PlaceOrderRequest`. The SDK order builders produce that shape.
 
-Do not send broker tags directly for live worker orders. The backend generates a compact `KA...` broker tag, persists a `live_order_intents` row with the strategy attribution, quotes broker margin/charges, and later projects broker fills into journal facts.
+### Supported values
 
-```bash
-curl -X POST "$KITE_ALGO_API_BASE/api/algo-workers/worker/runs/run_mean_reversion_20260424_001/intents" \
-  -H "Authorization: Bearer $KITE_ALGO_WORKER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "intent_type": "place_order",
-    "idempotency_key": "run_mean_reversion_20260424_001:entry:1",
-    "payload": {
-      "order": {
-        "symbol": "NIFTY 50",
-        "side": "BUY",
-        "quantity": 1,
-        "order_type": "MARKET"
-      }
-    },
-    "metadata": {
-      "signal": "zscore-cross"
-    }
-  }'
-```
+| Field | Supported values / notes |
+| --- | --- |
+| `exchange` | `NSE`, `BSE`, `NFO`, `CDS`, `MCX` |
+| `tradingsymbol` | Broker trading symbol, for example `INFY` or `NIFTY24APR22500CE` |
+| `transaction_type` | `BUY`, `SELL` |
+| `variety` | `regular`, `amo`, `co`, `iceberg`, `auction` |
+| `product` | `CNC`, `MIS`, `NRML`, `MTF` |
+| `order_type` | `MARKET`, `LIMIT`, `SL`, `SL-M` |
+| `quantity` | Positive integer |
+| `price` | Required for `LIMIT` and `SL`; omit for `MARKET`; omit or `0` for `SL-M` |
+| `trigger_price` | Required for `SL` and `SL-M` |
+| `validity` | `DAY`, `IOC`, `TTL` |
+| `validity_ttl` | Required when `validity=TTL`; backend validates `1..365` |
+| `disclosed_quantity` | Optional; cannot exceed `quantity` |
+| `market_protection` | Optional; allowed for `MARKET` and `SL-M`; `-1` or `0..100` |
+| `autoslice` | Optional boolean |
+| `iceberg_legs` | Optional integer `2..10` |
+| `iceberg_quantity` | Optional positive integer |
+| `auction_number` | Optional string for auction orders |
+| `squareoff` | Optional cover-order squareoff value |
+| `stoploss` | Optional cover-order stoploss value |
+| `trailing_stoploss` | Optional cover-order trailing stoploss value |
 
-For multi-leg or option strategies, submit a basket:
+Do **not** send `tag`, `tags`, or `attribution`. The backend injects compact broker tags and durable live attribution for the strategy run.
 
-```json
-{
-  "intent_type": "place_basket",
-  "idempotency_key": "run_option_master_001:entry-basket:1",
-  "payload": {
-    "basket": {
-      "orders": [
-        {"symbol": "NIFTY24APR22500CE", "side": "SELL", "quantity": 50, "order_type": "MARKET"},
-        {"symbol": "NIFTY24APR22600CE", "side": "BUY", "quantity": 50, "order_type": "MARKET"}
-      ]
-    }
-  }
-}
-```
-
-If the same `idempotency_key` is retried, the backend returns the previously stored result instead of placing a duplicate order.
-
-### 4. Patch Risk
-
-Use this when the strategy changes a stop, target, trail, model confidence threshold, max quantity, or any other run-level control.
-
-```bash
-curl -X PATCH "$KITE_ALGO_API_BASE/api/algo-workers/worker/runs/run_mean_reversion_20260424_001/risk" \
-  -H "Authorization: Bearer $KITE_ALGO_WORKER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "patch": {
-      "stop_loss_pct": 0.8,
-      "target_pct": 1.8
-    },
-    "reason": "volatility contraction"
-  }'
-```
-
-The patch updates both:
-
-- `runtime_state.risk`
-- matching values in `risk_schema`
-
-That keeps backend state and UI-editable risk fields aligned.
-
-### 5. Read Run State
-
-```bash
-curl "$KITE_ALGO_API_BASE/api/algo-workers/worker/runs/run_mean_reversion_20260424_001" \
-  -H "Authorization: Bearer $KITE_ALGO_WORKER_TOKEN"
-```
-
-Use this after restarts and after order or risk mutations.
-
-### 6. Exit the Strategy
-
-Exit the whole grouped strategy run, not one loose position.
-
-For `paper` runs, `/exit` calls the paper runtime and closes the grouped paper strategy.
-
-For `live` runs, `/exit` is grouped and broker-aware:
-
-- it reconciles live broker positions first
-- it builds reducing exit orders from attributed live fills for that `strategy_run_id`
-- it validates the broker position can cover the attributed strategy quantity
-- it places the exit basket through the same attributed live order path
-- it closes the run only after projected live fills prove the strategy is flat
-
-If exit orders are placed but fills are still pending, the run becomes `exiting`. Call `/exit` again after order/trade sync to confirm flat and close it. Use `dry_run=true` to preview the exit basket without placing broker orders.
-
-```bash
-curl -X POST "$KITE_ALGO_API_BASE/api/algo-workers/worker/runs/run_mean_reversion_20260424_001/exit" \
-  -H "Authorization: Bearer $KITE_ALGO_WORKER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "reason": "target reached",
-    "idempotency_key": "run_mean_reversion_20260424_001:exit:target:1",
-    "dry_run": false
-  }'
-```
-
-After exit/finalization, the run is closed. Closed runs cannot be risk-edited and cannot accept new order intents.
-
-## Python Worker Skeleton
+### SDK order helpers
 
 ```python
-import os
-import time
-from dataclasses import dataclass
-
-import requests
-
-
-@dataclass
-class AlgoConfig:
-    api_base: str
-    token: str
-    account_scope: str
-    strategy_run_id: str
-    template_id: str
-
-
-class KiteAlgoWorkerClient:
-    def __init__(self, config: AlgoConfig) -> None:
-        self.config = config
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {config.token}",
-            "Content-Type": "application/json",
-        })
-
-    def health(self) -> dict:
-        return self._request("GET", "/api/algo-workers/worker/health")
-
-    def create_run(self, risk: dict) -> dict:
-        return self._request("POST", "/api/algo-workers/worker/runs", json={
-            "strategy_run_id": self.config.strategy_run_id,
-            "template_id": self.config.template_id,
-            "account_scope": self.config.account_scope,
-            "execution_mode": os.environ.get("KITE_ALGO_EXECUTION_MODE", "paper"),
-            "risk_schema": [
-                {"key": key, "label": key.replace("_", " ").title(), "type": "number", "value": value, "editable": True}
-                for key, value in risk.items()
-            ],
-            "runtime_state": {"risk": risk},
-            "metadata": {
-                "strategy_family": os.environ.get("KITE_ALGO_STRATEGY_FAMILY", "indicator_strategy"),
-                "strategy_name": os.environ.get("KITE_ALGO_STRATEGY_NAME", self.config.template_id),
-                "entry_surface": "external_algo_worker",
-            },
-        })
-
-    def place_order(self, order: dict, key: str) -> dict:
-        return self._request("POST", f"/api/algo-workers/worker/runs/{self.config.strategy_run_id}/intents", json={
-            "intent_type": "place_order",
-            "idempotency_key": key,
-            "payload": {"order": order},
-        })
-
-    def patch_risk(self, patch: dict, reason: str) -> dict:
-        return self._request("PATCH", f"/api/algo-workers/worker/runs/{self.config.strategy_run_id}/risk", json={
-            "patch": patch,
-            "reason": reason,
-        })
-
-    def exit_run(self, reason: str) -> dict:
-        return self._request("POST", f"/api/algo-workers/worker/runs/{self.config.strategy_run_id}/exit", json={
-            "reason": reason,
-        })
-
-    def _request(self, method: str, path: str, **kwargs) -> dict:
-        response = self.session.request(method, f"{self.config.api_base}{path}", timeout=10, **kwargs)
-        response.raise_for_status()
-        return response.json()
-
-
-def main() -> None:
-    config = AlgoConfig(
-        api_base=os.environ["KITE_ALGO_API_BASE"],
-        token=os.environ["KITE_ALGO_WORKER_TOKEN"],
-        account_scope=os.environ.get("KITE_ALGO_ACCOUNT_SCOPE", "kite:paper-a"),
-        strategy_run_id=os.environ.get("KITE_ALGO_RUN_ID", "run_mean_reversion_local"),
-        template_id="mean-reversion",
-    )
-    client = KiteAlgoWorkerClient(config)
-    client.health()
-    client.create_run({"stop_loss_pct": 1.2, "target_pct": 2.4})
-
-    last_signal_id = None
-    while True:
-        signal = compute_signal()
-        if signal and signal["id"] != last_signal_id:
-            client.place_order(signal["order"], key=f"{config.strategy_run_id}:signal:{signal['id']}")
-            last_signal_id = signal["id"]
-        if signal and "risk_patch" in signal:
-            client.patch_risk(signal["risk_patch"], reason="model update")
-        time.sleep(1)
-
-
-def compute_signal():
-    return None
-
-
-if __name__ == "__main__":
-    main()
+from kite_algo_worker import (
+    market_order,
+    limit_order,
+    sl_order,
+    sl_m_order,
+    option_market_order,
+    equity_market_order,
+    OrderBuilder,
+)
 ```
 
-## Strategy Patterns
+Helpers:
 
-### Mean Reversion
+- `market_order(exchange, tradingsymbol, transaction_type, product, quantity, variety="regular", ...)`
+- `limit_order(exchange, tradingsymbol, transaction_type, product, quantity, price, variety="regular", ...)`
+- `sl_order(exchange, tradingsymbol, transaction_type, product, quantity, price, trigger_price, variety="regular", ...)`
+- `sl_m_order(exchange, tradingsymbol, transaction_type, product, quantity, trigger_price, variety="regular", ...)`
+- `option_market_order(tradingsymbol, transaction_type, quantity, product="NRML", exchange="NFO", variety="regular", ...)`
+- `equity_market_order(tradingsymbol, transaction_type, quantity, product="CNC", exchange="NSE", variety="regular", ...)`
 
-Use one run per traded symbol or portfolio bucket. Put editable stop, target, max position size, and cooldown in `risk_schema`. Use deterministic idempotency keys for entries and exits:
+All helpers accept the optional fields listed above except `price` / `trigger_price` where the order type controls them.
+
+## Equity examples
+
+```python
+from kite_algo_worker import equity_market_order, limit_order
+
+entry = equity_market_order("INFY", "BUY", 1, product="CNC")
+client.place_order(run_id, entry, f"{run_id}:entry:INFY:20260425T091500")
+
+limit_exit = limit_order("NSE", "INFY", "SELL", "CNC", 1, price=1510.50)
+client.place_order(run_id, limit_exit, f"{run_id}:target:INFY:20260425T100000")
+```
+
+## Option examples
+
+```python
+from kite_algo_worker import option_market_order
+
+buy_call = option_market_order("NIFTY24APR22500CE", "BUY", 50)
+client.place_order(run_id, buy_call, f"{run_id}:long-call:001")
+```
+
+## Basket examples
+
+Use baskets for spreads, hedges, and multi-leg strategies. Every leg remains grouped under the same `strategy_run_id`.
+
+```python
+orders = [
+    option_market_order("NIFTY24APR22500CE", "SELL", 50),
+    option_market_order("NIFTY24APR22600CE", "BUY", 50),
+]
+
+client.place_basket(
+    run_id,
+    orders,
+    idempotency_key=f"{run_id}:entry-basket:credit-spread:001",
+    metadata={"signal": "credit-spread-entry"},
+    all_or_none=False,
+    dry_run=False,
+)
+```
+
+For live basket previews, pass `dry_run=True` to preview broker margin/charges without placing broker orders.
+
+## Stop loss / SL-M / LIMIT examples
+
+```python
+from kite_algo_worker import limit_order, sl_order, sl_m_order
+
+target = limit_order("NSE", "INFY", "SELL", "CNC", 1, price=1510.50)
+stop_limit = sl_order("NSE", "INFY", "SELL", "CNC", 1, price=1489.50, trigger_price=1490.00)
+stop_market = sl_m_order("NSE", "INFY", "SELL", "CNC", 1, trigger_price=1490.00, market_protection=-1)
+
+client.place_order(run_id, target, f"{run_id}:target:001")
+client.place_order(run_id, stop_limit, f"{run_id}:stop-limit:001")
+client.place_order(run_id, stop_market, f"{run_id}:stop-market:001")
+```
+
+## Grouped live exit behavior
+
+Always exit with `exit_run(...)`; do not place ad-hoc manual exit orders from the worker.
+
+For live runs, grouped `/exit` is broker-aware:
+
+1. Reconciles live broker positions first.
+2. Reads attributed open live legs for that `strategy_run_id`.
+3. Builds reducing market exit orders for the grouped live legs.
+4. Validates broker net position can cover the attributed strategy quantity.
+5. Places the exit basket through the same attributed live order path unless `dry_run=True`.
+6. Closes the run only after projected live fills prove the strategy is flat.
+
+If exit orders are submitted but fills are still pending, the run status becomes `exiting`. Keep monitoring, allow order/trade sync to project fills, and call `exit_run(...)` again to confirm flat closure.
+
+Preview without broker placement:
+
+```python
+preview = client.exit_run(run_id, reason="operator preview", idempotency_key=f"{run_id}:exit-preview:001", dry_run=True)
+```
+
+## Risk patching for dynamic stops/ML models
+
+Use `patch_risk(...)` for dynamic stops, targets, trailing distances, model confidence thresholds, volatility regimes, and max exposure changes.
+
+```python
+client.patch_risk(
+    run_id,
+    {"trailing_stop_pct": 0.75, "model_confidence_min": 0.68},
+    reason="model regime changed",
+)
+```
+
+The backend updates `runtime_state.risk` and matching `risk_schema` values, so operator views and runtime state stay aligned. The worker does not need database access.
+
+## Idempotency key rules
+
+Every order intent must have an explicit idempotency key. Keys must be 8 to 160 characters. The SDK raises `ValueError` if `place_order` or `place_basket` is called without one or with a key outside that length range.
+
+Good keys are deterministic and include the run, action, instrument or basket, and signal/time bucket:
 
 ```text
-{strategy_run_id}:entry:{bar_timestamp}
-{strategy_run_id}:scaleout:{bar_timestamp}
-{strategy_run_id}:exit:{reason}:{bar_timestamp}
+{strategy_run_id}:entry:{symbol}:{bar_timestamp}
+{strategy_run_id}:entry-basket:{structure}:{signal_id}
+{strategy_run_id}:scaleout:{leg}:{signal_id}
+{strategy_run_id}:exit:{reason}:{signal_id}
 ```
 
-### Momentum
+If the same key is retried, the backend returns the stored result instead of placing a duplicate order. Do not generate random keys for retryable signals.
 
-Use `runtime_state.risk` for trend stop, trailing stop distance, pyramiding limit, and signal freshness. Patch risk whenever the trailing stop or max exposure changes.
+## Recovery after worker restart
 
-### Option Strategy Master
+Persist locally:
 
-Treat the option page as a master strategy. The master run can submit baskets for iron condors, spreads, long calls, long puts, and naked trades. Each leg stays attributed to the same `strategy_run_id`.
+- `strategy_run_id`
+- last processed signal/bar id
+- idempotency keys already emitted
+- strategy-local model/risk state needed to continue decisions
 
-Use `risk_schema` for premium stop, premium target, trailing premium stop, max loss, and manual-edit controls. The worker decides which fields are editable.
+On restart:
 
-### Machine Learning Strategy
+1. Create the SDK client and call `health()`.
+2. Call `get_run(strategy_run_id)`.
+3. If the run is `open`, resume from the last persisted signal id.
+4. If the run is `exiting`, call `exit_run(..., dry_run=True)` or `exit_run(...)` after broker sync to confirm flat closure.
+5. If the run is `closed` or `failed`, do not submit more intents; create a new lifecycle run if the strategy should start again.
 
-The ML model can run on a separate high-RAM machine. It should still use the same worker contract:
+## What backend owns vs what worker owns
 
-- create a run
-- submit order or basket intents
-- patch risk when model confidence or volatility regime changes
-- exit the run when the model invalidates the trade
+Backend owns:
 
-Dynamic stops work through `PATCH /risk`. The model does not need direct database access.
+- worker token authentication and scoping
+- dry_run/paper/live mode enforcement
+- live order validation and broker placement
+- compact broker tags and live attribution
+- paper runtime execution
+- grouped live and paper exits
+- live/paper journal separation
+- margin/charges contracts
+- order/fill projection into journal facts
+- keeping broker/manual activity separate as `broker_import` unless safely attributed by reconciliation
 
-## Production Rules
+Worker owns:
 
-- Use one `strategy_run_id` per strategy lifecycle.
-- Persist `strategy_run_id` and the last signal id locally so restarts do not duplicate trades.
-- Use idempotency keys for every intent.
-- Scope tokens to the narrowest account, modes, and templates possible.
-- Enable `live` only for workers that are ready to place real broker orders.
-- Live worker runs must use a real broker account scope (`kite:<broker_user_id>`) and strategy metadata (`strategy_family`, `strategy_name`).
-- Send heartbeat from long-running workers.
-- Never store the raw token in source control.
-- Never share one token across unrelated workers.
-- Close runs through `/exit`; do not leave grouped strategy positions open.
-- For live runs, use `/exit` as the grouped live exit path. If the response status is `exiting`, keep monitoring and call `/exit` again after broker fills sync.
-- Treat risk edits as run-level state, not loose order metadata.
-- Run every new strategy in `dry_run`, then `paper`, before enabling `live` on its worker token.
+- signals and strategy decisions
+- stable `strategy_run_id` selection
+- deterministic idempotency keys
+- run metadata, summary fields, and initial risk schema
+- risk patches when strategy controls change
+- heartbeat and restart recovery
 
-## Architecture Gaps To Close Next
+## What not to do
 
-The current API is enough to develop and paper-test isolated algos. The next production hardening steps are:
+- Do not call broker APIs directly from external workers.
+- Do not call backend database tables or paper-runtime internals.
+- Do not send `tag`, `tags`, or `attribution`; the backend injects attribution.
+- Do not mix multiple unrelated strategy lifecycles into one `strategy_run_id`.
+- Do not use random idempotency keys for retryable order intents.
+- Do not enable live before dry_run and paper behavior are proven.
+- Do not assume live `/exit` is closed until the backend confirms flat projected fills.
+- Do not manually merge live and paper P&L; the backend keeps them separated.
 
-1. Add a worker market-data stream or snapshot endpoint so remote workers do not need their own duplicate quote plumbing.
-2. Add first-class worker journal events for signal, model version, feature snapshot, and decision explanation.
-3. Add run recovery helpers, for example list open runs by token/template/account.
-4. Add optional per-token live limits, exit-aware kill switch controls, and maximum order size/exposure checks.
-5. Add SDK wrappers so strategy code can import a small client instead of writing raw HTTP calls.
+## Runnable SDK examples
+
+Examples live in `sdk/python/examples/`:
+
+- `mean_reversion_worker.py` — create run, place an equity order, patch risk, heartbeat, optional exit.
+- `option_basket_worker.py` — create run, submit an option basket, patch risk.
+- `live_exit_preview.py` — preview grouped live exit with `dry_run=True`.
+
+All examples default to safe behavior (`dry_run` or preview). Live order placement requires explicit environment acknowledgement.

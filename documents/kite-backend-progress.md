@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-04-24
+Last updated: 2026-04-25
 
 ## Scope
 
@@ -139,6 +139,11 @@ Do not use this file for frontend work.
   - dirty order trade sync now triggers best-effort live journal projection without blocking position reconciliation
   - journal summary/runs/trades/strategies filters now carry strategy-family and execution-mode separation through backend and frontend API types
   - `/api/algo-workers` now supports explicitly live-enabled worker tokens/runs and routes live external algo intents through the attributed live order path
+- Added the first real external worker SDK slice:
+  - `sdk/python/kite_algo_worker` exposes `KiteAlgoWorkerClient`, `AlgoWorkerConfig`, a custom API exception, and broker-shape order builders
+  - SDK examples now cover mean-reversion, option baskets, and grouped live exit preview with safe defaults
+  - `docs/algo-worker-development-guide.md` is now a full coding guide for dry_run/paper/live worker strategy development and documents all live order fields supported by `PlaceOrderRequest`
+  - focused SDK tests validate auth headers, run/intent payloads, idempotency enforcement, exit preview payloads, non-2xx handling, and order-builder compatibility with broker order validation
 
 ## Skill usage
 
@@ -433,11 +438,12 @@ Update after latest verification:
 
 If a new agent picks this up, the correct next task is:
 
-1. extract template-owned builders for `build_summary_fields(run)`, `build_risk_schema(run)`, and `build_allowed_actions(run)` so non-option strategies can use the same backend contract cleanly
-2. implement one non-option systematic algo on that contract and verify it in paper mode
-3. carry the same run/capability contract into the live strategy-management path
-4. continue implementing and hardening `market-runtime/`, starting with live shard verification and direct or optimized marketwatch/candle runtime streaming
-5. add backend tests for order runtime, websocket flow, and live positions
-6. verify live duplicate/replay order-event behavior against real provider events
-7. verify MF get-by-id shapes when a real order/SIP exists, without executing unsafe side-effecting writes unless explicitly approved
-8. refresh this tracker and the websocket-runtime docs after each material step
+1. add optional worker conveniences that remain API-only, such as listing recoverable open runs by token/template/account and structured decision/journal events
+2. extract template-owned builders for `build_summary_fields(run)`, `build_risk_schema(run)`, and `build_allowed_actions(run)` so non-option strategies can use the same backend contract cleanly
+3. implement one non-option systematic algo on that contract and verify it in paper mode using the SDK
+4. carry the same run/capability contract into the live strategy-management path
+5. continue implementing and hardening `market-runtime/`, starting with live shard verification and direct or optimized marketwatch/candle runtime streaming
+6. add backend tests for order runtime, websocket flow, and live positions
+7. verify live duplicate/replay order-event behavior against real provider events
+8. verify MF get-by-id shapes when a real order/SIP exists, without executing unsafe side-effecting writes unless explicitly approved
+9. refresh this tracker and the websocket-runtime docs after each material step
