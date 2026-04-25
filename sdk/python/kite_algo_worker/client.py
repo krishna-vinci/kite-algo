@@ -99,16 +99,99 @@ class KiteAlgoWorkerClient:
         return self._request("GET", f"/worker/runs/{strategy_run_id}/pnl")
 
     def stream_run_pnl(self, strategy_run_id: str, *, interval_seconds: float = 1.0) -> Iterator[JsonDict]:
-        response = self.session.request(
+        return self._stream_sse(
             "GET",
-            self._url(f"/worker/runs/{strategy_run_id}/pnl/stream"),
+            f"/worker/runs/{strategy_run_id}/pnl/stream",
+            params={"interval_seconds": interval_seconds},
+        )
+
+    def resolve_ticker(self, symbol: str) -> JsonDict:
+        return self._request("GET", "/worker/market/instruments/resolve", params={"symbol": symbol})
+
+    def resolve_tickers(self, instruments: Iterable[str | int]) -> JsonDict:
+        symbols, tokens = self._split_instruments(instruments)
+        return self._request(
+            "POST",
+            "/worker/market/instruments/resolve",
+            json={"symbols": symbols, "instrument_tokens": tokens},
+        )
+
+    def search_tickers(self, query: str, exchange: Optional[str] = None, limit: int = 20) -> JsonDict:
+        params: JsonDict = {"query": query, "limit": limit}
+        if exchange:
+            params["exchange"] = exchange
+        return self._request("GET", "/worker/market/instruments/search", params=params)
+
+    def get_quotes(self, instruments: Iterable[str | int], mode: str = "quote") -> JsonDict:
+        symbols, tokens = self._split_instruments(instruments)
+        return self._request(
+            "POST",
+            "/worker/market/quotes",
+            json={"symbols": symbols, "instrument_tokens": tokens, "mode": mode},
+        )
+
+    def stream_ticks(self, instruments: Iterable[str | int], mode: str = "quote") -> Iterator[JsonDict]:
+        symbols, tokens = self._split_instruments(instruments)
+        return self._stream_sse(
+            "GET",
+            "/worker/market/ticks/stream",
+            params={
+                "symbols": ",".join(symbols),
+                "tokens": ",".join(str(token) for token in tokens),
+                "mode": mode,
+            },
+        )
+
+    def get_candles(self, instrument: str | int, interval: str = "5minute", lookback: int = 50) -> JsonDict:
+        params: JsonDict = {"interval": interval, "lookback": lookback}
+        instrument_value = str(instrument).strip()
+        if isinstance(instrument, int) or instrument_value.isdigit():
+            params["instrument_token"] = int(instrument_value)
+        else:
+            params["symbol"] = instrument_value
+        return self._request("GET", "/worker/market/candles", params=params)
+
+    def get_current_candle(self, instrument: str | int, interval: str = "5minute") -> Optional[JsonDict]:
+        return self.get_candles(instrument, interval=interval, lookback=1).get("current")
+
+    def stream_candles(self, instrument: str | int, interval: str = "5minute") -> Iterator[JsonDict]:
+        params: JsonDict = {"interval": interval}
+        instrument_value = str(instrument).strip()
+        if isinstance(instrument, int) or instrument_value.isdigit():
+            params["instrument_token"] = int(instrument_value)
+        else:
+            params["symbol"] = instrument_value
+        return self._stream_sse("GET", "/worker/market/candles/stream", params=params)
+
+    def get_market_snapshot(
+        self,
+        symbols: Optional[List[str]] = None,
+        instrument_tokens: Optional[List[int]] = None,
+        candles: Optional[List[Mapping[str, Any]]] = None,
+        mode: str = "quote",
+    ) -> JsonDict:
+        return self._request(
+            "POST",
+            "/worker/market/snapshot",
+            json={
+                "symbols": symbols or [],
+                "instrument_tokens": instrument_tokens or [],
+                "candles": list(candles or []),
+                "mode": mode,
+            },
+        )
+
+    def _stream_sse(self, method: str, path: str, params: Optional[Mapping[str, Any]] = None) -> Iterator[JsonDict]:
+        response = self.session.request(
+            method,
+            self._url(path),
             timeout=(self.config.timeout, None),
             stream=True,
-            params={"interval_seconds": interval_seconds},
+            params=dict(params or {}),
         )
         if not 200 <= response.status_code < 300:
             try:
-                self._raise_response_error(response, "GET", f"/worker/runs/{strategy_run_id}/pnl/stream")
+                self._raise_response_error(response, method, path)
             finally:
                 response.close()
 
@@ -116,31 +199,50 @@ class KiteAlgoWorkerClient:
             current_event = "message"
             try:
                 for line in response.iter_lines(decode_unicode=True):
-                    if not line:
-                        continue
-                    if line.startswith(":"):
+                    if not line or line.startswith(":"):
                         continue
                     if line.startswith("event:"):
                         current_event = line.split(":", 1)[1].strip() or "message"
                         continue
-                    if line.startswith("data:"):
-                        payload = line.split(":", 1)[1].strip()
-                        if payload:
-                            decoded = json.loads(payload)
-                            if current_event == "error":
-                                raise KiteAlgoWorkerError(
-                                    f"Worker API stream error for run {strategy_run_id}: {decoded.get('detail') if isinstance(decoded, dict) else decoded}",
-                                    status_code=0,
-                                    response_body=decoded,
-                                )
-                            if current_event == "end":
-                                break
-                            yield decoded
-                        current_event = "message"
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line.split(":", 1)[1].strip()
+                    if not payload:
+                        continue
+                    try:
+                        decoded = json.loads(payload)
+                    except json.JSONDecodeError as exc:
+                        raise KiteAlgoWorkerError(
+                            f"Worker API stream at {path} returned invalid JSON: {exc}",
+                            status_code=0,
+                            response_body=payload,
+                        ) from exc
+                    if current_event == "error":
+                        raise KiteAlgoWorkerError(
+                            f"Worker API stream error at {path}: {decoded.get('detail') if isinstance(decoded, dict) else decoded}",
+                            status_code=0,
+                            response_body=decoded,
+                        )
+                    if current_event == "end":
+                        break
+                    yield decoded
+                    current_event = "message"
             finally:
                 response.close()
 
         return _events()
+
+    @staticmethod
+    def _split_instruments(instruments: Iterable[str | int]) -> tuple[List[str], List[int]]:
+        symbols: List[str] = []
+        tokens: List[int] = []
+        for item in instruments:
+            value = str(item).strip()
+            if isinstance(item, int) or value.isdigit():
+                tokens.append(int(value))
+            else:
+                symbols.append(value)
+        return symbols, tokens
 
     def place_order(
         self,

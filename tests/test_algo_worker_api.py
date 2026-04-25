@@ -14,7 +14,13 @@ install_dependency_stubs()
 from api.routers.algo_workers import (  # noqa: E402
     DEFAULT_WORKER_ACTIONS,
     WorkerIntentRequest,
+    WorkerInstrumentResolveRequest,
+    WorkerMarketSnapshotRequest,
+    WorkerQuoteRequest,
+    get_worker_market_candles,
     get_worker_run_pnl,
+    get_worker_market_snapshot,
+    get_worker_market_quotes,
     WorkerRiskPatchRequest,
     WorkerRunCreateRequest,
     WorkerToken,
@@ -23,15 +29,24 @@ from api.routers.algo_workers import (  # noqa: E402
     create_worker_token,
     patch_worker_run_risk,
     exit_worker_run,
+    resolve_worker_market_ticker,
+    resolve_worker_market_tickers,
+    stream_worker_market_candles,
+    stream_worker_market_ticks,
     stream_worker_run_pnl,
     submit_worker_intent,
     WorkerExitRequest,
 )
 from api.routers.algo_workers import _hash_token  # noqa: E402
+from api.worker_market_data import WorkerMarketDataService  # noqa: E402
 
 
 async def _run_to_thread_inline(func, /, *args, **kwargs):
     return func(*args, **kwargs)
+
+
+async def _single_sse(payload: str):
+    yield f"event: snapshot\ndata: {payload}\n\n"
 
 
 class _FakeWorkerRepository:
@@ -144,6 +159,290 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.account_scope, "kite:AB1234")
         self.assertIn("live", response.allowed_modes)
+
+    async def test_default_worker_actions_include_market_actions(self):
+        self.assertIn("market:read", DEFAULT_WORKER_ACTIONS)
+        self.assertIn("market:stream", DEFAULT_WORKER_ACTIONS)
+
+    async def test_resolve_ticker_endpoint_returns_fake_service_response(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        request.app.state.worker_market_data_service = SimpleNamespace(
+            resolve_ticker=AsyncMock(
+                return_value={
+                    "symbol": "NSE:INFY",
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            )
+        )
+
+        response = await resolve_worker_market_ticker(request, symbol="NSE:INFY")
+
+        self.assertEqual(response["instrument_token"], 408065)
+        self.assertEqual(response["symbol"], "NSE:INFY")
+
+    async def test_batch_resolve_returns_instruments_and_missing_fake_response(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        request.app.state.worker_market_data_service = SimpleNamespace(
+            resolve_many=AsyncMock(
+                return_value={
+                    "instruments": [
+                        {
+                            "symbol": "NSE:INFY",
+                            "instrument_token": 408065,
+                            "exchange": "NSE",
+                            "tradingsymbol": "INFY",
+                        }
+                    ],
+                    "missing": [999999],
+                }
+            )
+        )
+
+        response = await resolve_worker_market_tickers(
+            request,
+            WorkerInstrumentResolveRequest(symbols=["NSE:INFY"], instrument_tokens=[999999]),
+        )
+
+        self.assertEqual(len(response["instruments"]), 1)
+        self.assertEqual(response["instruments"][0]["instrument_token"], 408065)
+        self.assertEqual(response["missing"], [999999])
+
+    async def test_quote_endpoint_requires_market_read_action(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="limited",
+            account_scope="kite:paper-a",
+            allowed_modes=["paper"],
+            allowed_actions=["runs:read"],
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await get_worker_market_quotes(request, WorkerQuoteRequest(symbols=["NSE:INFY"]))
+
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    async def test_quote_endpoint_returns_fake_service_response(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        request.app.state.worker_market_data_service = SimpleNamespace(
+            get_quotes=AsyncMock(
+                return_value={
+                    "quotes": [
+                        {
+                            "symbol": "NSE:INFY",
+                            "instrument_token": 408065,
+                            "last_price": 1520.5,
+                            "received_at": "2026-04-25T12:00:00+00:00",
+                            "age_ms": 100,
+                            "is_stale": False,
+                        }
+                    ],
+                    "missing": [],
+                }
+            )
+        )
+
+        response = await get_worker_market_quotes(request, WorkerQuoteRequest(symbols=["NSE:INFY"], mode="quote"))
+
+        self.assertEqual(response["quotes"][0]["instrument_token"], 408065)
+        self.assertFalse(response["quotes"][0]["is_stale"])
+
+    async def test_worker_market_tick_stream_requires_market_stream_action(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="limited",
+            account_scope="kite:paper-a",
+            allowed_modes=["paper"],
+            allowed_actions=["market:read"],
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await stream_worker_market_ticks(request, symbols="NSE:INFY", tokens=None, mode="quote")
+
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    async def test_worker_market_tick_stream_returns_snapshot_event(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        request.app.state.worker_market_data_service = SimpleNamespace(
+            stream_ticks=lambda request, token, symbols, instrument_tokens, mode: _single_sse('{"ticks": [], "missing": []}')
+        )
+
+        response = await stream_worker_market_ticks(request, symbols="NSE:INFY", tokens=None, mode="quote")
+        chunk = await response.body_iterator.__anext__()  # pyright: ignore[reportAttributeAccessIssue]
+
+        self.assertEqual(response.media_type, "text/event-stream")
+        self.assertIn("event: snapshot", chunk)
+
+    async def test_worker_market_tick_stream_parses_symbols_and_tokens_for_service(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        captured = {}
+
+        async def fake_stream(request_obj, token, symbols, instrument_tokens, mode):
+            captured["symbols"] = symbols
+            captured["instrument_tokens"] = instrument_tokens
+            captured["mode"] = mode
+            yield "event: snapshot\ndata: {\"ticks\": []}\n\n"
+
+        request.app.state.worker_market_data_service = SimpleNamespace(stream_ticks=fake_stream)
+
+        response = await stream_worker_market_ticks(
+            request,
+            symbols="NSE:INFY, NSE:TCS ,,NSE:SBIN",
+            tokens="408065, 2953217, , 779521",
+            mode="quote",
+        )
+        await response.body_iterator.__anext__()  # pyright: ignore[reportAttributeAccessIssue]
+
+        self.assertEqual(captured["symbols"], ["NSE:INFY", "NSE:TCS", "NSE:SBIN"])
+        self.assertEqual(captured["instrument_tokens"], [408065, 2953217, 779521])
+        self.assertEqual(captured["mode"], "quote")
+
+    async def test_worker_market_tick_stream_rejects_invalid_token_csv(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await stream_worker_market_ticks(request, symbols="NSE:INFY", tokens="408065,bad-token", mode="quote")
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("tokens", ctx.exception.detail)
+
+    async def test_worker_market_tick_stream_rejects_out_of_range_token_csv(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await stream_worker_market_ticks(request, symbols="NSE:INFY", tokens="999999999999999999999", mode="quote")
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("out-of-range", ctx.exception.detail)
+
+    async def test_worker_market_candles_returns_history_and_current(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        request.app.state.worker_market_data_service = SimpleNamespace(
+            get_candles=AsyncMock(
+                return_value={
+                    "symbol": "NSE:INFY",
+                    "instrument_token": 408065,
+                    "interval": "5minute",
+                    "candles": [],
+                    "current": None,
+                }
+            )
+        )
+
+        response = await get_worker_market_candles(
+            request,
+            symbol="NSE:INFY",
+            instrument_token=None,
+            interval="5minute",
+            lookback=50,
+        )
+
+        self.assertEqual(response["symbol"], "NSE:INFY")
+        self.assertEqual(response["interval"], "5minute")
+
+    async def test_worker_market_candles_empty_reader_data_is_stale(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            ),
+            candle_reader=SimpleNamespace(get_candles=AsyncMock(return_value={"candles": [], "current": None})),
+        )
+
+        response = await service.get_candles(symbol="NSE:INFY", interval="5minute", lookback=50)
+
+        self.assertTrue(response["is_stale"])
+
+    async def test_worker_market_candle_stream_requires_market_stream_action(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="limited",
+            account_scope="kite:paper-a",
+            allowed_modes=["paper"],
+            allowed_actions=["market:read"],
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await stream_worker_market_candles(request, symbol="NSE:INFY", instrument_token=None, interval="5minute")
+
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    async def test_worker_market_candle_stream_returns_snapshot_chunk(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        request.app.state.worker_market_data_service = SimpleNamespace(
+            stream_candles=lambda request, symbol, instrument_token, interval: _single_sse(
+                '{"symbol": "NSE:INFY", "candles": [], "current": null}'
+            )
+        )
+
+        response = await stream_worker_market_candles(
+            request,
+            symbol="NSE:INFY",
+            instrument_token=None,
+            interval="5minute",
+        )
+        chunk = await response.body_iterator.__anext__()  # pyright: ignore[reportAttributeAccessIssue]
+
+        self.assertEqual(response.media_type, "text/event-stream")
+        self.assertIn("event: snapshot", chunk)
+
+    async def test_worker_market_snapshot_combines_quotes_and_candles(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        request.app.state.worker_market_data_service = SimpleNamespace(
+            get_market_snapshot=AsyncMock(
+                return_value={
+                    "quotes": [],
+                    "candles": [],
+                    "missing": [],
+                    "updated_at": "2026-04-25T00:00:00+00:00",
+                }
+            )
+        )
+
+        response = await get_worker_market_snapshot(
+            request,
+            WorkerMarketSnapshotRequest(symbols=["NSE:INFY"]),
+        )
+
+        self.assertIn("quotes", response)
+        self.assertIn("candles", response)
 
     async def test_admin_token_creation_rejects_live_without_kite_account_scope(self):
         repo = _FakeWorkerRepository()

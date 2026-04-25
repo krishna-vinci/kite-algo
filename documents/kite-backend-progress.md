@@ -149,6 +149,10 @@ Do not use this file for frontend work.
   - `/api/algo-workers/worker/runs/{strategy_run_id}/pnl/stream` now exposes SSE updates so remote workers can consume grouped P&L that feels realtime
   - live run P&L is reconstructed from attributed live fills plus current account position marks, keeping charges separated and flagging stale coverage when broker mark/quantity alignment is incomplete
   - paper run P&L reuses grouped paper strategy state via `strategy_run_id` instead of requiring workers to infer grouped P&L locally
+- Added generic runtime-backed algo-worker market-data primitives:
+  - worker endpoints now expose ticker resolution/search, quote snapshots, tick SSE streams, candle snapshots, candle SSE streams, and combined market snapshot bundles under `/api/algo-workers/worker/market/*`
+  - SDK methods now wrap those endpoints so external workers can build non-option realtime strategies without broker websockets, Redis access, database access, or backend internals
+  - option-chain discovery, strike/expiry selection, Greeks/IV, and spread builders are explicitly deferred to a later namespaced option worker layer inside the same SDK package
 
 ## Skill usage
 

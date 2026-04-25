@@ -10,10 +10,11 @@ Give the whole folder to an algo developer agent when you want it to write worke
 2. `ALGO_WORKER_DEVELOPMENT_GUIDE.md` — full copy of the main algo worker development guide.
 3. `SDK_INSTALL.md` — how to install the SDK on remote servers.
 4. `STRATEGY_LIFECYCLE.md` — how every worker should create runs, submit orders, patch risk, and exit.
-5. `REALTIME_PNL.md` — grouped realtime run-level P&L snapshot and stream usage.
-6. `ORDER_CATALOG.md` — supported order fields, including AMO.
-7. `LIVE_SAFETY.md` — live trading gates and what not to do.
-8. `examples/` — runnable strategy examples.
+5. `MARKET_DATA.md` — runtime-backed ticker, quote, tick-stream, and candle usage.
+6. `REALTIME_PNL.md` — grouped realtime run-level P&L snapshot and stream usage.
+7. `ORDER_CATALOG.md` — supported order fields, including AMO.
+8. `LIVE_SAFETY.md` — live trading gates and what not to do.
+9. `examples/` — runnable strategy examples.
 
 ## Canonical source files in this repo
 

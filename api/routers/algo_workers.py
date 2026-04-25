@@ -15,6 +15,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from api.worker_market_data import (
+    WorkerInstrumentResolveRequest,
+    WorkerMarketDataService,
+    WorkerMarketSnapshotRequest,
+    WorkerQuoteRequest,
+)
 from auth_service import require_app_user
 from database import SessionLocal
 
@@ -28,6 +34,8 @@ DEFAULT_WORKER_ACTIONS = {
     "risk:update",
     "runs:exit",
     "heartbeat",
+    "market:read",
+    "market:stream",
 }
 ALLOWED_V1_MODES = {"paper", "dry_run", "live"}
 LIVE_REQUIRED_RUN_METADATA = {"strategy_family", "strategy_name"}
@@ -698,6 +706,54 @@ def _repo(request: Request) -> Any:
         repository = SqlAlchemyAlgoWorkerRepository()
         request.app.state.algo_worker_repository = repository
     return repository
+
+
+def _market_data_service(request: Request) -> WorkerMarketDataService:
+    service = getattr(request.app.state, "worker_market_data_service", None)
+    if service is not None:
+        return service
+    candle_reader = getattr(request.app.state, "worker_candle_data_reader", None)
+    if candle_reader is None:
+        candle_reader = getattr(request.app.state, "algo_worker_candle_reader", None)
+    if candle_reader is None:
+        try:
+            from algo_runtime.snapshot_builder import RedisCandleDataReader
+            from broker_api.candle_aggregator import INTERVAL_SECONDS
+            from broker_api.candle_storage import CandleStorage
+            from broker_api.redis_events import get_redis
+
+            candle_reader = RedisCandleDataReader(
+                redis_client=get_redis(),
+                candle_storage=CandleStorage,
+                interval_seconds=INTERVAL_SECONDS,
+            )
+            request.app.state.algo_worker_candle_reader = candle_reader
+        except Exception:
+            candle_reader = None
+    return WorkerMarketDataService(
+        market_data_runtime=getattr(request.app.state, "market_data_runtime", None),
+        redis=getattr(getattr(request.app.state, "market_data_runtime", None), "redis", None),
+        candle_reader=candle_reader,
+    )
+
+
+def _parse_csv_values(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def _parse_csv_int_values(value: Optional[str], *, field_name: str) -> List[int]:
+    parsed: List[int] = []
+    for item in _parse_csv_values(value):
+        try:
+            numeric = int(item)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail=f"{field_name} must contain comma-separated integers") from None
+        if numeric <= 0 or numeric > 9_999_999_999:
+            raise HTTPException(status_code=422, detail=f"{field_name} contains an out-of-range instrument token")
+        parsed.append(numeric)
+    return parsed
 
 
 def _extract_bearer_token(request: Request) -> str:
@@ -1447,6 +1503,107 @@ async def get_worker_run(request: Request, strategy_run_id: str):
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     return run
+
+
+@router.get("/worker/market/instruments/resolve")
+async def resolve_worker_market_ticker(request: Request, symbol: str):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).resolve_ticker(symbol)
+
+
+@router.get("/worker/market/instruments/search")
+async def search_worker_market_tickers(request: Request, query: str, exchange: Optional[str] = None, limit: int = Query(20, ge=1, le=50)):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).search_tickers(query, exchange=exchange, limit=limit)
+
+
+@router.post("/worker/market/instruments/resolve")
+async def resolve_worker_market_tickers(request: Request, payload: WorkerInstrumentResolveRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).resolve_many(symbols=payload.symbols, instrument_tokens=payload.instrument_tokens)
+
+
+@router.post("/worker/market/quotes")
+async def get_worker_market_quotes(request: Request, payload: WorkerQuoteRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).get_quotes(payload)
+
+
+@router.get("/worker/market/ticks/stream")
+async def stream_worker_market_ticks(request: Request, symbols: Optional[str] = None, tokens: Optional[str] = None, mode: str = "quote"):
+    token = await require_worker_token(request)
+    _require_action(token, "market:stream")
+    parsed_symbols = _parse_csv_values(symbols)
+    parsed_tokens = _parse_csv_int_values(tokens, field_name="tokens")
+    return StreamingResponse(
+        _market_data_service(request).stream_ticks(
+            request,
+            token,
+            symbols=parsed_symbols,
+            instrument_tokens=parsed_tokens,
+            mode=mode,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/worker/market/candles")
+async def get_worker_market_candles(
+    request: Request,
+    symbol: Optional[str] = None,
+    instrument_token: Optional[int] = None,
+    interval: str = "5minute",
+    lookback: int = Query(50, ge=1, le=500),
+):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).get_candles(
+        symbol=symbol,
+        instrument_token=instrument_token,
+        interval=interval,
+        lookback=lookback,
+    )
+
+
+@router.get("/worker/market/candles/stream")
+async def stream_worker_market_candles(
+    request: Request,
+    symbol: Optional[str] = None,
+    instrument_token: Optional[int] = None,
+    interval: str = "5minute",
+):
+    token = await require_worker_token(request)
+    _require_action(token, "market:stream")
+    return StreamingResponse(
+        _market_data_service(request).stream_candles(
+            request,
+            symbol=symbol,
+            instrument_token=instrument_token,
+            interval=interval,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/worker/market/snapshot")
+async def get_worker_market_snapshot(request: Request, payload: WorkerMarketSnapshotRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).get_market_snapshot(payload)
 
 
 @router.get("/worker/runs/{strategy_run_id}/pnl")

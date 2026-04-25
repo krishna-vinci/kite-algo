@@ -96,3 +96,32 @@ The SDK exposes grouped run-level P&L helpers:
 - `stream_run_pnl(strategy_run_id, interval_seconds=1.0)`
 
 The backend remains the source of truth for paper/live separation, attribution, charges, and grouped run state.
+
+## Runtime-backed market data
+
+The SDK exposes worker-safe market-data helpers backed by Kite Algo's Go market-runtime. Workers do not connect to broker websockets, Redis, or backend internals directly.
+
+```python
+instrument = client.resolve_ticker("NSE:INFY")
+quotes = client.get_quotes(["NSE:INFY"], mode="quote")
+candles = client.get_candles("NSE:INFY", interval="5minute", lookback=50)
+
+for event in client.stream_ticks(["NSE:INFY"], mode="quote"):
+    for tick in event.get("ticks", []):
+        print(tick["last_price"])
+```
+
+Available helpers:
+
+- `resolve_ticker(symbol)` / `resolve_tickers([...])`
+- `search_tickers(query, exchange=None, limit=20)`
+- `get_quotes([...], mode="quote")`
+- `stream_ticks([...], mode="quote")`
+- `get_candles(symbol_or_token, interval="5minute", lookback=50)`
+- `get_current_candle(symbol_or_token, interval="5minute")`
+- `stream_candles(symbol_or_token, interval="5minute")`
+- `get_market_snapshot(...)`
+
+If a worker stops, strategy decisions stop. Existing broker orders and positions remain with broker/backend accounting. Restart workers with the same `strategy_run_id`, call `get_run`, call `get_run_pnl`, rebuild local indicator state from candles, and reconnect streams.
+
+Options-specific helpers are intentionally deferred to a later `kite_algo_worker.options` layer inside the same SDK package.
