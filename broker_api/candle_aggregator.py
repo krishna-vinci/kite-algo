@@ -9,11 +9,15 @@ import json
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Set, Tuple
 from dataclasses import dataclass
-from kiteconnect import KiteTicker
+from uuid import uuid4
+
+import httpx
 import pytz
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from .candle_storage import CandleStorage, IST
 from .redis_events import get_redis
+from .market_runtime_client import get_market_runtime_client, market_runtime_enabled
 from database import get_db
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -52,7 +56,7 @@ class CandleState:
 class CandleAggregator:
     """
     Real-time candle aggregator that:
-    1. Subscribes to live ticks via KiteTicker
+    1. Consumes normalized live ticks from the Go market-runtime
     2. Aggregates ticks into candles for multiple intervals
     3. Writes forming candles to Redis
     4. Publishes completed candles to Redis Pub/Sub
@@ -63,8 +67,7 @@ class CandleAggregator:
         self.api_key = api_key
         self.access_token: Optional[str] = None
         self.redis = None
-        self.kws: Optional[KiteTicker] = None
-        self.loop: Optional[asyncio.AbstractEventLoop] = None  # Store main event loop
+        self.owner_id: Optional[str] = None
         
         # Configuration
         self.intervals: List[str] = []
@@ -74,6 +77,8 @@ class CandleAggregator:
         # State
         self.running: bool = False
         self.subscribed_tokens: Set[int] = set()
+        self.external_token_sources: Dict[str, Set[int]] = {}
+        self._subscription_lock = asyncio.Lock()
         self.candle_states: Dict[Tuple[int, str], CandleState] = {}  # (token, interval) -> state
         
         # Background tasks
@@ -85,7 +90,9 @@ class CandleAggregator:
             'candles_persisted': 0,
             'persist_errors': 0,
             'last_persist_error': None,
-            'last_candle_time': None
+            'last_candle_time': None,
+            'last_subscription_refresh': None,
+            'last_runtime_tick': None,
         }
     
     async def start(
@@ -108,30 +115,19 @@ class CandleAggregator:
         if not self.intervals:
             raise ValueError("No valid intervals provided")
         
-        # Store the current event loop
-        self.loop = asyncio.get_running_loop()
-        
         # Initialize Redis
         self.redis = get_redis()
-        
-        # Initialize KiteTicker
-        self.kws = KiteTicker(self.api_key, access_token)
-        self.kws.on_ticks = self._on_ticks
-        self.kws.on_connect = self._on_connect
-        self.kws.on_close = self._on_close
-        self.kws.on_error = self._on_error
-        
-        # Connect WebSocket (threaded mode)
-        self.kws.connect(threaded=True)
-        
+        if not market_runtime_enabled():
+            raise RuntimeError("CandleAggregator requires MARKET_RUNTIME_ENABLED=true because the Go market-runtime is the only websocket owner")
+        self.owner_id = f"candles:{self.owner_scope}:{uuid4()}"
+
         self.running = True
-        
-        # Give WebSocket time to connect
-        await asyncio.sleep(2)
-        
+
         # Start background tasks
         self.tasks['watchlist_refresh'] = asyncio.create_task(self._watchlist_refresh_loop())
         self.tasks['persist_loop'] = asyncio.create_task(self._persist_loop())
+        self.tasks['runtime_ticks'] = asyncio.create_task(self._market_runtime_tick_loop())
+        self.tasks['runtime_lease'] = asyncio.create_task(self._market_runtime_lease_loop())
         
         logger.info(f"Aggregator started for intervals: {self.intervals}")
     
@@ -152,11 +148,12 @@ class CandleAggregator:
                     pass
         self.tasks.clear()
         
-        # Disconnect WebSocket
-        if self.kws and self.kws.is_connected():
-            if self.subscribed_tokens:
-                self.kws.unsubscribe(list(self.subscribed_tokens))
-            self.kws.stop()
+        if self.owner_id:
+            try:
+                client = await get_market_runtime_client()
+                await client.delete_owner(self.owner_id)
+            except Exception:
+                logger.warning("Failed to clean up candle aggregator runtime owner %s", self.owner_id, exc_info=True)
         
         # Final persistence of any remaining candles
         await self._persist_pending_candles()
@@ -171,40 +168,24 @@ class CandleAggregator:
         """Get current aggregator status."""
         return {
             'running': self.running,
+            'source': 'market_runtime',
+            'owner_id': self.owner_id,
             'intervals': self.intervals,
             'subscribed_tokens': len(self.subscribed_tokens),
+            'external_token_count': len(self._external_tokens()),
+            'external_owner_count': len(self.external_token_sources),
             'active_candles': len(self.candle_states),
             'stats': self.stats
         }
-    
-    # ===== WebSocket Callbacks =====
-    
-    def _on_ticks(self, ws, ticks: List[Dict]):
-        """Handle incoming ticks."""
-        try:
-            if self.loop and self.loop.is_running():
-                asyncio.run_coroutine_threadsafe(self._process_ticks(ticks), self.loop)
-        except Exception as e:
-            logger.error(f"Error scheduling tick processing: {e}", exc_info=True)
-    
-    def _on_connect(self, ws, response):
-        """Handle WebSocket connection."""
-        logger.info("Aggregator WebSocket connected")
-        
-        # Resubscribe to tokens on reconnect
-        if self.subscribed_tokens:
-            tokens = list(self.subscribed_tokens)
-            ws.subscribe(tokens)
-            ws.set_mode(ws.MODE_FULL, tokens)
-            logger.info(f"Resubscribed to {len(tokens)} tokens on reconnect")
-    
-    def _on_close(self, ws, code, reason):
-        """Handle WebSocket close."""
-        logger.warning(f"Aggregator WebSocket closed: {code} - {reason}")
-    
-    def _on_error(self, ws, code, reason):
-        """Handle WebSocket error."""
-        logger.error(f"Aggregator WebSocket error: {code} - {reason}")
+
+    async def set_external_tokens(self, owner_id: str, tokens: Set[int] | List[int]) -> None:
+        normalized = {int(token) for token in (tokens or []) if token is not None}
+        if normalized:
+            self.external_token_sources[str(owner_id)] = normalized
+        else:
+            self.external_token_sources.pop(str(owner_id), None)
+        if self.running:
+            await self._refresh_subscriptions()
     
     # ===== Tick Processing =====
     
@@ -217,13 +198,11 @@ class CandleAggregator:
                 
                 if not token or not last_price:
                     continue
+
+                self.stats['last_runtime_tick'] = datetime.now(timezone.utc).isoformat()
                 
                 # Get timestamp (prefer exchange_timestamp)
-                tick_ts = tick.get("exchange_timestamp") or datetime.now(timezone.utc)
-                if tick_ts.tzinfo is None:
-                    tick_ts = tick_ts.replace(tzinfo=timezone.utc)
-                else:
-                    tick_ts = tick_ts.astimezone(timezone.utc)
+                tick_ts = self._normalize_tick_timestamp(tick.get("exchange_timestamp"))
                 
                 # Process tick for each configured interval
                 for interval in self.intervals:
@@ -231,6 +210,89 @@ class CandleAggregator:
                     
             except Exception as e:
                 logger.error(f"Error processing tick for token {tick.get('instrument_token')}: {e}", exc_info=True)
+
+    def _normalize_tick_timestamp(self, raw_ts: Any) -> datetime:
+        """Normalize tick timestamp values from websocket/runtime payloads into UTC datetimes."""
+        if raw_ts is None:
+            return datetime.now(timezone.utc)
+        if isinstance(raw_ts, datetime):
+            if raw_ts.tzinfo is None:
+                return raw_ts.replace(tzinfo=timezone.utc)
+            return raw_ts.astimezone(timezone.utc)
+        if isinstance(raw_ts, str):
+            try:
+                parsed = datetime.fromisoformat(raw_ts.replace('Z', '+00:00'))
+                if parsed.tzinfo is None:
+                    return parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+            except ValueError:
+                logger.warning("Invalid tick timestamp string %r; falling back to current time", raw_ts)
+                return datetime.now(timezone.utc)
+        return datetime.now(timezone.utc)
+
+    async def _market_runtime_tick_loop(self):
+        """Consume normalized ticks from the market-runtime Redis channel."""
+        pubsub = None
+        retry_delay = 1.0
+        try:
+            while self.running:
+                try:
+                    if pubsub is None:
+                        pubsub = self.redis.pubsub()
+                        await pubsub.subscribe("market:ticks")
+                        retry_delay = 1.0
+
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if not message or message.get("type") != "message":
+                        continue
+
+                    payload = json.loads(message.get("data"))
+                    token = payload.get("instrument_token")
+                    if token is None:
+                        continue
+                    try:
+                        token = int(token)
+                    except (TypeError, ValueError):
+                        continue
+                    if token not in self.subscribed_tokens:
+                        continue
+                    await self._process_ticks([payload])
+                except RedisConnectionError:
+                    logger.warning("Candle aggregator lost Redis pubsub connection; retrying in %.1fs", retry_delay)
+                    if pubsub is not None:
+                        try:
+                            await pubsub.aclose()
+                        except Exception:
+                            pass
+                        pubsub = None
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 10.0)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error("Error in market runtime tick loop: %s", e, exc_info=True)
+                    await asyncio.sleep(1)
+        finally:
+            if pubsub is not None:
+                try:
+                    await pubsub.unsubscribe("market:ticks")
+                except Exception:
+                    pass
+                try:
+                    await pubsub.aclose()
+                except Exception:
+                    pass
+
+    async def _market_runtime_lease_loop(self):
+        """Refresh runtime subscription lease while running."""
+        while self.running and self.owner_id:
+            try:
+                await asyncio.sleep(25)
+                await self._sync_market_runtime_subscriptions(self.subscribed_tokens)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Candle aggregator runtime lease refresh failed: %s", e, exc_info=True)
     
     async def _update_candle(self, token: int, tick: Dict, tick_ts: datetime, interval: str):
         """Update candle state for a specific token and interval."""
@@ -462,31 +524,30 @@ class CandleAggregator:
                 await asyncio.sleep(self.refresh_seconds)
     
     async def _refresh_subscriptions(self):
-        """Refresh WebSocket subscriptions based on current watchlist."""
+        """Refresh runtime subscriptions based on current watchlist and external owners."""
+        async with self._subscription_lock:
+            try:
+                desired_tokens = await self._get_watchlist_tokens()
+                desired_tokens.update(self._external_tokens())
+                await self._sync_market_runtime_subscriptions(desired_tokens)
+                self.subscribed_tokens = desired_tokens
+                self.stats['last_subscription_refresh'] = datetime.now(timezone.utc).isoformat()
+
+            except Exception as e:
+                logger.error(f"Error refreshing subscriptions: {e}", exc_info=True)
+
+    async def _sync_market_runtime_subscriptions(self, desired_tokens: Set[int]):
+        """Sync current desired tokens to the market-runtime using full mode."""
+        if not self.owner_id:
+            return
+        client = await get_market_runtime_client()
+        payload = {int(token): "full" for token in desired_tokens}
         try:
-            # Get desired tokens from watchlist
-            desired_tokens = await self._get_watchlist_tokens()
-            
-            if not self.kws or not self.kws.is_connected():
-                logger.warning("WebSocket not connected, skipping subscription refresh")
-                return
-            
-            to_subscribe = list(desired_tokens - self.subscribed_tokens)
-            to_unsubscribe = list(self.subscribed_tokens - desired_tokens)
-            
-            if to_subscribe:
-                self.kws.subscribe(to_subscribe)
-                self.kws.set_mode(self.kws.MODE_FULL, to_subscribe)
-                logger.info(f"Subscribed to {len(to_subscribe)} new tokens")
-            
-            if to_unsubscribe:
-                self.kws.unsubscribe(to_unsubscribe)
-                logger.info(f"Unsubscribed from {len(to_unsubscribe)} tokens")
-            
-            self.subscribed_tokens = desired_tokens
-            
-        except Exception as e:
-            logger.error(f"Error refreshing subscriptions: {e}", exc_info=True)
+            await client.set_owner_subscriptions(self.owner_id, payload)
+            logger.info("Runtime candle subscriptions synced: %s tokens", len(desired_tokens))
+        except httpx.HTTPError as e:
+            logger.error("Failed to sync candle subscriptions to market-runtime: %s", e, exc_info=True)
+            raise
     
     async def _get_watchlist_tokens(self) -> Set[int]:
         """Fetch instrument tokens from user watchlists."""
@@ -506,6 +567,12 @@ class CandleAggregator:
         except Exception as e:
             logger.error(f"Failed to fetch watchlist tokens: {e}", exc_info=True)
             return set()
+
+    def _external_tokens(self) -> Set[int]:
+        tokens: Set[int] = set()
+        for owner_tokens in self.external_token_sources.values():
+            tokens.update(int(token) for token in owner_tokens)
+        return tokens
 
 
 # Global singleton instance

@@ -5,7 +5,7 @@ Purpose: document the alert system we built end-to-end so the same patterns can 
 ## 1) Components (files and roles)
 
 Backend
-- WebSocket tick ingest and token subscription: [broker_api/websocket_manager.py](broker_api/websocket_manager.py)
+- Market-runtime bridge and owner subscription management: [broker_api/market_runtime_client.py](broker_api/market_runtime_client.py)
 - Alert engine (load, evaluate, trigger, persist): [alerts/engine.py](alerts/engine.py)
   - Evaluation and trigger path (example refs):
     - [Python.AlertsEngine._evaluate_alert()](alerts/engine.py:218)
@@ -35,7 +35,7 @@ Frontend
 
 ## 2) Data Flow (end-to-end)
 
-1. Ticks in: broker WS delivers ticks to [broker_api/websocket_manager.py](broker_api/websocket_manager.py).  
+1. Ticks in: Go market-runtime publishes normalized ticks to Redis and the Python bridge consumes them via [broker_api/market_runtime_client.py](broker_api/market_runtime_client.py).  
 2. Active alerts: engine loads/refreshes enabled alerts from DB and indexes them by instrument_token in [alerts/engine.py](alerts/engine.py).  
 3. Subscriptions: engine ensures tokens of active alerts are subscribed; during WS reconnect it reconciles to resubscribe missing tokens.  
 4. Evaluate on tick: for each tick, the engine evaluates all alerts for that token using crossing logic (below).  

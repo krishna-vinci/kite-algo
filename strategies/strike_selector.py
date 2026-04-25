@@ -191,7 +191,7 @@ class StrikeSelector:
         Returns:
             Dict with strike data, or None if not found
         """
-        if not chain_data.get('rows'):
+        if not chain_data.get('strikes'):
             return None
         
         # For CE: delta is positive (0 to 1)
@@ -201,12 +201,15 @@ class StrikeSelector:
         best_match = None
         best_delta_diff = float('inf')
         
-        for row in chain_data['rows']:
-            option_data = row.get(option_type)
+        option_key = 'ce' if option_type == 'CE' else 'pe'
+
+        for row in chain_data['strikes']:
+            option_data = row.get(option_key)
             if not option_data:
                 continue
             
-            delta = option_data.get('delta')
+            greeks = option_data.get('greeks') or {}
+            delta = greeks.get('delta')
             if delta is None:
                 continue
             
@@ -221,12 +224,12 @@ class StrikeSelector:
                     'delta': delta,
                     'delta_abs': delta_abs,
                     'ltp': option_data.get('ltp'),
-                    'token': option_data.get('token'),
-                    'tsym': option_data.get('tsym'),
-                    'iv': option_data.get('iv'),
-                    'gamma': option_data.get('gamma'),
-                    'theta': option_data.get('theta'),
-                    'vega': option_data.get('vega')
+                    'token': option_data.get('instrument_token'),
+                    'tsym': option_data.get('tradingsymbol'),
+                    'iv': greeks.get('iv'),
+                    'gamma': greeks.get('gamma'),
+                    'theta': greeks.get('theta'),
+                    'vega': greeks.get('vega')
                 }
         
         if best_match and best_delta_diff <= tolerance:
@@ -330,18 +333,20 @@ class StrikeSelector:
         option_type: str
     ) -> Optional[Dict[str, Any]]:
         """Find option leg by exact strike"""
-        for row in chain_data.get('rows', []):
+        option_key = 'ce' if option_type == 'CE' else 'pe'
+        for row in chain_data.get('strikes', []):
             if row['strike'] == strike:
-                option_data = row.get(option_type)
+                option_data = row.get(option_key)
                 if option_data:
+                    greeks = option_data.get('greeks') or {}
                     return {
                         'strike': strike,
                         'option_type': option_type,
-                        'delta': option_data.get('delta'),
+                        'delta': greeks.get('delta'),
                         'ltp': option_data.get('ltp'),
-                        'token': option_data.get('token'),
-                        'tsym': option_data.get('tsym'),
-                        'iv': option_data.get('iv')
+                        'token': option_data.get('instrument_token'),
+                        'tsym': option_data.get('tradingsymbol'),
+                        'iv': greeks.get('iv')
                     }
         return None
     
@@ -411,6 +416,45 @@ class PositionBuilder:
     ):
         self.selector = strike_selector
         self.repo = instruments_repo
+
+    def _resolve_lot_size(self, strike: Dict[str, Any]) -> int:
+        instrument_token = strike.get("instrument_token") or strike.get("token")
+        resolved = self.repo.get_lot_size(instrument_token) if instrument_token else None
+        if resolved:
+            return int(resolved)
+        fallback = strike.get("lot_size") or 1
+        return max(1, int(fallback))
+
+    def _manual_strategy_leg(self, strike: Dict[str, Any]) -> Dict[str, Any]:
+        lot_size = self._resolve_lot_size(strike)
+        lots = max(1, int(strike.get("lots") or 1))
+        return {
+            "instrument_token": strike["instrument_token"],
+            "tradingsymbol": strike["tradingsymbol"],
+            "strike": strike["strike"],
+            "option_type": strike["option_type"],
+            "transaction_type": strike["transaction_type"],
+            "ltp": strike["ltp"],
+            "lot_size": lot_size,
+            "lots": lots,
+            "quantity": lot_size * lots,
+        }
+
+    def _suggestion_strategy_leg(self, leg: Dict[str, Any], quantity: int) -> Dict[str, Any]:
+        lot_size = self.repo.get_lot_size(leg.get("token")) or 1
+        resolved_quantity = max(quantity or 0, lot_size)
+        lots = max(1, int(resolved_quantity / lot_size)) if resolved_quantity else 1
+        return {
+            "instrument_token": leg["token"],
+            "tradingsymbol": leg["tsym"],
+            "strike": leg["strike"],
+            "option_type": leg["option_type"],
+            "transaction_type": leg["transaction_type"],
+            "ltp": leg.get("ltp") or 0,
+            "lot_size": lot_size,
+            "lots": lots,
+            "quantity": resolved_quantity,
+        }
     
     async def build_position_plan_from_strikes(
         self,
@@ -438,7 +482,9 @@ class PositionBuilder:
         total_premium = 0
         
         for strike in selected_strikes:
-            qty = strike['lot_size'] * strike['lots']
+            lot_size = self._resolve_lot_size(strike)
+            lots = max(1, int(strike.get('lots') or 1))
+            qty = lot_size * lots
             premium = strike['ltp'] * qty
             
             # Credit for SELL, debit for BUY
@@ -453,8 +499,8 @@ class PositionBuilder:
                 'exchange': 'NFO',
                 'transaction_type': strike['transaction_type'],
                 'quantity': qty,
-                'lot_size': strike['lot_size'],
-                'lots': strike['lots'],
+                'lot_size': lot_size,
+                'lots': lots,
                 'product': 'MIS',
                 'order_type': 'MARKET',
                 'price': 0,
@@ -475,6 +521,7 @@ class PositionBuilder:
             "underlying": underlying,
             "expiry": expiry.isoformat(),
             "strategy_type": strategy_type,
+            "strategy_legs": [self._manual_strategy_leg(strike) for strike in selected_strikes],
             "orders": orders,
             "protection_plan": protection_plan,
             "total_lots": sum(s['lots'] for s in selected_strikes),
@@ -546,6 +593,10 @@ class PositionBuilder:
             "strategy_type": strategy_type,
             "target_delta": target_delta,
             "suggestions": suggestions,
+            "strategy_legs": [
+                self._suggestion_strategy_leg(leg, suggestions.get('quantity_per_leg', 0))
+                for leg in suggestions.get('legs', [])
+            ],
             "orders": orders,
             "protection_plan": protection_plan,
             "execution_summary": {

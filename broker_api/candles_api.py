@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Literal
 import json
+from uuid import uuid4
 import pytz
 import psycopg2
 from psycopg2.extras import execute_values
@@ -21,8 +22,8 @@ from sqlalchemy import text
 from .candle_storage import CandleStorage, IST
 from .candle_aggregator import get_aggregator, SUPPORTED_INTERVALS
 from .candle_ingestion import CandleIngestion, IngestionScheduler
-from .kite_auth import get_kite, API_KEY
-from .kite_orders import KiteSession
+from .kite_auth import API_KEY
+from .kite_session import KiteSession, build_kite_client
 from .instruments_repository import InstrumentsRepository
 from database import get_db, get_db_connection
 
@@ -122,7 +123,7 @@ class DBCandlesResponse(BaseModel):
 
 # ===== Authentication =====
 
-def get_kite_db(db: Session = Depends(get_db)) -> KiteConnect:
+async def get_kite_db(db: Session = Depends(get_db)) -> KiteConnect:
     """
     Dependency to get a KiteConnect instance initialized with the system access token from the database.
     """
@@ -135,10 +136,9 @@ def get_kite_db(db: Session = Depends(get_db)) -> KiteConnect:
     access_token = system_session.access_token
 
     try:
-        kite = KiteConnect(api_key=API_KEY)
-        kite.set_access_token(access_token)
+        kite = build_kite_client(access_token, session_id="system")
         # Test call to verify credentials
-        kite.profile()
+        await asyncio.to_thread(kite.profile)
         return kite
     except Exception as e:
         logger.error(f"Failed to initialize KiteConnect or verify credentials with system token: {e}")
@@ -217,6 +217,7 @@ async def get_candles(
     from_ts: Optional[datetime] = Query(None, alias="from", description="Start time (ISO 8601)"),
     to_ts: Optional[datetime] = Query(None, alias="to", description="End time (ISO 8601), defaults to now"),
     ingest: bool = Query(True, description="Trigger background ingestion for missing data"),
+    passthrough: bool = Query(False, description="If true, fetch directly from Kite instead of DB"),
     db: Session = Depends(get_db),
     kite: KiteConnect = Depends(get_kite_db)
 ):
@@ -250,35 +251,56 @@ async def get_candles(
     else:
         from_utc = from_ts if from_ts.tzinfo else from_ts.replace(tzinfo=timezone.utc)
     
-    # Trigger background ingestion if enabled
     ingestion_status = IngestionStatus(status="disabled")
-    if ingest:
-        try:
-            ingestion_service = CandleIngestion(kite)
-            background_tasks.add_task(
-                ingestion_service.ingest_historical_data,
-                instrument_token,
-                interval,
-                from_utc,
-                to_utc,
-                force_refresh=False
-            )
-            ingestion_status = IngestionStatus(status="triggered", message="Background ingestion started")
-        except Exception as e:
-            logger.error(f"Failed to trigger ingestion: {e}")
-            ingestion_status = IngestionStatus(status="error", message=str(e))
+    ingestion_service = CandleIngestion(kite)
+
+    if passthrough:
+        # Direct fetch from Kite, bypass DB entirely
+        records = await ingestion_service.fetch_raw_records(
+            instrument_token,
+            interval,
+            from_utc,
+            to_utc
+        )
+        candles = [
+            {
+                'ts': (rec['date'] if rec['date'].tzinfo else rec['date'].replace(tzinfo=timezone.utc)),
+                'open': rec['open'],
+                'high': rec['high'],
+                'low': rec['low'],
+                'close': rec['close'],
+                'volume': rec.get('volume', 0),
+                'oi': rec.get('oi')
+            }
+            for rec in records
+        ]
+        # No ingestion triggered in passthrough mode
+    else:
+        if ingest:
+            try:
+                background_tasks.add_task(
+                    ingestion_service.ingest_historical_data,
+                    instrument_token,
+                    interval,
+                    from_utc,
+                    to_utc,
+                    force_refresh=False
+                )
+                ingestion_status = IngestionStatus(status="triggered", message="Background ingestion started")
+            except Exception as e:
+                logger.error(f"Failed to trigger ingestion: {e}")
+                ingestion_status = IngestionStatus(status="error", message=str(e))
+        
+        candles = CandleStorage.query_candles(
+            instrument_token,
+            interval,
+            from_utc,
+            to_utc,
+            include_oi=True
+        )
     
-    # Query existing data from database
-    candles = CandleStorage.query_candles(
-        instrument_token,
-        interval,
-        from_utc,
-        to_utc,
-        include_oi=True
-    )
-    
-    # Check if data is reasonably up-to-date
-    if candles and ingestion_status.status == "triggered":
+    # Check if data is reasonably up-to-date (DB mode only)
+    if (not passthrough) and candles and ingestion_status.status == "triggered":
         latest_candle_ts = candles[-1]['ts']
         time_since_latest = (to_utc - latest_candle_ts.astimezone(timezone.utc)).total_seconds()
         
@@ -289,19 +311,28 @@ async def get_candles(
             ingestion_status = IngestionStatus(status="up_to_date", message="Data is current")
     
     # Convert candles to response format
-    candle_data = [
-        CandleData(
-            time=int(c['ts'].timestamp()),  # UTC timestamp
+    candle_data = []
+    for c in candles:
+         # Ensure timestamp is aware
+         ts = c['ts']
+         if ts.tzinfo is None:
+             ts = ts.replace(tzinfo=timezone.utc)
+         
+         # Volume might be None from DB/API for indices, defaulting to 0
+         vol = c.get('volume')
+         if vol is None:
+             vol = 0
+             
+         candle_data.append(CandleData(
+            time=int(ts.timestamp()),  # UTC timestamp
             open=c['open'],
             high=c['high'],
             low=c['low'],
             close=c['close'],
-            volume=c['volume'],
+            volume=vol,
             oi=c.get('oi')
-        )
-        for c in candles
-    ]
-    
+        ))
+
     meta = CandlesMeta(
         instrument_token=instrument_token,
         interval=interval,
@@ -333,9 +364,22 @@ async def stream_candles(
     
     instrument_token = await resolve_identifier(identifier, db)
     interval = normalize_timeframe(timeframe)
+    stream_owner_id = f"candles-sse:{instrument_token}:{interval}:{uuid4().hex}"
     
     async def event_generator():
         redis = get_redis()
+        aggregator = get_aggregator(API_KEY)
+
+        try:
+            await aggregator.set_external_tokens(stream_owner_id, {instrument_token})
+        except Exception as e:
+            logger.warning(
+                "Failed to register external candle subscription for %s|%s: %s",
+                instrument_token,
+                interval,
+                e,
+                exc_info=True,
+            )
         
         # Send initial snapshot from database
         now_utc = datetime.now(timezone.utc)
@@ -487,6 +531,16 @@ async def stream_candles(
                 await pubsub_task
             except asyncio.CancelledError:
                 pass
+            try:
+                await aggregator.set_external_tokens(stream_owner_id, set())
+            except Exception as e:
+                logger.warning(
+                    "Failed to clear external candle subscription for %s|%s: %s",
+                    instrument_token,
+                    interval,
+                    e,
+                    exc_info=True,
+                )
     
     return StreamingResponse(
         event_generator(),

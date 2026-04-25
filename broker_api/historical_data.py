@@ -1,7 +1,6 @@
 import logging
 from datetime import datetime, timedelta, date
 from kiteconnect import KiteConnect
-import pandas as pd
 from psycopg2.extras import execute_values
 
 # Configure logging
@@ -13,6 +12,8 @@ def get_historical_data(kite: KiteConnect, instrument_token: int, from_date: dat
     """
     Fetches historical data for a given instrument token and date range.
     """
+    import pandas as pd
+
     try:
         # Convert date objects to naive datetime objects.
         # The Kite API treats naive datetimes as UTC.

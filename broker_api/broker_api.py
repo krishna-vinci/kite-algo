@@ -22,10 +22,6 @@ import requests
 import httpx
 import pyotp
 import pytz
-import numpy as np
-import pandas as pd
-import yfinance as yf
-from scipy.stats import norm
 from pydantic import BaseModel
 from kiteconnect import KiteConnect
 import uuid
@@ -68,9 +64,10 @@ historical_data_update_progress = {
 from sqlalchemy import Column, String, DateTime, inspect
 from sqlalchemy.orm import Session
 
-from fastapi import APIRouter, Depends, Response, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, Response, HTTPException, Request, Query, Body
 
 from .kite_auth import login_headless
+from .kite_session import KiteSession, build_kite_client, get_kite, get_system_access_token, rotate_broker_access_token, upsert_kite_session
 from kiteconnect import KiteConnect
 from database import SessionLocal, Base
 from fastapi import WebSocket, WebSocketDisconnect
@@ -126,10 +123,11 @@ import uuid
 from database import SessionLocal  # Your DB session factory
 from database import FyersSession
 
-from broker_api.kite_auth import login_headless, get_kite
+from broker_api.kite_auth import login_headless
 from broker_api.kite_auth import API_KEY
 from . import kite_orders
 from . import options_router
+from auth_service import require_app_user
 
 
 
@@ -154,6 +152,10 @@ class OHLCResponseData(BaseModel):
     high: float
     low: float
     previous_close: float
+    volume: Optional[int] = None
+    net_change: Optional[float] = None
+    net_change_percent: Optional[float] = None
+    close: Optional[float] = None
 
 
 class OHLCResponse(BaseModel):
@@ -175,7 +177,10 @@ class PortfolioSnapshotCreate(BaseModel):
 
 
 # ───────── DATABASE SETUP ─────────
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://krishna:1122@db.db-net:5432/finance")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    f"postgresql://{os.getenv('DB_USER', 'postgres')}:{os.getenv('DB_PASSWORD', 'postgres')}@{os.getenv('DB_HOST', 'postgres')}:{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME', 'postgres')}"
+)
 
 # synchronous engine + session
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -184,39 +189,12 @@ Base         = declarative_base()
 metadata     = MetaData()
 
 # async database client
-database     = Database(DATABASE_URL)
+from database import database
 
 # module-level session storage
 sessions: Dict[str, str] = {}
 
 # ───────── ORM MODELS ─────────
-
-class KiteSession(Base):
-    __tablename__ = "kite_sessions"
-    session_id    = Column(String(36), primary_key=True, index=True)
-    access_token  = Column(String, nullable=False)
-    created_at    = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-# ---- Centralized helpers for system token (DB is source of truth) ----
-def upsert_kite_session(db: Session, session_id: str, access_token: str) -> "KiteSession":
-    """
-    If a KiteSession with session_id exists, update access_token and created_at=now().
-    Else insert a new row. Caller is responsible for commit.
-    """
-    obj = db.query(KiteSession).filter_by(session_id=session_id).first()
-    now_dt = datetime.utcnow()
-    if obj:
-        obj.access_token = access_token
-        obj.created_at = now_dt
-        return obj
-    obj = KiteSession(session_id=session_id, access_token=access_token, created_at=now_dt)
-    db.add(obj)
-    return obj
-
-def get_system_access_token(db: Session) -> Optional[str]:
-    """Return access_token for session_id == 'system' if exists, else None."""
-    ks = db.query(KiteSession).filter_by(session_id="system").first()
-    return ks.access_token if ks else None
 
 def run_headless_login_and_persist_system_token(db: Session) -> str:
     """
@@ -225,9 +203,11 @@ def run_headless_login_and_persist_system_token(db: Session) -> str:
     Returns the redacted fingerprint (last 6 chars) of the access_token.
     """
     kite, at = login_headless()
-    upsert_kite_session(db, "system", at)
+    profile = kite.profile()
+    broker_user_id = str(profile.get("user_id") or "").strip() or None
+    rotated_sessions = rotate_broker_access_token(db, at, broker_user_id=broker_user_id)
     fp = at[-6:] if isinstance(at, str) else ""
-    logger.info("System access_token refreshed and upserted (..%s)", fp)
+    logger.info("System access_token refreshed and propagated (..%s, updated_sessions=%s)", fp, rotated_sessions)
     return fp
 
 
@@ -514,8 +494,17 @@ def ensure_instruments_index():
 
     settings = {
         "searchableAttributes": ["tradingsymbol", "aliases", "underlying", "name"],
-        "rankingRules": ["typo","words","proximity","attribute","exactness","sort"],
-        "customRanking": ["desc(boost_score)","asc(type_rank)","asc(expiry_ts)"],
+        "rankingRules": [
+            "typo",
+            "words",
+            "proximity",
+            "attribute",
+            "exactness",
+            "sort",
+            "boost_score:desc",
+            "type_rank:asc",
+            "expiry_ts:asc"
+        ],
         "filterableAttributes": [
             "underlying", "option_type", "exchange", "instrument_type", "segment",
             "expiry", "strike", "derivative_kind", "expiry_year", "expiry_month"
@@ -546,55 +535,34 @@ def ensure_instruments_index():
     except Exception as e:
         logger.error(f"Error applying Meilisearch index settings: {e}", exc_info=True)
 
-# ─────────── Meilisearch reindex pipeline ───────────
-async def meili_reindex_instruments():
-    """
-    Queries both kite_instruments and kite_indices tables, builds documents,
-    and upserts them into the Meilisearch 'instruments' index.
-    """
-    # Ensure index settings are up-to-date before reindexing
-    ensure_instruments_index()
 
-    client = get_meili_client(admin=True)
-    index = client.index("instruments")
-
-    # SQL query to combine data from both tables
+async def fetch_instrument_search_records() -> List[Dict[str, Any]]:
     sql_query = """
         SELECT
             instrument_token, exchange_token, tradingsymbol, name, last_price,
-            expiry, strike, tick_size, lot_size, instrument_type, segment, exchange,
-            underlying, option_type, last_updated
+            expiry, strike, tick_size, lot_size, instrument_type, segment,
+            exchange, underlying, option_type, last_updated
         FROM kite_instruments
         UNION ALL
         SELECT
             instrument_token, exchange_token, tradingsymbol, name, last_price,
-            expiry, strike, tick_size, lot_size, instrument_type, segment, exchange,
+            expiry, strike, tick_size, lot_size, instrument_type, segment,
+            exchange,
             NULL AS underlying, NULL AS option_type, last_updated
         FROM kite_indices;
     """
-    
-    logger.info("Fetching instruments from PostgreSQL for Meilisearch reindexing...")
+    logger.info("Fetching instruments from PostgreSQL for search indexing...")
     db_records = await database.fetch_all(sql_query)
-    
-    documents = []
-    
-    # Month abbreviations to numbers mapping
-    month_abbr_to_num = {name.lower(): i for i, name in enumerate(calendar.month_abbr) if i}
-    
-    # Regex to extract underlying symbol from tradingsymbol for stock derivatives
-    # Matches prefix before YYMON (e.g., RELIANCE25OCT) or YYM (e.g., RELIANCE25O)
-    # This regex is designed to be non-greedy and capture the stock symbol part.
-    # It looks for a pattern like 'DDMMM' or 'DDM' where D is digit, M is month char.
-    # Example: RELIANCE25OCT2600CE -> RELIANCE
-    # Example: NIFTY25OCT -> NIFTY
-    # Example: TCS25O -> TCS
-    underlying_symbol_regex = re.compile(r"^([A-Z0-9.&-]+?)(?:\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]?\d*|(?:\d{2}[JFMASOND][\dCEPE]*))", re.IGNORECASE)
+    return [dict(record) for record in db_records]
 
-    # Helper functions for Meilisearch document enrichment
+
+def build_instrument_search_documents(db_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    documents = []
+
     def _format_expiry_label(dt: Optional[date]) -> Optional[str]:
-        if not dt: return None
+        if not dt:
+            return None
         try:
-            # Use datetime.strftime for consistent formatting, even if input is date
             return dt.strftime("%d-%b-%Y")
         except Exception:
             return None
@@ -604,10 +572,14 @@ async def meili_reindex_instruments():
         instrument_type = str(doc.get("instrument_type", "")).upper()
         option_type = str(doc.get("option_type", "")).upper()
 
-        if segment == "INDICES" or instrument_type == "INDEX": return 1
-        if instrument_type == "FUT": return 2
-        if instrument_type == "EQ" and not option_type: return 3
-        if option_type in ("CE", "PE"): return 4
+        if segment == "INDICES" or instrument_type == "INDEX":
+            return 1
+        if instrument_type == "FUT":
+            return 2
+        if instrument_type == "EQ" and not option_type:
+            return 3
+        if option_type in ("CE", "PE"):
+            return 4
         return 9
 
     def _boost_and_aliases(underlying: str, tradingsymbol: str, name: Optional[str]) -> Tuple[int, List[str]]:
@@ -627,66 +599,57 @@ async def meili_reindex_instruments():
         elif "NIFTY" in u:
             boost = 100
             base_aliases.extend(["NIFTY", "NIFTY50", "NIFTY 50"])
-        
-        # Add tradingsymbol and name to aliases, ensuring uniqueness
+
         all_aliases = set(base_aliases)
         if tradingsymbol:
             all_aliases.add(tradingsymbol.upper())
         if name:
             all_aliases.add(name.upper())
-        
+
         return boost, list(all_aliases)
 
     for record in db_records:
         doc = {
-            "id": str(record["instrument_token"]), # Meili primary key
+            "id": str(record["instrument_token"]),
             "instrument_token": record["instrument_token"],
             "exchange_token": record["exchange_token"],
             "tradingsymbol": record["tradingsymbol"],
             "name": record["name"],
             "last_price": float(record["last_price"]) if record["last_price"] is not None else None,
-            "expiry": record["expiry"].isoformat() if record["expiry"] else None, # ISO date string
+            "expiry": record["expiry"].isoformat() if record["expiry"] else None,
             "strike": float(record["strike"]) if record["strike"] is not None else None,
             "tick_size": float(record["tick_size"]) if record["tick_size"] is not None else None,
             "lot_size": int(record["lot_size"]) if record["lot_size"] is not None else None,
             "instrument_type": record["instrument_type"],
             "segment": record["segment"],
             "exchange": record["exchange"],
-            "underlying": record["underlying"], # New field
-            "option_type": record["option_type"], # New field
-            "last_updated": record["last_updated"].isoformat() if record["last_updated"] else None, # ISO string
-            # The following fields are for backward compatibility with existing fuzzy search logic
-            "underlying_symbol": record["underlying"], # For existing fuzzy search
-            "derivative_kind": "NONE", # Will be set below
-            "expiry_ts": None, # Will be set below
-            "expiry_year": None, # Will be set below
-            "expiry_month": None, # Will be set below
-            "expiry_label": None, # New field
-            "type_rank": 9, # New field, default to 9
-            "boost_score": 0, # New field, default to 0
-            "aliases": [], # New field
+            "underlying": record["underlying"],
+            "option_type": record["option_type"],
+            "last_updated": record["last_updated"].isoformat() if record["last_updated"] else None,
+            "underlying_symbol": record["underlying"],
+            "derivative_kind": "NONE",
+            "expiry_ts": None,
+            "expiry_year": None,
+            "expiry_month": None,
+            "expiry_label": None,
+            "type_rank": 9,
+            "boost_score": 0,
+            "aliases": [],
         }
 
         instrument_type = record["instrument_type"]
         segment = record["segment"]
         tradingsymbol = record["tradingsymbol"]
         expiry_date = record["expiry"]
-        strike_price = record["strike"]
- 
-        # Normalization for INDICES rows:
-        # Ensure indices are represented with consistent fields for Meilisearch documents,
-        # and derive a usable 'underlying' when missing to improve recall for base queries.
+
         seg_up = (segment or "").upper() if segment else None
         if seg_up == "INDICES":
-            # Force canonical values for indices
             doc["instrument_type"] = "INDEX"
             doc["segment"] = "INDICES"
             doc["option_type"] = None
             doc["expiry"] = None
             doc["strike"] = None
-            # Derive a simple underlying from tradingsymbol when absent
             up_ts = (tradingsymbol or "").upper()
-            derived_underlying = None
             if "BANK" in up_ts:
                 derived_underlying = "BANKNIFTY"
             elif "NIFTY" in up_ts:
@@ -696,45 +659,49 @@ async def meili_reindex_instruments():
             elif "FINNIFTY" in up_ts:
                 derived_underlying = "FINNIFTY"
             else:
-                # Fallback: take first token and strip non-alphanumerics
                 first_word = up_ts.split()[0] if up_ts.split() else up_ts
                 cleaned = re.sub(r'[^A-Z0-9]', '', first_word)
                 derived_underlying = cleaned if cleaned else up_ts
             doc["underlying"] = derived_underlying
-            # Keep underlying_symbol in sync for compatibility
             doc["underlying_symbol"] = doc["underlying"]
-            # reflect the normalized instrument_type for downstream logic
             instrument_type = doc["instrument_type"]
-        else:
-            # Keep instrument_type as read from DB for non-indices
-            instrument_type = record["instrument_type"]
- 
-        # Determine derivative_kind
+
         if instrument_type in {"CE", "PE"}:
             doc["derivative_kind"] = "OPT"
         elif instrument_type == "FUT":
             doc["derivative_kind"] = "FUT"
 
-        # Set expiry related fields
         if expiry_date:
-            # Convert expiry date to UTC datetime at 00:00 and then to epoch seconds
-            # Using pytz.utc to ensure it's timezone-aware
             expiry_utc = datetime.combine(expiry_date, datetime.min.time(), tzinfo=pytz.utc)
             doc["expiry_ts"] = int(expiry_utc.timestamp())
             doc["expiry_year"] = expiry_date.year
             doc["expiry_month"] = expiry_date.month
-            doc["expiry_label"] = _format_expiry_label(expiry_date) # Assign expiry_label
+            doc["expiry_label"] = _format_expiry_label(expiry_date)
 
-        # Assign type_rank
         doc["type_rank"] = _type_rank(doc)
-
-        # Assign boost_score and aliases
         underlying_for_aliases = doc.get("underlying") or tradingsymbol
         boost, alias_list = _boost_and_aliases(underlying_for_aliases, tradingsymbol, doc.get("name"))
         doc["boost_score"] = boost
-        doc["aliases"] = list(set(alias_list)) # Ensure uniqueness
+        doc["aliases"] = list(set(alias_list))
 
         documents.append(doc)
+
+    return documents
+
+# ─────────── Meilisearch reindex pipeline ───────────
+async def meili_reindex_instruments():
+    """
+    Queries both kite_instruments and kite_indices tables, builds documents,
+    and upserts them into the Meilisearch 'instruments' index.
+    """
+    # Ensure index settings are up-to-date before reindexing
+    ensure_instruments_index()
+
+    client = get_meili_client(admin=True)
+    index = client.index("instruments")
+
+    db_records = await fetch_instrument_search_records()
+    documents = build_instrument_search_documents(db_records)
 
     total_documents = len(documents)
     if not total_documents:
@@ -799,8 +766,7 @@ async def sync_and_reindex_orchestrator(
                     logger.warning("No system access token found for instrument refresh. Skipping.")
                     refreshed_count = 0
                 else:
-                    kite_instance = KiteConnect(api_key=API_KEY)
-                    kite_instance.set_access_token(access_token)
+                    kite_instance = build_kite_client(access_token, session_id="system")
                     
                     # Call import_all_instruments directly
                     refresh_results = await import_all_instruments(kite_instance)
@@ -850,27 +816,10 @@ async def sync_and_reindex_orchestrator(
 
 ######kite
 
-# ─────────── Helper to load Kite client ───────────
-def get_kite(request: Request, db: Session = Depends(get_db)) -> KiteConnect:
-    # Support session via header (for dev cross-origin) or cookie
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
-    if not sid:
-        raise HTTPException(401, "Not authenticated; login first")
-    ks = db.query(KiteSession).filter_by(session_id=sid).first()
-    if not ks:
-        raise HTTPException(401, "Invalid session")
-    kite = KiteConnect(api_key=API_KEY)
-    kite.set_access_token(ks.access_token)
-    return kite
-
-
-
-
-
-
 # ─────────── Login endpoint ───────────
 @router.post("/login_kite")
 def headless_login(request: Request, response: Response, db: Session = Depends(get_db)):
+    require_app_user(request)
     try:
         kite, at = login_headless()
     except ValueError as e:
@@ -880,12 +829,15 @@ def headless_login(request: Request, response: Response, db: Session = Depends(g
     except Exception as e:
         raise HTTPException(500, f"An unexpected error occurred: {e}")
 
+    profile = kite.profile()
+    broker_user_id = str(profile.get("user_id") or "").strip() or None
+
     sid = str(uuid.uuid4())
-    db.add(KiteSession(session_id=sid, access_token=at))
+    upsert_kite_session(db, sid, at, broker_user_id=broker_user_id)
     db.commit()
 
     # Also persist/refresh system token so app startup and jobs use a consistent source
-    upsert_kite_session(db, "system", at)
+    rotate_broker_access_token(db, at, broker_user_id=broker_user_id)
     db.commit()
     logger.info("System access token upserted via login (..%s)", (at[-6:] if isinstance(at, str) else ""))
 
@@ -903,20 +855,22 @@ def headless_login(request: Request, response: Response, db: Session = Depends(g
         httponly=True,
         secure=is_secure,
         samesite="none" if is_secure else "lax",
+        path="/",
     )
 
     # Also return session_id so the frontend can send it in the X-Session-ID header (dev-friendly)
-    return {"session_id": sid, "access_token": at, "profile": kite.profile()}
+    return {"session_id": sid, "profile": profile, "authenticated": True}
 
 
 # ─────────── Logout endpoint ───────────
 @router.post("/logout_kite")
 def logout(response: Response, request: Request, db: Session = Depends(get_db)):
+    require_app_user(request)
     sid = request.cookies.get("kite_session_id")
     if sid:
         db.query(KiteSession).filter_by(session_id=sid).delete()
         db.commit()
-    response.delete_cookie("kite_session_id")
+    response.delete_cookie("kite_session_id", path="/")
     return {"message": "Logged out"}
 
 
@@ -927,7 +881,6 @@ def logout(response: Response, request: Request, db: Session = Depends(get_db)):
 
 
 
-# ─────────── Profile & holdings ───────────
 @router.get("/profile_kite")
 def profile(kite: KiteConnect = Depends(get_kite)):
     return kite.profile()
@@ -992,20 +945,29 @@ def get_ohlc(
         )
 
     try:
-        ohlc_data = kite.ohlc(instruments)
+        ohlc_data = kite.quote(instruments)
         
         response_data = {}
         for instrument, data in ohlc_data.items():
             try:
                 # Ensure all required fields are present
                 if "instrument_token" in data and "last_price" in data and "ohlc" in data and "open" in data["ohlc"] and "high" in data["ohlc"] and "low" in data["ohlc"] and "close" in data["ohlc"]:
+                    last_price = data["last_price"]
+                    previous_close = data["ohlc"]["close"]
+                    net_change = last_price - previous_close
+                    net_change_percent = (net_change / previous_close * 100) if previous_close != 0 else 0
+                    
                     response_data[instrument] = {
                         "instrument_token": data["instrument_token"],
-                        "last_price": data["last_price"],
+                        "last_price": last_price,
                         "open": data["ohlc"]["open"],
                         "high": data["ohlc"]["high"],
                         "low": data["ohlc"]["low"],
-                        "previous_close": data["ohlc"]["close"],
+                        "previous_close": previous_close,
+                        "volume": data.get("volume", 0),
+                        "net_change": round(net_change, 2),
+                        "net_change_percent": round(net_change_percent, 2),
+                        "close": last_price,
                     }
             except (KeyError, TypeError):
                 # Skip instruments with missing data
@@ -1098,9 +1060,8 @@ async def import_instruments_for_exchange(exchange: str, kite: KiteConnect):
 
 # ─────────── Instruments endpoints ───────────
 
-@router.post("/import_instruments/all")
 async def import_all_instruments(kite: KiteConnect = Depends(get_kite)):
-    """Import all instruments from major exchanges"""
+    """Import all instruments from major exchanges for internal maintenance flows."""
     exchanges = ["NSE", "NFO", "BSE", "BFO", "MCX"]
     results = []
     
@@ -1112,47 +1073,6 @@ async def import_all_instruments(kite: KiteConnect = Depends(get_kite)):
             results.append({"exchange": exchange, "error": str(e)})
     
     return {"message": "Imported all instruments", "results": results}
-
-@router.get("/instruments/nse")
-async def get_nse_instruments():
-    """Get NSE equity instruments"""
-    query = "SELECT * FROM kite_instruments WHERE exchange = 'NSE' AND instrument_type = 'EQ' ORDER BY tradingsymbol"
-    results = await database.fetch_all(query)
-    return results
-
-@router.get("/instruments/nfo")
-async def get_nfo_instruments():
-    """Get NFO instruments"""
-    query = "SELECT * FROM kite_instruments WHERE exchange = 'NFO' ORDER BY tradingsymbol"
-    results = await database.fetch_all(query)
-    return results
-
-@router.get("/instruments/commodity")
-async def get_commodity_instruments():
-    """Get commodity instruments"""
-    query = "SELECT * FROM kite_instruments WHERE exchange IN ('MCX', 'BFO') ORDER BY tradingsymbol"
-    results = await database.fetch_all(query)
-    return results
-
-@router.get("/instruments/search/{symbol}")
-async def search_instruments(symbol: str):
-    """Search instruments by symbol"""
-    query = "SELECT * FROM kite_instruments WHERE tradingsymbol ILIKE :symbol ORDER BY tradingsymbol"
-    results = await database.fetch_all(query, {"symbol": f"%{symbol}%"})
-    return results
-
-@router.post("/instruments/meili/reindex")
-async def trigger_meilisearch_reindex():
-    """
-    Triggers a full reindex of instruments into Meilisearch.
-    """
-    logger.info("Meilisearch reindex endpoint triggered.")
-    try:
-        stats = await meili_reindex_instruments()
-        return {"status": "success", "message": "Meilisearch reindex initiated.", "stats": stats}
-    except Exception as e:
-        logger.error(f"Error triggering Meilisearch reindex: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to trigger Meilisearch reindex: {e}")
 
 @router.get("/instruments/meili/health")
 async def get_meilisearch_health():
@@ -1169,6 +1089,7 @@ async def get_meilisearch_health():
     except Exception as e:
         logger.error(f"Error checking Meilisearch health: {e}", exc_info=True)
         return {"status": "error", "detail": str(e)}
+
 
 async def _parse_and_backfill_underlying(session: Session, only_nulls: bool = True) -> Dict[str, int]:
     """
@@ -1252,20 +1173,6 @@ async def _parse_and_backfill_underlying(session: Session, only_nulls: bool = Tr
         session.rollback()
         logger.error(f"Error during underlying and option_type backfill: {e}", exc_info=True)
         raise e # Re-raise to be handled by the calling endpoint
-
-@router.post("/broker/instruments/populate-underlying")
-async def populate_underlying_and_option_type(db: Session = Depends(get_db)):
-    """
-    [DEPRECATED] Populates the 'underlying' and 'option_type' columns in the 'kite_instruments' table
-    for records where 'underlying' is NULL. Designed for a one-time data backfill.
-    Please use /broker/instruments/sync-and-reindex for unified maintenance operations.
-    """
-    logger.info("Deprecated /broker/instruments/populate-underlying endpoint called. Redirecting to helper.")
-    try:
-        counts = await _parse_and_backfill_underlying(db, only_nulls=True)
-        return {"message": "Underlying and option_type populated successfully", **counts}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error populating underlying and option_type: {e}")
 
 async def sql_fallback_fuzzy_search(query: str, limit: int = 50, parsed: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
@@ -1457,8 +1364,7 @@ async def get_anchor_price_for_underlying(underlying_symbol: str) -> Optional[fl
             logger.warning(f"No system access token found for LTP fetch of {underlying_symbol}")
             return None
 
-        kite = KiteConnect(api_key=API_KEY)
-        kite.set_access_token(access_token)
+        kite = build_kite_client(access_token, session_id="system")
         
         # Set a short timeout to avoid blocking the search request for too long
         kite.set_timeout(5)
@@ -1482,24 +1388,27 @@ async def get_anchor_price_for_underlying(underlying_symbol: str) -> Optional[fl
 
 
 class SyncAndReindexRequest(BaseModel):
-    refresh_from_broker: bool = False
+    refresh_from_broker: bool = True
     backfill_only_nulls: bool = True
     reindex: bool = True
 
     # refresh_from_broker=True calls an internal import/refresh function (e.g., import_all_instruments) directly if present;
     # it does not call any HTTP endpoint. If no internal refresh function exists, this endpoint still backfills
     # underlying/option_type for current DB records and reindexes Meilisearch.
-@router.post("/broker/instruments/sync-and-reindex")
+@router.post("/instruments/sync-and-reindex")
 async def sync_and_reindex_instruments(
-    request: SyncAndReindexRequest,
     background_tasks: BackgroundTasks,
+    request: Optional[SyncAndReindexRequest] = Body(default=None),
     db: Session = Depends(get_db),
     # kite: KiteConnect = Depends(get_kite) # KiteConnect instance is handled internally by orchestrator for refresh
 ):
     """
-    Orchestrates optional instrument refresh, backfill of underlying/option_type, and Meilisearch reindex.
+    Orchestrates instrument refresh from broker, backfill of underlying/option_type, and Meilisearch reindex.
+
+    If the request body is omitted, this performs the full maintenance flow by default.
     """
     try:
+        request = request or SyncAndReindexRequest()
         # Delegate to the centralized orchestrator
         results = await sync_and_reindex_orchestrator(
             session=db,

@@ -4,60 +4,36 @@ import json
 import re
 import uuid
 import asyncio
-from datetime import datetime
+import hashlib
+from datetime import datetime, timezone
 from enum import Enum
-from typing import List, Optional, Any, Dict, AsyncGenerator
+from time import monotonic
+from typing import AsyncGenerator, Any, Callable, Dict, List, Optional
 
 import requests
+from redis.exceptions import ConnectionError as RedisConnectionError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Header, Response
 from fastapi.responses import StreamingResponse
 from kiteconnect import KiteConnect
 from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
-from sqlalchemy import Column, DateTime, String
 from sqlalchemy.orm import Session
 
 from .redis_events import get_redis, publish_event, pubsub_iter
 from .instruments_repository import InstrumentsRepository
-from database import Base, SessionLocal, get_db
+from .kite_session import KiteSession, get_kite, get_kite_session_id, get_session_account_id
+from .order_runtime import PositionPnL, order_event_runtime, realtime_positions_service
+from database import get_db
 
 # Module-level logger
 logger = logging.getLogger(__name__)
 
-# API_KEY is required by the correct get_kite function
+# API_KEY is required for raw provider requests
 API_KEY = os.getenv("KITE_API_KEY")
-
-# --- Copied Dependencies from broker_api.py to avoid circular import ---
-
-class KiteSession(Base):
-    __tablename__ = "kite_sessions"
-    session_id = Column(String(36), primary_key=True, index=True)
-    access_token = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-def get_db() -> Session:
-    """Dependency to get a DB session."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def get_kite(request: Request, db: Session = Depends(get_db)) -> KiteConnect:
-    """
-    Correct dependency that resolves a KiteConnect instance via session ID
-    from either X-Session-ID header or kite_session_id cookie.
-    """
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
-    if not sid:
-        raise HTTPException(401, "Not authenticated; login first")
-    ks = db.query(KiteSession).filter_by(session_id=sid).first()
-    if not ks:
-        raise HTTPException(401, "Invalid session")
-    kite = KiteConnect(api_key=API_KEY)
-    kite.set_access_token(ks.access_token)
-    return kite
-
-# --- End of Copied Dependencies ---
+IDEMPOTENCY_PROCESSING_TTL_SECONDS = max(30, int(os.getenv("KITE_ORDER_IDEMPOTENCY_PROCESSING_TTL_SECONDS", "120")))
+IDEMPOTENCY_COMPLETED_TTL_SECONDS = max(
+    IDEMPOTENCY_PROCESSING_TTL_SECONDS,
+    int(os.getenv("KITE_ORDER_IDEMPOTENCY_COMPLETED_TTL_SECONDS", "300")),
+)
 
 # ---------------- Enums ----------------
 class Exchange(str, Enum):
@@ -83,6 +59,10 @@ class Product(str, Enum):
     MIS = "MIS"
     NRML = "NRML"
     MTF = "MTF"
+
+class PositionType(str, Enum):
+    DAY = "day"
+    OVERNIGHT = "overnight"
 
 class OrderType(str, Enum):
     MARKET = "MARKET"
@@ -118,6 +98,7 @@ class PlaceOrderRequest(BaseModel):
     squareoff: Optional[float] = None
     stoploss: Optional[float] = None
     trailing_stoploss: Optional[float] = None
+    attribution: Optional[Dict[str, Any]] = None
 
     @model_validator(mode='after')
     def validate_order_conditions(self) -> 'PlaceOrderRequest':
@@ -173,6 +154,25 @@ class ModifyOrderRequest(BaseModel):
 
 class CancelOrderResponse(BaseModel):
     order_id: str
+
+class ConvertPositionRequest(BaseModel):
+    exchange: Exchange
+    tradingsymbol: str
+    transaction_type: TransactionType
+    position_type: PositionType
+    quantity: int = Field(gt=0)
+    old_product: Product
+    new_product: Product
+
+    @model_validator(mode='after')
+    def validate_conversion(self) -> 'ConvertPositionRequest':
+        if self.old_product == self.new_product:
+            raise ValueError("old_product and new_product must be different.")
+        return self
+
+class ConvertPositionResponse(BaseModel):
+    status: str = "success"
+    data: Any
 
 class Order(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -233,17 +233,17 @@ class OrderMarginsResponseItem(BaseModel):
     type: str
     tradingsymbol: Optional[str] = None
     exchange: Optional[Exchange] = None
-    span: float
-    exposure: float
-    option_premium: float
-    additional: float
-    bo: float
-    cash: float
-    var: float
-    pnl: Dict[str, float]
-    leverage: float
-    charges: Dict[str, Any]
-    total: float
+    span: float = 0.0
+    exposure: float = 0.0
+    option_premium: float = 0.0
+    additional: float = 0.0
+    bo: float = 0.0
+    cash: float = 0.0
+    var: float = 0.0
+    pnl: Dict[str, float] = {"realised": 0.0, "unrealised": 0.0}
+    leverage: float = 0.0
+    charges: Dict[str, Any] = {}
+    total: float = 0.0
 
     @field_validator("exchange", "tradingsymbol", mode="before")
     @classmethod
@@ -297,12 +297,157 @@ class Trade(BaseModel):
     exchange_timestamp: datetime
     fill_timestamp: datetime
 
+class BasketOrderRequest(BaseModel):
+    """Request model for placing multiple orders as a basket"""
+    orders: List[PlaceOrderRequest]
+    all_or_none: bool = False  # If True, attempt rollback on first failure
+    dry_run: bool = False  # If True, only preview margins without placing
+
+class BasketOrderResultItem(BaseModel):
+    """Result for a single order in the basket"""
+    index: int
+    tradingsymbol: str
+    order_id: Optional[str] = None
+    status: str  # "success" or "failed"
+    error: Optional[str] = None
+
+class BasketOrderResponse(BaseModel):
+    """Response for basket order placement"""
+    status: str  # "success", "partial", "failed", or "dry_run"
+    results: List[BasketOrderResultItem]
+    errors: List[Dict[str, Any]] = []
+    margins: Optional[BasketMarginsResponse] = None
+    note: Optional[str] = None
+
 def get_correlation_id(request: Request) -> str:
     """Dependency to get or generate a correlation ID."""
     corr_id = request.headers.get("X-Correlation-ID")
     if not corr_id:
         corr_id = str(uuid.uuid4())
     return corr_id
+
+
+class KiteWriteThrottler:
+    def __init__(self, rate_per_second: float):
+        capped_rate = min(10.0, max(1.0, rate_per_second))
+        self.rate_per_second = capped_rate
+        self.min_interval_seconds = 1.0 / capped_rate
+        self.interval_ms = max(1, int(self.min_interval_seconds * 1000))
+        self.redis_key = os.getenv("KITE_WRITE_LIMIT_REDIS_KEY", "kite:write_limit:next_slot_ms")
+        self.redis_ttl_ms = max(5000, int(os.getenv("KITE_WRITE_LIMIT_REDIS_TTL_MS", "60000")))
+        self.require_redis = os.getenv("KITE_WRITE_LIMIT_REQUIRE_REDIS", "true").lower() == "true"
+        self.max_wait_seconds = max(1.0, float(os.getenv("KITE_WRITE_LIMIT_MAX_WAIT_SECONDS", "30")))
+        self._local_fallback_lock = asyncio.Lock()
+        self._local_next_slot_at = 0.0
+
+    _RESERVE_SLOT_SCRIPT = """
+local interval_ms = tonumber(ARGV[1])
+local ttl_ms = tonumber(ARGV[2])
+local max_wait_ms = tonumber(ARGV[3])
+local t = redis.call('TIME')
+local now_ms = (tonumber(t[1]) * 1000) + math.floor(tonumber(t[2]) / 1000)
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local scheduled_ms = now_ms
+if current > now_ms then
+    scheduled_ms = current
+end
+local wait_ms = scheduled_ms - now_ms
+if wait_ms > max_wait_ms then
+    return {-1, now_ms, wait_ms}
+end
+local next_slot_ms = scheduled_ms + interval_ms
+redis.call('PSETEX', KEYS[1], ttl_ms, tostring(next_slot_ms))
+return {scheduled_ms, now_ms, wait_ms}
+"""
+
+    async def _reserve_local_slot(self) -> tuple[float, int]:
+        async with self._local_fallback_lock:
+            now = monotonic()
+            scheduled = max(now, self._local_next_slot_at)
+            wait_seconds = max(0.0, scheduled - now)
+            queue_depth = max(0, int(round(wait_seconds / self.min_interval_seconds)))
+            if wait_seconds > self.max_wait_seconds:
+                raise HTTPException(status_code=503, detail="Order queue is too long. Please retry.")
+            self._local_next_slot_at = scheduled + self.min_interval_seconds
+            return wait_seconds, queue_depth
+
+    async def _reserve_global_slot(self) -> tuple[float, int]:
+        redis = get_redis()
+        result = await redis.eval(
+            self._RESERVE_SLOT_SCRIPT,
+            1,
+            self.redis_key,
+            self.interval_ms,
+            self.redis_ttl_ms,
+            int(self.max_wait_seconds * 1000),
+        )
+        scheduled_ms = int(result[0])
+        if scheduled_ms < 0:
+            raise HTTPException(status_code=503, detail="Order queue is too long. Please retry.")
+        now_ms = int(result[1])
+        wait_ms = max(0, int(result[2]))
+        queue_depth = max(0, int(wait_ms // self.interval_ms))
+        return wait_ms / 1000.0, queue_depth
+
+    async def execute(
+        self,
+        action_name: str,
+        corr_id: str,
+        func: Callable[[], Any],
+        *,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        limiter_mode = "redis"
+        try:
+            wait_seconds, queue_depth = await self._reserve_global_slot()
+        except (RedisConnectionError, OSError) as exc:
+            if self.require_redis:
+                logger.error(
+                    "Redis write limiter unavailable; rejecting Kite write",
+                    extra={"action": action_name, "correlation_id": corr_id, "error": str(exc), **(meta or {})},
+                )
+                raise HTTPException(status_code=503, detail="Order dispatcher unavailable. Please retry.")
+            limiter_mode = "local-fallback"
+            wait_seconds, queue_depth = await self._reserve_local_slot()
+        except Exception as exc:
+            if self.require_redis:
+                logger.error(
+                    "Unexpected Redis limiter error; rejecting Kite write",
+                    extra={"action": action_name, "correlation_id": corr_id, "error": str(exc), **(meta or {})},
+                    exc_info=True,
+                )
+                raise HTTPException(status_code=503, detail="Order dispatcher unavailable. Please retry.")
+            limiter_mode = "local-fallback"
+            wait_seconds, queue_depth = await self._reserve_local_slot()
+
+        if wait_seconds > 0:
+            logger.info(
+                "Throttling Kite write action",
+                extra={
+                    "action": action_name,
+                    "correlation_id": corr_id,
+                    "limiter_mode": limiter_mode,
+                    "wait_seconds": round(wait_seconds, 4),
+                    "queue_depth": queue_depth,
+                    **(meta or {}),
+                },
+            )
+            await asyncio.sleep(wait_seconds)
+
+        return await asyncio.to_thread(func)
+
+
+write_throttler = KiteWriteThrottler(float(os.getenv("KITE_WRITE_OPS_PER_SEC", "9")))
+
+
+async def run_kite_write_action(
+    action_name: str,
+    corr_id: str,
+    func: Callable[[], Any],
+    *,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Any:
+    return await write_throttler.execute(action_name, corr_id, func, meta=meta)
 
 # ---------------- Service Layer ----------------
 class OrdersService:
@@ -312,6 +457,89 @@ class OrdersService:
         context = {"correlation_id": corr_id, "session_suffix": session_id}
         context.update(kwargs)
         return context
+
+    def _idempotency_redis_key(self, session_id: str, idempotency_key: str) -> str:
+        return f"idempotency:place_order:{session_id}:{idempotency_key}"
+
+    def _idempotency_body_hash(self, req: PlaceOrderRequest) -> str:
+        normalized_body = json.dumps(req.model_dump(exclude_none=True), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(normalized_body.encode("utf-8")).hexdigest()
+
+    async def _begin_idempotent_order(
+        self,
+        redis_client,
+        session_id: str,
+        idempotency_key: str,
+        body_hash: str,
+        response: Optional[Response],
+        log_ctx: Dict[str, Any],
+    ) -> tuple[Optional[str], Optional[PlaceOrderResponse]]:
+        redis_key = self._idempotency_redis_key(session_id, idempotency_key)
+        now = datetime.now(timezone.utc).isoformat()
+        pending_payload = json.dumps(
+            {
+                "status": "processing",
+                "body_hash": body_hash,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+        claimed = await redis_client.set(redis_key, pending_payload, ex=IDEMPOTENCY_PROCESSING_TTL_SECONDS, nx=True)
+        if claimed:
+            return redis_key, None
+
+        current_raw = await redis_client.get(redis_key)
+        if not current_raw:
+            raise HTTPException(status_code=503, detail="Unable to confirm idempotency state. Please retry.")
+
+        try:
+            current = json.loads(current_raw)
+        except Exception:
+            raise HTTPException(status_code=503, detail="Invalid idempotency state. Please retry.")
+
+        if current.get("body_hash") != body_hash:
+            raise HTTPException(status_code=409, detail="This idempotency key was already used for a different order request.")
+
+        status = current.get("status")
+        if status == "completed" and current.get("order_id"):
+            order_id = current["order_id"]
+            logger.info("Idempotent replay", extra={**log_ctx, "replay": True, "order_id": order_id})
+            if response:
+                response.headers["Idempotent-Replay"] = "true"
+            return redis_key, PlaceOrderResponse(order_id=order_id)
+
+        raise HTTPException(
+            status_code=409,
+            detail="An order with this idempotency key is already processing or awaiting verification.",
+        )
+
+    async def _store_completed_idempotent_order(self, redis_client, redis_key: str, body_hash: str, order_id: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(
+            {
+                "status": "completed",
+                "body_hash": body_hash,
+                "order_id": order_id,
+                "updated_at": now,
+            }
+        )
+        await redis_client.set(redis_key, payload, ex=IDEMPOTENCY_COMPLETED_TTL_SECONDS)
+
+    async def _store_uncertain_idempotent_order(self, redis_client, redis_key: str, body_hash: str, detail: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(
+            {
+                "status": "unknown",
+                "body_hash": body_hash,
+                "detail": detail[:500],
+                "updated_at": now,
+            }
+        )
+        await redis_client.set(redis_key, payload, ex=IDEMPOTENCY_COMPLETED_TTL_SECONDS)
+
+    async def _clear_idempotent_order(self, redis_client, redis_key: str) -> None:
+        await redis_client.delete(redis_key)
 
     def _raw_request(self, method: str, url: str, kite: KiteConnect, corr_id: str, **kwargs) -> Any:
         headers = {
@@ -353,41 +581,130 @@ class OrdersService:
         response: Response = None,
     ) -> PlaceOrderResponse:
         log_ctx = self._log_context(corr_id, kite, variety=req.variety.value, symbol=req.tradingsymbol)
+        redis_client = None
+        cache_key = None
+        body_hash = None
+        attribution = None
         
         if idempotency_key and session_id:
-            redis = get_redis()
-            normalized_body = json.dumps(req.model_dump(), sort_keys=True)
-            cache_key = f"idempotency:place_order:{session_id}:{idempotency_key}:{normalized_body}"
-            
             try:
-                cached_order_id = await redis.get(cache_key)
-                if cached_order_id:
-                    logger.info("Idempotent replay", extra={**log_ctx, "replay": True, "order_id": cached_order_id})
-                    if response:
-                        response.headers["Idempotent-Replay"] = "true"
-                    return PlaceOrderResponse(order_id=cached_order_id)
+                redis_client = get_redis()
+                body_hash = self._idempotency_body_hash(req)
+                cache_key, replay_response = await self._begin_idempotent_order(
+                    redis_client,
+                    session_id,
+                    idempotency_key,
+                    body_hash,
+                    response,
+                    log_ctx,
+                )
+                if replay_response:
+                    return replay_response
+            except HTTPException:
+                raise
             except Exception as e:
-                logger.error("Redis GET failed for idempotency check", extra={**log_ctx, "error": str(e)}, exc_info=True)
+                logger.error("Redis idempotency guard failed", extra={**log_ctx, "error": str(e)}, exc_info=True)
+                raise HTTPException(status_code=503, detail="Idempotency service unavailable. Please retry.")
 
         logger.info("Placing new order", extra=log_ctx)
         try:
             params = req.model_dump(exclude_none=True)
-            variety = params.pop('variety')
-            order_id = kite.place_order(variety=variety.value, **params)
-            log_ctx["order_id"] = order_id
+            attribution_payload = params.pop("attribution", None)
+            if session_id:
+                from broker_api.live_order_intents import create_live_order_intent, validate_live_order_attribution
+                from execution_accounting.kite_costs import build_live_order_cost_contract
 
-            if idempotency_key and session_id:
+                attribution = validate_live_order_attribution({"attribution": attribution_payload or {}})
+                if idempotency_key and not attribution.idempotency_key:
+                    attribution.idempotency_key = idempotency_key
+                params["tag"] = attribution.client_order_ref
+                quote_payload = dict(params)
+                quote_payload.pop("tag", None)
+                cost_contract = build_live_order_cost_contract(
+                    kite=kite,
+                    orders_service=self,
+                    order=quote_payload,
+                    corr_id=corr_id,
+                )
+                create_live_order_intent(
+                    attribution=attribution,
+                    cost_contract=cost_contract.journal_payload(),
+                    idempotency_key=idempotency_key,
+                )
+            variety = params.pop('variety')
+            variety_value = variety.value if isinstance(variety, Variety) else str(variety)
+            order_id = await run_kite_write_action(
+                "place_order",
+                corr_id,
+                lambda: kite.place_order(variety=variety_value, **params),
+                meta=log_ctx,
+            )
+            log_ctx["order_id"] = order_id
+            if attribution and attribution.client_order_ref:
                 try:
-                    await redis.set(cache_key, order_id, ex=120)
+                    from broker_api.live_order_intents import mark_live_order_intent_placed, seed_live_order_state_projection
+
+                    mark_live_order_intent_placed(client_order_ref=attribution.client_order_ref, broker_order_id=str(order_id))
+                    seed_live_order_state_projection(
+                        account_id=attribution.account_ref,
+                        broker_order_id=str(order_id),
+                        status="PLACED",
+                        order_payload=params,
+                    )
+                except Exception as mark_error:
+                    logger.error(
+                        "Failed to mark live order accounting state after broker success",
+                        extra={**log_ctx, "client_order_ref": attribution.client_order_ref, "error": str(mark_error)},
+                        exc_info=True,
+                    )
+
+            if redis_client and cache_key and body_hash:
+                try:
+                    await self._store_completed_idempotent_order(redis_client, cache_key, body_hash, order_id)
                     logger.info("Cached new order for idempotency", extra=log_ctx)
                 except Exception as e:
                     logger.error("Redis SET failed for idempotency cache", extra={**log_ctx, "error": str(e)}, exc_info=True)
 
             logger.info("Order placed successfully", extra=log_ctx)
             return PlaceOrderResponse(order_id=order_id)
+        except HTTPException as e:
+            if attribution and attribution.client_order_ref and e.status_code in {400, 401, 403, 404, 409, 422}:
+                try:
+                    from broker_api.live_order_intents import mark_live_order_intent_failed
+
+                    mark_live_order_intent_failed(
+                        client_order_ref=attribution.client_order_ref,
+                        error={"status_code": e.status_code, "detail": e.detail},
+                    )
+                except Exception as mark_error:
+                    logger.error("Failed to mark live order intent failed", extra={**log_ctx, "error": str(mark_error)}, exc_info=True)
+            if redis_client and cache_key:
+                try:
+                    if e.status_code in {400, 401, 403, 404, 409, 422}:
+                        await self._clear_idempotent_order(redis_client, cache_key)
+                    else:
+                        await self._store_uncertain_idempotent_order(redis_client, cache_key, body_hash or "", str(e.detail))
+                except Exception as redis_error:
+                    logger.error("Failed to update idempotency state after HTTP error", extra={**log_ctx, "error": str(redis_error)}, exc_info=True)
+            raise
         except Exception as e:
+            if attribution and attribution.client_order_ref:
+                try:
+                    from broker_api.live_order_intents import mark_live_order_intent_failed
+
+                    mark_live_order_intent_failed(
+                        client_order_ref=attribution.client_order_ref,
+                        error={"error": str(e)},
+                    )
+                except Exception as mark_error:
+                    logger.error("Failed to mark live order intent failed", extra={**log_ctx, "error": str(mark_error)}, exc_info=True)
+            if redis_client and cache_key:
+                try:
+                    await self._store_uncertain_idempotent_order(redis_client, cache_key, body_hash or "", str(e))
+                except Exception as redis_error:
+                    logger.error("Failed to update idempotency state after exception", extra={**log_ctx, "error": str(redis_error)}, exc_info=True)
             logger.error("Failed to place order", extra={**log_ctx, "error": str(e)}, exc_info=True)
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
 
     def orders(self, kite: KiteConnect, corr_id: str) -> List[Order]:
         log_ctx = self._log_context(corr_id, kite)
@@ -470,7 +787,41 @@ class OrdersService:
             logger.error("Failed to retrieve positions", extra={**log_ctx, "error": str(e)}, exc_info=True)
             raise HTTPException(status_code=502, detail="Failed to retrieve positions from provider.")
 
-    def modify_order(self, kite: KiteConnect, variety: str, order_id: str, req: ModifyOrderRequest, corr_id: str, parent_order_id: Optional[str] = None) -> dict:
+    async def convert_position(
+        self,
+        kite: KiteConnect,
+        req: ConvertPositionRequest,
+        corr_id: str,
+    ) -> ConvertPositionResponse:
+        log_ctx = self._log_context(
+            corr_id,
+            kite,
+            exchange=req.exchange.value,
+            tradingsymbol=req.tradingsymbol,
+            transaction_type=req.transaction_type.value,
+            position_type=req.position_type.value,
+            quantity=req.quantity,
+            old_product=req.old_product.value,
+            new_product=req.new_product.value,
+        )
+        logger.info("Converting position", extra=log_ctx)
+        try:
+            payload = req.model_dump(mode="python")
+            result = await run_kite_write_action(
+                "convert_position",
+                corr_id,
+                lambda: kite.convert_position(**payload),
+                meta=log_ctx,
+            )
+            logger.info("Position converted successfully", extra=log_ctx)
+            return ConvertPositionResponse(data=result)
+        except Exception as e:
+            logger.error("Failed to convert position", extra={**log_ctx, "error": str(e)}, exc_info=True)
+            if isinstance(e, HTTPException):
+                raise e
+            raise HTTPException(status_code=400, detail=str(e))
+
+    async def modify_order(self, kite: KiteConnect, variety: str, order_id: str, req: ModifyOrderRequest, corr_id: str, parent_order_id: Optional[str] = None) -> dict:
         log_ctx = self._log_context(corr_id, kite, variety=variety, order_id=order_id, parent_order_id=parent_order_id)
         logger.info("Modifying order", extra=log_ctx)
         try:
@@ -478,7 +829,12 @@ class OrdersService:
             if parent_order_id:
                 payload['parent_order_id'] = parent_order_id
             
-            result = self._raw_request("PUT", f"https://api.kite.trade/orders/{variety}/{order_id}", kite, corr_id, json=payload)
+            result = await run_kite_write_action(
+                "modify_order",
+                corr_id,
+                lambda: self._raw_request("PUT", f"https://api.kite.trade/orders/{variety}/{order_id}", kite, corr_id, json=payload),
+                meta=log_ctx,
+            )
             return {"order_id": result.get("data", {}).get("order_id", order_id)}
         except Exception as e:
             logger.error("Failed to modify order", extra={**log_ctx, "error": str(e)}, exc_info=True)
@@ -486,7 +842,7 @@ class OrdersService:
                 raise HTTPException(status_code=400, detail=str(e))
             raise e
 
-    def cancel_order(self, kite: KiteConnect, variety: str, order_id: str, corr_id: str, parent_order_id: Optional[str] = None) -> dict:
+    async def cancel_order(self, kite: KiteConnect, variety: str, order_id: str, corr_id: str, parent_order_id: Optional[str] = None) -> dict:
         log_ctx = self._log_context(corr_id, kite, variety=variety, order_id=order_id, parent_order_id=parent_order_id)
         logger.info("Cancelling order", extra=log_ctx)
         try:
@@ -494,7 +850,12 @@ class OrdersService:
             if parent_order_id:
                 params['parent_order_id'] = parent_order_id
 
-            result = self._raw_request("DELETE", f"https://api.kite.trade/orders/{variety}/{order_id}", kite, corr_id, params=params)
+            result = await run_kite_write_action(
+                "cancel_order",
+                corr_id,
+                lambda: self._raw_request("DELETE", f"https://api.kite.trade/orders/{variety}/{order_id}", kite, corr_id, params=params),
+                meta=log_ctx,
+            )
             return {"order_id": result.get("data", {}).get("order_id", order_id)}
         except Exception as e:
             logger.error("Failed to cancel order", extra={**log_ctx, "error": str(e)}, exc_info=True)
@@ -557,6 +918,125 @@ class OrdersService:
                 raise HTTPException(status_code=400, detail=str(e))
             raise e
 
+    async def place_basket(
+        self,
+        kite: KiteConnect,
+        req: BasketOrderRequest,
+        corr_id: str,
+        session_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        response: Response = None,
+    ) -> BasketOrderResponse:
+        """
+        Place a basket of orders sequentially.
+        - If dry_run is True, only returns margin preview.
+        - If all_or_none is True, attempts best-effort rollback on first failure.
+        Note: Market orders may execute immediately; cancellation isn't guaranteed.
+        """
+        log_ctx = self._log_context(corr_id, kite, order_count=len(req.orders))
+        logger.info("Processing basket order request", extra=log_ctx)
+
+        if not req.orders:
+            return BasketOrderResponse(status="success", results=[], errors=[])
+
+        # Dry run: preview margins only
+        if req.dry_run:
+            try:
+                margin_items = [
+                    OrderMarginInput(
+                        exchange=order.exchange,
+                        tradingsymbol=order.tradingsymbol,
+                        transaction_type=order.transaction_type,
+                        variety=order.variety,
+                        product=order.product,
+                        order_type=order.order_type,
+                        quantity=order.quantity,
+                        price=order.price or 0,
+                        trigger_price=order.trigger_price or 0,
+                    )
+                    for order in req.orders
+                ]
+                margins = self.basket_margins(kite, margin_items, consider_positions=True, corr_id=corr_id, mode="compact")
+                return BasketOrderResponse(status="dry_run", results=[], margins=margins)
+            except Exception as e:
+                logger.error("Failed to preview basket margins", extra={**log_ctx, "error": str(e)}, exc_info=True)
+                raise HTTPException(status_code=400, detail=f"Failed to preview margins: {str(e)}")
+
+        # Execute orders sequentially
+        results: List[BasketOrderResultItem] = []
+        placed: List[Dict[str, Any]] = []  # Track placed orders for rollback
+        errors: List[Dict[str, Any]] = []
+
+        for idx, order_req in enumerate(req.orders):
+            try:
+                # Place order using existing service method (with idempotency support)
+                child_idempotency_key = f"{idempotency_key}:{idx}" if idempotency_key and session_id else None
+                place_result = await self.place_order(
+                    kite,
+                    order_req,
+                    corr_id,
+                    idempotency_key=child_idempotency_key,
+                    session_id=session_id,
+                    response=response,
+                )
+                
+                placed.append({"index": idx, "order_id": place_result.order_id, "variety": order_req.variety.value})
+                results.append(
+                    BasketOrderResultItem(
+                        index=idx,
+                        tradingsymbol=order_req.tradingsymbol,
+                        order_id=place_result.order_id,
+                        status="success"
+                    )
+                )
+                logger.info(
+                    f"Basket order {idx+1}/{len(req.orders)} placed",
+                    extra={**log_ctx, "order_id": place_result.order_id, "symbol": order_req.tradingsymbol}
+                )
+            except Exception as e:
+                err_msg = str(e)
+                logger.error(
+                    f"Failed to place basket order {idx+1}/{len(req.orders)}",
+                    extra={**log_ctx, "symbol": order_req.tradingsymbol, "error": err_msg},
+                    exc_info=True
+                )
+                
+                err = {"index": idx, "tradingsymbol": order_req.tradingsymbol, "error": err_msg}
+                errors.append(err)
+                results.append(
+                    BasketOrderResultItem(
+                        index=idx,
+                        tradingsymbol=order_req.tradingsymbol,
+                        status="failed",
+                        error=err_msg
+                    )
+                )
+
+                # Handle all_or_none: attempt rollback
+                if req.all_or_none:
+                    logger.info("Attempting rollback due to all_or_none policy", extra=log_ctx)
+                    for p in placed:
+                        try:
+                            await self.cancel_order(kite, p["variety"], p["order_id"], corr_id)
+                            logger.info(f"Rolled back order {p['order_id']}", extra=log_ctx)
+                        except Exception as cancel_error:
+                            logger.error(
+                                f"Rollback failed for order {p['order_id']}",
+                                extra={**log_ctx, "error": str(cancel_error)},
+                                exc_info=True
+                            )
+                    
+                    return BasketOrderResponse(
+                        status="failed",
+                        results=results,
+                        errors=errors,
+                        note="Best-effort rollback attempted; some orders may already be executed."
+                    )
+
+        final_status = "success" if not errors else "partial"
+        logger.info(f"Basket order completed with status: {final_status}", extra={**log_ctx, "success_count": len(placed), "error_count": len(errors)})
+        return BasketOrderResponse(status=final_status, results=results, errors=errors)
+
 # ---------------- FastAPI Router ----------------
 router = APIRouter(tags=["orders"])
 service = OrdersService()
@@ -570,7 +1050,7 @@ async def place_order(
     idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key", description="Client-generated key for idempotent retries."),
     corr_id: str = Depends(get_correlation_id),
 ):
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
+    sid = get_kite_session_id(request)
     return await service.place_order(kite, req, corr_id, idempotency_key, sid, response)
 
 @router.get("/orders", response_model=List[Order], description="Retrieve the list of all orders for the day.")
@@ -597,9 +1077,17 @@ def get_trades(kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get
 def get_positions(kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.positions(kite, corr_id)
 
+@router.post("/positions/convert", response_model=ConvertPositionResponse, description="Convert an open position from one product type to another.")
+async def convert_position(
+    req: ConvertPositionRequest,
+    kite: KiteConnect = Depends(get_kite),
+    corr_id: str = Depends(get_correlation_id),
+):
+    return await service.convert_position(kite, req, corr_id)
+
 # Phase 2 Endpoints
 @router.put("/orders/{variety}/{order_id}", response_model=dict, description="Modify an open/pending order.")
-def modify_order(
+async def modify_order(
     variety: str,
     order_id: str,
     req: ModifyOrderRequest,
@@ -607,17 +1095,17 @@ def modify_order(
     kite: KiteConnect = Depends(get_kite),
     corr_id: str = Depends(get_correlation_id),
 ):
-    return service.modify_order(kite, variety, order_id, req, corr_id, parent_order_id)
+    return await service.modify_order(kite, variety, order_id, req, corr_id, parent_order_id)
 
 @router.delete("/orders/{variety}/{order_id}", response_model=dict, description="Cancel an open/pending order.")
-def cancel_order(
+async def cancel_order(
     variety: str,
     order_id: str,
     parent_order_id: Optional[str] = Query(None, description="Required for Cover Orders if cancelling the SL leg."),
     kite: KiteConnect = Depends(get_kite),
     corr_id: str = Depends(get_correlation_id),
 ):
-    return service.cancel_order(kite, variety, order_id, corr_id, parent_order_id)
+    return await service.cancel_order(kite, variety, order_id, corr_id, parent_order_id)
 
 @router.post("/margins/orders", response_model=List[OrderMarginsResponseItem], description="Calculate margins for a list of orders.")
 def get_order_margins(items: List[OrderMarginInput], mode: Optional[str] = Query(None, enum=["compact", "full"]), kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
@@ -635,384 +1123,54 @@ def get_charges_orders(items: List[ChargesOrderInput], kite: KiteConnect = Depen
 def get_trigger_range(transaction_type: TransactionType, instruments: List[str] = Query(...), kite: KiteConnect = Depends(get_kite), corr_id: str = Depends(get_correlation_id)):
     return service.trigger_range(kite, transaction_type, instruments, corr_id)
 
+@router.post("/orders/basket", response_model=BasketOrderResponse, description="Place multiple orders as a basket with optional dry-run and rollback support.")
+async def place_basket_orders(
+    req: BasketOrderRequest,
+    request: Request,
+    response: Response,
+    kite: KiteConnect = Depends(get_kite),
+    idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key", description="Client-generated key for idempotent basket retries."),
+    corr_id: str = Depends(get_correlation_id),
+):
+    """
+    Place a basket of orders sequentially.
+    - Set dry_run=true to preview margins without placing orders.
+    - Set all_or_none=true to attempt rollback on first failure (best-effort).
+    """
+    sid = get_kite_session_id(request)
+    return await service.place_basket(kite, req, corr_id, sid, idempotency_key, response)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # REAL-TIME POSITIONS TRACKING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class PositionPnL(BaseModel):
-    """Real-time position with calculated PnL"""
-    instrument_token: int
-    tradingsymbol: str
-    exchange: str
-    product: str
-    quantity: int
-    multiplier: int = 1
-    buy_quantity: int = 0
-    sell_quantity: int = 0
-    buy_value: float = 0.0
-    sell_value: float = 0.0
-    average_price: float = 0.0
-    last_price: float = 0.0
-    pnl: float = 0.0
-    realized_pnl: float = 0.0
-    unrealized_pnl: float = 0.0
-    day_change: float = 0.0
-    day_change_percentage: float = 0.0
-
-
-class RealTimePositionsService:
-    """
-    Service for real-time position tracking using:
-    - Buy/Sell values from orders/trades
-    - WebSocket LTP for real-time PnL calculation
-    - Formula: pnl = (sellValue - buyValue) + (netQuantity * lastPrice * multiplier)
-    """
-    
-    def __init__(self):
-        self.redis_key_prefix = "realtime_positions:"
-        self.position_subscribers: Dict[str, asyncio.Queue] = {}
-        self._running = False
-        self._update_task: Optional[asyncio.Task] = None
-        logger.info("RealTimePositionsService initialized")
-    
-    def _get_lot_size(self, instrument_token: int) -> int:
-        """Get lot size from database, fallback to 1"""
-        try:
-            db = next(get_db())
-            try:
-                repo = InstrumentsRepository(db)
-                lot_size = repo.get_lot_size(instrument_token)
-                return lot_size if lot_size is not None else 1
-            finally:
-                db.close()
-        except Exception as e:
-            logger.warning(f"Failed to fetch lot_size for {instrument_token}: {e}")
-            return 1
-    
-    async def initialize_positions(self, kite: KiteConnect, session_id: str, corr_id: str) -> Dict[str, PositionPnL]:
-        """
-        Initialize positions from Kite API and build tracking state.
-        This should be called once per session or when positions need refresh.
-        """
-        log_ctx = {"correlation_id": corr_id, "session_id": session_id}
-        logger.info("Initializing real-time positions", extra=log_ctx)
-        
-        try:
-            # Fetch current positions from Kite
-            positions_data = kite.positions()
-            
-            # Fetch today's trades to calculate buy/sell values accurately
-            trades = kite.trades()
-            
-            # Build position state
-            positions_map: Dict[str, PositionPnL] = {}
-            
-            # Process net positions (end of day positions)
-            for pos in positions_data.get('net', []):
-                key = f"{pos['exchange']}:{pos['tradingsymbol']}"
-                
-                # Get lot size/multiplier from database
-                multiplier = self._get_lot_size(pos['instrument_token'])
-                
-                # Calculate buy/sell values from position data
-                quantity = pos.get('quantity', 0)
-                buy_quantity = pos.get('buy_quantity', 0)
-                sell_quantity = pos.get('sell_quantity', 0)
-                buy_value = pos.get('buy_value', 0.0)
-                sell_value = pos.get('sell_value', 0.0)
-                average_price = pos.get('average_price', 0.0)
-                last_price = pos.get('last_price', 0.0)
-                
-                # Calculate PnL using Kite's formula
-                # pnl = (sellValue - buyValue) + (netQuantity * lastPrice * multiplier)
-                realized_pnl = sell_value - buy_value
-                unrealized_pnl = quantity * last_price * multiplier
-                total_pnl = realized_pnl + unrealized_pnl
-                
-                # Day change
-                day_change = pos.get('pnl', 0.0)
-                close_price = pos.get('close_price', 0.0)
-                day_change_pct = 0.0
-                if close_price and close_price > 0:
-                    day_change_pct = ((last_price - close_price) / close_price) * 100
-                
-                position = PositionPnL(
-                    instrument_token=pos['instrument_token'],
-                    tradingsymbol=pos['tradingsymbol'],
-                    exchange=pos['exchange'],
-                    product=pos['product'],
-                    quantity=quantity,
-                    multiplier=multiplier,
-                    buy_quantity=buy_quantity,
-                    sell_quantity=sell_quantity,
-                    buy_value=buy_value,
-                    sell_value=sell_value,
-                    average_price=average_price,
-                    last_price=last_price,
-                    pnl=total_pnl,
-                    realized_pnl=realized_pnl,
-                    unrealized_pnl=unrealized_pnl,
-                    day_change=day_change,
-                    day_change_percentage=day_change_pct
-                )
-                
-                positions_map[key] = position
-            
-            # Store in Redis for fast access
-            redis = get_redis()
-            redis_key = f"{self.redis_key_prefix}{session_id}"
-            
-            # Serialize positions
-            positions_json = {k: v.model_dump() for k, v in positions_map.items()}
-            await redis.set(redis_key, json.dumps(positions_json), ex=86400)  # 24 hour TTL
-            
-            logger.info(
-                f"Initialized {len(positions_map)} positions",
-                extra={**log_ctx, "position_count": len(positions_map)}
-            )
-            
-            return positions_map
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize positions: {e}", extra=log_ctx, exc_info=True)
-            raise HTTPException(status_code=502, detail=f"Failed to initialize positions: {e}")
-    
-    async def get_positions(self, session_id: str, corr_id: str) -> Dict[str, PositionPnL]:
-        """
-        Get current positions from Redis cache.
-        """
-        try:
-            redis = get_redis()
-            redis_key = f"{self.redis_key_prefix}{session_id}"
-            
-            cached = await redis.get(redis_key)
-            if not cached:
-                return {}
-            
-            positions_data = json.loads(cached)
-            positions_map = {k: PositionPnL(**v) for k, v in positions_data.items()}
-            
-            return positions_map
-            
-        except Exception as e:
-            logger.error(f"Failed to get positions: {e}", exc_info=True)
-            return {}
-    
-    async def update_position_ltp(
-        self,
-        session_id: str,
-        instrument_token: int,
-        last_price: float,
-        corr_id: str
-    ) -> Optional[PositionPnL]:
-        """
-        Update position with new LTP from WebSocket and recalculate PnL.
-        """
-        try:
-            positions = await self.get_positions(session_id, corr_id)
-            
-            # Find position with matching instrument token
-            updated_position = None
-            for key, pos in positions.items():
-                if pos.instrument_token == instrument_token:
-                    # Update LTP
-                    pos.last_price = last_price
-                    
-                    # Recalculate unrealized PnL
-                    pos.unrealized_pnl = pos.quantity * last_price * pos.multiplier
-                    pos.pnl = pos.realized_pnl + pos.unrealized_pnl
-                    
-                    # Update day change
-                    if pos.average_price > 0:
-                        pos.day_change_percentage = ((last_price - pos.average_price) / pos.average_price) * 100
-                    
-                    positions[key] = pos
-                    updated_position = pos
-                    break
-            
-            if updated_position:
-                # Save back to Redis
-                redis = get_redis()
-                redis_key = f"{self.redis_key_prefix}{session_id}"
-                positions_json = {k: v.model_dump() for k, v in positions.items()}
-                await redis.set(redis_key, json.dumps(positions_json), ex=86400)
-                
-                # Notify subscribers
-                await self._notify_subscribers(session_id, updated_position)
-            
-            return updated_position
-            
-        except Exception as e:
-            logger.error(f"Failed to update position LTP: {e}", exc_info=True)
-            return None
-    
-    async def update_position_from_order(
-        self,
-        session_id: str,
-        order: Dict[str, Any],
-        corr_id: str
-    ) -> Optional[PositionPnL]:
-        """
-        Update position when an order is filled.
-        Handles position building and exits.
-        """
-        try:
-            if order.get('status') not in ['COMPLETE', 'OPEN']:
-                return None
-            
-            positions = await self.get_positions(session_id, corr_id)
-            key = f"{order['exchange']}:{order['tradingsymbol']}"
-            
-            # Get or create position
-            position = positions.get(key)
-            if not position:
-                # Fetch lot_size from database for accurate multiplier
-                multiplier = self._get_lot_size(order['instrument_token'])
-                
-                position = PositionPnL(
-                    instrument_token=order['instrument_token'],
-                    tradingsymbol=order['tradingsymbol'],
-                    exchange=order['exchange'],
-                    product=order['product'],
-                    quantity=0,
-                    multiplier=multiplier,
-                    buy_quantity=0,
-                    sell_quantity=0,
-                    buy_value=0.0,
-                    sell_value=0.0,
-                    average_price=0.0,
-                    last_price=order.get('average_price', 0.0),
-                    pnl=0.0,
-                    realized_pnl=0.0,
-                    unrealized_pnl=0.0,
-                    day_change=0.0,
-                    day_change_percentage=0.0
-                )
-            
-            # Update position based on transaction type
-            filled_qty = order.get('filled_quantity', 0)
-            avg_price = order.get('average_price', 0.0)
-            
-            if order['transaction_type'] == 'BUY':
-                position.buy_quantity += filled_qty
-                position.buy_value += filled_qty * avg_price * position.multiplier
-                position.quantity += filled_qty
-            else:  # SELL
-                position.sell_quantity += filled_qty
-                position.sell_value += filled_qty * avg_price * position.multiplier
-                position.quantity -= filled_qty
-            
-            # Recalculate average price
-            if position.quantity != 0:
-                position.average_price = (position.buy_value - position.sell_value) / (position.quantity * position.multiplier)
-            
-            # Recalculate PnL
-            position.realized_pnl = position.sell_value - position.buy_value
-            position.unrealized_pnl = position.quantity * position.last_price * position.multiplier
-            position.pnl = position.realized_pnl + position.unrealized_pnl
-            
-            # Handle position exit (quantity becomes 0)
-            if position.quantity == 0:
-                logger.info(
-                    f"Position exited: {key}, Final PnL: {position.pnl}",
-                    extra={"correlation_id": corr_id, "session_id": session_id}
-                )
-                # Remove from active positions
-                positions.pop(key, None)
-            else:
-                positions[key] = position
-            
-            # Save to Redis
-            redis = get_redis()
-            redis_key = f"{self.redis_key_prefix}{session_id}"
-            positions_json = {k: v.model_dump() for k, v in positions.items()}
-            await redis.set(redis_key, json.dumps(positions_json), ex=86400)
-            
-            # Notify subscribers
-            await self._notify_subscribers(session_id, position)
-            
-            return position
-            
-        except Exception as e:
-            logger.error(f"Failed to update position from order: {e}", exc_info=True)
-            return None
-    
-    async def _notify_subscribers(self, session_id: str, position: PositionPnL):
-        """Notify all SSE subscribers of position update"""
-        if session_id in self.position_subscribers:
-            try:
-                queue = self.position_subscribers[session_id]
-                await queue.put(position.model_dump())
-            except Exception as e:
-                logger.error(f"Failed to notify subscribers: {e}")
-    
-    async def subscribe_to_positions(
-        self,
-        session_id: str,
-        corr_id: str
-    ) -> AsyncGenerator[str, None]:
-        """
-        SSE stream for real-time position updates.
-        """
-        # Create queue for this subscriber
-        queue = asyncio.Queue(maxsize=100)
-        self.position_subscribers[session_id] = queue
-        
-        logger.info(
-            f"New position subscriber: {session_id}",
-            extra={"correlation_id": corr_id}
-        )
-        
-        try:
-            # Send initial positions
-            positions = await self.get_positions(session_id, corr_id)
-            if positions:
-                for pos in positions.values():
-                    event_data = f"data: {json.dumps(pos.model_dump())}\n\n"
-                    yield event_data
-            
-            # Stream updates
-            while True:
-                try:
-                    # Wait for update with timeout
-                    position_data = await asyncio.wait_for(queue.get(), timeout=30.0)
-                    event_data = f"data: {json.dumps(position_data)}\n\n"
-                    yield event_data
-                except asyncio.TimeoutError:
-                    # Send keepalive
-                    yield ": keepalive\n\n"
-                    continue
-                
-        except asyncio.CancelledError:
-            logger.info(f"Position subscriber disconnected: {session_id}")
-        finally:
-            # Cleanup
-            self.position_subscribers.pop(session_id, None)
-
-
-# Global service instance
-realtime_positions_service = RealTimePositionsService()
+# Production implementation lives in broker_api.order_runtime.
 
 
 @router.post("/positions/initialize", description="Initialize real-time position tracking from Kite API")
 async def initialize_realtime_positions(
     request: Request,
     kite: KiteConnect = Depends(get_kite),
+    db: Session = Depends(get_db),
     corr_id: str = Depends(get_correlation_id)
 ):
     """
     Initialize real-time position tracking.
     Fetches current positions from Kite API and sets up tracking state.
     """
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
+    sid = get_kite_session_id(request)
     if not sid:
         raise HTTPException(401, "Session ID required")
     
-    positions = await realtime_positions_service.initialize_positions(kite, sid, corr_id)
+    try:
+        positions = await realtime_positions_service.initialize_positions(kite, sid, corr_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     
     return {
         "status": "initialized",
+        "account_id": get_session_account_id(db, sid),
         "position_count": len(positions),
         "positions": {k: v.model_dump() for k, v in positions.items()}
     }
@@ -1021,16 +1179,21 @@ async def initialize_realtime_positions(
 @router.get("/positions/realtime", description="Get current real-time positions")
 async def get_realtime_positions(
     request: Request,
+    db: Session = Depends(get_db),
     corr_id: str = Depends(get_correlation_id)
 ):
     """
     Get current real-time positions with calculated PnL.
     """
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
+    sid = get_kite_session_id(request)
     if not sid:
         raise HTTPException(401, "Session ID required")
     
-    positions = await realtime_positions_service.get_positions(sid, corr_id)
+    account_id = get_session_account_id(db, sid)
+    if not account_id:
+        raise HTTPException(409, "Broker account not initialized for this session. Call /positions/initialize first.")
+
+    positions = await realtime_positions_service.get_positions(account_id, corr_id)
     
     # Calculate summary
     total_pnl = sum(pos.pnl for pos in positions.values())
@@ -1049,6 +1212,7 @@ async def get_realtime_positions(
 @router.get("/positions/stream", description="SSE stream for real-time position updates")
 async def stream_realtime_positions(
     request: Request,
+    db: Session = Depends(get_db),
     corr_id: str = Depends(get_correlation_id)
 ):
     """
@@ -1058,12 +1222,16 @@ async def stream_realtime_positions(
     - Orders are filled
     - Positions are exited
     """
-    sid = request.headers.get("x-session-id") or request.cookies.get("kite_session_id")
+    sid = get_kite_session_id(request)
     if not sid:
         raise HTTPException(401, "Session ID required")
     
+    account_id = get_session_account_id(db, sid)
+    if not account_id:
+        raise HTTPException(409, "Broker account not initialized for this session. Call /positions/initialize first.")
+
     return StreamingResponse(
-        realtime_positions_service.subscribe_to_positions(sid, corr_id),
+        realtime_positions_service.subscribe_to_positions(account_id, corr_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1071,6 +1239,134 @@ async def stream_realtime_positions(
             "X-Accel-Buffering": "no"
         }
     )
+
+
+@router.post("/positions/reconcile", description="Reconcile real-time positions against broker truth")
+async def reconcile_realtime_positions(
+    request: Request,
+    kite: KiteConnect = Depends(get_kite),
+    db: Session = Depends(get_db),
+    corr_id: str = Depends(get_correlation_id),
+):
+    sid = get_kite_session_id(request)
+    if not sid:
+        raise HTTPException(401, "Session ID required")
+
+    account_id = get_session_account_id(db, sid)
+    if not account_id:
+        try:
+            positions = await realtime_positions_service.initialize_positions(kite, sid, corr_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        total_pnl = sum(pos.pnl for pos in positions.values())
+        return {
+            "status": "ok",
+            "account_id": next(iter(positions.values())).account_id if positions else None,
+            "position_count": len(positions),
+            "total_pnl": total_pnl,
+            "mode": "initialized",
+        }
+
+    count = await realtime_positions_service.reconcile_account_positions(kite, account_id, corr_id)
+    positions = await realtime_positions_service.get_positions(account_id, corr_id)
+    total_pnl = sum(pos.pnl for pos in positions.values())
+    return {
+        "status": "ok",
+        "account_id": account_id,
+        "position_count": count,
+        "cached_positions": len(positions),
+        "total_pnl": total_pnl,
+        "mode": "reconciled",
+    }
+
+
+@router.get("/order-runtime/status", description="Get canonical order runtime status")
+async def get_order_runtime_status(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    sid = get_kite_session_id(request)
+    account_id = get_session_account_id(db, sid) if sid else None
+
+    counts = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE processing_state = 'pending') AS pending_events,
+                COUNT(*) FILTER (WHERE processing_state = 'processing') AS processing_events,
+                COUNT(*) FILTER (WHERE processing_state = 'failed') AS failed_events
+            FROM canonical_order_events
+            """
+        )
+    ).fetchone()
+
+    dirty_counts = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE dirty_for_trade_sync = TRUE) AS dirty_orders,
+                COUNT(*) FILTER (WHERE needs_reconcile = TRUE) AS reconcile_orders
+            FROM order_state_projection
+            WHERE (:account_id IS NULL OR account_id = :account_id)
+            """
+        ),
+        {"account_id": account_id},
+    ).fetchone()
+
+    position_counts = db.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM account_positions
+            WHERE (:account_id IS NULL OR account_id = :account_id)
+              AND net_quantity <> 0
+            """
+        ),
+        {"account_id": account_id},
+    ).fetchone()
+
+    return {
+        "account_id": account_id,
+        "canonical_events": {
+            "pending": int(counts[0] or 0),
+            "processing": int(counts[1] or 0),
+            "failed": int(counts[2] or 0),
+        },
+        "orders": {
+            "dirty_for_trade_sync": int(dirty_counts[0] or 0),
+            "needs_reconcile": int(dirty_counts[1] or 0),
+        },
+        "positions": {
+            "open_rows": int(position_counts[0] or 0),
+        },
+    }
+
+
+@router.post("/order-runtime/process-now", description="Process canonical events and dirty orders immediately")
+async def process_order_runtime_now(
+    request: Request,
+    kite: KiteConnect = Depends(get_kite),
+    db: Session = Depends(get_db),
+    corr_id: str = Depends(get_correlation_id),
+):
+    sid = get_kite_session_id(request)
+    if not sid:
+        raise HTTPException(401, "Session ID required")
+    account_id = get_session_account_id(db, sid)
+
+    processed = await order_event_runtime.process_pending_events(batch_size=100)
+    synced = await order_event_runtime.sync_dirty_orders(kite, realtime_positions_service, batch_size=25)
+    reconciled = 0
+    if account_id:
+        reconciled = await realtime_positions_service.reconcile_account_positions(kite, account_id, corr_id)
+
+    return {
+        "status": "ok",
+        "account_id": account_id,
+        "processed_events": processed,
+        "synced_orders": synced,
+        "reconciled_positions": reconciled,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1244,7 +1540,7 @@ class GTTService:
             logger.error(f"GTT request failed", extra={**log_ctx, "error": str(e)}, exc_info=True)
             raise HTTPException(status_code=502, detail="An unexpected error occurred with the provider.")
 
-    def place_gtt(self, kite: KiteConnect, req: PlaceGTTRequest, corr_id: str) -> PlaceGTTResponse:
+    async def place_gtt(self, kite: KiteConnect, req: PlaceGTTRequest, corr_id: str) -> PlaceGTTResponse:
         """Place a GTT trigger"""
         log_ctx = self._log_context(corr_id, kite, gtt_type=req.type.value, symbol=req.condition.tradingsymbol)
         logger.info("Placing GTT trigger", extra=log_ctx)
@@ -1257,12 +1553,17 @@ class GTTService:
                 "orders": [order.model_dump() for order in req.orders]
             }
 
-            result = self._raw_request(
-                "POST",
-                "https://api.kite.trade/gtt/triggers",
-                kite,
+            result = await run_kite_write_action(
+                "place_gtt",
                 corr_id,
-                json=payload
+                lambda: self._raw_request(
+                    "POST",
+                    "https://api.kite.trade/gtt/triggers",
+                    kite,
+                    corr_id,
+                    json=payload,
+                ),
+                meta=log_ctx,
             )
 
             trigger_id = result.get("data", {}).get("trigger_id")
@@ -1321,7 +1622,7 @@ class GTTService:
             logger.error("Failed to retrieve GTT", extra={**log_ctx, "error": str(e)}, exc_info=True)
             raise HTTPException(status_code=502, detail=f"Failed to retrieve GTT trigger {trigger_id}")
 
-    def modify_gtt(self, kite: KiteConnect, trigger_id: int, req: ModifyGTTRequest, corr_id: str) -> PlaceGTTResponse:
+    async def modify_gtt(self, kite: KiteConnect, trigger_id: int, req: ModifyGTTRequest, corr_id: str) -> PlaceGTTResponse:
         """Modify a GTT trigger"""
         log_ctx = self._log_context(corr_id, kite, trigger_id=trigger_id, gtt_type=req.type.value)
         logger.info("Modifying GTT trigger", extra=log_ctx)
@@ -1334,12 +1635,17 @@ class GTTService:
                 "orders": [order.model_dump() for order in req.orders]
             }
 
-            result = self._raw_request(
-                "PUT",
-                f"https://api.kite.trade/gtt/triggers/{trigger_id}",
-                kite,
+            result = await run_kite_write_action(
+                "modify_gtt",
                 corr_id,
-                json=payload
+                lambda: self._raw_request(
+                    "PUT",
+                    f"https://api.kite.trade/gtt/triggers/{trigger_id}",
+                    kite,
+                    corr_id,
+                    json=payload,
+                ),
+                meta=log_ctx,
             )
 
             modified_trigger_id = result.get("data", {}).get("trigger_id")
@@ -1352,17 +1658,22 @@ class GTTService:
                 raise HTTPException(status_code=400, detail=str(e))
             raise e
 
-    def delete_gtt(self, kite: KiteConnect, trigger_id: int, corr_id: str) -> DeleteGTTResponse:
+    async def delete_gtt(self, kite: KiteConnect, trigger_id: int, corr_id: str) -> DeleteGTTResponse:
         """Delete a GTT trigger"""
         log_ctx = self._log_context(corr_id, kite, trigger_id=trigger_id)
         logger.info("Deleting GTT trigger", extra=log_ctx)
 
         try:
-            result = self._raw_request(
-                "DELETE",
-                f"https://api.kite.trade/gtt/triggers/{trigger_id}",
-                kite,
-                corr_id
+            result = await run_kite_write_action(
+                "delete_gtt",
+                corr_id,
+                lambda: self._raw_request(
+                    "DELETE",
+                    f"https://api.kite.trade/gtt/triggers/{trigger_id}",
+                    kite,
+                    corr_id,
+                ),
+                meta=log_ctx,
             )
 
             deleted_trigger_id = result.get("data", {}).get("trigger_id")
@@ -1380,7 +1691,7 @@ class GTTService:
 gtt_service = GTTService()
 
 @router.post("/gtt/triggers", response_model=PlaceGTTResponse, description="Place a GTT (Good Till Triggered) order")
-def place_gtt_trigger(
+async def place_gtt_trigger(
     req: PlaceGTTRequest,
     kite: KiteConnect = Depends(get_kite),
     corr_id: str = Depends(get_correlation_id)
@@ -1391,7 +1702,7 @@ def place_gtt_trigger(
     - **single**: Single trigger value, executes first order when reached
     - **two-leg**: Two trigger values (OCO - One Cancels Other), executes corresponding order
     """
-    return gtt_service.place_gtt(kite, req, corr_id)
+    return await gtt_service.place_gtt(kite, req, corr_id)
 
 @router.get("/gtt/triggers", response_model=List[GTTTrigger], description="Retrieve all GTT triggers")
 def get_gtt_triggers(
@@ -1422,7 +1733,7 @@ def get_gtt_trigger(
     return gtt_service.get_gtt(kite, trigger_id, corr_id)
 
 @router.put("/gtt/triggers/{trigger_id}", response_model=PlaceGTTResponse, description="Modify a GTT trigger")
-def modify_gtt_trigger(
+async def modify_gtt_trigger(
     trigger_id: int,
     req: ModifyGTTRequest,
     kite: KiteConnect = Depends(get_kite),
@@ -1433,16 +1744,16 @@ def modify_gtt_trigger(
     
     Recommended: Fetch the trigger using GET /gtt/triggers/{id}, modify values, and send to this endpoint.
     """
-    return gtt_service.modify_gtt(kite, trigger_id, req, corr_id)
+    return await gtt_service.modify_gtt(kite, trigger_id, req, corr_id)
 
 @router.delete("/gtt/triggers/{trigger_id}", response_model=DeleteGTTResponse, description="Delete a GTT trigger")
-def delete_gtt_trigger(
+async def delete_gtt_trigger(
     trigger_id: int,
     kite: KiteConnect = Depends(get_kite),
     corr_id: str = Depends(get_correlation_id)
 ):
     """Delete an active GTT trigger."""
-    return gtt_service.delete_gtt(kite, trigger_id, corr_id)
+    return await gtt_service.delete_gtt(kite, trigger_id, corr_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1620,46 +1931,20 @@ class WebhookService:
         Returns event ID if stored, None if duplicate.
         """
         try:
-            event_id = str(uuid.uuid4())
-            event_timestamp = payload.get_event_timestamp()
-            
-            # Prepare SQL insert with ON CONFLICT for idempotency
-            insert_sql = text("""
-                INSERT INTO order_events (
-                    id, order_id, user_id, status, event_timestamp, received_at,
-                    exchange, tradingsymbol, instrument_token, transaction_type,
-                    quantity, filled_quantity, average_price, payload_json
+            ingest_result = await order_event_runtime.ingest_webhook_event(payload, corr_id, db)
+            if ingest_result.get("duplicate"):
+                logger.info(
+                    "Duplicate webhook event detected (idempotent)",
+                    extra={
+                        "correlation_id": corr_id,
+                        "order_id": payload.order_id,
+                        "status": payload.status,
+                    }
                 )
-                VALUES (
-                    :id, :order_id, :user_id, :status, :event_timestamp, NOW(),
-                    :exchange, :tradingsymbol, :instrument_token, :transaction_type,
-                    :quantity, :filled_quantity, :average_price, CAST(:payload_json AS JSONB)
-                )
-                ON CONFLICT (order_id, event_timestamp, status) DO NOTHING
-                RETURNING id
-            """)
-            
-            result = db.execute(insert_sql, {
-                "id": event_id,
-                "order_id": payload.order_id,
-                "user_id": payload.user_id,
-                "status": payload.status,
-                "event_timestamp": event_timestamp,
-                "exchange": payload.exchange,
-                "tradingsymbol": payload.tradingsymbol,
-                "instrument_token": payload.instrument_token,
-                "transaction_type": payload.transaction_type,
-                "quantity": payload.quantity,
-                "filled_quantity": payload.filled_quantity,
-                "average_price": payload.average_price,
-                "payload_json": json.dumps(payload.model_dump())
-            })
-            
-            db.commit()
-            
-            # Check if row was actually inserted (idempotency check)
-            inserted_id = result.fetchone()
-            if inserted_id:
+                return None
+
+            event_id = str(ingest_result.get("canonical_event_id"))
+            if event_id:
                 logger.info(
                     "Webhook event stored successfully",
                     extra={
@@ -1670,19 +1955,9 @@ class WebhookService:
                     }
                 )
                 return event_id
-            else:
-                logger.info(
-                    "Duplicate webhook event detected (idempotent)",
-                    extra={
-                        "correlation_id": corr_id,
-                        "order_id": payload.order_id,
-                        "status": payload.status
-                    }
-                )
-                return None
-                
+            return None
+                 
         except Exception as e:
-            db.rollback()
             logger.error(
                 "Failed to store webhook event",
                 extra={
@@ -1874,8 +2149,10 @@ async def receive_order_postback(
         # Validate checksum
         webhook_service._validate_checksum(payload, corr_id, test_mode)
         
-        # Store event (with idempotency)
-        event_id = await webhook_service.store_event(payload, corr_id, db)
+        # Store raw + canonical event (with idempotency)
+        ingest_result = await order_event_runtime.ingest_webhook_event(payload, corr_id, db)
+        db.commit()
+        event_id = ingest_result.get("canonical_event_id")
 
         # Publish SSE event only when inserted (not duplicate)
         if event_id:
@@ -1903,13 +2180,21 @@ async def receive_order_postback(
         return {
             "status": "ok",
             "event_id": event_id,
-            "duplicate": event_id is None,
+            "duplicate": bool(ingest_result.get("duplicate", event_id is None)),
             "order_id": payload.order_id
         }
         
     except HTTPException:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         raise
     except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         logger.error(
             "Webhook processing failed",
             extra={**log_ctx, "error": str(e)},
@@ -1955,7 +2240,7 @@ async def query_webhook_events(
         offset=offset
     )
 
-@router.get("/orders/events/stream")
+@router.get("/order-events/stream")
 async def sse_order_events(request: Request, source: Optional[str] = Query(None, description="Filter by 'webhook', 'ws' or 'all'")):
     async def event_stream():
         try:
@@ -1988,29 +2273,29 @@ async def sse_order_events(request: Request, source: Optional[str] = Query(None,
 
 @router.post("/ws/orders/updates/enable")
 async def enable_ws_order_updates(request: Request):
-    mgr = getattr(request.app.state, "ws_manager", None)
-    if not mgr:
-        raise HTTPException(status_code=503, detail="WebSocket manager not available")
-    mgr.order_updates_enabled = True
+    runtime = getattr(request.app.state, "market_data_runtime", None)
+    if not runtime:
+        raise HTTPException(status_code=503, detail="Market runtime not available")
+    runtime.order_updates_enabled = True
     return {"status": "ok", "enabled": True}
 
 @router.post("/ws/orders/updates/disable")
 async def disable_ws_order_updates(request: Request):
-    mgr = getattr(request.app.state, "ws_manager", None)
-    if not mgr:
-        raise HTTPException(status_code=503, detail="WebSocket manager not available")
-    mgr.order_updates_enabled = False
+    runtime = getattr(request.app.state, "market_data_runtime", None)
+    if not runtime:
+        raise HTTPException(status_code=503, detail="Market runtime not available")
+    runtime.order_updates_enabled = False
     return {"status": "ok", "enabled": False}
 
 @router.get("/ws/orders/updates/status")
 async def ws_order_updates_status(request: Request):
-    mgr = getattr(request.app.state, "ws_manager", None)
-    if not mgr:
-        raise HTTPException(status_code=503, detail="WebSocket manager not available")
+    runtime = getattr(request.app.state, "market_data_runtime", None)
+    if not runtime:
+        raise HTTPException(status_code=503, detail="Market runtime not available")
     return {
-        "enabled": bool(getattr(mgr, "order_updates_enabled", False)),
-        "ws_status": mgr.get_websocket_status() if hasattr(mgr, "get_websocket_status") else "unknown",
-        "last_order_update_at": getattr(mgr, "last_order_update_at", None),
+        "enabled": bool(getattr(runtime, "order_updates_enabled", False)),
+        "ws_status": runtime.get_websocket_status() if hasattr(runtime, "get_websocket_status") else "unknown",
+        "last_order_update_at": getattr(runtime, "last_order_update_at", None),
     }
 
 @router.get("/ws/orders/events", response_model=List[OrderEventResponse])
@@ -2053,7 +2338,7 @@ async def get_ws_order_events(
                 quantity, filled_quantity, average_price, payload_json
             FROM ws_order_events
             WHERE {where_clause}
-            ORDER BY event_timestamp DESC
+            ORDER BY event_timestamp DESC, created_at DESC
             LIMIT :limit OFFSET :offset
         """)
 

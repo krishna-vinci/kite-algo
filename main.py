@@ -8,10 +8,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import uvicorn
 import psycopg2
 import psycopg2.extras
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from scipy.stats import norm
 from datetime import datetime, timedelta
 import os
 import json
@@ -25,24 +21,32 @@ load_dotenv() # Load environment variables from .env file
 from database import get_db_connection
 from pytz import timezone
 import random
-
-import pandas as pd
 import psycopg2
 from psycopg2 import extras
 import logging
 from datetime import datetime, date # Import date for CURRENT_DATE
 from zoneinfo import ZoneInfo
+from auth_service import auth_exempt_path, get_optional_app_user
+from runtime_monitor import heartbeat, install_log_buffer, set_component_status, set_meta
 
 # Configure logging for the main application
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+install_log_buffer()
 
 # Suppress INFO level logs from httpx for specific API calls
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-import plotly.express as px
-import pandas_market_calendars as mcal
-
-from charts import charts_app
+from api.openapi import OPENAPI_TAGS
+from api.routers.auth import router as auth_router
+from api.routers.market_data import router as market_data_router
+from api.routers.instruments import router as instruments_router
+from api.routers.historical import router as historical_router
+from api.routers.ingestion import router as ingestion_router
+from api.routers.user_settings import router as user_settings_router
+from api.routers.marketwatch import router as marketwatch_router
+from api.routers.algo_workers import router as algo_workers_router
+from journaling.runtime import JournalRuntimeWorker
+from api.routers.journal import router as journal_router
+from journaling.service import JournalService
 
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,6 +56,7 @@ from broker_api.alerts_router import router as alerts_router
 from broker_api.performance_router import router as performance_router
 from broker_api.options_router import router as options_router
 from broker_api.candles_api import router as candles_api_router
+from broker_api.kite_mutual_funds import router as kite_mutual_funds_router
 
 
 
@@ -75,17 +80,25 @@ from typing import List, Optional
 from server import mcp
 from contextlib import asynccontextmanager
 import server
-from kite_auth import login_headless
+from broker_api.kite_auth import login_headless
+from broker_api.index_ingestion import (
+    get_index_refresh_state,
+    list_supported_index_source_lists,
+    refresh_live_metrics_for_indices,
+    refresh_supported_indices,
+)
 import logging
 from database import SessionLocal, database as async_db
-from broker_api.broker_api import KiteSession, get_system_access_token, upsert_kite_session
+from broker_api.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
+from broker_api.market_runtime_client import MarketDataRuntime, market_runtime_enabled
 from broker_api.broker_api import run_headless_login_and_persist_system_token
 from broker_api.kite_auth import API_KEY
-from broker_api.websocket_manager import WebSocketManager
+from broker_api.order_runtime import order_event_runtime, realtime_positions_service, refresh_processing_stuck_rows
 from alerts.engine import AlertsEngine
 from database import get_user_settings, update_user_settings
 from pydantic import BaseModel
 import csv
+from sqlalchemy import text
 
 class UserSubscriptions(BaseModel):
     groups: List[dict]
@@ -104,8 +117,8 @@ class OverlaySnapshotResponse(BaseModel):
     status: str
     data: Dict[str, OverlaySnapshotTick]
 
-# Global instance for the WebSocketManager
-ws_manager: Optional[WebSocketManager] = None
+# Global instance for the Go market runtime bridge
+market_data_runtime: Optional[MarketDataRuntime] = None
 
 # Daily gating event (set once headless login succeeds; cleared before daily rotation)
 daily_token_ready: asyncio.Event = asyncio.Event()
@@ -147,9 +160,7 @@ class MCPAuthWrapper:
                 try:
                     ks = db.query(KiteSession).filter_by(session_id=sid).first()
                     if ks:
-                        from kiteconnect import KiteConnect
-                        kite = KiteConnect(api_key=API_KEY)
-                        kite.set_access_token(ks.access_token)
+                        kite = build_kite_client(ks.access_token, session_id=sid)
                         ctx_token = server.set_request_kite(kite)
                 finally:
                     db.close()
@@ -183,10 +194,15 @@ def run_schema_migrations() -> None:
 # 2. Combine the lifespans
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
-    global ws_manager
+    global market_data_runtime
     # Perform headless login at startup and store the KiteConnect instance
     token_watcher_task = None
     scheduler_task = None
+    index_refresh_task = None
+    order_runtime_task = None
+    positions_runtime_task = None
+    journal_runtime_worker = None
+    set_component_status("app", "starting", detail="Application startup in progress")
     try:
         # Ensure the schema is applied before any other database operations
         run_schema_migrations()
@@ -194,31 +210,62 @@ async def combined_lifespan(app: FastAPI):
         at = None
         kite = None
         db = None
+        startup_status = "healthy"
+        startup_detail = "Application startup complete"
         try:
             db = SessionLocal()
             # Prefer explicit "system" session_id token
             system_at = get_system_access_token(db)
             if system_at:
-                from kiteconnect import KiteConnect
-                kite = KiteConnect(api_key=API_KEY)
-                kite.set_access_token(system_at)
+                kite = build_kite_client(system_at, session_id="system")
                 at = system_at
                 try:
                     # Lightweight validation
-                    kite.profile()
+                    profile = await asyncio.to_thread(kite.profile)
+                    broker_user_id = str((profile or {}).get("user_id") or "").strip() or None
+                    if broker_user_id:
+                        rotate_broker_access_token(db, at, broker_user_id=broker_user_id)
+                        db.commit()
                     logging.info("Using system access_token from DB (..%s)", at[-6:] if isinstance(at, str) else "")
+                    set_meta("daily_broker_login", {
+                        "mode": "startup_existing_token",
+                        "last_success_at": datetime.utcnow().isoformat(),
+                        "token_suffix": at[-6:] if isinstance(at, str) else "",
+                        "status": "healthy",
+                    })
+                    set_component_status("broker_bootstrap", "healthy", detail="Validated persisted system broker token")
                 except Exception as e:
                     logging.warning("System token validation failed (..%s); performing headless login: %s", (at[-6:] if isinstance(at, str) else ""), e)
-                    kite, at = login_headless()
-                    upsert_kite_session(db, "system", at)
+                    _kite, at = login_headless()
+                    kite = build_kite_client(at, session_id="system")
+                    profile = await asyncio.to_thread(kite.profile)
+                    broker_user_id = str((profile or {}).get("user_id") or "").strip() or None
+                    rotate_broker_access_token(db, at, broker_user_id=broker_user_id)
                     db.commit()
                     logging.info("Refreshed system access_token via headless login (..%s)", at[-6:] if isinstance(at, str) else "")
+                    set_meta("daily_broker_login", {
+                        "mode": "startup_refresh",
+                        "last_success_at": datetime.utcnow().isoformat(),
+                        "token_suffix": at[-6:] if isinstance(at, str) else "",
+                        "status": "healthy",
+                    })
+                    set_component_status("broker_bootstrap", "healthy", detail="Refreshed expired system broker token at startup")
             else:
                 # No system token; perform headless login and persist
-                kite, at = login_headless()
-                upsert_kite_session(db, "system", at)
+                _kite, at = login_headless()
+                kite = build_kite_client(at, session_id="system")
+                profile = await asyncio.to_thread(kite.profile)
+                broker_user_id = str((profile or {}).get("user_id") or "").strip() or None
+                rotate_broker_access_token(db, at, broker_user_id=broker_user_id)
                 db.commit()
                 logging.info("Obtained system access_token via headless login (..%s)", at[-6:] if isinstance(at, str) else "")
+                set_meta("daily_broker_login", {
+                    "mode": "startup_new_login",
+                    "last_success_at": datetime.utcnow().isoformat(),
+                    "token_suffix": at[-6:] if isinstance(at, str) else "",
+                    "status": "healthy",
+                })
+                set_component_status("broker_bootstrap", "healthy", detail="Performed startup broker login and persisted system token")
         finally:
             try:
                 if db:
@@ -228,30 +275,144 @@ async def combined_lifespan(app: FastAPI):
 
         server.mcp_kite_instance = kite
         logging.info("MCP Kite instance initialized successfully.")
+        app.state.journal_service = JournalService()
+        journal_runtime_worker = JournalRuntimeWorker(service=app.state.journal_service)
+        await journal_runtime_worker.start()
+        app.state.journal_runtime_worker = journal_runtime_worker
+        set_component_status("journal_runtime", "healthy", detail="Trading journal runtime worker started")
 
-        # Initialize and start the WebSocketManager with the selected token
-        logging.info("Initializing WebSocketManager...")
-        # Get the main event loop to pass to the WebSocketManager
-        main_event_loop = asyncio.get_event_loop()
-        ws_manager = WebSocketManager(api_key=API_KEY, access_token=at, main_event_loop=main_event_loop)
-        
-        # Inject real-time positions service into WebSocket manager
-        from broker_api.kite_orders import realtime_positions_service
-        ws_manager.realtime_positions_service = realtime_positions_service
-        logging.info("Real-time positions service injected into WebSocketManager")
-        
-        ws_manager.start()
-        logging.info("WebSocketManager started.")
-        # Expose ws_manager for routers to access latest ticks
-        app.state.ws_manager = ws_manager
+        # Ensure async DB is connected (required for Meilisearch reindex and other async ops)
+        try:
+            # Check if 'is_connected' property exists (databases < 0.8.0) or just connect
+            # 'databases' library usually handles idempotency of connect()
+            if not async_db.is_connected:
+                await async_db.connect()
+                logging.info("Async database connected.")
+        except Exception as e:
+             logging.error(f"Failed to connect to async database: {e}")
 
-        # Start background token watcher to rotate WS token when DB 'system' token changes
+        if not market_runtime_enabled():
+            raise RuntimeError("MARKET_RUNTIME_ENABLED must be true because the Go market-runtime is the only websocket owner")
+
+        logging.info("Initializing Go market runtime bridge...")
+        market_data_runtime = MarketDataRuntime(realtime_positions_service=realtime_positions_service)
+        await market_data_runtime.start()
+        app.state.market_data_runtime = market_data_runtime
+        runtime_status = dict(getattr(market_data_runtime, "runtime_status", {}) or {})
+        set_component_status(
+            "market_runtime",
+            runtime_status.get("status", "healthy"),
+            detail="Go market runtime bridge started",
+            meta={
+                "active_shards": runtime_status.get("active_shards"),
+                "effective_tokens": runtime_status.get("effective_tokens"),
+            },
+        )
+
+        async def _order_runtime_worker():
+            poll_seconds = max(1.0, float(os.getenv("ORDER_RUNTIME_POLL_SECONDS", "1.0")))
+            reconcile_seconds = max(15.0, float(os.getenv("POSITIONS_RECONCILE_SECONDS", "30")))
+            last_reconcile_monotonic = 0.0
+            cached_token = at
+            kite_client = build_kite_client(cached_token, session_id="system")
+            set_component_status("order_runtime_worker", "healthy", detail="Order runtime worker started")
+            await refresh_processing_stuck_rows()
+            while True:
+                try:
+                    await asyncio.sleep(poll_seconds)
+                    db = SessionLocal()
+                    try:
+                        current_token = get_system_access_token(db) or cached_token
+                        system_session = db.query(KiteSession).filter_by(session_id="system").first()
+                        broker_user_id = getattr(system_session, "broker_user_id", None)
+                    finally:
+                        db.close()
+
+                    if current_token != cached_token:
+                        kite_client = build_kite_client(current_token, session_id="system")
+                        cached_token = current_token
+
+                    processed = await order_event_runtime.process_pending_events(batch_size=100)
+                    synced = await order_event_runtime.sync_dirty_orders(kite_client, realtime_positions_service, batch_size=25)
+
+                    now_monotonic = asyncio.get_running_loop().time()
+                    account_id = make_account_id(broker_user_id)
+                    if account_id and (now_monotonic - last_reconcile_monotonic) >= reconcile_seconds:
+                        await realtime_positions_service.reconcile_account_positions(kite_client, account_id, corr_id="periodic_reconcile")
+                        last_reconcile_monotonic = now_monotonic
+
+                    heartbeat(
+                        "order_runtime_worker",
+                        detail="Processed canonical order events and synced dirty orders",
+                        meta={
+                            "processed_events": processed,
+                            "synced_orders": synced,
+                            "poll_seconds": poll_seconds,
+                            "reconcile_seconds": reconcile_seconds,
+                            "account_id": account_id,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    set_component_status("order_runtime_worker", "stopped", detail="Order runtime worker cancelled")
+                    break
+                except Exception as exc:
+                    logging.error("Order runtime worker error: %s", exc, exc_info=True)
+                    set_component_status("order_runtime_worker", "degraded", detail=str(exc))
+
+        order_runtime_task = asyncio.create_task(_order_runtime_worker())
+
+        async def _positions_runtime_subscription_worker():
+            owner_id = "backend:realtime-positions"
+            poll_seconds = max(5.0, float(os.getenv("POSITIONS_RUNTIME_SUBS_POLL_SECONDS", "10")))
+            set_component_status("positions_runtime_subscriptions", "healthy", detail="Syncing runtime subscriptions for active positions")
+            while True:
+                try:
+                    db = SessionLocal()
+                    try:
+                        rows = db.execute(
+                            text(
+                                """
+                                SELECT DISTINCT instrument_token
+                                FROM account_positions
+                                WHERE net_quantity <> 0
+                                  AND instrument_token IS NOT NULL
+                                """
+                            )
+                        ).fetchall()
+                    finally:
+                        db.close()
+
+                    subscriptions = {int(row[0]): "ltp" for row in rows if row and row[0] is not None}
+                    if subscriptions:
+                        await market_data_runtime.set_owner_subscriptions(owner_id, subscriptions)
+                    else:
+                        await market_data_runtime.delete_owner(owner_id)
+
+                    heartbeat(
+                        "positions_runtime_subscriptions",
+                        detail="Synced runtime subscriptions for active positions",
+                        meta={"tracked_tokens": len(subscriptions), "poll_seconds": poll_seconds},
+                    )
+                    await asyncio.sleep(poll_seconds)
+                except asyncio.CancelledError:
+                    set_component_status("positions_runtime_subscriptions", "stopped", detail="Positions runtime subscription worker cancelled")
+                    break
+                except Exception as exc:
+                    logging.error("Positions runtime subscription worker error: %s", exc, exc_info=True)
+                    set_component_status("positions_runtime_subscriptions", "degraded", detail=str(exc))
+                    await asyncio.sleep(poll_seconds)
+
+        positions_runtime_task = asyncio.create_task(_positions_runtime_subscription_worker())
+
+        # Start background token watcher so MCP-facing system client follows DB token rotation.
         async def _system_token_watcher():
             poll_seconds = int(os.getenv("SYSTEM_TOKEN_POLL_SEC", "45"))
             last_token = at
+            set_component_status("system_token_watcher", "healthy", detail="Watching for system token changes")
             while True:
                 try:
                     await asyncio.sleep(max(30, min(poll_seconds, 60)))
+                    heartbeat("system_token_watcher", detail="Polling for token changes", meta={"poll_seconds": poll_seconds})
                     _db = SessionLocal()
                     try:
                         new_token = get_system_access_token(_db)
@@ -260,13 +421,16 @@ async def combined_lifespan(app: FastAPI):
                     if new_token and new_token != last_token:
                         old_fp = (last_token[-6:] if isinstance(last_token, str) else "")
                         new_fp = (new_token[-6:] if isinstance(new_token, str) else "")
-                        logging.info("System token change detected; rotating WS token (..%s -> ..%s)", old_fp, new_fp)
-                        ws_manager.reinit_with_token(new_token)
+                        logging.info("System token change detected; market runtime will rotate from DB token (..%s -> ..%s)", old_fp, new_fp)
+                        server.mcp_kite_instance = build_kite_client(new_token, session_id="system")
+                        set_component_status("market_runtime", "healthy", detail="Market runtime observing rotated system token", meta={"token_suffix": new_fp})
                         last_token = new_token
                 except asyncio.CancelledError:
+                    set_component_status("system_token_watcher", "stopped", detail="Token watcher cancelled")
                     break
                 except Exception as e:
                     logging.error("Token watcher error: %s", e, exc_info=True)
+                    set_component_status("system_token_watcher", "degraded", detail=str(e))
                     # Continue watching
                     continue
 
@@ -275,53 +439,38 @@ async def combined_lifespan(app: FastAPI):
         app.state.daily_token_ready = daily_token_ready
         if not daily_token_ready.is_set():
             daily_token_ready.set()
-        logging.info("[GATE] Initialized and open at startup (will close at next 07:31 IST)")
+        logging.info("[GATE] Initialized and open at startup (will close at next 08:00 IST)")
+        set_meta("daily_token_gate", {"ready": True, "last_changed_at": datetime.utcnow().isoformat()})
         scheduler_task = asyncio.create_task(daily_token_scheduler())
+        index_refresh_task = asyncio.create_task(monthly_index_refresh_scheduler())
+        try:
+            startup_index_result = await asyncio.to_thread(refresh_live_metrics_for_indices, ["Nifty50", "NiftyBank"])
+            set_meta("index_runtime_startup_refresh", {"last_result": startup_index_result, "last_success_at": datetime.utcnow().isoformat()})
+            set_component_status("index_runtime_refresh", "healthy", detail="Startup index runtime refresh completed")
+        except Exception as e:
+            logging.error("Failed startup index runtime refresh: %s", e, exc_info=True)
+            set_component_status("index_runtime_refresh", "degraded", detail=str(e))
 
-        # Ensure async DB is connected for workers
+        # Start AlertsEngine after the market runtime bridge and async DB are ready
         try:
-            if hasattr(async_db, "is_connected") and not async_db.is_connected:
-                await async_db.connect()
-        except Exception:
-            pass
-        # Start AlertsEngine (Phase 0) after WS manager and async DB are ready
-        try:
-            alerts_engine = AlertsEngine(async_db, ws_manager, app)
+            alerts_engine = AlertsEngine(async_db, market_data_runtime, app)
             alerts_engine.start()
             app.state.alerts_engine = alerts_engine
             logging.info("AlertsEngine started (interval_ms=%s)", getattr(alerts_engine, "interval_ms", None))
+            set_component_status("alerts_engine", "healthy", detail="Alerts engine started")
         except Exception as e:
             logging.error("Failed to start AlertsEngine: %s", e, exc_info=True)
-        
-        # Start PositionProtectionEngine (Phase 1) after AlertsEngine
-        try:
-            from strategies.indexstoploss.index_stoploss_algo import PositionProtectionEngine
-            from broker_api.kite_orders import OrdersService
-            
-            orders_service = OrdersService()
-            protection_engine = PositionProtectionEngine(
-                db=async_db,
-                ws_manager=ws_manager,
-                orders_service=orders_service,
-                app=app
-            )
-            protection_engine.start()
-            app.state.protection_engine = protection_engine
-            logging.info("PositionProtectionEngine started (500ms interval)")
-        except Exception as e:
-            logging.error("Failed to start PositionProtectionEngine: %s", e, exc_info=True)
+            set_component_status("alerts_engine", "degraded", detail=str(e))
         
         # Initialize Phase 3: StrikeSelector and PositionBuilder
         try:
             from strategies.strike_selector import StrikeSelector, PositionBuilder
             from broker_api.instruments_repository import InstrumentsRepository
-            from database import get_db
             
             # Get OptionsSessionManager from app state
             osm = getattr(app.state, "options_session_manager", None)
             if osm:
-                db_session = next(get_db())
-                instruments_repo = InstrumentsRepository(db=db_session)
+                instruments_repo = InstrumentsRepository(db=SessionLocal)
                 
                 strike_selector = StrikeSelector(osm, instruments_repo)
                 position_builder = PositionBuilder(strike_selector, instruments_repo)
@@ -334,10 +483,10 @@ async def combined_lifespan(app: FastAPI):
         except Exception as e:
             logging.error("Failed to initialize Phase 3 components: %s", e, exc_info=True)
 
-        # Start alert dispatcher (WS text messages) and 2s polling fallback
+        # Start alert dispatcher and polling fallback (not yet implemented in runtime form)
         alerts_ntfy_url = os.getenv("KITE_ALERTS_NTFY_URL") or os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
-        # TODO: alert_event_dispatcher needs to be implemented. See broker_api/websocket_manager.py:487
-        # asyncio.create_task(alert_event_dispatcher(ws_manager, alerts_ntfy_url))
+        # TODO: alert_event_dispatcher needs a market-runtime-backed implementation.
+        # asyncio.create_task(alert_event_dispatcher(market_data_runtime, alerts_ntfy_url))
         # TODO: alerts_poll_worker needs to be implemented.
         # asyncio.create_task(alerts_poll_worker(API_KEY, alerts_ntfy_url))
 
@@ -350,7 +499,13 @@ async def combined_lifespan(app: FastAPI):
                 client = get_meili_client(admin=True)
                 index = client.index("instruments")
                 stats = index.get_stats() if hasattr(index, "get_stats") else index.stats()
-                num_docs = (stats.get("numberOfDocuments") or stats.get("number_of_documents") or 0)
+                # Handle both dict (older versions) and IndexStats object (newer versions)
+                if isinstance(stats, dict):
+                    num_docs = (stats.get("numberOfDocuments") or stats.get("number_of_documents") or 0)
+                else:
+                    # Try camelCase first then snake_case attributes
+                    num_docs = getattr(stats, "numberOfDocuments", getattr(stats, "number_of_documents", 0))
+
                 if int(num_docs) == 0:
                     logger.info("Meilisearch 'instruments' index is empty; triggering bootstrap reindex...")
                     await meili_reindex_instruments()
@@ -375,22 +530,146 @@ async def combined_lifespan(app: FastAPI):
                 )
                 logging.info("Candle Aggregator started successfully with all intervals")
                 app.state.candle_aggregator = aggregator
+                set_component_status("candle_aggregator", "healthy", detail="Candle aggregator started")
             else:
                 logging.info("Candle Aggregator already running")
+                app.state.candle_aggregator = aggregator
+                set_component_status("candle_aggregator", "healthy", detail="Candle aggregator already running")
         except Exception as e:
             logging.error("Failed to start Candle Aggregator: %s", e, exc_info=True)
+            set_component_status("candle_aggregator", "degraded", detail=str(e))
+
+        # Initialize modular algo runtime service scaffold after market/candle/options services are ready
+        try:
+            from algo_runtime.live import AlgoRuntimeLiveWorker
+            from algo_runtime.kernel import AlgoKernel
+            from algo_runtime.intent_bridge import IntentBridge, KiteOrdersIntentHandler
+            from algo_runtime.indicators import BuiltInIndicatorReader
+            from algo_runtime.registry import AlgoRegistry
+            from algo_runtime.repository import SqlAlchemyAlgoRepository
+            from algo_runtime.service import AlgoRuntimeService
+            from algo_runtime.snapshot_builder import (
+                DependencyFilteredSnapshotBuilder,
+                OptionsSnapshotReader,
+                OrderProjectionReader,
+                PositionsSnapshotReader,
+                RedisCandleDataReader,
+                RuntimeMarketDataReader,
+            )
+            from algo_runtime.state_store import InMemoryAlgoStateStore
+            from broker_api.candle_aggregator import INTERVAL_SECONDS
+            from broker_api.candle_storage import CandleStorage
+            from broker_api.redis_events import get_redis
+            from paper_runtime import DryRunIntentHandler, PaperIntentHandler, PaperMarketEngine, PaperTradingService
+            from strategies.modular import register_builtin_algos
+
+            options_session_manager = getattr(app.state, "options_session_manager", None)
+            strike_selector = getattr(app.state, "strike_selector", None)
+            algo_registry = AlgoRegistry()
+            register_builtin_algos(algo_registry)
+
+            snapshot_builder = DependencyFilteredSnapshotBuilder(
+                market_reader=RuntimeMarketDataReader(market_data_runtime),
+                candle_reader=RedisCandleDataReader(
+                    redis_client=get_redis(),
+                    candle_storage=CandleStorage,
+                    interval_seconds=INTERVAL_SECONDS,
+                ),
+                indicator_reader=BuiltInIndicatorReader(),
+                options_reader=OptionsSnapshotReader(options_session_manager, strike_selector) if options_session_manager else None,
+                positions_reader=PositionsSnapshotReader(realtime_positions_service),
+                orders_reader=OrderProjectionReader(),
+            )
+            paper_runtime_service = PaperTradingService(
+                market_data_runtime=market_data_runtime,
+                journal_service=getattr(app.state, "journal_service", None),
+            )
+            app.state.paper_runtime_service = paper_runtime_service
+            algo_runtime_service = AlgoRuntimeService(
+                AlgoKernel(
+                    registry=algo_registry,
+                    repository=SqlAlchemyAlgoRepository(),
+                    state_store=InMemoryAlgoStateStore(),
+                    snapshot_builder=snapshot_builder,
+                    journal_service=getattr(app.state, "journal_service", None),
+                    intent_bridge=IntentBridge(
+                        live_order_intent_handler=KiteOrdersIntentHandler(),
+                        paper_order_intent_handler=PaperIntentHandler(paper_runtime_service),
+                        dry_run_order_intent_handler=DryRunIntentHandler(),
+                    ),
+                )
+            )
+            await algo_runtime_service.start()
+            app.state.algo_runtime_service = algo_runtime_service
+            algo_runtime_live_worker = AlgoRuntimeLiveWorker(
+                service=algo_runtime_service,
+                market_data_runtime=market_data_runtime,
+                candle_aggregator=getattr(app.state, "candle_aggregator", None),
+            )
+            await algo_runtime_live_worker.start()
+            app.state.algo_runtime_live_worker = algo_runtime_live_worker
+            paper_market_engine = PaperMarketEngine(
+                service=paper_runtime_service,
+                market_data_runtime=market_data_runtime,
+                redis_client=get_redis(),
+            )
+            await paper_market_engine.start()
+            app.state.paper_market_engine = paper_market_engine
+            set_component_status("paper_runtime", "healthy", detail="Paper runtime started", meta={"market_engine": paper_market_engine.status()})
+            algo_status = await algo_runtime_service.status()
+            load_summary = algo_status.get("load_summary", {})
+            active_count = int(load_summary.get("active_count") or 0)
+            loaded_count = int(load_summary.get("loaded_count") or 0)
+            skipped = load_summary.get("skipped", []) or []
+            algo_component_status = "healthy"
+            algo_detail = "Modular algo runtime scaffold started"
+            if active_count > 0 and loaded_count == 0:
+                algo_component_status = "degraded"
+                algo_detail = "Algo runtime started but no active instances could be loaded"
+            elif skipped:
+                algo_component_status = "degraded"
+                algo_detail = "Algo runtime started with skipped instances"
+            set_component_status(
+                "algo_runtime",
+                algo_component_status,
+                detail=algo_detail,
+                meta={
+                    "instance_count": algo_status.get("instance_count", 0),
+                    "registered_types": algo_status.get("registered_types", []),
+                    "active_count": active_count,
+                    "loaded_count": loaded_count,
+                    "skipped": skipped,
+                    "instances": algo_status.get("instances", []),
+                    "live_worker": algo_runtime_live_worker.status(),
+                },
+            )
+        except Exception as e:
+            logging.error("Failed to initialize modular algo runtime: %s", e, exc_info=True)
+            set_component_status("algo_runtime", "degraded", detail=str(e))
     except Exception as e:
-        logging.error(f"Failed to initialize MCP Kite instance or WebSocketManager: {e}", exc_info=True)
+        logging.error(f"Failed to initialize broker bootstrap or market runtime: {e}", exc_info=True)
+        startup_status = "degraded"
+        startup_detail = f"Broker startup degraded: {e}"
+        set_component_status("broker_bootstrap", "degraded", detail=str(e))
+        set_component_status("market_runtime", "degraded", detail="Go market runtime unavailable because broker bootstrap failed")
+        set_meta("daily_broker_login", {
+            "status": "degraded",
+            "last_error": str(e),
+            "last_failure_at": datetime.utcnow().isoformat(),
+        })
         # Depending on the desired behavior, you might want to exit the application
         # or proceed without a valid Kite instance for MCP.
-        # For now, we'll log the error and continue.
         server.mcp_kite_instance = None
+        raise
+
+    set_component_status("app", startup_status, detail=startup_detail)
 
     async with mcp_app.lifespan(app):
         yield
     
     # Cleanup on shutdown
     # Cancel token watcher first
+    set_component_status("app", "stopping", detail="Application shutdown in progress")
     try:
         if 'token_watcher_task' in locals() and token_watcher_task:
             token_watcher_task.cancel()
@@ -410,24 +689,46 @@ async def combined_lifespan(app: FastAPI):
                 pass
     except Exception:
         pass
+    # Cancel monthly index refresh scheduler
+    try:
+        if 'index_refresh_task' in locals() and index_refresh_task:
+            index_refresh_task.cancel()
+            try:
+                await index_refresh_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel order runtime worker
+    try:
+        if 'order_runtime_task' in locals() and order_runtime_task:
+            order_runtime_task.cancel()
+            try:
+                await order_runtime_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel positions runtime worker
+    try:
+        if 'positions_runtime_task' in locals() and positions_runtime_task:
+            positions_runtime_task.cancel()
+            try:
+                await positions_runtime_task
+            except Exception:
+                pass
+    except Exception:
+        pass
     # Stop AlertsEngine
     try:
         eng = getattr(app.state, "alerts_engine", None)
         if eng:
             await eng.stop()
             logging.info("AlertsEngine stopped.")
+            set_component_status("alerts_engine", "stopped", detail="Alerts engine stopped")
     except Exception:
         pass
     
-    # Stop PositionProtectionEngine
-    try:
-        protection_eng = getattr(app.state, "protection_engine", None)
-        if protection_eng:
-            await protection_eng.stop()
-            logging.info("PositionProtectionEngine stopped.")
-    except Exception:
-        pass
-
     # Stop Candle Aggregator
     try:
         aggregator = getattr(app.state, "candle_aggregator", None)
@@ -435,16 +736,52 @@ async def combined_lifespan(app: FastAPI):
             logging.info("Stopping Candle Aggregator...")
             await aggregator.stop()
             logging.info("Candle Aggregator stopped.")
+            set_component_status("candle_aggregator", "stopped", detail="Candle aggregator stopped")
     except Exception as e:
         logging.error("Error stopping Candle Aggregator: %s", e, exc_info=True)
 
-    if ws_manager:
-        logging.info("Stopping WebSocketManager...")
-        ws_manager.stop()
-        logging.info("WebSocketManager stopped.")
+    # Stop modular algo runtime service
+    try:
+        journal_runtime_worker = getattr(app.state, "journal_runtime_worker", None)
+        if journal_runtime_worker:
+            await journal_runtime_worker.stop()
+            set_component_status("journal_runtime", "stopped", detail="Trading journal runtime worker stopped")
+    except Exception:
+        pass
+
+    try:
+        algo_runtime_live_worker = getattr(app.state, "algo_runtime_live_worker", None)
+        if algo_runtime_live_worker:
+            await algo_runtime_live_worker.stop()
+    except Exception:
+        pass
+
+    try:
+        paper_market_engine = getattr(app.state, "paper_market_engine", None)
+        if paper_market_engine:
+            await paper_market_engine.stop()
+            set_component_status("paper_runtime", "stopped", detail="Paper runtime stopped")
+    except Exception:
+        pass
+
+    try:
+        algo_runtime_service = getattr(app.state, "algo_runtime_service", None)
+        if algo_runtime_service:
+            await algo_runtime_service.stop()
+            set_component_status("algo_runtime", "stopped", detail="Modular algo runtime stopped")
+    except Exception:
+        pass
+
+    if market_data_runtime:
+        logging.info("Stopping Go market runtime bridge...")
+        await market_data_runtime.stop()
+        logging.info("Go market runtime bridge stopped.")
+        set_component_status("market_runtime", "stopped", detail="Go market runtime bridge stopped")
+
+    set_component_status("app", "stopped", detail="Application shutdown complete")
 
 
-app = FastAPI(title="Kite App API", lifespan=combined_lifespan)
+app = FastAPI(title="Kite App API", lifespan=combined_lifespan, openapi_tags=OPENAPI_TAGS)
 
 # 3. Mount the MCP app at a subpath so normal FastAPI routes remain reachable
 # Final MCP endpoint will be available at /llm/mcp (since mcp_app was created with path='/mcp')
@@ -456,16 +793,24 @@ mcp_app_direct = mcp.http_app(path="/")
 mcp_app_direct_wrapped = MCPAuthWrapper(mcp_app_direct)
 app.mount("/mcp", mcp_app_direct_wrapped)
 
-# 4. Include existing API routes (mounted under /broker to match frontend)
-app.include_router(broker_api_router, prefix="/broker")
-app.include_router(kite_orders_router, prefix="/broker")
-app.include_router(options_router, prefix="/broker")
-app.include_router(candles_api_router, prefix="/broker")  # Unified candles API with all historical endpoints
-app.include_router(performance_router, prefix="/broker")
-app.include_router(momentum_router, prefix="/broker")
-
-app.include_router(alerts_router, prefix="/broker/alerts")
-app.include_router(indexstoploss_router, prefix="/broker/strategies")
+# 4. Include API routes under /api
+app.include_router(auth_router, prefix="/api")
+app.include_router(market_data_router, prefix="/api")
+app.include_router(instruments_router, prefix="/api")
+app.include_router(historical_router, prefix="/api")
+app.include_router(ingestion_router, prefix="/api")
+app.include_router(user_settings_router, prefix="/api")
+app.include_router(marketwatch_router, prefix="/api")
+app.include_router(algo_workers_router, prefix="/api")
+app.include_router(journal_router, prefix="/api")
+app.include_router(kite_orders_router, prefix="/api")
+app.include_router(kite_mutual_funds_router, prefix="/api")
+app.include_router(options_router, prefix="/api")
+app.include_router(candles_api_router, prefix="/api")  # Unified candles API with all historical endpoints
+app.include_router(performance_router, prefix="/api")
+app.include_router(momentum_router, prefix="/api")
+app.include_router(alerts_router, prefix="/api/alerts")
+app.include_router(indexstoploss_router, prefix="/api/strategies")
 
 from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
 import logging
@@ -485,111 +830,6 @@ def reset_meili_settings():
     except Exception as e:
         logger.error(f"Failed to reset Meilisearch settings: {e}", exc_info=True)
 
-# CSV file paths and their corresponding source list names
-CSV_FILES = {
-    'ind_nifty50list.csv': 'Nifty50',
-    'ind_niftylargemidcap250list.csv': 'NiftyLargeMidcap250',
-    'ind_nifty500list.csv': 'Nifty500'
-}
-
-def process_csv_data(csv_file_path, source_list_name):
-    """Reads a CSV file and returns a list of dictionaries with instrument details."""
-    data = []
-    try:
-        df = pd.read_csv(csv_file_path)
-        for index, row in df.iterrows():
-            symbol = row['Symbol']
-            company_name = row['Company Name']
-            sector = row['Industry'] # Assuming 'Industry' column maps to 'sector'
-            data.append({
-                'symbol': symbol,
-                'company_name': company_name,
-                'sector': sector,
-                'source_list': source_list_name
-            })
-        logging.info(f"Successfully processed {len(data)} entries from {csv_file_path}.")
-    except FileNotFoundError:
-        logging.error(f"CSV file not found: {csv_file_path}")
-    except KeyError as e:
-        logging.error(f"Missing expected column in {csv_file_path}: {e}")
-    except Exception as e:
-        logging.error(f"Error processing {csv_file_path}: {e}")
-    return data
-
-@app.post("/broker/ingest-stock-data")
-async def ingest_stock_data_endpoint():
-    """
-    FastAPI endpoint to trigger the stock market instrument data ingestion process.
-    """
-    logging.info("FastAPI endpoint /ingest-stock-data triggered.")
-    
-    all_csv_entries = []
-    for file_path, source_name in CSV_FILES.items():
-        all_csv_entries.extend(process_csv_data(file_path, source_name))
-
-    if not all_csv_entries:
-        logging.error("No data processed from CSV files. Aborting ingestion.")
-        raise HTTPException(status_code=500, detail="No data processed from CSV files.")
-
-    conn = None
-    try:
-        conn = get_db_connection()
-        kite_instruments_data = {}
-        with conn.cursor(cursor_factory=extras.DictCursor) as cur:
-            cur.execute(
-                "SELECT tradingsymbol, instrument_token, instrument_type FROM kite_instruments WHERE instrument_type = 'EQ' AND exchange = 'NSE';"
-            )
-            kite_instruments_data = {row['tradingsymbol']: row for row in cur.fetchall()}
-            logging.info(f"Fetched {len(kite_instruments_data)} equity instruments from kite_instruments.")
-        
-        if not kite_instruments_data:
-            logging.warning("No equity instruments found in kite_instruments table. Synchronization will not proceed.")
-            raise HTTPException(status_code=500, detail="No equity instruments found in kite_instruments table.")
-
-        inserted_count = 0
-        unmatched_count = 0
-        
-        with conn.cursor() as cur:
-            for entry in all_csv_entries:
-                symbol = entry['symbol']
-                company_name = entry['company_name']
-                sector = entry['sector']
-                source_list = entry['source_list']
-
-                if symbol in kite_instruments_data:
-                    instrument_token = kite_instruments_data[symbol]['instrument_token']
-                    
-                    try:
-                        cur.execute(
-                            """
-                            INSERT INTO kite_ticker_tickers (instrument_token, tradingsymbol, company_name, sector, source_list)
-                            VALUES (%s, %s, %s, %s, %s)
-                            ON CONFLICT (instrument_token, source_list) DO NOTHING;
-                            """,
-                            (instrument_token, symbol, company_name, sector, source_list)
-                        )
-                        inserted_count += 1
-                        logging.debug(f"Inserted new record for {symbol} (Token: {instrument_token}, Source: {source_list})")
-                    except Exception as e:
-                        logging.error(f"Error inserting record for {symbol} (Token: {instrument_token}, Source: {source_list}): {e}")
-                else:
-                    unmatched_count += 1
-                    logging.warning(f"Symbol '{symbol}' from '{source_list}' not found in kite_instruments (instrument_type='EQ').")
-            
-            conn.commit()
-        logging.info(f"Data synchronization complete. Inserted {inserted_count} records. {unmatched_count} symbols were unmatched.")
-        return JSONResponse(content={"message": "Data ingestion and synchronization completed successfully.", "inserted_records": inserted_count, "unmatched_symbols": unmatched_count})
-
-    except Exception as e:
-        logging.critical(f"An unhandled error occurred during ingestion: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error during ingestion: {e}")
-    finally:
-        if conn:
-            conn.close()
-            logging.info("Database connection closed.")
-
-
-
 # Add CORS middleware for frontend (production: single allowed origin)
 app.add_middleware(
     CORSMiddleware,
@@ -599,542 +839,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
+
+@app.middleware("http")
+async def app_auth_guard(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS" or not path.startswith("/api") or auth_exempt_path(path):
+        return await call_next(request)
+
+    user = get_optional_app_user(request)
+    if user is None:
+        return JSONResponse(status_code=401, content={"detail": "App authentication required"})
+
+    request.state.app_user = user
+    return await call_next(request)
+
+@app.get("/", tags=["System"])
 async def root():
     return {"message": "Welcome to Kite App API!"}
-
-def clean_value(value_str):
-    """
-    Removes '%' and ',' from a string and converts it to a float.
-    Returns None if the string is empty or cannot be converted.
-    """
-    if not value_str:
-        return None
-    try:
-        return float(value_str.replace('%', '').replace(',', ''))
-    except ValueError:
-        logging.warning(f"Could not convert '{value_str}' to float.")
-        return None
-
-@app.post("/broker/update-nifty50-data")
-async def update_nifty50_data_endpoint():
-    """
-    Reads the nifty50_data.csv file and updates the corresponding
-    rows in the kite_ticker_tickers table.
-    """
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        with open('nifty50_data.csv', 'r', encoding='utf-8') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                ticker = row.get('Ticker')
-
-                # Skip rows that are not stocks (e.g., sector summaries)
-                if not ticker or not ticker.strip():
-                    continue
-
-                tradingsymbol = ticker.strip()
-                
-                # Prepare data for update
-                data_to_update = {
-                    'change_1d': clean_value(row.get('1D change')),
-                    'return_attribution': clean_value(row.get('Return attribution')),
-                    'index_weight': clean_value(row.get('Index weight')),
-                    'freefloat_marketcap': clean_value(row.get('Free float marketcap'))
-                }
-
-                # Construct and execute the UPDATE statement
-                update_query = """
-                    UPDATE kite_ticker_tickers
-                    SET
-                        change_1d = %(change_1d)s,
-                        return_attribution = %(return_attribution)s,
-                        index_weight = %(index_weight)s,
-                        freefloat_marketcap = %(freefloat_marketcap)s,
-                        last_updated = NOW()
-                    WHERE
-                        tradingsymbol = %(tradingsymbol)s AND source_list = 'Nifty50';
-                """
-                
-                params = {**data_to_update, 'tradingsymbol': tradingsymbol}
-                
-                cur.execute(update_query, params)
-
-                if cur.rowcount == 0:
-                    logging.warning(
-                        f"No row found for tradingsymbol '{tradingsymbol}' with source_list 'Nifty50'. "
-                        "The stock might not be in the database yet."
-                    )
-
-        conn.commit()
-        logging.info("Database update process for Nifty50 data completed successfully.")
-        return JSONResponse(content={"message": "Nifty50 data updated successfully."})
-
-    except FileNotFoundError:
-        logging.error("Error: nifty50_data.csv not found.")
-        raise HTTPException(status_code=500, detail="nifty50_data.csv not found.")
-    except Exception as e:
-        logging.error(f"An error occurred during the database update: {e}")
-        if conn:
-            conn.rollback()
-        raise HTTPException(status_code=500, detail=f"An error occurred during the database update: {e}")
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
-            logging.info("Database connection closed.")
-
- 
-
-
-@app.get("/broker/user/subscriptions")
-def get_subscriptions(scope: Optional[str] = Query(default=None, pattern="^(sidebar|marketwatch|nfo-charts|nfo-charts-layouts)$")):
-    """
-    GET /user/subscriptions
-    - If scope is provided, return {"subscriptions": settings_json.get(f"subscriptions_{scope}") or {}}
-    - If no scope, return legacy {"subscriptions": settings_json.get("subscriptions") or {}}
-    """
-    db = SessionLocal()
-    try:
-        settings = get_user_settings(db)
-        if scope:
-            value = settings.get(f"subscriptions_{scope}") or {}
-        else:
-            value = settings.get("subscriptions") or {}
-        return JSONResponse(content={"subscriptions": value})
-    finally:
-        db.close()
-
-@app.put("/broker/user/subscriptions")
-async def put_subscriptions(
-    request: Request,
-    scope: Optional[str] = Query(default=None, pattern="^(sidebar|marketwatch|nfo-charts|nfo-charts-layouts)$")
-):
-    """
-    PUT /user/subscriptions
-    - Accepts JSON body that must contain a top-level "subscriptions" object.
-    - If scope is provided, upsert into settings_json[f"subscriptions_{scope}"].
-    - If no scope, upsert into legacy "subscriptions".
-    """
-    body = await request.json()
-    subs = body.get("subscriptions")
-    if subs is None or not isinstance(subs, (dict, list)):
-        # Keep consistent error shape
-        raise HTTPException(status_code=400, detail="Body must contain a 'subscriptions' object")
-
-    db = SessionLocal()
-    try:
-        # Load full settings_json, mutate appropriate key, then persist
-        settings = get_user_settings(db) or {}
-        if scope:
-            settings[f"subscriptions_{scope}"] = subs
-        else:
-            settings["subscriptions"] = subs
-        update_user_settings(db, settings)
-        return JSONResponse(content={"status": "ok"})
-    finally:
-        db.close()
-
-@app.get("/broker/nifty50")
-async def get_nifty50_data():
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("SELECT * FROM kite_ticker_tickers WHERE source_list = 'Nifty50' ORDER BY sector")
-            
-            sectors = {}
-            for row in cur.fetchall():
-                sector = row['sector']
-                if sector not in sectors:
-                    sectors[sector] = []
-                sectors[sector].append(dict(row))
-            
-            return sectors
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn:
-            conn.close()
-
-
-@app.get(
-    "/broker/marketwatch/nifty50/overlay-snapshot",
-    response_model=OverlaySnapshotResponse,
-    summary="Get a snapshot of the latest live ticks from the Redis overlay cache.",
-    description="""
-    Fetches the most recent tick data for a given set of instrument tokens from a fast, ephemeral Redis cache.
-    This endpoint is designed to be called by the frontend to overlay live market data on top of a baseline.
-
-    - If no tokens are provided, it defaults to all tokens in the 'Nifty50' source list.
-    - It returns only the data available in the cache; missing tokens are omitted.
-    - If `change_percent` is not in the cached tick, it attempts to compute it using the baseline close price from the database.
-
-    **Example Usage:**
-    ```bash
-    # Fetch specific tokens
-    curl -G "http://localhost:8777/api/marketwatch/nifty50/overlay-snapshot" \
-      --data-urlencode "token=256265" \
-      --data-urlencode "token=738561"
-
-    # Fetch all Nifty50 tokens (default)
-    curl "http://localhost:8777/api/marketwatch/nifty50/overlay-snapshot"
-    ```
-    """
-)
-async def get_overlay_snapshot(
-    token: Optional[List[int]] = Query(None, description="List of instrument tokens to fetch.")
-):
-    if token and (len(token) == 0 or len(token) > 2000):
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "Invalid token count"}
-        )
-
-    conn = None
-    try:
-        redis_client = get_redis()
-        today_iso = datetime.utcnow().strftime("%Y-%m-%d")
-        
-        target_tokens = token
-        if not target_tokens:
-            conn = get_db_connection()
-            with conn.cursor() as cur:
-                cur.execute("SELECT instrument_token FROM kite_ticker_tickers WHERE source_list = 'Nifty50'")
-                target_tokens = [row[0] for row in cur.fetchall()]
-
-        keys = [f"marketwatch:overlay:{today_iso}:{t}" for t in target_tokens]
-        
-        try:
-            overlay_data_raw = await redis_client.mget(keys)
-        except redis.exceptions.ConnectionError:
-            logging.warning("Redis connection error in overlay snapshot; returning empty data.")
-            return {"status": "success", "data": {}}
-
-        results: Dict[str, OverlaySnapshotTick] = {}
-        tokens_missing_change = []
-
-        server_ts = int(datetime.utcnow().timestamp() * 1000)
-
-        for i, raw_val in enumerate(overlay_data_raw):
-            if raw_val is None:
-                continue
-            
-            try:
-                overlay_tick = json.loads(raw_val)
-                instrument_token = overlay_tick["instrument_token"]
-                tick_ts = overlay_tick.get("tick_timestamp")
-                
-                snapshot = OverlaySnapshotTick(
-                    instrument_token=instrument_token,
-                    last_price=overlay_tick["last_price"],
-                    change_percent=overlay_tick.get("change_percent"),
-                    tick_timestamp=tick_ts,
-                    server_timestamp=server_ts,
-                    age_ms=server_ts - tick_ts if tick_ts else None,
-                    source="ws"
-                )
-                results[str(instrument_token)] = snapshot
-
-                if snapshot.change_percent is None:
-                    tokens_missing_change.append(instrument_token)
-
-            except (json.JSONDecodeError, KeyError) as e:
-                logging.warning(f"Failed to parse overlay data for key {keys[i]}: {e}")
-                continue
-
-        if tokens_missing_change:
-            if conn is None:
-                conn = get_db_connection()
-            
-            try:
-                with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                    cur.execute(
-                        "SELECT instrument_token, last_close FROM kite_instruments WHERE instrument_token = ANY(%s)",
-                        (tokens_missing_change,)
-                    )
-                    baseline_closes = {row["instrument_token"]: row["last_close"] for row in cur.fetchall()}
-
-                for token_to_update in tokens_missing_change:
-                    baseline_close = baseline_closes.get(token_to_update)
-                    if baseline_close and baseline_close > 0:
-                        snapshot_to_update = results[str(token_to_update)]
-                        snapshot_to_update.change_percent = (
-                            100 * (snapshot_to_update.last_price / baseline_close - 1)
-                        )
-            except Exception as e:
-                logging.error(f"DB lookup for baseline close failed: {e}", exc_info=True)
-
-        return {"status": "success", "data": results}
-
-    except Exception as e:
-        logging.error(f"Error in overlay snapshot endpoint: {e}", exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": "Internal server error"}
-        )
-    finally:
-        if conn:
-            conn.close()
-
-
-@app.post("/broker/marketwatch/nifty50/finalize-baseline")
-async def finalize_nifty50_baseline(dry_run: bool = False, target_date: Optional[str] = Query(None, description="Target date in YYYY-MM-DD format. Defaults to the last trading day.")):
-    """
-    Computes and stores all derived baseline metrics for all Nifty 50 instruments for a specific date.
-    This endpoint can be used for daily updates or to backfill missed days.
-    """
-    conn = None
-    try:
-        # Determine the target date
-        nse = mcal.get_calendar('NSE')
-        if target_date:
-            process_date = datetime.strptime(target_date, "%Y-%m-%d").date()
-        else:
-            today = datetime.now(timezone('Asia/Kolkata')).date()
-            schedule = nse.schedule(start_date=today - timedelta(days=10), end_date=today)
-            process_date = schedule.index[-1].date()
-
-        schedule_back = nse.schedule(start_date=process_date - timedelta(days=10), end_date=process_date)
-        if len(schedule_back) < 2:
-            raise HTTPException(status_code=400, detail="Not enough historical trading days to calculate change.")
-        prev_trading_date = schedule_back.index[-2].date()
-
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("SELECT instrument_token, tradingsymbol, freefloat_marketcap, index_weight FROM kite_ticker_tickers WHERE source_list = 'Nifty50'")
-            instruments = cur.fetchall()
-
-        db = SessionLocal()
-        try:
-            access_token = get_system_access_token(db)
-            if not access_token:
-                raise HTTPException(status_code=500, detail="System access token not available.")
-            kite = KiteConnect(api_key=API_KEY)
-            kite.set_access_token(access_token)
-        finally:
-            db.close()
-
-        updates = []
-        total_new_marketcap = 0
-        
-        # First pass: calculate individual metrics
-        for inst in instruments:
-            try:
-                hist_data = kite.historical_data(inst['instrument_token'], from_date=prev_trading_date, to_date=process_date, interval='day')
-                if len(hist_data) < 2: continue
-
-                today_data = next((d for d in hist_data if d['date'].date() == process_date), None)
-                prev_day_data = next((d for d in hist_data if d['date'].date() == prev_trading_date), None)
-
-                if not today_data or not prev_day_data: continue
-
-                baseline_close = today_data['close']
-                previous_close = prev_day_data['close']
-                change_1d = 0
-                if previous_close > 0:
-                    change_1d = (baseline_close / previous_close) - 1
-                
-                new_freefloat_marketcap = (inst['freefloat_marketcap'] or 0) * (1 + change_1d)
-                return_attribution = (inst['index_weight'] or 0) * change_1d
-                
-                total_new_marketcap += new_freefloat_marketcap
-
-                updates.append({
-                    "instrument_token": inst['instrument_token'],
-                    "change_1d": change_1d * 100,
-                    "previous_close": previous_close,
-                    "baseline_close": baseline_close,
-                    "freefloat_marketcap": new_freefloat_marketcap,
-                    "return_attribution": return_attribution,
-                    "index_weight": 0 # Placeholder for now
-                })
-            except Exception as e:
-                logging.warning(f"Could not process instrument {inst['tradingsymbol']}: {e}")
-                continue
-        
-        # Second pass: calculate new index weight
-        if total_new_marketcap > 0:
-            for update in updates:
-                update['index_weight'] = (update['freefloat_marketcap'] / total_new_marketcap) * 100
-
-        if dry_run:
-            return {"status": "success", "preview": updates}
-
-        with conn.cursor() as cur:
-            update_query = """
-                UPDATE kite_ticker_tickers
-                SET
-                    change_1d = %(change_1d)s,
-                    previous_close = %(previous_close)s,
-                    baseline_close = %(baseline_close)s,
-                    freefloat_marketcap = %(freefloat_marketcap)s,
-                    return_attribution = %(return_attribution)s,
-                    index_weight = %(index_weight)s,
-                    last_updated = NOW()
-                WHERE
-                    instrument_token = %(instrument_token)s AND source_list = 'Nifty50';
-            """
-            psycopg2.extras.execute_batch(cur, update_query, updates)
-        
-        conn.commit()
-        
-        return {"status": "success", "data": {"updated": len(updates), "skipped": len(instruments) - len(updates), "errors": []}}
-
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn:
-            conn.close()
-
-
-@app.websocket("/broker/ws/marketwatch")
-async def websocket_endpoint(websocket: WebSocket):
-    await ws_manager.connect(websocket)
-    # Auto-subscribe on connect (aggregate across legacy + scoped namespaces)
-    db = SessionLocal()
-    try:
-        settings = get_user_settings(db) or {}
-
-        def _extract_tokens_from_subs(_subs: dict) -> int:
-            """
-            Extract tokens from a subscriptions object using tolerant parsing.
-            Returns count added into outer token_set.
-            """
-            if not _subs or not isinstance(_subs, dict):
-                return 0
-            token_count = 0
-            # Handle `groups` structure (marketwatch, sidebar, nfo-charts union)
-            for group in _subs.get("groups", []) or []:
-                if not group or not isinstance(group, dict):
-                    continue
-                # Prefer explicit 'tokens' array
-                if isinstance(group.get("tokens"), list):
-                    for t in group["tokens"]:
-                        try:
-                            token_set.add(int(t))
-                            token_count += 1
-                        except (ValueError, TypeError):
-                            pass
-                # Fallback to instruments array
-                elif isinstance(group.get("instruments"), list):
-                    for inst in group["instruments"]:
-                        if not inst or not isinstance(inst, dict):
-                            continue
-                        token = inst.get("instrument_token") or inst.get("token")
-                        if token is None:
-                            continue
-                        try:
-                            token_set.add(int(token))
-                            token_count += 1
-                        except (ValueError, TypeError):
-                            pass
-            
-            # Handle `layouts` structure (nfo-charts-layouts)
-            if isinstance(_subs.get("layouts"), dict):
-                for layout_key, tokens in _subs["layouts"].items():
-                    if isinstance(tokens, list):
-                        for t in tokens:
-                            if t is not None:
-                                try:
-                                    token_set.add(int(t))
-                                    token_count += 1
-                                except (ValueError, TypeError):
-                                    pass
-            return token_count
-
-        token_set: set[int] = set()
-        # Legacy
-        legacy = settings.get("subscriptions")
-        if isinstance(legacy, dict):
-            c = _extract_tokens_from_subs(legacy)
-            logging.info("[WS auto-restore] Loaded %d tokens from legacy 'subscriptions'", c)
-
-        # Sidebar
-        sb = settings.get("subscriptions_sidebar")
-        if isinstance(sb, dict):
-            c = _extract_tokens_from_subs(sb)
-            logging.info("[WS auto-restore] Loaded %d tokens from 'subscriptions_sidebar'", c)
-
-        # Marketwatch
-        mw = settings.get("subscriptions_marketwatch")
-        if isinstance(mw, dict):
-            c = _extract_tokens_from_subs(mw)
-            logging.info("[WS auto-restore] Loaded %d tokens from 'subscriptions_marketwatch'", c)
-
-        # NFO Charts Union
-        nfo = settings.get("subscriptions_nfo-charts")
-        if isinstance(nfo, dict):
-            c = _extract_tokens_from_subs(nfo)
-            logging.info("[WS auto-restore] Loaded %d tokens from 'subscriptions_nfo-charts'", c)
-
-        # NFO Charts Layouts
-        nfo_layouts = settings.get("subscriptions_nfo-charts-layouts")
-        if isinstance(nfo_layouts, dict):
-            c = _extract_tokens_from_subs(nfo_layouts)
-            logging.info("[WS auto-restore] Loaded %d tokens from 'subscriptions_nfo-charts-layouts'", c)
-
-        all_tokens = list(token_set)
-        if all_tokens:
-            # Validate mode from any available section, fallback to 'quote'. Prioritize 'full' for NFO charts.
-            mode = None
-            for candidate in (nfo, nfo_layouts, legacy, sb, mw):
-                if isinstance(candidate, dict):
-                    m = candidate.get("mode")
-                    if m in {"ltp", "quote", "full"}:
-                        mode = m
-                        if mode == 'full': # Prioritize full mode if found
-                            break
-            if mode not in {"ltp", "quote", "full"}:
-                mode = "quote"
-
-            await ws_manager.subscribe(websocket, all_tokens, mode)
-            logging.info("[WS auto-restore] Auto-subscribed client to %d unique tokens on connect (mode=%s).", len(all_tokens), mode)
-    finally:
-        db.close()
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-            action = data.get("action")
-            if not action:
-                await websocket.send_text(json.dumps({"type": "error", "message": "Missing action"}))
-                continue
-
-            if action == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
-                continue
-
-            tokens = data.get("tokens") or []
-            mode = data.get("mode")
-
-            if tokens and isinstance(tokens, list):
-                try:
-                    tokens = [int(t) for t in tokens]
-                except Exception:
-                    await websocket.send_text(json.dumps({"type": "error", "message": "Invalid tokens"}))
-                    continue
-
-            if action == "subscribe" and tokens:
-                await ws_manager.subscribe(websocket, tokens, mode)
-            elif action == "unsubscribe" and tokens:
-                await ws_manager.unsubscribe(websocket, tokens)
-            elif action == "set_mode" and tokens and mode:
-                await ws_manager.set_mode(websocket, tokens, mode)
-            else:
-                await websocket.send_text(json.dumps({"type": "error", "message": "Invalid action"}))
-    except WebSocketDisconnect:
-        ws_manager.disconnect(websocket)
-        logging.info("Client disconnected.")
-    except Exception as e:
-        logging.error(f"Error in websocket endpoint: {e}", exc_info=True)
-        ws_manager.disconnect(websocket)
 
 # ───────── Daily token gate and scheduler ─────────
 async def ensure_daily_token_ready(timeout: float = 900.0) -> None:
@@ -1154,29 +875,41 @@ async def ensure_daily_token_ready(timeout: float = 900.0) -> None:
 async def daily_token_scheduler() -> None:
     """
     Runs forever:
-      - Sleeps until 07:31 Asia/Kolkata
+      - Sleeps until 08:00 Asia/Kolkata
       - Clears gate, performs headless login + persist 'system' token with retries
       - Sets gate on success
       - Triggers dependent daily jobs (e.g., instruments refresh)
     """
     tz = ZoneInfo("Asia/Kolkata")
+    set_component_status("daily_token_scheduler", "healthy", detail="Daily token scheduler started")
     while True:
         try:
             now = datetime.now(tz)
-            next_run = now.replace(hour=7, minute=31, second=0, microsecond=0)
+            next_run = now.replace(hour=8, minute=0, second=0, microsecond=0)
             if now >= next_run:
                 next_run += timedelta(days=1)
             sleep_sec = max(1, int((next_run - now).total_seconds()))
             logging.info("[SCHED] Next daily headless login scheduled at %s", next_run.strftime("%Y-%m-%d %H:%M:%S %Z%z"))
+            set_meta("daily_token_scheduler", {
+                "next_run": next_run.isoformat(),
+                "sleep_seconds": sleep_sec,
+                "last_heartbeat": datetime.utcnow().isoformat(),
+            })
+            heartbeat("daily_token_scheduler", detail="Scheduler sleeping until next run", meta={"next_run": next_run.isoformat()})
             await asyncio.sleep(sleep_sec)
 
             # Begin rotation
-            logging.info("[SCHED] 07:31 IST reached; clearing gate and refreshing system token")
+            logging.info("[SCHED] 08:00 IST reached; clearing gate and refreshing system token")
             daily_token_ready.clear()
+            set_meta("daily_token_gate", {"ready": False, "last_changed_at": datetime.utcnow().isoformat()})
+            set_component_status("daily_token_scheduler", "running", detail="Refreshing daily system token")
 
             # Retry loop until success
+            retry_count = 0
             while True:
                 try:
+                    retry_count += 1
+                    heartbeat("daily_token_scheduler", detail="Attempting headless broker login", meta={"attempt": retry_count})
                     db = SessionLocal()
                     try:
                         fp = run_headless_login_and_persist_system_token(db)
@@ -1184,23 +917,112 @@ async def daily_token_scheduler() -> None:
                     finally:
                         db.close()
                     logging.info("[SCHED] System access_token rotated (..%s)", fp)
+                    set_meta("daily_broker_login", {
+                        "mode": "daily_scheduler",
+                        "status": "healthy",
+                        "last_success_at": datetime.utcnow().isoformat(),
+                        "attempts": retry_count,
+                        "token_suffix": fp,
+                    })
                     break
                 except Exception as e:
                     logging.warning("[SCHED] Headless login failed: %s; retrying in 30s", e)
+                    set_component_status("daily_token_scheduler", "degraded", detail=f"Headless login failed: {e}", meta={"attempt": retry_count})
+                    set_meta("daily_broker_login", {
+                        "mode": "daily_scheduler",
+                        "status": "degraded",
+                        "last_error": str(e),
+                        "last_failure_at": datetime.utcnow().isoformat(),
+                        "attempts": retry_count,
+                    })
                     await asyncio.sleep(30)
 
             # Open gate
             daily_token_ready.set()
             logging.info("[GATE] Opened after successful token refresh")
+            set_meta("daily_token_gate", {"ready": True, "last_changed_at": datetime.utcnow().isoformat()})
+            set_component_status("daily_token_scheduler", "healthy", detail="Daily token refresh completed")
 
             # Kick off dependent daily jobs (fire-and-forget)
             # No dependent jobs for token refresh; other schedulers handle their own updates.
 
         except asyncio.CancelledError:
             logging.info("[SCHED] Daily token scheduler cancelled")
+            if not daily_token_ready.is_set():
+                daily_token_ready.set()
+                set_meta("daily_token_gate", {"ready": True, "last_changed_at": datetime.utcnow().isoformat()})
+            set_component_status("daily_token_scheduler", "stopped", detail="Daily token scheduler cancelled")
             break
         except Exception as e:
             logging.error("[SCHED] Scheduler loop error: %s", e, exc_info=True)
+            set_component_status("daily_token_scheduler", "degraded", detail=str(e))
             await asyncio.sleep(30)
 
 
+async def monthly_index_refresh_scheduler() -> None:
+    tz = ZoneInfo("Asia/Kolkata")
+    source_lists = list_supported_index_source_lists()
+    set_component_status("index_refresh_scheduler", "healthy", detail="Monthly index refresh scheduler started")
+    while True:
+        try:
+            persisted_state = await asyncio.to_thread(get_index_refresh_state, "Nifty50")
+            persisted_month = None
+            persisted_refresh_at = persisted_state.get("last_constituent_refresh_at")
+            if persisted_refresh_at:
+                persisted_month = persisted_refresh_at.astimezone(tz).strftime("%Y-%m")
+            now = datetime.now(tz)
+            next_run = now.replace(hour=6, minute=30, second=0, microsecond=0)
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            sleep_sec = max(1, int((next_run - now).total_seconds()))
+            set_meta(
+                "index_refresh_scheduler",
+                {
+                    "next_run": next_run.isoformat(),
+                    "sleep_seconds": sleep_sec,
+                    "last_success_month": persisted_month,
+                    "source_lists": source_lists,
+                },
+            )
+            heartbeat(
+                "index_refresh_scheduler",
+                detail="Scheduler sleeping until next refresh window",
+                meta={"next_run": next_run.isoformat(), "last_success_month": persisted_month},
+            )
+            await asyncio.sleep(sleep_sec)
+
+            month_key = datetime.now(tz).strftime("%Y-%m")
+            if month_key == persisted_month:
+                continue
+
+            set_component_status("index_refresh_scheduler", "running", detail=f"Refreshing official index datasets for {month_key}")
+            result = await asyncio.to_thread(refresh_supported_indices, source_lists)
+            if result.get("status") == "error":
+                raise RuntimeError(json.dumps(result))
+            runtime_result = await asyncio.to_thread(refresh_live_metrics_for_indices, source_lists)
+
+            set_meta(
+                "index_refresh_scheduler",
+                {
+                    "last_success_month": month_key,
+                    "last_success_at": datetime.utcnow().isoformat(),
+                    "last_result": result,
+                    "last_runtime_result": runtime_result,
+                },
+            )
+            set_component_status("index_refresh_scheduler", "healthy", detail=f"Monthly index refresh completed for {month_key}")
+        except asyncio.CancelledError:
+            set_component_status("index_refresh_scheduler", "stopped", detail="Monthly index refresh scheduler cancelled")
+            break
+        except Exception as e:
+            logging.error("[SCHED] Monthly index refresh failed: %s", e, exc_info=True)
+            set_component_status("index_refresh_scheduler", "degraded", detail=str(e))
+            set_meta(
+                "index_refresh_scheduler",
+                {
+                    "last_failure_at": datetime.utcnow().isoformat(),
+                    "last_error": str(e),
+                    "last_success_month": persisted_month,
+                },
+            )
+            await asyncio.sleep(300)

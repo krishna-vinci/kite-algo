@@ -78,19 +78,28 @@ async def pubsub_iter(channel: str) -> AsyncIterator[Dict]:
                 f"Redis connection lost. Reconnecting in {retry_delay}s..."
             )
             if pubsub:
-                await pubsub.close()
+                try:
+                    await pubsub.aclose()
+                except Exception:
+                    pass
                 pubsub = None
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 30)  # Exponential backoff up to 30s
         except asyncio.CancelledError:
             logger.info("[ALERTS-SSE] Client disconnected, cleaning up pubsub.")
             if pubsub:
-                await pubsub.unsubscribe(channel)
-                await pubsub.close()
+                try:
+                    await pubsub.unsubscribe(channel)
+                    await pubsub.aclose()
+                except Exception:
+                    pass
             break
         except Exception:
             logger.exception("An unexpected error occurred in pubsub iterator.")
             if pubsub:
-                await pubsub.close()
+                try:
+                    await pubsub.aclose()
+                except Exception:
+                    pass
                 pubsub = None
             await asyncio.sleep(5)

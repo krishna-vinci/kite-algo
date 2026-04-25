@@ -47,6 +47,25 @@ def create_tables_if_not_exists(conn):
     
     # Create Position Protection System tables if they don't exist
     _create_position_protection_tables(conn)
+    _ensure_option_strategy_runs_compatibility(conn)
+
+
+def _ensure_option_strategy_runs_compatibility(conn):
+    """Backfill additive columns for older option_strategy_runs tables."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                ALTER TABLE public.option_strategy_runs
+                ADD COLUMN IF NOT EXISTS algo_instance_id TEXT
+                """
+            )
+        conn.commit()
+        logging.info("Option strategy run compatibility checks applied successfully.")
+    except Exception as e:
+        logging.error(f"Error applying option strategy compatibility checks: {e}")
+        conn.rollback()
+        raise
 
 def _create_position_protection_tables(conn):
     """Creates Position Protection System tables if they don't exist."""
@@ -167,6 +186,9 @@ def _create_position_protection_tables(conn):
             cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_events_created_at ON strategy_events(created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_events_type ON strategy_events(event_type)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_events_order_id ON strategy_events(order_id) WHERE order_id IS NOT NULL")
+            
+            # Ensure correlation_id column exists (migration fix)
+            cur.execute("ALTER TABLE strategy_events ADD COLUMN IF NOT EXISTS correlation_id TEXT")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_strategy_events_correlation_id ON strategy_events(correlation_id) WHERE correlation_id IS NOT NULL")
         
         conn.commit()
@@ -223,10 +245,29 @@ database = Database(DATABASE_URL)
 # ───────── User Settings ─────────
 import json
 
+
+def _ensure_user_settings_table(db_session) -> None:
+    """Ensure the user_settings table exists before accessing it."""
+    from sqlalchemy import text
+
+    db_session.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS public.user_settings (
+                owner_id VARCHAR(255) PRIMARY KEY DEFAULT 'default',
+                settings_json JSONB,
+                last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+            """
+        )
+    )
+    db_session.commit()
+
 def get_user_settings(db_session, owner_id: str = "default") -> dict:
     """Fetches user settings JSON from the database."""
     from sqlalchemy import text
     try:
+        _ensure_user_settings_table(db_session)
         stmt = text("SELECT settings_json FROM user_settings WHERE owner_id = :owner_id")
         result = db_session.execute(stmt, {"owner_id": owner_id}).fetchone()
         if result and result[0]:
@@ -239,6 +280,7 @@ def update_user_settings(db_session, settings: dict, owner_id: str = "default"):
     """Upserts user settings JSON to the database."""
     from sqlalchemy import text
     try:
+        _ensure_user_settings_table(db_session)
         stmt = text("""
             INSERT INTO user_settings (owner_id, settings_json, last_updated)
             VALUES (:owner_id, :settings, NOW())

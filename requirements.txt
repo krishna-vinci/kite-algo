@@ -23,6 +23,7 @@ yfinance
 jinja2
 python-multipart
 asyncpg
+alembic
 kiteconnect
 indexed-gzip
 fastmcp
@@ -30,3 +31,5 @@ meilisearch>=0.31.0
 redis
 mibian
 numba
+PyJWT
+pytest
