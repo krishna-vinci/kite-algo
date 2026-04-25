@@ -16,6 +16,10 @@ from broker_api.order_runtime import (
 )
 
 
+async def _run_to_thread_inline(func, /, *args, **kwargs):
+    return func(*args, **kwargs)
+
+
 class FakeResult:
     def __init__(self, rows=None, one=None, scalar=None):
         self._rows = rows or []
@@ -384,6 +388,37 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel, service._channel(account_id))
         self.assertEqual(payload["reason"], "tick")
         self.assertEqual(payload["positions"][position_key]["pnl"], 40.0)
+
+    async def test_sync_dirty_orders_projects_live_fills_after_trade_sync(self):
+        runtime = CanonicalOrderEventRuntime()
+        dirty_row = SimpleNamespace(account_id="kite:AB1234", order_id="OID-1")
+        db = MagicMock()
+        db.execute.side_effect = [FakeResult(rows=[dirty_row]), FakeResult()]
+        positions_service = SimpleNamespace(
+            sync_account_cache_from_db=AsyncMock(),
+            publish_snapshot=AsyncMock(),
+        )
+        kite = SimpleNamespace(order_trades=MagicMock(return_value=[{"trade_id": "T1", "order_id": "OID-1"}]))
+
+        with patch("broker_api.order_runtime._acquire_advisory_lock_session", AsyncMock(return_value=db)), patch(
+            "broker_api.order_runtime._release_advisory_lock"
+        ), patch("broker_api.order_runtime._close_locked_session"), patch.object(
+            runtime, "_store_trade_fills", return_value=1
+        ), patch.object(
+            runtime, "_apply_pending_trade_fills", return_value=1
+        ), patch("broker_api.order_runtime.asyncio.to_thread", _run_to_thread_inline), patch(
+            "broker_api.order_runtime.LiveJournalProjector"
+        ) as projector_cls:
+            projector = MagicMock()
+            projector.project.return_value = {"projected": 1, "imported": 0}
+            projector_cls.return_value = projector
+
+            synced = await runtime.sync_dirty_orders(kite, positions_service, batch_size=25)
+
+        self.assertEqual(synced, 1)
+        positions_service.sync_account_cache_from_db.assert_awaited_once_with("kite:AB1234")
+        positions_service.publish_snapshot.assert_awaited_once_with("kite:AB1234", reason="trade_sync")
+        projector.project.assert_called_once_with(batch_size=50)
 
 
 class InstrumentsRepositoryTests(unittest.TestCase):

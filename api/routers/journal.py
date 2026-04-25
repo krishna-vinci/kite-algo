@@ -212,6 +212,7 @@ def get_run_detail(run_id: str, request: Request):
 def list_runs(
     request: Request,
     strategy_family: Optional[StrategyFamily] = Query(None),
+    execution_mode: Optional[ExecutionMode] = Query(None),
     status: Optional[JournalRunStatus] = Query(None),
     review_state: Optional[ReviewState] = Query(None),
     page: int = Query(1, ge=1),
@@ -221,6 +222,7 @@ def list_runs(
     service = get_journal_service(request)
     return service.list_runs_page(
         strategy_family=strategy_family,
+        execution_mode=execution_mode,
         status=status,
         review_state=review_state,
         page=page,
@@ -347,12 +349,13 @@ def list_trades(
 def list_strategies(
     request: Request,
     strategy_family: Optional[StrategyFamily] = Query(None),
+    execution_mode: Optional[ExecutionMode] = Query(None),
     limit: int = Query(100, ge=1, le=500),
 ):
     require_app_user(request)
     service = get_journal_service(request)
     return {
-        "items": service.list_strategies(strategy_family=strategy_family, limit=limit)
+        "items": service.list_strategies(strategy_family=strategy_family, execution_mode=execution_mode, limit=limit)
     }
 
 

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -27,7 +28,14 @@ DEFAULT_WORKER_ACTIONS = {
     "runs:exit",
     "heartbeat",
 }
-ALLOWED_V1_MODES = {"paper", "dry_run"}
+ALLOWED_V1_MODES = {"paper", "dry_run", "live"}
+LIVE_REQUIRED_RUN_METADATA = {"strategy_family", "strategy_name"}
+VALID_WORKER_STRATEGY_FAMILIES = {
+    "options_strategy",
+    "indicator_strategy",
+    "investment_strategy",
+    "discretionary_strategy",
+}
 
 
 def _utcnow() -> datetime:
@@ -158,6 +166,7 @@ class WorkerIntentRequest(BaseModel):
 class WorkerExitRequest(BaseModel):
     reason: Optional[str] = None
     idempotency_key: Optional[str] = None
+    dry_run: bool = False
 
 
 @dataclass
@@ -205,6 +214,9 @@ class SqlAlchemyAlgoWorkerRepository:
 
     async def update_run_status(self, strategy_run_id: str, status: str, *, state_patch: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._update_run_status_sync, strategy_run_id, status, state_patch)
+
+    async def list_live_strategy_open_legs(self, *, strategy_run_id: str, account_id: str) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._list_live_strategy_open_legs_sync, strategy_run_id, account_id)
 
     async def get_intent_result(self, strategy_run_id: str, idempotency_key: str) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._get_intent_result_sync, strategy_run_id, idempotency_key)
@@ -476,6 +488,61 @@ class SqlAlchemyAlgoWorkerRepository:
         finally:
             db.close()
 
+    def _list_live_strategy_open_legs_sync(self, strategy_run_id: str, account_id: str) -> List[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    WITH leg_facts AS (
+                        SELECT
+                            jr.id AS journal_run_id,
+                            jr.account_ref AS account_id,
+                            CAST(NULLIF(jef.payload_json -> 'broker_fill' ->> 'instrument_token', '') AS BIGINT) AS instrument_token,
+                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'exchange', '') AS exchange,
+                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'tradingsymbol', '') AS tradingsymbol,
+                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'product', '') AS product,
+                            SUM(CASE WHEN UPPER(jef.side) = 'BUY' THEN jef.quantity ELSE -jef.quantity END) AS net_quantity
+                        FROM public.journal_source_links jsl
+                        INNER JOIN public.journal_runs jr ON jr.id = jsl.run_id
+                        INNER JOIN public.journal_execution_facts jef ON jef.run_id = jr.id
+                        WHERE jsl.source_type = 'live_order'
+                          AND jsl.source_key = :strategy_run_id
+                          AND jr.execution_mode = 'live'
+                          AND jr.account_ref = :account_id
+                          AND jef.source_type = 'live_fill'
+                        GROUP BY
+                            jr.id,
+                            jr.account_ref,
+                            CAST(NULLIF(jef.payload_json -> 'broker_fill' ->> 'instrument_token', '') AS BIGINT),
+                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'exchange', ''),
+                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'tradingsymbol', ''),
+                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'product', '')
+                    )
+                    SELECT
+                        lf.journal_run_id,
+                        lf.account_id,
+                        lf.instrument_token,
+                        lf.exchange,
+                        lf.tradingsymbol,
+                        lf.product,
+                        lf.net_quantity,
+                        ap.net_quantity AS broker_net_quantity
+                    FROM leg_facts lf
+                    LEFT JOIN public.account_positions ap
+                      ON ap.account_id = lf.account_id
+                     AND ap.instrument_token = lf.instrument_token
+                     AND ap.product = lf.product
+                    WHERE lf.net_quantity <> 0
+                    ORDER BY lf.exchange, lf.tradingsymbol, lf.product
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id, "account_id": account_id},
+            ).mappings().all()
+            return [_row_mapping(row) for row in rows]
+        finally:
+            db.close()
+
     def _get_intent_result_sync(self, strategy_run_id: str, idempotency_key: str) -> Optional[Dict[str, Any]]:
         db = self.session_factory()
         try:
@@ -602,7 +669,318 @@ def _require_action(token: WorkerToken, action: str) -> None:
 def _require_v1_mode(mode: str) -> None:
     normalized = str(mode or "").strip().lower()
     if normalized not in ALLOWED_V1_MODES:
-        raise HTTPException(status_code=403, detail="Algo worker API v1 allows only paper and dry_run execution modes")
+        raise HTTPException(status_code=403, detail="Algo worker API allows only paper, dry_run, and explicitly enabled live execution modes")
+
+
+def _broker_user_id_from_account_scope(account_scope: str) -> str:
+    scope = str(account_scope or "").strip()
+    if not scope.startswith("kite:"):
+        raise HTTPException(status_code=400, detail="Live worker execution requires a kite:<broker_user_id> account_scope")
+    broker_user_id = scope.split(":", 1)[1].strip()
+    if not broker_user_id:
+        raise HTTPException(status_code=400, detail="Live worker execution requires a broker user id in account_scope")
+    if "paper" in broker_user_id.lower():
+        raise HTTPException(status_code=400, detail="Live worker execution requires a real broker account_scope, not a paper account scope")
+    return broker_user_id
+
+
+def _validate_live_run_contract(*, account_scope: str, metadata: Dict[str, Any]) -> None:
+    _broker_user_id_from_account_scope(account_scope)
+    missing = sorted(key for key in LIVE_REQUIRED_RUN_METADATA if not str(metadata.get(key) or "").strip())
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Live worker runs require metadata fields: {', '.join(missing)}",
+        )
+    strategy_family = str(metadata.get("strategy_family") or "").strip()
+    if strategy_family not in VALID_WORKER_STRATEGY_FAMILIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Live worker metadata.strategy_family must be one of: {', '.join(sorted(VALID_WORKER_STRATEGY_FAMILIES))}",
+        )
+
+
+def _load_live_kite_for_account(account_scope: str):
+    broker_user_id = _broker_user_id_from_account_scope(account_scope)
+    from broker_api.kite_session import build_kite_client
+
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT session_id, access_token
+                FROM public.kite_sessions
+                WHERE broker_user_id = :broker_user_id
+                  AND access_token IS NOT NULL
+                ORDER BY CASE WHEN session_id = 'system' THEN 0 ELSE 1 END, created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"broker_user_id": broker_user_id},
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=503, detail="No live Kite broker session is available for this worker account_scope")
+        return build_kite_client(str(row[1]), session_id=str(row[0]))
+    finally:
+        db.close()
+
+
+def _live_attribution_for_worker_intent(*, token: WorkerToken, run: Dict[str, Any], request: WorkerIntentRequest) -> Dict[str, Any]:
+    metadata = dict(run.get("metadata") or {})
+    account_scope = str(run.get("account_scope") or token.account_scope or "")
+    _validate_live_run_contract(account_scope=account_scope, metadata=metadata)
+    return {
+        "strategy_run_id": str(run["strategy_run_id"]),
+        "strategy_family": str(metadata["strategy_family"]),
+        "strategy_name": str(metadata["strategy_name"]),
+        "execution_mode": "live",
+        "account_ref": account_scope,
+        "entry_surface": str(metadata.get("entry_surface") or "algo_worker"),
+        "journal_run_id": metadata.get("journal_run_id") or None,
+        "source": "algo_worker",
+        "idempotency_key": request.idempotency_key,
+        "metadata": {
+            "token_id": token.token_id,
+            "template_id": run.get("template_id"),
+            "worker_run_metadata": metadata,
+            "intent_metadata": request.metadata,
+        },
+    }
+
+
+def _inject_live_attribution(order_payload: Dict[str, Any], attribution: Dict[str, Any]) -> Dict[str, Any]:
+    order = dict(order_payload)
+    order["attribution"] = dict(attribution)
+    return order
+
+
+async def _submit_live_worker_intent(*, request: Request, token: WorkerToken, run: Dict[str, Any], payload: WorkerIntentRequest) -> Dict[str, Any]:
+    from broker_api.kite_orders import BasketOrderRequest, OrdersService, PlaceOrderRequest
+
+    orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+    kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
+    corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-live-{uuid.uuid4()}"
+    worker_session_id = f"worker:{token.token_id}:{run['strategy_run_id']}"
+    attribution = _live_attribution_for_worker_intent(token=token, run=run, request=payload)
+
+    if payload.intent_type == "place_order":
+        order_payload = payload.payload.get("order") or payload.payload
+        req = PlaceOrderRequest.model_validate(_inject_live_attribution(order_payload, attribution))
+        result = await orders_service.place_order(
+            kite,
+            req,
+            corr_id,
+            idempotency_key=payload.idempotency_key,
+            session_id=worker_session_id,
+            response=Response(),
+        )
+        return {"mode": "live", "intent_type": payload.intent_type, "result": result.model_dump(mode="json")}
+
+    if payload.intent_type == "place_basket":
+        basket_payload = dict(payload.payload.get("basket") or payload.payload)
+        orders = [_inject_live_attribution(order, attribution) for order in basket_payload.get("orders") or []]
+        basket_payload["orders"] = orders
+        req = BasketOrderRequest.model_validate(basket_payload)
+        result = await orders_service.place_basket(
+            kite,
+            req,
+            corr_id,
+            session_id=worker_session_id,
+            idempotency_key=payload.idempotency_key,
+            response=Response(),
+        )
+        return {"mode": "live", "intent_type": payload.intent_type, "result": result.model_dump(mode="json")}
+
+    raise HTTPException(status_code=400, detail=f"Unsupported intent_type '{payload.intent_type}'")
+
+
+async def _refresh_live_account_state(*, kite: Any, account_id: str, corr_id: str) -> Dict[str, Any]:
+    from broker_api.kite_orders import order_event_runtime, realtime_positions_service
+
+    refresh_result: Dict[str, Any] = {"account_id": account_id}
+    try:
+        refresh_result["reconciled_positions"] = await realtime_positions_service.reconcile_account_positions(kite, account_id, corr_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Unable to reconcile live broker positions before exit: {exc}") from exc
+
+    try:
+        refresh_result["synced_dirty_orders"] = await order_event_runtime.sync_dirty_orders(kite, realtime_positions_service, batch_size=25)
+    except Exception as exc:
+        refresh_result["sync_warning"] = str(exc)
+    return refresh_result
+
+
+def _validate_live_exit_legs(legs: List[Dict[str, Any]]) -> None:
+    for leg in legs:
+        net_quantity = int(leg.get("net_quantity") or 0)
+        broker_net_quantity = leg.get("broker_net_quantity")
+        if not leg.get("exchange") or not leg.get("tradingsymbol") or not leg.get("product") or not leg.get("instrument_token"):
+            raise HTTPException(status_code=409, detail="Live exit cannot proceed because one or more attributed legs is missing broker instrument metadata")
+        if broker_net_quantity is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Live exit cannot proceed because broker position is missing for {leg.get('exchange')}:{leg.get('tradingsymbol')} {leg.get('product')}",
+            )
+        broker_net = int(broker_net_quantity or 0)
+        if net_quantity > 0 and broker_net < net_quantity:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Live exit cannot proceed because broker net quantity for {leg.get('tradingsymbol')} is lower than the attributed long quantity",
+            )
+        if net_quantity < 0 and broker_net > net_quantity:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Live exit cannot proceed because broker net quantity for {leg.get('tradingsymbol')} is lower than the attributed short quantity",
+            )
+
+
+def _live_exit_orders_from_legs(legs: List[Dict[str, Any]], attribution: Dict[str, Any]) -> List[Dict[str, Any]]:
+    orders: List[Dict[str, Any]] = []
+    for leg in legs:
+        net_quantity = int(leg.get("net_quantity") or 0)
+        if net_quantity == 0:
+            continue
+        orders.append(
+            {
+                "exchange": str(leg["exchange"]),
+                "tradingsymbol": str(leg["tradingsymbol"]),
+                "transaction_type": "SELL" if net_quantity > 0 else "BUY",
+                "variety": "regular",
+                "product": str(leg["product"]),
+                "order_type": "MARKET",
+                "quantity": abs(net_quantity),
+                "validity": "DAY",
+                "attribution": dict(attribution),
+            }
+        )
+    return orders
+
+
+def _live_exit_idempotency_key(*, strategy_run_id: str, legs: List[Dict[str, Any]], supplied_key: Optional[str]) -> str:
+    if supplied_key:
+        return supplied_key
+    normalized = [
+        {
+            "instrument_token": int(leg.get("instrument_token") or 0),
+            "product": str(leg.get("product") or ""),
+            "net_quantity": int(leg.get("net_quantity") or 0),
+        }
+        for leg in legs
+    ]
+    digest = hashlib.sha1(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:12]
+    run_digest = hashlib.sha1(strategy_run_id.encode("utf-8")).hexdigest()[:8]
+    return f"live-exit:{run_digest}:{digest}"
+
+
+async def _exit_live_worker_run(*, request: Request, token: WorkerToken, run: Dict[str, Any], payload: WorkerExitRequest) -> Dict[str, Any]:
+    from broker_api.kite_orders import BasketOrderRequest, OrdersService
+
+    strategy_run_id = str(run["strategy_run_id"])
+    if str(run.get("status") or "") == "closed":
+        return {"mode": "live", "status": "closed", "message": "Live worker run is already closed", "run": run}
+
+    account_id = str(run["account_scope"])
+    kite = await asyncio.to_thread(_load_live_kite_for_account, account_id)
+    corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-live-exit-{uuid.uuid4()}"
+    refresh_result = await _refresh_live_account_state(kite=kite, account_id=account_id, corr_id=corr_id)
+    legs = await _repo(request).list_live_strategy_open_legs(strategy_run_id=strategy_run_id, account_id=account_id)
+
+    if not legs:
+        updated = await _repo(request).update_run_status(
+            strategy_run_id,
+            "closed",
+            state_patch={
+                "exit_reason": payload.reason or "live_worker_flat",
+                "live_exit_finalized_at": _utcnow().isoformat(),
+                "live_exit_flat_confirmation": {"source": "journal_live_fills", "refresh": refresh_result},
+            },
+        )
+        return {"mode": "live", "status": "closed", "message": "Live worker run is already flat", "run": updated}
+
+    _validate_live_exit_legs(legs)
+    exit_idempotency_key = _live_exit_idempotency_key(
+        strategy_run_id=strategy_run_id,
+        legs=legs,
+        supplied_key=payload.idempotency_key,
+    )
+    live_exit_state = dict((run.get("runtime_state") or {}).get("live_exit") or {})
+    if live_exit_state.get("idempotency_key") == exit_idempotency_key and live_exit_state.get("order_result"):
+        return {
+            "mode": "live",
+            "status": str(run.get("status") or "exiting"),
+            "message": "Live exit was already submitted for this position state",
+            "run": run,
+            "exit": live_exit_state,
+        }
+
+    attribution = _live_attribution_for_worker_intent(
+        token=token,
+        run=run,
+        request=WorkerIntentRequest(
+            intent_type="place_basket",
+            idempotency_key=exit_idempotency_key,
+            payload={},
+            metadata={"exit_reason": payload.reason or "live_worker_exit"},
+        ),
+    )
+    orders = _live_exit_orders_from_legs(legs, attribution)
+    planned_exit = {
+        "idempotency_key": exit_idempotency_key,
+        "reason": payload.reason or "live_worker_exit",
+        "dry_run": payload.dry_run,
+        "planned_at": _utcnow().isoformat(),
+        "legs": legs,
+        "orders": orders,
+        "refresh": refresh_result,
+    }
+
+    if payload.dry_run:
+        return {"mode": "live", "status": "dry_run", "message": "Live exit dry run built without placing broker orders", "exit": planned_exit}
+
+    await _repo(request).update_run_status(strategy_run_id, "exiting", state_patch={"live_exit": planned_exit, "exit_reason": payload.reason})
+    orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+    worker_session_id = f"worker:{token.token_id}:{strategy_run_id}:exit"
+    req = BasketOrderRequest.model_validate({"orders": orders, "all_or_none": False, "dry_run": False})
+    result = await orders_service.place_basket(
+        kite,
+        req,
+        corr_id,
+        session_id=worker_session_id,
+        idempotency_key=exit_idempotency_key,
+        response=Response(),
+    )
+    result_payload = result.model_dump(mode="json")
+    planned_exit["submitted_at"] = _utcnow().isoformat()
+    planned_exit["order_result"] = result_payload
+
+    post_refresh = await _refresh_live_account_state(kite=kite, account_id=account_id, corr_id=corr_id)
+    remaining_legs = await _repo(request).list_live_strategy_open_legs(strategy_run_id=strategy_run_id, account_id=account_id)
+    planned_exit["post_submit_refresh"] = post_refresh
+    planned_exit["remaining_legs"] = remaining_legs
+
+    if not remaining_legs:
+        updated = await _repo(request).update_run_status(
+            strategy_run_id,
+            "closed",
+            state_patch={
+                "live_exit": planned_exit,
+                "exit_reason": payload.reason or "live_worker_exit",
+                "live_exit_finalized_at": _utcnow().isoformat(),
+                "live_exit_flat_confirmation": {"source": "journal_live_fills", "refresh": post_refresh},
+            },
+        )
+        return {"mode": "live", "status": "closed", "result": result_payload, "run": updated}
+
+    updated = await _repo(request).update_run_status(strategy_run_id, "exiting", state_patch={"live_exit": planned_exit, "exit_reason": payload.reason})
+    return {
+        "mode": "live",
+        "status": "exiting",
+        "message": "Live exit orders submitted; run remains open until broker fills confirm the strategy is flat",
+        "result": result_payload,
+        "remaining_legs": remaining_legs,
+        "run": updated,
+    }
 
 
 def _assert_run_access(token: WorkerToken, run: Dict[str, Any]) -> None:
@@ -617,7 +995,9 @@ async def create_worker_token(request: Request, payload: WorkerTokenCreateReques
     require_app_user(request)
     modes = {mode.lower() for mode in payload.allowed_modes}
     if not modes or not modes.issubset(ALLOWED_V1_MODES):
-        raise HTTPException(status_code=400, detail="Worker tokens may only allow paper and dry_run modes in v1")
+        raise HTTPException(status_code=400, detail="Worker tokens may only allow paper, dry_run, and live modes")
+    if "live" in modes:
+        _broker_user_id_from_account_scope(payload.account_scope or "")
     actions = set(payload.allowed_actions)
     if not actions or not actions.issubset(DEFAULT_WORKER_ACTIONS):
         raise HTTPException(status_code=400, detail="Worker token contains unsupported actions")
@@ -674,6 +1054,8 @@ async def create_worker_run(request: Request, payload: WorkerRunCreateRequest):
         raise HTTPException(status_code=403, detail="Worker token cannot create this strategy template")
     if payload.execution_mode not in token.allowed_modes:
         raise HTTPException(status_code=403, detail="Worker token cannot use this execution mode")
+    if payload.execution_mode == "live":
+        _validate_live_run_contract(account_scope=payload.account_scope, metadata=payload.metadata)
 
     strategy_run_id = payload.strategy_run_id or f"run_{uuid.uuid4().hex}"
     return await _repo(request).create_run(token, payload, strategy_run_id=strategy_run_id)
@@ -711,6 +1093,8 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    if str(run.get("status") or "open") != "open":
+        raise HTTPException(status_code=409, detail="Worker intents can only be submitted for open strategy runs")
     mode = str(run.get("execution_mode") or "").lower()
     _require_v1_mode(mode)
     if mode not in token.allowed_modes:
@@ -728,6 +1112,8 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
             "intent_type": payload.intent_type,
             "payload": payload.payload,
         }
+    elif mode == "live":
+        result = await _submit_live_worker_intent(request=request, token=token, run=run, payload=payload)
     else:
         paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
         if paper_runtime_service is None:
@@ -778,6 +1164,8 @@ async def exit_worker_run(request: Request, strategy_run_id: str, payload: Worke
     if mode == "dry_run":
         updated = await _repo(request).update_run_status(strategy_run_id, "closed", state_patch={"exit_reason": payload.reason or "dry_run_exit"})
         return {"mode": "dry_run", "status": "closed", "run": updated}
+    if mode == "live":
+        return await _exit_live_worker_run(request=request, token=token, run=run, payload=payload)
 
     paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
     if paper_runtime_service is None:

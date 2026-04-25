@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from database import SessionLocal, engine
+from journaling.live_projector import LiveJournalProjector
 from .redis_events import get_redis, publish_event, pubsub_iter
 from .kite_session import KiteSession, get_session_account_id, make_account_id
 
@@ -539,6 +540,10 @@ class CanonicalOrderEventRuntime:
                     if inserted or applied:
                         await positions_service.sync_account_cache_from_db(account_id)
                         await positions_service.publish_snapshot(account_id, reason="trade_sync")
+                        try:
+                            LiveJournalProjector().project(batch_size=50)
+                        except Exception:
+                            logger.warning("Failed to project live fills into journal", exc_info=True)
                     synced += 1
                 except Exception as exc:
                     db.rollback()

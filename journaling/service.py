@@ -292,8 +292,8 @@ class JournalService:
         )
         return {"items": items, "total": total, "page": safe_page, "page_size": safe_page_size}
 
-    def list_strategies(self, *, strategy_family: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
-        rows = self.repository.list_strategy_rollups(strategy_family=strategy_family, limit=limit)
+    def list_strategies(self, *, strategy_family: Optional[str] = None, execution_mode: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        rows = self.repository.list_strategy_rollups(strategy_family=strategy_family, execution_mode=execution_mode, limit=limit)
         items: List[Dict[str, Any]] = []
         for row in rows:
             net_pnl = _to_decimal(row.get("net_pnl"))
@@ -991,6 +991,7 @@ class JournalService:
         self,
         *,
         strategy_family: Optional[str] = None,
+        execution_mode: Optional[str] = None,
         status: Optional[str] = None,
         review_state: Optional[str] = None,
         limit: int = 100,
@@ -998,6 +999,7 @@ class JournalService:
     ) -> List[Dict[str, Any]]:
         runs = self.repository.list_runs(
             strategy_family=strategy_family,
+            execution_mode=execution_mode,
             status=status,
             review_state=review_state,
             limit=limit,
@@ -1021,6 +1023,7 @@ class JournalService:
         self,
         *,
         strategy_family: Optional[str] = None,
+        execution_mode: Optional[str] = None,
         status: Optional[str] = None,
         review_state: Optional[str] = None,
         page: int = 1,
@@ -1031,6 +1034,7 @@ class JournalService:
         offset = (safe_page - 1) * safe_page_size
         items = self.list_runs(
             strategy_family=strategy_family,
+            execution_mode=execution_mode,
             status=status,
             review_state=review_state,
             limit=safe_page_size,
@@ -1038,6 +1042,7 @@ class JournalService:
         )
         total = self.repository.count_runs(
             strategy_family=strategy_family,
+            execution_mode=execution_mode,
             status=status,
             review_state=review_state,
         )

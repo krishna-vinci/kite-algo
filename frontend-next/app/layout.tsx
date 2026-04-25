@@ -1,11 +1,23 @@
 import type { Metadata } from "next";
+import { Open_Sans, Poppins } from "next/font/google";
 import "./globals.css";
 import { Providers } from "@/app/providers";
 import type { ReactNode } from "react";
 
+const openSans = Open_Sans({
+  subsets: ["latin"],
+  variable: "--font-open-sans",
+});
+
+const poppins = Poppins({
+  subsets: ["latin"],
+  weight: ["500", "600", "700"],
+  variable: "--font-poppins",
+});
+
 export const metadata: Metadata = {
-  title: "Frontend Next Shell",
-  description: "Terminal-style operator shell scaffold for the frontend-next worktree.",
+  title: "Kite Algo",
+  description: "Open-source algorithmic trading terminal for Indian markets.",
 };
 
 export default function RootLayout({
@@ -15,7 +27,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning className="h-full">
-      <body className="min-h-full bg-background text-foreground antialiased">
+      <body className={`${openSans.variable} ${poppins.variable} min-h-full bg-background text-foreground antialiased`}>
         <Providers>{children}</Providers>
       </body>
     </html>

@@ -98,6 +98,7 @@ class PlaceOrderRequest(BaseModel):
     squareoff: Optional[float] = None
     stoploss: Optional[float] = None
     trailing_stoploss: Optional[float] = None
+    attribution: Optional[Dict[str, Any]] = None
 
     @model_validator(mode='after')
     def validate_order_conditions(self) -> 'PlaceOrderRequest':
@@ -583,6 +584,7 @@ class OrdersService:
         redis_client = None
         cache_key = None
         body_hash = None
+        attribution = None
         
         if idempotency_key and session_id:
             try:
@@ -607,6 +609,28 @@ class OrdersService:
         logger.info("Placing new order", extra=log_ctx)
         try:
             params = req.model_dump(exclude_none=True)
+            attribution_payload = params.pop("attribution", None)
+            if session_id:
+                from broker_api.live_order_intents import create_live_order_intent, validate_live_order_attribution
+                from execution_accounting.kite_costs import build_live_order_cost_contract
+
+                attribution = validate_live_order_attribution({"attribution": attribution_payload or {}})
+                if idempotency_key and not attribution.idempotency_key:
+                    attribution.idempotency_key = idempotency_key
+                params["tag"] = attribution.client_order_ref
+                quote_payload = dict(params)
+                quote_payload.pop("tag", None)
+                cost_contract = build_live_order_cost_contract(
+                    kite=kite,
+                    orders_service=self,
+                    order=quote_payload,
+                    corr_id=corr_id,
+                )
+                create_live_order_intent(
+                    attribution=attribution,
+                    cost_contract=cost_contract.journal_payload(),
+                    idempotency_key=idempotency_key,
+                )
             variety = params.pop('variety')
             variety_value = variety.value if isinstance(variety, Variety) else str(variety)
             order_id = await run_kite_write_action(
@@ -616,6 +640,23 @@ class OrdersService:
                 meta=log_ctx,
             )
             log_ctx["order_id"] = order_id
+            if attribution and attribution.client_order_ref:
+                try:
+                    from broker_api.live_order_intents import mark_live_order_intent_placed, seed_live_order_state_projection
+
+                    mark_live_order_intent_placed(client_order_ref=attribution.client_order_ref, broker_order_id=str(order_id))
+                    seed_live_order_state_projection(
+                        account_id=attribution.account_ref,
+                        broker_order_id=str(order_id),
+                        status="PLACED",
+                        order_payload=params,
+                    )
+                except Exception as mark_error:
+                    logger.error(
+                        "Failed to mark live order accounting state after broker success",
+                        extra={**log_ctx, "client_order_ref": attribution.client_order_ref, "error": str(mark_error)},
+                        exc_info=True,
+                    )
 
             if redis_client and cache_key and body_hash:
                 try:
@@ -627,6 +668,16 @@ class OrdersService:
             logger.info("Order placed successfully", extra=log_ctx)
             return PlaceOrderResponse(order_id=order_id)
         except HTTPException as e:
+            if attribution and attribution.client_order_ref and e.status_code in {400, 401, 403, 404, 409, 422}:
+                try:
+                    from broker_api.live_order_intents import mark_live_order_intent_failed
+
+                    mark_live_order_intent_failed(
+                        client_order_ref=attribution.client_order_ref,
+                        error={"status_code": e.status_code, "detail": e.detail},
+                    )
+                except Exception as mark_error:
+                    logger.error("Failed to mark live order intent failed", extra={**log_ctx, "error": str(mark_error)}, exc_info=True)
             if redis_client and cache_key:
                 try:
                     if e.status_code in {400, 401, 403, 404, 409, 422}:
@@ -637,6 +688,16 @@ class OrdersService:
                     logger.error("Failed to update idempotency state after HTTP error", extra={**log_ctx, "error": str(redis_error)}, exc_info=True)
             raise
         except Exception as e:
+            if attribution and attribution.client_order_ref:
+                try:
+                    from broker_api.live_order_intents import mark_live_order_intent_failed
+
+                    mark_live_order_intent_failed(
+                        client_order_ref=attribution.client_order_ref,
+                        error={"error": str(e)},
+                    )
+                except Exception as mark_error:
+                    logger.error("Failed to mark live order intent failed", extra={**log_ctx, "error": str(mark_error)}, exc_info=True)
             if redis_client and cache_key:
                 try:
                     await self._store_uncertain_idempotent_order(redis_client, cache_key, body_hash or "", str(e))

@@ -3,6 +3,7 @@ import type {
   AnalysisPeriod,
   BenchmarkComparison,
   CalendarDay,
+  JournalFilterParams,
   JournalInsight,
   JournalRule,
   JournalRun,
@@ -110,7 +111,7 @@ function normalizeRun(item: Record<string, unknown>): JournalRun {
   };
 }
 
-export async function fetchJournalSummary(params: { period?: AnalysisPeriod; strategy_family?: string; execution_mode?: string } = {}): Promise<JournalSummary> {
+export async function fetchJournalSummary(params: { period?: AnalysisPeriod } & JournalFilterParams = {}): Promise<JournalSummary> {
   const response = await apiFetch<Record<string, unknown>>(
     `/api/journal/summary${toSearchParams({
       period: params.period ? mapPeriod(params.period) : undefined,
@@ -121,7 +122,7 @@ export async function fetchJournalSummary(params: { period?: AnalysisPeriod; str
   return normalizeRunSummary(response);
 }
 
-export async function fetchBenchmarkComparison(params: { period?: AnalysisPeriod; strategy_family?: string; execution_mode?: string } = {}): Promise<BenchmarkComparison> {
+export async function fetchBenchmarkComparison(params: { period?: AnalysisPeriod } & JournalFilterParams = {}): Promise<BenchmarkComparison> {
   const response = await apiFetch<Record<string, unknown>>(
     `/api/journal/benchmark${toSearchParams({
       period: params.period ? mapPeriod(params.period) : undefined,
@@ -151,7 +152,7 @@ export async function fetchBenchmarkComparison(params: { period?: AnalysisPeriod
   };
 }
 
-export async function fetchCalendar(params: { month?: string; year?: string } = {}): Promise<CalendarDay[]> {
+export async function fetchCalendar(params: { month?: string; year?: string } & JournalFilterParams = {}): Promise<CalendarDay[]> {
   const month = params.month ? Number(params.month) : undefined;
   const year = params.year ? Number(params.year) : undefined;
   const startDay = year && month ? new Date(Date.UTC(year, month - 1, 1)) : null;
@@ -160,6 +161,8 @@ export async function fetchCalendar(params: { month?: string; year?: string } = 
     `/api/journal/calendar${toSearchParams({
       start_day: startDay ? startDay.toISOString().slice(0, 10) : undefined,
       end_day: endDay ? endDay.toISOString().slice(0, 10) : undefined,
+      strategy_family: params.strategy_family,
+      execution_mode: params.execution_mode,
     })}`,
   );
   return (response.items ?? []).map((item) => ({
@@ -171,7 +174,7 @@ export async function fetchCalendar(params: { month?: string; year?: string } = 
   }));
 }
 
-export async function fetchJournalRuns(params: { page?: number; page_size?: number; status?: string; strategy_family?: string } = {}): Promise<Paginated<JournalRun>> {
+export async function fetchJournalRuns(params: { page?: number; page_size?: number; status?: string } & JournalFilterParams = {}): Promise<Paginated<JournalRun>> {
   const pageSize = params.page_size ?? 20;
   const response = await apiFetch<{ items?: Array<Record<string, unknown>>; total?: number; page?: number; page_size?: number }>(
     `/api/journal/runs${toSearchParams({
@@ -179,6 +182,7 @@ export async function fetchJournalRuns(params: { page?: number; page_size?: numb
       page_size: String(pageSize),
       status: params.status,
       strategy_family: params.strategy_family,
+      execution_mode: params.execution_mode,
     })}`,
   );
   const items = (response.items ?? []).map(normalizeRun);
@@ -231,10 +235,16 @@ export async function updateRunReview(runId: string, payload: ReviewUpdatePayloa
   });
 }
 
-export async function fetchTrades(params: { page?: number; page_size?: number; run_id?: string } = {}): Promise<Paginated<JournalTrade>> {
+export async function fetchTrades(params: { page?: number; page_size?: number; run_id?: string } & JournalFilterParams = {}): Promise<Paginated<JournalTrade>> {
   const pageSize = params.page_size ?? 50;
   const response = await apiFetch<{ items?: Array<Record<string, unknown>>; total?: number; page?: number; page_size?: number }>(
-    `/api/journal/trades${toSearchParams({ page: String(params.page ?? 1), page_size: String(pageSize), run_id: params.run_id })}`,
+    `/api/journal/trades${toSearchParams({
+      page: String(params.page ?? 1),
+      page_size: String(pageSize),
+      run_id: params.run_id,
+      strategy_family: params.strategy_family,
+      execution_mode: params.execution_mode,
+    })}`,
   );
   const items = (response.items ?? []).map((item) => ({
     id: String(item.id ?? item.trade_id ?? item.source_fact_key ?? ""),
@@ -254,8 +264,13 @@ export async function fetchTrades(params: { page?: number; page_size?: number; r
   };
 }
 
-export async function fetchStrategies(): Promise<StrategyPerformance[]> {
-  const response = await apiFetch<{ items?: Array<Record<string, unknown>> }>("/api/journal/strategies");
+export async function fetchStrategies(params: JournalFilterParams = {}): Promise<StrategyPerformance[]> {
+  const response = await apiFetch<{ items?: Array<Record<string, unknown>> }>(
+    `/api/journal/strategies${toSearchParams({
+      strategy_family: params.strategy_family,
+      execution_mode: params.execution_mode,
+    })}`,
+  );
   return (response.items ?? []).map((item) => ({
     strategy_family: String(item.strategy_family ?? "options_strategy") as StrategyPerformance["strategy_family"],
     strategy_name: String(item.strategy_name ?? "Unspecified"),

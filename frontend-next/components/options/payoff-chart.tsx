@@ -27,6 +27,17 @@ export function PayoffChart({
   onDaysOffsetChange,
   maxDaysToExpiry,
 }: PayoffChartProps) {
+  if (!Number.isFinite(currentSpot) || currentSpot <= 0 || legs.length === 0) {
+    return (
+      <section className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg)]/60 p-3">
+        <p className="text-[9px] uppercase tracking-[0.18em] text-[var(--dim)]">payoff</p>
+        <div className="mt-2 rounded border border-dashed border-[var(--border-soft)] bg-[var(--panel)] px-3 py-6 text-center text-[11px] text-[var(--muted)]">
+          Waiting for a live option snapshot before rendering the payoff chart.
+        </div>
+      </section>
+    );
+  }
+
   const minSpot = Math.round(currentSpot * 0.85);
   const maxSpot = Math.round(currentSpot * 1.15);
   const expiryPoints = generatePayoffPoints(legs, minSpot, maxSpot, Math.max(25, Math.round(currentSpot * 0.005)));

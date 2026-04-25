@@ -1,25 +1,120 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { screen } from "@testing-library/react";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+
 import OptionsPage from "@/app/(app)/options/page";
+import { renderWithQueryClient } from "@/tests/render-with-query-client";
+
+class MockEventSource {
+  onmessage: ((event: MessageEvent<string>) => void) | null = null;
+  constructor() {}
+  close() {}
+}
+
+vi.mock("@/features/trading/hooks/use-trading-console-data", () => ({
+  useTradingConsoleData: () => ({
+    runtime: {
+      brokerConnected: true,
+      brokerStatus: "connected",
+      brokerMode: "system",
+      brokerLastSuccessAt: null,
+      brokerLastFailureAt: null,
+      brokerLastError: null,
+      brokerNextRefreshAt: null,
+      websocketStatus: "connected",
+      paperAvailable: true,
+      appAuthenticated: true,
+    },
+    quotes: [
+      { symbol: "NIFTY", token: 256265, lastPrice: 24300, changePercent: 0.4, connected: true },
+      { symbol: "BANKNIFTY", token: 260105, lastPrice: 52000, changePercent: -0.2, connected: true },
+    ],
+    paper: {
+      accountScope: "default",
+      account: {
+        accountScope: "default",
+        currency: "INR",
+        startingBalance: 100000,
+        availableFunds: 82000,
+        blockedFunds: 18000,
+        realizedPnl: 0,
+        unrealizedPnl: 1200,
+        openPositionCount: 2,
+      },
+      activeStrategyCount: 1,
+      strategies: [
+        {
+          strategyId: "run-1",
+          displayName: "Short Straddle",
+          mode: "paper",
+          status: "open",
+          isOpen: true,
+          openLegCount: 2,
+          realizedPnl: 0,
+          unrealizedPnl: 1200,
+          riskControls: {
+            indexLowerBoundary: null,
+            indexUpperBoundary: null,
+            combinedPremiumTarget: null,
+            combinedPremiumStoploss: null,
+            basketMtmTarget: null,
+            basketMtmStoploss: null,
+          },
+          capabilities: { canEditRisk: true, editRiskReason: null },
+          positions: [],
+          orders: [],
+          trades: [],
+          timeline: [],
+        },
+      ],
+    },
+    broker: { positions: [], activeCount: 0 },
+  }),
+}));
+
+vi.mock("@/lib/options/api", () => ({
+  ensureOptionsSessions: vi.fn().mockResolvedValue(undefined),
+  fetchOptionSession: vi.fn().mockResolvedValue({
+    underlying: "NIFTY",
+    spotLtp: 24300,
+    atmStrike: 24300,
+    expiries: ["2026-04-30"],
+    perExpiry: {
+      "2026-04-30": { forward: 24320, sigmaExpiry: null, atmStrike: 24300, strikes: [], rows: [] },
+    },
+    rows: [],
+    updatedAt: null,
+  }),
+  fetchNifty50Impact: vi.fn().mockResolvedValue([]),
+  loginToBroker: vi.fn().mockResolvedValue({ authenticated: true }),
+  mergeOptionSessionSnapshot: vi.fn((_current, next) => next),
+  normalizeOptionSessionSnapshot: vi.fn((payload) => payload),
+  buildOptionsSessionSseUrl: vi.fn(() => "/api/sse/options/session/NIFTY"),
+  previewOptionStrategy: vi.fn(),
+  buildPositionDryRun: vi.fn(),
+  executePaperOptionStrategy: vi.fn(),
+}));
+
+beforeAll(() => {
+  vi.stubGlobal("EventSource", MockEventSource as unknown as typeof EventSource);
+});
 
 describe("options page", () => {
-  it("renders the rebuilt options workspace", () => {
-    render(<OptionsPage />);
+  it("renders the productionized options workspace", async () => {
+    renderWithQueryClient(<OptionsPage />);
 
-    expect(screen.getByRole("heading", { name: /strategy-aware options workspace/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /login to broker/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /options/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /option chain/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /strategy builder/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /trading dock/i })).toBeInTheDocument();
+    expect(screen.getAllByText(/active strategies/i).length).toBeGreaterThan(0);
   });
 
-  it("shows payoff and dry-run workflow in strategy builder", () => {
-    render(<OptionsPage />);
+  it("shows explicit preview, dry-run, and paper execution states", async () => {
+    renderWithQueryClient(<OptionsPage />);
 
-    expect(screen.getByText(/primary structured deployment workflow/i)).toBeInTheDocument();
-    expect(screen.getByText(/backend-defined rule inputs/i)).toBeInTheDocument();
-    expect(screen.getByText(/basket MTM/i)).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /payoff chart with day and scenario sliders/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /build dry-run plan/i })).toBeInTheDocument();
+    expect(await screen.findAllByText(/^preview$/i)).not.toHaveLength(0);
+    expect(screen.getAllByText(/^dry run$/i)).not.toHaveLength(0);
+    expect(screen.getAllByText(/^paper$/i)).not.toHaveLength(0);
+    expect(screen.getByRole("button", { name: /dry-run/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /paper execute/i })).toBeInTheDocument();
   });
 });

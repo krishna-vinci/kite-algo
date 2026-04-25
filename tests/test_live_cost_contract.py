@@ -1,10 +1,12 @@
 import unittest
+import sys
 from decimal import Decimal
 from unittest.mock import Mock
 
 from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs(stub_kite_orders=False)
+sys.modules.pop("broker_api.kite_orders", None)
 
 from broker_api.kite_orders import Exchange, OrderType, Product, TransactionType, Variety
 from execution_accounting.kite_costs import build_live_order_cost_contract

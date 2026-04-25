@@ -247,7 +247,7 @@ class JournalRepository:
         finally:
             db.close()
 
-    def count_runs(self, *, strategy_family: Optional[str] = None, status: Optional[str] = None, review_state: Optional[str] = None) -> int:
+    def count_runs(self, *, strategy_family: Optional[str] = None, execution_mode: Optional[str] = None, status: Optional[str] = None, review_state: Optional[str] = None) -> int:
         db = self.session_factory()
         try:
             row = db.execute(
@@ -256,12 +256,14 @@ class JournalRepository:
                     SELECT COUNT(*)
                     FROM public.journal_runs
                     WHERE (:strategy_family IS NULL OR strategy_family = :strategy_family)
+                      AND (:execution_mode IS NULL OR execution_mode = :execution_mode)
                       AND (:status IS NULL OR status = :status)
                       AND (:review_state IS NULL OR review_state = :review_state)
                     """
                 ),
                 {
                     "strategy_family": strategy_family,
+                    "execution_mode": execution_mode,
                     "status": status,
                     "review_state": review_state,
                 },
@@ -270,7 +272,7 @@ class JournalRepository:
         finally:
             db.close()
 
-    def list_runs(self, *, strategy_family: Optional[str] = None, status: Optional[str] = None, review_state: Optional[str] = None, updated_after: Optional[datetime] = None, limit: int = 100, offset: int = 0) -> List[JournalRun]:
+    def list_runs(self, *, strategy_family: Optional[str] = None, execution_mode: Optional[str] = None, status: Optional[str] = None, review_state: Optional[str] = None, updated_after: Optional[datetime] = None, limit: int = 100, offset: int = 0) -> List[JournalRun]:
         db = self.session_factory()
         try:
             rows = db.execute(
@@ -279,6 +281,7 @@ class JournalRepository:
                     SELECT *
                     FROM public.journal_runs
                     WHERE (:strategy_family IS NULL OR strategy_family = :strategy_family)
+                      AND (:execution_mode IS NULL OR execution_mode = :execution_mode)
                       AND (:status IS NULL OR status = :status)
                       AND (:review_state IS NULL OR review_state = :review_state)
                       AND (:updated_after IS NULL OR updated_at >= :updated_after)
@@ -289,6 +292,7 @@ class JournalRepository:
                 ),
                 {
                     "strategy_family": strategy_family,
+                    "execution_mode": execution_mode,
                     "status": status,
                     "review_state": review_state,
                     "updated_after": updated_after,
@@ -375,6 +379,341 @@ class JournalRepository:
                 {"run_id": run_id},
             ).mappings().all()
             return [self._execution_fact_from_row(row) for row in rows]
+        finally:
+            db.close()
+
+    def list_unprojected_live_fills(self, *, batch_size: int = 100) -> List[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT otf.*
+                    FROM public.order_trade_fills otf
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM public.journal_execution_facts jef
+                        WHERE jef.source_type IN ('live_fill', 'broker_import')
+                          AND jef.source_fact_key = otf.account_id || ':' || otf.trade_id
+                    )
+                    ORDER BY otf.fill_timestamp ASC, otf.trade_id ASC
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": max(1, int(batch_size))},
+            ).mappings().all()
+            return [_row_mapping(row) for row in rows]
+        finally:
+            db.close()
+
+    def find_live_order_intent(self, *, account_id: str, order_id: str) -> Optional[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    SELECT *
+                    FROM public.live_order_intents
+                    WHERE account_id = :account_id
+                      AND broker_order_id = :order_id
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"account_id": account_id, "order_id": order_id},
+            ).mappings().first()
+            if not row:
+                tag_row = db.execute(
+                    text(
+                        """
+                        SELECT payload_json ->> 'tag' AS client_order_ref
+                        FROM public.canonical_order_events
+                        WHERE account_id = :account_id
+                          AND order_id = :order_id
+                          AND payload_json ? 'tag'
+                        ORDER BY event_timestamp DESC, id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"account_id": account_id, "order_id": order_id},
+                ).fetchone()
+                client_order_ref = str(tag_row[0]).strip() if tag_row and tag_row[0] else ""
+                if not client_order_ref:
+                    return None
+                row = db.execute(
+                    text(
+                        """
+                        UPDATE public.live_order_intents
+                        SET broker_order_id = COALESCE(broker_order_id, :order_id),
+                            status = CASE WHEN status = 'pending' THEN 'placed' ELSE status END,
+                            updated_at = NOW()
+                        WHERE account_id = :account_id
+                          AND client_order_ref = :client_order_ref
+                        RETURNING *
+                        """
+                    ),
+                    {"account_id": account_id, "order_id": order_id, "client_order_ref": client_order_ref},
+                ).mappings().first()
+                if not row:
+                    db.rollback()
+                    return None
+                db.commit()
+            payload = _row_mapping(row)
+            payload["attribution_json"] = _decode_json_field(payload.get("attribution_json")) or {}
+            payload["cost_contract_json"] = _decode_json_field(payload.get("cost_contract_json")) or {}
+            payload["error_json"] = _decode_json_field(payload.get("error_json")) or {}
+            return payload
+        finally:
+            db.close()
+
+    def ensure_live_strategy_run_for_intent(self, *, intent: Dict[str, Any]) -> str:
+        journal_run_id = intent.get("journal_run_id")
+        if journal_run_id:
+            return str(journal_run_id)
+
+        account_id = str(intent.get("account_id") or intent.get("account_ref") or "")
+        strategy_run_id = str(intent.get("strategy_run_id") or "").strip()
+        if not account_id or not strategy_run_id:
+            raise ValueError("live order intent requires account_id and strategy_run_id")
+
+        db = self.session_factory()
+        try:
+            existing_link = db.execute(
+                text(
+                    """
+                    SELECT run_id
+                    FROM public.journal_source_links
+                    WHERE source_type = 'live_order'
+                      AND source_key = :strategy_run_id
+                    ORDER BY linked_at DESC, id DESC
+                    LIMIT 1
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id},
+            ).fetchone()
+            if existing_link:
+                run_id = str(existing_link[0])
+            else:
+                created = db.execute(
+                    text(
+                        """
+                        INSERT INTO public.journal_runs (
+                            strategy_family,
+                            strategy_name,
+                            entry_surface,
+                            execution_mode,
+                            account_ref,
+                            status,
+                            benchmark_id,
+                            capital_basis_type,
+                            review_state,
+                            source_summary_json,
+                            metadata_json
+                        ) VALUES (
+                            :strategy_family,
+                            :strategy_name,
+                            :entry_surface,
+                            :execution_mode,
+                            :account_ref,
+                            'open',
+                            'NIFTY50',
+                            'margin_used',
+                            'pending',
+                            CAST(:source_summary_json AS jsonb),
+                            CAST(:metadata_json AS jsonb)
+                        )
+                        RETURNING id
+                        """
+                    ),
+                    {
+                        "strategy_family": intent.get("strategy_family") or "discretionary_strategy",
+                        "strategy_name": intent.get("strategy_name") or strategy_run_id,
+                        "entry_surface": intent.get("entry_surface") or "live_order",
+                        "execution_mode": intent.get("execution_mode") or "live",
+                        "account_ref": account_id,
+                        "source_summary_json": _json_dumps({"source": "live_order_intent", "strategy_run_id": strategy_run_id}),
+                        "metadata_json": _json_dumps({"created_by": "live_fill_projector", "live_order_intent": intent}),
+                    },
+                ).fetchone()
+                if not created:
+                    raise RuntimeError("failed to create live strategy journal run")
+                run_id = str(created[0])
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO public.journal_source_links (run_id, source_type, source_key, source_key_2, linked_at)
+                        VALUES (CAST(:run_id AS uuid), 'live_order', :strategy_run_id, NULL, NOW())
+                        ON CONFLICT (source_type, source_key, COALESCE(source_key_2, '')) DO UPDATE
+                        SET run_id = EXCLUDED.run_id,
+                            linked_at = EXCLUDED.linked_at
+                        """
+                    ),
+                    {"run_id": run_id, "strategy_run_id": strategy_run_id},
+                )
+
+            client_order_ref = intent.get("client_order_ref")
+            if client_order_ref:
+                db.execute(
+                    text(
+                        """
+                        UPDATE public.live_order_intents
+                        SET journal_run_id = CAST(:run_id AS uuid),
+                            updated_at = NOW()
+                        WHERE client_order_ref = :client_order_ref
+                          AND journal_run_id IS NULL
+                        """
+                    ),
+                    {"run_id": run_id, "client_order_ref": client_order_ref},
+                )
+            db.commit()
+            return run_id
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def ensure_imported_broker_run(self, *, account_id: str) -> str:
+        db = self.session_factory()
+        try:
+            existing = db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM public.journal_runs
+                    WHERE strategy_family = 'discretionary_strategy'
+                      AND strategy_name = 'Imported Broker Activity'
+                      AND execution_mode = 'live'
+                      AND entry_surface = 'broker_import'
+                      AND account_ref = :account_id
+                      AND status = 'open'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"account_id": account_id},
+            ).fetchone()
+            if existing:
+                return str(existing[0])
+
+            created = db.execute(
+                text(
+                    """
+                    INSERT INTO public.journal_runs (
+                        strategy_family,
+                        strategy_name,
+                        entry_surface,
+                        execution_mode,
+                        account_ref,
+                        status,
+                        benchmark_id,
+                        capital_basis_type,
+                        review_state,
+                        source_summary_json,
+                        metadata_json
+                    ) VALUES (
+                        'discretionary_strategy',
+                        'Imported Broker Activity',
+                        'broker_import',
+                        'live',
+                        :account_id,
+                        'open',
+                        'NIFTY50',
+                        'notional',
+                        'pending',
+                        CAST(:source_summary_json AS jsonb),
+                        CAST(:metadata_json AS jsonb)
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "account_id": account_id,
+                    "source_summary_json": _json_dumps({"source": "broker_import"}),
+                    "metadata_json": _json_dumps({"created_by": "live_fill_projector"}),
+                },
+            ).fetchone()
+            if not created:
+                raise RuntimeError("failed to create imported broker journal run")
+            db.commit()
+            return str(created[0])
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def find_open_live_runs_for_instrument(self, *, account_id: str, instrument_token: int, product: str) -> List[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT
+                        jr.id AS run_id,
+                        SUM(CASE WHEN UPPER(jef.side) = 'BUY' THEN jef.quantity ELSE -jef.quantity END) AS net_quantity
+                    FROM public.journal_runs jr
+                    INNER JOIN public.journal_execution_facts jef ON jef.run_id = jr.id
+                    WHERE jr.execution_mode = 'live'
+                      AND jr.status = 'open'
+                      AND jr.account_ref = :account_id
+                      AND COALESCE(jef.payload_json -> 'broker_fill' ->> 'instrument_token', '') = :instrument_token
+                      AND COALESCE(jef.payload_json -> 'broker_fill' ->> 'product', '') = :product
+                      AND jef.source_type = 'live_fill'
+                    GROUP BY jr.id
+                    HAVING SUM(CASE WHEN UPPER(jef.side) = 'BUY' THEN jef.quantity ELSE -jef.quantity END) <> 0
+                    """
+                ),
+                {
+                    "account_id": account_id,
+                    "instrument_token": str(int(instrument_token)),
+                    "product": product,
+                },
+            ).mappings().all()
+            return [_row_mapping(row) for row in rows]
+        finally:
+            db.close()
+
+    def mark_run_externally_closed_if_flat(self, *, run_id: str) -> None:
+        db = self.session_factory()
+        try:
+            net_row = db.execute(
+                text(
+                    """
+                    SELECT COALESCE(SUM(CASE WHEN UPPER(side) = 'BUY' THEN quantity ELSE -quantity END), 0) AS net_quantity
+                    FROM public.journal_execution_facts
+                    WHERE run_id = CAST(:run_id AS uuid)
+                      AND source_type = 'live_fill'
+                    """
+                ),
+                {"run_id": run_id},
+            ).fetchone()
+            net_quantity = int(net_row[0] or 0) if net_row else 0
+            if net_quantity != 0:
+                return
+            db.execute(
+                text(
+                    """
+                    UPDATE public.journal_runs
+                    SET status = 'closed',
+                        review_state = 'pending',
+                        ended_at = COALESCE(ended_at, NOW()),
+                        metadata_json = COALESCE(metadata_json, '{}'::jsonb) || CAST(:external_exit_json AS jsonb),
+                        updated_at = NOW()
+                    WHERE id = CAST(:run_id AS uuid)
+                    """
+                ),
+                {
+                    "run_id": run_id,
+                    "external_exit_json": _json_dumps(
+                        {"external_exit": {"detected_at": datetime.utcnow().isoformat(), "source": "broker_reconcile"}}
+                    ),
+                },
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 
@@ -853,6 +1192,7 @@ class JournalRepository:
         self,
         *,
         strategy_family: Optional[str] = None,
+        execution_mode: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
         db = self.session_factory()
@@ -876,6 +1216,7 @@ class JournalRepository:
                       AND jms.subject_id = CAST(jr.id AS text)
                       AND jms.time_window = 'since_inception'
                     WHERE (:strategy_family IS NULL OR jr.strategy_family = :strategy_family)
+                      AND (:execution_mode IS NULL OR jr.execution_mode = :execution_mode)
                     GROUP BY jr.strategy_family, COALESCE(jr.strategy_name, 'Unspecified')
                     ORDER BY latest_started_at DESC NULLS LAST
                     LIMIT :limit
@@ -883,6 +1224,7 @@ class JournalRepository:
                 ),
                 {
                     "strategy_family": strategy_family,
+                    "execution_mode": execution_mode,
                     "limit": max(1, int(limit)),
                 },
             ).mappings().all()

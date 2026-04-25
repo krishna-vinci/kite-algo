@@ -28,6 +28,9 @@ export function FloatingOrderTicket({ open, initialStrike, initialOptionType, in
         </button>
       </div>
       <div className="flex-1 space-y-3 overflow-auto px-3 py-3 text-[11px]">
+        <div className="rounded-lg border border-slate-500/40 bg-slate-500/10 px-3 py-2 text-[11px] text-slate-200">
+          This quick ticket is preview-only right now. It helps stage a single-leg idea, but it does not place paper or live orders yet.
+        </div>
         <div className="grid grid-cols-2 gap-2">
           <button type="button" onClick={() => setSide("long")} className={`cursor-pointer rounded border px-3 py-1.5 transition-colors duration-150 ${side === "long" ? "border-[var(--green)] text-[var(--green)]" : "border-[var(--border)] text-[var(--muted)]"}`}>
             BUY
@@ -58,8 +61,8 @@ export function FloatingOrderTicket({ open, initialStrike, initialOptionType, in
         </div>
       </div>
       <div className="border-t border-[var(--border)] px-3 py-2">
-        <button type="button" className="w-full cursor-pointer rounded-md border border-[var(--accent-border)] bg-[var(--accent-soft)] px-3 py-1.5 text-[11px] font-semibold text-[var(--accent)] transition-colors duration-200 hover:bg-[var(--accent-border)]">
-          Dry-run {side === "long" ? "BUY" : "SELL"} {optionType === "call" ? "CE" : "PE"} {strike}
+        <button type="button" disabled className="w-full cursor-not-allowed rounded-md border border-[var(--border)] bg-[var(--bg)] px-3 py-1.5 text-[11px] font-semibold text-[var(--muted)] opacity-80">
+          Preview {side === "long" ? "BUY" : "SELL"} {optionType === "call" ? "CE" : "PE"} {strike}
         </button>
       </div>
     </aside>

@@ -17,10 +17,10 @@ export function AppShell({ navigation, activeHref, children }: AppShellProps) {
   const hideGlobalDock = activeHref.startsWith("/options") || activeHref.startsWith("/quick-trade");
 
   return (
-    <div className="grid min-h-screen grid-cols-[48px_1fr] grid-rows-[40px_1fr_auto] bg-[var(--bg)] text-[var(--text)]">
+    <div className="grid min-h-screen grid-cols-[68px_1fr] grid-rows-[52px_1fr_auto] bg-[var(--bg)] text-[var(--text)]">
       <LeftRail navigation={navigation} activeHref={activeHref} />
       <TopBar title={activeItem?.label ?? "Dashboard"} />
-      <main className="min-w-0 overflow-auto p-3">{children}</main>
+      <main className="min-w-0 overflow-auto p-4 lg:p-5">{children}</main>
       {hideGlobalDock ? <div /> : <BottomDock workspace={activeHref} />}
     </div>
   );

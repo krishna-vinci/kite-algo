@@ -49,6 +49,8 @@ class CapitalBasisType(str, Enum):
 
 class SourceType(str, Enum):
     LIVE_ORDER = "live_order"
+    LIVE_FILL = "live_fill"
+    BROKER_IMPORT = "broker_import"
     PAPER_TRADE = "paper_trade"
     PAPER_ORDER = "paper_order"
     OPTION_STRATEGY_RUN = "option_strategy_run"

@@ -8,6 +8,13 @@ export type StrategyFamily =
   | "investment_strategy"
   | "discretionary_strategy";
 
+export type ExecutionMode = "live" | "paper" | "dry_run";
+
+export type JournalFilterParams = {
+  strategy_family?: StrategyFamily;
+  execution_mode?: ExecutionMode;
+};
+
 export type RunStatus = "open" | "closed" | "expired" | "cancelled" | "reviewed";
 
 export type ReviewStatus = "pending" | "in_progress" | "completed" | "skipped";

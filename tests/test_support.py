@@ -69,6 +69,9 @@ def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
             pass
 
         class Redis:
+            async def eval(self, *args, **kwargs):
+                return [0, 0, 0]
+
             async def publish(self, *args, **kwargs):
                 return None
 

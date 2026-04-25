@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-04-14
+Last updated: 2026-04-24
 
 ## Scope
 
@@ -24,6 +24,7 @@ Do not use this file for frontend work.
 
 ## Newly implemented in current branch
 
+- Fixed the monthly index refresh scheduler so live metric refresh/injection now also runs for `Nifty500` after constituent refreshes, matching the existing `Nifty50`/`NiftyBank` flow
 - Added the next trading journal backend slice:
   - new `journaling/service.py` for run orchestration, source links, decision events, benchmark daily-price refresh, and run summary/benchmark comparison queries
   - new `journaling/runtime.py` restart-safe helper that persists projection cursor state and periodically refreshes benchmark data / recent run summaries without Celery
@@ -113,6 +114,16 @@ Do not use this file for frontend work.
 - Reduced startup DB session lifetime for Phase 3 instrument lookups by switching `InstrumentsRepository` to session-factory usage instead of app-lifetime sessions
 - Reduced advisory-lock polling connection pressure by acquiring position-runtime locks with short-lived retry sessions instead of holding one DB session open while polling
 - Improved startup degraded-health reporting when broker bootstrap fails by marking broker/app/websocket runtime state as degraded instead of always reporting healthy startup
+- Added Phase 1 frontend-facing trading-console backend enablers:
+  - paper strategy summary now exposes `mode`, `is_open`, `timeline`, and baseline risk-edit capability hints for strategy-grouped operator surfaces
+  - new authenticated `PATCH /api/system/paper/strategies/{strategy_id}/risk` route updates canonical option-strategy protection preferences for open paper runs
+  - runtime-managed option-strategy risk edits now also patch the linked algo-instance config when an `algo_instance_id` is present
+  - `strategies/option_strategy/runtime_updates.py` provides a pure helper for recomputing canonical preview/rules after protection edits
+- Completed the first strategy-run unification backend slice for paper strategy management:
+  - option strategy executions now return and persist canonical `strategy_run_id` alongside compatibility `strategy_id` / `option_strategy_id`
+  - `paper_runtime/service.py` now groups and exits paper strategy activity by `strategy_run_id` first, with compatibility fallback for older records
+  - paper strategy summaries now expose backend-driven `allowed_actions`, `risk_schema`, and `summary_fields` instead of relying on fixed option-only risk control payloads
+  - manual or ambiguous paper groups are now explicitly blocked from strategy-level edit/exit behavior instead of being guessed into monitored strategy flows
 - Live-verified mutual fund provider read endpoints via headless login:
   - `mf_instruments` ✅ returned 7409 rows in live verification
   - `mf_holdings` ✅ returned empty list for current account
@@ -121,6 +132,13 @@ Do not use this file for frontend work.
 - Tightened `MFInstrument` model using live provider fields (`plan`, `scheme_type`, `settlement_type`, `dividend_type`, `last_price`, `last_price_date`)
 - Evaluated a PostgreSQL `pg_trgm` search migration for instruments, but rejected it because duplicating search state inside Postgres increased DB footprint and risked competing with order/runtime workloads
 - Reduced FastAPI startup memory pressure by removing or lazy-loading heavyweight imports that were not needed at app boot (`pandas`, `numpy`, `yfinance`, `scipy`, chart-only modules)
+- Completed the live/paper accounting and reconciliation backend spine:
+  - live app order placement now accepts required strategy attribution, writes compact broker tags, quotes margin/charges contracts, and persists `live_order_intents`
+  - broker trade fills now project into journal execution facts as `live_fill` when attributed and `broker_import` when external/unknown
+  - untagged broker-side exits conservatively attach to exactly one matching open live run, otherwise they stay in the imported broker activity bucket
+  - dirty order trade sync now triggers best-effort live journal projection without blocking position reconciliation
+  - journal summary/runs/trades/strategies filters now carry strategy-family and execution-mode separation through backend and frontend API types
+  - `/api/algo-workers` now supports explicitly live-enabled worker tokens/runs and routes live external algo intents through the attributed live order path
 
 ## Skill usage
 
@@ -415,9 +433,11 @@ Update after latest verification:
 
 If a new agent picks this up, the correct next task is:
 
-1. continue implementing and hardening `market-runtime/`, starting with live shard verification and direct or optimized marketwatch/candle runtime streaming
-2. add backend tests for order runtime, websocket flow, and live positions
-3. migrate alerts, protection, and options consumers off direct Python websocket ownership
-4. verify live duplicate/replay order-event behavior against real provider events
-5. verify MF get-by-id shapes when a real order/SIP exists, without executing unsafe side-effecting writes unless explicitly approved
-6. refresh this tracker and the websocket-runtime docs after each material step
+1. extract template-owned builders for `build_summary_fields(run)`, `build_risk_schema(run)`, and `build_allowed_actions(run)` so non-option strategies can use the same backend contract cleanly
+2. implement one non-option systematic algo on that contract and verify it in paper mode
+3. carry the same run/capability contract into the live strategy-management path
+4. continue implementing and hardening `market-runtime/`, starting with live shard verification and direct or optimized marketwatch/candle runtime streaming
+5. add backend tests for order runtime, websocket flow, and live positions
+6. verify live duplicate/replay order-event behavior against real provider events
+7. verify MF get-by-id shapes when a real order/SIP exists, without executing unsafe side-effecting writes unless explicitly approved
+8. refresh this tracker and the websocket-runtime docs after each material step

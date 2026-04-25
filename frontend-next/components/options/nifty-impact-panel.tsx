@@ -26,6 +26,11 @@ export function NiftyImpactPanel({ rows }: NiftyImpactPanelProps) {
         </div>
       </div>
       <div className="overflow-auto px-3 pb-3">
+        {sortedRows.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-[var(--border-soft)] bg-[var(--bg)]/50 px-3 py-6 text-center text-[11px] text-[var(--muted)]">
+            Nifty impact data is unavailable right now.
+          </div>
+        ) : (
         <table className="min-w-full border-collapse text-[11px]">
           <thead className="text-[9px] uppercase tracking-[0.16em] text-[var(--dim)]">
             <tr>
@@ -52,6 +57,7 @@ export function NiftyImpactPanel({ rows }: NiftyImpactPanelProps) {
             ))}
           </tbody>
         </table>
+        )}
       </div>
     </section>
   );

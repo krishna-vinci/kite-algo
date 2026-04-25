@@ -1130,6 +1130,35 @@ CREATE INDEX IF NOT EXISTS idx_journal_run_legs_token
     ON public.journal_run_legs (instrument_token)
     WHERE instrument_token IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS public.live_order_intents (
+  intent_id TEXT PRIMARY KEY,
+  client_order_ref TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  strategy_run_id TEXT NOT NULL,
+  journal_run_id UUID,
+  strategy_family TEXT NOT NULL,
+  strategy_name TEXT NOT NULL,
+  execution_mode TEXT NOT NULL DEFAULT 'live',
+  entry_surface TEXT NOT NULL,
+  idempotency_key TEXT,
+  broker_order_id TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attribution_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  cost_contract_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  error_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_live_order_intents_client_order_ref
+  ON public.live_order_intents (client_order_ref);
+
+CREATE INDEX IF NOT EXISTS idx_live_order_intents_broker_order
+  ON public.live_order_intents (account_id, broker_order_id);
+
+CREATE INDEX IF NOT EXISTS idx_live_order_intents_strategy
+  ON public.live_order_intents (strategy_run_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS public.journal_source_links (
     id BIGSERIAL PRIMARY KEY,
     run_id UUID NOT NULL REFERENCES public.journal_runs(id) ON DELETE CASCADE,
@@ -1137,8 +1166,14 @@ CREATE TABLE IF NOT EXISTS public.journal_source_links (
     source_key TEXT NOT NULL,
     source_key_2 TEXT,
     linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT journal_source_links_source_type_chk CHECK (source_type IN ('live_order', 'paper_trade', 'paper_order', 'option_strategy_run', 'algo_instance', 'investing_strategy'))
+    CONSTRAINT journal_source_links_source_type_chk CHECK (source_type IN ('live_order', 'paper_trade', 'paper_order', 'option_strategy_run', 'algo_instance', 'investing_strategy', 'live_fill', 'broker_import'))
 );
+
+ALTER TABLE public.journal_source_links
+    DROP CONSTRAINT IF EXISTS journal_source_links_source_type_chk;
+
+ALTER TABLE public.journal_source_links
+    ADD CONSTRAINT journal_source_links_source_type_chk CHECK (source_type IN ('live_order', 'paper_trade', 'paper_order', 'option_strategy_run', 'algo_instance', 'investing_strategy', 'live_fill', 'broker_import'));
 
 CREATE INDEX IF NOT EXISTS idx_journal_source_links_run
     ON public.journal_source_links (run_id, linked_at DESC);
