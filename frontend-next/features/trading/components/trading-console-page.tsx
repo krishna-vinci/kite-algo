@@ -6,6 +6,7 @@ import { RuntimeHealthCard } from "./runtime-health-card";
 import { TradingKpiGrid } from "./trading-kpi-grid";
 import { StrategyGroupsPanel } from "./strategy-groups-panel";
 import { BrokerPositionsPanel } from "./broker-positions-panel";
+import { ControlPlanePanel } from "./control-plane-panel";
 
 type TradingConsolePageProps = {
   snapshot: TradingConsoleSnapshot;
@@ -22,6 +23,8 @@ export function TradingConsolePage({ snapshot }: TradingConsolePageProps) {
 
       {/* KPI summary */}
       <TradingKpiGrid paper={snapshot.paper} broker={snapshot.broker} />
+
+      <ControlPlanePanel snapshot={snapshot.control} />
 
       {/* Main content grid */}
       <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">

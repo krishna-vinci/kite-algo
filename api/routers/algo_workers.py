@@ -276,6 +276,9 @@ class SqlAlchemyAlgoWorkerRepository:
     async def get_run(self, strategy_run_id: str) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._get_run_sync, strategy_run_id)
 
+    async def list_runs_for_control_plane(self) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._list_runs_for_control_plane_sync)
+
     async def update_run_risk(self, strategy_run_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
         return await asyncio.to_thread(self._update_run_risk_sync, strategy_run_id, patch)
 
@@ -478,6 +481,27 @@ class SqlAlchemyAlgoWorkerRepository:
         try:
             row = db.execute(text("SELECT * FROM public.algo_worker_runs WHERE strategy_run_id = :strategy_run_id"), {"strategy_run_id": strategy_run_id}).fetchone()
             return self._run_view(row) if row else None
+        finally:
+            db.close()
+
+    def _list_runs_for_control_plane_sync(self) -> List[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT
+                        r.*,
+                        t.name AS worker_name,
+                        t.last_heartbeat_at,
+                        t.heartbeat_json
+                    FROM public.algo_worker_runs r
+                    LEFT JOIN public.algo_worker_tokens t ON t.token_id = r.token_id
+                    ORDER BY COALESCE(r.updated_at, r.created_at) DESC
+                    """
+                )
+            ).fetchall()
+            return [self._run_view_with_worker(row) for row in rows]
         finally:
             db.close()
 
@@ -698,6 +722,14 @@ class SqlAlchemyAlgoWorkerRepository:
             "updated_at": payload.get("updated_at"),
             "closed_at": payload.get("closed_at"),
         }
+
+    def _run_view_with_worker(self, row: Any) -> Dict[str, Any]:
+        payload = self._run_view(row)
+        raw = _row_mapping(row)
+        payload["worker_name"] = raw.get("worker_name")
+        payload["last_heartbeat_at"] = raw.get("last_heartbeat_at")
+        payload["heartbeat_json"] = _json_loads(raw.get("heartbeat_json"), {})
+        return payload
 
 
 def _repo(request: Request) -> Any:

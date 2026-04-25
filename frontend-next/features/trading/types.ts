@@ -109,9 +109,72 @@ export type TradingBrokerSnapshot = {
   activeCount: number;
 };
 
+export type ControlStrategySource = "paper_runtime" | "algo_worker" | "broker_unattributed";
+export type ControlHealthStatus = "healthy" | "stale" | "disconnected" | "unknown";
+
+export type ControlProtectionState = {
+  source: string;
+  status: string;
+  summary: string;
+  lastCheckedAt: string | null;
+  details: Record<string, unknown>;
+};
+
+export type ControlStrategyGroup = {
+  strategyRunId: string;
+  displayName: string;
+  source: ControlStrategySource;
+  mode: TradingMode;
+  status: string;
+  healthStatus: ControlHealthStatus;
+  heartbeatAgeSec: number | null;
+  workerId: string | null;
+  workerName: string | null;
+  workerMetrics: Record<string, unknown>;
+  isOpen: boolean;
+  realizedPnl: number;
+  unrealizedPnl: number;
+  netPnl: number;
+  positionCount: number;
+  openOrderCount: number;
+  tradeCount: number;
+  positions: TradingPositionRow[];
+  orders: TradingOrderRow[];
+  trades: TradingTradeRow[];
+  allowedActions: string[];
+  actionReasons: Record<string, string>;
+  protection: ControlProtectionState;
+  lastUpdatedAt: string | null;
+};
+
+export type ControlUnattributedBucket = {
+  displayName: string;
+  positions: TradingPositionRow[];
+  orders: TradingOrderRow[];
+  realizedPnl: number;
+  unrealizedPnl: number;
+  netPnl: number;
+};
+
+export type ControlPlaneSnapshot = {
+  generatedAt: string | null;
+  totals: {
+    strategyCount: number;
+    openStrategyCount: number;
+    positionCount: number;
+    staleWorkerCount: number;
+    realizedPnl: number;
+    unrealizedPnl: number;
+    netPnl: number;
+  };
+  strategies: ControlStrategyGroup[];
+  unattributed: ControlUnattributedBucket;
+};
+
 export type TradingConsoleSnapshot = {
   runtime: RuntimeStatus;
   quotes: MarketQuote[];
   paper: TradingPaperSummary;
   broker: TradingBrokerSnapshot;
+  control: ControlPlaneSnapshot | null;
 };

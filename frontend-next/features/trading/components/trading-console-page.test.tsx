@@ -1,4 +1,6 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { describe, it, expect } from "vitest";
 import { TradingConsolePage } from "./trading-console-page";
 import type { TradingConsoleSnapshot } from "@/features/trading/types";
@@ -87,21 +89,80 @@ const MOCK_SNAPSHOT: TradingConsoleSnapshot = {
     ],
     activeCount: 1,
   },
+  control: {
+    generatedAt: "2026-04-25T12:00:00+00:00",
+    totals: {
+      strategyCount: 1,
+      openStrategyCount: 1,
+      positionCount: 1,
+      staleWorkerCount: 0,
+      realizedPnl: 150,
+      unrealizedPnl: -25,
+      netPnl: 125,
+    },
+    strategies: [
+      {
+        strategyRunId: "control-1",
+        displayName: "Mean Reversion",
+        source: "algo_worker",
+        mode: "live",
+        status: "open",
+        healthStatus: "healthy",
+        heartbeatAgeSec: 10,
+        workerId: "worker-1",
+        workerName: "box-1",
+        workerMetrics: {},
+        isOpen: true,
+        realizedPnl: 150,
+        unrealizedPnl: -25,
+        netPnl: 125,
+        positionCount: 1,
+        openOrderCount: 0,
+        tradeCount: 1,
+        positions: [{ tradingsymbol: "INFY", quantity: 1 }],
+        orders: [],
+        trades: [],
+        allowedActions: ["exit_strategy"],
+        actionReasons: { cancel_orders: "Strategy-scoped cancel is disabled" },
+        protection: {
+          source: "option_runtime",
+          status: "active",
+          summary: "Option protection active; 2 rule(s) configured",
+          lastCheckedAt: "2026-04-25T12:00:00+00:00",
+          details: { rule_count: 2, lifecycle_state: "running" },
+        },
+        lastUpdatedAt: null,
+      },
+    ],
+    unattributed: {
+      displayName: "Manual / unattributed broker exposure",
+      positions: [{ tradingsymbol: "MANUAL", quantity: 25 }],
+      orders: [],
+      realizedPnl: 0,
+      unrealizedPnl: 250,
+      netPnl: 250,
+    },
+  },
 };
+
+function renderWithQueryClient(ui: ReactElement) {
+  const client = new QueryClient();
+  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+}
 
 describe("TradingConsolePage", () => {
   it("renders the heading", () => {
-    render(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
+    renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
     expect(screen.getByText("Trading console")).toBeInTheDocument();
   });
 
   it("renders strategy name", () => {
-    render(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
+    renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
     expect(screen.getByText("Iron Condor NIFTY")).toBeInTheDocument();
   });
 
   it("renders broker positions section with active positions only", () => {
-    render(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
+    renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
     // The active position should appear
     expect(screen.getByText("NIFTY24APR25300CE")).toBeInTheDocument();
     // The closed position (qty=0) should NOT appear
@@ -109,8 +170,17 @@ describe("TradingConsolePage", () => {
   });
 
   it("shows market quotes", () => {
-    render(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
+    renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
     expect(screen.getByTestId("market-quote-strip")).toBeInTheDocument();
     expect(screen.getByText("NIFTY")).toBeInTheDocument();
+  });
+
+  it("renders control plane without losing existing panels", () => {
+    renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
+
+    expect(screen.getByTestId("control-plane-panel")).toBeInTheDocument();
+    expect(screen.getByText("Mean Reversion")).toBeInTheDocument();
+    expect(screen.getByTestId("strategy-groups-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("broker-positions-panel")).toBeInTheDocument();
   });
 });
