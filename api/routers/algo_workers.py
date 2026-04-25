@@ -7,9 +7,10 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -82,6 +83,24 @@ def _row_mapping(row: Any) -> Dict[str, Any]:
         for key in dir(row)
         if not key.startswith("_") and not callable(getattr(row, key))
     }
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 class WorkerTokenCreateRequest(BaseModel):
@@ -167,6 +186,46 @@ class WorkerExitRequest(BaseModel):
     reason: Optional[str] = None
     idempotency_key: Optional[str] = None
     dry_run: bool = False
+
+
+class WorkerRunPnlTotals(BaseModel):
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    gross_pnl: float = 0.0
+    charges: float = 0.0
+    net_pnl: float = 0.0
+
+
+class WorkerRunPnlLeg(BaseModel):
+    instrument_token: Optional[int] = None
+    exchange: Optional[str] = None
+    tradingsymbol: Optional[str] = None
+    product: Optional[str] = None
+    net_quantity: int = 0
+    side: str = "FLAT"
+    average_price: float = 0.0
+    last_price: float = 0.0
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    gross_pnl: float = 0.0
+    charges: float = 0.0
+    net_pnl: float = 0.0
+    broker_net_quantity: Optional[int] = None
+    is_stale: bool = False
+    last_reconciled_at: Optional[str] = None
+
+
+class WorkerRunPnlSnapshot(BaseModel):
+    strategy_run_id: str
+    execution_mode: str
+    status: str
+    currency: str = "INR"
+    totals: WorkerRunPnlTotals = Field(default_factory=WorkerRunPnlTotals)
+    legs: List[WorkerRunPnlLeg] = Field(default_factory=list)
+    position_count: int = 0
+    is_realtime: bool = False
+    is_stale: bool = False
+    updated_at: str
 
 
 @dataclass
@@ -755,6 +814,324 @@ def _inject_live_attribution(order_payload: Dict[str, Any], attribution: Dict[st
     return order
 
 
+def _worker_pnl_side(net_quantity: int) -> str:
+    if net_quantity > 0:
+        return "LONG"
+    if net_quantity < 0:
+        return "SHORT"
+    return "FLAT"
+
+
+def _empty_worker_pnl_snapshot(run: Dict[str, Any], *, is_realtime: bool, is_stale: bool = False, updated_at: Optional[str] = None) -> Dict[str, Any]:
+    return WorkerRunPnlSnapshot(
+        strategy_run_id=str(run["strategy_run_id"]),
+        execution_mode=str(run.get("execution_mode") or "dry_run"),
+        status=str(run.get("status") or "open"),
+        currency="INR",
+        totals=WorkerRunPnlTotals(),
+        legs=[],
+        position_count=0,
+        is_realtime=is_realtime,
+        is_stale=is_stale,
+        updated_at=updated_at or _run_updated_at(run) or "1970-01-01T00:00:00+00:00",
+    ).model_dump(mode="json")
+
+
+def _snapshot_signature(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, default=_json_default, separators=(",", ":"))
+
+
+def _run_updated_at(run: Dict[str, Any]) -> Optional[str]:
+    runtime_state = dict(run.get("runtime_state") or {})
+    for key in ("updated_at", "created_at"):
+        value = run.get(key)
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, str) and value.strip():
+            return value
+    for key in ("live_exit_finalized_at", "updated_at"):
+        value = runtime_state.get(key)
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _accumulate_leg_fact(state: Dict[str, Any], *, side: str, quantity: int, price: float, charges: float) -> None:
+    net_quantity = _to_int(state.get("net_quantity"))
+    average_price = _to_float(state.get("average_price"))
+    signed_quantity = quantity if side == "BUY" else -quantity
+
+    state["charges"] = _to_float(state.get("charges")) + charges
+
+    if net_quantity == 0 or (net_quantity > 0 and signed_quantity > 0) or (net_quantity < 0 and signed_quantity < 0):
+        existing_abs = abs(net_quantity)
+        incoming_abs = abs(signed_quantity)
+        combined = existing_abs + incoming_abs
+        state["average_price"] = price if combined == 0 else ((average_price * existing_abs) + (price * incoming_abs)) / combined
+        state["net_quantity"] = net_quantity + signed_quantity
+        return
+
+    closing_quantity = min(abs(net_quantity), abs(signed_quantity))
+    realized_pnl = _to_float(state.get("realized_pnl"))
+    if net_quantity > 0 and signed_quantity < 0:
+        realized_pnl += (price - average_price) * closing_quantity
+    elif net_quantity < 0 and signed_quantity > 0:
+        realized_pnl += (average_price - price) * closing_quantity
+    state["realized_pnl"] = realized_pnl
+
+    remaining_existing = abs(net_quantity) - closing_quantity
+    remaining_incoming = abs(signed_quantity) - closing_quantity
+    if remaining_existing > 0:
+        state["net_quantity"] = remaining_existing if net_quantity > 0 else -remaining_existing
+        state["average_price"] = average_price
+        return
+    if remaining_incoming > 0:
+        state["net_quantity"] = remaining_incoming if signed_quantity > 0 else -remaining_incoming
+        state["average_price"] = price
+        return
+    state["net_quantity"] = 0
+    state["average_price"] = 0.0
+
+
+def _build_live_worker_leg_states(facts: List[Any]) -> Tuple[Dict[Tuple[int, str], Dict[str, Any]], float]:
+    legs: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    total_charges = 0.0
+    ordered_facts = sorted(facts, key=lambda item: (getattr(item, "fill_timestamp", _utcnow()), getattr(item, "id", 0) or 0))
+    for fact in ordered_facts:
+        payload = dict(getattr(fact, "payload", {}) or {})
+        broker_fill = dict(payload.get("broker_fill") or {})
+        instrument_token = _to_int(broker_fill.get("instrument_token"))
+        product = str(broker_fill.get("product") or "")
+        if not instrument_token or not product:
+            continue
+        key = (instrument_token, product)
+        state = legs.setdefault(
+            key,
+            {
+                "instrument_token": instrument_token,
+                "exchange": str(broker_fill.get("exchange") or "") or None,
+                "tradingsymbol": str(broker_fill.get("tradingsymbol") or "") or None,
+                "product": product,
+                "net_quantity": 0,
+                "average_price": 0.0,
+                "realized_pnl": 0.0,
+                "charges": 0.0,
+                "last_fill_at": getattr(fact, "fill_timestamp", None),
+            },
+        )
+        side = str(getattr(fact, "side", "") or "").upper()
+        quantity = _to_int(getattr(fact, "quantity", 0))
+        price = _to_float(getattr(fact, "price", 0.0))
+        fact_charges = _to_float(getattr(fact, "fees_amount", 0.0)) + _to_float(getattr(fact, "taxes_amount", 0.0)) + _to_float(getattr(fact, "slippage_amount", 0.0))
+        total_charges += fact_charges
+        _accumulate_leg_fact(state, side=side, quantity=quantity, price=price, charges=fact_charges)
+        state["last_fill_at"] = getattr(fact, "fill_timestamp", None) or state.get("last_fill_at")
+    return legs, total_charges
+
+
+async def _paper_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) -> Dict[str, Any]:
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if paper_runtime_service is None:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+    summary = await paper_runtime_service.get_strategy_run_pnl(str(run["account_scope"]), str(run["strategy_run_id"]))
+    if summary is None:
+        return _empty_worker_pnl_snapshot(run, is_realtime=True)
+
+    strategy = dict(summary.get("strategy") or {})
+    legs = [
+        WorkerRunPnlLeg(
+            instrument_token=position.get("instrument_token"),
+            exchange=position.get("exchange"),
+            tradingsymbol=position.get("tradingsymbol"),
+            product=position.get("product"),
+            net_quantity=_to_int(position.get("net_quantity")),
+            side=str(position.get("side") or _worker_pnl_side(_to_int(position.get("net_quantity")))),
+            average_price=_to_float(position.get("average_price")),
+            last_price=_to_float(position.get("last_price")),
+            realized_pnl=_to_float(position.get("realized_pnl")),
+            unrealized_pnl=_to_float(position.get("unrealized_pnl")),
+            gross_pnl=_to_float(position.get("realized_pnl")) + _to_float(position.get("unrealized_pnl")),
+            charges=0.0,
+            net_pnl=_to_float(position.get("realized_pnl")) + _to_float(position.get("unrealized_pnl")),
+            is_stale=False,
+        )
+        for position in strategy.get("positions", [])
+        if _to_int(position.get("net_quantity")) != 0
+    ]
+    realized = _to_float(strategy.get("realized_pnl"))
+    unrealized = _to_float(strategy.get("unrealized_pnl"))
+    gross = realized + unrealized
+    updated_at = str(strategy.get("last_updated_at") or strategy.get("last_event_at") or _utcnow().isoformat())
+    return WorkerRunPnlSnapshot(
+        strategy_run_id=str(run["strategy_run_id"]),
+        execution_mode="paper",
+        status=str(strategy.get("status") or run.get("status") or "open"),
+        currency=str(summary.get("currency") or "INR"),
+        totals=WorkerRunPnlTotals(realized_pnl=realized, unrealized_pnl=unrealized, gross_pnl=gross, charges=0.0, net_pnl=gross),
+        legs=legs,
+        position_count=len(legs),
+        is_realtime=True,
+        is_stale=False,
+        updated_at=updated_at,
+    ).model_dump(mode="json")
+
+
+async def _live_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) -> Dict[str, Any]:
+    from journaling.repository import JournalRepository
+
+    strategy_run_id = str(run["strategy_run_id"])
+    account_id = str(run["account_scope"])
+    journal_repository = getattr(request.app.state, "algo_worker_journal_repository", None) or JournalRepository()
+    link = await asyncio.to_thread(journal_repository.find_source_link, source_type="live_order", source_key=strategy_run_id)
+    if link is None:
+        return _empty_worker_pnl_snapshot(run, is_realtime=True)
+
+    facts = await asyncio.to_thread(journal_repository.list_execution_facts, str(link.run_id))
+    live_facts = [fact for fact in facts if str(getattr(fact, "source_type", "")) == "live_fill"]
+    legs_by_key, total_charges = _build_live_worker_leg_states(live_facts)
+
+    realtime_positions = getattr(request.app.state, "algo_worker_realtime_positions_service", None)
+    if realtime_positions is None:
+        from broker_api.order_runtime import realtime_positions_service as realtime_positions
+
+    corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-pnl-{uuid.uuid4()}"
+    positions = await realtime_positions.get_positions(account_id, corr_id)
+    positions_by_leg: Dict[Tuple[int, str], Any] = {}
+    for position in positions.values():
+        positions_by_leg[(int(position.instrument_token), str(position.product))] = position
+
+    rendered_legs: List[WorkerRunPnlLeg] = []
+    unrealized_total = 0.0
+    realized_total = 0.0
+    updated_markers: List[str] = []
+    stale = False
+
+    for key, state in sorted(legs_by_key.items(), key=lambda item: ((item[1].get("exchange") or ""), (item[1].get("tradingsymbol") or ""), (item[1].get("product") or ""))):
+        position = positions_by_leg.get(key)
+        net_quantity = _to_int(state.get("net_quantity"))
+        if position is not None:
+            last_price = _to_float(getattr(position, "last_price", 0.0))
+            broker_net_quantity = _to_int(getattr(position, "quantity", 0))
+            last_reconciled_at = getattr(position, "last_reconciled_at", None)
+            if last_reconciled_at:
+                updated_markers.append(str(last_reconciled_at))
+        else:
+            last_price = 0.0
+            broker_net_quantity = None
+            last_reconciled_at = None
+
+        realized = _to_float(state.get("realized_pnl"))
+        charges = _to_float(state.get("charges"))
+        average_price = _to_float(state.get("average_price"))
+        unrealized = 0.0
+        leg_stale = False
+        if net_quantity != 0:
+            if last_price > 0:
+                unrealized = (last_price - average_price) * net_quantity
+            else:
+                leg_stale = True
+            if broker_net_quantity is None:
+                leg_stale = True
+            elif broker_net_quantity != net_quantity:
+                leg_stale = True
+
+        stale = stale or leg_stale
+        realized_total += realized
+        unrealized_total += unrealized
+        gross = realized + unrealized
+        net = gross - charges
+        rendered_legs.append(
+            WorkerRunPnlLeg(
+                instrument_token=state.get("instrument_token"),
+                exchange=state.get("exchange"),
+                tradingsymbol=state.get("tradingsymbol"),
+                product=state.get("product"),
+                net_quantity=net_quantity,
+                side=_worker_pnl_side(net_quantity),
+                average_price=average_price,
+                last_price=last_price,
+                realized_pnl=realized,
+                unrealized_pnl=unrealized,
+                gross_pnl=gross,
+                charges=charges,
+                net_pnl=net,
+                broker_net_quantity=broker_net_quantity,
+                is_stale=leg_stale,
+                last_reconciled_at=str(last_reconciled_at) if last_reconciled_at else None,
+            )
+        )
+
+    gross_total = realized_total + unrealized_total
+    net_total = gross_total - total_charges
+    if not updated_markers and live_facts:
+        updated_markers = [getattr(live_facts[-1], "fill_timestamp", _utcnow()).isoformat()]
+    updated_at = max(updated_markers) if updated_markers else (_run_updated_at(run) or _utcnow().isoformat())
+    return WorkerRunPnlSnapshot(
+        strategy_run_id=strategy_run_id,
+        execution_mode="live",
+        status=str(run.get("status") or "open"),
+        currency="INR",
+        totals=WorkerRunPnlTotals(
+            realized_pnl=realized_total,
+            unrealized_pnl=unrealized_total,
+            gross_pnl=gross_total,
+            charges=total_charges,
+            net_pnl=net_total,
+        ),
+        legs=[leg for leg in rendered_legs if leg.net_quantity != 0],
+        position_count=len([leg for leg in rendered_legs if leg.net_quantity != 0]),
+        is_realtime=True,
+        is_stale=stale,
+        updated_at=updated_at,
+    ).model_dump(mode="json")
+
+
+async def _build_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) -> Dict[str, Any]:
+    mode = str(run.get("execution_mode") or "").lower()
+    if mode == "dry_run":
+        return _empty_worker_pnl_snapshot(run, is_realtime=False)
+    if mode == "paper":
+        return await _paper_worker_run_pnl_snapshot(request, run)
+    if mode == "live":
+        return await _live_worker_run_pnl_snapshot(request, run)
+    raise HTTPException(status_code=400, detail=f"Unsupported execution mode '{mode}'")
+
+
+async def _worker_run_pnl_stream(request: Request, run: Dict[str, Any], *, interval_seconds: float) -> AsyncGenerator[str, None]:
+    strategy_run_id = str(run["strategy_run_id"])
+    current_run = dict(run)
+    last_signature: Optional[str] = None
+    heartbeat_counter = 0
+    safe_interval = min(5.0, max(0.25, float(interval_seconds or 1.0)))
+    while True:
+        if await request.is_disconnected():
+            break
+        refreshed_run = await _repo(request).get_run(strategy_run_id)
+        if refreshed_run is None:
+            yield "event: end\ndata: {\"detail\": \"Strategy run not found\"}\n\n"
+            break
+        current_run = refreshed_run
+        try:
+            snapshot = await _build_worker_run_pnl_snapshot(request, current_run)
+        except Exception as exc:
+            yield f"event: error\ndata: {json.dumps({'detail': str(exc)})}\n\n"
+            await asyncio.sleep(safe_interval)
+            continue
+        signature = _snapshot_signature(snapshot)
+        if signature != last_signature:
+            yield f"data: {json.dumps(snapshot, default=_json_default)}\n\n"
+            last_signature = signature
+            heartbeat_counter = 0
+        else:
+            heartbeat_counter += 1
+            if heartbeat_counter >= max(1, int(15 / safe_interval)):
+                yield ": heartbeat\n\n"
+                heartbeat_counter = 0
+        await asyncio.sleep(safe_interval)
+
+
 async def _submit_live_worker_intent(*, request: Request, token: WorkerToken, run: Dict[str, Any], payload: WorkerIntentRequest) -> Dict[str, Any]:
     from broker_api.kite_orders import BasketOrderRequest, OrdersService, PlaceOrderRequest
 
@@ -1070,6 +1447,36 @@ async def get_worker_run(request: Request, strategy_run_id: str):
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     return run
+
+
+@router.get("/worker/runs/{strategy_run_id}/pnl")
+async def get_worker_run_pnl(request: Request, strategy_run_id: str):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    return await _build_worker_run_pnl_snapshot(request, run)
+
+
+@router.get("/worker/runs/{strategy_run_id}/pnl/stream")
+async def stream_worker_run_pnl(request: Request, strategy_run_id: str, interval_seconds: float = Query(1.0, ge=0.25, le=5.0)):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    return StreamingResponse(
+        _worker_run_pnl_stream(request, run, interval_seconds=interval_seconds),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.patch("/worker/runs/{strategy_run_id}/risk")

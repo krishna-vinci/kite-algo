@@ -1,5 +1,7 @@
+# pyright: reportArgumentType=false
 import sys
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -12,6 +14,7 @@ install_dependency_stubs()
 from api.routers.algo_workers import (  # noqa: E402
     DEFAULT_WORKER_ACTIONS,
     WorkerIntentRequest,
+    get_worker_run_pnl,
     WorkerRiskPatchRequest,
     WorkerRunCreateRequest,
     WorkerToken,
@@ -20,6 +23,7 @@ from api.routers.algo_workers import (  # noqa: E402
     create_worker_token,
     patch_worker_run_risk,
     exit_worker_run,
+    stream_worker_run_pnl,
     submit_worker_intent,
     WorkerExitRequest,
 )
@@ -127,6 +131,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             headers={"authorization": f"Bearer {raw_token}"},
             app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo, paper_runtime_service=paper_runtime)),
+            is_disconnected=AsyncMock(return_value=False),
         )
 
     async def test_admin_token_creation_allows_explicit_live_kite_scope(self):
@@ -449,10 +454,10 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["status"], "exiting")
         self.assertEqual(repo.runs["run-live"]["status"], "exiting")
         live_orders.place_basket.assert_awaited_once()
-        basket_req = live_orders.place_basket.await_args.args[1]
-        self.assertEqual(basket_req.orders[0].transaction_type.value, "SELL")
-        self.assertEqual(basket_req.orders[0].quantity, 1)
-        self.assertEqual(basket_req.orders[0].attribution["strategy_run_id"], "run-live")
+        planned_orders = repo.runs["run-live"]["runtime_state"]["live_exit"]["orders"]
+        self.assertEqual(planned_orders[0]["transaction_type"], "SELL")
+        self.assertEqual(planned_orders[0]["quantity"], 1)
+        self.assertEqual(planned_orders[0]["attribution"]["strategy_run_id"], "run-live")
         self.assertEqual(live_orders.place_basket.await_args.kwargs["idempotency_key"], "exit-0001")
 
     async def test_live_worker_exit_rejects_when_broker_position_cannot_cover_attributed_leg(self):
@@ -498,6 +503,232 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ctx.exception.status_code, 409)
         live_orders.place_basket.assert_not_called()
+
+    async def test_worker_run_pnl_snapshot_returns_zeroes_for_dry_run(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-dry"] = {
+            "strategy_run_id": "run-dry",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "dry_run",
+            "status": "open",
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        response = await get_worker_run_pnl(request, "run-dry")
+
+        self.assertEqual(response["strategy_run_id"], "run-dry")
+        self.assertEqual(response["execution_mode"], "dry_run")
+        self.assertEqual(response["totals"]["net_pnl"], 0.0)
+        self.assertFalse(response["is_realtime"])
+        self.assertEqual(response["legs"], [])
+
+    async def test_worker_run_pnl_snapshot_returns_paper_grouped_totals_and_legs(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-paper"] = {
+            "strategy_run_id": "run-paper",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "metadata": {},
+        }
+        paper_runtime = SimpleNamespace(
+            get_strategy_run_pnl=AsyncMock(
+                return_value={
+                    "currency": "INR",
+                    "strategy": {
+                        "status": "open",
+                        "realized_pnl": 10.0,
+                        "unrealized_pnl": 5.5,
+                        "last_updated_at": "2026-04-25T12:00:00+00:00",
+                        "positions": [
+                            {
+                                "instrument_token": 408065,
+                                "exchange": "NSE",
+                                "tradingsymbol": "INFY",
+                                "product": "CNC",
+                                "net_quantity": 1,
+                                "side": "LONG",
+                                "average_price": 100.0,
+                                "last_price": 105.5,
+                                "realized_pnl": 10.0,
+                                "unrealized_pnl": 5.5,
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        request = self._request(repo, paper_runtime=paper_runtime)
+
+        response = await get_worker_run_pnl(request, "run-paper")
+
+        self.assertEqual(response["totals"]["gross_pnl"], 15.5)
+        self.assertEqual(response["totals"]["charges"], 0.0)
+        self.assertEqual(response["legs"][0]["tradingsymbol"], "INFY")
+        self.assertEqual(response["legs"][0]["net_pnl"], 15.5)
+
+    async def test_worker_run_pnl_snapshot_returns_live_grouped_totals_and_legs(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-pnl"] = {
+            "strategy_run_id": "run-live-pnl",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_journal_repository = SimpleNamespace(
+            find_source_link=lambda **kwargs: SimpleNamespace(run_id="11111111-1111-4111-8111-111111111111"),
+            list_execution_facts=lambda run_id: [
+                SimpleNamespace(
+                    id=1,
+                    source_type="live_fill",
+                    side="BUY",
+                    quantity=1,
+                    price=100.0,
+                    fees_amount=0.8,
+                    taxes_amount=0.2,
+                    slippage_amount=0.0,
+                    fill_timestamp=datetime.fromisoformat("2026-04-25T12:00:00+00:00"),
+                    payload={"broker_fill": {"instrument_token": 408065, "exchange": "NSE", "tradingsymbol": "INFY", "product": "CNC"}},
+                )
+            ],
+        )
+        request.app.state.algo_worker_realtime_positions_service = SimpleNamespace(
+            get_positions=AsyncMock(
+                return_value={
+                    "NSE:INFY:CNC": SimpleNamespace(
+                        instrument_token=408065,
+                        product="CNC",
+                        quantity=1,
+                        last_price=101.5,
+                        last_reconciled_at="2026-04-25T12:00:05+00:00",
+                    )
+                }
+            )
+        )
+
+        response = await get_worker_run_pnl(request, "run-live-pnl")
+
+        self.assertEqual(response["totals"]["realized_pnl"], 0.0)
+        self.assertEqual(response["totals"]["unrealized_pnl"], 1.5)
+        self.assertEqual(response["totals"]["charges"], 1.0)
+        self.assertEqual(response["totals"]["net_pnl"], 0.5)
+        self.assertEqual(response["legs"][0]["broker_net_quantity"], 1)
+        self.assertFalse(response["is_stale"])
+
+    async def test_worker_run_pnl_snapshot_marks_live_leg_stale_when_broker_quantity_sign_is_opposite(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-stale"] = {
+            "strategy_run_id": "run-live-stale",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_journal_repository = SimpleNamespace(
+            find_source_link=lambda **kwargs: SimpleNamespace(run_id="11111111-1111-4111-8111-111111111111"),
+            list_execution_facts=lambda run_id: [
+                SimpleNamespace(
+                    id=1,
+                    source_type="live_fill",
+                    side="BUY",
+                    quantity=1,
+                    price=100.0,
+                    fees_amount=0.0,
+                    taxes_amount=0.0,
+                    slippage_amount=0.0,
+                    fill_timestamp=datetime.fromisoformat("2026-04-25T12:00:00+00:00"),
+                    payload={"broker_fill": {"instrument_token": 408065, "exchange": "NSE", "tradingsymbol": "INFY", "product": "CNC"}},
+                )
+            ],
+        )
+        request.app.state.algo_worker_realtime_positions_service = SimpleNamespace(
+            get_positions=AsyncMock(
+                return_value={
+                    "NSE:INFY:CNC": SimpleNamespace(
+                        instrument_token=408065,
+                        product="CNC",
+                        quantity=-1,
+                        last_price=101.5,
+                        last_reconciled_at="2026-04-25T12:00:05+00:00",
+                    )
+                }
+            )
+        )
+
+        response = await get_worker_run_pnl(request, "run-live-stale")
+
+        self.assertTrue(response["is_stale"])
+        self.assertTrue(response["legs"][0]["is_stale"])
+
+    async def test_worker_run_pnl_stream_returns_sse_snapshot(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-dry-stream"] = {
+            "strategy_run_id": "run-dry-stream",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "dry_run",
+            "status": "open",
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        response = await stream_worker_run_pnl(request, "run-dry-stream", interval_seconds=0.25)
+        chunk = await response.body_iterator.__anext__()  # pyright: ignore[reportAttributeAccessIssue]
+
+        self.assertEqual(response.media_type, "text/event-stream")
+        self.assertIn("run-dry-stream", chunk)
+        self.assertIn("data:", chunk)
+
+    async def test_worker_run_pnl_stream_refreshes_run_status_between_events(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-dry-stream-status"] = {
+            "strategy_run_id": "run-dry-stream-status",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "dry_run",
+            "status": "open",
+            "metadata": {},
+        }
+        request = self._request(repo)
+        request.is_disconnected = AsyncMock(side_effect=[False, False, True])
+
+        response = await stream_worker_run_pnl(request, "run-dry-stream-status", interval_seconds=0.25)
+        first = await response.body_iterator.__anext__()  # pyright: ignore[reportAttributeAccessIssue]
+        repo.runs["run-dry-stream-status"]["status"] = "closed"
+        second = await response.body_iterator.__anext__()  # pyright: ignore[reportAttributeAccessIssue]
+
+        self.assertIn('"status": "open"', first)
+        self.assertIn('"status": "closed"', second)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
 import requests
 
@@ -93,6 +94,53 @@ class KiteAlgoWorkerClient:
 
     def get_run(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}")
+
+    def get_run_pnl(self, strategy_run_id: str) -> JsonDict:
+        return self._request("GET", f"/worker/runs/{strategy_run_id}/pnl")
+
+    def stream_run_pnl(self, strategy_run_id: str, *, interval_seconds: float = 1.0) -> Iterator[JsonDict]:
+        response = self.session.request(
+            "GET",
+            self._url(f"/worker/runs/{strategy_run_id}/pnl/stream"),
+            timeout=(self.config.timeout, None),
+            stream=True,
+            params={"interval_seconds": interval_seconds},
+        )
+        if not 200 <= response.status_code < 300:
+            try:
+                self._raise_response_error(response, "GET", f"/worker/runs/{strategy_run_id}/pnl/stream")
+            finally:
+                response.close()
+
+        def _events() -> Iterator[JsonDict]:
+            current_event = "message"
+            try:
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if line.startswith("event:"):
+                        current_event = line.split(":", 1)[1].strip() or "message"
+                        continue
+                    if line.startswith("data:"):
+                        payload = line.split(":", 1)[1].strip()
+                        if payload:
+                            decoded = json.loads(payload)
+                            if current_event == "error":
+                                raise KiteAlgoWorkerError(
+                                    f"Worker API stream error for run {strategy_run_id}: {decoded.get('detail') if isinstance(decoded, dict) else decoded}",
+                                    status_code=0,
+                                    response_body=decoded,
+                                )
+                            if current_event == "end":
+                                break
+                            yield decoded
+                        current_event = "message"
+            finally:
+                response.close()
+
+        return _events()
 
     def place_order(
         self,
@@ -186,6 +234,11 @@ class KiteAlgoWorkerClient:
             except ValueError:
                 return {"raw": response.text}
 
+        self._raise_response_error(response, method, path)
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _raise_response_error(response: requests.Response, method: str, path: str) -> None:
         body: Any
         try:
             body = response.json()

@@ -144,6 +144,11 @@ Do not use this file for frontend work.
   - SDK examples now cover mean-reversion, option baskets, and grouped live exit preview with safe defaults
   - `docs/algo-worker-development-guide.md` is now a full coding guide for dry_run/paper/live worker strategy development and documents all live order fields supported by `PlaceOrderRequest`
   - focused SDK tests validate auth headers, run/intent payloads, idempotency enforcement, exit preview payloads, non-2xx handling, and order-builder compatibility with broker order validation
+- Added grouped algo-worker run P&L snapshot/stream support:
+  - `/api/algo-workers/worker/runs/{strategy_run_id}/pnl` now returns backend-owned grouped run totals plus per-leg breakdown for `dry_run`, `paper`, and `live`
+  - `/api/algo-workers/worker/runs/{strategy_run_id}/pnl/stream` now exposes SSE updates so remote workers can consume grouped P&L that feels realtime
+  - live run P&L is reconstructed from attributed live fills plus current account position marks, keeping charges separated and flagging stale coverage when broker mark/quantity alignment is incomplete
+  - paper run P&L reuses grouped paper strategy state via `strategy_run_id` instead of requiring workers to infer grouped P&L locally
 
 ## Skill usage
 

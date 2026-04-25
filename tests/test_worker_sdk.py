@@ -6,6 +6,7 @@ import pytest
 from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs(stub_kite_orders=False)
+sys.modules.pop("broker_api.kite_orders", None)
 
 SDK_ROOT = Path(__file__).resolve().parents[1] / "sdk" / "python"
 if str(SDK_ROOT) not in sys.path:
@@ -26,16 +27,25 @@ from broker_api.kite_orders import PlaceOrderRequest  # noqa: E402
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, payload=None, text=""):
+    def __init__(self, status_code=200, payload=None, text="", lines=None):
         self.status_code = status_code
         self._payload = payload if payload is not None else {"ok": True}
         self.text = text
         self.content = text.encode("utf-8") if text else b"{}"
+        self._lines = lines or []
+        self.closed = False
 
     def json(self):
         if isinstance(self._payload, Exception):
             raise self._payload
         return self._payload
+
+    def iter_lines(self, decode_unicode=False):
+        for line in self._lines:
+            yield line if decode_unicode else line.encode("utf-8")
+
+    def close(self):
+        self.closed = True
 
 
 @pytest.fixture
@@ -115,6 +125,64 @@ def test_exit_run_supports_dry_run(captured_requests):
     assert payload == {"reason": "operator preview", "idempotency_key": "run-1:exit-preview:1", "dry_run": True}
 
 
+def test_get_run_pnl_uses_worker_pnl_endpoint(captured_requests):
+    client().get_run_pnl("run-1")
+
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/pnl"
+
+
+def test_stream_run_pnl_parses_sse_events(monkeypatch):
+    response = FakeResponse(
+        payload={"ignored": True},
+        lines=[": heartbeat", "data: {\"strategy_run_id\": \"run-1\", \"totals\": {\"net_pnl\": 12.5}}"],
+    )
+
+    def fake_request(self, method, url, **kwargs):
+        assert method == "GET"
+        assert url == "http://localhost:8000/api/algo-workers/worker/runs/run-1/pnl/stream"
+        assert kwargs["stream"] is True
+        assert kwargs["params"] == {"interval_seconds": 0.5}
+        return response
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    events = list(client().stream_run_pnl("run-1", interval_seconds=0.5))
+
+    assert events == [{"strategy_run_id": "run-1", "totals": {"net_pnl": 12.5}}]
+    assert response.closed is True
+
+
+def test_stream_run_pnl_closes_response_on_non_2xx(monkeypatch):
+    response = FakeResponse(status_code=503, payload={"detail": "stream unavailable"})
+
+    def fake_request(self, method, url, **kwargs):
+        return response
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    with pytest.raises(KiteAlgoWorkerError, match="stream unavailable"):
+        list(client().stream_run_pnl("run-1"))
+
+    assert response.closed is True
+
+
+def test_stream_run_pnl_raises_on_sse_error_event(monkeypatch):
+    response = FakeResponse(
+        payload={"ignored": True},
+        lines=["event: error", "data: {\"detail\": \"temporary backend issue\"}"],
+    )
+
+    def fake_request(self, method, url, **kwargs):
+        return response
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    with pytest.raises(KiteAlgoWorkerError, match="temporary backend issue"):
+        list(client().stream_run_pnl("run-1"))
+
+    assert response.closed is True
+
+
 def test_non_2xx_response_raises_custom_exception(monkeypatch):
     def fake_request(self, method, url, **kwargs):
         return FakeResponse(status_code=409, payload={"detail": "closed strategy runs cannot be edited"})
@@ -166,4 +234,4 @@ def test_order_builders_produce_valid_broker_order_payloads():
 
     for payload in [equity, option, limit, stop_limit, slm]:
         validated = PlaceOrderRequest.model_validate(payload)
-        assert validated.model_dump(mode="json", exclude_none=True)["tradingsymbol"] == payload["tradingsymbol"]
+        assert validated.tradingsymbol == payload["tradingsymbol"]

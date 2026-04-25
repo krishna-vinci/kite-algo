@@ -61,6 +61,13 @@ run = client.create_run(
 
 order = equity_market_order("INFY", "BUY", 1)
 client.place_order(run["strategy_run_id"], order, "run_mean_reversion_001:entry:001")
+
+pnl = client.get_run_pnl(run["strategy_run_id"])
+print(pnl["totals"]["net_pnl"])
+
+for update in client.stream_run_pnl(run["strategy_run_id"], interval_seconds=1.0):
+    print(update["totals"]["net_pnl"])
+    break
 ```
 
 ## AMO orders
@@ -80,3 +87,12 @@ amo_limit = limit_order("NSE", "INFY", "BUY", "CNC", 1, price=1450.0, variety="a
 - Start strategies in `dry_run`, then `paper`, then explicitly validated `live`.
 - Do not send broker tags or attribution; the backend injects them.
 - Keep tokens in environment variables or a secret manager.
+
+## Realtime grouped run P&L
+
+The SDK exposes grouped run-level P&L helpers:
+
+- `get_run_pnl(strategy_run_id)`
+- `stream_run_pnl(strategy_run_id, interval_seconds=1.0)`
+
+The backend remains the source of truth for paper/live separation, attribution, charges, and grouped run state.

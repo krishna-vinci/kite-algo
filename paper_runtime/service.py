@@ -495,6 +495,20 @@ class PaperTradingService:
             "strategies": grouped,
         }
 
+    async def get_strategy_run_pnl(self, account_scope: str, strategy_run_id: str) -> Dict[str, Any] | None:
+        normalized_strategy_run_id = str(strategy_run_id or "").strip()
+        if not normalized_strategy_run_id:
+            raise ValueError("strategy_run_id is required")
+        summary = await self.get_strategy_summary(account_scope)
+        for strategy in summary.get("strategies", []):
+            if str(strategy.get("strategy_run_id") or strategy.get("strategy_id") or "") == normalized_strategy_run_id:
+                return {
+                    "currency": summary.get("account", {}).get("currency") or "INR",
+                    "account_scope": summary.get("account", {}).get("account_scope") or account_scope,
+                    "strategy": strategy,
+                }
+        return None
+
     async def exit_strategy(self, *, account_scope: str, strategy_id: str) -> Dict[str, Any]:
         normalized_strategy_id = str(strategy_id or "").strip()
         if not normalized_strategy_id:

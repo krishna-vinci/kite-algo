@@ -120,7 +120,7 @@ The SDK maps to public endpoints only:
 
 ## Realtime run P&L
 
-The worker API now supports grouped run-level P&L snapshots and an SSE stream.
+The worker API supports grouped run-level P&L snapshots and an SSE stream.
 
 Use:
 
@@ -131,61 +131,12 @@ for update in client.stream_run_pnl(run_id, interval_seconds=1.0):
     print(update["totals"]["net_pnl"])
 ```
 
-The payload is grouped by `strategy_run_id` and keeps paper and live P&L separated.
-
-Response shape:
-
-```json
-{
-  "strategy_run_id": "run_mean_reversion_20260425_001",
-  "execution_mode": "live",
-  "status": "open",
-  "currency": "INR",
-  "totals": {
-    "realized_pnl": 1250.0,
-    "unrealized_pnl": -180.0,
-    "gross_pnl": 1070.0,
-    "charges": 42.5,
-    "net_pnl": 1027.5
-  },
-  "legs": [
-    {
-      "instrument_token": 408065,
-      "exchange": "NSE",
-      "tradingsymbol": "INFY",
-      "product": "CNC",
-      "net_quantity": 1,
-      "side": "LONG",
-      "average_price": 1450.0,
-      "last_price": 1462.0,
-      "realized_pnl": 0.0,
-      "unrealized_pnl": 12.0,
-      "gross_pnl": 12.0,
-      "charges": 0.0,
-      "net_pnl": 12.0,
-      "broker_net_quantity": 1,
-      "is_stale": false,
-      "last_reconciled_at": "2026-04-25T12:34:56Z"
-    }
-  ],
-  "position_count": 1,
-  "is_realtime": true,
-  "is_stale": false,
-  "updated_at": "2026-04-25T12:34:56Z"
-}
-```
-
-Mode behavior:
-
-- `dry_run`: returns zero totals and no legs.
-- `paper`: returns grouped paper run P&L and grouped paper legs.
-- `live`: returns grouped attributed live run P&L with charges and live-leg breakdown.
-
 Important notes:
 
-- The backend is the source of truth for grouped P&L.
-- Live broker/manual activity stays separate unless safely attributed.
-- `is_stale=true` means the backend could not fully confirm live leg mark coverage or broker quantity alignment for one or more open legs.
+- `dry_run` returns zero totals and no legs.
+- `paper` returns grouped paper run P&L and grouped paper legs.
+- `live` returns grouped attributed live run P&L with charges and live-leg breakdown.
+- `is_stale=true` means the backend could not fully confirm one or more live leg marks/coverage.
 
 ## Execution modes: dry_run vs paper vs live
 
