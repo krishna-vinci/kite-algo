@@ -104,6 +104,15 @@ class KiteAlgoWorkerClient:
     def get_run_pnl(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}/pnl")
 
+    def get_funds(self, *, mode: str = "paper", account_scope: Optional[str] = None) -> JsonDict:
+        params: JsonDict = {"mode": mode}
+        if account_scope is not None:
+            params["account_scope"] = account_scope
+        return self._request("GET", "/worker/funds", params=params)
+
+    def get_run_funds(self, strategy_run_id: str) -> JsonDict:
+        return self._request("GET", f"/worker/runs/{strategy_run_id}/funds")
+
     def stream_run_pnl(self, strategy_run_id: str, *, interval_seconds: float = 1.0) -> Iterator[JsonDict]:
         return self._stream_sse(
             "GET",

@@ -36,12 +36,12 @@ If this context pack and the canonical files disagree, trust the canonical files
 ## Current SDK release
 
 - Package name: `kite-algo-worker`
-- Version: `0.2.0`
-- Git tag: `kite-algo-worker-v0.2.0`
+- Version: `0.3.0`
+- Git tag: `kite-algo-worker-v0.3.0`
 
 Remote install:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.2.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"
 ```
