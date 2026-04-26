@@ -218,6 +218,8 @@ async def _worker_strategy_rows(request: Any, *, broker_account_id: Optional[str
             "strategy_family": metadata.get("strategy_family"),
             "algo_instance_id": metadata.get("algo_instance_id") or run.get("algo_instance_id"),
             "protection": runtime_state.get("protection") if isinstance(runtime_state.get("protection"), dict) else metadata.get("protection"),
+            "backend_protection": runtime_state.get("backend_protection") if isinstance(runtime_state.get("backend_protection"), dict) else None,
+            "backend_protection_state": runtime_state.get("backend_protection_state") if isinstance(runtime_state.get("backend_protection_state"), dict) else None,
         }
         protection = await _safe_protection_for_strategy(protection_service, adapter_row)
         rows.append(
@@ -399,11 +401,12 @@ async def exit_control_strategy(
     account_scope: str = "default",
     reason: Optional[str] = None,
     dry_run: bool = False,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     repo = getattr(request.app.state, "algo_worker_repository", None)
     run = await repo.get_run(strategy_run_id) if repo is not None and hasattr(repo, "get_run") else None
     if run is not None:
-        return await _exit_worker_control_strategy(request, run, reason=reason, dry_run=dry_run)
+        return await _exit_worker_control_strategy(request, run, reason=reason, dry_run=dry_run, idempotency_key=idempotency_key)
 
     paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
     if paper_runtime_service is None:
@@ -435,12 +438,12 @@ async def _paper_strategy_exists(service: Any, *, account_scope: str, strategy_r
     return False
 
 
-async def _exit_worker_control_strategy(request: Any, run: Dict[str, Any], *, reason: Optional[str], dry_run: bool) -> Dict[str, Any]:
+async def _exit_worker_control_strategy(request: Any, run: Dict[str, Any], *, reason: Optional[str], dry_run: bool, idempotency_key: Optional[str] = None) -> Dict[str, Any]:
     from api.routers.algo_workers import WorkerExitRequest, WorkerToken, _exit_live_worker_run
 
     mode = str(run.get("execution_mode") or "paper").lower()
     strategy_run_id = str(run.get("strategy_run_id"))
-    payload = WorkerExitRequest(reason=reason, dry_run=dry_run)
+    payload = WorkerExitRequest(reason=reason, dry_run=dry_run, idempotency_key=idempotency_key)
     repo = getattr(request.app.state, "algo_worker_repository", None)
     if repo is None:
         raise HTTPException(status_code=503, detail="Algo worker repository is not available")

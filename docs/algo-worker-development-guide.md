@@ -121,7 +121,43 @@ The SDK maps to public endpoints only:
 | `get_market_snapshot(...)` | `POST /api/algo-workers/worker/market/snapshot` |
 | `place_order(...)` / `place_basket(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/intents` |
 | `patch_risk(...)` | `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/risk` |
+| `update_backend_protection(...)` | `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/protection` |
 | `exit_run(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/exit` |
+
+## Backend-owned exposure protection
+
+If a worker wants the backend to enforce position, basket, stale-worker, or MIS squareoff protection, send a declarative `BackendProtection` contract during `create_run(...)` or later with `update_backend_protection(...)`.
+
+Current V1 protection exits the attributed strategy through the backend control-plane exit path when a declared rule triggers. Position rules are still useful for leg-specific thresholds, but the submitted safety action is conservative strategy exit until a broker-safe leg-only exit primitive is added.
+
+```python
+from kite_algo_worker import BackendProtection, BasketProtection, OperationalProtection, ProtectedPosition
+
+protection = BackendProtection(
+    positions=[
+        ProtectedPosition(
+            symbol="NSE:INFY",
+            product="CNC",
+            side="BUY",
+            quantity=1,
+            entry_price=1500,
+            stoploss_pct=2,
+        )
+    ],
+    basket=BasketProtection(stoploss_pct=4, trailing_activate_pct=3, trailing_drawdown_pct=1),
+    operations=OperationalProtection(exit_on_worker_stale=True, worker_stale_sec=300, mis_squareoff_buffer_sec=60),
+)
+
+client.create_run(
+    strategy_run_id=run_id,
+    template_id="mean-reversion",
+    account_scope="kite:paper-a",
+    execution_mode="paper",
+    backend_protection=protection,
+)
+```
+
+Keep this contract small and explicit. The worker still owns strategy decisions; the backend only owns enforcement. Validation is strict: product must be `CNC`/`MIS`/`NRML`, side must be `BUY`/`SELL`, quantities and entry prices must be positive, stale-worker limits must be `30..86400`, MIS buffer must be `0..3600`, and enabled protection must contain at least one rules object.
 
 ## Runtime-backed market data
 

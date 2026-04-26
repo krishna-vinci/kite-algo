@@ -14,8 +14,12 @@ if str(SDK_ROOT) not in sys.path:
 
 from kite_algo_worker import (  # noqa: E402
     AlgoWorkerConfig,
+    BackendProtection,
+    BasketProtection,
     KiteAlgoWorkerClient,
     KiteAlgoWorkerError,
+    OperationalProtection,
+    ProtectedPosition,
     equity_market_order,
     limit_order,
     market_order,
@@ -104,6 +108,79 @@ def test_place_order_requires_idempotency_key(captured_requests):
             client().place_order("run-1", {"exchange": "NSE"}, bad_key)
 
     assert captured_requests == []
+
+
+def test_create_run_serializes_backend_protection(captured_requests):
+    protection = BackendProtection(
+        positions=[
+            ProtectedPosition(
+                symbol="nse:infy",
+                product="cnc",
+                side="buy",
+                quantity=1,
+                entry_price=1500,
+                stoploss_pct=2.5,
+            )
+        ],
+        basket=BasketProtection(stoploss_pct=5, trailing_activate_pct=3, trailing_drawdown_pct=1.5),
+        operations=OperationalProtection(exit_on_worker_stale=True, worker_stale_sec=300, mis_squareoff_buffer_sec=60),
+    )
+
+    client().create_run(
+        strategy_run_id="run-1",
+        template_id="mean-reversion",
+        account_scope="kite:paper-a",
+        execution_mode="paper",
+        runtime_state={"risk": {"stop_loss_pct": 1.2}},
+        backend_protection=protection,
+    )
+
+    payload = captured_requests[0]["kwargs"]["json"]
+    assert payload["runtime_state"]["risk"] == {"stop_loss_pct": 1.2}
+    assert payload["runtime_state"]["backend_protection"] == {
+        "enabled": True,
+        "mode": "exposure",
+        "version": 1,
+        "positions": [
+            {
+                "symbol": "NSE:INFY",
+                "product": "CNC",
+                "side": "BUY",
+                "quantity": 1,
+                "entry_price": 1500.0,
+                "stoploss_pct": 2.5,
+            }
+        ],
+        "basket": {
+            "stoploss_pct": 5.0,
+            "trailing_activate_pct": 3.0,
+            "trailing_drawdown_pct": 1.5,
+        },
+        "operations": {
+            "exit_on_worker_stale": True,
+            "worker_stale_sec": 300,
+            "mis_squareoff_buffer_sec": 60,
+        },
+    }
+
+
+def test_update_backend_protection_calls_patch_endpoint(captured_requests):
+    protection = BackendProtection(basket=BasketProtection(stoploss_pct=5))
+
+    client().update_backend_protection("run-1", protection, reason="rebalance", reset_trailing=False)
+
+    assert captured_requests[0]["method"] == "PATCH"
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/protection"
+    assert captured_requests[0]["kwargs"]["json"] == {
+        "backend_protection": {
+            "enabled": True,
+            "mode": "exposure",
+            "version": 1,
+            "basket": {"stoploss_pct": 5.0},
+        },
+        "reason": "rebalance",
+        "reset_trailing": False,
+    }
 
 
 def test_place_basket_wraps_orders_correctly(captured_requests):

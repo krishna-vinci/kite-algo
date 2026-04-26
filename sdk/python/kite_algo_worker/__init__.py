@@ -10,6 +10,7 @@ from .orders import (
     sl_m_order,
     sl_order,
 )
+from .protection import BackendProtection, BasketProtection, OperationalProtection, ProtectedPosition
 
 __version__ = "0.1.0"
 
@@ -18,6 +19,10 @@ __all__ = [
     "AlgoWorkerConfig",
     "KiteAlgoWorkerClient",
     "KiteAlgoWorkerError",
+    "ProtectedPosition",
+    "BasketProtection",
+    "OperationalProtection",
+    "BackendProtection",
     "OrderBuilder",
     "market_order",
     "limit_order",

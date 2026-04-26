@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from api.worker_protection import validate_backend_protection_payload
 from api.worker_market_data import (
     WorkerInstrumentResolveRequest,
     WorkerMarketDataService,
@@ -183,6 +184,12 @@ class WorkerRiskPatchRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class WorkerProtectionPatchRequest(BaseModel):
+    backend_protection: Dict[str, Any] = Field(default_factory=dict)
+    reason: Optional[str] = None
+    reset_trailing: bool = True
+
+
 class WorkerIntentRequest(BaseModel):
     intent_type: str = Field(min_length=1)
     payload: Dict[str, Any] = Field(default_factory=dict)
@@ -279,8 +286,52 @@ class SqlAlchemyAlgoWorkerRepository:
     async def list_runs_for_control_plane(self) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(self._list_runs_for_control_plane_sync)
 
+    async def list_protection_enabled_runs(self) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._list_protection_enabled_runs_sync)
+
     async def update_run_risk(self, strategy_run_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
         return await asyncio.to_thread(self._update_run_risk_sync, strategy_run_id, patch)
+
+    async def update_run_runtime_state(self, strategy_run_id: str, runtime_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(self._update_run_runtime_state_sync, strategy_run_id, runtime_state)
+
+    async def update_run_backend_protection(
+        self,
+        strategy_run_id: str,
+        protection: Dict[str, Any],
+        protection_state: Dict[str, Any],
+        *,
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._update_run_backend_protection_sync,
+            strategy_run_id,
+            protection,
+            protection_state,
+            expected_generation,
+            expected_triggered_rule,
+            expected_exit_claim_id,
+        )
+
+    async def update_run_backend_protection_state(
+        self,
+        strategy_run_id: str,
+        protection_state: Dict[str, Any],
+        *,
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._update_run_backend_protection_state_sync,
+            strategy_run_id,
+            protection_state,
+            expected_generation,
+            expected_triggered_rule,
+            expected_exit_claim_id,
+        )
 
     async def update_run_status(self, strategy_run_id: str, status: str, *, state_patch: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._update_run_status_sync, strategy_run_id, status, state_patch)
@@ -292,7 +343,14 @@ class SqlAlchemyAlgoWorkerRepository:
         return await asyncio.to_thread(self._get_intent_result_sync, strategy_run_id, idempotency_key)
 
     async def save_intent_result(self, *, token_id: str, strategy_run_id: str, request: WorkerIntentRequest, status: str, result: Dict[str, Any]) -> Dict[str, Any]:
-        return await asyncio.to_thread(self._save_intent_result_sync, token_id, strategy_run_id, request, status, result)
+        return await asyncio.to_thread(
+            self._save_intent_result_sync,
+            token_id=token_id,
+            strategy_run_id=strategy_run_id,
+            request=request,
+            status=status,
+            result=result,
+        )
 
     def _create_token_sync(self, payload: WorkerTokenCreateRequest, raw_token: str, token_id: str) -> Dict[str, Any]:
         db = self.session_factory()
@@ -505,6 +563,29 @@ class SqlAlchemyAlgoWorkerRepository:
         finally:
             db.close()
 
+    def _list_protection_enabled_runs_sync(self) -> List[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT
+                        r.*,
+                        t.name AS worker_name,
+                        t.last_heartbeat_at,
+                        t.heartbeat_json
+                    FROM public.algo_worker_runs r
+                    LEFT JOIN public.algo_worker_tokens t ON t.token_id = r.token_id
+                    WHERE r.status IN ('open', 'exiting')
+                      AND COALESCE((r.runtime_state_json -> 'backend_protection' ->> 'enabled')::BOOLEAN, FALSE) = TRUE
+                    ORDER BY COALESCE(r.updated_at, r.created_at) ASC
+                    """
+                )
+            ).fetchall()
+            return [self._run_view_with_worker(row) for row in rows]
+        finally:
+            db.close()
+
     def _update_run_risk_sync(self, strategy_run_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
         run = self._get_run_sync(strategy_run_id)
         if run is None:
@@ -573,6 +654,146 @@ class SqlAlchemyAlgoWorkerRepository:
             ).fetchone()
             db.commit()
             return self._run_view(row)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _update_run_runtime_state_sync(self, strategy_run_id: str, runtime_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE public.algo_worker_runs
+                    SET runtime_state_json = CAST(:runtime_state_json AS JSONB),
+                        updated_at = NOW()
+                    WHERE strategy_run_id = :strategy_run_id
+                    RETURNING *
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id, "runtime_state_json": _json_dumps(runtime_state)},
+            ).fetchone()
+            db.commit()
+            return self._run_view(row) if row else None
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _update_run_backend_protection_sync(
+        self,
+        strategy_run_id: str,
+        protection: Dict[str, Any],
+        protection_state: Dict[str, Any],
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE public.algo_worker_runs
+                    SET runtime_state_json = jsonb_set(
+                            jsonb_set(
+                                COALESCE(runtime_state_json, '{}'::jsonb),
+                                '{backend_protection}',
+                                CAST(:protection_json AS JSONB),
+                                true
+                            ),
+                            '{backend_protection_state}',
+                            CAST(:protection_state_json AS JSONB),
+                            true
+                        ),
+                        updated_at = NOW()
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND (
+                        :expected_generation IS NULL
+                        OR COALESCE((runtime_state_json -> 'backend_protection_state' ->> 'generation')::INTEGER, 0) = :expected_generation
+                      )
+                      AND (
+                        :check_triggered_rule = FALSE
+                        OR COALESCE(runtime_state_json -> 'backend_protection_state' ->> 'triggered_rule', '') = :expected_triggered_rule
+                      )
+                      AND (
+                        :check_exit_claim_id = FALSE
+                        OR COALESCE(runtime_state_json -> 'backend_protection_state' ->> 'exit_claim_id', '') = :expected_exit_claim_id
+                      )
+                    RETURNING *
+                    """
+                ),
+                {
+                    "strategy_run_id": strategy_run_id,
+                    "protection_json": _json_dumps(protection),
+                    "protection_state_json": _json_dumps(protection_state),
+                    "expected_generation": expected_generation,
+                    "check_triggered_rule": expected_triggered_rule is not None,
+                    "expected_triggered_rule": expected_triggered_rule or "",
+                    "check_exit_claim_id": expected_exit_claim_id is not None,
+                    "expected_exit_claim_id": expected_exit_claim_id or "",
+                },
+            ).fetchone()
+            db.commit()
+            return self._run_view(row) if row else None
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _update_run_backend_protection_state_sync(
+        self,
+        strategy_run_id: str,
+        protection_state: Dict[str, Any],
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE public.algo_worker_runs
+                    SET runtime_state_json = jsonb_set(
+                            COALESCE(runtime_state_json, '{}'::jsonb),
+                            '{backend_protection_state}',
+                            CAST(:protection_state_json AS JSONB),
+                            true
+                        ),
+                        updated_at = NOW()
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND (
+                        :expected_generation IS NULL
+                        OR COALESCE((runtime_state_json -> 'backend_protection_state' ->> 'generation')::INTEGER, 0) = :expected_generation
+                      )
+                      AND (
+                        :check_triggered_rule = FALSE
+                        OR COALESCE(runtime_state_json -> 'backend_protection_state' ->> 'triggered_rule', '') = :expected_triggered_rule
+                      )
+                      AND (
+                        :check_exit_claim_id = FALSE
+                        OR COALESCE(runtime_state_json -> 'backend_protection_state' ->> 'exit_claim_id', '') = :expected_exit_claim_id
+                      )
+                    RETURNING *
+                    """
+                ),
+                {
+                    "strategy_run_id": strategy_run_id,
+                    "protection_state_json": _json_dumps(protection_state),
+                    "expected_generation": expected_generation,
+                    "check_triggered_rule": expected_triggered_rule is not None,
+                    "expected_triggered_rule": expected_triggered_rule or "",
+                    "check_exit_claim_id": expected_exit_claim_id is not None,
+                    "expected_exit_claim_id": expected_exit_claim_id or "",
+                },
+            ).fetchone()
+            db.commit()
+            return self._run_view(row) if row else None
         except Exception:
             db.rollback()
             raise
@@ -845,6 +1066,43 @@ def _validate_live_run_contract(*, account_scope: str, metadata: Dict[str, Any])
             status_code=400,
             detail=f"Live worker metadata.strategy_family must be one of: {', '.join(sorted(VALID_WORKER_STRATEGY_FAMILIES))}",
         )
+
+
+def _normalized_backend_protection_runtime_state(payload: Any, *, live: bool) -> Dict[str, Any]:
+    return validate_backend_protection_payload(payload, live=live).to_runtime_state()
+
+
+def _initial_backend_protection_state(protection: Dict[str, Any], *, generation: int = 1, reason: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "status": "active" if protection.get("enabled") else "disabled",
+        "generation": generation,
+        "version": int(protection.get("version") or 1),
+        "update_reason": reason,
+        "updated_at": _utcnow().isoformat(),
+        "last_checked_at": None,
+        "triggered_rule": None,
+        "action": None,
+        "exit_submitted": False,
+        "errors": [],
+    }
+
+
+def _next_backend_protection_for_patch(protection: Dict[str, Any], previous_runtime_state: Dict[str, Any]) -> Dict[str, Any]:
+    previous_config = dict(previous_runtime_state.get("backend_protection") or {})
+    previous_version = _to_int(previous_config.get("version"), default=0)
+    next_protection = dict(protection)
+    next_protection["version"] = max(_to_int(next_protection.get("version"), default=1), previous_version + 1)
+    return next_protection
+
+
+def _preserve_backend_trailing_state(next_state: Dict[str, Any], previous_state: Dict[str, Any]) -> Dict[str, Any]:
+    preserved = dict(next_state)
+    if "best_basket_pnl_pct" in previous_state:
+        preserved["best_basket_pnl_pct"] = previous_state.get("best_basket_pnl_pct")
+    previous_positions = previous_state.get("position_states")
+    if isinstance(previous_positions, dict):
+        preserved["position_states"] = dict(previous_positions)
+    return preserved
 
 
 def _load_live_kite_for_account(account_scope: str):
@@ -1522,6 +1780,22 @@ async def create_worker_run(request: Request, payload: WorkerRunCreateRequest):
     if payload.execution_mode == "live":
         _validate_live_run_contract(account_scope=payload.account_scope, metadata=payload.metadata)
 
+    runtime_state = dict(payload.runtime_state or {})
+    if "backend_protection" in runtime_state:
+        try:
+            runtime_state["backend_protection"] = _normalized_backend_protection_runtime_state(
+                runtime_state.get("backend_protection"),
+                live=payload.execution_mode == "live",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime_state["backend_protection_state"] = _initial_backend_protection_state(
+            runtime_state["backend_protection"],
+            generation=1,
+            reason="run_create",
+        )
+        payload = payload.model_copy(update={"runtime_state": runtime_state})
+
     strategy_run_id = payload.strategy_run_id or f"run_{uuid.uuid4().hex}"
     return await _repo(request).create_run(token, payload, strategy_run_id=strategy_run_id)
 
@@ -1679,6 +1953,56 @@ async def patch_worker_run_risk(request: Request, strategy_run_id: str, payload:
     if run.get("status") in {"closed", "failed"}:
         raise HTTPException(status_code=409, detail="Closed strategy runs cannot be risk-edited")
     return await _repo(request).update_run_risk(strategy_run_id, payload.patch)
+
+
+@router.patch("/worker/runs/{strategy_run_id}/protection")
+async def patch_worker_run_protection(request: Request, strategy_run_id: str, payload: WorkerProtectionPatchRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "risk:update")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    if run.get("status") in {"closed", "failed"}:
+        raise HTTPException(status_code=409, detail="Closed strategy runs cannot be protection-edited")
+
+    runtime_state = dict(run.get("runtime_state") or {})
+    previous_state = dict(runtime_state.get("backend_protection_state") or {})
+    if previous_state.get("exit_submitted"):
+        raise HTTPException(status_code=409, detail="Backend protection cannot be reset after a terminal protection exit")
+    if previous_state.get("exit_claim_id"):
+        raise HTTPException(status_code=409, detail="Backend protection exit is already in progress")
+
+    try:
+        protection = _normalized_backend_protection_runtime_state(
+            payload.backend_protection,
+            live=str(run.get("execution_mode") or "").lower() == "live",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    next_generation = _to_int(previous_state.get("generation"), default=0) + 1
+    protection = _next_backend_protection_for_patch(protection, runtime_state)
+    runtime_state["backend_protection"] = protection
+    next_state = _initial_backend_protection_state(
+        protection,
+        generation=next_generation,
+        reason=payload.reason,
+    )
+    if not payload.reset_trailing:
+        next_state = _preserve_backend_trailing_state(next_state, previous_state)
+    next_state["reset_trailing"] = payload.reset_trailing
+    previous_generation = _to_int(previous_state.get("generation"), default=0)
+    updated = await _repo(request).update_run_backend_protection(
+        strategy_run_id,
+        protection,
+        next_state,
+        expected_generation=previous_generation,
+        expected_triggered_rule=previous_state.get("triggered_rule") or "",
+        expected_exit_claim_id=previous_state.get("exit_claim_id") or "",
+    )
+    if updated is None:
+        raise HTTPException(status_code=409, detail="Backend protection changed concurrently; reload and retry")
+    return updated
 
 
 @router.post("/worker/runs/{strategy_run_id}/intents")

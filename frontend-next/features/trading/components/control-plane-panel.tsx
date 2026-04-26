@@ -24,9 +24,17 @@ function healthTone(status: ControlStrategyGroup["healthStatus"]): "positive" | 
 
 function protectionTone(status: string): "positive" | "warning" | "danger" | "neutral" {
   if (status === "active") return "positive";
-  if (status === "error") return "danger";
+  if (status === "error" || status === "triggered") return "danger";
   if (status === "pending_exit" || status === "stale") return "warning";
   return "neutral";
+}
+
+function detailNumber(details: Record<string, unknown>, key: string): number | null {
+  return typeof details[key] === "number" ? (details[key] as number) : null;
+}
+
+function detailString(details: Record<string, unknown>, key: string): string | null {
+  return typeof details[key] === "string" && details[key] ? (details[key] as string) : null;
 }
 
 export function ControlPlanePanel({ snapshot, onRefresh }: Props) {
@@ -110,6 +118,9 @@ export function ControlPlanePanel({ snapshot, onRefresh }: Props) {
                       </StatusBadge>
                     </div>
                     <p className="mt-1">{strategy.protection.summary}</p>
+                    {strategy.protection.source === "backend_worker_protection" ? (
+                      <BackendProtectionDetails details={strategy.protection.details} />
+                    ) : null}
                   </div>
                 </div>
                 <div className="space-y-2 lg:text-right">
@@ -142,6 +153,26 @@ export function ControlPlanePanel({ snapshot, onRefresh }: Props) {
         )}
       </div>
     </Panel>
+  );
+}
+
+function BackendProtectionDetails({ details }: { details: Record<string, unknown> }) {
+  const generation = detailNumber(details, "generation");
+  const basketPnlPct = detailNumber(details, "current_basket_pnl_pct");
+  const triggeredRule = detailString(details, "triggered_rule");
+  const triggeredAction = detailString(details, "action");
+
+  if (generation == null && basketPnlPct == null && triggeredRule == null && triggeredAction == null) {
+    return null;
+  }
+
+  return (
+    <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-foreground/45">
+      {generation != null ? <span>Generation {generation}</span> : null}
+      {basketPnlPct != null ? <span>Basket P&amp;L {basketPnlPct}%</span> : null}
+      {triggeredRule ? <span>Rule {triggeredRule}</span> : null}
+      {triggeredAction ? <span>Action {triggeredAction}</span> : null}
+    </div>
   );
 }
 

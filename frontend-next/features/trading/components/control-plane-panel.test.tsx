@@ -49,11 +49,16 @@ const snapshot: ControlPlaneSnapshot = {
       allowedActions: ["exit_strategy"],
       actionReasons: { cancel_orders: "Strategy-scoped cancel is disabled" },
       protection: {
-        source: "option_runtime",
+        source: "backend_worker_protection",
         status: "active",
-        summary: "Option protection active; 2 rule(s) configured",
+        summary: "1 protected position(s); basket rules active; triggered basket_stoploss",
         lastCheckedAt: "2026-04-25T12:00:00+00:00",
-        details: { rule_count: 2, lifecycle_state: "running" },
+        details: {
+          generation: 2,
+          current_basket_pnl_pct: -1.8,
+          triggered_rule: "basket_stoploss",
+          action: "exit_strategy",
+        },
       },
       lastUpdatedAt: null,
     },
@@ -81,8 +86,12 @@ describe("ControlPlanePanel", () => {
     expect(screen.getByText("Mean Reversion")).toBeInTheDocument();
     expect(screen.getByText("stale")).toBeInTheDocument();
     expect(screen.getByText("Exit strategy")).toBeInTheDocument();
-    expect(screen.getByText("option_runtime · active")).toBeInTheDocument();
-    expect(screen.getByText(/2 rule/)).toBeInTheDocument();
+    expect(screen.getByText("backend_worker_protection · active")).toBeInTheDocument();
+    expect(screen.getByText(/basket rules active/)).toBeInTheDocument();
+    expect(screen.getByText(/Generation 2/)).toBeInTheDocument();
+    expect(screen.getByText(/Basket P&L -1.8%/)).toBeInTheDocument();
+    expect(screen.getByText(/Rule basket_stoploss/)).toBeInTheDocument();
+    expect(screen.getByText(/Action exit_strategy/)).toBeInTheDocument();
     expect(screen.getByText("Manual / unattributed broker exposure")).toBeInTheDocument();
     expect(screen.getByText(/MANUAL/)).toBeInTheDocument();
   });

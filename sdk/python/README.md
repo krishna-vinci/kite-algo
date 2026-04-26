@@ -97,6 +97,43 @@ The SDK exposes grouped run-level P&L helpers:
 
 The backend remains the source of truth for paper/live separation, attribution, charges, and grouped run state.
 
+## Backend protection helpers
+
+Workers can register backend-owned exposure protection when they create or update a run.
+
+Current V1 submits a conservative attributed strategy exit when a declared backend protection rule triggers. Position rules define leg-level thresholds; they do not re-enter, roll, rebalance, or run custom worker logic.
+
+```python
+from kite_algo_worker import BackendProtection, BasketProtection, OperationalProtection, ProtectedPosition
+
+protection = BackendProtection(
+    positions=[
+        ProtectedPosition(
+            symbol="NSE:INFY",
+            product="CNC",
+            side="BUY",
+            quantity=1,
+            entry_price=1500,
+            stoploss_pct=2,
+        )
+    ],
+    basket=BasketProtection(stoploss_pct=4),
+    operations=OperationalProtection(exit_on_worker_stale=True, worker_stale_sec=300),
+)
+
+client.create_run(
+    strategy_run_id="run_mean_reversion_001",
+    template_id="mean-reversion",
+    account_scope="kite:paper-a",
+    execution_mode="paper",
+    backend_protection=protection,
+)
+
+client.update_backend_protection("run_mean_reversion_001", protection, reason="rebalance")
+```
+
+Validation mirrors the backend contract: products must be `CNC`/`MIS`/`NRML`, sides must be `BUY`/`SELL`, quantities and prices must be positive, stale-worker limits must stay between `30` and `86400` seconds, and MIS squareoff buffer must stay between `0` and `3600` seconds.
+
 ## Runtime-backed market data
 
 The SDK exposes worker-safe market-data helpers backed by Kite Algo's Go market-runtime. Workers do not connect to broker websockets, Redis, or backend internals directly.

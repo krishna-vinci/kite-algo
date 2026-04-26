@@ -13,6 +13,7 @@ install_dependency_stubs()
 
 from api.routers.algo_workers import (  # noqa: E402
     DEFAULT_WORKER_ACTIONS,
+    SqlAlchemyAlgoWorkerRepository,
     WorkerIntentRequest,
     WorkerInstrumentResolveRequest,
     WorkerMarketSnapshotRequest,
@@ -22,12 +23,14 @@ from api.routers.algo_workers import (  # noqa: E402
     get_worker_market_snapshot,
     get_worker_market_quotes,
     WorkerRiskPatchRequest,
+    WorkerProtectionPatchRequest,
     WorkerRunCreateRequest,
     WorkerToken,
     WorkerTokenCreateRequest,
     create_worker_run,
     create_worker_token,
     patch_worker_run_risk,
+    patch_worker_run_protection,
     exit_worker_run,
     resolve_worker_market_ticker,
     resolve_worker_market_tickers,
@@ -127,6 +130,40 @@ class _FakeWorkerRepository:
         if state_patch:
             state.update(state_patch)
         run["status"] = status
+        run["runtime_state"] = state
+        return dict(run)
+
+    async def update_run_runtime_state(self, strategy_run_id, runtime_state):
+        run = self.runs[strategy_run_id]
+        run["runtime_state"] = dict(runtime_state)
+        return dict(run)
+
+    async def update_run_backend_protection(self, strategy_run_id, protection, protection_state, *, expected_generation=None, expected_triggered_rule=None, expected_exit_claim_id=None):
+        run = self.runs[strategy_run_id]
+        state = dict(run.get("runtime_state") or {})
+        current = dict(state.get("backend_protection_state") or {})
+        if expected_generation is not None and int(current.get("generation") or 0) != int(expected_generation):
+            return None
+        if expected_triggered_rule is not None and str(current.get("triggered_rule") or "") != str(expected_triggered_rule):
+            return None
+        if expected_exit_claim_id is not None and str(current.get("exit_claim_id") or "") != str(expected_exit_claim_id):
+            return None
+        state["backend_protection"] = dict(protection)
+        state["backend_protection_state"] = dict(protection_state)
+        run["runtime_state"] = state
+        return dict(run)
+
+    async def update_run_backend_protection_state(self, strategy_run_id, protection_state, *, expected_generation=None, expected_triggered_rule=None, expected_exit_claim_id=None):
+        run = self.runs[strategy_run_id]
+        state = dict(run.get("runtime_state") or {})
+        current = dict(state.get("backend_protection_state") or {})
+        if expected_generation is not None and int(current.get("generation") or 0) != int(expected_generation):
+            return None
+        if expected_triggered_rule is not None and str(current.get("triggered_rule") or "") != str(expected_triggered_rule):
+            return None
+        if expected_exit_claim_id is not None and str(current.get("exit_claim_id") or "") != str(expected_exit_claim_id):
+            return None
+        state["backend_protection_state"] = dict(protection_state)
         run["runtime_state"] = state
         return dict(run)
 
@@ -573,6 +610,231 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("strategy_family", ctx.exception.detail)
+
+
+class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
+    def _request(self, repo, *, paper_runtime=None, raw_token="secret-token"):
+        return SimpleNamespace(
+            headers={"authorization": f"Bearer {raw_token}"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo, paper_runtime_service=paper_runtime)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+    async def test_create_run_validates_backend_protection_and_normalizes_runtime_state(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+
+        result = await create_worker_run(
+            request,
+            WorkerRunCreateRequest(
+                strategy_run_id="run-protection-create",
+                template_id="mean_reversion",
+                account_scope="kite:paper-a",
+                execution_mode="paper",
+                runtime_state={
+                    "backend_protection": {
+                        "enabled": True,
+                        "positions": [
+                            {
+                                "symbol": "nse:infy",
+                                "product": "cnc",
+                                "side": "buy",
+                                "quantity": 1,
+                                "entry_price": 1500,
+                                "stoploss_pct": 2,
+                            }
+                        ],
+                    }
+                },
+            ),
+        )
+
+        self.assertEqual(result["runtime_state"]["backend_protection"]["positions"][0]["symbol"], "NSE:INFY")
+        self.assertEqual(result["runtime_state"]["backend_protection"]["positions"][0]["product"], "CNC")
+        self.assertEqual(result["runtime_state"]["backend_protection_state"]["generation"], 1)
+        self.assertEqual(result["runtime_state"]["backend_protection_state"]["status"], "active")
+
+    async def test_create_run_rejects_invalid_backend_protection(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await create_worker_run(
+                request,
+                WorkerRunCreateRequest(
+                    strategy_run_id="run-protection-invalid",
+                    template_id="mean_reversion",
+                    account_scope="kite:paper-a",
+                    execution_mode="paper",
+                    runtime_state={"backend_protection": {"enabled": True}},
+                ),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    async def test_patch_backend_protection_updates_runtime_state_and_generation(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        await create_worker_run(
+            request,
+            WorkerRunCreateRequest(
+                strategy_run_id="run-protection-patch",
+                template_id="momentum",
+                account_scope="kite:paper-a",
+                execution_mode="paper",
+            ),
+        )
+
+        result = await patch_worker_run_protection(
+            request,
+            "run-protection-patch",
+            WorkerProtectionPatchRequest(
+                backend_protection={
+                    "enabled": True,
+                    "version": 1,
+                    "positions": [
+                        {
+                            "symbol": "NSE:INFY",
+                            "product": "CNC",
+                            "side": "BUY",
+                            "quantity": 1,
+                            "entry_price": 1500,
+                            "stoploss_pct": 2,
+                        }
+                    ],
+                },
+                reason="rebalance_update",
+            ),
+        )
+
+        self.assertEqual(result["runtime_state"]["backend_protection"]["version"], 1)
+        self.assertEqual(result["runtime_state"]["backend_protection_state"]["generation"], 1)
+        self.assertEqual(result["runtime_state"]["backend_protection_state"]["update_reason"], "rebalance_update")
+
+    async def test_patch_backend_protection_increments_version_and_preserves_trailing_when_requested(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        repo.runs["run-protection-preserve"] = {
+            "strategy_run_id": "run-protection-preserve",
+            "token_id": "worker-1",
+            "template_id": "momentum",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": ["edit_risk", "exit_strategy"],
+            "runtime_state": {
+                "backend_protection": {"enabled": True, "version": 3, "basket": {"stoploss_pct": 5}},
+                "backend_protection_state": {
+                    "generation": 3,
+                    "best_basket_pnl_pct": 6.5,
+                    "position_states": {"symbol:NSE:INFY:CNC": {"best_pnl_pct": 3.2}},
+                },
+            },
+            "metadata": {},
+        }
+
+        result = await patch_worker_run_protection(
+            request,
+            "run-protection-preserve",
+            WorkerProtectionPatchRequest(
+                backend_protection={"enabled": True, "version": 1, "basket": {"stoploss_pct": 4}},
+                reason="rebalance_update",
+                reset_trailing=False,
+            ),
+        )
+
+        self.assertEqual(result["runtime_state"]["backend_protection"]["version"], 4)
+        self.assertEqual(result["runtime_state"]["backend_protection_state"]["generation"], 4)
+        self.assertEqual(result["runtime_state"]["backend_protection_state"]["best_basket_pnl_pct"], 6.5)
+        self.assertIn("symbol:NSE:INFY:CNC", result["runtime_state"]["backend_protection_state"]["position_states"])
+
+    async def test_patch_backend_protection_rejects_after_terminal_exit_submission(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        repo.runs["run-protection-locked"] = {
+            "strategy_run_id": "run-protection-locked",
+            "token_id": "worker-1",
+            "template_id": "momentum",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": ["edit_risk", "exit_strategy"],
+            "runtime_state": {"backend_protection_state": {"exit_submitted": True}},
+            "metadata": {},
+        }
+
+        with self.assertRaises(HTTPException) as ctx:
+            await patch_worker_run_protection(
+                request,
+                "run-protection-locked",
+                WorkerProtectionPatchRequest(backend_protection={"enabled": False}),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    async def test_patch_backend_protection_rejects_when_exit_claim_in_progress(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        repo.runs["run-protection-claimed"] = {
+            "strategy_run_id": "run-protection-claimed",
+            "token_id": "worker-1",
+            "template_id": "momentum",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": ["edit_risk", "exit_strategy"],
+            "runtime_state": {"backend_protection_state": {"generation": 1, "exit_claim_id": "claim-1"}},
+            "metadata": {},
+        }
+
+        with self.assertRaises(HTTPException) as ctx:
+            await patch_worker_run_protection(
+                request,
+                "run-protection-claimed",
+                WorkerProtectionPatchRequest(backend_protection={"enabled": False}),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    async def test_patch_backend_protection_rejects_concurrent_generation_change(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        repo.runs["run-protection-conflict"] = {
+            "strategy_run_id": "run-protection-conflict",
+            "token_id": "worker-1",
+            "template_id": "momentum",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": ["edit_risk", "exit_strategy"],
+            "runtime_state": {
+                "backend_protection": {"enabled": True, "version": 1, "basket": {"stoploss_pct": 5}},
+                "backend_protection_state": {"generation": 1},
+            },
+            "metadata": {},
+        }
+
+        async def conflict_update(*args, **kwargs):
+            return None
+
+        repo.update_run_backend_protection = conflict_update
+
+        with self.assertRaises(HTTPException) as ctx:
+            await patch_worker_run_protection(
+                request,
+                "run-protection-conflict",
+                WorkerProtectionPatchRequest(backend_protection={"enabled": True, "basket": {"stoploss_pct": 4}}),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 409)
 
     async def test_live_worker_intent_routes_through_live_order_service_with_attribution(self):
         sys.modules.pop("broker_api.kite_orders", None)
@@ -1028,6 +1290,37 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('"status": "open"', first)
         self.assertIn('"status": "closed"', second)
+
+
+class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
+    def test_run_view_with_worker_includes_heartbeat_fields(self):
+        repository = SqlAlchemyAlgoWorkerRepository(session_factory=lambda: None)
+        row = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-token-1",
+            "template_id": "mean-reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "summary_fields_json": "[]",
+            "risk_schema_json": "[]",
+            "allowed_actions_json": '["exit_strategy"]',
+            "runtime_state_json": "{}",
+            "metadata_json": '{"strategy_name": "Mean Reversion"}',
+            "created_at": None,
+            "updated_at": None,
+            "closed_at": None,
+            "worker_name": "ml-box-worker",
+            "last_heartbeat_at": datetime.fromisoformat("2026-04-25T12:00:00+00:00"),
+            "heartbeat_json": '{"worker_id": "w-1", "metrics": {"machine_id": "ml-box-01"}}',
+        }
+
+        payload = repository._run_view_with_worker(row)
+
+        self.assertEqual(payload["worker_name"], "ml-box-worker")
+        self.assertEqual(payload["heartbeat_json"]["worker_id"], "w-1")
+        self.assertEqual(payload["heartbeat_json"]["metrics"]["machine_id"], "ml-box-01")
+        self.assertEqual(payload["last_heartbeat_at"], datetime.fromisoformat("2026-04-25T12:00:00+00:00"))
 
 
 if __name__ == "__main__":

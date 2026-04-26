@@ -85,6 +85,24 @@ class ControlPlaneProtectionService:
     investing_repository: Any = None
 
     async def for_strategy(self, strategy: Dict[str, Any]) -> Dict[str, Any]:
+        backend_config = strategy.get("backend_protection")
+        backend_state = strategy.get("backend_protection_state")
+        if isinstance(backend_config, dict) and backend_config.get("enabled"):
+            state = dict(backend_state or {}) if isinstance(backend_state, dict) else {}
+            positions = list(backend_config.get("positions") or [])
+            basket = backend_config.get("basket") if isinstance(backend_config.get("basket"), dict) else None
+            summary_parts = [f"{len(positions)} protected position(s)"]
+            if basket:
+                summary_parts.append("basket rules active")
+            if state.get("triggered_rule"):
+                summary_parts.append(f"triggered {state['triggered_rule']}")
+            return {
+                "source": "backend_worker_protection",
+                "status": str(state.get("status") or "active"),
+                "summary": "; ".join(summary_parts),
+                "last_checked_at": state.get("last_checked_at"),
+                "details": {"config": backend_config, **state},
+            }
         metadata = dict(strategy.get("metadata") or {})
         family = str(metadata.get("strategy_family") or strategy.get("strategy_family") or "").strip().lower()
         if family == "options_strategy" or self._looks_like_option_run(strategy):

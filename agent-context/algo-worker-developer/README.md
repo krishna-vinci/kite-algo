@@ -14,7 +14,8 @@ Give the whole folder to an algo developer agent when you want it to write worke
 6. `REALTIME_PNL.md` — grouped realtime run-level P&L snapshot and stream usage.
 7. `ORDER_CATALOG.md` — supported order fields, including AMO.
 8. `LIVE_SAFETY.md` — live trading gates and what not to do.
-9. `examples/` — runnable strategy examples.
+9. `PROTECTION.md` — backend-owned protection contract usage.
+10. `examples/` — runnable strategy examples.
 
 ## Canonical source files in this repo
 

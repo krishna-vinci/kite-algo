@@ -24,6 +24,18 @@ Do not use this file for frontend work.
 
 ## Newly implemented in current branch
 
+- Completed backend control-plane Phases 1-3:
+  - added authenticated `GET /api/control/strategy-positions`, `POST /api/control/strategies/{strategy_run_id}/exit`, `POST /api/control/strategies/{strategy_run_id}/cancel-orders`, and `POST /api/control/reconcile`
+  - snapshot aggregation now reuses paper runtime summaries, non-paper algo-worker runs/P&L, and heartbeat-derived worker health, while keeping a stable manual/unattributed exposure bucket that infers broker account from the current Kite session and avoids double-counting known live strategy exposure
+  - control-plane exit reuses existing paper-runtime and worker live exit paths; strategy-scoped cancel intentionally returns a deterministic `409` until broker-safe open-order attribution exists
+  - control-plane protection adapters attach `option_runtime` state from option strategy store + algo runtime status and `investing_runtime` state from investing holdings summaries, with metadata fallback and per-strategy degradation when adapter state is unavailable
+- Added centralized backend exposure protection for algo-worker runs:
+  - workers can declare versioned `runtime_state.backend_protection` on run creation and patch it later through `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/protection`
+  - backend evaluator supports position-level and basket-level percent stoploss/target/trailing rules, optional worker-stale exit, and configurable MIS squareoff buffer
+  - triggered V1 rules submit conservative attributed strategy exits; position rules provide leg-specific thresholds until a broker-safe leg-only exit primitive exists
+  - protection state persists in `runtime_state.backend_protection_state`, including generation, last check, trigger/action, exit submission, and errors
+  - control plane displays `backend_worker_protection` alongside existing option/investing protection state
+  - Python SDK now includes helper models plus `create_run(..., backend_protection=...)` and `update_backend_protection(...)`, with docs/examples for protected workers
 - Fixed the monthly index refresh scheduler so live metric refresh/injection now also runs for `Nifty500` after constituent refreshes, matching the existing `Nifty50`/`NiftyBank` flow
 - Added the next trading journal backend slice:
   - new `journaling/service.py` for run orchestration, source links, decision events, benchmark daily-price refresh, and run summary/benchmark comparison queries

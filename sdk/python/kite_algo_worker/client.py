@@ -6,6 +6,8 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
 import requests
 
+from .protection import BackendProtection
+
 
 JsonDict = Dict[str, Any]
 
@@ -77,7 +79,11 @@ class KiteAlgoWorkerClient:
         allowed_actions: Optional[Iterable[str]] = None,
         runtime_state: Optional[Mapping[str, Any]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        backend_protection: Optional[BackendProtection] = None,
     ) -> JsonDict:
+        runtime_state_payload: JsonDict = dict(runtime_state or {})
+        if backend_protection is not None:
+            runtime_state_payload["backend_protection"] = backend_protection.to_dict()
         payload: JsonDict = {
             "template_id": template_id,
             "account_scope": account_scope,
@@ -85,7 +91,7 @@ class KiteAlgoWorkerClient:
             "summary_fields": [dict(item) for item in (summary_fields or [])],
             "risk_schema": [dict(item) for item in (risk_schema or [])],
             "allowed_actions": list(allowed_actions or ["edit_risk", "exit_strategy"]),
-            "runtime_state": dict(runtime_state or {}),
+            "runtime_state": runtime_state_payload,
             "metadata": dict(metadata or {}),
         }
         if strategy_run_id is not None:
@@ -296,6 +302,24 @@ class KiteAlgoWorkerClient:
             "PATCH",
             f"/worker/runs/{strategy_run_id}/risk",
             json={"patch": dict(patch), "reason": reason},
+        )
+
+    def update_backend_protection(
+        self,
+        strategy_run_id: str,
+        backend_protection: BackendProtection,
+        *,
+        reason: Optional[str] = None,
+        reset_trailing: bool = True,
+    ) -> JsonDict:
+        return self._request(
+            "PATCH",
+            f"/worker/runs/{strategy_run_id}/protection",
+            json={
+                "backend_protection": backend_protection.to_dict(),
+                "reason": reason,
+                "reset_trailing": reset_trailing,
+            },
         )
 
     def exit_run(
