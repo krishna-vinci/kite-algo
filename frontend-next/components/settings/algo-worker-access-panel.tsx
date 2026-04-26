@@ -2,12 +2,13 @@
 
 import { useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Copy, KeyRound, RefreshCw, ShieldCheck, Terminal, Trash2 } from "lucide-react";
+import { AlertTriangle, Copy, KeyRound, RefreshCw, ShieldCheck, Terminal, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Panel } from "@/components/operator/panel";
 import { StatusBadge } from "@/components/operator/status-badge";
 import {
   createAlgoWorkerToken,
+  getKiteProfile,
   listAlgoWorkerTokens,
   revokeAlgoWorkerToken,
   type AlgoWorkerToken,
@@ -217,6 +218,8 @@ export function AlgoWorkerAccessPanel() {
   const [name, setName] = useState("paper-worker");
   const [accountScope, setAccountScope] = useState(DEFAULT_ACCOUNT_SCOPE);
   const [templatesText, setTemplatesText] = useState("");
+  const [liveModeEnabled, setLiveModeEnabled] = useState(false);
+  const [liveAcknowledged, setLiveAcknowledged] = useState(false);
   const [createdToken, setCreatedToken] = useState<CreatedAlgoWorkerToken | null>(null);
 
   const tokensQuery = useQuery({
@@ -224,11 +227,22 @@ export function AlgoWorkerAccessPanel() {
     queryFn: listAlgoWorkerTokens,
   });
 
+  const kiteProfileQuery = useQuery({
+    queryKey: ["kite-profile-for-worker-token"],
+    queryFn: getKiteProfile,
+  });
+
+  const brokerUserId = kiteProfileQuery.data?.userId ?? null;
+  const liveAccountScope = brokerUserId ? `kite:${brokerUserId}` : "";
+  const effectiveAccountScope = liveModeEnabled ? liveAccountScope : accountScope.trim() || null;
+  const liveTokenBlocked = liveModeEnabled && (!brokerUserId || !liveAcknowledged);
+
   const createMutation = useMutation({
     mutationFn: () =>
       createAlgoWorkerToken({
         name: name.trim() || "paper-worker",
-        accountScope: accountScope.trim() || null,
+        accountScope: effectiveAccountScope,
+        allowedModes: liveModeEnabled ? ["paper", "dry_run", "live"] : undefined,
         allowedTemplates: splitTemplateList(templatesText),
       }),
     onSuccess: (token) => {
@@ -262,7 +276,7 @@ export function AlgoWorkerAccessPanel() {
         <div className="rounded-xl border border-border/70 bg-background/45 p-4">
           <div className="flex items-center gap-2">
             <KeyRound aria-hidden size={16} className="text-primary" />
-            <p className="text-sm font-semibold text-foreground">New paper worker token</p>
+            <p className="text-sm font-semibold text-foreground">New worker token</p>
           </div>
           <div className="mt-4 grid gap-3">
             <label className="grid gap-1.5 text-xs text-foreground/55">
@@ -276,10 +290,16 @@ export function AlgoWorkerAccessPanel() {
             <label className="grid gap-1.5 text-xs text-foreground/55">
               Account scope
               <input
-                value={accountScope}
+                value={liveModeEnabled ? liveAccountScope || "Login to Kite to resolve account" : accountScope}
                 onChange={(event) => setAccountScope(event.target.value)}
+                disabled={liveModeEnabled}
                 className="rounded-xl border border-border/70 bg-background/70 px-3 py-2 font-mono text-sm text-foreground outline-none transition-colors focus:border-primary/45"
               />
+              {liveModeEnabled ? (
+                <span className="text-[11px] leading-4 text-foreground/45">
+                  Live worker tokens are bound to your Kite profile user id. Current profile: {brokerUserId ? <span className="font-mono text-primary">{brokerUserId}</span> : "not available"}.
+                </span>
+              ) : null}
             </label>
             <label className="grid gap-1.5 text-xs text-foreground/55">
               Template allow-list
@@ -290,13 +310,56 @@ export function AlgoWorkerAccessPanel() {
                 className="rounded-xl border border-border/70 bg-background/70 px-3 py-2 font-mono text-sm text-foreground outline-none transition-colors focus:border-primary/45"
               />
             </label>
+            <div className="rounded-xl border border-border/70 bg-background/50 p-3">
+              <label className="flex items-start gap-3 text-sm text-foreground">
+                <input
+                  type="checkbox"
+                  checked={liveModeEnabled}
+                  onChange={(event) => {
+                    setLiveModeEnabled(event.target.checked);
+                    setLiveAcknowledged(false);
+                  }}
+                  className="mt-1 h-4 w-4 rounded border-border/70"
+                />
+                <span>
+                  Enable live mode
+                  <span className="mt-1 block text-xs leading-5 text-foreground/55">
+                    Adds <span className="font-mono text-primary">live</span> to this token and binds it to the real broker scope <span className="font-mono text-primary">{liveAccountScope || "kite:<user_id>"}</span>.
+                  </span>
+                </span>
+              </label>
+              {liveModeEnabled ? (
+                <div className="mt-3 rounded-xl border border-amber-400/30 bg-amber-400/10 p-3 text-xs leading-5 text-amber-200">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle aria-hidden size={15} className="mt-0.5 shrink-0" />
+                    <div>
+                      <p className="font-semibold text-amber-100">Live worker tokens can place real broker orders.</p>
+                      <p className="mt-1 text-amber-100/80">
+                        Keep this token only on trusted worker machines. The worker must still set <span className="font-mono">KITE_ALGO_ENABLE_LIVE=1</span> and create runs with required live metadata.
+                      </p>
+                    </div>
+                  </div>
+                  <label className="mt-3 flex items-start gap-2 text-amber-100/90">
+                    <input
+                      type="checkbox"
+                      checked={liveAcknowledged}
+                      onChange={(event) => setLiveAcknowledged(event.target.checked)}
+                      disabled={!brokerUserId}
+                      className="mt-1 h-4 w-4 rounded border-amber-200/60"
+                    />
+                    <span>I understand this token can place live orders for {liveAccountScope || "the resolved Kite account"}.</span>
+                  </label>
+                  {kiteProfileQuery.isError ? <p className="mt-2 text-amber-100/80">Could not load Kite profile. Login to Kite, then refresh this page before enabling live mode.</p> : null}
+                </div>
+              ) : null}
+            </div>
             <IconButton
               icon={<KeyRound aria-hidden size={14} />}
               variant="primary"
               onClick={() => createMutation.mutate()}
-              disabled={createMutation.isPending}
+              disabled={createMutation.isPending || liveTokenBlocked}
             >
-              Generate
+              {liveModeEnabled ? "Generate live-enabled token" : "Generate"}
             </IconButton>
           </div>
 

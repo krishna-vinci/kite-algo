@@ -5,10 +5,11 @@ Last updated: 2026-04-26
 ## Current state
 
 - Added the first real Python SDK package in `sdk/python/kite_algo_worker`.
-- Added Git-tag installation documentation for remote strategy servers. Recommended production install is `pip install "kite-algo-worker @ git+ssh://.../kite-algo.git@kite-algo-worker-v0.2.0#subdirectory=sdk/python"`.
+- Added Git-tag installation documentation for remote strategy servers. Recommended production install is `pip install "kite-algo-worker @ git+ssh://.../kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"`.
 - The SDK is intentionally thin: it only calls public `/api/algo-workers/worker/*` endpoints and does not import backend broker, database, market-runtime, or paper-runtime internals.
 - `KiteAlgoWorkerClient` supports health, heartbeat, create/get run, order intent, basket intent, risk patch, and grouped exit calls.
 - `KiteAlgoWorkerClient` now also supports grouped run P&L snapshots and SSE streaming via `get_run_pnl()` and `stream_run_pnl()`.
+- `KiteAlgoWorkerClient` now also supports worker-safe funds/allocation snapshots via `get_funds()` and `get_run_funds()`.
 - `KiteAlgoWorkerClient` now also supports generic runtime-backed market-data primitives: ticker resolution/search, quote snapshots, tick SSE streams, candle snapshots, candle SSE streams, and market snapshot bundles.
 - Order intent methods require explicit idempotency keys before any HTTP request is made and mirror the backend `8..160` character length contract.
 - `KiteAlgoWorkerError` preserves HTTP status and response body for non-2xx responses.
@@ -32,10 +33,11 @@ Examples default to `dry_run` or live exit preview behavior and require explicit
 - `python3 -m pytest tests/test_worker_sdk.py -q` ✅ `23 passed`
 - `python3 -m pytest tests/test_algo_worker_api.py -q` ✅ `33 passed` after adding worker market-data endpoint coverage
 - `python3 -m pytest tests/test_algo_worker_api.py tests/test_worker_sdk.py -q` ✅ `54 passed`
+- `python3 -m pytest tests/test_algo_worker_api.py tests/test_worker_sdk.py -q` ✅ `68 passed` after adding worker-safe funds/run-allocation endpoints and SDK helpers
 - `python3 -m pytest tests/test_live_order_attribution_gate.py tests/test_live_journal_projector.py tests/test_live_external_exit_recovery.py -q` ✅ `8 passed`
 - `python3 -m pytest tests/test_algo_worker_api.py tests/test_live_order_attribution_gate.py tests/test_live_journal_projector.py tests/test_live_external_exit_recovery.py -q` ✅ previously covered worker SDK/API and related live attribution/projector/external-exit suites after adding realtime run-P&L snapshot/stream coverage
 - SDK/example Python syntax checked with `ast.parse` ✅
-- SDK package metadata install check in a temporary venv with `pip install --dry-run --no-deps ./sdk/python` ✅ would install `kite-algo-worker-0.2.0`
+- SDK package metadata install check in a temporary venv with `pip install --dry-run --no-deps ./sdk/python` ✅ would install `kite-algo-worker-0.3.0`
 
 ## Known gaps / next steps
 

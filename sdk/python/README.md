@@ -10,14 +10,14 @@ Recommended for remote strategy servers:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.2.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.2.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"
 ```
 
 Pin to an immutable tag in production. Avoid installing from a moving branch such as `main` on live strategy servers.
@@ -33,8 +33,8 @@ python3 -m pip install -e /path/to/kite-algo/sdk/python
 After the SDK changes are committed and pushed, create and push a tag from the repository root:
 
 ```bash
-git tag -a kite-algo-worker-v0.2.0 -m "kite-algo-worker v0.2.0"
-git push origin kite-algo-worker-v0.2.0
+git tag -a kite-algo-worker-v0.3.0 -m "kite-algo-worker v0.3.0"
+git push origin kite-algo-worker-v0.3.0
 ```
 
 Then remote servers can install the exact SDK version using the Git-tag install command above.
@@ -96,6 +96,21 @@ The SDK exposes grouped run-level P&L helpers:
 - `stream_run_pnl(strategy_run_id, interval_seconds=1.0)`
 
 The backend remains the source of truth for paper/live separation, attribution, charges, and grouped run state.
+
+## Funds and allocation
+
+Workers can read backend-owned account funds and run-level allocation usage without calling broker APIs directly:
+
+```python
+account_funds = client.get_funds(mode="paper")
+run_funds = client.get_run_funds("run_mean_reversion_001")
+
+remaining = (run_funds.get("strategy", {}).get("allocation", {}) or {}).get("remaining")
+if remaining is not None and remaining < 10_000:
+    print("Skip new entry; allocation cap is nearly used")
+```
+
+`get_funds()` returns account-level funds for the token's account scope. `get_run_funds()` adds current run exposure/P&L and, when the run metadata includes `allocation_cap` or `allocation_cap_inr`, returns remaining run allocation using current gross exposure as the V1 usage basis.
 
 ## Backend protection helpers
 

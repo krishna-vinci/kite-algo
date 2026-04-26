@@ -37,6 +37,7 @@ DEFAULT_WORKER_ACTIONS = {
     "heartbeat",
     "market:read",
     "market:stream",
+    "funds:read",
 }
 ALLOWED_V1_MODES = {"paper", "dry_run", "live"}
 LIVE_REQUIRED_RUN_METADATA = {"strategy_family", "strategy_name"}
@@ -240,6 +241,28 @@ class WorkerRunPnlSnapshot(BaseModel):
     position_count: int = 0
     is_realtime: bool = False
     is_stale: bool = False
+    updated_at: str
+
+
+class WorkerFundsSegment(BaseModel):
+    net: float = 0.0
+    available_cash: float = 0.0
+    opening_balance: float = 0.0
+    live_balance: Optional[float] = None
+    collateral: Optional[float] = None
+    utilised: float = 0.0
+    m2m_realised: float = 0.0
+    m2m_unrealised: float = 0.0
+
+
+class WorkerFundsSnapshot(BaseModel):
+    account_scope: str
+    mode: str
+    currency: str = "INR"
+    source: str
+    segments: Dict[str, WorkerFundsSegment] = Field(default_factory=dict)
+    allocation: Dict[str, Any] = Field(default_factory=dict)
+    stale: bool = False
     updated_at: str
 
 
@@ -1187,6 +1210,151 @@ def _snapshot_signature(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, default=_json_default, separators=(",", ":"))
 
 
+def _numeric_dict_total(payload: Any, *, exclude: Optional[set[str]] = None) -> float:
+    if not isinstance(payload, dict):
+        return 0.0
+    excluded = exclude or set()
+    return sum(_to_float(value) for key, value in payload.items() if key not in excluded and isinstance(value, (int, float, str)))
+
+
+def _worker_margin_segment(payload: Any) -> WorkerFundsSegment:
+    segment = dict(payload or {}) if isinstance(payload, dict) else {}
+    available = dict(segment.get("available") or {}) if isinstance(segment.get("available"), dict) else {}
+    utilised = dict(segment.get("utilised") or {}) if isinstance(segment.get("utilised"), dict) else {}
+    available_cash = _to_float(available.get("cash"), default=_to_float(segment.get("net")))
+    return WorkerFundsSegment(
+        net=_to_float(segment.get("net")),
+        available_cash=available_cash,
+        opening_balance=_to_float(available.get("opening_balance")),
+        live_balance=_to_float(available.get("live_balance")) if "live_balance" in available else None,
+        collateral=_to_float(available.get("collateral")) if "collateral" in available else None,
+        utilised=_numeric_dict_total(utilised, exclude={"m2m_realised", "m2m_unrealised"}),
+        m2m_realised=_to_float(utilised.get("m2m_realised")),
+        m2m_unrealised=_to_float(utilised.get("m2m_unrealised")),
+    )
+
+
+async def _paper_worker_funds_snapshot(request: Request, account_scope: str, *, mode: str) -> Dict[str, Any]:
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if paper_runtime_service is None:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+    account = await paper_runtime_service.get_account_summary(account_scope)
+    available_funds = _to_float(account.get("available_funds"))
+    blocked_funds = _to_float(account.get("blocked_funds"))
+    realized_pnl = _to_float(account.get("realized_pnl"))
+    segment = WorkerFundsSegment(
+        net=available_funds + blocked_funds,
+        available_cash=available_funds,
+        opening_balance=_to_float(account.get("starting_balance")),
+        utilised=blocked_funds,
+        m2m_realised=realized_pnl,
+        m2m_unrealised=0.0,
+    )
+    return WorkerFundsSnapshot(
+        account_scope=account_scope,
+        mode=mode,
+        currency=str(account.get("currency") or "INR"),
+        source="paper_runtime",
+        segments={"equity": segment},
+        allocation={"usable_equity_cash": available_funds, "max_new_position_value": available_funds},
+        stale=False,
+        updated_at=str(account.get("updated_at") or _utcnow().isoformat()),
+    ).model_dump(mode="json")
+
+
+async def _live_worker_funds_snapshot(account_scope: str, *, mode: str) -> Dict[str, Any]:
+    kite = _load_live_kite_for_account(account_scope)
+    margins = await asyncio.to_thread(kite.margins)
+    segments = {
+        name: _worker_margin_segment(payload)
+        for name, payload in dict(margins or {}).items()
+        if name in {"equity", "commodity"}
+    }
+    equity = segments.get("equity") or WorkerFundsSegment()
+    return WorkerFundsSnapshot(
+        account_scope=account_scope,
+        mode=mode,
+        currency="INR",
+        source="broker",
+        segments=segments,
+        allocation={"usable_equity_cash": equity.available_cash, "max_new_position_value": equity.available_cash},
+        stale=False,
+        updated_at=_utcnow().isoformat(),
+    ).model_dump(mode="json")
+
+
+async def _build_worker_funds_snapshot(request: Request, *, account_scope: str, mode: str) -> Dict[str, Any]:
+    normalized_mode = str(mode or "paper").lower()
+    if normalized_mode == "paper" or str(account_scope).startswith("kite:paper"):
+        return await _paper_worker_funds_snapshot(request, account_scope, mode=normalized_mode)
+    if normalized_mode in {"live", "dry_run"}:
+        return await _live_worker_funds_snapshot(account_scope, mode=normalized_mode)
+    raise HTTPException(status_code=400, detail=f"Unsupported execution mode '{normalized_mode}'")
+
+
+def _run_allocation_cap(run: Dict[str, Any]) -> Optional[float]:
+    metadata = dict(run.get("metadata") or {})
+    runtime_state = dict(run.get("runtime_state") or {})
+    allocation_state = dict(runtime_state.get("allocation") or {}) if isinstance(runtime_state.get("allocation"), dict) else {}
+    for value in (
+        metadata.get("allocation_cap"),
+        metadata.get("allocation_cap_inr"),
+        allocation_state.get("cap"),
+        runtime_state.get("allocation_cap"),
+    ):
+        cap = _to_float(value, default=-1.0)
+        if cap >= 0:
+            return cap
+    return None
+
+
+def _run_usage_from_pnl(pnl: Dict[str, Any]) -> Dict[str, float]:
+    gross_exposure = 0.0
+    net_exposure = 0.0
+    for leg in pnl.get("legs") or []:
+        quantity = _to_int(leg.get("net_quantity"))
+        mark = _to_float(leg.get("last_price"), default=0.0) or _to_float(leg.get("average_price"), default=0.0)
+        gross_exposure += abs(quantity) * mark
+        net_exposure += quantity * mark
+    totals = dict(pnl.get("totals") or {})
+    return {
+        "gross_exposure": gross_exposure,
+        "net_exposure": net_exposure,
+        "realized_pnl": _to_float(totals.get("realized_pnl")),
+        "unrealized_pnl": _to_float(totals.get("unrealized_pnl")),
+        "net_pnl": _to_float(totals.get("net_pnl")),
+    }
+
+
+async def _build_worker_run_funds_snapshot(request: Request, run: Dict[str, Any]) -> Dict[str, Any]:
+    account_funds = await _build_worker_funds_snapshot(request, account_scope=str(run["account_scope"]), mode=str(run.get("execution_mode") or "paper"))
+    pnl = await _build_worker_run_pnl_snapshot(request, run)
+    usage = _run_usage_from_pnl(pnl)
+    cap = _run_allocation_cap(run)
+    used = usage["gross_exposure"]
+    allocation = {
+        "cap": cap,
+        "used": used,
+        "remaining": max(0.0, cap - used) if cap is not None else None,
+        "basis": "gross_exposure",
+    }
+    return {
+        **account_funds,
+        "strategy_run_id": str(run["strategy_run_id"]),
+        "strategy": {
+            "strategy_run_id": str(run["strategy_run_id"]),
+            "status": str(run.get("status") or "open"),
+            **usage,
+            "estimated_margin_used": None,
+            "allocation": allocation,
+            "pnl": pnl.get("totals") or {},
+            "position_count": _to_int(pnl.get("position_count")),
+            "is_stale": bool(pnl.get("is_stale")),
+        },
+        "allocation": {**dict(account_funds.get("allocation") or {}), "run": allocation},
+    }
+
+
 def _run_updated_at(run: Dict[str, Any]) -> Optional[str]:
     runtime_state = dict(run.get("runtime_state") or {})
     for key in ("updated_at", "created_at"):
@@ -1910,6 +2078,36 @@ async def get_worker_market_snapshot(request: Request, payload: WorkerMarketSnap
     token = await require_worker_token(request)
     _require_action(token, "market:read")
     return await _market_data_service(request).get_market_snapshot(payload)
+
+
+@router.get("/worker/funds")
+async def get_worker_funds(request: Request, mode: str = Query("paper"), account_scope: Optional[str] = None):
+    token = await require_worker_token(request)
+    _require_action(token, "funds:read")
+    normalized_mode = str(mode or "paper").strip().lower()
+    _require_v1_mode(normalized_mode)
+    if normalized_mode not in token.allowed_modes:
+        raise HTTPException(status_code=403, detail="Worker token cannot read funds for this execution mode")
+    scope = str(account_scope or token.account_scope or "").strip()
+    if not scope:
+        raise HTTPException(status_code=400, detail="account_scope is required for worker funds")
+    if token.account_scope and scope != token.account_scope:
+        raise HTTPException(status_code=403, detail="Worker token cannot read this account scope")
+    return await _build_worker_funds_snapshot(request, account_scope=scope, mode=normalized_mode)
+
+
+@router.get("/worker/runs/{strategy_run_id}/funds")
+async def get_worker_run_funds(request: Request, strategy_run_id: str):
+    token = await require_worker_token(request)
+    _require_action(token, "funds:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    mode = str(run.get("execution_mode") or "paper").lower()
+    if mode not in token.allowed_modes:
+        raise HTTPException(status_code=403, detail="Worker token cannot read funds for this execution mode")
+    return await _build_worker_run_funds_snapshot(request, run)
 
 
 @router.get("/worker/runs/{strategy_run_id}/pnl")

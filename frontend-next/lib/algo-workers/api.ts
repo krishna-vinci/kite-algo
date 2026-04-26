@@ -26,6 +26,12 @@ export type CreatedAlgoWorkerToken = AlgoWorkerToken & {
   token: string;
 };
 
+export type KiteProfile = {
+  userId: string | null;
+  userName: string | null;
+  raw: Record<string, unknown>;
+};
+
 const DEFAULT_ALLOWED_MODES = ["paper", "dry_run"];
 const DEFAULT_ALLOWED_ACTIONS = [
   "heartbeat",
@@ -34,6 +40,7 @@ const DEFAULT_ALLOWED_ACTIONS = [
   "intents:submit",
   "risk:update",
   "runs:exit",
+  "funds:read",
 ];
 
 function asStringArray(value: unknown): string[] {
@@ -75,6 +82,15 @@ export async function createAlgoWorkerToken(payload: CreateAlgoWorkerTokenPayloa
   return {
     ...normalizeToken(response),
     token: String(response.token ?? ""),
+  };
+}
+
+export async function getKiteProfile(): Promise<KiteProfile> {
+  const response = await apiFetch<Record<string, unknown>>("/api/profile_kite");
+  return {
+    userId: typeof response.user_id === "string" && response.user_id.trim() ? response.user_id.trim() : null,
+    userName: typeof response.user_name === "string" && response.user_name.trim() ? response.user_name.trim() : null,
+    raw: response,
   };
 }
 

@@ -19,23 +19,23 @@ Once the SDK changes are committed and tagged, remote servers can install the ex
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.2.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.2.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"
 ```
 
-Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.2.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
+Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.3.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
 
 Create the tag from the repository root after committing the SDK:
 
 ```bash
-git tag -a kite-algo-worker-v0.2.0 -m "kite-algo-worker v0.2.0"
-git push origin kite-algo-worker-v0.2.0
+git tag -a kite-algo-worker-v0.3.0 -m "kite-algo-worker v0.3.0"
+git push origin kite-algo-worker-v0.3.0
 ```
 
 ### Local development install
@@ -102,8 +102,9 @@ All strategy activity should happen under one stable `strategy_run_id` per strat
 5. `heartbeat(...)` from long-running workers.
 6. `resolve_ticker(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, or `stream_candles(...)` for runtime-backed market data.
 7. `get_run(...)` after restarts, mutations, and exits.
-8. `get_run_pnl(...)` or `stream_run_pnl(...)` for grouped realtime run P&L.
-9. `exit_run(...)` to close the grouped strategy run.
+8. `get_funds(...)` or `get_run_funds(...)` before sizing entries.
+9. `get_run_pnl(...)` or `stream_run_pnl(...)` for grouped realtime run P&L.
+10. `exit_run(...)` to close the grouped strategy run.
 
 The SDK maps to public endpoints only:
 
@@ -113,6 +114,8 @@ The SDK maps to public endpoints only:
 | `heartbeat(...)` | `POST /api/algo-workers/worker/heartbeat` |
 | `create_run(...)` | `POST /api/algo-workers/worker/runs` |
 | `get_run(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}` |
+| `get_funds(...)` | `GET /api/algo-workers/worker/funds` |
+| `get_run_funds(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/funds` |
 | `get_run_pnl(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/pnl` |
 | `stream_run_pnl(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/pnl/stream` |
 | `resolve_ticker(...)` / `search_tickers(...)` | `/api/algo-workers/worker/market/instruments/*` |
@@ -261,6 +264,23 @@ Important notes:
 - The backend is the source of truth for grouped P&L.
 - Live broker/manual activity stays separate unless safely attributed.
 - `is_stale=true` means the backend could not fully confirm live leg mark coverage or broker quantity alignment for one or more open legs.
+
+## Funds and run allocation
+
+Workers can ask the backend for account-level funds and run-level usage before sizing entries:
+
+```python
+account_funds = client.get_funds(mode="paper")
+run_funds = client.get_run_funds(run_id)
+
+remaining = run_funds["strategy"]["allocation"]["remaining"]
+if remaining is not None and remaining < required_notional:
+    return  # skip or reduce size
+```
+
+`get_funds(...)` returns a worker-safe account funds snapshot for the token account scope. For paper runs this comes from the paper runtime account. For live runs this comes from broker margins through the backend's live Kite session for `kite:<broker_user_id>`.
+
+`get_run_funds(strategy_run_id)` adds strategy/run usage derived from backend-owned grouped P&L legs. Kite does not provide strategy-level funds directly, so V1 derives `gross_exposure`, `net_exposure`, and current P&L from attributed run state. If run metadata includes `allocation_cap` or `allocation_cap_inr`, the response includes remaining allocation using current gross exposure as the usage basis.
 
 ## Execution modes: dry_run vs paper vs live
 

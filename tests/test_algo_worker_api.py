@@ -20,6 +20,8 @@ from api.routers.algo_workers import (  # noqa: E402
     WorkerQuoteRequest,
     get_worker_market_candles,
     get_worker_run_pnl,
+    get_worker_funds,
+    get_worker_run_funds,
     get_worker_market_snapshot,
     get_worker_market_quotes,
     WorkerRiskPatchRequest,
@@ -200,6 +202,88 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_default_worker_actions_include_market_actions(self):
         self.assertIn("market:read", DEFAULT_WORKER_ACTIONS)
         self.assertIn("market:stream", DEFAULT_WORKER_ACTIONS)
+        self.assertIn("funds:read", DEFAULT_WORKER_ACTIONS)
+
+    async def test_worker_funds_returns_paper_account_summary(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        request.app.state.paper_runtime_service = SimpleNamespace(
+            get_account_summary=AsyncMock(
+                return_value={
+                    "account_scope": "kite:paper-a",
+                    "currency": "INR",
+                    "starting_balance": 100000,
+                    "available_funds": 82000,
+                    "blocked_funds": 18000,
+                    "realized_pnl": 1250,
+                    "updated_at": "2026-04-26T08:00:00+00:00",
+                }
+            )
+        )
+
+        response = await get_worker_funds(request, mode="paper")
+
+        self.assertEqual(response["source"], "paper_runtime")
+        self.assertEqual(response["segments"]["equity"]["available_cash"], 82000)
+        self.assertEqual(response["allocation"]["usable_equity_cash"], 82000)
+
+    async def test_worker_run_funds_includes_allocation_remaining(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-1"] = {
+            "strategy_run_id": "run-1",
+            "token_id": "worker-1",
+            "template_id": "mean-reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {},
+            "metadata": {"allocation_cap": 50000},
+        }
+        request = self._request(repo)
+        request.app.state.paper_runtime_service = SimpleNamespace(
+            get_account_summary=AsyncMock(
+                return_value={
+                    "account_scope": "kite:paper-a",
+                    "currency": "INR",
+                    "starting_balance": 100000,
+                    "available_funds": 75000,
+                    "blocked_funds": 25000,
+                    "realized_pnl": 0,
+                    "updated_at": "2026-04-26T08:00:00+00:00",
+                }
+            ),
+            get_strategy_run_pnl=AsyncMock(
+                return_value={
+                    "currency": "INR",
+                    "strategy": {
+                        "status": "open",
+                        "realized_pnl": 100,
+                        "unrealized_pnl": -25,
+                        "last_updated_at": "2026-04-26T08:00:00+00:00",
+                        "positions": [
+                            {
+                                "instrument_token": 408065,
+                                "exchange": "NSE",
+                                "tradingsymbol": "INFY",
+                                "product": "CNC",
+                                "net_quantity": 10,
+                                "average_price": 1500,
+                                "last_price": 1510,
+                            }
+                        ],
+                    },
+                }
+            ),
+        )
+
+        response = await get_worker_run_funds(request, "run-1")
+
+        self.assertEqual(response["strategy"]["gross_exposure"], 15100)
+        self.assertEqual(response["strategy"]["allocation"]["cap"], 50000)
+        self.assertEqual(response["strategy"]["allocation"]["remaining"], 34900)
 
     async def test_resolve_ticker_endpoint_returns_fake_service_response(self):
         repo = _FakeWorkerRepository()

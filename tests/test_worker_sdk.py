@@ -208,6 +208,19 @@ def test_get_run_pnl_uses_worker_pnl_endpoint(captured_requests):
     assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/pnl"
 
 
+def test_get_funds_uses_worker_funds_endpoint(captured_requests):
+    client().get_funds(mode="live", account_scope="kite:AB1234")
+
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/funds"
+    assert captured_requests[0]["kwargs"]["params"] == {"mode": "live", "account_scope": "kite:AB1234"}
+
+
+def test_get_run_funds_uses_worker_run_funds_endpoint(captured_requests):
+    client().get_run_funds("run-1")
+
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/funds"
+
+
 def test_get_quotes_splits_string_symbols_and_int_tokens(captured_requests):
     client().get_quotes(["NSE:INFY", 408065], mode="full")
 
