@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-04-25
+Last updated: 2026-04-26
 
 ## Scope
 
@@ -11,6 +11,7 @@ Do not use this file for frontend work.
 
 ## Recently completed
 
+- Fixed headless Kite Connect login for newly switched broker accounts that land on Zerodha's app authorization page before returning a `request_token`
 - Centralized Kite session handling in `broker_api/kite_session.py`
 - Stopped returning broker `access_token` from login responses
 - Hardened headless broker login and startup token rotation
