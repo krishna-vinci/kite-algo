@@ -10,14 +10,14 @@ Recommended for remote strategy servers:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.1.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.2.0#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.1.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.2.0#subdirectory=sdk/python"
 ```
 
 Pin to an immutable tag in production. Avoid installing from a moving branch such as `main` on live strategy servers.
@@ -33,8 +33,8 @@ python3 -m pip install -e /path/to/kite-algo/sdk/python
 After the SDK changes are committed and pushed, create and push a tag from the repository root:
 
 ```bash
-git tag -a kite-algo-worker-v0.1.0 -m "kite-algo-worker v0.1.0"
-git push origin kite-algo-worker-v0.1.0
+git tag -a kite-algo-worker-v0.2.0 -m "kite-algo-worker v0.2.0"
+git push origin kite-algo-worker-v0.2.0
 ```
 
 Then remote servers can install the exact SDK version using the Git-tag install command above.
