@@ -44,6 +44,7 @@ from api.routers.ingestion import router as ingestion_router
 from api.routers.user_settings import router as user_settings_router
 from api.routers.marketwatch import router as marketwatch_router
 from api.routers.algo_workers import router as algo_workers_router
+from api.routers.control import router as control_router
 from journaling.runtime import JournalRuntimeWorker
 from api.routers.journal import router as journal_router
 from journaling.service import JournalService
@@ -191,6 +192,63 @@ def run_schema_migrations() -> None:
             except Exception:
                 pass
 
+
+def _worker_protection_squareoff_schedule() -> dict[str, str]:
+    defaults = {
+        "NSE:MIS": "15:20",
+        "BSE:MIS": "15:20",
+        "NFO:MIS": "15:25",
+        "CDS:MIS": "16:45",
+        "MCX:MIS": "23:20",
+    }
+    raw = os.getenv("WORKER_PROTECTION_SQUAREOFF_SCHEDULE_JSON")
+    if not raw:
+        return defaults
+    try:
+        override = json.loads(raw)
+        if not isinstance(override, dict):
+            raise ValueError("schedule must be a JSON object")
+        return {**defaults, **{str(key): str(value) for key, value in override.items()}}
+    except Exception:
+        logging.warning("Invalid WORKER_PROTECTION_SQUAREOFF_SCHEDULE_JSON; using defaults", exc_info=True)
+        return defaults
+
+
+async def _worker_protection_loop(app: FastAPI):
+    from types import SimpleNamespace
+
+    from api.routers.algo_workers import SqlAlchemyAlgoWorkerRepository
+    from api.worker_protection_runtime import (
+        WorkerProtectionRuntime,
+        load_worker_run_pnl_for_protection,
+        submit_worker_protection_exit,
+    )
+
+    interval = max(1.0, float(os.getenv("WORKER_PROTECTION_INTERVAL_SECONDS", "5")))
+    request = SimpleNamespace(headers={}, app=app, is_disconnected=lambda: False)
+    repo = getattr(app.state, "algo_worker_repository", None)
+    if repo is None:
+        repo = SqlAlchemyAlgoWorkerRepository()
+        app.state.algo_worker_repository = repo
+    runtime = WorkerProtectionRuntime(
+        repo=repo,
+        pnl_loader=lambda run: load_worker_run_pnl_for_protection(request, run),
+        exit_submitter=lambda run, state: submit_worker_protection_exit(request, run, state),
+        squareoff_schedule=_worker_protection_squareoff_schedule(),
+    )
+    set_component_status("worker_protection", "healthy", detail="Worker protection runtime started")
+    while True:
+        try:
+            result = await runtime.evaluate_once()
+            heartbeat("worker_protection", detail="Evaluated worker backend protection", meta={**result, "interval_seconds": interval})
+        except asyncio.CancelledError:
+            set_component_status("worker_protection", "stopped", detail="Worker protection runtime cancelled")
+            break
+        except Exception as exc:
+            logging.warning("Worker protection loop failed: %s", exc, exc_info=True)
+            set_component_status("worker_protection", "degraded", detail=str(exc))
+        await asyncio.sleep(interval)
+
 # 2. Combine the lifespans
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
@@ -201,6 +259,7 @@ async def combined_lifespan(app: FastAPI):
     index_refresh_task = None
     order_runtime_task = None
     positions_runtime_task = None
+    worker_protection_task = None
     journal_runtime_worker = None
     set_component_status("app", "starting", detail="Application startup in progress")
     try:
@@ -646,6 +705,11 @@ async def combined_lifespan(app: FastAPI):
         except Exception as e:
             logging.error("Failed to initialize modular algo runtime: %s", e, exc_info=True)
             set_component_status("algo_runtime", "degraded", detail=str(e))
+
+        if os.getenv("WORKER_PROTECTION_ENABLED", "true").lower() in {"1", "true", "yes"}:
+            worker_protection_task = asyncio.create_task(_worker_protection_loop(app))
+        else:
+            set_component_status("worker_protection", "disabled", detail="Worker protection runtime disabled by WORKER_PROTECTION_ENABLED")
     except Exception as e:
         logging.error(f"Failed to initialize broker bootstrap or market runtime: {e}", exc_info=True)
         startup_status = "degraded"
@@ -715,6 +779,16 @@ async def combined_lifespan(app: FastAPI):
             positions_runtime_task.cancel()
             try:
                 await positions_runtime_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel worker protection runtime
+    try:
+        if 'worker_protection_task' in locals() and worker_protection_task:
+            worker_protection_task.cancel()
+            try:
+                await worker_protection_task
             except Exception:
                 pass
     except Exception:
@@ -802,6 +876,7 @@ app.include_router(ingestion_router, prefix="/api")
 app.include_router(user_settings_router, prefix="/api")
 app.include_router(marketwatch_router, prefix="/api")
 app.include_router(algo_workers_router, prefix="/api")
+app.include_router(control_router, prefix="/api")
 app.include_router(journal_router, prefix="/api")
 app.include_router(kite_orders_router, prefix="/api")
 app.include_router(kite_mutual_funds_router, prefix="/api")

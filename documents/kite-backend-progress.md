@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-04-24
+Last updated: 2026-04-25
 
 ## Scope
 
@@ -24,6 +24,18 @@ Do not use this file for frontend work.
 
 ## Newly implemented in current branch
 
+- Completed backend control-plane Phases 1-3:
+  - added authenticated `GET /api/control/strategy-positions`, `POST /api/control/strategies/{strategy_run_id}/exit`, `POST /api/control/strategies/{strategy_run_id}/cancel-orders`, and `POST /api/control/reconcile`
+  - snapshot aggregation now reuses paper runtime summaries, non-paper algo-worker runs/P&L, and heartbeat-derived worker health, while keeping a stable manual/unattributed exposure bucket that infers broker account from the current Kite session and avoids double-counting known live strategy exposure
+  - control-plane exit reuses existing paper-runtime and worker live exit paths; strategy-scoped cancel intentionally returns a deterministic `409` until broker-safe open-order attribution exists
+  - control-plane protection adapters attach `option_runtime` state from option strategy store + algo runtime status and `investing_runtime` state from investing holdings summaries, with metadata fallback and per-strategy degradation when adapter state is unavailable
+- Added centralized backend exposure protection for algo-worker runs:
+  - workers can declare versioned `runtime_state.backend_protection` on run creation and patch it later through `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/protection`
+  - backend evaluator supports position-level and basket-level percent stoploss/target/trailing rules, optional worker-stale exit, and configurable MIS squareoff buffer
+  - triggered V1 rules submit conservative attributed strategy exits; position rules provide leg-specific thresholds until a broker-safe leg-only exit primitive exists
+  - protection state persists in `runtime_state.backend_protection_state`, including generation, last check, trigger/action, exit submission, and errors
+  - control plane displays `backend_worker_protection` alongside existing option/investing protection state
+  - Python SDK now includes helper models plus `create_run(..., backend_protection=...)` and `update_backend_protection(...)`, with docs/examples for protected workers
 - Fixed the monthly index refresh scheduler so live metric refresh/injection now also runs for `Nifty500` after constituent refreshes, matching the existing `Nifty50`/`NiftyBank` flow
 - Added the next trading journal backend slice:
   - new `journaling/service.py` for run orchestration, source links, decision events, benchmark daily-price refresh, and run summary/benchmark comparison queries
@@ -139,6 +151,20 @@ Do not use this file for frontend work.
   - dirty order trade sync now triggers best-effort live journal projection without blocking position reconciliation
   - journal summary/runs/trades/strategies filters now carry strategy-family and execution-mode separation through backend and frontend API types
   - `/api/algo-workers` now supports explicitly live-enabled worker tokens/runs and routes live external algo intents through the attributed live order path
+- Added the first real external worker SDK slice:
+  - `sdk/python/kite_algo_worker` exposes `KiteAlgoWorkerClient`, `AlgoWorkerConfig`, a custom API exception, and broker-shape order builders
+  - SDK examples now cover mean-reversion, option baskets, and grouped live exit preview with safe defaults
+  - `docs/algo-worker-development-guide.md` is now a full coding guide for dry_run/paper/live worker strategy development and documents all live order fields supported by `PlaceOrderRequest`
+  - focused SDK tests validate auth headers, run/intent payloads, idempotency enforcement, exit preview payloads, non-2xx handling, and order-builder compatibility with broker order validation
+- Added grouped algo-worker run P&L snapshot/stream support:
+  - `/api/algo-workers/worker/runs/{strategy_run_id}/pnl` now returns backend-owned grouped run totals plus per-leg breakdown for `dry_run`, `paper`, and `live`
+  - `/api/algo-workers/worker/runs/{strategy_run_id}/pnl/stream` now exposes SSE updates so remote workers can consume grouped P&L that feels realtime
+  - live run P&L is reconstructed from attributed live fills plus current account position marks, keeping charges separated and flagging stale coverage when broker mark/quantity alignment is incomplete
+  - paper run P&L reuses grouped paper strategy state via `strategy_run_id` instead of requiring workers to infer grouped P&L locally
+- Added generic runtime-backed algo-worker market-data primitives:
+  - worker endpoints now expose ticker resolution/search, quote snapshots, tick SSE streams, candle snapshots, candle SSE streams, and combined market snapshot bundles under `/api/algo-workers/worker/market/*`
+  - SDK methods now wrap those endpoints so external workers can build non-option realtime strategies without broker websockets, Redis access, database access, or backend internals
+  - option-chain discovery, strike/expiry selection, Greeks/IV, and spread builders are explicitly deferred to a later namespaced option worker layer inside the same SDK package
 
 ## Skill usage
 
@@ -433,11 +459,12 @@ Update after latest verification:
 
 If a new agent picks this up, the correct next task is:
 
-1. extract template-owned builders for `build_summary_fields(run)`, `build_risk_schema(run)`, and `build_allowed_actions(run)` so non-option strategies can use the same backend contract cleanly
-2. implement one non-option systematic algo on that contract and verify it in paper mode
-3. carry the same run/capability contract into the live strategy-management path
-4. continue implementing and hardening `market-runtime/`, starting with live shard verification and direct or optimized marketwatch/candle runtime streaming
-5. add backend tests for order runtime, websocket flow, and live positions
-6. verify live duplicate/replay order-event behavior against real provider events
-7. verify MF get-by-id shapes when a real order/SIP exists, without executing unsafe side-effecting writes unless explicitly approved
-8. refresh this tracker and the websocket-runtime docs after each material step
+1. add optional worker conveniences that remain API-only, such as listing recoverable open runs by token/template/account and structured decision/journal events
+2. extract template-owned builders for `build_summary_fields(run)`, `build_risk_schema(run)`, and `build_allowed_actions(run)` so non-option strategies can use the same backend contract cleanly
+3. implement one non-option systematic algo on that contract and verify it in paper mode using the SDK
+4. carry the same run/capability contract into the live strategy-management path
+5. continue implementing and hardening `market-runtime/`, starting with live shard verification and direct or optimized marketwatch/candle runtime streaming
+6. add backend tests for order runtime, websocket flow, and live positions
+7. verify live duplicate/replay order-event behavior against real provider events
+8. verify MF get-by-id shapes when a real order/SIP exists, without executing unsafe side-effecting writes unless explicitly approved
+9. refresh this tracker and the websocket-runtime docs after each material step

@@ -1,5 +1,6 @@
 import type { RuntimeStatus } from "@/components/options/types";
 import type {
+  ControlPlaneSnapshot,
   TradingPaperAccount,
   StrategyCapabilities,
   StrategySummaryField,
@@ -63,6 +64,18 @@ export type BrokerPositionsResponse = {
     }
   >;
 };
+
+function numberValue(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
 
 function normalizeSummaryFields(raw: unknown): StrategySummaryField[] {
   if (!Array.isArray(raw)) {
@@ -224,6 +237,102 @@ export function normalizeBrokerPositions(response: BrokerPositionsResponse): Tra
 export async function fetchBrokerPositions(): Promise<TradingBrokerSnapshot> {
   const response = await apiFetch<BrokerPositionsResponse>("/api/positions/realtime");
   return normalizeBrokerPositions(response);
+}
+
+export function normalizeControlPlaneSnapshot(response: Record<string, unknown>): ControlPlaneSnapshot {
+  const totals = recordValue(response.totals);
+  const unattributed = recordValue(response.unattributed);
+  const strategies = Array.isArray(response.strategies) ? response.strategies : [];
+
+  return {
+    generatedAt: stringOrNull(response.generated_at),
+    totals: {
+      strategyCount: numberValue(totals.strategy_count),
+      openStrategyCount: numberValue(totals.open_strategy_count),
+      positionCount: numberValue(totals.position_count),
+      staleWorkerCount: numberValue(totals.stale_worker_count),
+      realizedPnl: numberValue(totals.realized_pnl),
+      unrealizedPnl: numberValue(totals.unrealized_pnl),
+      netPnl: numberValue(totals.net_pnl),
+    },
+    strategies: strategies
+      .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+      .map((item) => {
+        const protection = recordValue(item.protection);
+        return {
+          strategyRunId: String(item.strategy_run_id ?? "unknown"),
+          displayName: String(item.display_name ?? item.strategy_run_id ?? "Unnamed strategy"),
+          source: String(item.source ?? "algo_worker") as ControlPlaneSnapshot["strategies"][number]["source"],
+          mode: (item.mode === "live" || item.mode === "dry_run" ? item.mode : "paper") as ControlPlaneSnapshot["strategies"][number]["mode"],
+          status: String(item.status ?? "unknown"),
+          healthStatus: String(item.health_status ?? "unknown") as ControlPlaneSnapshot["strategies"][number]["healthStatus"],
+          heartbeatAgeSec: typeof item.heartbeat_age_sec === "number" ? item.heartbeat_age_sec : null,
+          workerId: stringOrNull(item.worker_id),
+          workerName: stringOrNull(item.worker_name),
+          workerMetrics: recordValue(item.worker_metrics),
+          isOpen: Boolean(item.is_open),
+          realizedPnl: numberValue(item.realized_pnl),
+          unrealizedPnl: numberValue(item.unrealized_pnl),
+          netPnl: numberValue(item.net_pnl),
+          positionCount: numberValue(item.position_count),
+          openOrderCount: numberValue(item.open_order_count),
+          tradeCount: numberValue(item.trade_count),
+          positions: Array.isArray(item.positions) ? item.positions : [],
+          orders: Array.isArray(item.orders) ? item.orders : [],
+          trades: Array.isArray(item.trades) ? item.trades : [],
+          allowedActions: Array.isArray(item.allowed_actions)
+            ? item.allowed_actions.filter((action): action is string => typeof action === "string")
+            : [],
+          actionReasons: Object.fromEntries(Object.entries(recordValue(item.action_reasons)).map(([key, value]) => [key, String(value)])),
+          protection: {
+            source: String(protection.source ?? "none"),
+            status: String(protection.status ?? "unknown"),
+            summary: String(protection.summary ?? "No protection runtime attached"),
+            lastCheckedAt: stringOrNull(protection.last_checked_at),
+            details: recordValue(protection.details),
+          },
+          lastUpdatedAt: stringOrNull(item.last_updated_at),
+        };
+      }),
+    unattributed: {
+      displayName: String(unattributed.display_name ?? "Manual / unattributed broker exposure"),
+      positions: Array.isArray(unattributed.positions) ? unattributed.positions : [],
+      orders: Array.isArray(unattributed.orders) ? unattributed.orders : [],
+      realizedPnl: numberValue(unattributed.realized_pnl),
+      unrealizedPnl: numberValue(unattributed.unrealized_pnl),
+      netPnl: numberValue(unattributed.net_pnl),
+    },
+  };
+}
+
+export async function fetchControlPlaneSnapshot(): Promise<ControlPlaneSnapshot> {
+  const response = await apiFetch<Record<string, unknown>>("/api/control/strategy-positions");
+  return normalizeControlPlaneSnapshot(response);
+}
+
+export async function exitControlStrategy(
+  strategyRunId: string,
+  payload: { reason?: string; dryRun?: boolean; accountScope?: string } = {},
+) {
+  return apiFetch(`/api/control/strategies/${encodeURIComponent(strategyRunId)}/exit`, {
+    method: "POST",
+    body: JSON.stringify({
+      reason: payload.reason ?? "operator_exit",
+      dry_run: Boolean(payload.dryRun),
+      account_scope: payload.accountScope ?? "default",
+    }),
+  });
+}
+
+export async function cancelControlStrategyOrders(strategyRunId: string, payload: { reason?: string } = {}) {
+  return apiFetch(`/api/control/strategies/${encodeURIComponent(strategyRunId)}/cancel-orders`, {
+    method: "POST",
+    body: JSON.stringify({ reason: payload.reason ?? "operator_cancel", dry_run: false, account_scope: "default" }),
+  });
+}
+
+export async function reconcileControlPlane() {
+  return apiFetch("/api/control/reconcile", { method: "POST" });
 }
 
 export async function updatePaperStrategyRisk(

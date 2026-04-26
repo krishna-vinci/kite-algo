@@ -7,13 +7,21 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from api.worker_protection import validate_backend_protection_payload
+from api.worker_market_data import (
+    WorkerInstrumentResolveRequest,
+    WorkerMarketDataService,
+    WorkerMarketSnapshotRequest,
+    WorkerQuoteRequest,
+)
 from auth_service import require_app_user
 from database import SessionLocal
 
@@ -27,6 +35,8 @@ DEFAULT_WORKER_ACTIONS = {
     "risk:update",
     "runs:exit",
     "heartbeat",
+    "market:read",
+    "market:stream",
 }
 ALLOWED_V1_MODES = {"paper", "dry_run", "live"}
 LIVE_REQUIRED_RUN_METADATA = {"strategy_family", "strategy_name"}
@@ -82,6 +92,24 @@ def _row_mapping(row: Any) -> Dict[str, Any]:
         for key in dir(row)
         if not key.startswith("_") and not callable(getattr(row, key))
     }
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 class WorkerTokenCreateRequest(BaseModel):
@@ -156,6 +184,12 @@ class WorkerRiskPatchRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class WorkerProtectionPatchRequest(BaseModel):
+    backend_protection: Dict[str, Any] = Field(default_factory=dict)
+    reason: Optional[str] = None
+    reset_trailing: bool = True
+
+
 class WorkerIntentRequest(BaseModel):
     intent_type: str = Field(min_length=1)
     payload: Dict[str, Any] = Field(default_factory=dict)
@@ -167,6 +201,46 @@ class WorkerExitRequest(BaseModel):
     reason: Optional[str] = None
     idempotency_key: Optional[str] = None
     dry_run: bool = False
+
+
+class WorkerRunPnlTotals(BaseModel):
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    gross_pnl: float = 0.0
+    charges: float = 0.0
+    net_pnl: float = 0.0
+
+
+class WorkerRunPnlLeg(BaseModel):
+    instrument_token: Optional[int] = None
+    exchange: Optional[str] = None
+    tradingsymbol: Optional[str] = None
+    product: Optional[str] = None
+    net_quantity: int = 0
+    side: str = "FLAT"
+    average_price: float = 0.0
+    last_price: float = 0.0
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    gross_pnl: float = 0.0
+    charges: float = 0.0
+    net_pnl: float = 0.0
+    broker_net_quantity: Optional[int] = None
+    is_stale: bool = False
+    last_reconciled_at: Optional[str] = None
+
+
+class WorkerRunPnlSnapshot(BaseModel):
+    strategy_run_id: str
+    execution_mode: str
+    status: str
+    currency: str = "INR"
+    totals: WorkerRunPnlTotals = Field(default_factory=WorkerRunPnlTotals)
+    legs: List[WorkerRunPnlLeg] = Field(default_factory=list)
+    position_count: int = 0
+    is_realtime: bool = False
+    is_stale: bool = False
+    updated_at: str
 
 
 @dataclass
@@ -209,8 +283,55 @@ class SqlAlchemyAlgoWorkerRepository:
     async def get_run(self, strategy_run_id: str) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._get_run_sync, strategy_run_id)
 
+    async def list_runs_for_control_plane(self) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._list_runs_for_control_plane_sync)
+
+    async def list_protection_enabled_runs(self) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._list_protection_enabled_runs_sync)
+
     async def update_run_risk(self, strategy_run_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
         return await asyncio.to_thread(self._update_run_risk_sync, strategy_run_id, patch)
+
+    async def update_run_runtime_state(self, strategy_run_id: str, runtime_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(self._update_run_runtime_state_sync, strategy_run_id, runtime_state)
+
+    async def update_run_backend_protection(
+        self,
+        strategy_run_id: str,
+        protection: Dict[str, Any],
+        protection_state: Dict[str, Any],
+        *,
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._update_run_backend_protection_sync,
+            strategy_run_id,
+            protection,
+            protection_state,
+            expected_generation,
+            expected_triggered_rule,
+            expected_exit_claim_id,
+        )
+
+    async def update_run_backend_protection_state(
+        self,
+        strategy_run_id: str,
+        protection_state: Dict[str, Any],
+        *,
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._update_run_backend_protection_state_sync,
+            strategy_run_id,
+            protection_state,
+            expected_generation,
+            expected_triggered_rule,
+            expected_exit_claim_id,
+        )
 
     async def update_run_status(self, strategy_run_id: str, status: str, *, state_patch: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._update_run_status_sync, strategy_run_id, status, state_patch)
@@ -222,7 +343,14 @@ class SqlAlchemyAlgoWorkerRepository:
         return await asyncio.to_thread(self._get_intent_result_sync, strategy_run_id, idempotency_key)
 
     async def save_intent_result(self, *, token_id: str, strategy_run_id: str, request: WorkerIntentRequest, status: str, result: Dict[str, Any]) -> Dict[str, Any]:
-        return await asyncio.to_thread(self._save_intent_result_sync, token_id, strategy_run_id, request, status, result)
+        return await asyncio.to_thread(
+            self._save_intent_result_sync,
+            token_id=token_id,
+            strategy_run_id=strategy_run_id,
+            request=request,
+            status=status,
+            result=result,
+        )
 
     def _create_token_sync(self, payload: WorkerTokenCreateRequest, raw_token: str, token_id: str) -> Dict[str, Any]:
         db = self.session_factory()
@@ -414,6 +542,50 @@ class SqlAlchemyAlgoWorkerRepository:
         finally:
             db.close()
 
+    def _list_runs_for_control_plane_sync(self) -> List[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT
+                        r.*,
+                        t.name AS worker_name,
+                        t.last_heartbeat_at,
+                        t.heartbeat_json
+                    FROM public.algo_worker_runs r
+                    LEFT JOIN public.algo_worker_tokens t ON t.token_id = r.token_id
+                    ORDER BY COALESCE(r.updated_at, r.created_at) DESC
+                    """
+                )
+            ).fetchall()
+            return [self._run_view_with_worker(row) for row in rows]
+        finally:
+            db.close()
+
+    def _list_protection_enabled_runs_sync(self) -> List[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT
+                        r.*,
+                        t.name AS worker_name,
+                        t.last_heartbeat_at,
+                        t.heartbeat_json
+                    FROM public.algo_worker_runs r
+                    LEFT JOIN public.algo_worker_tokens t ON t.token_id = r.token_id
+                    WHERE r.status IN ('open', 'exiting')
+                      AND COALESCE((r.runtime_state_json -> 'backend_protection' ->> 'enabled')::BOOLEAN, FALSE) = TRUE
+                    ORDER BY COALESCE(r.updated_at, r.created_at) ASC
+                    """
+                )
+            ).fetchall()
+            return [self._run_view_with_worker(row) for row in rows]
+        finally:
+            db.close()
+
     def _update_run_risk_sync(self, strategy_run_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
         run = self._get_run_sync(strategy_run_id)
         if run is None:
@@ -482,6 +654,146 @@ class SqlAlchemyAlgoWorkerRepository:
             ).fetchone()
             db.commit()
             return self._run_view(row)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _update_run_runtime_state_sync(self, strategy_run_id: str, runtime_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE public.algo_worker_runs
+                    SET runtime_state_json = CAST(:runtime_state_json AS JSONB),
+                        updated_at = NOW()
+                    WHERE strategy_run_id = :strategy_run_id
+                    RETURNING *
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id, "runtime_state_json": _json_dumps(runtime_state)},
+            ).fetchone()
+            db.commit()
+            return self._run_view(row) if row else None
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _update_run_backend_protection_sync(
+        self,
+        strategy_run_id: str,
+        protection: Dict[str, Any],
+        protection_state: Dict[str, Any],
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE public.algo_worker_runs
+                    SET runtime_state_json = jsonb_set(
+                            jsonb_set(
+                                COALESCE(runtime_state_json, '{}'::jsonb),
+                                '{backend_protection}',
+                                CAST(:protection_json AS JSONB),
+                                true
+                            ),
+                            '{backend_protection_state}',
+                            CAST(:protection_state_json AS JSONB),
+                            true
+                        ),
+                        updated_at = NOW()
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND (
+                        :expected_generation IS NULL
+                        OR COALESCE((runtime_state_json -> 'backend_protection_state' ->> 'generation')::INTEGER, 0) = :expected_generation
+                      )
+                      AND (
+                        :check_triggered_rule = FALSE
+                        OR COALESCE(runtime_state_json -> 'backend_protection_state' ->> 'triggered_rule', '') = :expected_triggered_rule
+                      )
+                      AND (
+                        :check_exit_claim_id = FALSE
+                        OR COALESCE(runtime_state_json -> 'backend_protection_state' ->> 'exit_claim_id', '') = :expected_exit_claim_id
+                      )
+                    RETURNING *
+                    """
+                ),
+                {
+                    "strategy_run_id": strategy_run_id,
+                    "protection_json": _json_dumps(protection),
+                    "protection_state_json": _json_dumps(protection_state),
+                    "expected_generation": expected_generation,
+                    "check_triggered_rule": expected_triggered_rule is not None,
+                    "expected_triggered_rule": expected_triggered_rule or "",
+                    "check_exit_claim_id": expected_exit_claim_id is not None,
+                    "expected_exit_claim_id": expected_exit_claim_id or "",
+                },
+            ).fetchone()
+            db.commit()
+            return self._run_view(row) if row else None
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _update_run_backend_protection_state_sync(
+        self,
+        strategy_run_id: str,
+        protection_state: Dict[str, Any],
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE public.algo_worker_runs
+                    SET runtime_state_json = jsonb_set(
+                            COALESCE(runtime_state_json, '{}'::jsonb),
+                            '{backend_protection_state}',
+                            CAST(:protection_state_json AS JSONB),
+                            true
+                        ),
+                        updated_at = NOW()
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND (
+                        :expected_generation IS NULL
+                        OR COALESCE((runtime_state_json -> 'backend_protection_state' ->> 'generation')::INTEGER, 0) = :expected_generation
+                      )
+                      AND (
+                        :check_triggered_rule = FALSE
+                        OR COALESCE(runtime_state_json -> 'backend_protection_state' ->> 'triggered_rule', '') = :expected_triggered_rule
+                      )
+                      AND (
+                        :check_exit_claim_id = FALSE
+                        OR COALESCE(runtime_state_json -> 'backend_protection_state' ->> 'exit_claim_id', '') = :expected_exit_claim_id
+                      )
+                    RETURNING *
+                    """
+                ),
+                {
+                    "strategy_run_id": strategy_run_id,
+                    "protection_state_json": _json_dumps(protection_state),
+                    "expected_generation": expected_generation,
+                    "check_triggered_rule": expected_triggered_rule is not None,
+                    "expected_triggered_rule": expected_triggered_rule or "",
+                    "check_exit_claim_id": expected_exit_claim_id is not None,
+                    "expected_exit_claim_id": expected_exit_claim_id or "",
+                },
+            ).fetchone()
+            db.commit()
+            return self._run_view(row) if row else None
         except Exception:
             db.rollback()
             raise
@@ -632,6 +944,14 @@ class SqlAlchemyAlgoWorkerRepository:
             "closed_at": payload.get("closed_at"),
         }
 
+    def _run_view_with_worker(self, row: Any) -> Dict[str, Any]:
+        payload = self._run_view(row)
+        raw = _row_mapping(row)
+        payload["worker_name"] = raw.get("worker_name")
+        payload["last_heartbeat_at"] = raw.get("last_heartbeat_at")
+        payload["heartbeat_json"] = _json_loads(raw.get("heartbeat_json"), {})
+        return payload
+
 
 def _repo(request: Request) -> Any:
     repository = getattr(request.app.state, "algo_worker_repository", None)
@@ -639,6 +959,54 @@ def _repo(request: Request) -> Any:
         repository = SqlAlchemyAlgoWorkerRepository()
         request.app.state.algo_worker_repository = repository
     return repository
+
+
+def _market_data_service(request: Request) -> WorkerMarketDataService:
+    service = getattr(request.app.state, "worker_market_data_service", None)
+    if service is not None:
+        return service
+    candle_reader = getattr(request.app.state, "worker_candle_data_reader", None)
+    if candle_reader is None:
+        candle_reader = getattr(request.app.state, "algo_worker_candle_reader", None)
+    if candle_reader is None:
+        try:
+            from algo_runtime.snapshot_builder import RedisCandleDataReader
+            from broker_api.candle_aggregator import INTERVAL_SECONDS
+            from broker_api.candle_storage import CandleStorage
+            from broker_api.redis_events import get_redis
+
+            candle_reader = RedisCandleDataReader(
+                redis_client=get_redis(),
+                candle_storage=CandleStorage,
+                interval_seconds=INTERVAL_SECONDS,
+            )
+            request.app.state.algo_worker_candle_reader = candle_reader
+        except Exception:
+            candle_reader = None
+    return WorkerMarketDataService(
+        market_data_runtime=getattr(request.app.state, "market_data_runtime", None),
+        redis=getattr(getattr(request.app.state, "market_data_runtime", None), "redis", None),
+        candle_reader=candle_reader,
+    )
+
+
+def _parse_csv_values(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def _parse_csv_int_values(value: Optional[str], *, field_name: str) -> List[int]:
+    parsed: List[int] = []
+    for item in _parse_csv_values(value):
+        try:
+            numeric = int(item)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail=f"{field_name} must contain comma-separated integers") from None
+        if numeric <= 0 or numeric > 9_999_999_999:
+            raise HTTPException(status_code=422, detail=f"{field_name} contains an out-of-range instrument token")
+        parsed.append(numeric)
+    return parsed
 
 
 def _extract_bearer_token(request: Request) -> str:
@@ -700,6 +1068,43 @@ def _validate_live_run_contract(*, account_scope: str, metadata: Dict[str, Any])
         )
 
 
+def _normalized_backend_protection_runtime_state(payload: Any, *, live: bool) -> Dict[str, Any]:
+    return validate_backend_protection_payload(payload, live=live).to_runtime_state()
+
+
+def _initial_backend_protection_state(protection: Dict[str, Any], *, generation: int = 1, reason: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "status": "active" if protection.get("enabled") else "disabled",
+        "generation": generation,
+        "version": int(protection.get("version") or 1),
+        "update_reason": reason,
+        "updated_at": _utcnow().isoformat(),
+        "last_checked_at": None,
+        "triggered_rule": None,
+        "action": None,
+        "exit_submitted": False,
+        "errors": [],
+    }
+
+
+def _next_backend_protection_for_patch(protection: Dict[str, Any], previous_runtime_state: Dict[str, Any]) -> Dict[str, Any]:
+    previous_config = dict(previous_runtime_state.get("backend_protection") or {})
+    previous_version = _to_int(previous_config.get("version"), default=0)
+    next_protection = dict(protection)
+    next_protection["version"] = max(_to_int(next_protection.get("version"), default=1), previous_version + 1)
+    return next_protection
+
+
+def _preserve_backend_trailing_state(next_state: Dict[str, Any], previous_state: Dict[str, Any]) -> Dict[str, Any]:
+    preserved = dict(next_state)
+    if "best_basket_pnl_pct" in previous_state:
+        preserved["best_basket_pnl_pct"] = previous_state.get("best_basket_pnl_pct")
+    previous_positions = previous_state.get("position_states")
+    if isinstance(previous_positions, dict):
+        preserved["position_states"] = dict(previous_positions)
+    return preserved
+
+
 def _load_live_kite_for_account(account_scope: str):
     broker_user_id = _broker_user_id_from_account_scope(account_scope)
     from broker_api.kite_session import build_kite_client
@@ -753,6 +1158,324 @@ def _inject_live_attribution(order_payload: Dict[str, Any], attribution: Dict[st
     order = dict(order_payload)
     order["attribution"] = dict(attribution)
     return order
+
+
+def _worker_pnl_side(net_quantity: int) -> str:
+    if net_quantity > 0:
+        return "LONG"
+    if net_quantity < 0:
+        return "SHORT"
+    return "FLAT"
+
+
+def _empty_worker_pnl_snapshot(run: Dict[str, Any], *, is_realtime: bool, is_stale: bool = False, updated_at: Optional[str] = None) -> Dict[str, Any]:
+    return WorkerRunPnlSnapshot(
+        strategy_run_id=str(run["strategy_run_id"]),
+        execution_mode=str(run.get("execution_mode") or "dry_run"),
+        status=str(run.get("status") or "open"),
+        currency="INR",
+        totals=WorkerRunPnlTotals(),
+        legs=[],
+        position_count=0,
+        is_realtime=is_realtime,
+        is_stale=is_stale,
+        updated_at=updated_at or _run_updated_at(run) or "1970-01-01T00:00:00+00:00",
+    ).model_dump(mode="json")
+
+
+def _snapshot_signature(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, default=_json_default, separators=(",", ":"))
+
+
+def _run_updated_at(run: Dict[str, Any]) -> Optional[str]:
+    runtime_state = dict(run.get("runtime_state") or {})
+    for key in ("updated_at", "created_at"):
+        value = run.get(key)
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, str) and value.strip():
+            return value
+    for key in ("live_exit_finalized_at", "updated_at"):
+        value = runtime_state.get(key)
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _accumulate_leg_fact(state: Dict[str, Any], *, side: str, quantity: int, price: float, charges: float) -> None:
+    net_quantity = _to_int(state.get("net_quantity"))
+    average_price = _to_float(state.get("average_price"))
+    signed_quantity = quantity if side == "BUY" else -quantity
+
+    state["charges"] = _to_float(state.get("charges")) + charges
+
+    if net_quantity == 0 or (net_quantity > 0 and signed_quantity > 0) or (net_quantity < 0 and signed_quantity < 0):
+        existing_abs = abs(net_quantity)
+        incoming_abs = abs(signed_quantity)
+        combined = existing_abs + incoming_abs
+        state["average_price"] = price if combined == 0 else ((average_price * existing_abs) + (price * incoming_abs)) / combined
+        state["net_quantity"] = net_quantity + signed_quantity
+        return
+
+    closing_quantity = min(abs(net_quantity), abs(signed_quantity))
+    realized_pnl = _to_float(state.get("realized_pnl"))
+    if net_quantity > 0 and signed_quantity < 0:
+        realized_pnl += (price - average_price) * closing_quantity
+    elif net_quantity < 0 and signed_quantity > 0:
+        realized_pnl += (average_price - price) * closing_quantity
+    state["realized_pnl"] = realized_pnl
+
+    remaining_existing = abs(net_quantity) - closing_quantity
+    remaining_incoming = abs(signed_quantity) - closing_quantity
+    if remaining_existing > 0:
+        state["net_quantity"] = remaining_existing if net_quantity > 0 else -remaining_existing
+        state["average_price"] = average_price
+        return
+    if remaining_incoming > 0:
+        state["net_quantity"] = remaining_incoming if signed_quantity > 0 else -remaining_incoming
+        state["average_price"] = price
+        return
+    state["net_quantity"] = 0
+    state["average_price"] = 0.0
+
+
+def _build_live_worker_leg_states(facts: List[Any]) -> Tuple[Dict[Tuple[int, str], Dict[str, Any]], float]:
+    legs: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    total_charges = 0.0
+    ordered_facts = sorted(facts, key=lambda item: (getattr(item, "fill_timestamp", _utcnow()), getattr(item, "id", 0) or 0))
+    for fact in ordered_facts:
+        payload = dict(getattr(fact, "payload", {}) or {})
+        broker_fill = dict(payload.get("broker_fill") or {})
+        instrument_token = _to_int(broker_fill.get("instrument_token"))
+        product = str(broker_fill.get("product") or "")
+        if not instrument_token or not product:
+            continue
+        key = (instrument_token, product)
+        state = legs.setdefault(
+            key,
+            {
+                "instrument_token": instrument_token,
+                "exchange": str(broker_fill.get("exchange") or "") or None,
+                "tradingsymbol": str(broker_fill.get("tradingsymbol") or "") or None,
+                "product": product,
+                "net_quantity": 0,
+                "average_price": 0.0,
+                "realized_pnl": 0.0,
+                "charges": 0.0,
+                "last_fill_at": getattr(fact, "fill_timestamp", None),
+            },
+        )
+        side = str(getattr(fact, "side", "") or "").upper()
+        quantity = _to_int(getattr(fact, "quantity", 0))
+        price = _to_float(getattr(fact, "price", 0.0))
+        fact_charges = _to_float(getattr(fact, "fees_amount", 0.0)) + _to_float(getattr(fact, "taxes_amount", 0.0)) + _to_float(getattr(fact, "slippage_amount", 0.0))
+        total_charges += fact_charges
+        _accumulate_leg_fact(state, side=side, quantity=quantity, price=price, charges=fact_charges)
+        state["last_fill_at"] = getattr(fact, "fill_timestamp", None) or state.get("last_fill_at")
+    return legs, total_charges
+
+
+async def _paper_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) -> Dict[str, Any]:
+    paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
+    if paper_runtime_service is None:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+    summary = await paper_runtime_service.get_strategy_run_pnl(str(run["account_scope"]), str(run["strategy_run_id"]))
+    if summary is None:
+        return _empty_worker_pnl_snapshot(run, is_realtime=True)
+
+    strategy = dict(summary.get("strategy") or {})
+    legs = [
+        WorkerRunPnlLeg(
+            instrument_token=position.get("instrument_token"),
+            exchange=position.get("exchange"),
+            tradingsymbol=position.get("tradingsymbol"),
+            product=position.get("product"),
+            net_quantity=_to_int(position.get("net_quantity")),
+            side=str(position.get("side") or _worker_pnl_side(_to_int(position.get("net_quantity")))),
+            average_price=_to_float(position.get("average_price")),
+            last_price=_to_float(position.get("last_price")),
+            realized_pnl=_to_float(position.get("realized_pnl")),
+            unrealized_pnl=_to_float(position.get("unrealized_pnl")),
+            gross_pnl=_to_float(position.get("realized_pnl")) + _to_float(position.get("unrealized_pnl")),
+            charges=0.0,
+            net_pnl=_to_float(position.get("realized_pnl")) + _to_float(position.get("unrealized_pnl")),
+            is_stale=False,
+        )
+        for position in strategy.get("positions", [])
+        if _to_int(position.get("net_quantity")) != 0
+    ]
+    realized = _to_float(strategy.get("realized_pnl"))
+    unrealized = _to_float(strategy.get("unrealized_pnl"))
+    gross = realized + unrealized
+    updated_at = str(strategy.get("last_updated_at") or strategy.get("last_event_at") or _utcnow().isoformat())
+    return WorkerRunPnlSnapshot(
+        strategy_run_id=str(run["strategy_run_id"]),
+        execution_mode="paper",
+        status=str(strategy.get("status") or run.get("status") or "open"),
+        currency=str(summary.get("currency") or "INR"),
+        totals=WorkerRunPnlTotals(realized_pnl=realized, unrealized_pnl=unrealized, gross_pnl=gross, charges=0.0, net_pnl=gross),
+        legs=legs,
+        position_count=len(legs),
+        is_realtime=True,
+        is_stale=False,
+        updated_at=updated_at,
+    ).model_dump(mode="json")
+
+
+async def _live_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) -> Dict[str, Any]:
+    from journaling.repository import JournalRepository
+
+    strategy_run_id = str(run["strategy_run_id"])
+    account_id = str(run["account_scope"])
+    journal_repository = getattr(request.app.state, "algo_worker_journal_repository", None) or JournalRepository()
+    link = await asyncio.to_thread(journal_repository.find_source_link, source_type="live_order", source_key=strategy_run_id)
+    if link is None:
+        return _empty_worker_pnl_snapshot(run, is_realtime=True)
+
+    facts = await asyncio.to_thread(journal_repository.list_execution_facts, str(link.run_id))
+    live_facts = [fact for fact in facts if str(getattr(fact, "source_type", "")) == "live_fill"]
+    legs_by_key, total_charges = _build_live_worker_leg_states(live_facts)
+
+    realtime_positions = getattr(request.app.state, "algo_worker_realtime_positions_service", None)
+    if realtime_positions is None:
+        from broker_api.order_runtime import realtime_positions_service as realtime_positions
+
+    corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-pnl-{uuid.uuid4()}"
+    positions = await realtime_positions.get_positions(account_id, corr_id)
+    positions_by_leg: Dict[Tuple[int, str], Any] = {}
+    for position in positions.values():
+        positions_by_leg[(int(position.instrument_token), str(position.product))] = position
+
+    rendered_legs: List[WorkerRunPnlLeg] = []
+    unrealized_total = 0.0
+    realized_total = 0.0
+    updated_markers: List[str] = []
+    stale = False
+
+    for key, state in sorted(legs_by_key.items(), key=lambda item: ((item[1].get("exchange") or ""), (item[1].get("tradingsymbol") or ""), (item[1].get("product") or ""))):
+        position = positions_by_leg.get(key)
+        net_quantity = _to_int(state.get("net_quantity"))
+        if position is not None:
+            last_price = _to_float(getattr(position, "last_price", 0.0))
+            broker_net_quantity = _to_int(getattr(position, "quantity", 0))
+            last_reconciled_at = getattr(position, "last_reconciled_at", None)
+            if last_reconciled_at:
+                updated_markers.append(str(last_reconciled_at))
+        else:
+            last_price = 0.0
+            broker_net_quantity = None
+            last_reconciled_at = None
+
+        realized = _to_float(state.get("realized_pnl"))
+        charges = _to_float(state.get("charges"))
+        average_price = _to_float(state.get("average_price"))
+        unrealized = 0.0
+        leg_stale = False
+        if net_quantity != 0:
+            if last_price > 0:
+                unrealized = (last_price - average_price) * net_quantity
+            else:
+                leg_stale = True
+            if broker_net_quantity is None:
+                leg_stale = True
+            elif broker_net_quantity != net_quantity:
+                leg_stale = True
+
+        stale = stale or leg_stale
+        realized_total += realized
+        unrealized_total += unrealized
+        gross = realized + unrealized
+        net = gross - charges
+        rendered_legs.append(
+            WorkerRunPnlLeg(
+                instrument_token=state.get("instrument_token"),
+                exchange=state.get("exchange"),
+                tradingsymbol=state.get("tradingsymbol"),
+                product=state.get("product"),
+                net_quantity=net_quantity,
+                side=_worker_pnl_side(net_quantity),
+                average_price=average_price,
+                last_price=last_price,
+                realized_pnl=realized,
+                unrealized_pnl=unrealized,
+                gross_pnl=gross,
+                charges=charges,
+                net_pnl=net,
+                broker_net_quantity=broker_net_quantity,
+                is_stale=leg_stale,
+                last_reconciled_at=str(last_reconciled_at) if last_reconciled_at else None,
+            )
+        )
+
+    gross_total = realized_total + unrealized_total
+    net_total = gross_total - total_charges
+    if not updated_markers and live_facts:
+        updated_markers = [getattr(live_facts[-1], "fill_timestamp", _utcnow()).isoformat()]
+    updated_at = max(updated_markers) if updated_markers else (_run_updated_at(run) or _utcnow().isoformat())
+    return WorkerRunPnlSnapshot(
+        strategy_run_id=strategy_run_id,
+        execution_mode="live",
+        status=str(run.get("status") or "open"),
+        currency="INR",
+        totals=WorkerRunPnlTotals(
+            realized_pnl=realized_total,
+            unrealized_pnl=unrealized_total,
+            gross_pnl=gross_total,
+            charges=total_charges,
+            net_pnl=net_total,
+        ),
+        legs=[leg for leg in rendered_legs if leg.net_quantity != 0],
+        position_count=len([leg for leg in rendered_legs if leg.net_quantity != 0]),
+        is_realtime=True,
+        is_stale=stale,
+        updated_at=updated_at,
+    ).model_dump(mode="json")
+
+
+async def _build_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) -> Dict[str, Any]:
+    mode = str(run.get("execution_mode") or "").lower()
+    if mode == "dry_run":
+        return _empty_worker_pnl_snapshot(run, is_realtime=False)
+    if mode == "paper":
+        return await _paper_worker_run_pnl_snapshot(request, run)
+    if mode == "live":
+        return await _live_worker_run_pnl_snapshot(request, run)
+    raise HTTPException(status_code=400, detail=f"Unsupported execution mode '{mode}'")
+
+
+async def _worker_run_pnl_stream(request: Request, run: Dict[str, Any], *, interval_seconds: float) -> AsyncGenerator[str, None]:
+    strategy_run_id = str(run["strategy_run_id"])
+    current_run = dict(run)
+    last_signature: Optional[str] = None
+    heartbeat_counter = 0
+    safe_interval = min(5.0, max(0.25, float(interval_seconds or 1.0)))
+    while True:
+        if await request.is_disconnected():
+            break
+        refreshed_run = await _repo(request).get_run(strategy_run_id)
+        if refreshed_run is None:
+            yield "event: end\ndata: {\"detail\": \"Strategy run not found\"}\n\n"
+            break
+        current_run = refreshed_run
+        try:
+            snapshot = await _build_worker_run_pnl_snapshot(request, current_run)
+        except Exception as exc:
+            yield f"event: error\ndata: {json.dumps({'detail': str(exc)})}\n\n"
+            await asyncio.sleep(safe_interval)
+            continue
+        signature = _snapshot_signature(snapshot)
+        if signature != last_signature:
+            yield f"data: {json.dumps(snapshot, default=_json_default)}\n\n"
+            last_signature = signature
+            heartbeat_counter = 0
+        else:
+            heartbeat_counter += 1
+            if heartbeat_counter >= max(1, int(15 / safe_interval)):
+                yield ": heartbeat\n\n"
+                heartbeat_counter = 0
+        await asyncio.sleep(safe_interval)
 
 
 async def _submit_live_worker_intent(*, request: Request, token: WorkerToken, run: Dict[str, Any], payload: WorkerIntentRequest) -> Dict[str, Any]:
@@ -1057,6 +1780,22 @@ async def create_worker_run(request: Request, payload: WorkerRunCreateRequest):
     if payload.execution_mode == "live":
         _validate_live_run_contract(account_scope=payload.account_scope, metadata=payload.metadata)
 
+    runtime_state = dict(payload.runtime_state or {})
+    if "backend_protection" in runtime_state:
+        try:
+            runtime_state["backend_protection"] = _normalized_backend_protection_runtime_state(
+                runtime_state.get("backend_protection"),
+                live=payload.execution_mode == "live",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        runtime_state["backend_protection_state"] = _initial_backend_protection_state(
+            runtime_state["backend_protection"],
+            generation=1,
+            reason="run_create",
+        )
+        payload = payload.model_copy(update={"runtime_state": runtime_state})
+
     strategy_run_id = payload.strategy_run_id or f"run_{uuid.uuid4().hex}"
     return await _repo(request).create_run(token, payload, strategy_run_id=strategy_run_id)
 
@@ -1072,6 +1811,137 @@ async def get_worker_run(request: Request, strategy_run_id: str):
     return run
 
 
+@router.get("/worker/market/instruments/resolve")
+async def resolve_worker_market_ticker(request: Request, symbol: str):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).resolve_ticker(symbol)
+
+
+@router.get("/worker/market/instruments/search")
+async def search_worker_market_tickers(request: Request, query: str, exchange: Optional[str] = None, limit: int = Query(20, ge=1, le=50)):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).search_tickers(query, exchange=exchange, limit=limit)
+
+
+@router.post("/worker/market/instruments/resolve")
+async def resolve_worker_market_tickers(request: Request, payload: WorkerInstrumentResolveRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).resolve_many(symbols=payload.symbols, instrument_tokens=payload.instrument_tokens)
+
+
+@router.post("/worker/market/quotes")
+async def get_worker_market_quotes(request: Request, payload: WorkerQuoteRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).get_quotes(payload)
+
+
+@router.get("/worker/market/ticks/stream")
+async def stream_worker_market_ticks(request: Request, symbols: Optional[str] = None, tokens: Optional[str] = None, mode: str = "quote"):
+    token = await require_worker_token(request)
+    _require_action(token, "market:stream")
+    parsed_symbols = _parse_csv_values(symbols)
+    parsed_tokens = _parse_csv_int_values(tokens, field_name="tokens")
+    return StreamingResponse(
+        _market_data_service(request).stream_ticks(
+            request,
+            token,
+            symbols=parsed_symbols,
+            instrument_tokens=parsed_tokens,
+            mode=mode,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/worker/market/candles")
+async def get_worker_market_candles(
+    request: Request,
+    symbol: Optional[str] = None,
+    instrument_token: Optional[int] = None,
+    interval: str = "5minute",
+    lookback: int = Query(50, ge=1, le=500),
+):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).get_candles(
+        symbol=symbol,
+        instrument_token=instrument_token,
+        interval=interval,
+        lookback=lookback,
+    )
+
+
+@router.get("/worker/market/candles/stream")
+async def stream_worker_market_candles(
+    request: Request,
+    symbol: Optional[str] = None,
+    instrument_token: Optional[int] = None,
+    interval: str = "5minute",
+):
+    token = await require_worker_token(request)
+    _require_action(token, "market:stream")
+    return StreamingResponse(
+        _market_data_service(request).stream_candles(
+            request,
+            symbol=symbol,
+            instrument_token=instrument_token,
+            interval=interval,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/worker/market/snapshot")
+async def get_worker_market_snapshot(request: Request, payload: WorkerMarketSnapshotRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).get_market_snapshot(payload)
+
+
+@router.get("/worker/runs/{strategy_run_id}/pnl")
+async def get_worker_run_pnl(request: Request, strategy_run_id: str):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    return await _build_worker_run_pnl_snapshot(request, run)
+
+
+@router.get("/worker/runs/{strategy_run_id}/pnl/stream")
+async def stream_worker_run_pnl(request: Request, strategy_run_id: str, interval_seconds: float = Query(1.0, ge=0.25, le=5.0)):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    return StreamingResponse(
+        _worker_run_pnl_stream(request, run, interval_seconds=interval_seconds),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.patch("/worker/runs/{strategy_run_id}/risk")
 async def patch_worker_run_risk(request: Request, strategy_run_id: str, payload: WorkerRiskPatchRequest):
     token = await require_worker_token(request)
@@ -1083,6 +1953,56 @@ async def patch_worker_run_risk(request: Request, strategy_run_id: str, payload:
     if run.get("status") in {"closed", "failed"}:
         raise HTTPException(status_code=409, detail="Closed strategy runs cannot be risk-edited")
     return await _repo(request).update_run_risk(strategy_run_id, payload.patch)
+
+
+@router.patch("/worker/runs/{strategy_run_id}/protection")
+async def patch_worker_run_protection(request: Request, strategy_run_id: str, payload: WorkerProtectionPatchRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "risk:update")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    if run.get("status") in {"closed", "failed"}:
+        raise HTTPException(status_code=409, detail="Closed strategy runs cannot be protection-edited")
+
+    runtime_state = dict(run.get("runtime_state") or {})
+    previous_state = dict(runtime_state.get("backend_protection_state") or {})
+    if previous_state.get("exit_submitted"):
+        raise HTTPException(status_code=409, detail="Backend protection cannot be reset after a terminal protection exit")
+    if previous_state.get("exit_claim_id"):
+        raise HTTPException(status_code=409, detail="Backend protection exit is already in progress")
+
+    try:
+        protection = _normalized_backend_protection_runtime_state(
+            payload.backend_protection,
+            live=str(run.get("execution_mode") or "").lower() == "live",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    next_generation = _to_int(previous_state.get("generation"), default=0) + 1
+    protection = _next_backend_protection_for_patch(protection, runtime_state)
+    runtime_state["backend_protection"] = protection
+    next_state = _initial_backend_protection_state(
+        protection,
+        generation=next_generation,
+        reason=payload.reason,
+    )
+    if not payload.reset_trailing:
+        next_state = _preserve_backend_trailing_state(next_state, previous_state)
+    next_state["reset_trailing"] = payload.reset_trailing
+    previous_generation = _to_int(previous_state.get("generation"), default=0)
+    updated = await _repo(request).update_run_backend_protection(
+        strategy_run_id,
+        protection,
+        next_state,
+        expected_generation=previous_generation,
+        expected_triggered_rule=previous_state.get("triggered_rule") or "",
+        expected_exit_claim_id=previous_state.get("exit_claim_id") or "",
+    )
+    if updated is None:
+        raise HTTPException(status_code=409, detail="Backend protection changed concurrently; reload and retry")
+    return updated
 
 
 @router.post("/worker/runs/{strategy_run_id}/intents")

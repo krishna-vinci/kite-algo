@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kite-algo-worker"
+version = "0.2.0"
+description = "Thin Python SDK for external Kite Algo strategy workers"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["requests>=2"]
+
+[project.urls]
+Source = "https://github.com/krishna-vinci/kite-algo"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kite_algo_worker*"]

@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 
 import type { TradingConsoleSnapshot } from "@/features/trading/types";
+import { useControlPlaneSnapshot } from "@/features/trading/hooks/use-control-plane-snapshot";
 import { useLiveBrokerPositions } from "@/features/trading/hooks/use-live-broker-positions";
 import { useMarketwatchQuotes } from "@/features/trading/hooks/use-marketwatch-quotes";
 import { usePaperStrategySummary } from "@/features/trading/hooks/use-paper-strategy-summary";
@@ -23,6 +24,7 @@ export function useTradingConsoleData(): TradingConsoleSnapshot {
   const runtimeQuery = useRuntimeStatusQuery();
   const paperQuery = usePaperStrategySummary();
   const brokerQuery = useLiveBrokerPositions();
+  const controlQuery = useControlPlaneSnapshot();
   const market = useMarketwatchQuotes();
 
   return useMemo(
@@ -45,7 +47,8 @@ export function useTradingConsoleData(): TradingConsoleSnapshot {
         strategies: [],
       },
       broker: brokerQuery.data ?? { positions: [], activeCount: 0 },
+      control: controlQuery.data ?? null,
     }),
-    [brokerQuery.data, market.quotes, paperQuery.data, runtimeQuery.data],
+    [brokerQuery.data, controlQuery.data, market.quotes, paperQuery.data, runtimeQuery.data],
   );
 }

@@ -348,3 +348,74 @@ class InstrumentsRepository:
                 },
             ).mappings().first()
             return dict(row) if row else None
+
+    def get_instrument_by_token(self, instrument_token: int) -> Optional[Dict[str, object]]:
+        try:
+            normalized_token = int(instrument_token)
+        except (TypeError, ValueError):
+            return None
+        if normalized_token <= 0 or normalized_token > 9_999_999_999:
+            return None
+        query = text(
+            """
+            SELECT instrument_token, exchange, tradingsymbol, name, instrument_type,
+                   segment, tick_size, lot_size, expiry, strike
+            FROM kite_instruments
+            WHERE instrument_token = :instrument_token
+            LIMIT 1
+            """
+        )
+        with self._session_scope() as db:
+            row = db.execute(query, {"instrument_token": normalized_token}).mappings().first()
+            return dict(row) if row else None
+
+    def resolve_market_symbol(self, symbol: str) -> Optional[Dict[str, object]]:
+        raw = str(symbol or "").strip().upper()
+        if not raw:
+            return None
+        if raw.isdigit():
+            if len(raw) > 10:
+                return None
+            return self.get_instrument_by_token(int(raw))
+        if ":" not in raw:
+            return None
+        exchange, tradingsymbol = raw.split(":", 1)
+        exchange = exchange.strip()
+        tradingsymbol = tradingsymbol.strip()
+        if not exchange or not tradingsymbol:
+            return None
+        return self.get_instrument_by_exchange_symbol(exchange, tradingsymbol)
+
+    def search_market_instruments(self, query: str, *, exchange: Optional[str] = None, limit: int = 20) -> List[Dict[str, object]]:
+        normalized_text = str(query or "").strip().upper()
+        if not normalized_text:
+            return []
+        normalized_exchange = str(exchange or "").strip().upper() or None
+        safe_limit = max(1, min(int(limit or 20), 50))
+        sql = text(
+            """
+            SELECT instrument_token, exchange, tradingsymbol, name, instrument_type,
+                   segment, tick_size, lot_size, expiry, strike
+            FROM kite_instruments
+            WHERE (:exchange IS NULL OR exchange = :exchange)
+              AND (
+                upper(tradingsymbol) LIKE :query
+                OR upper(coalesce(name, '')) LIKE :query
+              )
+            ORDER BY
+              CASE WHEN upper(tradingsymbol) = :exact_query THEN 0 ELSE 1 END,
+              tradingsymbol ASC
+            LIMIT :limit
+            """
+        )
+        with self._session_scope() as db:
+            rows = db.execute(
+                sql,
+                {
+                    "query": f"%{normalized_text}%",
+                    "exact_query": normalized_text,
+                    "exchange": normalized_exchange,
+                    "limit": safe_limit,
+                },
+            ).mappings().all()
+            return [dict(row) for row in rows]

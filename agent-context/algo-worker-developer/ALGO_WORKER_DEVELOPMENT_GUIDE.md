@@ -100,10 +100,9 @@ All strategy activity should happen under one stable `strategy_run_id` per strat
 3. `place_order(...)` or `place_basket(...)` with explicit idempotency keys for every intent.
 4. `patch_risk(...)` whenever stops, targets, model thresholds, or exposure controls change.
 5. `heartbeat(...)` from long-running workers.
-6. `resolve_ticker(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, or `stream_candles(...)` for runtime-backed market data.
-7. `get_run(...)` after restarts, mutations, and exits.
-8. `get_run_pnl(...)` or `stream_run_pnl(...)` for grouped realtime run P&L.
-9. `exit_run(...)` to close the grouped strategy run.
+6. `get_run(...)` after restarts, mutations, and exits.
+7. `get_run_pnl(...)` or `stream_run_pnl(...)` for grouped realtime run P&L.
+8. `exit_run(...)` to close the grouped strategy run.
 
 The SDK maps to public endpoints only:
 
@@ -115,87 +114,13 @@ The SDK maps to public endpoints only:
 | `get_run(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}` |
 | `get_run_pnl(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/pnl` |
 | `stream_run_pnl(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/pnl/stream` |
-| `resolve_ticker(...)` / `search_tickers(...)` | `/api/algo-workers/worker/market/instruments/*` |
-| `get_quotes(...)` / `stream_ticks(...)` | `POST /api/algo-workers/worker/market/quotes`, `GET /api/algo-workers/worker/market/ticks/stream` |
-| `get_candles(...)` / `stream_candles(...)` | `/api/algo-workers/worker/market/candles*` |
-| `get_market_snapshot(...)` | `POST /api/algo-workers/worker/market/snapshot` |
 | `place_order(...)` / `place_basket(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/intents` |
 | `patch_risk(...)` | `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/risk` |
-| `update_backend_protection(...)` | `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/protection` |
 | `exit_run(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/exit` |
-
-## Backend-owned exposure protection
-
-If a worker wants the backend to enforce position, basket, stale-worker, or MIS squareoff protection, send a declarative `BackendProtection` contract during `create_run(...)` or later with `update_backend_protection(...)`.
-
-Current V1 protection exits the attributed strategy through the backend control-plane exit path when a declared rule triggers. Position rules are still useful for leg-specific thresholds, but the submitted safety action is conservative strategy exit until a broker-safe leg-only exit primitive is added.
-
-```python
-from kite_algo_worker import BackendProtection, BasketProtection, OperationalProtection, ProtectedPosition
-
-protection = BackendProtection(
-    positions=[
-        ProtectedPosition(
-            symbol="NSE:INFY",
-            product="CNC",
-            side="BUY",
-            quantity=1,
-            entry_price=1500,
-            stoploss_pct=2,
-        )
-    ],
-    basket=BasketProtection(stoploss_pct=4, trailing_activate_pct=3, trailing_drawdown_pct=1),
-    operations=OperationalProtection(exit_on_worker_stale=True, worker_stale_sec=300, mis_squareoff_buffer_sec=60),
-)
-
-client.create_run(
-    strategy_run_id=run_id,
-    template_id="mean-reversion",
-    account_scope="kite:paper-a",
-    execution_mode="paper",
-    backend_protection=protection,
-)
-```
-
-Keep this contract small and explicit. The worker still owns strategy decisions; the backend only owns enforcement. Validation is strict: product must be `CNC`/`MIS`/`NRML`, side must be `BUY`/`SELL`, quantities and entry prices must be positive, stale-worker limits must be `30..86400`, MIS buffer must be `0..3600`, and enabled protection must contain at least one rules object.
-
-## Runtime-backed market data
-
-External workers can consume market data through the worker API/SDK. The backend remains the facade and the Go market-runtime remains the broker websocket owner.
-
-Use the SDK for ticker resolution, quote snapshots, tick streams, candle snapshots, candle streams, and combined market snapshots:
-
-```python
-instrument = client.resolve_ticker("NSE:INFY")
-quotes = client.get_quotes(["NSE:INFY"], mode="quote")
-candles = client.get_candles("NSE:INFY", interval="5minute", lookback=50)
-
-for event in client.stream_ticks(["NSE:INFY"], mode="quote"):
-    for tick in event.get("ticks", []):
-        print(tick["last_price"])
-```
-
-The worker market-data contract is intentionally generic. It supports non-option realtime strategies without adding option-chain strategy logic to the base worker layer. Option-chain helpers, expiry/strike selection, Greeks, IV, and spread builders should be added later in a namespaced options layer inside the same SDK package.
-
-Workers must not connect to broker websockets, read Redis, query market-data tables, or manage market-runtime owner leases directly.
-
-## Worker disconnects and restart recovery
-
-External workers own strategy decisions. If a worker goes offline, new decisions stop. Existing broker orders and positions remain active, and the backend still owns fill ingestion, live position projection, grouped P&L, accounting, and grouped exits when requested.
-
-Production workers should be restart-safe:
-
-1. Persist or deterministically derive the same `strategy_run_id`.
-2. On startup, call `get_run(...)` and `get_run_pnl(...)`.
-3. Rebuild indicator state from `get_candles(...)` or `get_market_snapshot(...)`.
-4. Reconnect `stream_ticks(...)`, `stream_candles(...)`, and/or `stream_run_pnl(...)`.
-5. Resume decisions only after the recovered backend state is understood.
-
-Do not assume the backend will auto-exit positions when a worker disconnects. Emergency failover policies such as `observe_only`, `cancel_open_orders`, `exit_positions`, or backend hard-stop enforcement should be explicit future safety features.
 
 ## Realtime run P&L
 
-The worker API now supports grouped run-level P&L snapshots and an SSE stream.
+The worker API supports grouped run-level P&L snapshots and an SSE stream.
 
 Use:
 
@@ -206,61 +131,12 @@ for update in client.stream_run_pnl(run_id, interval_seconds=1.0):
     print(update["totals"]["net_pnl"])
 ```
 
-The payload is grouped by `strategy_run_id` and keeps paper and live P&L separated.
-
-Response shape:
-
-```json
-{
-  "strategy_run_id": "run_mean_reversion_20260425_001",
-  "execution_mode": "live",
-  "status": "open",
-  "currency": "INR",
-  "totals": {
-    "realized_pnl": 1250.0,
-    "unrealized_pnl": -180.0,
-    "gross_pnl": 1070.0,
-    "charges": 42.5,
-    "net_pnl": 1027.5
-  },
-  "legs": [
-    {
-      "instrument_token": 408065,
-      "exchange": "NSE",
-      "tradingsymbol": "INFY",
-      "product": "CNC",
-      "net_quantity": 1,
-      "side": "LONG",
-      "average_price": 1450.0,
-      "last_price": 1462.0,
-      "realized_pnl": 0.0,
-      "unrealized_pnl": 12.0,
-      "gross_pnl": 12.0,
-      "charges": 0.0,
-      "net_pnl": 12.0,
-      "broker_net_quantity": 1,
-      "is_stale": false,
-      "last_reconciled_at": "2026-04-25T12:34:56Z"
-    }
-  ],
-  "position_count": 1,
-  "is_realtime": true,
-  "is_stale": false,
-  "updated_at": "2026-04-25T12:34:56Z"
-}
-```
-
-Mode behavior:
-
-- `dry_run`: returns zero totals and no legs.
-- `paper`: returns grouped paper run P&L and grouped paper legs.
-- `live`: returns grouped attributed live run P&L with charges and live-leg breakdown.
-
 Important notes:
 
-- The backend is the source of truth for grouped P&L.
-- Live broker/manual activity stays separate unless safely attributed.
-- `is_stale=true` means the backend could not fully confirm live leg mark coverage or broker quantity alignment for one or more open legs.
+- `dry_run` returns zero totals and no legs.
+- `paper` returns grouped paper run P&L and grouped paper legs.
+- `live` returns grouped attributed live run P&L with charges and live-leg breakdown.
+- `is_stale=true` means the backend could not fully confirm one or more live leg marks/coverage.
 
 ## Execution modes: dry_run vs paper vs live
 
