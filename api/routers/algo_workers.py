@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
@@ -2045,6 +2045,32 @@ async def get_worker_market_candles(
         instrument_token=instrument_token,
         interval=interval,
         lookback=lookback,
+    )
+
+
+@router.get("/worker/market/history")
+async def get_worker_market_history(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    symbol: Optional[str] = None,
+    instrument_token: Optional[int] = None,
+    timeframe: str = "day",
+    from_ts: Optional[datetime] = Query(None, alias="from"),
+    to_ts: Optional[datetime] = Query(None, alias="to"),
+    ingest: bool = True,
+    passthrough: bool = False,
+):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    return await _market_data_service(request).get_historical_candles(
+        symbol=symbol,
+        instrument_token=instrument_token,
+        timeframe=timeframe,
+        from_date=from_ts,
+        to_date=to_ts,
+        ingest=ingest,
+        passthrough=passthrough,
+        background_tasks=background_tasks,
     )
 
 

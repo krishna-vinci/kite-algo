@@ -267,6 +267,38 @@ def test_get_candles_uses_symbol_endpoint(captured_requests):
     }
 
 
+def test_get_historical_candles_uses_worker_history_endpoint(captured_requests):
+    client().get_historical_candles(
+        "NSE:INFY",
+        timeframe="day",
+        from_date="2024-01-01T00:00:00Z",
+        to_date="2024-12-31T00:00:00Z",
+        ingest=True,
+        passthrough=True,
+    )
+
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/market/history"
+    assert captured_requests[0]["kwargs"]["params"] == {
+        "timeframe": "day",
+        "ingest": True,
+        "passthrough": True,
+        "symbol": "NSE:INFY",
+        "from": "2024-01-01T00:00:00Z",
+        "to": "2024-12-31T00:00:00Z",
+    }
+
+
+def test_get_historical_candles_accepts_token(captured_requests):
+    client().get_historical_candles(408065, timeframe="5minute", ingest=False)
+
+    assert captured_requests[0]["kwargs"]["params"] == {
+        "timeframe": "5minute",
+        "ingest": False,
+        "passthrough": False,
+        "instrument_token": 408065,
+    }
+
+
 def test_get_market_snapshot_uses_expected_endpoint(captured_requests):
     client().get_market_snapshot(
         symbols=["NSE:INFY"],

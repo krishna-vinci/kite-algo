@@ -1,7 +1,7 @@
 # pyright: reportArgumentType=false
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -19,6 +19,7 @@ from api.routers.algo_workers import (  # noqa: E402
     WorkerMarketSnapshotRequest,
     WorkerQuoteRequest,
     get_worker_market_candles,
+    get_worker_market_history,
     get_worker_run_pnl,
     get_worker_funds,
     get_worker_run_funds,
@@ -505,6 +506,181 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         response = await service.get_candles(symbol="NSE:INFY", interval="5minute", lookback=50)
 
         self.assertTrue(response["is_stale"])
+
+    async def test_worker_market_history_forwards_passthrough_request(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        captured = {}
+        request.app.state.worker_market_data_service = SimpleNamespace(
+            get_historical_candles=AsyncMock(
+                side_effect=lambda **kwargs: captured.update(kwargs)
+                or {
+                    "symbol": "NSE:INFY",
+                    "instrument_token": 408065,
+                    "timeframe": "day",
+                    "candles": [],
+                    "ingestion": {"status": "disabled"},
+                    "source": "kite_passthrough",
+                }
+            )
+        )
+
+        response = await get_worker_market_history(
+            request,
+            SimpleNamespace(add_task=lambda *args, **kwargs: None),
+            symbol="NSE:INFY",
+            instrument_token=None,
+            timeframe="day",
+            from_ts=datetime.fromisoformat("2024-01-01T00:00:00+00:00"),
+            to_ts=datetime.fromisoformat("2024-12-31T00:00:00+00:00"),
+            ingest=True,
+            passthrough=True,
+        )
+
+        self.assertEqual(response["source"], "kite_passthrough")
+        self.assertEqual(captured["symbol"], "NSE:INFY")
+        self.assertEqual(captured["timeframe"], "day")
+        self.assertTrue(captured["ingest"])
+        self.assertTrue(captured["passthrough"])
+
+    async def test_worker_market_history_passthrough_treats_naive_kite_dates_as_ist(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            )
+        )
+
+        class FakeIngestion:
+            def __init__(self, kite):
+                self.kite = kite
+
+            async def fetch_raw_records(self, instrument_token, interval, from_date, to_date):
+                return [
+                    {
+                        "date": datetime(2024, 1, 1, 9, 15),
+                        "open": 100,
+                        "high": 101,
+                        "low": 99,
+                        "close": 100.5,
+                        "volume": 10,
+                    }
+                ]
+
+        with patch("api.worker_market_data.WorkerMarketDataService._get_system_kite_client", AsyncMock(return_value=object())):
+            with patch("broker_api.candle_ingestion.CandleIngestion", FakeIngestion):
+                response = await service.get_historical_candles(
+                    symbol="NSE:INFY",
+                    timeframe="day",
+                    from_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    to_date=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                    passthrough=True,
+                )
+
+        self.assertEqual(response["candles"][0]["ts"], "2024-01-01T09:15:00+05:30")
+
+    async def test_worker_market_history_rejects_unbounded_passthrough_range(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            )
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            await service.get_historical_candles(
+                symbol="NSE:INFY",
+                timeframe="day",
+                from_date=datetime(2010, 1, 1, tzinfo=timezone.utc),
+                to_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                passthrough=True,
+            )
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("passthrough", ctx.exception.detail)
+
+    async def test_worker_market_history_rejects_naive_request_window(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            )
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            await service.get_historical_candles(
+                symbol="NSE:INFY",
+                timeframe="day",
+                from_date=datetime(2024, 1, 1),
+                to_date=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                passthrough=False,
+                ingest=False,
+            )
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("timezone", ctx.exception.detail)
+
+    async def test_worker_market_history_db_failure_returns_503(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            )
+        )
+
+        with patch("broker_api.candle_storage.CandleStorage.query_candles", side_effect=RuntimeError("db down")):
+            with self.assertRaises(HTTPException) as ctx:
+                await service.get_historical_candles(
+                    symbol="NSE:INFY",
+                    timeframe="day",
+                    from_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    to_date=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                    passthrough=False,
+                    ingest=False,
+                )
+
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertIn("storage query failed", ctx.exception.detail)
 
     async def test_worker_market_candle_stream_requires_market_stream_action(self):
         token = WorkerToken(

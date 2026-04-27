@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-04-25
+Last updated: 2026-04-26
 
 ## Scope
 
@@ -11,6 +11,7 @@ Do not use this file for frontend work.
 
 ## Recently completed
 
+- Fixed headless Kite Connect login for newly switched broker accounts that land on Zerodha's app authorization page before returning a `request_token`
 - Centralized Kite session handling in `broker_api/kite_session.py`
 - Stopped returning broker `access_token` from login responses
 - Hardened headless broker login and startup token rotation
@@ -165,6 +166,14 @@ Do not use this file for frontend work.
   - worker endpoints now expose ticker resolution/search, quote snapshots, tick SSE streams, candle snapshots, candle SSE streams, and combined market snapshot bundles under `/api/algo-workers/worker/market/*`
   - SDK methods now wrap those endpoints so external workers can build non-option realtime strategies without broker websockets, Redis access, database access, or backend internals
   - option-chain discovery, strike/expiry selection, Greeks/IV, and spread builders are explicitly deferred to a later namespaced option worker layer inside the same SDK package
+- Added worker-safe funds and run-allocation snapshots:
+  - `/api/algo-workers/worker/funds` returns account funds from paper runtime or broker margins through the backend-controlled live Kite session
+  - `/api/algo-workers/worker/runs/{strategy_run_id}/funds` adds derived run exposure/P&L and optional allocation-cap remaining calculations for worker position sizing
+  - SDK methods `get_funds()` and `get_run_funds()` expose these snapshots without letting workers call broker APIs directly
+- Added worker-safe historical candle access for investing/positional strategies:
+  - `/api/algo-workers/worker/market/history` wraps the existing robust backend candle facade under worker auth
+  - SDK method `get_historical_candles()` supports symbol/token lookup, timeframe ranges, backend background ingestion, and deliberate Kite passthrough via the backend-controlled system session
+  - realtime worker market streams remain SSE-based (`stream_ticks`, `stream_candles`, `stream_run_pnl`), not raw WebSocket connections from workers
 
 ## Skill usage
 

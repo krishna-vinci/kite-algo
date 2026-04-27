@@ -169,6 +169,27 @@ class KiteAlgoWorkerClient:
     def get_current_candle(self, instrument: str | int, interval: str = "5minute") -> Optional[JsonDict]:
         return self.get_candles(instrument, interval=interval, lookback=1).get("current")
 
+    def get_historical_candles(
+        self,
+        instrument: str | int,
+        timeframe: str = "day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        ingest: bool = True,
+        passthrough: bool = False,
+    ) -> JsonDict:
+        params: JsonDict = {"timeframe": timeframe, "ingest": ingest, "passthrough": passthrough}
+        instrument_value = str(instrument).strip()
+        if isinstance(instrument, int) or instrument_value.isdigit():
+            params["instrument_token"] = int(instrument_value)
+        else:
+            params["symbol"] = instrument_value
+        if from_date is not None:
+            params["from"] = from_date
+        if to_date is not None:
+            params["to"] = to_date
+        return self._request("GET", "/worker/market/history", params=params)
+
     def stream_candles(self, instrument: str | int, interval: str = "5minute") -> Iterator[JsonDict]:
         params: JsonDict = {"interval": interval}
         instrument_value = str(instrument).strip()
