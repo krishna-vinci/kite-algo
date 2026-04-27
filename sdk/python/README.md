@@ -10,14 +10,14 @@ Recommended for remote strategy servers:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
 ```
 
 Pin to an immutable tag in production. Avoid installing from a moving branch such as `main` on live strategy servers.
@@ -33,8 +33,8 @@ python3 -m pip install -e /path/to/kite-algo/sdk/python
 After the SDK changes are committed and pushed, create and push a tag from the repository root:
 
 ```bash
-git tag -a kite-algo-worker-v0.3.0 -m "kite-algo-worker v0.3.0"
-git push origin kite-algo-worker-v0.3.0
+git tag -a kite-algo-worker-v0.4.0 -m "kite-algo-worker v0.4.0"
+git push origin kite-algo-worker-v0.4.0
 ```
 
 Then remote servers can install the exact SDK version using the Git-tag install command above.
@@ -157,6 +157,14 @@ The SDK exposes worker-safe market-data helpers backed by Kite Algo's Go market-
 instrument = client.resolve_ticker("NSE:INFY")
 quotes = client.get_quotes(["NSE:INFY"], mode="quote")
 candles = client.get_candles("NSE:INFY", interval="5minute", lookback=50)
+history = client.get_historical_candles(
+    "NSE:INFY",
+    timeframe="day",
+    from_date="2024-01-01T00:00:00Z",
+    to_date="2024-12-31T00:00:00Z",
+    ingest=True,
+    passthrough=False,
+)
 
 for event in client.stream_ticks(["NSE:INFY"], mode="quote"):
     for tick in event.get("ticks", []):
@@ -171,9 +179,12 @@ Available helpers:
 - `stream_ticks([...], mode="quote")`
 - `get_candles(symbol_or_token, interval="5minute", lookback=50)`
 - `get_current_candle(symbol_or_token, interval="5minute")`
+- `get_historical_candles(symbol_or_token, timeframe="day", from_date=None, to_date=None, ingest=True, passthrough=False)`
 - `stream_candles(symbol_or_token, interval="5minute")`
 - `get_market_snapshot(...)`
 
-If a worker stops, strategy decisions stop. Existing broker orders and positions remain with broker/backend accounting. Restart workers with the same `strategy_run_id`, call `get_run`, call `get_run_pnl`, rebuild local indicator state from candles, and reconnect streams.
+`get_historical_candles(...)` uses the backend candle facade. With `ingest=True`, the backend can trigger background ingestion for missing DB ranges. With `passthrough=True`, the backend fetches directly from Kite through the controlled system session for fresh historical data. Workers still never call Kite or the database directly.
+
+If a worker stops, strategy decisions stop. Existing broker orders and positions remain with broker/backend accounting. Restart workers with the same `strategy_run_id`, call `get_run`, call `get_run_pnl`, rebuild local indicator state from historical candles, and reconnect SSE streams.
 
 Options-specific helpers are intentionally deferred to a later `kite_algo_worker.options` layer inside the same SDK package.

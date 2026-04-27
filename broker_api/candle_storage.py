@@ -139,7 +139,8 @@ class CandleStorage:
         interval: str,
         from_ts: datetime,
         to_ts: datetime,
-        include_oi: bool = False
+        include_oi: bool = False,
+        raise_errors: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Query candles from database for a given time range.
@@ -190,6 +191,8 @@ class CandleStorage:
                 
         except Exception as e:
             logger.error(f"Failed to query candles for {instrument_token}|{interval}: {e}", exc_info=True)
+            if raise_errors:
+                raise
             return []
         finally:
             if conn:

@@ -19,23 +19,23 @@ Once the SDK changes are committed and tagged, remote servers can install the ex
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
 ```
 
-Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.3.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
+Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.4.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
 
 Create the tag from the repository root after committing the SDK:
 
 ```bash
-git tag -a kite-algo-worker-v0.3.0 -m "kite-algo-worker v0.3.0"
-git push origin kite-algo-worker-v0.3.0
+git tag -a kite-algo-worker-v0.4.0 -m "kite-algo-worker v0.4.0"
+git push origin kite-algo-worker-v0.4.0
 ```
 
 ### Local development install
@@ -100,7 +100,7 @@ All strategy activity should happen under one stable `strategy_run_id` per strat
 3. `place_order(...)` or `place_basket(...)` with explicit idempotency keys for every intent.
 4. `patch_risk(...)` whenever stops, targets, model thresholds, or exposure controls change.
 5. `heartbeat(...)` from long-running workers.
-6. `resolve_ticker(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, or `stream_candles(...)` for runtime-backed market data.
+6. `resolve_ticker(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `get_historical_candles(...)`, or `stream_candles(...)` for backend-owned market data.
 7. `get_run(...)` after restarts, mutations, and exits.
 8. `get_funds(...)` or `get_run_funds(...)` before sizing entries.
 9. `get_run_pnl(...)` or `stream_run_pnl(...)` for grouped realtime run P&L.
@@ -121,6 +121,7 @@ The SDK maps to public endpoints only:
 | `resolve_ticker(...)` / `search_tickers(...)` | `/api/algo-workers/worker/market/instruments/*` |
 | `get_quotes(...)` / `stream_ticks(...)` | `POST /api/algo-workers/worker/market/quotes`, `GET /api/algo-workers/worker/market/ticks/stream` |
 | `get_candles(...)` / `stream_candles(...)` | `/api/algo-workers/worker/market/candles*` |
+| `get_historical_candles(...)` | `GET /api/algo-workers/worker/market/history` |
 | `get_market_snapshot(...)` | `POST /api/algo-workers/worker/market/snapshot` |
 | `place_order(...)` / `place_basket(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/intents` |
 | `patch_risk(...)` | `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/risk` |
@@ -172,13 +173,23 @@ Use the SDK for ticker resolution, quote snapshots, tick streams, candle snapsho
 instrument = client.resolve_ticker("NSE:INFY")
 quotes = client.get_quotes(["NSE:INFY"], mode="quote")
 candles = client.get_candles("NSE:INFY", interval="5minute", lookback=50)
+history = client.get_historical_candles(
+    "NSE:INFY",
+    timeframe="day",
+    from_date="2024-01-01T00:00:00Z",
+    to_date="2024-12-31T00:00:00Z",
+    ingest=True,
+    passthrough=False,
+)
 
 for event in client.stream_ticks(["NSE:INFY"], mode="quote"):
     for tick in event.get("ticks", []):
         print(tick["last_price"])
 ```
 
-The worker market-data contract is intentionally generic. It supports non-option realtime strategies without adding option-chain strategy logic to the base worker layer. Option-chain helpers, expiry/strike selection, Greeks, IV, and spread builders should be added later in a namespaced options layer inside the same SDK package.
+`get_historical_candles(...)` uses the backend candle facade. With `ingest=True`, the backend may trigger background ingestion for missing DB ranges. With `passthrough=True`, the backend fetches directly from Kite through its controlled system session and returns normalized candles. Use passthrough deliberately because it consumes broker historical-data quota.
+
+The worker market-data contract is intentionally generic. It supports non-option realtime and investing/positional strategies without adding option-chain strategy logic to the base worker layer. Option-chain helpers, expiry/strike selection, Greeks, IV, and spread builders should be added later in a namespaced options layer inside the same SDK package.
 
 Workers must not connect to broker websockets, read Redis, query market-data tables, or manage market-runtime owner leases directly.
 
@@ -190,7 +201,7 @@ Production workers should be restart-safe:
 
 1. Persist or deterministically derive the same `strategy_run_id`.
 2. On startup, call `get_run(...)` and `get_run_pnl(...)`.
-3. Rebuild indicator state from `get_candles(...)` or `get_market_snapshot(...)`.
+3. Rebuild indicator state from `get_historical_candles(...)`, `get_candles(...)`, or `get_market_snapshot(...)`.
 4. Reconnect `stream_ticks(...)`, `stream_candles(...)`, and/or `stream_run_pnl(...)`.
 5. Resume decisions only after the recovered backend state is understood.
 

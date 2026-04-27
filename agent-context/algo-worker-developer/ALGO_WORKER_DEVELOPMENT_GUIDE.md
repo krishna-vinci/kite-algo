@@ -19,23 +19,23 @@ Once the SDK changes are committed and tagged, remote servers can install the ex
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.3.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
 ```
 
-Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.3.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
+Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.4.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
 
 Create the tag from the repository root after committing the SDK:
 
 ```bash
-git tag -a kite-algo-worker-v0.3.0 -m "kite-algo-worker v0.3.0"
-git push origin kite-algo-worker-v0.3.0
+git tag -a kite-algo-worker-v0.4.0 -m "kite-algo-worker v0.4.0"
+git push origin kite-algo-worker-v0.4.0
 ```
 
 ### Local development install
@@ -100,9 +100,11 @@ All strategy activity should happen under one stable `strategy_run_id` per strat
 3. `place_order(...)` or `place_basket(...)` with explicit idempotency keys for every intent.
 4. `patch_risk(...)` whenever stops, targets, model thresholds, or exposure controls change.
 5. `heartbeat(...)` from long-running workers.
-6. `get_run(...)` after restarts, mutations, and exits.
-7. `get_run_pnl(...)` or `stream_run_pnl(...)` for grouped realtime run P&L.
-8. `exit_run(...)` to close the grouped strategy run.
+6. `resolve_ticker(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `get_historical_candles(...)`, or `stream_candles(...)` for backend-owned market data.
+7. `get_run(...)` after restarts, mutations, and exits.
+8. `get_funds(...)` or `get_run_funds(...)` before sizing entries.
+9. `get_run_pnl(...)` or `stream_run_pnl(...)` for grouped realtime run P&L.
+10. `exit_run(...)` to close the grouped strategy run.
 
 The SDK maps to public endpoints only:
 
@@ -112,8 +114,15 @@ The SDK maps to public endpoints only:
 | `heartbeat(...)` | `POST /api/algo-workers/worker/heartbeat` |
 | `create_run(...)` | `POST /api/algo-workers/worker/runs` |
 | `get_run(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}` |
+| `get_funds(...)` | `GET /api/algo-workers/worker/funds` |
+| `get_run_funds(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/funds` |
 | `get_run_pnl(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/pnl` |
 | `stream_run_pnl(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/pnl/stream` |
+| `resolve_ticker(...)` / `search_tickers(...)` | `/api/algo-workers/worker/market/instruments/*` |
+| `get_quotes(...)` / `stream_ticks(...)` | `POST /api/algo-workers/worker/market/quotes`, `GET /api/algo-workers/worker/market/ticks/stream` |
+| `get_candles(...)` / `stream_candles(...)` | `/api/algo-workers/worker/market/candles*` |
+| `get_historical_candles(...)` | `GET /api/algo-workers/worker/market/history` |
+| `get_market_snapshot(...)` | `POST /api/algo-workers/worker/market/snapshot` |
 | `place_order(...)` / `place_basket(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/intents` |
 | `patch_risk(...)` | `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/risk` |
 | `exit_run(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/exit` |

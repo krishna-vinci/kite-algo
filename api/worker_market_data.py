@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional
 
 from fastapi import HTTPException, Request
@@ -18,6 +18,53 @@ from broker_api.market_runtime_client import RUNTIME_TICKS_CHANNEL
 VALID_MARKET_MODES = {"ltp", "quote", "full"}
 DEFAULT_TICK_STALE_MS = 15_000
 MAX_INSTRUMENT_TOKEN = 9_999_999_999
+MAX_HISTORY_DAYS_BY_INTERVAL = {
+    "minute": 90,
+    "3minute": 180,
+    "5minute": 180,
+    "10minute": 240,
+    "15minute": 365,
+    "30minute": 365,
+    "60minute": 730,
+    "day": 3650,
+}
+MAX_PASSTHROUGH_HISTORY_DAYS_BY_INTERVAL = {
+    "minute": 60,
+    "3minute": 100,
+    "5minute": 100,
+    "10minute": 100,
+    "15minute": 200,
+    "30minute": 200,
+    "60minute": 400,
+    "day": 2000,
+}
+TIMEFRAME_ALIASES = {
+    "1m": "minute",
+    "min": "minute",
+    "minute": "minute",
+    "3m": "3minute",
+    "3minute": "3minute",
+    "5m": "5minute",
+    "5minute": "5minute",
+    "10m": "10minute",
+    "10minute": "10minute",
+    "15m": "15minute",
+    "15minute": "15minute",
+    "30m": "30minute",
+    "30minute": "30minute",
+    "60m": "60minute",
+    "1h": "60minute",
+    "60minute": "60minute",
+    "1d": "day",
+    "day": "day",
+}
+
+
+def normalize_timeframe(value: str) -> str:
+    canonical = TIMEFRAME_ALIASES.get(str(value or "").strip().lower())
+    if not canonical:
+        raise HTTPException(status_code=400, detail=f"Invalid timeframe '{value}'")
+    return canonical
 
 
 def utcnow() -> datetime:
@@ -212,6 +259,168 @@ class WorkerMarketDataService:
             "is_stale": not candles and current is None,
         }
 
+    async def get_historical_candles(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        instrument_token: Optional[int] = None,
+        timeframe: str = "day",
+        from_date: Optional[datetime] = None,
+        to_date: Optional[datetime] = None,
+        ingest: bool = True,
+        passthrough: bool = False,
+        background_tasks: Any = None,
+    ) -> Dict[str, Any]:
+        """Return historical candles through the backend-owned candle facade.
+
+        This deliberately wraps the app's robust candle storage/ingestion path instead
+        of letting external workers call broker APIs or database internals directly.
+        """
+
+        from broker_api.candle_ingestion import CandleIngestion
+        from broker_api.candle_storage import CandleStorage, IST
+
+        instrument = await self._resolve_one(symbol=symbol, instrument_token=instrument_token)
+        interval = normalize_timeframe(timeframe)
+        to_utc = to_date or utcnow()
+        if to_utc.tzinfo is None:
+            raise HTTPException(status_code=422, detail="to must include timezone information")
+        to_utc = to_utc.astimezone(timezone.utc)
+
+        if from_date is None:
+            lookback_days = {
+                "minute": 7,
+                "3minute": 14,
+                "5minute": 30,
+                "10minute": 45,
+                "15minute": 60,
+                "30minute": 90,
+                "60minute": 180,
+                "day": 365,
+            }
+            from_utc = to_utc - timedelta(days=lookback_days.get(interval, 30))
+        else:
+            if from_date.tzinfo is None:
+                raise HTTPException(status_code=422, detail="from must include timezone information")
+            from_utc = from_date
+            from_utc = from_utc.astimezone(timezone.utc)
+
+        if from_utc >= to_utc:
+            raise HTTPException(status_code=422, detail="from must be earlier than to")
+
+        span_days = (to_utc - from_utc).total_seconds() / 86400
+        max_days = (
+            MAX_PASSTHROUGH_HISTORY_DAYS_BY_INTERVAL if passthrough else MAX_HISTORY_DAYS_BY_INTERVAL
+        ).get(interval, 30)
+        if span_days > max_days:
+            raise HTTPException(
+                status_code=422,
+                detail=f"historical range for {interval} is limited to {max_days} days{' in passthrough mode' if passthrough else ''}",
+            )
+
+        ingestion = {"status": "disabled", "message": None}
+        raw_candles: List[Any]
+        source = "historical_db"
+
+        if passthrough:
+            kite = await self._get_system_kite_client()
+            ingestion_service = CandleIngestion(kite)
+            records = await ingestion_service.fetch_raw_records(
+                int(instrument["instrument_token"]),
+                interval,
+                from_utc,
+                to_utc,
+            )
+            raw_candles = [
+                {
+                    "ts": self._normalize_kite_history_ts(rec.get("date"), IST),
+                    "open": rec.get("open"),
+                    "high": rec.get("high"),
+                    "low": rec.get("low"),
+                    "close": rec.get("close"),
+                    "volume": rec.get("volume", 0) or 0,
+                    "oi": rec.get("oi"),
+                }
+                for rec in records
+            ]
+            source = "kite_passthrough"
+        else:
+            if ingest:
+                try:
+                    kite = await self._get_system_kite_client()
+                    ingestion_service = CandleIngestion(kite)
+                    if background_tasks is not None:
+                        background_tasks.add_task(
+                            ingestion_service.ingest_historical_data,
+                            int(instrument["instrument_token"]),
+                            interval,
+                            from_utc,
+                            to_utc,
+                            force_refresh=False,
+                        )
+                    else:
+                        asyncio.create_task(
+                            ingestion_service.ingest_historical_data(
+                                int(instrument["instrument_token"]),
+                                interval,
+                                from_utc,
+                                to_utc,
+                                force_refresh=False,
+                            )
+                        )
+                    ingestion = {"status": "triggered", "message": "Background ingestion started"}
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    ingestion = {"status": "error", "message": str(exc)}
+
+            try:
+                raw_candles = await asyncio.to_thread(
+                    CandleStorage.query_candles,
+                    int(instrument["instrument_token"]),
+                    interval,
+                    from_utc,
+                    to_utc,
+                    include_oi=True,
+                    raise_errors=True,
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail=f"historical candle storage query failed: {exc}") from exc
+
+            if ingest and raw_candles and ingestion["status"] == "triggered":
+                latest_ts = raw_candles[-1].get("ts") if isinstance(raw_candles[-1], dict) else None
+                latest = parse_iso(latest_ts)
+                interval_seconds = {
+                    "minute": 60,
+                    "3minute": 180,
+                    "5minute": 300,
+                    "10minute": 600,
+                    "15minute": 900,
+                    "30minute": 1800,
+                    "60minute": 3600,
+                    "day": 86400,
+                }
+                if latest is not None and (to_utc - latest.astimezone(timezone.utc)).total_seconds() < interval_seconds.get(interval, 300) * 2:
+                    ingestion = {"status": "up_to_date", "message": "Data is current"}
+
+        candles = [
+            normalized
+            for item in raw_candles
+            if (normalized := self._normalize_candle(item, is_complete=True)) is not None
+        ]
+        return {
+            "symbol": instrument["symbol"],
+            "instrument_token": instrument["instrument_token"],
+            "timeframe": interval,
+            "interval": interval,
+            "from": from_utc.astimezone(IST).isoformat(),
+            "to": to_utc.astimezone(IST).isoformat(),
+            "count": len(candles),
+            "source": source,
+            "ingestion": ingestion,
+            "candles": candles,
+        }
+
     async def stream_candles(
         self,
         request: Request,
@@ -378,6 +587,16 @@ class WorkerMarketDataService:
             return await value
         return value
 
+    async def _get_system_kite_client(self) -> Any:
+        from broker_api.candles_api import get_kite_db
+        from database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            return await get_kite_db(db)
+        finally:
+            db.close()
+
     def _unpack_candle_series(self, raw: Any) -> tuple[List[Any], Any]:
         if isinstance(raw, dict):
             candles = raw.get("candles") or raw.get("history") or raw.get("items") or []
@@ -390,6 +609,15 @@ class WorkerMarketDataService:
         if isinstance(raw, (list, tuple)):
             return list(raw), None
         return [], None
+
+    def _normalize_kite_history_ts(self, value: Any, ist_tz: Any) -> Any:
+        if not isinstance(value, datetime):
+            return value
+        if value.tzinfo is None:
+            if hasattr(ist_tz, "localize"):
+                return ist_tz.localize(value)
+            return value.replace(tzinfo=ist_tz)
+        return value
 
     def _normalize_candle(self, candle: Any, *, is_complete: bool) -> Optional[Dict[str, Any]]:
         if candle is None:
