@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
@@ -21,6 +21,7 @@ from api.worker_market_data import (
     WorkerMarketDataService,
     WorkerMarketSnapshotRequest,
     WorkerQuoteRequest,
+    normalize_instrument_token,
 )
 from auth_service import require_app_user
 from database import SessionLocal
@@ -202,6 +203,44 @@ class WorkerExitRequest(BaseModel):
     reason: Optional[str] = None
     idempotency_key: Optional[str] = None
     dry_run: bool = False
+
+
+class WorkerOrderActionRequest(BaseModel):
+    strategy_run_id: str = Field(min_length=1)
+    variety: str = "regular"
+    parent_order_id: Optional[str] = None
+
+
+class WorkerOrderModifyRequest(WorkerOrderActionRequest):
+    order_type: Optional[str] = None
+    price: Optional[float] = None
+    trigger_price: Optional[float] = None
+    quantity: Optional[int] = Field(None, gt=0)
+    validity: Optional[str] = None
+    validity_ttl: Optional[int] = None
+
+    def to_modify_request(self) -> Any:
+        from broker_api.kite_orders import ModifyOrderRequest
+
+        return ModifyOrderRequest.model_validate(
+            self.model_dump(
+                exclude_none=True,
+                exclude={"strategy_run_id", "variety", "parent_order_id"},
+            )
+        )
+
+
+class WorkerOrderPreviewRequest(BaseModel):
+    order: Dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkerBasketPreviewRequest(BaseModel):
+    orders: List[Dict[str, Any]] = Field(default_factory=list)
+    all_or_none: bool = False
+    idempotency_key: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkerRunPnlTotals(BaseModel):
@@ -976,7 +1015,7 @@ class SqlAlchemyAlgoWorkerRepository:
         return payload
 
 
-def _repo(request: Request) -> Any:
+def _repo(request: Any) -> Any:
     repository = getattr(request.app.state, "algo_worker_repository", None)
     if repository is None:
         repository = SqlAlchemyAlgoWorkerRepository()
@@ -984,7 +1023,7 @@ def _repo(request: Request) -> Any:
     return repository
 
 
-def _market_data_service(request: Request) -> WorkerMarketDataService:
+def _market_data_service(request: Any) -> WorkerMarketDataService:
     service = getattr(request.app.state, "worker_market_data_service", None)
     if service is not None:
         return service
@@ -1040,6 +1079,13 @@ def _extract_bearer_token(request: Request) -> str:
     return token.strip()
 
 
+def _extract_ws_token(websocket: WebSocket) -> str:
+    token = str(websocket.query_params.get("token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Worker websocket token required")
+    return token
+
+
 async def require_worker_token(request: Request) -> WorkerToken:
     raw_token = _extract_bearer_token(request)
     repository = _repo(request)
@@ -1050,6 +1096,76 @@ async def require_worker_token(request: Request) -> WorkerToken:
         raise HTTPException(status_code=401, detail="Worker token expired")
     await repository.touch_token(token.token_id)
     return token
+
+
+async def require_worker_ws_token(websocket: WebSocket) -> WorkerToken:
+    raw_token = _extract_ws_token(websocket)
+    repository = _repo(websocket)
+    token = await repository.get_token_by_hash(_hash_token(raw_token))
+    if token is None or token.status != "active":
+        raise HTTPException(status_code=401, detail="Invalid worker token")
+    if token.expires_at and token.expires_at <= _utcnow():
+        raise HTTPException(status_code=401, detail="Worker token expired")
+    await repository.touch_token(token.token_id)
+    return token
+
+
+def _serialize_model(value: Any) -> Dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return dict(value)
+
+
+def _payload_matches_strategy_run(payload: Dict[str, Any], strategy_run_id: str) -> bool:
+    if str(payload.get("strategy_run_id") or "") == strategy_run_id:
+        return True
+    attribution = payload.get("attribution")
+    if isinstance(attribution, dict) and str(attribution.get("strategy_run_id") or "") == strategy_run_id:
+        return True
+    meta = payload.get("meta")
+    if isinstance(meta, dict) and str(meta.get("strategy_run_id") or "") == strategy_run_id:
+        return True
+    return False
+
+
+async def _websocket_is_disconnected(websocket: WebSocket) -> bool:
+    state = getattr(websocket, "client_state", None)
+    if state is not None and str(getattr(state, "name", state)).upper() == "DISCONNECTED":
+        return True
+    return False
+
+
+async def _worker_run_pnl_stream_ws(websocket: WebSocket, run: Dict[str, Any], *, interval_seconds: float) -> AsyncGenerator[tuple[str, Dict[str, Any]], None]:
+    strategy_run_id = str(run["strategy_run_id"])
+    current_run = dict(run)
+    last_signature: Optional[str] = None
+    heartbeat_counter = 0
+    safe_interval = min(5.0, max(0.25, float(interval_seconds or 1.0)))
+    while True:
+        if await _websocket_is_disconnected(websocket):
+            break
+        refreshed_run = await _repo(websocket).get_run(strategy_run_id)
+        if refreshed_run is None:
+            yield "end", {"detail": "Strategy run not found"}
+            break
+        current_run = refreshed_run
+        try:
+            snapshot = await _build_worker_run_pnl_snapshot(websocket, current_run)
+        except Exception as exc:
+            yield "error", {"detail": str(exc)}
+            await asyncio.sleep(safe_interval)
+            continue
+        signature = _snapshot_signature(snapshot)
+        if signature != last_signature:
+            yield "snapshot", snapshot
+            last_signature = signature
+            heartbeat_counter = 0
+        else:
+            heartbeat_counter += 1
+            if heartbeat_counter >= max(1, int(15 / safe_interval)):
+                yield "heartbeat", {"strategy_run_id": strategy_run_id}
+                heartbeat_counter = 0
+        await asyncio.sleep(safe_interval)
 
 
 def _require_action(token: WorkerToken, action: str) -> None:
@@ -1602,7 +1718,7 @@ async def _live_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) -
     ).model_dump(mode="json")
 
 
-async def _build_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) -> Dict[str, Any]:
+async def _build_worker_run_pnl_snapshot(request: Any, run: Dict[str, Any]) -> Dict[str, Any]:
     mode = str(run.get("execution_mode") or "").lower()
     if mode == "dry_run":
         return _empty_worker_pnl_snapshot(run, is_realtime=False)
@@ -1879,6 +1995,11 @@ def _assert_run_access(token: WorkerToken, run: Dict[str, Any]) -> None:
         raise HTTPException(status_code=403, detail="Worker token cannot access this account scope")
     if token.allowed_templates and run.get("template_id") not in token.allowed_templates:
         raise HTTPException(status_code=403, detail="Worker token cannot access this strategy template")
+
+
+def _require_live_run(run: Dict[str, Any], *, feature: str) -> None:
+    if str(run.get("execution_mode") or "").lower() != "live":
+        raise HTTPException(status_code=409, detail=f"{feature} is only supported for live runs")
 
 
 @router.post("/tokens", response_model=WorkerTokenCreateResponse)
@@ -2229,6 +2350,164 @@ async def patch_worker_run_protection(request: Request, strategy_run_id: str, pa
     return updated
 
 
+@router.get("/worker/orders")
+async def list_worker_orders(request: Request, strategy_run_id: str):
+    from broker_api.kite_orders import OrdersService
+
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    _require_live_run(run, feature="Order inspection")
+    kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
+    corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-orders-{uuid.uuid4()}"
+    orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+    orders = await asyncio.to_thread(orders_service.orders, kite, corr_id)
+    serialized = [_serialize_model(order) for order in orders]
+    filtered = [order for order in serialized if _payload_matches_strategy_run(order, strategy_run_id)]
+    return {"strategy_run_id": strategy_run_id, "orders": filtered}
+
+
+@router.get("/worker/trades")
+async def list_worker_trades(request: Request, strategy_run_id: str):
+    from broker_api.kite_orders import OrdersService
+
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    _require_live_run(run, feature="Trade inspection")
+    kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
+    corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-trades-{uuid.uuid4()}"
+    orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+    trades = await asyncio.to_thread(orders_service.trades, kite, corr_id)
+    serialized = [_serialize_model(trade) for trade in trades]
+    filtered = [trade for trade in serialized if _payload_matches_strategy_run(trade, strategy_run_id)]
+    return {"strategy_run_id": strategy_run_id, "trades": filtered}
+
+
+@router.post("/worker/orders/{order_id}/cancel")
+async def cancel_worker_order(request: Request, order_id: str, payload: WorkerOrderActionRequest):
+    from broker_api.kite_orders import OrdersService
+
+    token = await require_worker_token(request)
+    _require_action(token, "intents:submit")
+    run = await _repo(request).get_run(payload.strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    _require_live_run(run, feature="Order cancellation")
+    kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
+    corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-cancel-{uuid.uuid4()}"
+    orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+    result = await orders_service.cancel_order(
+        kite,
+        payload.variety or "regular",
+        order_id,
+        corr_id,
+        parent_order_id=payload.parent_order_id,
+    )
+    return {"strategy_run_id": payload.strategy_run_id, "order_id": order_id, "result": _serialize_model(result)}
+
+
+@router.post("/worker/orders/{order_id}/modify")
+async def modify_worker_order(request: Request, order_id: str, payload: WorkerOrderModifyRequest):
+    from broker_api.kite_orders import OrdersService
+
+    token = await require_worker_token(request)
+    _require_action(token, "intents:submit")
+    run = await _repo(request).get_run(payload.strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    _require_live_run(run, feature="Order modification")
+    kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
+    corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-modify-{uuid.uuid4()}"
+    orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+    result = await orders_service.modify_order(
+        kite,
+        payload.variety or "regular",
+        order_id,
+        payload.to_modify_request(),
+        corr_id,
+        parent_order_id=payload.parent_order_id,
+    )
+    return {"strategy_run_id": payload.strategy_run_id, "order_id": order_id, "result": _serialize_model(result)}
+
+
+@router.post("/worker/runs/{strategy_run_id}/preview/order")
+async def preview_worker_order(request: Request, strategy_run_id: str, payload: WorkerOrderPreviewRequest):
+    from broker_api.kite_orders import OrdersService, PlaceOrderRequest
+    from execution_accounting.kite_costs import build_live_order_cost_contract
+
+    token = await require_worker_token(request)
+    _require_action(token, "intents:submit")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    if str(run.get("execution_mode") or "").lower() != "live":
+        raise HTTPException(status_code=409, detail="Order preview is only required for live runs")
+
+    kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
+    order_payload = dict(payload.order or {})
+    attribution = _live_attribution_for_worker_intent(
+        token=token,
+        run=run,
+        request=WorkerIntentRequest(
+            intent_type="place_order",
+            idempotency_key=payload.idempotency_key or f"preview:{strategy_run_id}",
+            payload={},
+            metadata=payload.metadata or {},
+        ),
+    )
+    req = PlaceOrderRequest.model_validate(_inject_live_attribution(order_payload, attribution))
+    orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+    cost_contract = build_live_order_cost_contract(
+        kite=kite,
+        orders_service=orders_service,
+        order=req.model_dump(exclude_none=True),
+        corr_id=f"preview-{strategy_run_id}",
+    )
+    return {
+        "strategy_run_id": strategy_run_id,
+        "mode": "live",
+        "preview": {
+            "intent_type": "place_order",
+            "order": req.model_dump(mode="json", exclude_none=True),
+            "cost_contract": cost_contract.journal_payload(),
+        },
+    }
+
+
+@router.post("/worker/runs/{strategy_run_id}/preview/basket")
+async def preview_worker_basket(request: Request, strategy_run_id: str, payload: WorkerBasketPreviewRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "intents:submit")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    if str(run.get("execution_mode") or "").lower() != "live":
+        raise HTTPException(status_code=409, detail="Basket preview is only required for live runs")
+    preview = await _submit_live_worker_intent(
+        request=request,
+        token=token,
+        run=run,
+        payload=WorkerIntentRequest(
+            intent_type="place_basket",
+            idempotency_key=payload.idempotency_key or f"preview:{strategy_run_id}:basket",
+            payload={"basket": {"orders": payload.orders, "all_or_none": payload.all_or_none, "dry_run": True}},
+            metadata=payload.metadata or {},
+        ),
+    )
+    return {"strategy_run_id": strategy_run_id, "mode": "live", "preview": preview}
+
+
 @router.post("/worker/runs/{strategy_run_id}/intents")
 async def submit_worker_intent(request: Request, strategy_run_id: str, payload: WorkerIntentRequest):
     token = await require_worker_token(request)
@@ -2317,3 +2596,59 @@ async def exit_worker_run(request: Request, strategy_run_id: str, payload: Worke
     result = await paper_runtime_service.exit_strategy(account_scope=str(run["account_scope"]), strategy_id=strategy_run_id)
     updated = await _repo(request).update_run_status(strategy_run_id, "closed", state_patch={"exit_result": result, "exit_reason": payload.reason})
     return {"mode": "paper", "status": "closed", "result": result, "run": updated}
+
+
+@router.websocket("/worker/ws/market/ticks")
+async def worker_ticks_ws(websocket: WebSocket):
+    token = await require_worker_ws_token(websocket)
+    _require_action(token, "market:stream")
+    await websocket.accept()
+    symbols = _parse_csv_values(websocket.query_params.get("symbols"))
+    instrument_tokens = _parse_csv_int_values(websocket.query_params.get("tokens"), field_name="tokens")
+    mode = websocket.query_params.get("mode") or "quote"
+    async for event, payload in _market_data_service(websocket).stream_ticks_ws(
+        websocket,
+        token,
+        symbols=symbols,
+        instrument_tokens=instrument_tokens,
+        mode=mode,
+    ):
+        await websocket.send_json({"event": event, "data": payload})
+
+
+@router.websocket("/worker/ws/market/candles")
+async def worker_candles_ws(websocket: WebSocket):
+    token = await require_worker_ws_token(websocket)
+    _require_action(token, "market:stream")
+    await websocket.accept()
+    instrument_token_param = websocket.query_params.get("instrument_token")
+    instrument_token = normalize_instrument_token(instrument_token_param) if instrument_token_param else None
+    async for event, payload in _market_data_service(websocket).stream_candles_ws(
+        websocket,
+        symbol=websocket.query_params.get("symbol"),
+        instrument_token=instrument_token,
+        interval=websocket.query_params.get("interval") or "5minute",
+    ):
+        await websocket.send_json({"event": event, "data": payload})
+
+
+@router.websocket("/worker/ws/runs/{strategy_run_id}/pnl")
+async def worker_run_pnl_ws(websocket: WebSocket, strategy_run_id: str):
+    token = await require_worker_ws_token(websocket)
+    _require_action(token, "runs:read")
+    run = await _repo(websocket).get_run(strategy_run_id)
+    if run is None:
+        await websocket.close(code=4404)
+        return
+    _assert_run_access(token, run)
+    try:
+        interval_seconds = float(websocket.query_params.get("interval_seconds") or "1.0")
+    except (TypeError, ValueError):
+        await websocket.close(code=4400)
+        return
+    if interval_seconds < 0.25 or interval_seconds > 5.0:
+        await websocket.close(code=4400)
+        return
+    await websocket.accept()
+    async for event, payload in _worker_run_pnl_stream_ws(websocket, run, interval_seconds=interval_seconds):
+        await websocket.send_json({"event": event, "data": payload})

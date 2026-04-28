@@ -36,12 +36,19 @@ If this context pack and the canonical files disagree, trust the canonical files
 ## Current SDK release
 
 - Package name: `kite-algo-worker`
-- Version: `0.4.0`
-- Git tag: `kite-algo-worker-v0.4.0`
+- Version: `0.5.0`
+- Git tag: `kite-algo-worker-v0.5.0`
 
 Remote install:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.5.0#subdirectory=sdk/python"
+
+This release adds:
+
+- grouped order/trade inspection and order lifecycle helpers
+- live order/basket preview APIs for sizing and charges checks
+- async SDK support plus websocket clients for ticks, candles, and grouped run P&L
+- safer worker ergonomics such as `ensure_run(...)`, `wait_for_history(...)`, and `live_equity_market_order(...)`
 ```

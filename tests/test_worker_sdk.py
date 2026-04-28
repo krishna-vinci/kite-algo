@@ -14,18 +14,28 @@ if str(SDK_ROOT) not in sys.path:
 
 from kite_algo_worker import (  # noqa: E402
     AlgoWorkerConfig,
+    BrokerValidationError,
     BackendProtection,
     BasketProtection,
+    CostContract,
+    OrderPreview,
     KiteAlgoWorkerClient,
     KiteAlgoWorkerError,
+    PreviewPayload,
     OperationalProtection,
     ProtectedPosition,
+    RunProtectionState,
+    WorkerOrderResult,
+    amo_limit_order,
     equity_market_order,
+    ensure_run,
     limit_order,
     market_order,
+    live_equity_market_order,
     option_market_order,
     sl_m_order,
     sl_order,
+    wait_for_history,
 )
 from broker_api.kite_orders import PlaceOrderRequest  # noqa: E402
 
@@ -500,3 +510,78 @@ def test_order_builders_produce_valid_broker_order_payloads():
     for payload in [equity, option, limit, stop_limit, slm]:
         validated = PlaceOrderRequest.model_validate(payload)
         assert validated.tradingsymbol == payload["tradingsymbol"]
+
+
+def test_typed_models_and_exception_hierarchy():
+    preview = OrderPreview.model_validate(
+        {
+            "strategy_run_id": "run-1",
+            "mode": "live",
+            "preview": {
+                "intent_type": "place_order",
+                "cost_contract": {"margin_required": "10.00", "charges_estimate": "2.50"},
+            },
+        }
+    )
+    assert preview.preview.cost_contract.margin_required == "10.00"
+    assert preview.preview.cost_contract.charges_estimate == "2.50"
+
+    order_result = WorkerOrderResult.model_validate({"mode": "paper", "result": {"status": "filled", "order": {"order_id": "PAPER-1"}}})
+    assert order_result.result["order"]["order_id"].startswith("PAPER-")
+
+    state = RunProtectionState.model_validate({"status": "active", "generation": 2})
+    assert state.status == "active"
+    assert state.generation == 2
+
+    err = BrokerValidationError("bad order", status_code=422, response_body={"detail": "bad order"})
+    assert isinstance(err, KiteAlgoWorkerError)
+    assert err.status_code == 422
+
+
+def test_sync_client_order_lifecycle_and_preview_endpoints(captured_requests):
+    client().list_orders("run-1")
+    client().list_trades("run-1")
+    client().cancel_order("run-1", "order-1")
+    client().modify_order("run-1", "order-1", {"quantity": 2}, variety="amo")
+    client().preview_order("run-1", market_order("NSE", "INFY", "BUY", "CNC", 1))
+    client().preview_basket("run-1", [market_order("NSE", "INFY", "BUY", "CNC", 1)], metadata={"source": "test"}, all_or_none=True)
+
+    assert captured_requests[0]["kwargs"]["params"] == {"strategy_run_id": "run-1"}
+    assert captured_requests[1]["kwargs"]["params"] == {"strategy_run_id": "run-1"}
+    assert captured_requests[2]["kwargs"]["json"] == {"strategy_run_id": "run-1", "variety": "regular"}
+    assert captured_requests[3]["kwargs"]["json"] == {"strategy_run_id": "run-1", "variety": "amo", "quantity": 2}
+    assert captured_requests[4]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/preview/order"
+    assert captured_requests[5]["kwargs"]["json"] == {
+        "orders": [market_order("NSE", "INFY", "BUY", "CNC", 1)],
+        "metadata": {"source": "test"},
+        "all_or_none": True,
+    }
+
+
+def test_get_run_protection_state_returns_runtime_state_fragment(monkeypatch):
+    monkeypatch.setattr(KiteAlgoWorkerClient, "get_run", lambda self, run_id: {"runtime_state": {"backend_protection_state": {"status": "active", "generation": 2}}})
+    assert client().get_run_protection_state("run-1") == {"status": "active", "generation": 2}
+
+
+def test_helper_layer_builds_safe_orders_and_recovers_runs(monkeypatch):
+    order = live_equity_market_order("IDEA", "BUY", 1, product="MIS")
+    amo = amo_limit_order("NSE", "IDEA", "BUY", "MIS", 1, price=9.8)
+    assert order["market_protection"] == -1
+    assert order["exchange"] == "NSE"
+    assert amo["variety"] == "amo"
+    assert amo["price"] == 9.8
+
+    responses = [
+        {"candles": []},
+        {"candles": [{"ts": "2026-04-28T00:00:00Z"}]},
+    ]
+    monkeypatch.setattr(KiteAlgoWorkerClient, "get_historical_candles", lambda *args, **kwargs: responses.pop(0))
+    assert wait_for_history(client(), "NSE:IDEA", timeframe="day", attempts=2, sleep_seconds=0)["candles"]
+
+    def _missing_run(self, run_id):
+        raise KiteAlgoWorkerError("missing", status_code=404, response_body={"detail": "missing"})
+
+    monkeypatch.setattr(KiteAlgoWorkerClient, "get_run", _missing_run)
+    monkeypatch.setattr(KiteAlgoWorkerClient, "create_run", lambda self, **kwargs: {"created": kwargs})
+    created = ensure_run(client(), strategy_run_id="run-2", template_id="mean-reversion", account_scope="kite:paper-a", execution_mode="paper", metadata={"x": 1})
+    assert created["created"]["strategy_run_id"] == "run-2"

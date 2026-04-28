@@ -6,9 +6,17 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
+
+
+SDK_ROOT = Path(__file__).resolve().parents[1] / "sdk" / "python"
+if str(SDK_ROOT) not in sys.path:
+    sys.path.insert(0, str(SDK_ROOT))
+
+from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, ensure_run, live_equity_market_order  # noqa: E402
 
 
 def _env(name: str, default: Optional[str] = None) -> str:
@@ -73,6 +81,16 @@ def _ensure_run(api: WorkerApi, *, run_id: str, account_scope: str, mode: str, t
     )
 
 
+def _sdk_client() -> KiteAlgoWorkerClient:
+    return KiteAlgoWorkerClient(
+        AlgoWorkerConfig(
+            base_url=_env("KITE_ALGO_API_BASE", "http://localhost:8000"),
+            token=_env("KITE_ALGO_WORKER_TOKEN"),
+            timeout=float(os.environ.get("KITE_ALGO_TIMEOUT", "20")),
+        )
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate Kite Algo worker dry-run/live execution wiring.")
     parser.add_argument("--mode", choices=["dry_run", "live"], default=os.environ.get("KITE_ALGO_E2E_MODE", "dry_run"))
@@ -84,6 +102,7 @@ def main() -> int:
         raise SystemExit("Live mode requires --place-live-order and KITE_ALGO_CONFIRM_LIVE=YES.")
 
     api = WorkerApi(base_url=_env("KITE_ALGO_API_BASE", "http://localhost:8000"), token=_env("KITE_ALGO_WORKER_TOKEN"))
+    client = _sdk_client()
     account_scope = _env("KITE_ALGO_ACCOUNT_SCOPE")
     run_id = os.environ.get("KITE_ALGO_RUN_ID") or f"run_live_e2e_{int(time.time())}"
     template_id = os.environ.get("KITE_ALGO_TEMPLATE_ID", "live-worker-e2e")
@@ -91,21 +110,35 @@ def main() -> int:
     symbol = os.environ.get("KITE_ALGO_E2E_SYMBOL", "INFY")
     product = os.environ.get("KITE_ALGO_E2E_PRODUCT", "CNC")
     quantity = int(os.environ.get("KITE_ALGO_E2E_QUANTITY", "1"))
+    transaction_type = os.environ.get("KITE_ALGO_E2E_TRANSACTION_TYPE", "BUY").strip().upper()
 
     _print_step("health", api.request("GET", "/api/algo-workers/worker/health"))
-    run = _ensure_run(api, run_id=run_id, account_scope=account_scope, mode=args.mode, template_id=template_id)
+    run = ensure_run(
+        client,
+        strategy_run_id=run_id,
+        template_id=template_id,
+        account_scope=account_scope,
+        execution_mode=args.mode,
+        metadata={
+            "strategy_family": "indicator_strategy",
+            "strategy_name": "Live Worker E2E Validation",
+            "entry_surface": "external_algo_worker_validation",
+        },
+    ) if args.mode == "live" else _ensure_run(api, run_id=run_id, account_scope=account_scope, mode=args.mode, template_id=template_id)
     _print_step("run", run)
 
-    order = {
-        "exchange": exchange,
-        "tradingsymbol": symbol,
-        "transaction_type": "BUY",
-        "variety": "regular",
-        "product": product,
-        "order_type": "MARKET",
-        "quantity": quantity,
-        "validity": "DAY",
-    }
+    order = live_equity_market_order(
+        symbol,
+        transaction_type,
+        quantity,
+        product=product,
+        exchange=exchange,
+        market_protection=int(os.environ.get("KITE_ALGO_E2E_MARKET_PROTECTION", "-1")),
+    )
+    preview = client.preview_order(run_id, order, metadata={"validation": True, "script": "scripts/live_worker_e2e_validation.py"}) if args.mode == "live" else None
+    if preview is not None:
+        _print_step("entry_preview", preview)
+
     intent = api.request(
         "POST",
         f"/api/algo-workers/worker/runs/{run_id}/intents",

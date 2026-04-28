@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-04-26
+Last updated: 2026-04-28
 
 ## Scope
 
@@ -174,6 +174,12 @@ Do not use this file for frontend work.
   - `/api/algo-workers/worker/market/history` wraps the existing robust backend candle facade under worker auth
   - SDK method `get_historical_candles()` supports symbol/token lookup, timeframe ranges, backend background ingestion, and deliberate Kite passthrough via the backend-controlled system session
   - realtime worker market streams remain SSE-based (`stream_ticks`, `stream_candles`, `stream_run_pnl`), not raw WebSocket connections from workers
+- Extended the algo-worker API and Python SDK core refresh:
+  - added worker order lifecycle routes for grouped live order/trade inspection plus cancel/modify actions under worker auth
+  - added worker preview routes for live order margin/charges inspection and dry-run basket previews
+  - added worker websocket routes for tick streams, candle streams, and grouped run P&L streams with worker-token auth and stream-specific permission checks
+  - refreshed the Python SDK with typed exceptions/models, sync order lifecycle + preview methods, an async client, websocket clients, and helper ergonomics such as `ensure_run(...)`, `wait_for_history(...)`, and `live_equity_market_order(...)`
+  - updated the worker development guide and added `scripts/sdk_worker_certification.py` for lightweight worker SDK certification checks
 
 ## Skill usage
 

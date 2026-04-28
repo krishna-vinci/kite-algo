@@ -19,23 +19,23 @@ Once the SDK changes are committed and tagged, remote servers can install the ex
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.5.0#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.5.0#subdirectory=sdk/python"
 ```
 
-Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.4.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
+Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.5.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
 
 Create the tag from the repository root after committing the SDK:
 
 ```bash
-git tag -a kite-algo-worker-v0.4.0 -m "kite-algo-worker v0.4.0"
-git push origin kite-algo-worker-v0.4.0
+git tag -a kite-algo-worker-v0.5.0 -m "kite-algo-worker v0.5.0"
+git push origin kite-algo-worker-v0.5.0
 ```
 
 ### Local development install
@@ -55,23 +55,23 @@ export PYTHONPATH="$PWD/sdk/python:$PYTHONPATH"
 Minimal worker:
 
 ```python
-from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, equity_market_order
+from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, ensure_run, live_equity_market_order
 
 client = KiteAlgoWorkerClient(AlgoWorkerConfig(
     base_url="http://localhost:8000",
     token="kwa_...",
 ))
 
-run = client.create_run(
+run = ensure_run(
+    client,
     strategy_run_id="run_mean_reversion_20260425_001",
     template_id="mean-reversion",
     account_scope="kite:paper-a",
     execution_mode="paper",
-    runtime_state={"risk": {"stop_loss_pct": 1.2}},
     metadata={"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
 )
 
-order = equity_market_order("INFY", "BUY", 1)
+order = live_equity_market_order("INFY", "BUY", 1)
 client.place_order(run["strategy_run_id"], order, "run_mean_reversion_20260425_001:entry:001")
 ```
 
@@ -100,7 +100,7 @@ All strategy activity should happen under one stable `strategy_run_id` per strat
 3. `place_order(...)` or `place_basket(...)` with explicit idempotency keys for every intent.
 4. `patch_risk(...)` whenever stops, targets, model thresholds, or exposure controls change.
 5. `heartbeat(...)` from long-running workers.
-6. `resolve_ticker(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `get_historical_candles(...)`, or `stream_candles(...)` for backend-owned market data.
+6. `resolve_ticker(...)`, `get_quotes(...)`, `get_candles(...)`, `get_historical_candles(...)`, `wait_for_history(...)`, websocket streams, or SSE streams for backend-owned market data.
 7. `get_run(...)` after restarts, mutations, and exits.
 8. `get_funds(...)` or `get_run_funds(...)` before sizing entries.
 9. `get_run_pnl(...)` or `stream_run_pnl(...)` for grouped realtime run P&L.
@@ -114,6 +114,8 @@ The SDK maps to public endpoints only:
 | `heartbeat(...)` | `POST /api/algo-workers/worker/heartbeat` |
 | `create_run(...)` | `POST /api/algo-workers/worker/runs` |
 | `get_run(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}` |
+| `list_orders(strategy_run_id)` / `list_trades(strategy_run_id)` | `GET /api/algo-workers/worker/orders`, `GET /api/algo-workers/worker/trades` |
+| `preview_order(...)` / `preview_basket(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/preview/*` |
 | `get_funds(...)` | `GET /api/algo-workers/worker/funds` |
 | `get_run_funds(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/funds` |
 | `get_run_pnl(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/pnl` |
@@ -185,6 +187,17 @@ history = client.get_historical_candles(
 for event in client.stream_ticks(["NSE:INFY"], mode="quote"):
     for tick in event.get("ticks", []):
         print(tick["last_price"])
+```
+
+For new worker code, prefer the websocket SDK clients for ticks, candles, and grouped run P&L instead of building ad hoc SSE loops:
+
+```python
+from kite_algo_worker import WorkerWebSocketClient
+
+ws = WorkerWebSocketClient(base_url="ws://localhost:8000", token="kwa_...")
+
+async with ws.stream(symbols=["NSE:INFY"], mode="quote") as stream:
+    event = await stream.recv()
 ```
 
 `get_historical_candles(...)` uses the backend candle facade. With `ingest=True`, the backend may trigger background ingestion for missing DB ranges. With `passthrough=True`, the backend fetches directly from Kite through its controlled system session and returns normalized candles. Use passthrough deliberately because it consumes broker historical-data quota.
@@ -312,6 +325,15 @@ if remaining is not None and remaining < required_notional:
 - Places real broker orders only when the worker token explicitly allows `live`, the run uses a real broker account scope such as `kite:AB1234`, and live metadata is present.
 - Proves broker order placement, fills, margin/charges, and live journaling only after real validation.
 - Keep live enablement environment-gated in worker code. The repository also includes `scripts/live_worker_e2e_validation.py` for explicit live validation.
+- Use `live_equity_market_order(...)` so `market_protection` is explicit on market entries.
+- Use `preview_order(...)` and `preview_basket(...)` before live worker-side sizing decisions.
+
+## Recommended startup helpers
+
+- `ensure_run(...)` avoids duplicate run creation when a worker restarts.
+- `wait_for_history(...)` smooths over first-run history ingestion delays by polling until candles appear.
+- `get_run_protection_state(...)` exposes the backend protection generation/state fragment directly from `runtime_state.backend_protection_state`.
+- `list_orders(...)` and `list_trades(...)` give grouped run lifecycle visibility without direct broker API access.
 
 ## Strategy run metadata
 

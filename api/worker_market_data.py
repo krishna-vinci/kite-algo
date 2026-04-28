@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, WebSocket
 from pydantic import BaseModel, Field, field_validator
 
 from algo_runtime.models import CandleSeriesSpec
@@ -423,7 +423,7 @@ class WorkerMarketDataService:
 
     async def stream_candles(
         self,
-        request: Request,
+        request: Any,
         *,
         symbol: Optional[str] = None,
         instrument_token: Optional[int] = None,
@@ -456,7 +456,7 @@ class WorkerMarketDataService:
                 ),
             )
 
-    async def _stream_candles_from_redis(self, request: Request, *, instrument: Dict[str, Any], interval: str) -> AsyncGenerator[str, None]:
+    async def _stream_candles_from_redis(self, request: Any, *, instrument: Dict[str, Any], interval: str) -> AsyncGenerator[str, None]:
         redis = self.redis or getattr(self.market_data_runtime, "redis", None)
         if redis is None:
             yield self._sse_event("error", {"detail": "Candle stream is not available after snapshot"})
@@ -689,7 +689,7 @@ class WorkerMarketDataService:
 
     async def stream_ticks(
         self,
-        request: Request,
+        request: Any,
         token: Any,
         *,
         symbols: Iterable[str],
@@ -795,3 +795,72 @@ class WorkerMarketDataService:
                     await runtime.delete_owner(owner_id)
                 except Exception:
                     pass
+
+    async def stream_ticks_ws(
+        self,
+        websocket: WebSocket,
+        token: Any,
+        *,
+        symbols: Iterable[str],
+        instrument_tokens: Iterable[int],
+        mode: str,
+    ) -> AsyncGenerator[tuple[str, Dict[str, Any]], None]:
+        async for payload in self.stream_ticks(
+            _WebSocketRequestAdapter(websocket),
+            token,
+            symbols=symbols,
+            instrument_tokens=instrument_tokens,
+            mode=mode,
+        ):
+            parsed = self._decode_sse_payload(payload)
+            if parsed is not None:
+                yield parsed
+
+    async def stream_candles_ws(
+        self,
+        websocket: WebSocket,
+        *,
+        symbol: Optional[str] = None,
+        instrument_token: Optional[int] = None,
+        interval: str = "5minute",
+    ) -> AsyncGenerator[tuple[str, Dict[str, Any]], None]:
+        normalized_token = normalize_instrument_token(instrument_token) if instrument_token is not None else None
+        async for payload in self.stream_candles(
+            _WebSocketRequestAdapter(websocket),
+            symbol=symbol,
+            instrument_token=normalized_token,
+            interval=interval,
+        ):
+            parsed = self._decode_sse_payload(payload)
+            if parsed is not None:
+                yield parsed
+
+    def _decode_sse_payload(self, raw_event: str) -> Optional[tuple[str, Dict[str, Any]]]:
+        event = "message"
+        data_lines: List[str] = []
+        for line in str(raw_event).splitlines():
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event = line.split(":", 1)[1].strip() or "message"
+                continue
+            if line.startswith("data:"):
+                data_lines.append(line.split(":", 1)[1].strip())
+        if not data_lines:
+            return None
+        payload_text = "\n".join(data_lines)
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            payload = {"raw": payload_text}
+        return event, payload
+
+
+class _WebSocketRequestAdapter:
+    def __init__(self, websocket: WebSocket) -> None:
+        self._websocket = websocket
+        self.app = websocket.app
+
+    async def is_disconnected(self) -> bool:
+        state = getattr(self._websocket, "client_state", None)
+        return state is not None and str(getattr(state, "name", state)).upper() == "DISCONNECTED"

@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from tests.test_support import install_dependency_stubs
 
@@ -25,6 +29,13 @@ from api.routers.algo_workers import (  # noqa: E402
     get_worker_run_funds,
     get_worker_market_snapshot,
     get_worker_market_quotes,
+    list_worker_orders,
+    cancel_worker_order,
+    preview_worker_order,
+    WorkerOrderActionRequest,
+    WorkerOrderPreviewRequest,
+    WorkerBasketPreviewRequest,
+    preview_worker_basket,
     WorkerRiskPatchRequest,
     WorkerProtectionPatchRequest,
     WorkerRunCreateRequest,
@@ -42,6 +53,10 @@ from api.routers.algo_workers import (  # noqa: E402
     stream_worker_run_pnl,
     submit_worker_intent,
     WorkerExitRequest,
+    worker_ticks_ws,
+    worker_candles_ws,
+    worker_run_pnl_ws,
+    router,
 )
 from api.routers.algo_workers import _hash_token  # noqa: E402
 from api.worker_market_data import WorkerMarketDataService  # noqa: E402
@@ -179,6 +194,15 @@ class _FakeWorkerRepository:
     async def save_intent_result(self, *, token_id, strategy_run_id, request, status, result):
         self.intent_results[(strategy_run_id, request.idempotency_key)] = result
         return result
+
+
+def _test_client(*, repo, market_data_service=None):
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    app.state.algo_worker_repository = repo
+    if market_data_service is not None:
+        app.state.worker_market_data_service = market_data_service
+    return TestClient(app)
 
 
 class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
@@ -1163,6 +1187,189 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req.attribution["source"], "algo_worker")
         self.assertEqual(call.kwargs["idempotency_key"], "live-0001")
 
+    async def test_worker_can_list_live_orders_for_grouped_run(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        live_orders = SimpleNamespace(
+            orders=lambda kite, corr_id: [
+                {
+                    "order_id": "260428150255994",
+                    "tradingsymbol": "IDEA",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "transaction_type": "BUY",
+                    "status": "COMPLETE",
+                    "strategy_run_id": "run-live",
+                }
+            ]
+        )
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = live_orders
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ):
+            response = await list_worker_orders(request, "run-live")
+
+        self.assertEqual(response["orders"][0]["order_id"], "260428150255994")
+
+    async def test_worker_live_order_routes_reject_non_live_runs(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-paper"] = {
+            "strategy_run_id": "run-paper",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await list_worker_orders(request, "run-paper")
+
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    async def test_worker_cancel_order_requires_run_access(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:OTHER",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await cancel_worker_order(request, "260428150255994", WorkerOrderActionRequest(strategy_run_id="run-live"))
+
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    async def test_worker_preview_order_returns_margin_and_charges(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = SimpleNamespace()
+
+        class _CostContract:
+            def journal_payload(self):
+                return {"charges_estimate": "2.50", "margin_required": "10.00"}
+
+        with patch.dict(
+            sys.modules,
+            {"execution_accounting.kite_costs": SimpleNamespace(build_live_order_cost_contract=lambda **kwargs: _CostContract())},
+        ):
+            with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+                "api.routers.algo_workers.asyncio.to_thread",
+                _run_to_thread_inline,
+            ):
+                response = await preview_worker_order(
+                    request,
+                    "run-live",
+                    WorkerOrderPreviewRequest(
+                        order={
+                            "exchange": "NSE",
+                            "tradingsymbol": "IDEA",
+                            "transaction_type": "BUY",
+                            "variety": "regular",
+                            "product": "MIS",
+                            "order_type": "MARKET",
+                            "quantity": 1,
+                            "validity": "DAY",
+                            "market_protection": -1,
+                        }
+                    ),
+                )
+
+        self.assertEqual(response["preview"]["cost_contract"]["charges_estimate"], "2.50")
+        self.assertEqual(response["preview"]["cost_contract"]["margin_required"], "10.00")
+
+    async def test_worker_live_exit_dry_run_returns_grouped_exit_plan(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+            "runtime_state": {},
+        }
+        repo.live_open_legs["run-live"] = [
+            {
+                "instrument_token": 408065,
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "product": "CNC",
+                "net_quantity": 1,
+                "broker_net_quantity": 1,
+            }
+        ]
+        request = self._request(repo)
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers._refresh_live_account_state",
+            AsyncMock(return_value={"account_id": "kite:AB1234", "reconciled_positions": 1}),
+        ), patch("api.routers.algo_workers.asyncio.to_thread", _run_to_thread_inline):
+            response = await exit_worker_run(request, "run-live", WorkerExitRequest(reason="preview", idempotency_key="run:exit:preview:001", dry_run=True))
+
+        self.assertEqual(response["status"], "dry_run")
+        self.assertIn("orders", response["exit"])
+
     async def test_worker_intent_rejects_non_open_run(self):
         repo = _FakeWorkerRepository()
         repo.runs["run-closed"] = {
@@ -1581,6 +1788,68 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
         self.assertEqual(payload["heartbeat_json"]["worker_id"], "w-1")
         self.assertEqual(payload["heartbeat_json"]["metrics"]["machine_id"], "ml-box-01")
         self.assertEqual(payload["last_heartbeat_at"], datetime.fromisoformat("2026-04-25T12:00:00+00:00"))
+
+
+def test_worker_tick_websocket_sends_snapshot_then_ticks():
+    repo = _FakeWorkerRepository(raw_token="secret-token")
+
+    async def fake_stream_ticks_ws(websocket, token, symbols, instrument_tokens, mode):
+        assert symbols == ["NSE:NIFTY 50"]
+        assert instrument_tokens == []
+        assert mode == "quote"
+        yield "snapshot", {"ticks": [], "missing": []}
+
+    market_data_service = SimpleNamespace(stream_ticks_ws=fake_stream_ticks_ws)
+    with _test_client(repo=repo, market_data_service=market_data_service) as client:
+        with client.websocket_connect("/api/algo-workers/worker/ws/market/ticks?token=secret-token&symbols=NSE:NIFTY%2050&mode=quote") as ws:
+            first = ws.receive_json()
+            assert first["event"] == "snapshot"
+
+
+def test_worker_tick_websocket_requires_market_stream_permission():
+    token = WorkerToken(
+        token_id="worker-1",
+        name="limited",
+        account_scope="kite:paper-a",
+        allowed_modes=["paper"],
+        allowed_actions=["market:read"],
+        allowed_templates=[],
+    )
+    repo = _FakeWorkerRepository(raw_token="secret-token", token=token)
+
+    async def fake_stream_ticks_ws(websocket, token, symbols, instrument_tokens, mode):
+        yield "snapshot", {"ticks": [], "missing": []}
+
+    market_data_service = SimpleNamespace(stream_ticks_ws=fake_stream_ticks_ws)
+    with _test_client(repo=repo, market_data_service=market_data_service) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/api/algo-workers/worker/ws/market/ticks?token=secret-token&symbols=NSE:NIFTY%2050&mode=quote"):
+                pass
+
+
+def test_worker_run_pnl_websocket_rejects_unknown_run():
+    repo = _FakeWorkerRepository(raw_token="secret-token")
+    with _test_client(repo=repo) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/api/algo-workers/worker/ws/runs/missing-run/pnl?token=secret-token"):
+                pass
+
+
+def test_worker_run_pnl_websocket_rejects_invalid_interval_seconds():
+    repo = _FakeWorkerRepository(raw_token="secret-token")
+    repo.runs["run-1"] = {
+        "strategy_run_id": "run-1",
+        "token_id": "worker-1",
+        "template_id": "mean_reversion",
+        "account_scope": "kite:paper-a",
+        "execution_mode": "paper",
+        "status": "open",
+        "metadata": {},
+    }
+    with _test_client(repo=repo) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/api/algo-workers/worker/ws/runs/run-1/pnl?token=secret-token&interval_seconds=abc"):
+                pass
 
 
 if __name__ == "__main__":
