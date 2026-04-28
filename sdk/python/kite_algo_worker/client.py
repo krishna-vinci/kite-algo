@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 import requests
 
 from .exceptions import KiteAlgoWorkerError, error_for_status
-from .models import RunProtectionState
+from .models import RunProtectionState, WorkerFundsSnapshot, WorkerRunPnlSnapshot
 from .protection import BackendProtection
 
 
@@ -97,6 +97,9 @@ class KiteAlgoWorkerClient:
     def get_run_pnl(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}/pnl")
 
+    def get_run_pnl_snapshot(self, strategy_run_id: str) -> WorkerRunPnlSnapshot:
+        return WorkerRunPnlSnapshot.model_validate(self.get_run_pnl(strategy_run_id))
+
     def list_orders(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", "/worker/orders", params={"strategy_run_id": strategy_run_id})
 
@@ -153,6 +156,9 @@ class KiteAlgoWorkerClient:
         if account_scope is not None:
             params["account_scope"] = account_scope
         return self._request("GET", "/worker/funds", params=params)
+
+    def get_funds_snapshot(self, *, mode: str = "paper", account_scope: Optional[str] = None) -> WorkerFundsSnapshot:
+        return WorkerFundsSnapshot.model_validate(self.get_funds(mode=mode, account_scope=account_scope))
 
     def get_run_funds(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}/funds")

@@ -71,7 +71,6 @@ from fyers_apiv3 import fyersModel
 
 from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
 from broker_api.broker_api import router as kite_router
-from strategies.momentum import router as momentum_router
 from broker_api.kite_orders import router as kite_orders_router
 from strategies.indexstoploss.router import router as indexstoploss_router
 
@@ -883,7 +882,6 @@ app.include_router(kite_mutual_funds_router, prefix="/api")
 app.include_router(options_router, prefix="/api")
 app.include_router(candles_api_router, prefix="/api")  # Unified candles API with all historical endpoints
 app.include_router(performance_router, prefix="/api")
-app.include_router(momentum_router, prefix="/api")
 app.include_router(alerts_router, prefix="/api/alerts")
 app.include_router(indexstoploss_router, prefix="/api/strategies")
 

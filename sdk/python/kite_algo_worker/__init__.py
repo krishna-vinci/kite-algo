@@ -3,8 +3,21 @@
 from .async_client import AsyncKiteAlgoWorkerClient
 from .client import AlgoWorkerConfig, KiteAlgoWorkerClient, KiteAlgoWorkerError
 from .exceptions import AuthError, BrokerValidationError, PermissionDeniedError, StreamDisconnectedError
-from .helpers import amo_limit_order, ensure_run, live_equity_market_order, wait_for_history
-from .models import CostContract, OrderPreview, PreviewPayload, RunProtectionState, WorkerOrderResult, WorkerOrdersResponse, WorkerTradesResponse
+from .helpers import amo_limit_order, ensure_run, live_equity_market_order, preview_then_place_order, wait_for_history, wait_for_quotes
+from .models import (
+    CostContract,
+    OrderPreview,
+    PreviewPayload,
+    RunProtectionState,
+    WorkerFundsSegment,
+    WorkerFundsSnapshot,
+    WorkerOrderResult,
+    WorkerOrdersResponse,
+    WorkerRunPnlLeg,
+    WorkerRunPnlSnapshot,
+    WorkerRunPnlTotals,
+    WorkerTradesResponse,
+)
 from .orders import OrderBuilder, equity_market_order, limit_order, market_order, option_market_order, sl_m_order, sl_order
 from .protection import BackendProtection, BasketProtection, OperationalProtection, ProtectedPosition
 from .ws import WorkerCandleWebSocketClient, WorkerRunPnlWebSocketClient, WorkerTickWebSocketClient, WorkerWebSocketClient
@@ -33,6 +46,7 @@ __all__ = [
     "OrderPreview",
     "PermissionDeniedError",
     "PreviewPayload",
+    "preview_then_place_order",
     "ProtectedPosition",
     "OperationalProtection",
     "RunProtectionState",
@@ -40,9 +54,15 @@ __all__ = [
     "sl_m_order",
     "StreamDisconnectedError",
     "wait_for_history",
+    "wait_for_quotes",
     "WorkerCandleWebSocketClient",
+    "WorkerFundsSegment",
+    "WorkerFundsSnapshot",
     "WorkerOrderResult",
     "WorkerOrdersResponse",
+    "WorkerRunPnlLeg",
+    "WorkerRunPnlSnapshot",
+    "WorkerRunPnlTotals",
     "WorkerRunPnlWebSocketClient",
     "WorkerTickWebSocketClient",
     "WorkerWebSocketClient",

@@ -9,9 +9,14 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY alerts ./alerts
+COPY algo_runtime ./algo_runtime
 COPY api ./api
 COPY alembic ./alembic
 COPY broker_api ./broker_api
+COPY execution_accounting ./execution_accounting
+COPY journal ./journal
+COPY journaling ./journaling
+COPY paper_runtime ./paper_runtime
 COPY strategies ./strategies
 COPY alembic.ini auth_service.py charts.py database.py main.py runtime_monitor.py server.py schema.sql ./
 COPY ind_nifty50list.csv ind_nifty500list.csv ind_niftylargemidcap250list.csv nifty50_data.csv ./

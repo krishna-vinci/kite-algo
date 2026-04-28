@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from .client import KiteAlgoWorkerClient
 from .exceptions import KiteAlgoWorkerError
@@ -59,6 +59,23 @@ def wait_for_history(
     return last
 
 
+def wait_for_quotes(
+    client: KiteAlgoWorkerClient,
+    instruments: list[str | int],
+    *,
+    mode: str = "quote",
+    attempts: int = 10,
+    sleep_seconds: float = 1.0,
+):
+    last: dict[str, Any] = {}
+    for _ in range(attempts):
+        last = client.get_quotes(instruments, mode=mode)
+        if last.get("quotes"):
+            return last
+        time.sleep(sleep_seconds)
+    return last
+
+
 def ensure_run(
     client: KiteAlgoWorkerClient,
     *,
@@ -82,4 +99,23 @@ def ensure_run(
         )
 
 
-__all__ = ["amo_limit_order", "ensure_run", "live_equity_market_order", "wait_for_history"]
+def preview_then_place_order(
+    client: KiteAlgoWorkerClient,
+    strategy_run_id: str,
+    order: Mapping[str, Any],
+    *,
+    idempotency_key: str,
+    metadata: Optional[Mapping[str, Any]] = None,
+):
+    client.preview_order(strategy_run_id, order, metadata=metadata)
+    return client.place_order(strategy_run_id, order, idempotency_key, metadata=metadata)
+
+
+__all__ = [
+    "amo_limit_order",
+    "ensure_run",
+    "live_equity_market_order",
+    "preview_then_place_order",
+    "wait_for_history",
+    "wait_for_quotes",
+]

@@ -19,8 +19,18 @@ depends_on = None
 def upgrade() -> None:
     op.execute(
         """
-        ALTER TABLE public.option_strategy_runs
-        ADD COLUMN IF NOT EXISTS algo_instance_id TEXT
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'option_strategy_runs'
+            ) THEN
+                ALTER TABLE public.option_strategy_runs
+                ADD COLUMN IF NOT EXISTS algo_instance_id TEXT;
+            END IF;
+        END
+        $$;
         """
     )
 
@@ -28,7 +38,17 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute(
         """
-        ALTER TABLE public.option_strategy_runs
-        DROP COLUMN IF EXISTS algo_instance_id
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'option_strategy_runs'
+            ) THEN
+                ALTER TABLE public.option_strategy_runs
+                DROP COLUMN IF EXISTS algo_instance_id;
+            END IF;
+        END
+        $$;
         """
     )

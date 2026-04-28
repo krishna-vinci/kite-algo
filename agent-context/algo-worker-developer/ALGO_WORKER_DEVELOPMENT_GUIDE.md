@@ -106,6 +106,17 @@ All strategy activity should happen under one stable `strategy_run_id` per strat
 9. `get_run_pnl(...)` or `stream_run_pnl(...)` for grouped realtime run P&L.
 10. `exit_run(...)` to close the grouped strategy run.
 
+## Hardened core surface
+
+Keep new worker code on the production-safe core surface:
+
+- lifecycle/accounting: `health()`, `heartbeat(...)`, `create_run(...)`, `get_run(...)`, `get_funds(...)`, `get_run_funds(...)`, `get_run_pnl(...)`, `stream_run_pnl(...)`
+- execution control: `list_orders(...)`, `list_trades(...)`, `preview_order(...)`, `preview_basket(...)`, `place_order(...)`, `place_basket(...)`, `exit_run(...)`
+- market data: `resolve_ticker(...)`, `search_tickers(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `stream_candles(...)`, `get_historical_candles(...)`, `get_market_snapshot(...)`
+- recovery helpers: `wait_for_history(...)` and the websocket client for reconnectable streams
+
+The certification script at `scripts/sdk_worker_certification.py` exercises this core surface and now reports preview output plus capability flags.
+
 The SDK maps to public endpoints only:
 
 | SDK method | Worker endpoint |

@@ -2390,6 +2390,48 @@ async def list_worker_trades(request: Request, strategy_run_id: str):
     return {"strategy_run_id": strategy_run_id, "trades": filtered}
 
 
+@router.get("/worker/orders/{order_id}")
+async def get_worker_order(request: Request, order_id: str, strategy_run_id: str):
+    from broker_api.kite_orders import OrdersService
+
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    _require_live_run(run, feature="Order inspection")
+    kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
+    corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-order-{uuid.uuid4()}"
+    orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+    order = await asyncio.to_thread(orders_service.order_snapshot, kite, order_id, corr_id)
+    payload = _serialize_model(order)
+    if not _payload_matches_strategy_run(payload, strategy_run_id):
+        raise HTTPException(status_code=404, detail="Order not found for strategy run")
+    return {"strategy_run_id": strategy_run_id, "order": payload}
+
+
+@router.get("/worker/orders/{order_id}/history")
+async def get_worker_order_history(request: Request, order_id: str, strategy_run_id: str):
+    from broker_api.kite_orders import OrdersService
+
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    _require_live_run(run, feature="Order inspection")
+    kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
+    corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-order-history-{uuid.uuid4()}"
+    orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+    history = await asyncio.to_thread(orders_service.order_history, kite, order_id, corr_id)
+    entries = [_serialize_model(item) for item in history]
+    if not entries or not any(_payload_matches_strategy_run(item, strategy_run_id) for item in entries):
+        raise HTTPException(status_code=404, detail="Order not found for strategy run")
+    return {"strategy_run_id": strategy_run_id, "order_id": order_id, "history": entries}
+
+
 @router.post("/worker/orders/{order_id}/cancel")
 async def cancel_worker_order(request: Request, order_id: str, payload: WorkerOrderActionRequest):
     from broker_api.kite_orders import OrdersService

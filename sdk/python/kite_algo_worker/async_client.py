@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from importlib import import_module
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 from .client import AlgoWorkerConfig, JsonDict
 from .exceptions import error_for_status
@@ -37,14 +37,47 @@ class AsyncKiteAlgoWorkerClient:
     async def close(self) -> None:
         await self.client.aclose()
 
+    async def health(self) -> JsonDict:
+        return await self._request("GET", "/worker/health")
+
     async def get_run(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", f"/worker/runs/{strategy_run_id}")
+
+    async def get_funds(self, *, mode: str = "paper", account_scope: Optional[str] = None) -> JsonDict:
+        params: JsonDict = {"mode": mode}
+        if account_scope is not None:
+            params["account_scope"] = account_scope
+        return await self._request("GET", "/worker/funds", params=params)
+
+    async def list_orders(self, strategy_run_id: str) -> JsonDict:
+        return await self._request("GET", "/worker/orders", params={"strategy_run_id": strategy_run_id})
+
+    async def list_trades(self, strategy_run_id: str) -> JsonDict:
+        return await self._request("GET", "/worker/trades", params={"strategy_run_id": strategy_run_id})
 
     async def preview_order(self, strategy_run_id: str, order: Mapping[str, Any], *, metadata: Optional[Mapping[str, Any]] = None) -> JsonDict:
         return await self._request(
             "POST",
             f"/worker/runs/{strategy_run_id}/preview/order",
             json={"order": dict(order), "metadata": dict(metadata or {})},
+        )
+
+    async def preview_basket(
+        self,
+        strategy_run_id: str,
+        orders: Iterable[Mapping[str, Any]],
+        *,
+        metadata: Optional[Mapping[str, Any]] = None,
+        all_or_none: bool = False,
+    ) -> JsonDict:
+        return await self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/preview/basket",
+            json={
+                "orders": [dict(order) for order in orders],
+                "metadata": dict(metadata or {}),
+                "all_or_none": all_or_none,
+            },
         )
 
     def _url(self, path: str) -> str:

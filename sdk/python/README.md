@@ -88,6 +88,18 @@ amo_limit = limit_order("NSE", "INFY", "BUY", "CNC", 1, price=1450.0, variety="a
 - Do not send broker tags or attribution; the backend injects them.
 - Keep tokens in environment variables or a secret manager.
 
+## Hardened core surface
+
+The production-safe SDK surface is centered on a few stable calls:
+
+- lifecycle and recovery: `health()`, `heartbeat(...)`, `create_run(...)`, `get_run(...)`
+- sizing and accounting: `get_funds(...)`, `get_run_funds(...)`, `get_run_pnl(...)`, `stream_run_pnl(...)`
+- execution control: `list_orders(...)`, `list_trades(...)`, `preview_order(...)`, `preview_basket(...)`, `place_order(...)`, `place_basket(...)`, `exit_run(...)`
+- market data: `resolve_ticker(...)`, `search_tickers(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `stream_candles(...)`, `get_historical_candles(...)`, `get_market_snapshot(...)`
+- recovery helpers: `wait_for_history(...)` and the websocket client for reconnecting streams
+
+`scripts/sdk_worker_certification.py` now reports preview output and a simple capability summary for this core surface.
+
 ## Realtime grouped run P&L
 
 The SDK exposes grouped run-level P&L helpers:

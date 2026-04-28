@@ -39,6 +39,16 @@ If this context pack and the canonical files disagree, trust the canonical files
 - Version: `0.5.0`
 - Git tag: `kite-algo-worker-v0.5.0`
 
+Current hardened core surface:
+
+- lifecycle and recovery: `health()`, `heartbeat(...)`, `create_run(...)`, `get_run(...)`
+- accounting: `get_funds(...)`, `get_run_funds(...)`, `get_run_pnl(...)`, `stream_run_pnl(...)`
+- execution control: `list_orders(...)`, `list_trades(...)`, `preview_order(...)`, `preview_basket(...)`, `place_order(...)`, `place_basket(...)`, `exit_run(...)`
+- market data: `resolve_ticker(...)`, `search_tickers(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `stream_candles(...)`, `get_historical_candles(...)`, `get_market_snapshot(...)`
+- recovery helpers: `wait_for_history(...)` and the websocket client for reconnectable streams
+
+The certification script now prints preview output and capability flags for this surface.
+
 Remote install:
 
 ```bash
