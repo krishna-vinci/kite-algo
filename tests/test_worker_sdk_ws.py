@@ -12,6 +12,7 @@ sys.modules.pop("broker_api.kite_orders", None)
 def _install_websockets_stub(routes):
     module = types.ModuleType("websockets")
     module.calls = []
+    route_positions = {key: 0 for key in routes}
 
     class FakeWebSocket:
         def __init__(self, messages):
@@ -21,7 +22,10 @@ def _install_websockets_stub(routes):
         async def recv(self):
             if not self.messages:
                 raise RuntimeError("no more messages")
-            return self.messages.pop(0)
+            item = self.messages.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
 
         async def close(self):
             self.closed = True
@@ -40,7 +44,15 @@ def _install_websockets_stub(routes):
         module.calls.append(url)
         for needle, messages in routes.items():
             if needle in url:
-                return _Connect(FakeWebSocket(messages))
+                position = route_positions[needle]
+                route_positions[needle] += 1
+                if position < len(messages) and isinstance(messages[position], list):
+                    payload = messages[position]
+                elif position < len(messages):
+                    payload = [messages[position]]
+                else:
+                    payload = []
+                return _Connect(FakeWebSocket(payload))
         raise AssertionError(f"unexpected websocket url: {url}")
 
     module.connect = connect
@@ -92,3 +104,51 @@ def test_websocket_candle_and_run_pnl_streams_read_json_events():
 
     assert candle["data"]["current"]["close"] == 123.4
     assert pnl["data"]["totals"]["net_pnl"] == 12.5
+
+
+def test_reconnecting_tick_stream_retries_after_disconnect():
+    websockets = _install_websockets_stub(
+        {
+            "/worker/ws/market/ticks": [
+                [RuntimeError("disconnect once")],
+                ['{"event": "snapshot", "data": {"ticks": [{"instrument_token": 408065}]}}'],
+            ]
+        }
+    )
+
+    async def main():
+        client = WorkerWebSocketClient(
+            base_url="ws://localhost:8765",
+            token="kwa_test",
+            reconnect_attempts=2,
+            reconnect_delay_seconds=0,
+        )
+        async with client.stream(symbols=["NSE:NIFTY 50"], mode="quote") as stream:
+            return await stream.recv()
+
+    event = asyncio.run(main())
+
+    assert event["event"] == "snapshot"
+    assert len(websockets.calls) == 2
+
+
+def test_stream_recv_ignores_heartbeat_before_payload():
+    _install_websockets_stub(
+        {
+            "/worker/ws/runs/run-1/pnl": [
+                [
+                    '{"event": "heartbeat", "data": {"strategy_run_id": "run-1"}}',
+                    '{"event": "snapshot", "data": {"totals": {"net_pnl": 12.5}}}',
+                ]
+            ]
+        }
+    )
+
+    async def main():
+        client = WorkerWebSocketClient(base_url="ws://localhost:8765", token="kwa_test")
+        async with client.stream_run_pnl("run-1") as stream:
+            return await stream.recv(ignore_heartbeats=True)
+
+    payload = asyncio.run(main())
+
+    assert payload["data"]["totals"]["net_pnl"] == 12.5

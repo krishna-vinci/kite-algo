@@ -36,8 +36,8 @@ If this context pack and the canonical files disagree, trust the canonical files
 ## Current SDK release
 
 - Package name: `kite-algo-worker`
-- Version: `0.5.0`
-- Git tag: `kite-algo-worker-v0.5.0`
+- Version: `0.5.1`
+- Git tag: `kite-algo-worker-v0.5.1`
 
 Current hardened core surface:
 
@@ -53,7 +53,7 @@ Remote install:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.5.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.5.1#subdirectory=sdk/python"
 
 This release adds:
 

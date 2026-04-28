@@ -22,7 +22,7 @@ from .orders import OrderBuilder, equity_market_order, limit_order, market_order
 from .protection import BackendProtection, BasketProtection, OperationalProtection, ProtectedPosition
 from .ws import WorkerCandleWebSocketClient, WorkerRunPnlWebSocketClient, WorkerTickWebSocketClient, WorkerWebSocketClient
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
     "__version__",

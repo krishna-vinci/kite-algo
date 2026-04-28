@@ -22,6 +22,8 @@ from api.routers.algo_workers import (  # noqa: E402
     WorkerInstrumentResolveRequest,
     WorkerMarketSnapshotRequest,
     WorkerQuoteRequest,
+    get_worker_order,
+    get_worker_order_history,
     get_worker_market_candles,
     get_worker_market_history,
     get_worker_run_pnl,
@@ -1229,6 +1231,78 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             response = await list_worker_orders(request, "run-live")
 
         self.assertEqual(response["orders"][0]["order_id"], "260428150255994")
+
+    async def test_worker_can_get_order_snapshot_for_grouped_run(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = SimpleNamespace(
+            order_snapshot=lambda kite, order_id, corr_id: {
+                "order_id": order_id,
+                "status": "COMPLETE",
+                "strategy_run_id": "run-live",
+                "tradingsymbol": "INFY",
+            }
+        )
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ):
+            response = await get_worker_order(request, "OID-1", strategy_run_id="run-live")
+
+        self.assertEqual(response["order"]["order_id"], "OID-1")
+
+    async def test_worker_order_history_rejects_cross_run_order(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = SimpleNamespace(
+            order_history=lambda kite, order_id, corr_id: [
+                {"order_id": order_id, "status": "OPEN", "strategy_run_id": "other-run", "order_timestamp": "2026-04-28T09:15:00Z"}
+            ]
+        )
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await get_worker_order_history(request, "OID-1", strategy_run_id="run-live")
+
+        self.assertEqual(ctx.exception.status_code, 404)
 
     async def test_worker_live_order_routes_reject_non_live_runs(self):
         repo = _FakeWorkerRepository()

@@ -1,5 +1,7 @@
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +20,8 @@ from kite_algo_worker import (  # noqa: E402
     BackendProtection,
     BasketProtection,
     CostContract,
+    WorkerFundsSegment,
+    WorkerFundsSnapshot,
     OrderPreview,
     KiteAlgoWorkerClient,
     KiteAlgoWorkerError,
@@ -26,6 +30,8 @@ from kite_algo_worker import (  # noqa: E402
     ProtectedPosition,
     RunProtectionState,
     WorkerOrderResult,
+    WorkerRunPnlLeg,
+    WorkerRunPnlSnapshot,
     amo_limit_order,
     equity_market_order,
     ensure_run,
@@ -33,11 +39,14 @@ from kite_algo_worker import (  # noqa: E402
     market_order,
     live_equity_market_order,
     option_market_order,
+    preview_then_place_order,
     sl_m_order,
     sl_order,
     wait_for_history,
+    wait_for_quotes,
 )
 from broker_api.kite_orders import PlaceOrderRequest  # noqa: E402
+from scripts.sdk_worker_certification import main as sdk_worker_certification_main  # noqa: E402
 
 
 class FakeResponse:
@@ -396,6 +405,34 @@ def test_stream_candles_parses_sse_events_and_closes_response(monkeypatch):
     assert response.closed is True
 
 
+def test_sdk_certification_reports_preview_and_stream_capabilities(monkeypatch, capsys):
+    fake_client = SimpleNamespace(
+        health=lambda: {"status": "ok"},
+        get_funds=lambda **kwargs: {"account_scope": "kite:paper-a"},
+        get_quotes=lambda *args, **kwargs: {"quotes": [{"symbol": "NSE:NIFTY 50"}]},
+        preview_order=lambda *args, **kwargs: {"preview": {"intent_type": "place_order"}},
+    )
+
+    monkeypatch.setattr("scripts.sdk_worker_certification.KiteAlgoWorkerClient", lambda config: fake_client)
+    monkeypatch.setenv("KITE_ALGO_WORKER_TOKEN", "kwa_test")
+    monkeypatch.setenv("KITE_ALGO_RUN_ID", "run-1")
+    monkeypatch.setenv("KITE_ALGO_ACCOUNT_SCOPE", "kite:paper-a")
+    monkeypatch.setenv("KITE_ALGO_SYMBOL", "NSE:NIFTY 50")
+    monkeypatch.setattr(sys, "argv", ["sdk_worker_certification.py", "--mode", "live"])
+
+    assert sdk_worker_certification_main() == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["preview"] == {"preview": {"intent_type": "place_order"}}
+    assert report["capabilities"] == {
+        "async_client": True,
+        "websocket_client": True,
+        "preview_order": True,
+        "list_orders": True,
+        "wait_for_history": True,
+    }
+
+
 def test_stream_run_pnl_closes_response_on_non_2xx(monkeypatch):
     response = FakeResponse(status_code=503, payload={"detail": "stream unavailable"})
 
@@ -536,6 +573,98 @@ def test_typed_models_and_exception_hierarchy():
     err = BrokerValidationError("bad order", status_code=422, response_body={"detail": "bad order"})
     assert isinstance(err, KiteAlgoWorkerError)
     assert err.status_code == 422
+
+
+def test_funds_and_pnl_models_validate_nested_payloads():
+    funds = WorkerFundsSnapshot.model_validate(
+        {
+            "account_scope": "kite:paper-a",
+            "mode": "paper",
+            "source": "paper_runtime",
+            "segments": {"equity": {"available_cash": 82000, "net": 100000}},
+            "allocation": {"usable_equity_cash": 82000},
+            "updated_at": "2026-04-28T09:15:00Z",
+        }
+    )
+    pnl = WorkerRunPnlSnapshot.model_validate(
+        {
+            "strategy_run_id": "run-1",
+            "execution_mode": "paper",
+            "status": "open",
+            "totals": {"net_pnl": 12.5},
+            "legs": [{"tradingsymbol": "INFY", "net_pnl": 12.5}],
+            "updated_at": "2026-04-28T09:15:00Z",
+        }
+    )
+
+    assert isinstance(funds.segments["equity"], WorkerFundsSegment)
+    assert funds.segments["equity"].available_cash == 82000.0
+    assert isinstance(pnl.legs[0], WorkerRunPnlLeg)
+    assert pnl.legs[0].tradingsymbol == "INFY"
+
+
+def test_get_typed_snapshots_validate_payloads(monkeypatch):
+    def fake_request(self, method, url, **kwargs):
+        if url.endswith("/worker/funds"):
+            return FakeResponse(
+                payload={
+                    "account_scope": "kite:paper-a",
+                    "mode": "paper",
+                    "source": "paper_runtime",
+                    "segments": {"equity": {"available_cash": "82000", "net": "100000"}},
+                    "allocation": {"usable_equity_cash": 82000},
+                    "updated_at": "2026-04-28T09:15:00Z",
+                }
+            )
+        if url.endswith("/worker/runs/run-1/pnl"):
+            return FakeResponse(
+                payload={
+                    "strategy_run_id": "run-1",
+                    "execution_mode": "paper",
+                    "status": "open",
+                    "totals": {"net_pnl": "12.5"},
+                    "legs": [{"tradingsymbol": "INFY", "net_pnl": "12.5"}],
+                    "updated_at": "2026-04-28T09:15:00Z",
+                }
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    funds = client().get_funds_snapshot(mode="paper", account_scope="kite:paper-a")
+    pnl = client().get_run_pnl_snapshot("run-1")
+
+    assert funds.segments["equity"].available_cash == 82000.0
+    assert pnl.totals.net_pnl == 12.5
+
+
+def test_wait_for_quotes_polls_until_quotes_arrive(monkeypatch):
+    responses = [{"quotes": []}, {"quotes": [{"symbol": "NSE:INFY"}]}]
+    monkeypatch.setattr(KiteAlgoWorkerClient, "get_quotes", lambda *args, **kwargs: responses.pop(0))
+
+    result = wait_for_quotes(client(), ["NSE:INFY"], attempts=2, sleep_seconds=0)
+
+    assert result["quotes"][0]["symbol"] == "NSE:INFY"
+
+
+def test_preview_then_place_order_uses_preview_before_place(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        KiteAlgoWorkerClient,
+        "preview_order",
+        lambda self, run_id, order, metadata=None: calls.append("preview") or {"preview": {"intent_type": "place_order"}},
+    )
+    monkeypatch.setattr(
+        KiteAlgoWorkerClient,
+        "place_order",
+        lambda self, run_id, order, key, metadata=None: calls.append("place") or {"status": "accepted"},
+    )
+
+    result = preview_then_place_order(client(), "run-1", {"exchange": "NSE", "tradingsymbol": "INFY"}, idempotency_key="run-1:entry:1")
+
+    assert result["status"] == "accepted"
+    assert calls == ["preview", "place"]
 
 
 def test_sync_client_order_lifecycle_and_preview_endpoints(captured_requests):
