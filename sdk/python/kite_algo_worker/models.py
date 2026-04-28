@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, cast
 
 
 def _dump_value(value: Any, *, exclude_none: bool) -> Any:
@@ -64,6 +64,33 @@ class ModelMixin:
     def model_dump(self, *, exclude_none: bool = True, mode: str = "python") -> Dict[str, Any]:
         _ = mode
         return _dump_value(self, exclude_none=exclude_none)
+
+
+class RawModelMixin(ModelMixin):
+    @classmethod
+    def model_validate(cls, payload: Any):
+        if isinstance(payload, cls):
+            return payload
+        if not isinstance(payload, Mapping):
+            raise TypeError(f"{cls.__name__} requires a mapping payload")
+        aliases = getattr(cls, "__field_aliases__", {})
+        data = {aliases.get(key, key): value for key, value in dict(payload).items()}
+        known = {item.name for item in fields(cast(Any, cls))}
+        kwargs = {key: data[key] for key in known if key != "raw" and key in data}
+        kwargs["raw"] = {key: value for key, value in data.items() if key not in known}
+        return cls(**kwargs)
+
+    def model_dump(self, *, exclude_none: bool = True, mode: str = "python") -> Dict[str, Any]:
+        payload = super().model_dump(exclude_none=exclude_none, mode=mode)
+        payload.pop("raw", None)
+        raw = dict(getattr(self, "raw", {}) or {})
+        if raw:
+            payload.update(raw)
+        reverse_aliases = {value: key for key, value in getattr(type(self), "__field_aliases__", {}).items()}
+        for internal_name, external_name in reverse_aliases.items():
+            if internal_name in payload:
+                payload[external_name] = payload.pop(internal_name)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -247,7 +274,7 @@ class WorkerOrderResult(ModelMixin):
 
 
 @dataclass(frozen=True)
-class RunProtectionState(ModelMixin):
+class RunProtectionState(RawModelMixin):
     status: Optional[str] = None
     generation: Optional[int] = None
     triggered_rule: Optional[str] = None
@@ -257,41 +284,188 @@ class RunProtectionState(ModelMixin):
     backend_protection: Optional[Dict[str, Any]] = None
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
 
-    @classmethod
-    def model_validate(cls, payload: Any):
-        if isinstance(payload, cls):
-            return payload
-        if not isinstance(payload, Mapping):
-            raise TypeError(f"{cls.__name__} requires a mapping payload")
-        data = dict(payload)
-        known = {field.name for field in fields(cls)}
-        raw = {key: value for key, value in data.items() if key not in known}
-        kwargs = {key: data[key] for key in known if key != "raw" and key in data}
-        kwargs["raw"] = raw
-        return cls(**kwargs)
+@dataclass(frozen=True)
+class WorkerCandle(RawModelMixin):
+    ts: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    oi: Optional[float] = None
+    is_complete: bool = True
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "ts", str(self.ts))
+        object.__setattr__(self, "open", _coerce_float(self.open))
+        object.__setattr__(self, "high", _coerce_float(self.high))
+        object.__setattr__(self, "low", _coerce_float(self.low))
+        object.__setattr__(self, "close", _coerce_float(self.close))
+        object.__setattr__(self, "volume", _coerce_float(self.volume))
+        object.__setattr__(self, "oi", _coerce_optional_float(self.oi))
+        object.__setattr__(self, "is_complete", _coerce_bool(self.is_complete, default=True))
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+@dataclass(frozen=True)
+class WorkerHistoricalCandles(RawModelMixin):
+    __field_aliases__ = {"from": "from_ts", "to": "to_ts"}
+
+    symbol: Optional[str] = None
+    instrument_token: Optional[int] = None
+    interval: str = ""
+    timeframe: Optional[str] = None
+    from_ts: Optional[str] = None
+    to_ts: Optional[str] = None
+    count: Optional[int] = None
+    source: Optional[str] = None
+    ingestion: Optional[Dict[str, Any]] = None
+    current: Optional[WorkerCandle] = None
+    candles: List[WorkerCandle] = field(default_factory=list)
+    is_stale: bool = False
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "symbol", None if self.symbol is None else str(self.symbol))
+        object.__setattr__(self, "instrument_token", _coerce_optional_int(self.instrument_token))
+        object.__setattr__(self, "interval", str(self.interval))
+        object.__setattr__(self, "timeframe", None if self.timeframe is None else str(self.timeframe))
+        object.__setattr__(self, "from_ts", None if self.from_ts is None else str(self.from_ts))
+        object.__setattr__(self, "to_ts", None if self.to_ts is None else str(self.to_ts))
+        object.__setattr__(self, "count", _coerce_optional_int(self.count))
+        object.__setattr__(self, "source", None if self.source is None else str(self.source))
+        object.__setattr__(self, "ingestion", dict(self.ingestion or {}) if self.ingestion is not None else None)
+        current = self.current if isinstance(self.current, WorkerCandle) else (WorkerCandle.model_validate(self.current) if self.current is not None else None)
+        candles = [c if isinstance(c, WorkerCandle) else WorkerCandle.model_validate(c) for c in list(self.candles or [])]
+        object.__setattr__(self, "current", current)
+        object.__setattr__(self, "candles", candles)
+        object.__setattr__(self, "is_stale", _coerce_bool(self.is_stale))
+        object.__setattr__(self, "raw", dict(self.raw or {}))
 
     def model_dump(self, *, exclude_none: bool = True, mode: str = "python") -> Dict[str, Any]:
         payload = super().model_dump(exclude_none=exclude_none, mode=mode)
-        payload.pop("raw", None)
         if self.raw:
             payload.update(self.raw)
         return payload
 
 
 @dataclass(frozen=True)
+class WorkerOrderSnapshot(RawModelMixin):
+    order_id: str
+    status: str
+    exchange: Optional[str] = None
+    tradingsymbol: Optional[str] = None
+    instrument_token: Optional[int] = None
+    transaction_type: Optional[str] = None
+    product: Optional[str] = None
+    variety: Optional[str] = None
+    order_type: Optional[str] = None
+    validity: Optional[str] = None
+    quantity: Optional[int] = None
+    price: Optional[float] = None
+    trigger_price: Optional[float] = None
+    average_price: Optional[float] = None
+    filled_quantity: Optional[int] = None
+    pending_quantity: Optional[int] = None
+    cancelled_quantity: Optional[int] = None
+    order_timestamp: Optional[str] = None
+    exchange_update_timestamp: Optional[str] = None
+    exchange_timestamp: Optional[str] = None
+    status_message: Optional[str] = None
+    status_message_raw: Optional[str] = None
+    parent_order_id: Optional[str] = None
+    tag: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "order_id", str(self.order_id))
+        object.__setattr__(self, "status", str(self.status))
+        object.__setattr__(self, "exchange", None if self.exchange is None else str(self.exchange))
+        object.__setattr__(self, "tradingsymbol", None if self.tradingsymbol is None else str(self.tradingsymbol))
+        object.__setattr__(self, "instrument_token", _coerce_optional_int(self.instrument_token))
+        object.__setattr__(self, "transaction_type", None if self.transaction_type is None else str(self.transaction_type))
+        object.__setattr__(self, "product", None if self.product is None else str(self.product))
+        object.__setattr__(self, "variety", None if self.variety is None else str(self.variety))
+        object.__setattr__(self, "order_type", None if self.order_type is None else str(self.order_type))
+        object.__setattr__(self, "validity", None if self.validity is None else str(self.validity))
+        object.__setattr__(self, "quantity", _coerce_optional_int(self.quantity))
+        object.__setattr__(self, "price", _coerce_optional_float(self.price))
+        object.__setattr__(self, "trigger_price", _coerce_optional_float(self.trigger_price))
+        object.__setattr__(self, "average_price", _coerce_optional_float(self.average_price))
+        object.__setattr__(self, "filled_quantity", _coerce_optional_int(self.filled_quantity))
+        object.__setattr__(self, "pending_quantity", _coerce_optional_int(self.pending_quantity))
+        object.__setattr__(self, "cancelled_quantity", _coerce_optional_int(self.cancelled_quantity))
+        object.__setattr__(self, "order_timestamp", None if self.order_timestamp is None else str(self.order_timestamp))
+        object.__setattr__(self, "exchange_update_timestamp", None if self.exchange_update_timestamp is None else str(self.exchange_update_timestamp))
+        object.__setattr__(self, "exchange_timestamp", None if self.exchange_timestamp is None else str(self.exchange_timestamp))
+        object.__setattr__(self, "status_message", None if self.status_message is None else str(self.status_message))
+        object.__setattr__(self, "status_message_raw", None if self.status_message_raw is None else str(self.status_message_raw))
+        object.__setattr__(self, "parent_order_id", None if self.parent_order_id is None else str(self.parent_order_id))
+        object.__setattr__(self, "tag", None if self.tag is None else str(self.tag))
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+@dataclass(frozen=True)
+class WorkerTradeSnapshot(RawModelMixin):
+    trade_id: str
+    order_id: str
+    exchange: Optional[str] = None
+    tradingsymbol: Optional[str] = None
+    instrument_token: Optional[int] = None
+    transaction_type: Optional[str] = None
+    product: Optional[str] = None
+    average_price: Optional[float] = None
+    quantity: Optional[int] = None
+    order_timestamp: Optional[str] = None
+    exchange_timestamp: Optional[str] = None
+    fill_timestamp: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "trade_id", str(self.trade_id))
+        object.__setattr__(self, "order_id", str(self.order_id))
+        object.__setattr__(self, "exchange", None if self.exchange is None else str(self.exchange))
+        object.__setattr__(self, "tradingsymbol", None if self.tradingsymbol is None else str(self.tradingsymbol))
+        object.__setattr__(self, "instrument_token", _coerce_optional_int(self.instrument_token))
+        object.__setattr__(self, "transaction_type", None if self.transaction_type is None else str(self.transaction_type))
+        object.__setattr__(self, "product", None if self.product is None else str(self.product))
+        object.__setattr__(self, "average_price", _coerce_optional_float(self.average_price))
+        object.__setattr__(self, "quantity", _coerce_optional_int(self.quantity))
+        object.__setattr__(self, "order_timestamp", None if self.order_timestamp is None else str(self.order_timestamp))
+        object.__setattr__(self, "exchange_timestamp", None if self.exchange_timestamp is None else str(self.exchange_timestamp))
+        object.__setattr__(self, "fill_timestamp", None if self.fill_timestamp is None else str(self.fill_timestamp))
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+@dataclass(frozen=True)
 class WorkerOrdersResponse(ModelMixin):
     strategy_run_id: str
-    orders: List[Dict[str, Any]] = field(default_factory=list)
+    orders: List[WorkerOrderSnapshot] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        orders = [order if isinstance(order, WorkerOrderSnapshot) else WorkerOrderSnapshot.model_validate(order) for order in list(self.orders or [])]
+        object.__setattr__(self, "orders", orders)
 
 
 @dataclass(frozen=True)
 class WorkerTradesResponse(ModelMixin):
     strategy_run_id: str
-    trades: List[Dict[str, Any]] = field(default_factory=list)
+    trades: List[WorkerTradeSnapshot] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        trades = [trade if isinstance(trade, WorkerTradeSnapshot) else WorkerTradeSnapshot.model_validate(trade) for trade in list(self.trades or [])]
+        object.__setattr__(self, "trades", trades)
 
 
 __all__ = [
     "CostContract",
+    "WorkerCandle",
+    "WorkerHistoricalCandles",
+    "WorkerOrderSnapshot",
+    "WorkerTradeSnapshot",
     "OrderPreview",
     "PreviewPayload",
     "WorkerFundsSegment",

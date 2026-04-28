@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from importlib import import_module
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 from .client import AlgoWorkerConfig, JsonDict
 from .exceptions import error_for_status
+from .models import (
+    WorkerHistoricalCandles,
+    WorkerOrderSnapshot,
+    WorkerOrdersResponse,
+    WorkerRunPnlSnapshot,
+    WorkerTradesResponse,
+)
 
 
 @dataclass(frozen=True)
@@ -43,6 +51,12 @@ class AsyncKiteAlgoWorkerClient:
     async def get_run(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", f"/worker/runs/{strategy_run_id}")
 
+    async def get_run_pnl(self, strategy_run_id: str) -> JsonDict:
+        return await self._request("GET", f"/worker/runs/{strategy_run_id}/pnl")
+
+    async def get_run_pnl_snapshot(self, strategy_run_id: str) -> WorkerRunPnlSnapshot:
+        return WorkerRunPnlSnapshot.model_validate(await self.get_run_pnl(strategy_run_id))
+
     async def get_funds(self, *, mode: str = "paper", account_scope: Optional[str] = None) -> JsonDict:
         params: JsonDict = {"mode": mode}
         if account_scope is not None:
@@ -52,8 +66,71 @@ class AsyncKiteAlgoWorkerClient:
     async def list_orders(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", "/worker/orders", params={"strategy_run_id": strategy_run_id})
 
+    async def get_orders_snapshot(self, strategy_run_id: str) -> WorkerOrdersResponse:
+        return WorkerOrdersResponse.model_validate(await self.list_orders(strategy_run_id))
+
     async def list_trades(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", "/worker/trades", params={"strategy_run_id": strategy_run_id})
+
+    async def get_trades_snapshot(self, strategy_run_id: str) -> WorkerTradesResponse:
+        return WorkerTradesResponse.model_validate(await self.list_trades(strategy_run_id))
+
+    async def get_order_snapshot(self, strategy_run_id: str, order_id: str) -> WorkerOrderSnapshot:
+        response = await self._request("GET", f"/worker/orders/{order_id}", params={"strategy_run_id": strategy_run_id})
+        return WorkerOrderSnapshot.model_validate(response.get("order") or response)
+
+    async def get_candles(self, instrument: str | int, interval: str = "5minute", lookback: int = 50) -> JsonDict:
+        params: JsonDict = {"interval": interval, "lookback": lookback}
+        instrument_value = str(instrument).strip()
+        if isinstance(instrument, int) or instrument_value.isdigit():
+            params["instrument_token"] = int(instrument_value)
+        else:
+            params["symbol"] = instrument_value
+        return await self._request("GET", "/worker/market/candles", params=params)
+
+    async def get_candles_snapshot(self, instrument: str | int, interval: str = "5minute", lookback: int = 50) -> WorkerHistoricalCandles:
+        return WorkerHistoricalCandles.model_validate(await self.get_candles(instrument, interval=interval, lookback=lookback))
+
+    async def get_historical_candles(
+        self,
+        instrument: str | int,
+        timeframe: str = "day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        ingest: bool = True,
+        passthrough: bool = False,
+    ) -> JsonDict:
+        params: JsonDict = {"timeframe": timeframe, "ingest": ingest, "passthrough": passthrough}
+        instrument_value = str(instrument).strip()
+        if isinstance(instrument, int) or instrument_value.isdigit():
+            params["instrument_token"] = int(instrument_value)
+        else:
+            params["symbol"] = instrument_value
+        if from_date is not None:
+            params["from"] = from_date
+        if to_date is not None:
+            params["to"] = to_date
+        return await self._request("GET", "/worker/market/history", params=params)
+
+    async def get_historical_candles_snapshot(
+        self,
+        instrument: str | int,
+        timeframe: str = "day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        ingest: bool = True,
+        passthrough: bool = False,
+    ) -> WorkerHistoricalCandles:
+        return WorkerHistoricalCandles.model_validate(
+            await self.get_historical_candles(
+                instrument,
+                timeframe=timeframe,
+                from_date=from_date,
+                to_date=to_date,
+                ingest=ingest,
+                passthrough=passthrough,
+            )
+        )
 
     async def preview_order(self, strategy_run_id: str, order: Mapping[str, Any], *, metadata: Optional[Mapping[str, Any]] = None) -> JsonDict:
         return await self._request(
@@ -79,6 +156,24 @@ class AsyncKiteAlgoWorkerClient:
                 "all_or_none": all_or_none,
             },
         )
+
+    async def wait_for_terminal_order_state(
+        self,
+        strategy_run_id: str,
+        order_id: str,
+        *,
+        attempts: int = 20,
+        sleep_seconds: float = 1.0,
+    ) -> WorkerOrderSnapshot:
+        last_snapshot: Optional[WorkerOrderSnapshot] = None
+        for _ in range(attempts):
+            last_snapshot = await self.get_order_snapshot(strategy_run_id, order_id)
+            if last_snapshot.status in {"COMPLETE", "CANCELLED", "REJECTED"}:
+                return last_snapshot
+            await asyncio.sleep(sleep_seconds)
+        if last_snapshot is None:
+            raise RuntimeError("wait_for_terminal_order_state exhausted without fetching an order snapshot")
+        return last_snapshot
 
     def _url(self, path: str) -> str:
         base = self.config.base_url.rstrip("/")

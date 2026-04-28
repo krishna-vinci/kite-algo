@@ -19,23 +19,23 @@ Once the SDK changes are committed and tagged, remote servers can install the ex
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.5.1#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.5.1#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
 ```
 
-Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.5.1`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
+Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.6.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
 
 Create the tag from the repository root after committing the SDK:
 
 ```bash
-git tag -a kite-algo-worker-v0.5.1 -m "kite-algo-worker v0.5.1"
-git push origin kite-algo-worker-v0.5.1
+git tag -a kite-algo-worker-v0.6.0 -m "kite-algo-worker v0.6.0"
+git push origin kite-algo-worker-v0.6.0
 ```
 
 ### Local development install

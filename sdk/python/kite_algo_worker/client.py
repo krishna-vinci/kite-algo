@@ -7,7 +7,15 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 import requests
 
 from .exceptions import KiteAlgoWorkerError, error_for_status
-from .models import RunProtectionState, WorkerFundsSnapshot, WorkerRunPnlSnapshot
+from .models import (
+    RunProtectionState,
+    WorkerFundsSnapshot,
+    WorkerHistoricalCandles,
+    WorkerOrderSnapshot,
+    WorkerOrdersResponse,
+    WorkerRunPnlSnapshot,
+    WorkerTradesResponse,
+)
 from .protection import BackendProtection
 
 
@@ -105,6 +113,16 @@ class KiteAlgoWorkerClient:
 
     def list_trades(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", "/worker/trades", params={"strategy_run_id": strategy_run_id})
+
+    def get_orders_snapshot(self, strategy_run_id: str) -> WorkerOrdersResponse:
+        return WorkerOrdersResponse.model_validate(self.list_orders(strategy_run_id))
+
+    def get_trades_snapshot(self, strategy_run_id: str) -> WorkerTradesResponse:
+        return WorkerTradesResponse.model_validate(self.list_trades(strategy_run_id))
+
+    def get_order_snapshot(self, strategy_run_id: str, order_id: str) -> WorkerOrderSnapshot:
+        response = self._request("GET", f"/worker/orders/{order_id}", params={"strategy_run_id": strategy_run_id})
+        return WorkerOrderSnapshot.model_validate(response.get("order") or response)
 
     def cancel_order(self, strategy_run_id: str, order_id: str, *, variety: str = "regular") -> JsonDict:
         return self._request(
@@ -218,6 +236,29 @@ class KiteAlgoWorkerClient:
 
     def get_current_candle(self, instrument: str | int, interval: str = "5minute") -> Optional[JsonDict]:
         return self.get_candles(instrument, interval=interval, lookback=1).get("current")
+
+    def get_candles_snapshot(self, instrument: str | int, interval: str = "5minute", lookback: int = 50) -> WorkerHistoricalCandles:
+        return WorkerHistoricalCandles.model_validate(self.get_candles(instrument, interval=interval, lookback=lookback))
+
+    def get_historical_candles_snapshot(
+        self,
+        instrument: str | int,
+        timeframe: str = "day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        ingest: bool = True,
+        passthrough: bool = False,
+    ) -> WorkerHistoricalCandles:
+        return WorkerHistoricalCandles.model_validate(
+            self.get_historical_candles(
+                instrument,
+                timeframe=timeframe,
+                from_date=from_date,
+                to_date=to_date,
+                ingest=ingest,
+                passthrough=passthrough,
+            )
+        )
 
     def get_historical_candles(
         self,

@@ -11,8 +11,8 @@ sys.modules.pop("broker_api.kite_orders", None)
 
 def _install_httpx_stub(responses):
     module = types.ModuleType("httpx")
-    module.calls = []
-    module.closed = 0
+    setattr(module, "calls", [])
+    setattr(module, "closed", 0)
 
     class AsyncClient:
         def __init__(self, headers=None, timeout=None):
@@ -24,9 +24,9 @@ def _install_httpx_stub(responses):
             return responses.pop(0)
 
         async def aclose(self):
-            module.closed += 1
+            setattr(module, "closed", module.closed + 1)
 
-    module.AsyncClient = AsyncClient
+    setattr(module, "AsyncClient", AsyncClient)
     sys.modules["httpx"] = module
     return module
 
@@ -37,6 +37,14 @@ if str(SDK_ROOT) not in sys.path:
 
 from kite_algo_worker import AlgoWorkerConfig  # noqa: E402
 from kite_algo_worker.async_client import AsyncKiteAlgoWorkerClient  # noqa: E402
+from kite_algo_worker.models import (  # noqa: E402
+    WorkerHistoricalCandles,
+    WorkerOrderSnapshot,
+    WorkerOrdersResponse,
+    WorkerRunPnlSnapshot,
+    WorkerTradeSnapshot,
+    WorkerTradesResponse,
+)
 
 
 def test_async_client_get_run_preview_and_close():
@@ -128,3 +136,198 @@ def test_async_client_core_parity_methods_use_worker_endpoints():
         "all_or_none": False,
     }
     assert httpx.closed == 1
+
+
+def test_async_client_typed_snapshot_helpers_return_models():
+    httpx = _install_httpx_stub(
+        [
+            types.SimpleNamespace(
+                status_code=200,
+                content=b'{"symbol": "NSE:SBIN", "instrument_token": 123, "interval": "5minute", "current": {"ts": "2026-04-28T09:20:00+05:30", "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 1200, "oi": null, "is_complete": false}, "candles": [{"ts": "2026-04-28T09:15:00+05:30", "open": 99, "high": 100, "low": 98.5, "close": 99.8, "volume": 1000, "oi": null, "is_complete": true}], "is_stale": false, "source": "runtime"}',
+                text='{"symbol": "NSE:SBIN", "instrument_token": 123, "interval": "5minute", "current": {"ts": "2026-04-28T09:20:00+05:30", "open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 1200, "oi": null, "is_complete": false}, "candles": [{"ts": "2026-04-28T09:15:00+05:30", "open": 99, "high": 100, "low": 98.5, "close": 99.8, "volume": 1000, "oi": null, "is_complete": true}], "is_stale": false, "source": "runtime"}',
+                json=lambda: {
+                    "symbol": "NSE:SBIN",
+                    "instrument_token": 123,
+                    "interval": "5minute",
+                    "current": {
+                        "ts": "2026-04-28T09:20:00+05:30",
+                        "open": 100,
+                        "high": 101,
+                        "low": 99,
+                        "close": 100.5,
+                        "volume": 1200,
+                        "oi": None,
+                        "is_complete": False,
+                    },
+                    "candles": [
+                        {
+                            "ts": "2026-04-28T09:15:00+05:30",
+                            "open": 99,
+                            "high": 100,
+                            "low": 98.5,
+                            "close": 99.8,
+                            "volume": 1000,
+                            "oi": None,
+                            "is_complete": True,
+                        }
+                    ],
+                    "is_stale": False,
+                    "source": "runtime",
+                },
+            ),
+            types.SimpleNamespace(
+                status_code=200,
+                content=b'{"symbol": "NSE:SBIN", "instrument_token": 123, "timeframe": "day", "interval": "day", "from": "2026-01-01T09:15:00+05:30", "to": "2026-01-02T15:30:00+05:30", "count": 1, "source": "historical_db", "ingestion": {"status": "disabled"}, "candles": [{"ts": "2026-01-01T15:30:00+05:30", "open": 99, "high": 100, "low": 98, "close": 99.5, "volume": 500, "oi": 12, "is_complete": true}]}',
+                text='{"symbol": "NSE:SBIN", "instrument_token": 123, "timeframe": "day", "interval": "day", "from": "2026-01-01T09:15:00+05:30", "to": "2026-01-02T15:30:00+05:30", "count": 1, "source": "historical_db", "ingestion": {"status": "disabled"}, "candles": [{"ts": "2026-01-01T15:30:00+05:30", "open": 99, "high": 100, "low": 98, "close": 99.5, "volume": 500, "oi": 12, "is_complete": true}]}',
+                json=lambda: {
+                    "symbol": "NSE:SBIN",
+                    "instrument_token": 123,
+                    "timeframe": "day",
+                    "interval": "day",
+                    "from": "2026-01-01T09:15:00+05:30",
+                    "to": "2026-01-02T15:30:00+05:30",
+                    "count": 1,
+                    "source": "historical_db",
+                    "ingestion": {"status": "disabled"},
+                    "candles": [
+                        {
+                            "ts": "2026-01-01T15:30:00+05:30",
+                            "open": 99,
+                            "high": 100,
+                            "low": 98,
+                            "close": 99.5,
+                            "volume": 500,
+                            "oi": 12,
+                            "is_complete": True,
+                        }
+                    ],
+                },
+            ),
+            types.SimpleNamespace(
+                status_code=200,
+                content=b'{"strategy_run_id": "run-1", "orders": [{"order_id": "o1", "status": "COMPLETE", "tradingsymbol": "INFY", "quantity": 2, "price": 10.5, "meta": {"source": "worker"}}]}',
+                text='{"strategy_run_id": "run-1", "orders": [{"order_id": "o1", "status": "COMPLETE", "tradingsymbol": "INFY", "quantity": 2, "price": 10.5, "meta": {"source": "worker"}}]}',
+                json=lambda: {
+                    "strategy_run_id": "run-1",
+                    "orders": [
+                        {
+                            "order_id": "o1",
+                            "status": "COMPLETE",
+                            "tradingsymbol": "INFY",
+                            "quantity": 2,
+                            "price": 10.5,
+                            "meta": {"source": "worker"},
+                        }
+                    ],
+                },
+            ),
+            types.SimpleNamespace(
+                status_code=200,
+                content=b'{"strategy_run_id": "run-1", "order": {"order_id": "o1", "status": "COMPLETE", "tradingsymbol": "INFY", "quantity": 2, "price": 10.5, "meta": {"source": "worker"}}}',
+                text='{"strategy_run_id": "run-1", "order": {"order_id": "o1", "status": "COMPLETE", "tradingsymbol": "INFY", "quantity": 2, "price": 10.5, "meta": {"source": "worker"}}}',
+                json=lambda: {
+                    "strategy_run_id": "run-1",
+                    "order": {
+                        "order_id": "o1",
+                        "status": "COMPLETE",
+                        "tradingsymbol": "INFY",
+                        "quantity": 2,
+                        "price": 10.5,
+                        "meta": {"source": "worker"},
+                    },
+                },
+            ),
+            types.SimpleNamespace(
+                status_code=200,
+                content=b'{"strategy_run_id": "run-1", "trades": [{"trade_id": "abc", "order_id": "o1", "quantity": 2, "average_price": 10.5, "meta": {"fill": "worker"}}]}',
+                text='{"strategy_run_id": "run-1", "trades": [{"trade_id": "abc", "order_id": "o1", "quantity": 2, "average_price": 10.5, "meta": {"fill": "worker"}}]}',
+                json=lambda: {
+                    "strategy_run_id": "run-1",
+                    "trades": [
+                        {
+                            "trade_id": "abc",
+                            "order_id": "o1",
+                            "quantity": 2,
+                            "average_price": 10.5,
+                            "meta": {"fill": "worker"},
+                        }
+                    ],
+                },
+            ),
+            types.SimpleNamespace(
+                status_code=200,
+                content=b'{"strategy_run_id": "run-1", "execution_mode": "live", "status": "OK", "totals": {"net_pnl": 12.5}, "legs": []}',
+                text='{"strategy_run_id": "run-1", "execution_mode": "live", "status": "OK", "totals": {"net_pnl": 12.5}, "legs": []}',
+                json=lambda: {
+                    "strategy_run_id": "run-1",
+                    "execution_mode": "live",
+                    "status": "OK",
+                    "totals": {"net_pnl": 12.5},
+                    "legs": [],
+                },
+            ),
+        ]
+    )
+
+    async def main():
+        async with AsyncKiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test")) as client:
+            candles = await client.get_candles_snapshot("NSE:SBIN")
+            history = await client.get_historical_candles_snapshot("NSE:SBIN", timeframe="day")
+            orders = await client.get_orders_snapshot("run-1")
+            order = await client.get_order_snapshot("run-1", "o1")
+            trades = await client.get_trades_snapshot("run-1")
+            pnl = await client.get_run_pnl_snapshot("run-1")
+            return candles, history, orders, order, trades, pnl
+
+    candles, history, orders, order, trades, pnl = asyncio.run(main())
+
+    assert isinstance(candles, WorkerHistoricalCandles)
+    assert candles.current.close == 100.5
+    assert isinstance(history, WorkerHistoricalCandles)
+    assert history.from_ts == "2026-01-01T09:15:00+05:30"
+    assert isinstance(orders, WorkerOrdersResponse)
+    assert isinstance(orders.orders[0], WorkerOrderSnapshot)
+    assert orders.orders[0].order_id == "o1"
+    assert isinstance(order, WorkerOrderSnapshot)
+    assert order.price == 10.5
+    assert isinstance(trades, WorkerTradesResponse)
+    assert isinstance(trades.trades[0], WorkerTradeSnapshot)
+    assert trades.trades[0].trade_id == "abc"
+    assert isinstance(pnl, WorkerRunPnlSnapshot)
+    assert pnl.totals.net_pnl == 12.5
+    assert httpx.calls[0]["url"] == "http://localhost:8000/api/algo-workers/worker/market/candles"
+    assert httpx.calls[1]["url"] == "http://localhost:8000/api/algo-workers/worker/market/history"
+    assert httpx.calls[2]["url"] == "http://localhost:8000/api/algo-workers/worker/orders"
+    assert httpx.calls[3]["url"] == "http://localhost:8000/api/algo-workers/worker/orders/o1"
+    assert httpx.calls[4]["url"] == "http://localhost:8000/api/algo-workers/worker/trades"
+    assert httpx.calls[5]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/pnl"
+
+
+def test_async_wait_for_terminal_order_state_polls_until_complete():
+    httpx = _install_httpx_stub(
+        [
+            types.SimpleNamespace(
+                status_code=200,
+                content=b'{"order": {"order_id": "o1", "status": "OPEN"}}',
+                text='{"order": {"order_id": "o1", "status": "OPEN"}}',
+                json=lambda: {"order": {"order_id": "o1", "status": "OPEN"}},
+            ),
+            types.SimpleNamespace(
+                status_code=200,
+                content=b'{"order": {"order_id": "o1", "status": "COMPLETE"}}',
+                text='{"order": {"order_id": "o1", "status": "COMPLETE"}}',
+                json=lambda: {"order": {"order_id": "o1", "status": "COMPLETE"}},
+            ),
+        ]
+    )
+
+    async def main():
+        async with AsyncKiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test")) as client:
+            return await client.wait_for_terminal_order_state("run-1", "o1", attempts=2, sleep_seconds=0)
+
+    result = asyncio.run(main())
+
+    assert isinstance(result, WorkerOrderSnapshot)
+    assert result.status == "COMPLETE"
+    assert httpx.calls[0]["kwargs"]["params"] == {"strategy_run_id": "run-1"}
+    assert httpx.calls[1]["kwargs"]["params"] == {"strategy_run_id": "run-1"}
