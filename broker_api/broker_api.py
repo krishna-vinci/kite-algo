@@ -378,6 +378,27 @@ def get_psql_conn():
 _meili_client = None  # preserved (unused) to keep imports/refs stable
 _meili_client_cache: Dict[str, meilisearch.Client] = {}
 
+MEILI_INSTRUMENT_RESULT_ATTRIBUTES = [
+    "instrument_token",
+    "exchange_token",
+    "tradingsymbol",
+    "name",
+    "last_price",
+    "expiry",
+    "strike",
+    "tick_size",
+    "lot_size",
+    "instrument_type",
+    "segment",
+    "exchange",
+    "underlying",
+    "option_type",
+]
+
+MEILI_INSTRUMENT_MARKET_DATE_SQL = "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date"
+
+KITE_INSTRUMENT_IMPORT_EXCHANGES = ["NSE", "NFO", "BSE", "BFO", "CDS", "BCD", "MCX"]
+
 def _meili_health_ok(client: "meilisearch.Client") -> bool:
     """
     Small helper to check Meilisearch health using available method names.
@@ -493,7 +514,8 @@ def ensure_instruments_index():
         return
 
     settings = {
-        "searchableAttributes": ["tradingsymbol", "aliases", "underlying", "name"],
+        "displayedAttributes": MEILI_INSTRUMENT_RESULT_ATTRIBUTES,
+        "searchableAttributes": ["tradingsymbol", "name", "underlying", "aliases"],
         "rankingRules": [
             "typo",
             "words",
@@ -537,35 +559,57 @@ def ensure_instruments_index():
 
 
 async def fetch_instrument_search_records() -> List[Dict[str, Any]]:
-    sql_query = """
+    sql_query = f"""
         SELECT
             instrument_token, exchange_token, tradingsymbol, name, last_price,
             expiry, strike, tick_size, lot_size, instrument_type, segment,
-            exchange, underlying, option_type, last_updated
+            exchange, underlying, option_type
         FROM kite_instruments
+        WHERE expiry IS NULL OR expiry >= {MEILI_INSTRUMENT_MARKET_DATE_SQL}
         UNION ALL
         SELECT
             instrument_token, exchange_token, tradingsymbol, name, last_price,
             expiry, strike, tick_size, lot_size, instrument_type, segment,
             exchange,
-            NULL AS underlying, NULL AS option_type, last_updated
-        FROM kite_indices;
+            NULL AS underlying, NULL AS option_type
+        FROM kite_indices
+        WHERE expiry IS NULL OR expiry >= {MEILI_INSTRUMENT_MARKET_DATE_SQL};
     """
     logger.info("Fetching instruments from PostgreSQL for search indexing...")
     db_records = await database.fetch_all(sql_query)
     return [dict(record) for record in db_records]
 
 
+async def fetch_expired_instrument_search_ids() -> List[str]:
+    sql_query = f"""
+        WITH source_rows AS (
+            SELECT instrument_token, expiry
+            FROM kite_instruments
+            UNION ALL
+            SELECT instrument_token, expiry
+            FROM kite_indices
+        ),
+        active_tokens AS (
+            SELECT DISTINCT instrument_token
+            FROM source_rows
+            WHERE expiry IS NULL OR expiry >= {MEILI_INSTRUMENT_MARKET_DATE_SQL}
+        ),
+        expired_tokens AS (
+            SELECT DISTINCT instrument_token
+            FROM source_rows
+            WHERE expiry < {MEILI_INSTRUMENT_MARKET_DATE_SQL}
+        )
+        SELECT expired_tokens.instrument_token
+        FROM expired_tokens
+        LEFT JOIN active_tokens USING (instrument_token)
+        WHERE active_tokens.instrument_token IS NULL;
+    """
+    rows = await database.fetch_all(sql_query)
+    return [str(row["instrument_token"]) for row in rows]
+
+
 def build_instrument_search_documents(db_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     documents = []
-
-    def _format_expiry_label(dt: Optional[date]) -> Optional[str]:
-        if not dt:
-            return None
-        try:
-            return dt.strftime("%d-%b-%Y")
-        except Exception:
-            return None
 
     def _type_rank(doc: Dict[str, Any]) -> int:
         segment = str(doc.get("segment", "")).upper()
@@ -600,13 +644,18 @@ def build_instrument_search_documents(db_records: List[Dict[str, Any]]) -> List[
             boost = 100
             base_aliases.extend(["NIFTY", "NIFTY50", "NIFTY 50"])
 
-        all_aliases = set(base_aliases)
-        if tradingsymbol:
-            all_aliases.add(tradingsymbol.upper())
-        if name:
-            all_aliases.add(name.upper())
+        searchable_reference = {
+            value.upper()
+            for value in (underlying, tradingsymbol, name)
+            if value
+        }
+        all_aliases = {
+            alias.upper()
+            for alias in base_aliases
+            if alias and alias.upper() not in searchable_reference
+        }
 
-        return boost, list(all_aliases)
+        return boost, sorted(all_aliases)
 
     for record in db_records:
         doc = {
@@ -625,16 +674,12 @@ def build_instrument_search_documents(db_records: List[Dict[str, Any]]) -> List[
             "exchange": record["exchange"],
             "underlying": record["underlying"],
             "option_type": record["option_type"],
-            "last_updated": record["last_updated"].isoformat() if record["last_updated"] else None,
-            "underlying_symbol": record["underlying"],
             "derivative_kind": "NONE",
             "expiry_ts": None,
             "expiry_year": None,
             "expiry_month": None,
-            "expiry_label": None,
             "type_rank": 9,
             "boost_score": 0,
-            "aliases": [],
         }
 
         instrument_type = record["instrument_type"]
@@ -663,7 +708,6 @@ def build_instrument_search_documents(db_records: List[Dict[str, Any]]) -> List[
                 cleaned = re.sub(r'[^A-Z0-9]', '', first_word)
                 derived_underlying = cleaned if cleaned else up_ts
             doc["underlying"] = derived_underlying
-            doc["underlying_symbol"] = doc["underlying"]
             instrument_type = doc["instrument_type"]
 
         if instrument_type in {"CE", "PE"}:
@@ -676,13 +720,13 @@ def build_instrument_search_documents(db_records: List[Dict[str, Any]]) -> List[
             doc["expiry_ts"] = int(expiry_utc.timestamp())
             doc["expiry_year"] = expiry_date.year
             doc["expiry_month"] = expiry_date.month
-            doc["expiry_label"] = _format_expiry_label(expiry_date)
 
         doc["type_rank"] = _type_rank(doc)
         underlying_for_aliases = doc.get("underlying") or tradingsymbol
         boost, alias_list = _boost_and_aliases(underlying_for_aliases, tradingsymbol, doc.get("name"))
         doc["boost_score"] = boost
-        doc["aliases"] = list(set(alias_list))
+        if alias_list:
+            doc["aliases"] = alias_list
 
         documents.append(doc)
 
@@ -702,17 +746,18 @@ async def meili_reindex_instruments():
 
     db_records = await fetch_instrument_search_records()
     documents = build_instrument_search_documents(db_records)
+    expired_document_ids = await fetch_expired_instrument_search_ids()
 
     total_documents = len(documents)
     if not total_documents:
         logger.info("No instruments to reindex in Meilisearch.")
-        return {"total": 0, "batches": 0}
+        return {"total": 0, "batches": 0, "expired_removed": 0}
 
     batch_size = 5000 # Sensible default batch size
     batches = 0
     last_task_uid = None
 
-    logger.info(f"Starting Meilisearch reindexing for {total_documents} instruments in batches of {batch_size}...")
+    logger.info(f"Starting Meilisearch reindexing for {total_documents} active instruments in batches of {batch_size}...")
     for i in range(0, total_documents, batch_size):
         batch = documents[i:i + batch_size]
         try:
@@ -732,7 +777,24 @@ async def meili_reindex_instruments():
     else:
         logger.info("No documents were sent to Meilisearch for reindexing.")
 
-    return {"total": total_documents, "batches": batches}
+    expired_removed = 0
+    last_delete_task_uid = None
+    for i in range(0, len(expired_document_ids), batch_size):
+        batch = expired_document_ids[i:i + batch_size]
+        try:
+            task = index.delete_documents(batch)
+            last_delete_task_uid = task.task_uid
+            expired_removed += len(batch)
+        except Exception as e:
+            logger.error(f"Error deleting expired Meilisearch instruments batch starting at {i}: {e}", exc_info=True)
+            raise
+
+    if last_delete_task_uid is not None:
+        logger.info(f"Waiting for last expired Meilisearch delete task ({last_delete_task_uid}) to complete...")
+        client.wait_for_task(last_delete_task_uid)
+        logger.info(f"Expired Meilisearch instruments removed: {expired_removed}.")
+
+    return {"total": total_documents, "batches": batches, "expired_removed": expired_removed}
 
 
 
@@ -1062,10 +1124,9 @@ async def import_instruments_for_exchange(exchange: str, kite: KiteConnect):
 
 async def import_all_instruments(kite: KiteConnect = Depends(get_kite)):
     """Import all instruments from major exchanges for internal maintenance flows."""
-    exchanges = ["NSE", "NFO", "BSE", "BFO", "MCX"]
     results = []
     
-    for exchange in exchanges:
+    for exchange in KITE_INSTRUMENT_IMPORT_EXCHANGES:
         try:
             result = await import_instruments_for_exchange(exchange, kite)
             results.append(result)
@@ -1466,11 +1527,7 @@ async def fuzzy_search_instruments(
             options = {
                 "limit": limit,
                 "sort": ["boost_score:desc","type_rank:asc","expiry_ts:asc"],
-                "attributesToRetrieve": [
-                    'instrument_token', 'exchange_token', 'tradingsymbol', 'name',
-                    'last_price', 'expiry', 'strike', 'tick_size', 'lot_size',
-                    'instrument_type', 'segment', 'exchange', 'underlying', 'option_type'
-                ]
+                "attributesToRetrieve": MEILI_INSTRUMENT_RESULT_ATTRIBUTES,
             }
             # Pre-sanitize sort against current index settings to avoid invalid_search_sort
             try:
@@ -1534,11 +1591,7 @@ async def fuzzy_search_instruments(
 
     options = {
         "limit": limit,
-        "attributesToRetrieve": [
-            'instrument_token', 'exchange_token', 'tradingsymbol', 'name',
-            'last_price', 'expiry', 'strike', 'tick_size', 'lot_size',
-            'instrument_type', 'segment', 'exchange', 'underlying', 'option_type'
-        ]
+        "attributesToRetrieve": MEILI_INSTRUMENT_RESULT_ATTRIBUTES,
     }
     
     filter_clauses = []
@@ -1808,7 +1861,7 @@ def parse_fo_query(query: str) -> Dict[str, Any]:
     month_map = {name.upper(): i for i, name in enumerate(calendar.month_abbr) if i}
     
     # Exchange hints
-    exchange_map = {"NSE": "NSE", "NFO": "NFO", "BFO": "BFO", "MCX": "MCX"}
+    exchange_map = {exchange: exchange for exchange in KITE_INSTRUMENT_IMPORT_EXCHANGES}
 
     # --- Extraction Logic ---
     residual_tokens = []
