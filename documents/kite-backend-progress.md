@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-04-28
+Last updated: 2026-04-29
 
 ## Scope
 
@@ -471,6 +471,20 @@ Update after latest verification:
 - baseline Postgres/Redis integration coverage now exists for canonical runtime + failure paths
 - remaining verification gap is mainly live duplicate/replay edge cases and live MF get-by-id/write-path shapes
 - attempted live duplicate/replay verification on 2026-04-05, but the current Kite account had `orders() == 0` and `trades() == 0`, and runtime raw event tables were empty, so there was no real captured order-event bundle available to replay without placing a new live order
+- live worker drill on 2026-04-29 verified that the SDK can stream fresh GOLDM data after subscription, compute indicators from worker-safe historical candles, preview live orders, and place real broker orders from worker runs
+- the same live drill also exposed a critical backend-control-plane gap for generic worker protection: a stale-worker protection exit closed the run `live_protection_idea_1777436466` as already flat even though the broker-side `IDEA` `MIS` buy had filled and remained open until a second manual worker sell flattened it
+- live worker order/trade inspection is not yet trustworthy because real broker orders/trades for those runs were filtered out of `/api/algo-workers/worker/orders` and `/api/algo-workers/worker/trades`, while `order_state_projection` also remained stuck at `PLACED` for both filled order IDs
+- likely root cause from the drill: live worker fills were not linked into `journal_source_links` / `journal_execution_facts` for the worker `strategy_run_id`, so `_list_live_strategy_open_legs_sync(...)` returned no legs and `_exit_live_worker_run(...)` treated the run as flat
+- same-day fixes corrected the worker safety path by:
+  - deriving worker live open legs from `live_order_intents` + trade fills instead of journal tables
+  - recovering durable worker attribution from broker order ids and client-order-ref tags, including canonical order-event tag recovery when direct backfill lags
+  - adding a direct-broker defer guard so a run is not falsely marked flat just because local attribution/projection tables are behind
+  - adding `market_protection=-1` to backend-generated live market exit orders
+  - adding a live worker P&L fallback when journal linkage is missing
+- same-day live re-validation then succeeded for:
+  - grouped live entry/exit round-trip on `live_final_exit_1777441545`
+  - full backend stale-worker auto-exit on `live_stale_auto_1777441609` with real broker fill, trigger at `heartbeat_age_sec=31`, attributed exit order, final closed run, and flat broker account
+- generic worker stoploss/target logic remains strongly unit-tested but not fully forced against real market movement in the same live session; stale-worker protection is the best live-validated generic path so far
 
 If a new agent picks this up, the correct next task is:
 

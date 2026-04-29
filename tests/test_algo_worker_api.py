@@ -32,6 +32,7 @@ from api.routers.algo_workers import (  # noqa: E402
     get_worker_market_snapshot,
     get_worker_market_quotes,
     list_worker_orders,
+    list_worker_trades,
     cancel_worker_order,
     preview_worker_order,
     WorkerOrderActionRequest,
@@ -62,6 +63,9 @@ from api.routers.algo_workers import (  # noqa: E402
 )
 from api.routers.algo_workers import _hash_token  # noqa: E402
 from api.worker_market_data import WorkerMarketDataService  # noqa: E402
+from sqlalchemy import create_engine, event, text  # noqa: E402
+from sqlalchemy.orm import sessionmaker  # noqa: E402
+from sqlalchemy.pool import StaticPool  # noqa: E402
 
 
 async def _run_to_thread_inline(func, /, *args, **kwargs):
@@ -70,6 +74,86 @@ async def _run_to_thread_inline(func, /, *args, **kwargs):
 
 async def _single_sse(payload: str):
     yield f"event: snapshot\ndata: {payload}\n\n"
+
+
+def _sqlite_algo_worker_repo() -> SqlAlchemyAlgoWorkerRepository:
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _attach_public_schema(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("ATTACH DATABASE ':memory:' AS public")
+        cursor.close()
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.live_order_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    client_order_ref TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    strategy_run_id TEXT NOT NULL,
+                    broker_order_id TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.order_trade_fills (
+                    account_id TEXT NOT NULL,
+                    trade_id TEXT NOT NULL,
+                    order_id TEXT NOT NULL,
+                    instrument_token BIGINT NOT NULL,
+                    exchange TEXT,
+                    tradingsymbol TEXT,
+                    product TEXT NOT NULL,
+                    transaction_type TEXT NOT NULL,
+                    quantity INT NOT NULL,
+                    price NUMERIC,
+                    fill_timestamp TEXT,
+                    payload_json TEXT,
+                    PRIMARY KEY (account_id, trade_id)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.canonical_order_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    order_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.account_positions (
+                    account_id TEXT NOT NULL,
+                    instrument_token BIGINT NOT NULL,
+                    product TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    tradingsymbol TEXT NOT NULL,
+                    net_quantity INT NOT NULL,
+                    PRIMARY KEY (account_id, instrument_token, product)
+                )
+                """
+            )
+        )
+    factory = sessionmaker(bind=engine)
+    return SqlAlchemyAlgoWorkerRepository(session_factory=factory)
 
 
 class _FakeWorkerRepository:
@@ -88,6 +172,8 @@ class _FakeWorkerRepository:
         self.intent_results = {}
         self.touched = []
         self.live_open_legs = {}
+        self.live_order_attribution_refs = {}
+        self.live_broker_positions = {}
 
     async def create_token(self, payload, *, raw_token, token_id):
         self.tokens[token_id] = {
@@ -189,6 +275,16 @@ class _FakeWorkerRepository:
 
     async def list_live_strategy_open_legs(self, *, strategy_run_id, account_id):
         return [dict(item) for item in self.live_open_legs.get(strategy_run_id, [])]
+
+    async def get_live_order_attribution_refs(self, *, strategy_run_id, account_id):
+        refs = self.live_order_attribution_refs.get(strategy_run_id, {})
+        return {
+            "broker_order_ids": list(refs.get("broker_order_ids", [])),
+            "client_order_refs": list(refs.get("client_order_refs", [])),
+        }
+
+    async def list_live_strategy_broker_positions(self, *, strategy_run_id, account_id):
+        return [dict(item) for item in self.live_broker_positions.get(strategy_run_id, [])]
 
     async def get_intent_result(self, strategy_run_id, idempotency_key):
         return self.intent_results.get((strategy_run_id, idempotency_key))
@@ -1232,6 +1328,245 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["orders"][0]["order_id"], "260428150255994")
 
+    async def test_live_open_leg_detection_works_without_journal_rows(self):
+        repo = _sqlite_algo_worker_repo()
+        session = repo.session_factory()
+        try:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO live_order_intents (intent_id, client_order_ref, account_id, strategy_run_id, broker_order_id)
+                    VALUES (:intent_id, :client_order_ref, :account_id, :strategy_run_id, :broker_order_id)
+                    """
+                ),
+                {
+                    "intent_id": "lint-1",
+                    "client_order_ref": "KAOPEN01",
+                    "account_id": "kite:AB1234",
+                    "strategy_run_id": "run-live",
+                    "broker_order_id": "OID-1",
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO order_trade_fills (
+                        account_id, trade_id, order_id, instrument_token, exchange, tradingsymbol,
+                        product, transaction_type, quantity, price, fill_timestamp, payload_json
+                    ) VALUES (
+                        :account_id, :trade_id, :order_id, :instrument_token, :exchange, :tradingsymbol,
+                        :product, :transaction_type, :quantity, :price, :fill_timestamp, :payload_json
+                    )
+                    """
+                ),
+                {
+                    "account_id": "kite:AB1234",
+                    "trade_id": "T-1",
+                    "order_id": "OID-1",
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "product": "MIS",
+                    "transaction_type": "BUY",
+                    "quantity": 2,
+                    "price": 1500,
+                    "fill_timestamp": "2026-04-29T09:15:00Z",
+                    "payload_json": "{}",
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO account_positions (account_id, instrument_token, product, exchange, tradingsymbol, net_quantity)
+                    VALUES (:account_id, :instrument_token, :product, :exchange, :tradingsymbol, :net_quantity)
+                    """
+                ),
+                {
+                    "account_id": "kite:AB1234",
+                    "instrument_token": 408065,
+                    "product": "MIS",
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "net_quantity": 2,
+                },
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        legs = await repo.list_live_strategy_open_legs(strategy_run_id="run-live", account_id="kite:AB1234")
+
+        self.assertEqual(len(legs), 1)
+        self.assertEqual(legs[0]["net_quantity"], 2)
+        self.assertEqual(legs[0]["broker_net_quantity"], 2)
+        self.assertEqual(legs[0]["tradingsymbol"], "INFY")
+
+    async def test_live_open_leg_detection_can_recover_order_id_from_canonical_tag(self):
+        repo = _sqlite_algo_worker_repo()
+        session = repo.session_factory()
+        try:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO live_order_intents (intent_id, client_order_ref, account_id, strategy_run_id, broker_order_id)
+                    VALUES (:intent_id, :client_order_ref, :account_id, :strategy_run_id, NULL)
+                    """
+                ),
+                {
+                    "intent_id": "lint-2",
+                    "client_order_ref": "KATAGRECOVER",
+                    "account_id": "kite:AB1234",
+                    "strategy_run_id": "run-live-recover",
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO canonical_order_events (account_id, order_id, payload_json)
+                    VALUES (:account_id, :order_id, :payload_json)
+                    """
+                ),
+                {
+                    "account_id": "kite:AB1234",
+                    "order_id": "OID-RECOVER-1",
+                    "payload_json": '{"tag":"KATAGRECOVER"}',
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO order_trade_fills (
+                        account_id, trade_id, order_id, instrument_token, exchange, tradingsymbol,
+                        product, transaction_type, quantity, price, fill_timestamp, payload_json
+                    ) VALUES (
+                        :account_id, :trade_id, :order_id, :instrument_token, :exchange, :tradingsymbol,
+                        :product, :transaction_type, :quantity, :price, :fill_timestamp, :payload_json
+                    )
+                    """
+                ),
+                {
+                    "account_id": "kite:AB1234",
+                    "trade_id": "T-RECOVER-1",
+                    "order_id": "OID-RECOVER-1",
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "product": "MIS",
+                    "transaction_type": "BUY",
+                    "quantity": 1,
+                    "price": 1500,
+                    "fill_timestamp": "2026-04-29T09:15:00Z",
+                    "payload_json": "{}",
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO account_positions (account_id, instrument_token, product, exchange, tradingsymbol, net_quantity)
+                    VALUES (:account_id, :instrument_token, :product, :exchange, :tradingsymbol, :net_quantity)
+                    """
+                ),
+                {
+                    "account_id": "kite:AB1234",
+                    "instrument_token": 408065,
+                    "product": "MIS",
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "net_quantity": 1,
+                },
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        refs = await repo.get_live_order_attribution_refs(strategy_run_id="run-live-recover", account_id="kite:AB1234")
+        legs = await repo.list_live_strategy_open_legs(strategy_run_id="run-live-recover", account_id="kite:AB1234")
+
+        self.assertEqual(refs["broker_order_ids"], ["OID-RECOVER-1"])
+        self.assertEqual(refs["client_order_refs"], ["KATAGRECOVER"])
+        self.assertEqual(len(legs), 1)
+        self.assertEqual(legs[0]["instrument_token"], 408065)
+
+    async def test_worker_order_list_matches_by_broker_order_id_or_tag(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        repo.live_order_attribution_refs["run-live"] = {
+            "broker_order_ids": ["OID-1"],
+            "client_order_refs": ["KATAG01"],
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = SimpleNamespace(
+            orders=lambda kite, corr_id: [
+                {"order_id": "OID-1", "status": "COMPLETE", "tradingsymbol": "INFY"},
+                {"order_id": "OID-2", "status": "OPEN", "tag": "KATAG01", "tradingsymbol": "TCS"},
+                {"order_id": "OID-X", "status": "OPEN", "tag": "OTHER", "tradingsymbol": "RELIANCE"},
+            ]
+        )
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ):
+            response = await list_worker_orders(request, "run-live")
+
+        self.assertEqual([order["order_id"] for order in response["orders"]], ["OID-1", "OID-2"])
+
+    async def test_worker_trade_list_matches_by_order_id_or_tag(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        repo.live_order_attribution_refs["run-live"] = {
+            "broker_order_ids": ["OID-1"],
+            "client_order_refs": ["KATAG01"],
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = SimpleNamespace(
+            trades=lambda kite, corr_id: [
+                {"trade_id": "T-1", "order_id": "OID-1", "tradingsymbol": "INFY", "exchange": "NSE", "instrument_token": 408065, "transaction_type": "BUY", "product": "MIS", "average_price": 1500, "quantity": 1},
+                {"trade_id": "T-2", "order_id": "OID-2", "tag": "KATAG01", "tradingsymbol": "TCS", "exchange": "NSE", "instrument_token": 2953217, "transaction_type": "BUY", "product": "MIS", "average_price": 3500, "quantity": 1},
+                {"trade_id": "T-X", "order_id": "OID-X", "tag": "OTHER", "tradingsymbol": "RELIANCE", "exchange": "NSE", "instrument_token": 738561, "transaction_type": "BUY", "product": "MIS", "average_price": 2500, "quantity": 1},
+            ]
+        )
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ):
+            response = await list_worker_trades(request, "run-live")
+
+        self.assertEqual([trade["trade_id"] for trade in response["trades"]], ["T-1", "T-2"])
+
     async def test_worker_can_get_order_snapshot_for_grouped_run(self):
         token = WorkerToken(
             token_id="worker-live",
@@ -1257,6 +1592,47 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
                 "order_id": order_id,
                 "status": "COMPLETE",
                 "strategy_run_id": "run-live",
+                "tradingsymbol": "INFY",
+            }
+        )
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ):
+            response = await get_worker_order(request, "OID-1", strategy_run_id="run-live")
+
+        self.assertEqual(response["order"]["order_id"], "OID-1")
+
+    async def test_worker_order_snapshot_accepts_same_run_via_durable_attribution(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        repo.live_order_attribution_refs["run-live"] = {
+            "broker_order_ids": ["OID-1"],
+            "client_order_refs": ["KATAG01"],
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = SimpleNamespace(
+            order_snapshot=lambda kite, order_id, corr_id: {
+                "order_id": order_id,
+                "status": "COMPLETE",
+                "tag": "KATAG01",
                 "tradingsymbol": "INFY",
             }
         )
@@ -1295,6 +1671,57 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await get_worker_order_history(request, "OID-1", strategy_run_id="run-live")
+
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    async def test_worker_order_history_accepts_same_run_via_durable_attribution_and_rejects_cross_run(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        repo.live_order_attribution_refs["run-live"] = {
+            "broker_order_ids": ["OID-1"],
+            "client_order_refs": ["KATAG01"],
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = SimpleNamespace(
+            order_history=lambda kite, order_id, corr_id: [
+                {"order_id": order_id, "status": "OPEN", "order_timestamp": "2026-04-28T09:15:00Z", "tag": "KATAG01"}
+            ]
+        )
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ):
+            response = await get_worker_order_history(request, "OID-1", strategy_run_id="run-live")
+
+        self.assertEqual(response["order_id"], "OID-1")
+
+        repo.live_order_attribution_refs["run-live"] = {
+            "broker_order_ids": ["OID-Z"],
+            "client_order_refs": ["OTHER-TAG"],
+        }
         with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
             "api.routers.algo_workers.asyncio.to_thread",
             _run_to_thread_inline,
@@ -1443,6 +1870,7 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["status"], "dry_run")
         self.assertIn("orders", response["exit"])
+        self.assertEqual(response["exit"]["orders"][0]["market_protection"], -1)
 
     async def test_worker_intent_rejects_non_open_run(self):
         repo = _FakeWorkerRepository()
@@ -1499,6 +1927,116 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["run"]["status"], "closed")
         self.assertEqual(repo.runs["run-live"]["runtime_state"]["exit_reason"], "target reached")
         paper_runtime.exit_strategy.assert_not_called()
+
+    async def test_live_worker_exit_defers_when_no_grouped_legs_but_broker_exposure_still_exists(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+            "runtime_state": {},
+        }
+        repo.live_broker_positions["run-live"] = [
+            {
+                "account_id": "kite:AB1234",
+                "instrument_token": 408065,
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "product": "CNC",
+                "net_quantity": 1,
+            }
+        ]
+        paper_runtime = SimpleNamespace(exit_strategy=AsyncMock())
+        request = self._request(repo, paper_runtime=paper_runtime)
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers._refresh_live_account_state",
+            AsyncMock(return_value={"account_id": "kite:AB1234", "reconciled_positions": 1}),
+        ), patch("api.routers.algo_workers.asyncio.to_thread", _run_to_thread_inline):
+            response = await exit_worker_run(request, "run-live", WorkerExitRequest(reason="target reached"))
+
+        self.assertEqual(response["status"], "deferred")
+        self.assertTrue(response["deferred"])
+        self.assertEqual(repo.runs["run-live"]["status"], "open")
+        self.assertNotIn("exit_reason", repo.runs["run-live"].get("runtime_state") or {})
+        paper_runtime.exit_strategy.assert_not_called()
+
+    async def test_live_worker_exit_defers_when_direct_broker_orders_show_exposure_before_projection_catches_up(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+            "runtime_state": {},
+        }
+        repo.live_order_attribution_refs["run-live"] = {
+            "broker_order_ids": [],
+            "client_order_refs": ["KATAG01"],
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = SimpleNamespace(
+            orders=lambda kite, corr_id: [
+                {
+                    "order_id": "OID-1",
+                    "tag": "KATAG01",
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "product": "CNC",
+                }
+            ]
+        )
+        fake_kite = SimpleNamespace(
+            access_token="token",
+            positions=lambda: {
+                "net": [
+                    {
+                        "instrument_token": 408065,
+                        "exchange": "NSE",
+                        "tradingsymbol": "INFY",
+                        "product": "CNC",
+                        "quantity": 1,
+                        "average_price": 100.0,
+                        "last_price": 101.0,
+                    }
+                ]
+            },
+        )
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=fake_kite), patch(
+            "api.routers.algo_workers._refresh_live_account_state",
+            AsyncMock(return_value={"account_id": "kite:AB1234", "reconciled_positions": 1}),
+        ), patch("api.routers.algo_workers.asyncio.to_thread", _run_to_thread_inline):
+            response = await exit_worker_run(request, "run-live", WorkerExitRequest(reason="target reached"))
+
+        self.assertEqual(response["status"], "deferred")
+        self.assertTrue(response["deferred"])
+        self.assertEqual(response["broker_positions"][0]["tradingsymbol"], "INFY")
+        self.assertEqual(repo.runs["run-live"]["status"], "open")
 
     async def test_live_worker_exit_places_reducing_basket_and_keeps_run_exiting_until_flat(self):
         token = WorkerToken(
@@ -1559,6 +2097,7 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         planned_orders = repo.runs["run-live"]["runtime_state"]["live_exit"]["orders"]
         self.assertEqual(planned_orders[0]["transaction_type"], "SELL")
         self.assertEqual(planned_orders[0]["quantity"], 1)
+        self.assertEqual(planned_orders[0]["market_protection"], -1)
         self.assertEqual(planned_orders[0]["attribution"]["strategy_run_id"], "run-live")
         self.assertEqual(live_orders.place_basket.await_args.kwargs["idempotency_key"], "exit-0001")
 
@@ -1789,6 +2328,63 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response["is_stale"])
         self.assertTrue(response["legs"][0]["is_stale"])
+
+    async def test_worker_run_pnl_snapshot_falls_back_to_live_attribution_legs_without_journal_link(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-fallback"] = {
+            "strategy_run_id": "run-live-fallback",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        repo.live_open_legs["run-live-fallback"] = [
+            {
+                "instrument_token": 408065,
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "product": "CNC",
+                "net_quantity": 1,
+                "broker_net_quantity": 1,
+            }
+        ]
+        request = self._request(repo)
+        request.app.state.algo_worker_journal_repository = SimpleNamespace(
+            find_source_link=lambda **kwargs: None,
+        )
+        request.app.state.algo_worker_realtime_positions_service = SimpleNamespace(
+            get_positions=AsyncMock(
+                return_value={
+                    "NSE:INFY:CNC": SimpleNamespace(
+                        instrument_token=408065,
+                        product="CNC",
+                        quantity=1,
+                        average_price=100.0,
+                        last_price=101.5,
+                        last_reconciled_at="2026-04-25T12:00:05+00:00",
+                    )
+                }
+            )
+        )
+
+        response = await get_worker_run_pnl(request, "run-live-fallback")
+
+        self.assertEqual(response["position_count"], 1)
+        self.assertEqual(response["legs"][0]["tradingsymbol"], "INFY")
+        self.assertEqual(response["legs"][0]["average_price"], 100.0)
+        self.assertEqual(response["totals"]["unrealized_pnl"], 1.5)
+        self.assertEqual(response["totals"]["charges"], 0.0)
+        self.assertFalse(response["is_stale"])
 
     async def test_worker_run_pnl_stream_returns_sse_snapshot(self):
         repo = _FakeWorkerRepository()

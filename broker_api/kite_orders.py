@@ -293,9 +293,16 @@ class Trade(BaseModel):
     product: str
     average_price: float
     quantity: int
-    order_timestamp: datetime
-    exchange_timestamp: datetime
-    fill_timestamp: datetime
+    order_timestamp: str | datetime | None = None
+    exchange_timestamp: str | datetime | None = None
+    fill_timestamp: str | datetime | None = None
+
+    @field_validator("order_timestamp", "exchange_timestamp", "fill_timestamp", mode="before")
+    @classmethod
+    def _coerce_trade_timestamp(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
 
 class BasketOrderRequest(BaseModel):
     """Request model for placing multiple orders as a basket"""

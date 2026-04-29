@@ -1,6 +1,6 @@
 # Backend Control Plane Progress
 
-Date: 2026-04-25
+Date: 2026-04-29
 
 ## Status
 
@@ -69,10 +69,28 @@ Date: 2026-04-25
   - Latest result: `23 passed, 1 warning`.
   - `npm --prefix frontend-next test -- features/trading/components/control-plane-panel.test.tsx`
   - Latest result: `1 passed`.
+- Live drill on 2026-04-29:
+  - GOLDM worker market data became fresh once subscribed through the worker market stream; 5-minute historical candles and indicator calculations (`sma`, `ema`, `rsi`, `atr`, `LiveIndicatorEngine`) worked for `MCX:GOLDM26MAYFUT`.
+  - A live `NSE:IDEA` `MIS` buy intent from worker run `live_protection_idea_1777436466` reached the broker and filled (`order_id=260429150367762`, buy 1 @ 10.34).
+  - Backend worker-stale protection triggered after ~31s and closed the run, but incorrectly concluded the run was already flat instead of placing/confirming a protective exit.
+  - Manual flatten via worker run `live_flatten_idea_1777436676` also reached the broker and filled (`order_id=260429150386155`, sell 1 @ 10.33), restoring broker-side flatness.
+  - During the drill, worker `list_orders` / `list_trades` stayed empty and `get_order_snapshot` returned 404 for the real broker order IDs.
+  - same-day follow-up fixes corrected the live worker attribution/safety chain:
+    - live open-leg detection no longer depends on journal tables for worker safety
+    - worker order/trade inspection now matches by durable order id / client-order-ref tag attribution, including canonical event tag recovery when direct backfill lags
+    - live worker P&L gained an attribution fallback when journal linkage is missing
+    - backend-generated live exit basket orders now include `market_protection=-1`
+    - protection runtime now understands deferred exits instead of forcing a false terminal submission state
+  - live re-validation after fixes succeeded:
+    - grouped live entry/exit round-trip completed successfully on `live_final_exit_1777441545`
+    - full backend stale-worker auto-exit completed successfully on `live_stale_auto_1777441609` with real broker buy + backend-triggered sell + final flat account state
 
 ## Current limitations
 
 - Backend does not mirror strategy logic or create entries, re-entries, rolls, strike selection, rebalance actions, or ML decisions.
 - Generic worker backend protection is now present for declarative exposure exits only; it still does not mirror worker strategy logic.
+- Live worker protection is not yet trustworthy for real broker fills until attribution/journal linkage is fixed:
+- Journaling can still lag or miss worker-fill linkage, but worker safety no longer depends on journal tables for open-leg detection.
+- Generic worker stoploss/target logic is still primarily live-verified only for stale-worker protection; stoploss/target live-forced market validation remains pending.
 - Strategy-scoped cancel remains disabled until open broker orders can be attributed safely by `strategy_run_id`.
 - Manual/unattributed residual P&L for partially overlapping live strategy positions is prorated from broker position P&L because broker realtime positions are account-level, not attribution-level.

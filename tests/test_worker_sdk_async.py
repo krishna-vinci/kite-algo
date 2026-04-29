@@ -80,6 +80,7 @@ def test_async_client_core_parity_methods_use_worker_endpoints():
         [
             types.SimpleNamespace(status_code=200, content=b'{"status": "ok"}', text='{"status": "ok"}', json=lambda: {"status": "ok"}),
             types.SimpleNamespace(status_code=200, content=b'{"account_scope": "kite:paper-a"}', text='{"account_scope": "kite:paper-a"}', json=lambda: {"account_scope": "kite:paper-a"}),
+            types.SimpleNamespace(status_code=200, content=b'{"quotes": [{"symbol": "NSE:INFY"}], "missing": []}', text='{"quotes": [{"symbol": "NSE:INFY"}], "missing": []}', json=lambda: {"quotes": [{"symbol": "NSE:INFY"}], "missing": []}),
             types.SimpleNamespace(status_code=200, content=b'{"strategy_run_id": "run-1", "orders": []}', text='{"strategy_run_id": "run-1", "orders": []}', json=lambda: {"strategy_run_id": "run-1", "orders": []}),
             types.SimpleNamespace(status_code=200, content=b'{"strategy_run_id": "run-1", "trades": []}', text='{"strategy_run_id": "run-1", "trades": []}', json=lambda: {"strategy_run_id": "run-1", "trades": []}),
             types.SimpleNamespace(status_code=200, content=b'{"strategy_run_id": "run-1", "mode": "live", "preview": {"intent_type": "place_basket"}}', text='{"strategy_run_id": "run-1", "mode": "live", "preview": {"intent_type": "place_basket"}}', json=lambda: {"strategy_run_id": "run-1", "mode": "live", "preview": {"intent_type": "place_basket"}}),
@@ -90,6 +91,7 @@ def test_async_client_core_parity_methods_use_worker_endpoints():
         async with AsyncKiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test")) as client:
             health = await client.health()
             funds = await client.get_funds(mode="paper", account_scope="kite:paper-a")
+            quotes = await client.get_quotes(["NSE:INFY"], mode="quote")
             orders = await client.list_orders("run-1")
             trades = await client.list_trades("run-1")
             preview = await client.preview_basket(
@@ -105,23 +107,26 @@ def test_async_client_core_parity_methods_use_worker_endpoints():
                     }
                 ],
             )
-            return health, funds, orders, trades, preview
+            return health, funds, quotes, orders, trades, preview
 
-    health, funds, orders, trades, preview = asyncio.run(main())
+    health, funds, quotes, orders, trades, preview = asyncio.run(main())
 
     assert health == {"status": "ok"}
     assert funds["account_scope"] == "kite:paper-a"
+    assert quotes["quotes"][0]["symbol"] == "NSE:INFY"
     assert orders["strategy_run_id"] == "run-1"
     assert trades["strategy_run_id"] == "run-1"
     assert preview["preview"]["intent_type"] == "place_basket"
     assert httpx.calls[0]["url"] == "http://localhost:8000/api/algo-workers/worker/health"
     assert httpx.calls[1]["kwargs"]["params"] == {"mode": "paper", "account_scope": "kite:paper-a"}
-    assert httpx.calls[2]["url"] == "http://localhost:8000/api/algo-workers/worker/orders"
-    assert httpx.calls[2]["kwargs"]["params"] == {"strategy_run_id": "run-1"}
-    assert httpx.calls[3]["url"] == "http://localhost:8000/api/algo-workers/worker/trades"
+    assert httpx.calls[2]["url"] == "http://localhost:8000/api/algo-workers/worker/market/quotes"
+    assert httpx.calls[2]["kwargs"]["json"] == {"symbols": ["NSE:INFY"], "instrument_tokens": [], "mode": "quote"}
+    assert httpx.calls[3]["url"] == "http://localhost:8000/api/algo-workers/worker/orders"
     assert httpx.calls[3]["kwargs"]["params"] == {"strategy_run_id": "run-1"}
-    assert httpx.calls[4]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/preview/basket"
-    assert httpx.calls[4]["kwargs"]["json"] == {
+    assert httpx.calls[4]["url"] == "http://localhost:8000/api/algo-workers/worker/trades"
+    assert httpx.calls[4]["kwargs"]["params"] == {"strategy_run_id": "run-1"}
+    assert httpx.calls[5]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/preview/basket"
+    assert httpx.calls[5]["kwargs"]["json"] == {
         "orders": [
             {
                 "exchange": "NSE",

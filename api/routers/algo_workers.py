@@ -401,6 +401,12 @@ class SqlAlchemyAlgoWorkerRepository:
     async def list_live_strategy_open_legs(self, *, strategy_run_id: str, account_id: str) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(self._list_live_strategy_open_legs_sync, strategy_run_id, account_id)
 
+    async def get_live_order_attribution_refs(self, *, strategy_run_id: str, account_id: str) -> Dict[str, List[str]]:
+        return await asyncio.to_thread(self._get_live_order_attribution_refs_sync, strategy_run_id, account_id)
+
+    async def list_live_strategy_broker_positions(self, *, strategy_run_id: str, account_id: str) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._list_live_strategy_broker_positions_sync, strategy_run_id, account_id)
+
     async def get_intent_result(self, strategy_run_id: str, idempotency_key: str) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._get_intent_result_sync, strategy_run_id, idempotency_key)
 
@@ -868,30 +874,58 @@ class SqlAlchemyAlgoWorkerRepository:
             rows = db.execute(
                 text(
                     """
-                    WITH leg_facts AS (
+                    WITH attributed_orders AS (
+                        SELECT DISTINCT
+                            resolved.account_id,
+                            resolved.broker_order_id
+                        FROM (
+                            SELECT
+                                loi.account_id,
+                                loi.broker_order_id
+                            FROM public.live_order_intents loi
+                            WHERE loi.strategy_run_id = :strategy_run_id
+                              AND loi.account_id = :account_id
+                              AND COALESCE(NULLIF(loi.broker_order_id, ''), '') <> ''
+                            UNION ALL
+                            SELECT
+                                loi.account_id,
+                                coe.order_id AS broker_order_id
+                            FROM public.live_order_intents loi
+                            INNER JOIN public.canonical_order_events coe
+                              ON coe.account_id = loi.account_id
+                             AND CAST(coe.payload_json AS TEXT) LIKE '%"tag"%'
+                             AND CAST(coe.payload_json AS TEXT) LIKE '%' || '"' || loi.client_order_ref || '"' || '%'
+                            WHERE loi.strategy_run_id = :strategy_run_id
+                              AND loi.account_id = :account_id
+                              AND COALESCE(NULLIF(loi.client_order_ref, ''), '') <> ''
+                        ) resolved
+                        WHERE COALESCE(NULLIF(resolved.broker_order_id, ''), '') <> ''
+                    ),
+                    leg_facts AS (
                         SELECT
-                            jr.id AS journal_run_id,
-                            jr.account_ref AS account_id,
-                            CAST(NULLIF(jef.payload_json -> 'broker_fill' ->> 'instrument_token', '') AS BIGINT) AS instrument_token,
-                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'exchange', '') AS exchange,
-                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'tradingsymbol', '') AS tradingsymbol,
-                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'product', '') AS product,
-                            SUM(CASE WHEN UPPER(jef.side) = 'BUY' THEN jef.quantity ELSE -jef.quantity END) AS net_quantity
-                        FROM public.journal_source_links jsl
-                        INNER JOIN public.journal_runs jr ON jr.id = jsl.run_id
-                        INNER JOIN public.journal_execution_facts jef ON jef.run_id = jr.id
-                        WHERE jsl.source_type = 'live_order'
-                          AND jsl.source_key = :strategy_run_id
-                          AND jr.execution_mode = 'live'
-                          AND jr.account_ref = :account_id
-                          AND jef.source_type = 'live_fill'
+                            CAST(NULL AS UUID) AS journal_run_id,
+                            otf.account_id,
+                            otf.instrument_token,
+                            COALESCE(NULLIF(otf.exchange, ''), COALESCE(otf.payload_json ->> 'exchange', '')) AS exchange,
+                            COALESCE(NULLIF(otf.tradingsymbol, ''), COALESCE(otf.payload_json ->> 'tradingsymbol', '')) AS tradingsymbol,
+                            COALESCE(NULLIF(otf.product, ''), COALESCE(otf.payload_json ->> 'product', '')) AS product,
+                            SUM(
+                                CASE
+                                    WHEN UPPER(COALESCE(NULLIF(otf.transaction_type, ''), COALESCE(otf.payload_json ->> 'transaction_type', ''))) = 'BUY'
+                                        THEN otf.quantity
+                                    ELSE -otf.quantity
+                                END
+                            ) AS net_quantity
+                        FROM public.order_trade_fills otf
+                        INNER JOIN attributed_orders ao
+                          ON ao.account_id = otf.account_id
+                         AND ao.broker_order_id = otf.order_id
                         GROUP BY
-                            jr.id,
-                            jr.account_ref,
-                            CAST(NULLIF(jef.payload_json -> 'broker_fill' ->> 'instrument_token', '') AS BIGINT),
-                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'exchange', ''),
-                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'tradingsymbol', ''),
-                            COALESCE(jef.payload_json -> 'broker_fill' ->> 'product', '')
+                            otf.account_id,
+                            otf.instrument_token,
+                            COALESCE(NULLIF(otf.exchange, ''), COALESCE(otf.payload_json ->> 'exchange', '')),
+                            COALESCE(NULLIF(otf.tradingsymbol, ''), COALESCE(otf.payload_json ->> 'tradingsymbol', '')),
+                            COALESCE(NULLIF(otf.product, ''), COALESCE(otf.payload_json ->> 'product', ''))
                     )
                     SELECT
                         lf.journal_run_id,
@@ -905,15 +939,149 @@ class SqlAlchemyAlgoWorkerRepository:
                     FROM leg_facts lf
                     LEFT JOIN public.account_positions ap
                       ON ap.account_id = lf.account_id
-                     AND ap.instrument_token = lf.instrument_token
-                     AND ap.product = lf.product
+                      AND ap.instrument_token = lf.instrument_token
+                      AND ap.product = lf.product
+                      AND ap.exchange = lf.exchange
+                      AND ap.tradingsymbol = lf.tradingsymbol
                     WHERE lf.net_quantity <> 0
                     ORDER BY lf.exchange, lf.tradingsymbol, lf.product
                     """
                 ),
                 {"strategy_run_id": strategy_run_id, "account_id": account_id},
             ).mappings().all()
-            return [_row_mapping(row) for row in rows]
+            return [dict(row) for row in rows]
+        finally:
+            db.close()
+
+    def _get_live_order_attribution_refs_sync(self, strategy_run_id: str, account_id: str) -> Dict[str, List[str]]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT client_order_ref, broker_order_id
+                    FROM public.live_order_intents
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND account_id = :account_id
+                    ORDER BY created_at DESC
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id, "account_id": account_id},
+            ).mappings().all()
+            recovered_rows = db.execute(
+                text(
+                    """
+                    SELECT DISTINCT
+                        loi.client_order_ref,
+                        coe.order_id AS broker_order_id
+                    FROM public.live_order_intents loi
+                    INNER JOIN public.canonical_order_events coe
+                      ON coe.account_id = loi.account_id
+                     AND CAST(coe.payload_json AS TEXT) LIKE '%"tag"%'
+                     AND CAST(coe.payload_json AS TEXT) LIKE '%' || '"' || loi.client_order_ref || '"' || '%'
+                    WHERE loi.strategy_run_id = :strategy_run_id
+                      AND loi.account_id = :account_id
+                      AND COALESCE(NULLIF(loi.client_order_ref, ''), '') <> ''
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id, "account_id": account_id},
+            ).mappings().all()
+            combined_rows = [dict(row) for row in rows] + [dict(row) for row in recovered_rows]
+            broker_order_ids = sorted(
+                {
+                    str(row.get("broker_order_id") or "").strip()
+                    for row in combined_rows
+                    if str(row.get("broker_order_id") or "").strip()
+                }
+            )
+            client_order_refs = sorted(
+                {
+                    str(row.get("client_order_ref") or "").strip()
+                    for row in combined_rows
+                    if str(row.get("client_order_ref") or "").strip()
+                }
+            )
+            return {
+                "broker_order_ids": broker_order_ids,
+                "client_order_refs": client_order_refs,
+            }
+        finally:
+            db.close()
+
+    def _list_live_strategy_broker_positions_sync(self, strategy_run_id: str, account_id: str) -> List[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    WITH attributed_orders AS (
+                        SELECT DISTINCT
+                            resolved.account_id,
+                            resolved.broker_order_id
+                        FROM (
+                            SELECT
+                                loi.account_id,
+                                loi.broker_order_id
+                            FROM public.live_order_intents loi
+                            WHERE loi.strategy_run_id = :strategy_run_id
+                              AND loi.account_id = :account_id
+                              AND COALESCE(NULLIF(loi.broker_order_id, ''), '') <> ''
+                            UNION ALL
+                            SELECT
+                                loi.account_id,
+                                coe.order_id AS broker_order_id
+                            FROM public.live_order_intents loi
+                            INNER JOIN public.canonical_order_events coe
+                              ON coe.account_id = loi.account_id
+                             AND CAST(coe.payload_json AS TEXT) LIKE '%"tag"%'
+                             AND CAST(coe.payload_json AS TEXT) LIKE '%' || '"' || loi.client_order_ref || '"' || '%'
+                            WHERE loi.strategy_run_id = :strategy_run_id
+                              AND loi.account_id = :account_id
+                              AND COALESCE(NULLIF(loi.client_order_ref, ''), '') <> ''
+                        ) resolved
+                        WHERE COALESCE(NULLIF(resolved.broker_order_id, ''), '') <> ''
+                    ),
+                    attributed_instruments AS (
+                        SELECT DISTINCT
+                            osp.account_id,
+                            osp.instrument_token,
+                            osp.exchange,
+                            osp.tradingsymbol,
+                            osp.product
+                        FROM public.order_state_projection osp
+                        INNER JOIN attributed_orders ao
+                          ON ao.account_id = osp.account_id
+                         AND ao.broker_order_id = osp.order_id
+                        WHERE COALESCE(osp.instrument_token, 0) <> 0
+                          AND COALESCE(NULLIF(osp.exchange, ''), '') <> ''
+                          AND COALESCE(NULLIF(osp.tradingsymbol, ''), '') <> ''
+                          AND COALESCE(NULLIF(osp.product, ''), '') <> ''
+                    )
+                    SELECT
+                        ap.account_id,
+                        ap.instrument_token,
+                        ap.exchange,
+                        ap.tradingsymbol,
+                        ap.product,
+                        ap.net_quantity,
+                        ap.average_price,
+                        ap.last_price,
+                        ap.updated_at,
+                        ap.last_reconciled_at
+                    FROM public.account_positions ap
+                    INNER JOIN attributed_instruments ai
+                      ON ai.account_id = ap.account_id
+                     AND ai.instrument_token = ap.instrument_token
+                     AND ai.exchange = ap.exchange
+                     AND ai.tradingsymbol = ap.tradingsymbol
+                     AND ai.product = ap.product
+                    WHERE ap.net_quantity <> 0
+                    ORDER BY ap.exchange, ap.tradingsymbol, ap.product
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id, "account_id": account_id},
+            ).mappings().all()
+            return [dict(row) for row in rows]
         finally:
             db.close()
 
@@ -1124,6 +1292,58 @@ def _payload_matches_strategy_run(payload: Dict[str, Any], strategy_run_id: str)
         return True
     meta = payload.get("meta")
     if isinstance(meta, dict) and str(meta.get("strategy_run_id") or "") == strategy_run_id:
+        return True
+    return False
+
+
+def _payload_matches_live_attribution(payload: Dict[str, Any], refs: Dict[str, List[str]]) -> bool:
+    broker_order_ids = {str(value).strip() for value in refs.get("broker_order_ids") or [] if str(value).strip()}
+    client_order_refs = {str(value).strip() for value in refs.get("client_order_refs") or [] if str(value).strip()}
+
+    order_id_candidates = {
+        str(payload.get("order_id") or "").strip(),
+        str(payload.get("broker_order_id") or "").strip(),
+    }
+    if broker_order_ids.intersection({value for value in order_id_candidates if value}):
+        return True
+
+    tag_candidates: set[str] = set()
+    tag_value = payload.get("tag")
+    if tag_value is not None:
+        cleaned = str(tag_value).strip()
+        if cleaned:
+            tag_candidates.add(cleaned)
+    tags_value = payload.get("tags")
+    if isinstance(tags_value, list):
+        tag_candidates.update(str(item).strip() for item in tags_value if str(item).strip())
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        for key in ("tag", "client_order_ref"):
+            cleaned = str(meta.get(key) or "").strip()
+            if cleaned:
+                tag_candidates.add(cleaned)
+    attribution = payload.get("attribution")
+    if isinstance(attribution, dict):
+        cleaned = str(attribution.get("client_order_ref") or "").strip()
+        if cleaned:
+            tag_candidates.add(cleaned)
+    if client_order_refs.intersection(tag_candidates):
+        return True
+
+    return False
+
+
+async def _worker_run_live_attribution_refs(request: Request, run: Dict[str, Any]) -> Dict[str, List[str]]:
+    return await _repo(request).get_live_order_attribution_refs(
+        strategy_run_id=str(run["strategy_run_id"]),
+        account_id=str(run["account_scope"]),
+    )
+
+
+def _payload_matches_worker_run(payload: Dict[str, Any], strategy_run_id: str, refs: Optional[Dict[str, List[str]]] = None) -> bool:
+    if _payload_matches_strategy_run(payload, strategy_run_id):
+        return True
+    if refs and _payload_matches_live_attribution(payload, refs):
         return True
     return False
 
@@ -1609,18 +1829,8 @@ async def _paper_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) 
 
 
 async def _live_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) -> Dict[str, Any]:
-    from journaling.repository import JournalRepository
-
     strategy_run_id = str(run["strategy_run_id"])
     account_id = str(run["account_scope"])
-    journal_repository = getattr(request.app.state, "algo_worker_journal_repository", None) or JournalRepository()
-    link = await asyncio.to_thread(journal_repository.find_source_link, source_type="live_order", source_key=strategy_run_id)
-    if link is None:
-        return _empty_worker_pnl_snapshot(run, is_realtime=True)
-
-    facts = await asyncio.to_thread(journal_repository.list_execution_facts, str(link.run_id))
-    live_facts = [fact for fact in facts if str(getattr(fact, "source_type", "")) == "live_fill"]
-    legs_by_key, total_charges = _build_live_worker_leg_states(live_facts)
 
     realtime_positions = getattr(request.app.state, "algo_worker_realtime_positions_service", None)
     if realtime_positions is None:
@@ -1631,6 +1841,41 @@ async def _live_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) -
     positions_by_leg: Dict[Tuple[int, str], Any] = {}
     for position in positions.values():
         positions_by_leg[(int(position.instrument_token), str(position.product))] = position
+
+    from journaling.repository import JournalRepository
+
+    journal_repository = getattr(request.app.state, "algo_worker_journal_repository", None) or JournalRepository()
+    link = await asyncio.to_thread(journal_repository.find_source_link, source_type="live_order", source_key=strategy_run_id)
+    live_facts: List[Any] = []
+    if link is not None:
+        facts = await asyncio.to_thread(journal_repository.list_execution_facts, str(link.run_id))
+        live_facts = [fact for fact in facts if str(getattr(fact, "source_type", "")) == "live_fill"]
+
+    if live_facts:
+        legs_by_key, total_charges = _build_live_worker_leg_states(live_facts)
+    else:
+        attributed_legs = await _repo(request).list_live_strategy_open_legs(strategy_run_id=strategy_run_id, account_id=account_id)
+        legs_by_key = {}
+        total_charges = 0.0
+        for leg in attributed_legs:
+            instrument_token = _to_int(leg.get("instrument_token"))
+            product = str(leg.get("product") or "")
+            if not instrument_token or not product:
+                continue
+            net_quantity = _to_int(leg.get("net_quantity"))
+            position = positions_by_leg.get((instrument_token, product))
+            average_price = _to_float(getattr(position, "average_price", 0.0)) if position is not None else 0.0
+            legs_by_key[(instrument_token, product)] = {
+                "instrument_token": instrument_token,
+                "exchange": leg.get("exchange"),
+                "tradingsymbol": leg.get("tradingsymbol"),
+                "product": product,
+                "net_quantity": net_quantity,
+                "average_price": average_price,
+                "realized_pnl": 0.0,
+                "charges": 0.0,
+                "last_fill_at": None,
+            }
 
     rendered_legs: List[WorkerRunPnlLeg] = []
     unrealized_total = 0.0
@@ -1858,10 +2103,77 @@ def _live_exit_orders_from_legs(legs: List[Dict[str, Any]], attribution: Dict[st
                 "order_type": "MARKET",
                 "quantity": abs(net_quantity),
                 "validity": "DAY",
+                "market_protection": -1,
                 "attribution": dict(attribution),
             }
         )
     return orders
+
+
+async def _live_broker_positions_for_attribution(
+    request: Request,
+    *,
+    kite: Any,
+    corr_id: str,
+    refs: Dict[str, List[str]],
+) -> List[Dict[str, Any]]:
+    from broker_api.kite_orders import OrdersService
+
+    if not (refs.get("broker_order_ids") or refs.get("client_order_refs")):
+        return []
+
+    orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+    broker_orders = await asyncio.to_thread(orders_service.orders, kite, corr_id)
+    matched_orders = [
+        _serialize_model(order)
+        for order in broker_orders
+        if _payload_matches_live_attribution(_serialize_model(order), refs)
+    ]
+    if not matched_orders:
+        return []
+
+    positions_payload = await asyncio.to_thread(kite.positions)
+    net_positions = positions_payload.get("net", []) if isinstance(positions_payload, dict) else []
+    positions_by_key: Dict[Tuple[int, str, str, str], Dict[str, Any]] = {}
+    for position in net_positions:
+        instrument_token = _to_int(position.get("instrument_token"))
+        product = str(position.get("product") or "")
+        exchange = str(position.get("exchange") or "")
+        tradingsymbol = str(position.get("tradingsymbol") or "")
+        if not instrument_token or not product or not exchange or not tradingsymbol:
+            continue
+        positions_by_key[(instrument_token, product, exchange, tradingsymbol)] = dict(position)
+
+    exposure: List[Dict[str, Any]] = []
+    seen: set[Tuple[int, str, str, str]] = set()
+    for order in matched_orders:
+        key = (
+            _to_int(order.get("instrument_token")),
+            str(order.get("product") or ""),
+            str(order.get("exchange") or ""),
+            str(order.get("tradingsymbol") or ""),
+        )
+        if key in seen or not all(key):
+            continue
+        seen.add(key)
+        position = positions_by_key.get(key)
+        if not position:
+            continue
+        if _to_int(position.get("quantity") or position.get("net_quantity")) == 0:
+            continue
+        exposure.append(
+            {
+                "account_id": position.get("account_id") or position.get("account_ref"),
+                "instrument_token": key[0],
+                "product": key[1],
+                "exchange": key[2],
+                "tradingsymbol": key[3],
+                "net_quantity": _to_int(position.get("quantity") or position.get("net_quantity")),
+                "average_price": _to_float(position.get("average_price")),
+                "last_price": _to_float(position.get("last_price")),
+            }
+        )
+    return exposure
 
 
 def _live_exit_idempotency_key(*, strategy_run_id: str, legs: List[Dict[str, Any]], supplied_key: Optional[str]) -> str:
@@ -1894,13 +2206,35 @@ async def _exit_live_worker_run(*, request: Request, token: WorkerToken, run: Di
     legs = await _repo(request).list_live_strategy_open_legs(strategy_run_id=strategy_run_id, account_id=account_id)
 
     if not legs:
+        attribution_refs = await _worker_run_live_attribution_refs(request, run)
+        broker_positions = await _repo(request).list_live_strategy_broker_positions(
+            strategy_run_id=strategy_run_id,
+            account_id=account_id,
+        )
+        if not broker_positions:
+            broker_positions = await _live_broker_positions_for_attribution(
+                request,
+                kite=kite,
+                corr_id=corr_id,
+                refs=attribution_refs,
+            )
+        if broker_positions:
+            return {
+                "mode": "live",
+                "status": "deferred",
+                "deferred": True,
+                "message": "Live exit attribution is still synchronizing; broker exposure exists so the run cannot be marked flat yet",
+                "broker_positions": broker_positions,
+                "refresh": refresh_result,
+                "run": run,
+            }
         updated = await _repo(request).update_run_status(
             strategy_run_id,
             "closed",
             state_patch={
                 "exit_reason": payload.reason or "live_worker_flat",
                 "live_exit_finalized_at": _utcnow().isoformat(),
-                "live_exit_flat_confirmation": {"source": "journal_live_fills", "refresh": refresh_result},
+                "live_exit_flat_confirmation": {"source": "live_order_attribution", "refresh": refresh_result},
             },
         )
         return {"mode": "live", "status": "closed", "message": "Live worker run is already flat", "run": updated}
@@ -1974,7 +2308,7 @@ async def _exit_live_worker_run(*, request: Request, token: WorkerToken, run: Di
                 "live_exit": planned_exit,
                 "exit_reason": payload.reason or "live_worker_exit",
                 "live_exit_finalized_at": _utcnow().isoformat(),
-                "live_exit_flat_confirmation": {"source": "journal_live_fills", "refresh": post_refresh},
+                "live_exit_flat_confirmation": {"source": "live_order_attribution", "refresh": post_refresh},
             },
         )
         return {"mode": "live", "status": "closed", "result": result_payload, "run": updated}
@@ -2361,12 +2695,13 @@ async def list_worker_orders(request: Request, strategy_run_id: str):
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     _require_live_run(run, feature="Order inspection")
+    attribution_refs = await _worker_run_live_attribution_refs(request, run)
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
     corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-orders-{uuid.uuid4()}"
     orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
     orders = await asyncio.to_thread(orders_service.orders, kite, corr_id)
     serialized = [_serialize_model(order) for order in orders]
-    filtered = [order for order in serialized if _payload_matches_strategy_run(order, strategy_run_id)]
+    filtered = [order for order in serialized if _payload_matches_worker_run(order, strategy_run_id, attribution_refs)]
     return {"strategy_run_id": strategy_run_id, "orders": filtered}
 
 
@@ -2381,12 +2716,13 @@ async def list_worker_trades(request: Request, strategy_run_id: str):
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     _require_live_run(run, feature="Trade inspection")
+    attribution_refs = await _worker_run_live_attribution_refs(request, run)
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
     corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-trades-{uuid.uuid4()}"
     orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
     trades = await asyncio.to_thread(orders_service.trades, kite, corr_id)
     serialized = [_serialize_model(trade) for trade in trades]
-    filtered = [trade for trade in serialized if _payload_matches_strategy_run(trade, strategy_run_id)]
+    filtered = [trade for trade in serialized if _payload_matches_worker_run(trade, strategy_run_id, attribution_refs)]
     return {"strategy_run_id": strategy_run_id, "trades": filtered}
 
 
@@ -2401,12 +2737,13 @@ async def get_worker_order(request: Request, order_id: str, strategy_run_id: str
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     _require_live_run(run, feature="Order inspection")
+    attribution_refs = await _worker_run_live_attribution_refs(request, run)
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
     corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-order-{uuid.uuid4()}"
     orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
     order = await asyncio.to_thread(orders_service.order_snapshot, kite, order_id, corr_id)
     payload = _serialize_model(order)
-    if not _payload_matches_strategy_run(payload, strategy_run_id):
+    if not _payload_matches_worker_run(payload, strategy_run_id, attribution_refs):
         raise HTTPException(status_code=404, detail="Order not found for strategy run")
     return {"strategy_run_id": strategy_run_id, "order": payload}
 
@@ -2422,12 +2759,13 @@ async def get_worker_order_history(request: Request, order_id: str, strategy_run
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     _require_live_run(run, feature="Order inspection")
+    attribution_refs = await _worker_run_live_attribution_refs(request, run)
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
     corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-order-history-{uuid.uuid4()}"
     orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
     history = await asyncio.to_thread(orders_service.order_history, kite, order_id, corr_id)
     entries = [_serialize_model(item) for item in history]
-    if not entries or not any(_payload_matches_strategy_run(item, strategy_run_id) for item in entries):
+    if not entries or not any(_payload_matches_worker_run(item, strategy_run_id, attribution_refs) for item in entries):
         raise HTTPException(status_code=404, detail="Order not found for strategy run")
     return {"strategy_run_id": strategy_run_id, "order_id": order_id, "history": entries}
 

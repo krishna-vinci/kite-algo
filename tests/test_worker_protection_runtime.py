@@ -168,6 +168,26 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["exit_submission_status"], "unknown")
         self.assertTrue(state["exit_claim_id"])
 
+    async def test_deferred_exit_result_keeps_claim_for_retry_without_marking_exit_submitted(self):
+        repo = _Repo()
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": [{"symbol": "NSE:INFY", "product": "CNC", "side": "BUY", "quantity": 1, "net_quantity": 1, "average_price": 100, "last_price": 94}]}),
+            exit_submitter=AsyncMock(return_value={"status": "deferred", "deferred": True, "message": "attribution pending"}),
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result["triggered"], 0)
+        state = repo.saved[-1][1]["backend_protection_state"]
+        self.assertEqual(state["status"], "triggered")
+        self.assertFalse(state["exit_submitted"])
+        self.assertEqual(state["exit_submission_status"], "deferred")
+        self.assertEqual(state["exit_result"]["status"], "deferred")
+        self.assertTrue(state["exit_claim_id"])
+
     async def test_successful_exit_forces_terminal_state_if_final_cas_fails(self):
         repo = _Repo()
         calls = {"count": 0}

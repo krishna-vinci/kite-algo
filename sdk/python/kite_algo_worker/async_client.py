@@ -63,6 +63,9 @@ class AsyncKiteAlgoWorkerClient:
             params["account_scope"] = account_scope
         return await self._request("GET", "/worker/funds", params=params)
 
+    async def get_run_funds(self, strategy_run_id: str) -> JsonDict:
+        return await self._request("GET", f"/worker/runs/{strategy_run_id}/funds")
+
     async def list_orders(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", "/worker/orders", params={"strategy_run_id": strategy_run_id})
 
@@ -130,6 +133,64 @@ class AsyncKiteAlgoWorkerClient:
                 ingest=ingest,
                 passthrough=passthrough,
             )
+        )
+
+    async def resolve_ticker(self, symbol: str) -> JsonDict:
+        return await self._request("GET", "/worker/market/instruments/resolve", params={"symbol": symbol})
+
+    async def resolve_tickers(self, instruments: Iterable[str | int]) -> JsonDict:
+        symbols: list[str] = []
+        tokens: list[int] = []
+        for instrument in instruments:
+            value = str(instrument).strip()
+            if isinstance(instrument, int) or value.isdigit():
+                tokens.append(int(value))
+            elif value:
+                symbols.append(value)
+        return await self._request(
+            "POST",
+            "/worker/market/instruments/resolve",
+            json={"symbols": symbols, "instrument_tokens": tokens},
+        )
+
+    async def search_tickers(self, query: str, exchange: Optional[str] = None, limit: int = 20) -> JsonDict:
+        params: JsonDict = {"query": query, "limit": limit}
+        if exchange:
+            params["exchange"] = exchange
+        return await self._request("GET", "/worker/market/instruments/search", params=params)
+
+    async def get_quotes(self, instruments: Iterable[str | int], mode: str = "quote") -> JsonDict:
+        symbols: list[str] = []
+        tokens: list[int] = []
+        for instrument in instruments:
+            value = str(instrument).strip()
+            if isinstance(instrument, int) or value.isdigit():
+                tokens.append(int(value))
+            elif value:
+                symbols.append(value)
+        return await self._request(
+            "POST",
+            "/worker/market/quotes",
+            json={"symbols": symbols, "instrument_tokens": tokens, "mode": mode},
+        )
+
+    async def get_market_snapshot(
+        self,
+        *,
+        symbols: Optional[list[str]] = None,
+        instrument_tokens: Optional[list[int]] = None,
+        candles: Optional[list[Mapping[str, Any]]] = None,
+        mode: str = "quote",
+    ) -> JsonDict:
+        return await self._request(
+            "POST",
+            "/worker/market/snapshot",
+            json={
+                "symbols": symbols or [],
+                "instrument_tokens": instrument_tokens or [],
+                "candles": list(candles or []),
+                "mode": mode,
+            },
         )
 
     async def preview_order(self, strategy_run_id: str, order: Mapping[str, Any], *, metadata: Optional[Mapping[str, Any]] = None) -> JsonDict:
