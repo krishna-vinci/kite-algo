@@ -29,17 +29,22 @@ from .metrics import (
     win_rate,
 )
 from .models import (
+    CapitalBasisType,
     BenchmarkDailyPrice,
     BenchmarkDefinition,
+    ExecutionMode,
     JournalDecisionEvent,
     JournalEquityPoint,
     JournalExecutionFact,
     JournalMetricSnapshot,
     JournalRule,
+    JournalRunStatus,
     JournalRun,
+    ReviewState,
     JournalSourceLink,
     ProjectionState,
     SourceType,
+    StrategyFamily,
 )
 from .repository import JournalRepository
 
@@ -716,6 +721,54 @@ class JournalService:
             source_key_2=resolved_source_key_2,
         )
         return str(link.run_id) if link else None
+
+    def ensure_paper_strategy_run(self, *, attribution: Dict[str, Any]) -> Optional[str]:
+        strategy_run_id = str(attribution.get("strategy_run_id") or "").strip()
+        account_ref = str(attribution.get("account_ref") or attribution.get("account_scope") or "").strip()
+        if not strategy_run_id or not account_ref:
+            return None
+        strategy_family_value = str(attribution.get("strategy_family") or StrategyFamily.INDICATOR.value).strip()
+        try:
+            strategy_family = StrategyFamily(strategy_family_value)
+        except ValueError:
+            strategy_family = StrategyFamily.INDICATOR
+
+        existing = self.repository.find_source_link(
+            source_type=SourceType.PAPER_STRATEGY_RUN,
+            source_key=strategy_run_id,
+            source_key_2=account_ref,
+        )
+        if existing is not None:
+            return str(existing.run_id)
+
+        run = self.create_run(
+            JournalRun(
+                strategy_family=strategy_family,
+                strategy_name=str(attribution.get("strategy_name") or strategy_run_id),
+                entry_surface=str(attribution.get("entry_surface") or "paper_runtime"),
+                execution_mode=ExecutionMode(str(attribution.get("execution_mode") or ExecutionMode.PAPER.value)),
+                account_ref=account_ref,
+                status=JournalRunStatus.OPEN,
+                benchmark_id="NIFTY50",
+                capital_basis_type=CapitalBasisType.MARGIN_USED,
+                review_state=ReviewState.PENDING,
+                source_summary={"source": "paper_runtime", "strategy_run_id": strategy_run_id},
+                metadata={"created_by": "paper_runtime", "paper_attribution": _serialize_decimal(attribution)},
+            ),
+        )
+        run_id = str(run.get("id") or "") if isinstance(run, dict) else ""
+        if not run_id:
+            return None
+        self.link_source(
+            run_id,
+            JournalSourceLink(
+                run_id=run_id,
+                source_type=SourceType.PAPER_STRATEGY_RUN,
+                source_key=str(strategy_run_id),
+                source_key_2=account_ref,
+            ),
+        )
+        return run_id
 
     def mirror_option_strategy_run(
         self,

@@ -84,6 +84,29 @@ const ACTION_OPTIONS = [
   },
 ] as const;
 
+function isPaperScope(value: string | null | undefined): boolean {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return false;
+  const identifier = normalized.startsWith("kite:") ? normalized.slice(5) : normalized;
+  return (
+    identifier === "paper" ||
+    identifier.startsWith("paper-") ||
+    identifier.startsWith("paper_") ||
+    identifier.startsWith("test-paper") ||
+    identifier.endsWith("-paper") ||
+    identifier.endsWith("_paper")
+  );
+}
+
+function describeTokenScope(token: AlgoWorkerToken): string {
+  const scope = token.accountScope?.trim() || "";
+  if (!scope) return "Any paper scope";
+  if (token.allowedModes.includes("live") && !isPaperScope(scope)) {
+    return `Live ${scope} + any paper scope`;
+  }
+  return scope;
+}
+
 function splitTemplateList(value: string): string[] {
   return value
     .split(",")
@@ -182,7 +205,7 @@ function TokenRow({
         </div>
         <div className="mt-2 grid gap-2 text-xs text-foreground/55 sm:grid-cols-2 xl:grid-cols-4">
           <span className="min-w-0 truncate font-mono">{token.tokenId}</span>
-          <span>Scope: {token.accountScope || "Any paper scope"}</span>
+          <span>Scope: {describeTokenScope(token)}</span>
           <span>Last used: {formatDate(token.lastUsedAt)}</span>
           <span>Expires: {formatDate(token.expiresAt)}</span>
         </div>
@@ -223,14 +246,20 @@ function WorkerQuickGuide({ token }: { token: CreatedAlgoWorkerToken | null }) {
   const rawToken = token?.token || "kwa_your_token";
   const runId = "run_mean_reversion_001";
   const authHeader = `Authorization: Bearer ${rawToken}`;
+  const sampleMode = token?.allowedModes.includes("paper") ? "paper" : token?.allowedModes.includes("dry_run") ? "dry_run" : "live";
+  const sampleAccountScope = sampleMode === "live" ? token?.accountScope || "kite:YOUR_BROKER_USER_ID" : DEFAULT_ACCOUNT_SCOPE;
   const createRunSnippet = `curl -X POST "$API_BASE/api/algo-workers/worker/runs" \\
   -H "${authHeader}" \\
   -H "Content-Type: application/json" \\
   -d '{
     "strategy_run_id": "${runId}",
     "template_id": "mean-reversion",
-    "account_scope": "${token?.accountScope || DEFAULT_ACCOUNT_SCOPE}",
-    "execution_mode": "paper",
+    "account_scope": "${sampleAccountScope}",
+    "execution_mode": "${sampleMode}",
+    "metadata": {
+      "strategy_family": "indicator_strategy",
+      "strategy_name": "Mean Reversion"
+    },
     "risk_schema": [
       {"key": "stop_loss_pct", "label": "Stop loss %", "type": "number", "value": 1.2, "editable": true},
       {"key": "target_pct", "label": "Target %", "type": "number", "value": 2.4, "editable": true}
@@ -266,6 +295,11 @@ function WorkerQuickGuide({ token }: { token: CreatedAlgoWorkerToken | null }) {
           <Terminal aria-hidden size={15} className="text-primary" />
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-foreground/60">Create run</p>
         </div>
+        {token?.allowedModes.includes("live") && token.accountScope && !isPaperScope(token.accountScope) ? (
+          <p className="mb-3 text-[11px] leading-5 text-foreground/55">
+            This token is live-bound to <span className="font-mono text-primary">{token.accountScope}</span>, but it can still create paper or dry-run runs with <span className="font-mono text-primary">account_scope: "{DEFAULT_ACCOUNT_SCOPE}"</span> when those modes are enabled.
+          </p>
+        ) : null}
         <CodeBlock value={createRunSnippet} />
       </div>
       <div className="rounded-xl border border-border/70 bg-background/45 p-3">
@@ -374,7 +408,7 @@ export function AlgoWorkerAccessPanel() {
               />
               {liveModeEnabled ? (
                 <span className="text-[11px] leading-4 text-foreground/45">
-                  Live worker tokens are bound to your Kite profile user id. Current profile: {brokerUserId ? <span className="font-mono text-primary">{brokerUserId}</span> : "not available"}.
+                  Live worker tokens are bound to your Kite profile user id for live runs. Current profile: {brokerUserId ? <span className="font-mono text-primary">{brokerUserId}</span> : "not available"}. The same token can still create paper or dry-run runs on scopes like <span className="font-mono text-primary">{DEFAULT_ACCOUNT_SCOPE}</span> when those modes are enabled.
                 </span>
               ) : null}
             </label>
@@ -453,7 +487,7 @@ export function AlgoWorkerAccessPanel() {
                   <div>
                     <p className="font-semibold text-amber-100">Live worker tokens can place real broker orders.</p>
                     <p className="mt-1 text-amber-100/80">
-                      Keep this token only on trusted worker machines. The worker must still set <span className="font-mono">KITE_ALGO_ENABLE_LIVE=1</span> and create runs with required live metadata.
+                      Keep this token only on trusted worker machines. The worker must still set <span className="font-mono">KITE_ALGO_ENABLE_LIVE=1</span> and create runs with required live metadata. If paper or dry-run mode is also enabled, this same token can be reused without generating another token.
                     </p>
                   </div>
                 </div>
@@ -488,7 +522,7 @@ export function AlgoWorkerAccessPanel() {
               }}
               disabled={createMutation.isPending || liveTokenBlocked || invalidSelection}
             >
-              {liveModeEnabled ? "Generate live-enabled token" : "Generate"}
+              {liveModeEnabled ? (selectedModes.includes("paper") ? "Generate paper + live token" : "Generate live-only token") : "Generate"}
             </IconButton>
           </div>
 
@@ -529,7 +563,7 @@ export function AlgoWorkerAccessPanel() {
             <div className="rounded-xl border border-rose-400/30 bg-rose-400/10 p-4 text-sm text-rose-300">Could not load worker tokens.</div>
           ) : sortedTokens.length === 0 ? (
             <div className="rounded-xl border border-dashed border-border/70 bg-background/40 p-4 text-sm text-foreground/55">
-              No worker tokens yet. Generate one for paper or dry-run strategy development.
+              No worker tokens yet. Generate one for paper, dry-run, or a combined paper + dry-run + live worker.
             </div>
           ) : (
             sortedTokens.map((token) => (
@@ -549,10 +583,10 @@ export function AlgoWorkerAccessPanel() {
           <div>
             <p className="text-sm font-semibold text-foreground">Worker usage contract</p>
             <p className="mt-1 text-xs leading-5 text-foreground/55">
-              Set <span className="font-mono text-primary">API_BASE</span>, send the bearer token, create one strategy run, submit idempotent intents, patch risk only through the run, and close the run when the strategy exits.
+              Set <span className="font-mono text-primary">API_BASE</span>, send the bearer token, create one strategy run, submit idempotent intents, patch risk only through the run, and close the run when the strategy exits. A live-bound token can still be reused for paper or dry-run runs when those modes are enabled.
             </p>
           </div>
-          <StatusBadge tone="warning">paper v1</StatusBadge>
+          <StatusBadge tone="warning">multi-mode v1</StatusBadge>
         </div>
         <WorkerQuickGuide token={createdToken} />
       </div>

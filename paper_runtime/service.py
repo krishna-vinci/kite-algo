@@ -10,6 +10,8 @@ from broker_api.instruments_repository import InstrumentsRepository
 from broker_api.redis_events import publish_event
 from execution_accounting.contracts import signed_cash_flow
 
+from algo_runtime.execution_attribution import build_execution_attribution
+
 from .charges import PaperChargesCalculator
 from .events import paper_order_event_payload, paper_position_event_payload, paper_trade_event_payload
 from .margin_engine import PaperMarginEngine
@@ -26,10 +28,18 @@ from .models import (
     PaperTrade,
 )
 from .repository import SqlAlchemyPaperRepository
+from .run_state import PaperRunStateService
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 class _AtomicBasketRejected(Exception):
@@ -57,6 +67,7 @@ class PaperTradingService:
         self.charges_calculator = charges_calculator or PaperChargesCalculator()
         self.journal_service = journal_service
         self.default_starting_balance = Decimal(str(default_starting_balance))
+        self.run_state_service = PaperRunStateService(self.repository)
         self._account_locks: Dict[str, asyncio.Lock] = {}
 
     async def ensure_account(self, account_scope: str, *, starting_balance: Decimal | None = None) -> PaperAccount:
@@ -499,15 +510,23 @@ class PaperTradingService:
         normalized_strategy_run_id = str(strategy_run_id or "").strip()
         if not normalized_strategy_run_id:
             raise ValueError("strategy_run_id is required")
-        summary = await self.get_strategy_summary(account_scope)
-        for strategy in summary.get("strategies", []):
-            if str(strategy.get("strategy_run_id") or strategy.get("strategy_id") or "") == normalized_strategy_run_id:
-                return {
-                    "currency": summary.get("account", {}).get("currency") or "INR",
-                    "account_scope": summary.get("account", {}).get("account_scope") or account_scope,
-                    "strategy": strategy,
-                }
-        return None
+        account = await self.ensure_account(account_scope)
+        strategy = await asyncio.to_thread(self.run_state_service.get_run_state, account_scope, normalized_strategy_run_id)
+        if strategy is None:
+            summary = await self.get_strategy_summary(account_scope)
+            for legacy in summary.get("strategies", []):
+                if str(legacy.get("strategy_run_id") or legacy.get("strategy_id") or "") == normalized_strategy_run_id:
+                    return {
+                        "currency": summary.get("account", {}).get("currency") or "INR",
+                        "account_scope": summary.get("account", {}).get("account_scope") or account_scope,
+                        "strategy": legacy,
+                    }
+            return None
+        return {
+            "currency": account.currency,
+            "account_scope": account.account_scope,
+            "strategy": strategy,
+        }
 
     async def exit_strategy(self, *, account_scope: str, strategy_id: str) -> Dict[str, Any]:
         normalized_strategy_id = str(strategy_id or "").strip()
@@ -530,33 +549,76 @@ class PaperTradingService:
                 "message": "Strategy-level exit is disabled because the open position attribution is ambiguous",
             }
 
+        run_state = await asyncio.to_thread(self.run_state_service.get_run_state, account_scope, normalized_strategy_id)
+        linked_positions = [
+            position
+            for position in list((run_state or {}).get("positions") or [])
+            if _to_int(position.get("net_quantity")) != 0
+        ]
         open_positions = await self.list_positions(account_scope, only_open=True)
         orders = await asyncio.to_thread(self.repository.list_orders, account_scope, limit=1000)
         trades = await asyncio.to_thread(self.repository.list_trades, account_scope, limit=2000)
-        linked_positions = []
+        legacy_positions = []
         for position in open_positions:
             metadata = await self._strategy_group_metadata_for_position(position, orders=orders, trades=trades)
             if str(metadata.get("_group_strategy_id") or self._strategy_identity(metadata) or "") == normalized_strategy_id:
-                linked_positions.append(position)
+                legacy_positions.append(position)
+        if not linked_positions and not legacy_positions:
+            return {"mode": "paper", "status": "noop", "strategy_id": normalized_strategy_id, "results": [], "message": "No open paper positions found for strategy"}
+
+        if run_state and run_state.get("is_stale"):
+            return {
+                "mode": "paper",
+                "status": "blocked",
+                "strategy_id": normalized_strategy_id,
+                "results": [],
+                "message": "Strategy-level exit is blocked because the paper run exposure no longer reconciles cleanly with account-level positions",
+                "stale_reasons": list(run_state.get("stale_reasons") or []),
+            }
+
+        exit_position_map: Dict[Tuple[int, str], Dict[str, Any]] = {
+            (int(position.get("instrument_token") or 0), str(position.get("product") or "")): dict(position)
+            for position in linked_positions
+        }
+        for legacy_position in legacy_positions:
+            key = (int(legacy_position.instrument_token), str(legacy_position.product))
+            current = exit_position_map.get(key)
+            legacy_qty = abs(int(legacy_position.net_quantity))
+            current_qty = abs(_to_int((current or {}).get("net_quantity")))
+            lots = await asyncio.to_thread(
+                self.repository.list_open_position_lots,
+                account_scope,
+                instrument_token=legacy_position.instrument_token,
+                product=legacy_position.product,
+            )
+            lot_identities = {self._strategy_identity(dict(lot.metadata or {})) for lot in lots if self._strategy_identity(dict(lot.metadata or {}))}
+            legacy_override_safe = bool(lots) and lot_identities == {normalized_strategy_id}
+            if current is None or (legacy_override_safe and legacy_qty > current_qty):
+                exit_position_map[key] = {
+                    "instrument_token": legacy_position.instrument_token,
+                    "exchange": legacy_position.exchange,
+                    "tradingsymbol": legacy_position.tradingsymbol,
+                    "product": legacy_position.product,
+                    "net_quantity": int(legacy_position.net_quantity),
+                }
+        linked_positions = [position for position in exit_position_map.values() if _to_int(position.get("net_quantity")) != 0]
         if not linked_positions:
             return {"mode": "paper", "status": "noop", "strategy_id": normalized_strategy_id, "results": [], "message": "No open paper positions found for strategy"}
 
         exit_orders = []
-        algo_instance_id = None
-        strategy_tag = None
+        run_state_payload = dict(run_state or {})
+        algo_instance_id = run_state_payload.get("algo_instance_id")
+        strategy_tag = run_state_payload.get("strategy_tag")
         for position in linked_positions:
-            metadata = self._position_strategy_metadata(position, orders=orders, trades=trades)
-            algo_instance_id = algo_instance_id or metadata.get("algo_instance_id")
-            strategy_tag = strategy_tag or metadata.get("strategy_tag")
-            side = "BUY" if int(position.net_quantity) < 0 else "SELL"
+            side = "BUY" if _to_int(position.get("net_quantity")) < 0 else "SELL"
             exit_orders.append(
                 {
-                        "exchange": position.exchange,
-                        "tradingsymbol": position.tradingsymbol,
-                        "product": position.product,
+                        "exchange": position.get("exchange"),
+                        "tradingsymbol": position.get("tradingsymbol"),
+                        "product": position.get("product"),
                         "transaction_type": side,
                         "order_type": "MARKET",
-                        "quantity": abs(int(position.net_quantity)),
+                        "quantity": abs(_to_int(position.get("net_quantity"))),
                         "metadata": {
                             "strategy_run_id": normalized_strategy_id,
                             "option_strategy_id": normalized_strategy_id,
@@ -622,15 +684,31 @@ class PaperTradingService:
     def _attribution(self, intent: Any, instance_context: Dict[str, Any]) -> Dict[str, Any]:
         metadata = dict(instance_context.get("metadata") or {})
         dependency_spec = dict(instance_context.get("dependency_spec") or {})
-        return {
-            "algo_instance_id": instance_context.get("instance_id"),
-            "algo_type": instance_context.get("algo_type"),
-            "strategy_tag": instance_context.get("algo_type"),
-            "intent_type": intent.intent_type,
-            "dedupe_key": getattr(intent, "dedupe_key", None),
-            "journal_run_id": metadata.get("journal_run_id") or dependency_spec.get("journal_run_id"),
-            "journal_ref": metadata.get("journal_ref") or dependency_spec.get("journal_ref"),
-        }
+        account_scope = str(dependency_spec.get("account_scope") or "").strip()
+        strategy_run_id = str(metadata.get("strategy_run_id") or dependency_spec.get("strategy_run_id") or instance_context.get("instance_id") or "").strip()
+        strategy_family = str(metadata.get("strategy_family") or dependency_spec.get("strategy_family") or "indicator_strategy").strip()
+        strategy_name = str(metadata.get("strategy_name") or dependency_spec.get("strategy_name") or instance_context.get("algo_type") or strategy_run_id).strip()
+        idempotency_key = str(getattr(intent, "dedupe_key", None) or dependency_spec.get("idempotency_key") or f"{strategy_run_id}:{intent.intent_type}").strip()
+        return build_execution_attribution(
+            execution_mode="paper",
+            strategy_run_id=strategy_run_id,
+            strategy_family=strategy_family,
+            strategy_name=strategy_name,
+            account_ref=account_scope,
+            entry_surface=str(metadata.get("entry_surface") or dependency_spec.get("entry_surface") or "algo_runtime").strip(),
+            source=str(metadata.get("source") or dependency_spec.get("source") or "algo_runtime").strip(),
+            idempotency_key=idempotency_key,
+            metadata=metadata,
+            extras={
+                "algo_instance_id": instance_context.get("instance_id"),
+                "algo_type": instance_context.get("algo_type"),
+                "strategy_tag": metadata.get("strategy_tag") or instance_context.get("algo_type"),
+                "intent_type": intent.intent_type,
+                "dedupe_key": getattr(intent, "dedupe_key", None),
+                "journal_run_id": metadata.get("journal_run_id") or dependency_spec.get("journal_run_id"),
+                "journal_ref": metadata.get("journal_ref") or dependency_spec.get("journal_ref"),
+            },
+        )
     
     def _merged_attribution(self, attribution: Dict[str, Any], *metadata_sources: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         merged = dict(attribution or {})
@@ -649,10 +727,15 @@ class PaperTradingService:
             return None
         payload = dict(attribution or {})
         try:
-            return self.journal_service.resolve_run_id(
+            resolved = self.journal_service.resolve_run_id(
                 journal_run_id=payload.get("journal_run_id"),
                 journal_ref=payload.get("journal_ref"),
             )
+            if resolved:
+                return resolved
+            if str(payload.get("execution_mode") or "").strip().lower() == "paper" and str(payload.get("strategy_run_id") or "").strip():
+                return self.journal_service.ensure_paper_strategy_run(attribution=payload)
+            return None
         except Exception:
             return None
 
@@ -724,6 +807,20 @@ class PaperTradingService:
             reference_price=reference_price if reference_price > 0 else Decimal(position.average_price or 0),
             instrument_type=str(instrument_type or position.metadata.get("instrument_type") or ""),
         )
+
+    def _position_margin_in_use(self, position: PaperPosition | None, *, instrument_type: Any, reference_price: Decimal) -> Decimal:
+        if position is None or int(position.net_quantity) == 0:
+            return Decimal("0")
+        metadata = dict(position.metadata or {})
+        raw_margin = metadata.get("margin_in_use")
+        if raw_margin not in (None, ""):
+            try:
+                parsed = Decimal(str(raw_margin))
+                if parsed >= 0:
+                    return parsed
+            except Exception:
+                pass
+        return self._position_margin(position, instrument_type=instrument_type, reference_price=reference_price)
 
     def _apply_fill_to_position(self, *, account_scope: str, position: PaperPosition | None, request: Dict[str, Any], fill_price: Decimal, instrument: Dict[str, Any]) -> PaperPosition:
         side = 1 if str(request["transaction_type"]).upper() == "BUY" else -1
@@ -802,7 +899,7 @@ class PaperTradingService:
         existing_position: PaperPosition | None,
     ) -> Dict[str, Any]:
         reserved_margin = Decimal(str((order.metadata or {}).get("reserved_margin") or "0"))
-        old_margin = self._position_margin(existing_position, instrument_type=instrument.get("instrument_type"), reference_price=fill_price)
+        old_margin = self._position_margin_in_use(existing_position, instrument_type=instrument.get("instrument_type"), reference_price=fill_price)
         new_position = self._apply_fill_to_position(account_scope=order.account_scope, position=existing_position, request=request, fill_price=fill_price, instrument=instrument)
         new_position = new_position.model_copy(update={"account_scope": order.account_scope})
         new_margin = self._position_margin(new_position, instrument_type=instrument.get("instrument_type"), reference_price=fill_price)
@@ -854,7 +951,12 @@ class PaperTradingService:
                 quantity=order.quantity,
                 price=fill_price,
                 trade_timestamp=_utcnow(),
-                metadata=dict(order.metadata or {}),
+                metadata={
+                    **dict(order.metadata or {}),
+                    "exchange": order.exchange,
+                    "tradingsymbol": order.tradingsymbol,
+                    "product": order.product,
+                },
             ),
         )
         await self._record_journal_trade(trade)
@@ -1014,7 +1116,7 @@ class PaperTradingService:
         staged_events: List[Tuple[str, Dict[str, Any]]],
     ) -> Tuple[Dict[str, Any], PaperAccount]:
         reserved_margin = Decimal(str((order.metadata or {}).get("reserved_margin") or "0"))
-        old_margin = self._position_margin(existing_position, instrument_type=instrument.get("instrument_type"), reference_price=fill_price)
+        old_margin = self._position_margin_in_use(existing_position, instrument_type=instrument.get("instrument_type"), reference_price=fill_price)
         new_position = self._apply_fill_to_position(account_scope=order.account_scope, position=existing_position, request=request, fill_price=fill_price, instrument=instrument)
         new_position = new_position.model_copy(update={"account_scope": order.account_scope})
         new_margin = self._position_margin(new_position, instrument_type=instrument.get("instrument_type"), reference_price=fill_price)
@@ -1070,7 +1172,12 @@ class PaperTradingService:
                 quantity=order.quantity,
                 price=fill_price,
                 trade_timestamp=_utcnow(),
-                metadata=dict(order.metadata or {}),
+                metadata={
+                    **dict(order.metadata or {}),
+                    "exchange": order.exchange,
+                    "tradingsymbol": order.tradingsymbol,
+                    "product": order.product,
+                },
             )
         )
         lot_side = self._paper_side_value(order.transaction_type)

@@ -23,6 +23,8 @@ from api.worker_market_data import (
     WorkerQuoteRequest,
     normalize_instrument_token,
 )
+from algo_runtime.account_scope import parse_account_scope
+from algo_runtime.execution_attribution import build_execution_attribution, build_paper_execution_attribution
 from auth_service import require_app_user
 from database import SessionLocal
 
@@ -1400,15 +1402,13 @@ def _require_v1_mode(mode: str) -> None:
 
 
 def _broker_user_id_from_account_scope(account_scope: str) -> str:
-    scope = str(account_scope or "").strip()
-    if not scope.startswith("kite:"):
-        raise HTTPException(status_code=400, detail="Live worker execution requires a kite:<broker_user_id> account_scope")
-    broker_user_id = scope.split(":", 1)[1].strip()
-    if not broker_user_id:
-        raise HTTPException(status_code=400, detail="Live worker execution requires a broker user id in account_scope")
-    if "paper" in broker_user_id.lower():
+    try:
+        parsed = parse_account_scope(account_scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Live worker execution requires a kite:<broker_user_id> account_scope") from exc
+    if parsed.mode != "live" or not parsed.broker_user_id:
         raise HTTPException(status_code=400, detail="Live worker execution requires a real broker account_scope, not a paper account scope")
-    return broker_user_id
+    return parsed.broker_user_id
 
 
 def _validate_live_run_contract(*, account_scope: str, metadata: Dict[str, Any]) -> None:
@@ -1511,6 +1511,37 @@ def _live_attribution_for_worker_intent(*, token: WorkerToken, run: Dict[str, An
             "intent_metadata": request.metadata,
         },
     }
+
+
+def _paper_attribution_for_worker_intent(*, token: WorkerToken, run: Dict[str, Any], request: WorkerIntentRequest) -> Dict[str, Any]:
+    metadata = dict(run.get("metadata") or {})
+    account_scope = str(run.get("account_scope") or token.account_scope or "")
+    strategy_family = str(metadata.get("strategy_family") or "indicator_strategy").strip()
+    if strategy_family not in VALID_WORKER_STRATEGY_FAMILIES:
+        strategy_family = "indicator_strategy"
+    strategy_name = str(metadata.get("strategy_name") or run.get("template_id") or run.get("strategy_run_id") or "paper-run").strip()
+    return build_paper_execution_attribution(
+        strategy_run_id=str(run["strategy_run_id"]),
+        strategy_family=strategy_family,
+        strategy_name=strategy_name,
+        account_ref=account_scope,
+        entry_surface=str(metadata.get("entry_surface") or "algo_worker"),
+        source="algo_worker",
+        idempotency_key=request.idempotency_key,
+        metadata=request.metadata,
+        extras={
+            "token_id": token.token_id,
+            "template_id": run.get("template_id"),
+            "strategy_id": str(run["strategy_run_id"]),
+            "option_strategy_id": str(run["strategy_run_id"]),
+            "strategy_tag": metadata.get("strategy_tag") or run.get("template_id"),
+            "algo_instance_id": metadata.get("algo_instance_id"),
+            "journal_run_id": metadata.get("journal_run_id") or None,
+            "journal_ref": metadata.get("journal_ref") or None,
+            "worker_run_metadata": metadata,
+            "intent_metadata": request.metadata,
+        },
+    )
 
 
 def _inject_live_attribution(order_payload: Dict[str, Any], attribution: Dict[str, Any]) -> Dict[str, Any]:
@@ -1621,7 +1652,13 @@ async def _live_worker_funds_snapshot(account_scope: str, *, mode: str) -> Dict[
 
 async def _build_worker_funds_snapshot(request: Request, *, account_scope: str, mode: str) -> Dict[str, Any]:
     normalized_mode = str(mode or "paper").lower()
-    if normalized_mode == "paper" or str(account_scope).startswith("kite:paper"):
+    try:
+        parsed_scope = parse_account_scope(account_scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if normalized_mode == "paper":
+        return await _paper_worker_funds_snapshot(request, account_scope, mode=normalized_mode)
+    if normalized_mode == "dry_run" and parsed_scope.mode == "paper":
         return await _paper_worker_funds_snapshot(request, account_scope, mode=normalized_mode)
     if normalized_mode in {"live", "dry_run"}:
         return await _live_worker_funds_snapshot(account_scope, mode=normalized_mode)
@@ -1802,28 +1839,39 @@ async def _paper_worker_run_pnl_snapshot(request: Request, run: Dict[str, Any]) 
             last_price=_to_float(position.get("last_price")),
             realized_pnl=_to_float(position.get("realized_pnl")),
             unrealized_pnl=_to_float(position.get("unrealized_pnl")),
-            gross_pnl=_to_float(position.get("realized_pnl")) + _to_float(position.get("unrealized_pnl")),
-            charges=0.0,
-            net_pnl=_to_float(position.get("realized_pnl")) + _to_float(position.get("unrealized_pnl")),
-            is_stale=False,
+            gross_pnl=_to_float(position.get("gross_pnl"))
+            if "gross_pnl" in position
+            else (_to_float(position.get("realized_pnl")) + _to_float(position.get("unrealized_pnl"))),
+            charges=_to_float(position.get("charges")),
+            net_pnl=_to_float(position.get("net_pnl"))
+            if "net_pnl" in position
+            else (
+                (_to_float(position.get("gross_pnl")) if "gross_pnl" in position else (_to_float(position.get("realized_pnl")) + _to_float(position.get("unrealized_pnl"))))
+                - _to_float(position.get("charges"))
+            ),
+            is_stale=bool(position.get("is_stale")),
         )
         for position in strategy.get("positions", [])
         if _to_int(position.get("net_quantity")) != 0
     ]
     realized = _to_float(strategy.get("realized_pnl"))
     unrealized = _to_float(strategy.get("unrealized_pnl"))
-    gross = realized + unrealized
+    gross = _to_float(strategy.get("gross_pnl")) if "gross_pnl" in strategy else (realized + unrealized)
+    charges = _to_float(strategy.get("charges"))
+    if charges == 0.0:
+        charges = sum(_to_float(getattr(leg, "charges", 0.0)) for leg in legs)
+    net = _to_float(strategy.get("net_pnl")) if "net_pnl" in strategy else (gross - charges)
     updated_at = str(strategy.get("last_updated_at") or strategy.get("last_event_at") or _utcnow().isoformat())
     return WorkerRunPnlSnapshot(
         strategy_run_id=str(run["strategy_run_id"]),
         execution_mode="paper",
         status=str(strategy.get("status") or run.get("status") or "open"),
         currency=str(summary.get("currency") or "INR"),
-        totals=WorkerRunPnlTotals(realized_pnl=realized, unrealized_pnl=unrealized, gross_pnl=gross, charges=0.0, net_pnl=gross),
+        totals=WorkerRunPnlTotals(realized_pnl=realized, unrealized_pnl=unrealized, gross_pnl=gross, charges=charges, net_pnl=net),
         legs=legs,
         position_count=len(legs),
         is_realtime=True,
-        is_stale=False,
+        is_stale=bool(strategy.get("is_stale")),
         updated_at=updated_at,
     ).model_dump(mode="json")
 
@@ -2325,10 +2373,32 @@ async def _exit_live_worker_run(*, request: Request, token: WorkerToken, run: Di
 
 
 def _assert_run_access(token: WorkerToken, run: Dict[str, Any]) -> None:
-    if token.account_scope and run.get("account_scope") != token.account_scope:
+    if str(run.get("token_id") or "") != token.token_id:
+        raise HTTPException(status_code=403, detail="Worker token cannot access this run")
+    if not _token_allows_account_scope(token, str(run.get("account_scope") or "")):
         raise HTTPException(status_code=403, detail="Worker token cannot access this account scope")
     if token.allowed_templates and run.get("template_id") not in token.allowed_templates:
         raise HTTPException(status_code=403, detail="Worker token cannot access this strategy template")
+
+
+def _token_allows_account_scope(token: WorkerToken, account_scope: str) -> bool:
+    token_scope = str(token.account_scope or "").strip()
+    if not token_scope:
+        return True
+    requested_scope = str(account_scope or "").strip()
+    if not requested_scope:
+        return False
+    try:
+        token_parsed = parse_account_scope(token_scope)
+        requested_parsed = parse_account_scope(requested_scope)
+    except ValueError:
+        return token_scope == requested_scope
+
+    if token_parsed.mode == "live":
+        if requested_parsed.mode == "paper":
+            return True
+        return requested_parsed.normalized == token_parsed.normalized
+    return requested_parsed.normalized == token_parsed.normalized
 
 
 def _require_live_run(run: Dict[str, Any], *, feature: str) -> None:
@@ -2394,7 +2464,13 @@ async def create_worker_run(request: Request, payload: WorkerRunCreateRequest):
     token = await require_worker_token(request)
     _require_action(token, "runs:create")
     _require_v1_mode(payload.execution_mode)
-    if token.account_scope and payload.account_scope != token.account_scope:
+    try:
+        parsed_scope = parse_account_scope(payload.account_scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload.execution_mode == "paper" and parsed_scope.mode != "paper":
+        raise HTTPException(status_code=400, detail="Paper worker runs require a paper account_scope")
+    if not _token_allows_account_scope(token, payload.account_scope):
         raise HTTPException(status_code=403, detail="Worker token cannot create runs for this account scope")
     if token.allowed_templates and payload.template_id not in token.allowed_templates:
         raise HTTPException(status_code=403, detail="Worker token cannot create this strategy template")
@@ -2572,7 +2648,7 @@ async def get_worker_funds(request: Request, mode: str = Query("paper"), account
     scope = str(account_scope or token.account_scope or "").strip()
     if not scope:
         raise HTTPException(status_code=400, detail="account_scope is required for worker funds")
-    if token.account_scope and scope != token.account_scope:
+    if not _token_allows_account_scope(token, scope):
         raise HTTPException(status_code=403, detail="Worker token cannot read this account scope")
     return await _build_worker_funds_snapshot(request, account_scope=scope, mode=normalized_mode)
 
@@ -2909,11 +2985,30 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
 
     result: Dict[str, Any]
     if mode == "dry_run":
+        attribution = build_execution_attribution(
+            execution_mode="dry_run",
+            strategy_run_id=str(run["strategy_run_id"]),
+            strategy_family=str((run.get("metadata") or {}).get("strategy_family") or "indicator_strategy"),
+            strategy_name=str((run.get("metadata") or {}).get("strategy_name") or run.get("template_id") or run["strategy_run_id"]),
+            account_ref=str(run.get("account_scope") or ""),
+            entry_surface=str((run.get("metadata") or {}).get("entry_surface") or "algo_worker"),
+            source="algo_worker",
+            idempotency_key=payload.idempotency_key,
+            metadata=payload.metadata,
+            extras={
+                "token_id": token.token_id,
+                "template_id": run.get("template_id"),
+                "strategy_id": str(run["strategy_run_id"]),
+                "option_strategy_id": str(run["strategy_run_id"]),
+            },
+        )
         result = {
             "mode": "dry_run",
-            "status": "accepted",
+            "status": "validated",
             "intent_type": payload.intent_type,
+            "mutated_state": False,
             "payload": payload.payload,
+            "attribution": attribution,
         }
     elif mode == "live":
         result = await _submit_live_worker_intent(request=request, token=token, run=run, payload=payload)
@@ -2921,14 +3016,7 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
         paper_runtime_service = getattr(request.app.state, "paper_runtime_service", None)
         if paper_runtime_service is None:
             raise HTTPException(status_code=503, detail="Paper runtime is not available")
-        attribution = {
-            "source": "algo_worker",
-            "token_id": token.token_id,
-            "strategy_run_id": strategy_run_id,
-            "strategy_id": strategy_run_id,
-            "template_id": run.get("template_id"),
-            **payload.metadata,
-        }
+        attribution = _paper_attribution_for_worker_intent(token=token, run=run, request=payload)
         if payload.intent_type == "place_order":
             result = await paper_runtime_service.place_order(
                 account_scope=str(run["account_scope"]),
@@ -2974,8 +3062,12 @@ async def exit_worker_run(request: Request, strategy_run_id: str, payload: Worke
     if paper_runtime_service is None:
         raise HTTPException(status_code=503, detail="Paper runtime is not available")
     result = await paper_runtime_service.exit_strategy(account_scope=str(run["account_scope"]), strategy_id=strategy_run_id)
-    updated = await _repo(request).update_run_status(strategy_run_id, "closed", state_patch={"exit_result": result, "exit_reason": payload.reason})
-    return {"mode": "paper", "status": "closed", "result": result, "run": updated}
+    result_status = str(result.get("status") or "success").lower()
+    if result_status in {"success", "closed", "noop"}:
+        updated = await _repo(request).update_run_status(strategy_run_id, "closed", state_patch={"exit_result": result, "exit_reason": payload.reason})
+        return {"mode": "paper", "status": "closed", "result": result, "run": updated}
+    updated = await _repo(request).update_run_status(strategy_run_id, str(run.get("status") or "open"), state_patch={"exit_result": result, "exit_reason": payload.reason})
+    return {"mode": "paper", "status": result_status, "result": result, "run": updated}
 
 
 @router.websocket("/worker/ws/market/ticks")
