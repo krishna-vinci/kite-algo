@@ -1,6 +1,13 @@
 """
 Strike Selector for Position Protection System
 Phase 3: Delta-based strike selection and automated position building
+
+Compatibility/canonical ownership note:
+- This module serves legacy index-stoploss and position-builder flows.
+- Canonical options market ownership (session/chain/greeks/selection analytics)
+  is under `options/market/*` and `options/api/market_router.py`.
+- Keep behavior here compatibility-focused unless a safe, response-compatible
+  delegation to canonical helpers is straightforward.
 """
 
 import logging
@@ -20,9 +27,12 @@ logger = logging.getLogger(__name__)
 class StrikeSelector:
     """
     Handles delta-based strike selection and position building.
-    
-    Integrates with OptionsSessionManager for real-time Greeks
-    and InstrumentsRepository for strike lookups.
+
+    Compatibility adapter details:
+    - Consumes `OptionsSessionManager` snapshots as input.
+    - Session Greek values are sourced from backend option sessions
+      (synthetic-forward/Black-76 computation), then transformed here into
+      legacy mini-chain/suggestion payloads used by older callers.
     """
     
     def __init__(

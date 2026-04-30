@@ -1,3 +1,17 @@
+"""Legacy options session routes kept for compatibility.
+
+Canonical options behavior is owned by:
+- options/market/service.py
+- options/api/market_router.py
+- options/api/execution_router.py
+- options/api/protection_router.py
+
+This module is intentionally retained for existing clients that still call
+legacy paths under /options/* and /ws|/sse options session endpoints.
+Avoid adding new option business logic here; prefer canonical routes/services
+and keep this file as a compatibility adapter.
+"""
+
 import asyncio
 import logging
 from datetime import date, datetime
@@ -251,6 +265,11 @@ async def get_session_snapshot(
     """
     Returns the latest snapshot for a given underlying's session.
 
+    Compatibility note:
+    - This legacy route preserves the old snapshot response shape.
+    - Canonical app-user routes live under `/api/options/underlyings/*` and
+      should be used for new integrations.
+
     - Response model: `OptionChainSnapshotModel`
     - 404 detail shape: `{"code":"OPTION_SESSION_NOT_FOUND","message":"..."}`
     """
@@ -357,6 +376,10 @@ async def get_option_chain(
 ):
     """
     Thin alias to get a session snapshot, for backward compatibility.
+
+    Compatibility note:
+    - This endpoint intentionally keeps the legacy response model.
+    - Canonical option chain route is `/api/options/underlyings/{underlying}/chain`.
 
     - Response model: `OptionChainSnapshotModel`
     - 404 detail shape: `{"code":"OPTION_SESSION_NOT_FOUND","message":"..."}`

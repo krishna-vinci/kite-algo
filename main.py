@@ -72,6 +72,11 @@ from fyers_apiv3 import fyersModel
 from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
 from broker_api.broker_api import router as kite_router
 from broker_api.kite_orders import router as kite_orders_router
+from options.api.execution_router import router as options_execution_router
+from options.api.market_router import router as options_market_router
+from options.api.protection_router import router as options_protection_router
+from options.api.strategy_router import router as options_strategy_router
+from options.api.worker_options_router import router as worker_options_router
 from strategies.indexstoploss.router import router as indexstoploss_router
 
 from broker_api.broker_api import get_kite
@@ -91,6 +96,7 @@ import logging
 from database import SessionLocal, database as async_db
 from broker_api.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
 from broker_api.market_runtime_client import MarketDataRuntime, market_runtime_enabled
+from broker_api.options_greeks import prewarm_options_engine
 from broker_api.broker_api import run_headless_login_and_persist_system_token
 from broker_api.kite_auth import API_KEY
 from broker_api.order_runtime import order_event_runtime, realtime_positions_service, refresh_processing_stuck_rows
@@ -264,6 +270,16 @@ async def combined_lifespan(app: FastAPI):
     try:
         # Ensure the schema is applied before any other database operations
         run_schema_migrations()
+        try:
+            prewarmed = await asyncio.to_thread(prewarm_options_engine)
+            if prewarmed:
+                logging.info("Options Black-76/IV kernels prewarmed successfully.")
+                set_component_status("options_math_engine", "healthy", detail="Black-76/IV kernels prewarmed")
+            else:
+                set_component_status("options_math_engine", "degraded", detail="Black-76/IV kernel prewarm returned false")
+        except Exception as e:
+            logging.warning("Options math engine prewarm failed; continuing startup: %s", e, exc_info=True)
+            set_component_status("options_math_engine", "degraded", detail=str(e))
         # Determine system access_token from DB; validate and fallback to headless login
         at = None
         kite = None
@@ -887,6 +903,11 @@ app.include_router(candles_api_router, prefix="/api")  # Unified candles API wit
 app.include_router(performance_router, prefix="/api")
 app.include_router(alerts_router, prefix="/api/alerts")
 app.include_router(indexstoploss_router, prefix="/api/strategies")
+app.include_router(options_market_router)
+app.include_router(options_strategy_router)
+app.include_router(options_execution_router)
+app.include_router(options_protection_router)
+app.include_router(worker_options_router)
 
 from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
 import logging

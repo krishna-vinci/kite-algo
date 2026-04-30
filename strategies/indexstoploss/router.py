@@ -3,6 +3,14 @@ Slim strategy router for the options workspace and runtime-managed option execut
 
 Legacy position-protection endpoints were removed after the option strategy flow
 fully moved onto the modular algo runtime.
+
+Compatibility/canonical ownership note:
+- This router is a legacy compatibility surface used by existing frontend and
+  older integration flows.
+- Canonical option market/run/protection APIs now live under `options/api/*`
+  (`market_router`, `execution_router`, `protection_router`).
+- Keep legacy route behavior stable; new option-core behavior should be added
+  in canonical routes/services and referenced from here only when safe.
 """
 
 import logging
@@ -24,6 +32,7 @@ from broker_api.instruments_repository import InstrumentsRepository
 from broker_api.kite_orders import get_correlation_id, realtime_positions_service, run_kite_write_action
 from broker_api.kite_session import get_kite_session_id, get_session_account_id
 from database import SessionLocal
+from options.api.strategy_router import preview_option_strategy as canonical_preview_option_strategy
 from strategies.option_strategy import (
     StrategyExecutionMode,
     StrategyProtectionPreferences,
@@ -560,19 +569,22 @@ async def build_position(
 
 @router.post("/preview-option-strategy")
 async def preview_option_strategy(req: StrategyPreviewRequest):
-    try:
-        preview = compile_option_strategy_preview(
-            underlying=req.underlying.upper(),
-            template_id=req.template_id,
-            strategy_type=req.strategy_type,
-            current_spot=req.current_spot,
-            legs=[item.model_dump(mode="json") for item in req.selected_strikes],
-            protection_preferences=StrategyProtectionPreferences.from_payload(req.protection_config),
-        )
-        return {"strategy": preview.model_dump(mode="json")}
-    except Exception as e:
-        logger.error("Failed to preview option strategy: %s", e, exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+    """Compatibility adapter to canonical option strategy preview route.
+
+    This legacy endpoint intentionally delegates to the canonical
+    `options.api.strategy_router.preview_option_strategy` implementation while
+    preserving the older request envelope expected by existing callers.
+    """
+    return await canonical_preview_option_strategy(
+        {
+            "underlying": req.underlying,
+            "template_id": req.template_id,
+            "strategy_type": req.strategy_type,
+            "current_spot": req.current_spot,
+            "selected_strikes": [item.model_dump(mode="json") for item in req.selected_strikes],
+            "protection_config": req.protection_config,
+        }
+    )
 
 
 @router.get("/positions/realtime-summary")

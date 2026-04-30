@@ -16,6 +16,7 @@ from .models import (
     WorkerRunPnlSnapshot,
     WorkerTradesResponse,
 )
+from .options.client import OptionWorkerClient
 from .protection import BackendProtection
 
 
@@ -53,6 +54,7 @@ class KiteAlgoWorkerClient:
                 "Content-Type": "application/json",
             }
         )
+        self.options = OptionWorkerClient(self)
 
     def health(self) -> JsonDict:
         return self._request("GET", "/worker/health")

@@ -1,5 +1,6 @@
 """Thin Python SDK for external Kite Algo strategy workers."""
 
+from . import options
 from .async_client import AsyncKiteAlgoWorkerClient
 from .client import AlgoWorkerConfig, KiteAlgoWorkerClient, KiteAlgoWorkerError
 from .exceptions import AuthError, BrokerValidationError, PermissionDeniedError, StreamDisconnectedError
@@ -34,6 +35,7 @@ from .models import (
     WorkerTradesResponse,
 )
 from .orders import OrderBuilder, equity_market_order, limit_order, market_order, option_market_order, sl_m_order, sl_order
+from .options import OptionEntryPreviewRequest, OptionExpirySnapshot, OptionWorkerClient, option_leg
 from .protection import BackendProtection, BasketProtection, OperationalProtection, ProtectedPosition
 from .ws import StreamHealth, WorkerCandleWebSocketClient, WorkerRunPnlWebSocketClient, WorkerTickWebSocketClient, WorkerWebSocketClient
 
@@ -88,6 +90,9 @@ __all__ = [
     "TechnicalAnalysis",
     "option_market_order",
     "OrderBuilder",
+    "OptionEntryPreviewRequest",
+    "OptionExpirySnapshot",
+    "OptionWorkerClient",
     "OrderPreview",
     "PermissionDeniedError",
     "PreviewPayload",
@@ -104,6 +109,8 @@ __all__ = [
     "format_output",
     "njit",
     "normalize_input",
+    "option_leg",
+    "options",
     "sma",
     "ta",
     "wait_for_history",

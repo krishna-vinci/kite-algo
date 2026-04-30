@@ -48,6 +48,7 @@ def create_tables_if_not_exists(conn):
     # Create Position Protection System tables if they don't exist
     _create_position_protection_tables(conn)
     _ensure_option_strategy_runs_compatibility(conn)
+    _ensure_option_run_states_compatibility(conn)
 
 
 def _ensure_option_strategy_runs_compatibility(conn):
@@ -64,6 +65,56 @@ def _ensure_option_strategy_runs_compatibility(conn):
         logging.info("Option strategy run compatibility checks applied successfully.")
     except Exception as e:
         logging.error(f"Error applying option strategy compatibility checks: {e}")
+        conn.rollback()
+        raise
+
+
+def _ensure_option_run_states_compatibility(conn):
+    """Ensure canonical option run state table exists in older environments."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.option_run_states (
+                    strategy_run_id TEXT PRIMARY KEY,
+                    strategy_name TEXT NOT NULL,
+                    product VARCHAR(8) NOT NULL CHECK (product IN ('MIS', 'NRML')),
+                    status VARCHAR(64) NOT NULL,
+                    legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    protection JSONB,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    orders JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    trades JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    completed_legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    failed_legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    pending_legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_option_run_states_status
+                ON public.option_run_states(status)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_option_run_states_updated
+                ON public.option_run_states(updated_at DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_option_run_states_product
+                ON public.option_run_states(product)
+                """
+            )
+        conn.commit()
+        logging.info("Option run state compatibility checks applied successfully.")
+    except Exception as e:
+        logging.error(f"Error applying option run state compatibility checks: {e}")
         conn.rollback()
         raise
 

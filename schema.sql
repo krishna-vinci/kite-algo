@@ -1005,6 +1005,32 @@ CREATE TABLE IF NOT EXISTS public.option_strategy_runs (
 CREATE INDEX IF NOT EXISTS idx_option_strategy_runs_created ON public.option_strategy_runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_option_strategy_runs_mode_status ON public.option_strategy_runs(execution_mode, status, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS public.option_run_states (
+    strategy_run_id TEXT PRIMARY KEY,
+    strategy_name TEXT NOT NULL,
+    product VARCHAR(8) NOT NULL CHECK (product IN ('MIS', 'NRML')),
+    status VARCHAR(64) NOT NULL,
+    legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    protection JSONB,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    orders JSONB NOT NULL DEFAULT '[]'::jsonb,
+    trades JSONB NOT NULL DEFAULT '[]'::jsonb,
+    completed_legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    failed_legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    pending_legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_option_run_states_status
+    ON public.option_run_states(status);
+
+CREATE INDEX IF NOT EXISTS idx_option_run_states_updated
+    ON public.option_run_states(updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_option_run_states_product
+    ON public.option_run_states(product);
+
 -- =========================================
 -- Portfolio snapshots and history
 -- =========================================
