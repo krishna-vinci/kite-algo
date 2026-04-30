@@ -145,6 +145,11 @@ def _build_run_exit_orders(run: OptionRunState) -> list[dict[str, Any]]:
                     "net_quantity": net_quantity,
                     "product": run.product,
                     "apply_market_protection": True,
+                    "exit_order_type": leg.get("exit_order_type"),
+                    "exit_price": leg.get("exit_price"),
+                    "limit_price": leg.get("limit_price"),
+                    "exit_variety": leg.get("exit_variety"),
+                    "market_protection": leg.get("market_protection"),
                 }
             )
     else:
@@ -170,6 +175,11 @@ def _build_run_exit_orders(run: OptionRunState) -> list[dict[str, Any]]:
                     "net_quantity": net_quantity,
                     "product": run.product,
                     "apply_market_protection": True,
+                    "exit_order_type": leg.get("exit_order_type"),
+                    "exit_price": leg.get("exit_price"),
+                    "limit_price": leg.get("limit_price"),
+                    "exit_variety": leg.get("exit_variety"),
+                    "market_protection": leg.get("market_protection"),
                 }
             )
 

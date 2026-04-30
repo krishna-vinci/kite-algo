@@ -30,15 +30,20 @@ def build_entry_order_plan(
         if transaction_type not in {"BUY", "SELL"}:
             continue
 
-        orders.append(
-            {
-                "leg_id": str(leg.get("leg_id") or f"leg_{index + 1}"),
-                "tradingsymbol": leg.get("tradingsymbol"),
-                "quantity": quantity,
-                "transaction_type": transaction_type,
-                # Product policy for B3: prefer run-level product.
-                "product": product,
-            }
-        )
+        order = {
+            "leg_id": str(leg.get("leg_id") or f"leg_{index + 1}"),
+            "exchange": leg.get("exchange") or "NFO",
+            "tradingsymbol": leg.get("tradingsymbol"),
+            "quantity": quantity,
+            "transaction_type": transaction_type,
+            "variety": leg.get("variety") or "regular",
+            "order_type": str(leg.get("order_type") or "MARKET").upper(),
+            # Product policy for B3: prefer run-level product.
+            "product": product,
+        }
+        for optional_key in ("price", "trigger_price", "market_protection"):
+            if leg.get(optional_key) is not None:
+                order[optional_key] = leg.get(optional_key)
+        orders.append(order)
 
     return sort_entry_orders_buy_first(orders)

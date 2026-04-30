@@ -28,13 +28,7 @@ def build_exit_preview_packet(run: OptionRunState) -> dict[str, Any]:
         "product": run.product,
         "open_legs": open_legs,
         "order_plan": [
-            {
-                "leg_id": leg["leg_id"],
-                "tradingsymbol": leg.get("tradingsymbol"),
-                "quantity": leg["open_quantity"],
-                "transaction_type": "SELL" if leg.get("entry_side") == "BUY" else "BUY",
-                "product": run.product,
-            }
+            _build_exit_order_plan_item(leg, product=run.product)
             for leg in open_legs
             if int(leg.get("open_quantity") or 0) > 0
         ],
@@ -43,11 +37,35 @@ def build_exit_preview_packet(run: OptionRunState) -> dict[str, Any]:
     }
 
 
+def _build_exit_order_plan_item(leg: dict[str, Any], *, product: str | None) -> dict[str, Any]:
+    order_type = str(leg.get("exit_order_type") or leg.get("order_type") or "MARKET").upper()
+    item: dict[str, Any] = {
+        "leg_id": leg["leg_id"],
+        "exchange": leg.get("exchange") or "NFO",
+        "tradingsymbol": leg.get("tradingsymbol"),
+        "quantity": leg["open_quantity"],
+        "transaction_type": "SELL" if leg.get("entry_side") == "BUY" else "BUY",
+        "variety": leg.get("exit_variety") or leg.get("variety") or "regular",
+        "order_type": order_type,
+        "product": product,
+    }
+    exit_price = leg.get("exit_price") if leg.get("exit_price") is not None else leg.get("limit_price")
+    if order_type == "LIMIT" and exit_price is not None:
+        item["price"] = exit_price
+    if order_type == "MARKET" and leg.get("market_protection") is not None:
+        item["market_protection"] = leg.get("market_protection")
+    return item
+
+
 def _derive_open_exit_legs(run: OptionRunState) -> list[dict[str, Any]]:
     # Prefer trade-derived open quantity when available.
     if run.trades:
         signed_qty_by_leg: dict[str, int] = defaultdict(int)
-        meta_by_leg: dict[str, dict[str, Any]] = {}
+        meta_by_leg: dict[str, dict[str, Any]] = {
+            str(leg.get("leg_id") or ""): dict(leg)
+            for leg in run.legs
+            if str(leg.get("leg_id") or "")
+        }
         for trade in run.trades:
             leg_id = str(trade.get("leg_id") or "")
             if not leg_id:
@@ -58,12 +76,12 @@ def _derive_open_exit_legs(run: OptionRunState) -> list[dict[str, Any]]:
                 signed_qty_by_leg[leg_id] += qty
             elif side == "SELL":
                 signed_qty_by_leg[leg_id] -= qty
-            if leg_id not in meta_by_leg:
-                meta_by_leg[leg_id] = {
-                    "tradingsymbol": trade.get("tradingsymbol"),
-                    "entry_side": trade.get("entry_side")
-                    or ("BUY" if signed_qty_by_leg[leg_id] >= 0 else "SELL"),
-                }
+            meta_by_leg.setdefault(leg_id, {})
+            meta_by_leg[leg_id].setdefault("tradingsymbol", trade.get("tradingsymbol"))
+            meta_by_leg[leg_id].setdefault(
+                "entry_side",
+                trade.get("entry_side") or ("BUY" if signed_qty_by_leg[leg_id] >= 0 else "SELL"),
+            )
 
         open_legs = []
         for leg_id, net in signed_qty_by_leg.items():
@@ -74,9 +92,15 @@ def _derive_open_exit_legs(run: OptionRunState) -> list[dict[str, Any]]:
             open_legs.append(
                 {
                     "leg_id": leg_id,
+                    "exchange": meta.get("exchange") or "NFO",
                     "tradingsymbol": meta.get("tradingsymbol"),
                     "entry_side": meta.get("entry_side") or entry_side,
                     "open_quantity": abs(int(net)),
+                    "exit_order_type": meta.get("exit_order_type"),
+                    "exit_price": meta.get("exit_price"),
+                    "limit_price": meta.get("limit_price"),
+                    "exit_variety": meta.get("exit_variety"),
+                    "market_protection": meta.get("market_protection"),
                 }
             )
         return open_legs
@@ -98,9 +122,15 @@ def _derive_open_exit_legs(run: OptionRunState) -> list[dict[str, Any]]:
         open_legs.append(
             {
                 "leg_id": str(leg.get("leg_id") or f"leg_{index + 1}"),
+                "exchange": leg.get("exchange") or "NFO",
                 "tradingsymbol": leg.get("tradingsymbol"),
                 "entry_side": transaction_type,
                 "open_quantity": quantity,
+                "exit_order_type": leg.get("exit_order_type"),
+                "exit_price": leg.get("exit_price"),
+                "limit_price": leg.get("limit_price"),
+                "exit_variety": leg.get("exit_variety"),
+                "market_protection": leg.get("market_protection"),
             }
         )
     return open_legs
