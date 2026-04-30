@@ -1,11 +1,8 @@
 import { screen } from "@testing-library/react";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
-import AlertsPage from "@/app/(app)/alerts/page";
-import AlgosPage from "@/app/(app)/algos/page";
 import DashboardPage from "@/app/(app)/dashboard/page";
 import OptionsPage from "@/app/(app)/options/page";
-import ScreenersPage from "@/app/(app)/screeners/page";
 import { renderWithQueryClient } from "@/tests/render-with-query-client";
 
 class MockEventSource {
@@ -123,27 +120,4 @@ describe("reference pages", () => {
     expect(screen.getByText(/canonical paper \+ broker state/i)).toBeInTheDocument();
   });
 
-  it("renders the live algos monitoring page", () => {
-    renderWithQueryClient(<AlgosPage />);
-
-    expect(screen.getByText(/algo runtime overview/i)).toBeInTheDocument();
-    expect(screen.getByText(/short straddle/i)).toBeInTheDocument();
-    expect(screen.getByText(/system health/i)).toBeInTheDocument();
-  });
-
-  it("renders alerts quick create and history", () => {
-    renderWithQueryClient(<AlertsPage />);
-
-    expect(screen.getByRole("heading", { name: /alerts/i })).toBeInTheDocument();
-    expect(screen.getByText(/alert authoring, delivery status, and alert history/i)).toBeInTheDocument();
-    expect(screen.getByText(/not live yet/i)).toBeInTheDocument();
-  });
-
-  it("renders saved screeners and results", () => {
-    renderWithQueryClient(<ScreenersPage />);
-
-    expect(screen.getByRole("heading", { name: /screeners/i })).toBeInTheDocument();
-    expect(screen.getByText(/real filter-builder and result stream/i)).toBeInTheDocument();
-    expect(screen.getByText(/not live yet/i)).toBeInTheDocument();
-  });
 });

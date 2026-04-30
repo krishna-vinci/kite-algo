@@ -14,7 +14,7 @@ export function AppShell({ navigation, activeHref, children }: AppShellProps) {
   const activeItem = navigation.find(
     (item) => activeHref === item.href || (item.href !== "/dashboard" && activeHref.startsWith(item.href)),
   );
-  const hideGlobalDock = activeHref.startsWith("/options") || activeHref.startsWith("/quick-trade");
+  const hideGlobalDock = activeHref.startsWith("/options");
 
   return (
     <div className="grid min-h-screen grid-cols-[68px_1fr] grid-rows-[52px_1fr_auto] bg-[var(--bg)] text-[var(--text)]">

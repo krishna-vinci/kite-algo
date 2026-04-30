@@ -1,16 +1,10 @@
 import Link from "next/link";
 import {
   Activity,
-  Bell,
   BookOpen,
-  Bot,
-  ChartCandlestick,
   FlaskConical,
   LayoutDashboard,
   LayoutGrid,
-  LineChart,
-  PanelsTopLeft,
-  ScanSearch,
   Settings,
   type LucideIcon,
 } from "lucide-react";
@@ -25,15 +19,9 @@ type LeftRailProps = Readonly<{
 const iconByHref: Record<string, LucideIcon> = {
   "/dashboard": LayoutDashboard,
   "/trading": Activity,
-  "/quick-trade": ChartCandlestick,
   "/options": Activity,
-  "/algos": Bot,
   "/journal": BookOpen,
-  "/alerts": Bell,
-  "/screeners": ScanSearch,
   "/paper": FlaskConical,
-  "/charts": LineChart,
-  "/custom-display": PanelsTopLeft,
   "/settings": Settings,
 };
 

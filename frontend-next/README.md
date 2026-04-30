@@ -4,14 +4,9 @@ Terminal-style Next.js shell for static reference pages in `frontend-next`.
 
 ### Routes
 
-- `/custom-display` - workspace composition sketch
 - `/dashboard` - operator overview draft
 - `/options` - options workspace draft
-- `/algos` - process manager draft
-- `/alerts` - alerting draft
-- `/screeners` - screener builder draft
 - `/paper` - paper trading blotter mock
-- `/charts` - charting surface mock
 - `/settings` - trading defaults and sessions mock
 
 ### Scripts
