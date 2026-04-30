@@ -76,8 +76,105 @@ except ModuleNotFoundError as exc:  # pragma: no cover - import-time fallback
             raise ModuleNotFoundError("pandas and numpy are required for kite_algo_worker indicators")
 
     class TechnicalAnalysis(BaseIndicator):  # type: ignore[no-redef]
-        def sma(self, *_args: Any, **_kwargs: Any):
-            raise ModuleNotFoundError("pandas and numpy are required for kite_algo_worker indicators")
+        @staticmethod
+        def _series(values: Any) -> list[float]:
+            return [float(value) for value in list(values or [])]
+
+        def sma(self, values: Any, period: int):
+            series = self._series(values)
+            window = max(int(period), 1)
+            result: list[float | None] = []
+            for index in range(len(series)):
+                if index + 1 < window:
+                    result.append(None)
+                    continue
+                chunk = series[index + 1 - window : index + 1]
+                result.append(sum(chunk) / window)
+            return result
+
+        def ema(self, values: Any, period: int):
+            series = self._series(values)
+            window = max(int(period), 1)
+            if not series:
+                return []
+            multiplier = 2.0 / (window + 1.0)
+            result: list[float | None] = []
+            ema_value: float | None = None
+            for index, value in enumerate(series):
+                if index + 1 < window:
+                    result.append(None)
+                    continue
+                if ema_value is None:
+                    ema_value = sum(series[index + 1 - window : index + 1]) / window
+                else:
+                    ema_value = ((value - ema_value) * multiplier) + ema_value
+                result.append(ema_value)
+            return result
+
+        def rsi(self, values: Any, period: int = 14):
+            series = self._series(values)
+            window = max(int(period), 1)
+            if len(series) < 2:
+                return [None for _ in series]
+            gains = [0.0]
+            losses = [0.0]
+            for index in range(1, len(series)):
+                delta = series[index] - series[index - 1]
+                gains.append(max(delta, 0.0))
+                losses.append(abs(min(delta, 0.0)))
+            result: list[float | None] = []
+            avg_gain = 0.0
+            avg_loss = 0.0
+            for index in range(len(series)):
+                if index < window:
+                    result.append(None)
+                    if index > 0:
+                        avg_gain += gains[index]
+                        avg_loss += losses[index]
+                    continue
+                if index == window:
+                    avg_gain = sum(gains[1 : window + 1]) / window
+                    avg_loss = sum(losses[1 : window + 1]) / window
+                else:
+                    avg_gain = ((avg_gain * (window - 1)) + gains[index]) / window
+                    avg_loss = ((avg_loss * (window - 1)) + losses[index]) / window
+                if avg_loss == 0:
+                    result.append(100.0)
+                    continue
+                rs = avg_gain / avg_loss
+                result.append(100.0 - (100.0 / (1.0 + rs)))
+            return result
+
+        def atr(self, high: Any, low: Any, close: Any, period: int = 14):
+            highs = self._series(high)
+            lows = self._series(low)
+            closes = self._series(close)
+            window = max(int(period), 1)
+            length = min(len(highs), len(lows), len(closes))
+            if length == 0:
+                return []
+            true_ranges: list[float] = []
+            for index in range(length):
+                previous_close = closes[index - 1] if index > 0 else closes[index]
+                true_ranges.append(max(highs[index] - lows[index], abs(highs[index] - previous_close), abs(lows[index] - previous_close)))
+            result: list[float | None] = []
+            atr_value: float | None = None
+            for index, tr in enumerate(true_ranges):
+                if index + 1 < window:
+                    result.append(None)
+                    continue
+                if atr_value is None:
+                    atr_value = sum(true_ranges[index + 1 - window : index + 1]) / window
+                else:
+                    atr_value = ((atr_value * (window - 1)) + tr) / window
+                result.append(atr_value)
+            return result
+
+        def __getattr__(self, _name: str):
+            def _missing(*_args: Any, **_kwargs: Any):
+                raise ModuleNotFoundError("pandas and numpy are required for kite_algo_worker indicators")
+
+            return _missing
 
     class IndicatorValue:  # type: ignore[no-redef]
         pass

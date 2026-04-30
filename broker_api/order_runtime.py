@@ -31,6 +31,7 @@ TERMINAL_ORDER_STATUSES = {
 
 EVENT_PROCESSOR_LOCK_ID = 87234101
 POSITION_RECONCILE_LOCK_ID = 87234102
+_ORDER_RUNTIME_SCHEMA_COMPAT_READY = False
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -455,6 +456,7 @@ class CanonicalOrderEventRuntime:
         )
 
     async def process_pending_events(self, batch_size: int = 100) -> int:
+        await ensure_order_runtime_schema_compatibility()
         db = SessionLocal()
         try:
             if not _try_advisory_lock(db, EVENT_PROCESSOR_LOCK_ID):
@@ -1177,6 +1179,7 @@ def _close_locked_session(db: Optional[Session], *, invalidate_connection: bool 
 
 
 async def refresh_processing_stuck_rows() -> None:
+    await ensure_order_runtime_schema_compatibility()
     db = SessionLocal()
     try:
         db.execute(
@@ -1190,6 +1193,29 @@ async def refresh_processing_stuck_rows() -> None:
             )
         )
         db.commit()
+    finally:
+        db.close()
+
+
+async def ensure_order_runtime_schema_compatibility() -> None:
+    global _ORDER_RUNTIME_SCHEMA_COMPAT_READY
+    if _ORDER_RUNTIME_SCHEMA_COMPAT_READY:
+        return
+    db = SessionLocal()
+    try:
+        db.execute(
+            text(
+                """
+                ALTER TABLE public.canonical_order_events
+                ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMPTZ
+                """
+            )
+        )
+        db.commit()
+        _ORDER_RUNTIME_SCHEMA_COMPAT_READY = True
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 

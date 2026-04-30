@@ -371,12 +371,15 @@ async def combined_lifespan(app: FastAPI):
             poll_seconds = max(1.0, float(os.getenv("ORDER_RUNTIME_POLL_SECONDS", "1.0")))
             reconcile_seconds = max(15.0, float(os.getenv("POSITIONS_RECONCILE_SECONDS", "30")))
             last_reconcile_monotonic = 0.0
+            startup_recovered = False
             cached_token = at
             kite_client = build_kite_client(cached_token, session_id="system")
             set_component_status("order_runtime_worker", "healthy", detail="Order runtime worker started")
-            await refresh_processing_stuck_rows()
             while True:
                 try:
+                    if not startup_recovered:
+                        await refresh_processing_stuck_rows()
+                        startup_recovered = True
                     await asyncio.sleep(poll_seconds)
                     db = SessionLocal()
                     try:
