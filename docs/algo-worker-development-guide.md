@@ -118,6 +118,95 @@ The v0.5.x SDK is intentionally small and production-oriented. Use these public 
 
 The certification script at `scripts/sdk_worker_certification.py` exercises this core surface and now reports preview output plus a capability summary.
 
+## Options namespace (canonical worker-safe surface)
+
+Worker options SDK calls must use worker-auth-safe routes under:
+
+`/api/algo-workers/worker/options/*`
+
+Use `client.options` for options market + run/protection lifecycle flows. Canonical
+option market snapshots (including Greeks/IV) are exposed by backend option sessions.
+Those session Greeks are computed from synthetic-forward + Black-76 in backend option
+session computation and surfaced through canonical routes/SDK.
+
+Key points:
+
+- Run-level `product` is required for option run creation (`MIS` or `NRML`).
+- Market calls should use `client.options.ensure_session/list_expiries/get_chain/get_mini_chain/get_greeks/...`.
+- Selection resolution supports exact strike, ATM/ITM/OTM offset, and snapshot-safe
+  `delta_target` selection. Delta targeting only uses already-computed session
+  Greek fields; it does not recompute Greeks from raw spot in the worker or route.
+- Run/protection SDK methods exist: create/list/get run, preview/enter/exit,
+  protection get/update/state/replay.
+- Production option runs persist through the durable backend run-state store;
+  tests may still override routes with the in-memory store for deterministic cases.
+- `kite_algo_worker.option_leg(...)` remains only a payload helper and does not
+  imply hidden run-level product defaults.
+
+Example:
+
+```python
+from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, option_leg
+
+client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_..."))
+
+client.options.ensure_session("NIFTY")
+expiries = client.options.list_expiries("NIFTY")
+greeks = client.options.get_greeks("NIFTY", expiry="nearest")
+
+run = client.options.create_run(
+    strategy_name="bull_call_spread",
+    product="MIS",  # required at run level
+    legs=[
+        option_leg("NIFTY26MAY25000CE", "BUY", 75),
+        option_leg("NIFTY26MAY25100CE", "SELL", 75),
+    ],
+)
+
+preview = client.options.preview_entry(run["strategy_run_id"])
+enter_result = client.options.enter(run["strategy_run_id"])
+protection_state = client.options.get_protection_state(run["strategy_run_id"])
+```
+
+For compatibility, generic SDK primitives still exist, but new option strategy
+work should prefer the options namespace above.
+
+### Live protection certification
+
+Use `scripts/live_worker_protection_certification.py` to run the generic live protection 100% gate scenarios for worker stale, position stoploss/target, basket stoploss/target, and protection patch mutability.
+
+Required env:
+
+```bash
+export KITE_ALGO_API_BASE=http://localhost:8000
+export KITE_ALGO_WORKER_TOKEN=kwa_...
+export KITE_ALGO_ACCOUNT_SCOPE=kite:YOUR_BROKER_USER_ID
+export KITE_ALGO_CONFIRM_LIVE=YES
+```
+
+Optional trading env:
+
+```bash
+export KITE_ALGO_CERT_SYMBOL=INFY
+export KITE_ALGO_CERT_EXCHANGE=NSE
+export KITE_ALGO_CERT_PRODUCT=CNC
+export KITE_ALGO_CERT_QUANTITY=1
+```
+
+Run all scenarios:
+
+```bash
+python3 scripts/live_worker_protection_certification.py
+```
+
+Run a subset:
+
+```bash
+python3 scripts/live_worker_protection_certification.py --scenarios worker_stale,position_stoploss
+```
+
+The script emits structured JSON. If a scenario leaves live exposure behind, it will only submit the emergency flatten fallback when `KITE_ALGO_CONFIRM_FLATTEN=YES`. Otherwise it reports the failure loudly and stops.
+
 The SDK maps to public endpoints only:
 
 | SDK method | Worker endpoint |
