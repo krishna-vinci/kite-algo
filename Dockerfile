@@ -14,8 +14,8 @@ COPY api ./api
 COPY alembic ./alembic
 COPY broker_api ./broker_api
 COPY execution_accounting ./execution_accounting
-COPY journal ./journal
 COPY journaling ./journaling
+COPY options ./options
 COPY paper_runtime ./paper_runtime
 COPY strategies ./strategies
 COPY alembic.ini auth_service.py charts.py database.py main.py runtime_monitor.py server.py schema.sql ./

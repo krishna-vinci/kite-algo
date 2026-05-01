@@ -14,7 +14,7 @@ from .kite_session import get_kite
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/mf", tags=["kite-mutual-funds"])
+router = APIRouter(prefix="/mf", tags=["Mutual Funds"])
 
 
 class MFTransactionType(str, Enum):

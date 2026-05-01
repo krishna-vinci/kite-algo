@@ -1,33 +1,72 @@
-from fastapi import FastAPI
+import asyncio
+import json
+import logging
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+import server
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from sqlalchemy import text
 
-from fastapi import FastAPI, Request, Form, HTTPException, Query
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-import uvicorn
-import psycopg2
-import psycopg2.extras
-from datetime import datetime, timedelta
-import os
-import json
-from dotenv import load_dotenv
-from typing import Dict, Any
-from broker_api.redis_events import get_redis
-import redis.asyncio as redis
-
-load_dotenv() # Load environment variables from .env file
-
-from database import get_db_connection
-from pytz import timezone
-import random
-import psycopg2
-from psycopg2 import extras
-import logging
-from datetime import datetime, date # Import date for CURRENT_DATE
-from zoneinfo import ZoneInfo
+from api.openapi import OPENAPI_TAGS
+from api.routers.algo_workers import router as algo_workers_router
+from api.routers.auth import router as auth_router
+from api.routers.control import router as control_router
+from api.routers.historical import router as historical_router
+from api.routers.ingestion import router as ingestion_router
+from api.routers.instruments import router as instruments_router
+from api.routers.journal import router as journal_router
+from api.routers.market_data import router as market_data_router
+from api.routers.marketwatch import router as marketwatch_router
+from api.routers.user_settings import router as user_settings_router
 from auth_service import auth_exempt_path, get_optional_app_user
+from broker_api.broker_api import run_headless_login_and_persist_system_token
+from broker_api.candles_api import router as candles_api_router
+from broker_api.index_ingestion import (
+    get_index_refresh_state,
+    list_supported_index_source_lists,
+    refresh_live_metrics_for_indices,
+    refresh_supported_indices,
+)
+from broker_api.kite_auth import API_KEY, login_headless
+from broker_api.kite_mutual_funds import router as kite_mutual_funds_router
+from broker_api.kite_orders import router as kite_orders_router
+from broker_api.kite_session import (
+    KiteSession,
+    build_kite_client,
+    get_system_access_token,
+    make_account_id,
+    rotate_broker_access_token,
+)
+from broker_api.market_runtime_client import MarketDataRuntime, market_runtime_enabled
+from broker_api.options_greeks import prewarm_options_engine
+from broker_api.order_runtime import (
+    order_event_runtime,
+    realtime_positions_service,
+    refresh_processing_stuck_rows,
+)
+from broker_api.performance_router import router as performance_router
+from broker_api.redis_events import get_redis
+from database import SessionLocal, database as async_db, get_db_connection
+from journaling.runtime import JournalRuntimeWorker
+from journaling.service import JournalService
+from options.api.execution_router import router as options_execution_router
+from options.api.market_router import router as options_market_router
+from options.api.protection_router import router as options_protection_router
+from options.api.strategy_router import router as options_strategy_router
+from options.api.worker_options_router import router as worker_options_router
 from runtime_monitor import heartbeat, install_log_buffer, set_component_status, set_meta
+from server import mcp
+from strategies.indexstoploss.router import router as indexstoploss_router
+
+load_dotenv()  # Load environment variables from .env file
 
 # Configure logging for the main application
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -35,76 +74,6 @@ install_log_buffer()
 
 # Suppress INFO level logs from httpx for specific API calls
 logging.getLogger("httpx").setLevel(logging.WARNING)
-from api.openapi import OPENAPI_TAGS
-from api.routers.auth import router as auth_router
-from api.routers.market_data import router as market_data_router
-from api.routers.instruments import router as instruments_router
-from api.routers.historical import router as historical_router
-from api.routers.ingestion import router as ingestion_router
-from api.routers.user_settings import router as user_settings_router
-from api.routers.marketwatch import router as marketwatch_router
-from api.routers.algo_workers import router as algo_workers_router
-from api.routers.control import router as control_router
-from journaling.runtime import JournalRuntimeWorker
-from api.routers.journal import router as journal_router
-from journaling.service import JournalService
-
-
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI
-from broker_api.broker_api import router as broker_api_router
-from broker_api.alerts_router import router as alerts_router
-from broker_api.performance_router import router as performance_router
-from broker_api.options_router import router as options_router
-from broker_api.candles_api import router as candles_api_router
-from broker_api.kite_mutual_funds import router as kite_mutual_funds_router
-
-
-
-### fyers auth import ##
-import httpx
-import pyotp
-import asyncio
-import json
-from urllib import parse
-from fyers_apiv3 import fyersModel
-
-from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
-from broker_api.broker_api import router as kite_router
-from broker_api.kite_orders import router as kite_orders_router
-from options.api.execution_router import router as options_execution_router
-from options.api.market_router import router as options_market_router
-from options.api.protection_router import router as options_protection_router
-from options.api.strategy_router import router as options_strategy_router
-from options.api.worker_options_router import router as worker_options_router
-from strategies.indexstoploss.router import router as indexstoploss_router
-
-from broker_api.broker_api import get_kite
-from kiteconnect import KiteConnect
-from typing import List, Optional
-from server import mcp
-from contextlib import asynccontextmanager
-import server
-from broker_api.kite_auth import login_headless
-from broker_api.index_ingestion import (
-    get_index_refresh_state,
-    list_supported_index_source_lists,
-    refresh_live_metrics_for_indices,
-    refresh_supported_indices,
-)
-import logging
-from database import SessionLocal, database as async_db
-from broker_api.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
-from broker_api.market_runtime_client import MarketDataRuntime, market_runtime_enabled
-from broker_api.options_greeks import prewarm_options_engine
-from broker_api.broker_api import run_headless_login_and_persist_system_token
-from broker_api.kite_auth import API_KEY
-from broker_api.order_runtime import order_event_runtime, realtime_positions_service, refresh_processing_stuck_rows
-from alerts.engine import AlertsEngine
-from database import get_user_settings, update_user_settings
-from pydantic import BaseModel
-import csv
-from sqlalchemy import text
 
 class UserSubscriptions(BaseModel):
     groups: List[dict]
@@ -528,17 +497,6 @@ async def combined_lifespan(app: FastAPI):
             logging.error("Failed startup index runtime refresh: %s", e, exc_info=True)
             set_component_status("index_runtime_refresh", "degraded", detail=str(e))
 
-        # Start AlertsEngine after the market runtime bridge and async DB are ready
-        try:
-            alerts_engine = AlertsEngine(async_db, market_data_runtime, app)
-            alerts_engine.start()
-            app.state.alerts_engine = alerts_engine
-            logging.info("AlertsEngine started (interval_ms=%s)", getattr(alerts_engine, "interval_ms", None))
-            set_component_status("alerts_engine", "healthy", detail="Alerts engine started")
-        except Exception as e:
-            logging.error("Failed to start AlertsEngine: %s", e, exc_info=True)
-            set_component_status("alerts_engine", "degraded", detail=str(e))
-        
         # Initialize Phase 3: StrikeSelector and PositionBuilder
         try:
             from strategies.strike_selector import StrikeSelector, PositionBuilder
@@ -559,13 +517,6 @@ async def combined_lifespan(app: FastAPI):
                 logging.warning("OptionsSessionManager not available, Phase 3 components not initialized")
         except Exception as e:
             logging.error("Failed to initialize Phase 3 components: %s", e, exc_info=True)
-
-        # Start alert dispatcher and polling fallback (not yet implemented in runtime form)
-        alerts_ntfy_url = os.getenv("KITE_ALERTS_NTFY_URL") or os.getenv("kite_alerts_NTFY_URL") or "https://ntfy.krishna.quest/kite-alerts"
-        # TODO: alert_event_dispatcher needs a market-runtime-backed implementation.
-        # asyncio.create_task(alert_event_dispatcher(market_data_runtime, alerts_ntfy_url))
-        # TODO: alerts_poll_worker needs to be implemented.
-        # asyncio.create_task(alerts_poll_worker(API_KEY, alerts_ntfy_url))
 
         # Ensure Meilisearch index exists on startup (and bootstrap reindex if empty)
         try:
@@ -811,16 +762,6 @@ async def combined_lifespan(app: FastAPI):
                 pass
     except Exception:
         pass
-    # Stop AlertsEngine
-    try:
-        eng = getattr(app.state, "alerts_engine", None)
-        if eng:
-            await eng.stop()
-            logging.info("AlertsEngine stopped.")
-            set_component_status("alerts_engine", "stopped", detail="Alerts engine stopped")
-    except Exception:
-        pass
-    
     # Stop Candle Aggregator
     try:
         aggregator = getattr(app.state, "candle_aggregator", None)
@@ -898,10 +839,8 @@ app.include_router(control_router, prefix="/api")
 app.include_router(journal_router, prefix="/api")
 app.include_router(kite_orders_router, prefix="/api")
 app.include_router(kite_mutual_funds_router, prefix="/api")
-app.include_router(options_router, prefix="/api")
 app.include_router(candles_api_router, prefix="/api")  # Unified candles API with all historical endpoints
 app.include_router(performance_router, prefix="/api")
-app.include_router(alerts_router, prefix="/api/alerts")
 app.include_router(indexstoploss_router, prefix="/api/strategies")
 app.include_router(options_market_router)
 app.include_router(options_strategy_router)
@@ -910,7 +849,6 @@ app.include_router(options_protection_router)
 app.include_router(worker_options_router)
 
 from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -1059,11 +997,11 @@ async def daily_token_scheduler() -> None:
 async def monthly_index_refresh_scheduler() -> None:
     tz = ZoneInfo("Asia/Kolkata")
     source_lists = list_supported_index_source_lists()
+    persisted_month = None
     set_component_status("index_refresh_scheduler", "healthy", detail="Monthly index refresh scheduler started")
     while True:
         try:
             persisted_state = await asyncio.to_thread(get_index_refresh_state, "Nifty50")
-            persisted_month = None
             persisted_refresh_at = persisted_state.get("last_constituent_refresh_at")
             if persisted_refresh_at:
                 persisted_month = persisted_refresh_at.astimezone(tz).strftime("%Y-%m")

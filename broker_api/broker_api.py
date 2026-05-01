@@ -1,31 +1,52 @@
-import os
-import uuid
-import time
-import json
-import csv
 import asyncio
-from typing import List, Optional, Tuple, Dict, Any
-from datetime import date, datetime, timedelta
-from urllib.parse import urlparse
-from urllib import parse
-import gzip
+import calendar
 import csv
-import io
-import logging # Added logging
-import meilisearch # Added meilisearch
-import re # Added for regex parsing
-import calendar # Added for month mapping
-from kiteconnect import KiteConnect # For LTP fetching
-from database import SessionLocal # For DB session in LTP helper
-
-import requests
-import httpx
-import pyotp
-import pytz
-from pydantic import BaseModel
-from kiteconnect import KiteConnect
+import json
+import logging
+import os
+import re
 import uuid
-# from datetime import datetime # Already imported above, no need to re-import
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+import meilisearch
+import psycopg2
+import pytz
+import requests
+from dotenv import load_dotenv
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, Request, Response
+from kiteconnect import KiteConnect
+from psycopg2.extras import execute_values
+from pydantic import BaseModel
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    MetaData,
+    Numeric,
+    String,
+    create_engine,
+)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import Session, relationship, sessionmaker
+
+from auth_service import require_app_user
+from database import database
+
+from .kite_auth import login_headless
+from .kite_session import (
+    KiteSession,
+    build_kite_client,
+    get_kite,
+    get_system_access_token,
+    rotate_broker_access_token,
+    upsert_kite_session,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -61,73 +82,7 @@ historical_data_update_progress = {
     "error": None,
 }
 
-from sqlalchemy import Column, String, DateTime, inspect
-from sqlalchemy.orm import Session
-
-from fastapi import APIRouter, Depends, Response, HTTPException, Request, Query, Body
-
-from .kite_auth import login_headless
-from .kite_session import KiteSession, build_kite_client, get_kite, get_system_access_token, rotate_broker_access_token, upsert_kite_session
-from kiteconnect import KiteConnect
-from database import SessionLocal, Base
-from fastapi import WebSocket, WebSocketDisconnect
-
-from dotenv import load_dotenv
-
-from fastapi import (
-    FastAPI,
-    APIRouter,
-    HTTPException,
-    Depends,
-    Form,
-    Cookie,
-    Header,
-    Query,
-    Response,
-    BackgroundTasks
-)
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-
-from pydantic import BaseModel
-
-from sqlalchemy import (
-    create_engine,
-    MetaData,
-    Column,
-    Integer,
-    String,
-    Date,
-    Float,
-    BigInteger,
-    ForeignKey,
-    Numeric,
-    DateTime,
-    Table,
-    select
-)
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, relationship, Session
-
-from databases import Database
-
-import psycopg2
-from psycopg2.extras import execute_batch, execute_values
-
-
-from fastapi import APIRouter, Response, HTTPException, Depends
-from sqlalchemy.orm import Session
-import uuid
-
-from database import SessionLocal  # Your DB session factory
-from database import FyersSession
-
-from broker_api.kite_auth import login_headless
 from broker_api.kite_auth import API_KEY
-from . import kite_orders
-from . import options_router
-from auth_service import require_app_user
 
 
 
@@ -187,9 +142,6 @@ engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base         = declarative_base()
 metadata     = MetaData()
-
-# async database client
-from database import database
 
 # module-level session storage
 sessions: Dict[str, str] = {}
@@ -360,14 +312,6 @@ def get_db() -> Session:
         yield db
     finally:
         db.close()
-
-def get_token(session_id: Optional[str] = Cookie(None), db: Session = Depends(get_db)) -> str:
-    if session_id:
-        session = db.query(FyersSession).filter_by(session_id=session_id).first()
-        if session:
-            return session.access_token
-    raise HTTPException(status_code=401, detail="Unauthorized")
-
 
 def get_psql_conn():
     """

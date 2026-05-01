@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from kiteconnect import KiteConnect
 from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from .redis_events import get_redis, publish_event, pubsub_iter
 from .instruments_repository import InstrumentsRepository
@@ -1045,7 +1046,7 @@ class OrdersService:
         return BasketOrderResponse(status=final_status, results=results, errors=errors)
 
 # ---------------- FastAPI Router ----------------
-router = APIRouter(tags=["orders"])
+router = APIRouter(tags=["Orders"])
 service = OrdersService()
 
 @router.post("/orders", response_model=PlaceOrderResponse, description="Place a new order.")
@@ -1766,9 +1767,6 @@ async def delete_gtt_trigger(
 # ═══════════════════════════════════════════════════════════════════════════════
 # KITE CONNECT WEBHOOK / POSTBACK API
 # ═══════════════════════════════════════════════════════════════════════════════
-
-import hashlib
-from sqlalchemy import text
 
 # API Secret for checksum validation
 API_SECRET = os.getenv("KITE_API_SECRET")

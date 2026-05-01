@@ -1,16 +1,26 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from broker_api.instruments_repository import InstrumentsRepository
+from broker_api.options_sessions import OptionsSessionManager
+from database import SessionLocal
 from options.market.service import OptionsMarketService
 
 router = APIRouter(prefix="/api/options", tags=["Options"])
 
 
 def get_options_session_manager(request: Request):
-    from broker_api.options_router import get_options_session_manager
-
-    return get_options_session_manager(request)
+    if not hasattr(request.app.state, "options_session_manager"):
+        market_data_runtime = getattr(request.app.state, "market_data_runtime", None)
+        if market_data_runtime is None:
+            raise HTTPException(status_code=503, detail="Market runtime not available")
+        instrument_repo = InstrumentsRepository(db=SessionLocal)
+        request.app.state.options_session_manager = OptionsSessionManager(
+            market_data_runtime,
+            instrument_repo,
+        )
+    return request.app.state.options_session_manager
 
 
 @router.get("/underlyings/{underlying}/session")

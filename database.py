@@ -4,11 +4,10 @@ import os
 import psycopg2
 from dotenv import load_dotenv
 
-from sqlalchemy import create_engine, MetaData, Column, String, DateTime
+from sqlalchemy import create_engine, MetaData
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from databases import Database  # if you still use it elsewhere
-from datetime import datetime
 import logging
 
 # Configure logging for database operations
@@ -21,13 +20,6 @@ load_dotenv()
 Base = declarative_base()
 metadata = MetaData()
 _SCHEMA_APPLIED: bool = False
-
-# --- ORM model for Fyers sessions (if you want it here)
-class FyersSession(Base):
-    __tablename__ = "fyers_sessions"
-    session_id   = Column(String(36), primary_key=True, index=True)
-    access_token = Column(String, nullable=False)
-    created_at   = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 def create_tables_if_not_exists(conn):
     """Executes the schema.sql to create tables if they don't exist."""
