@@ -35,7 +35,8 @@ class LiveJournalProjectorTests(unittest.TestCase):
         repository.ensure_live_strategy_run_for_intent.return_value = "11111111-1111-4111-8111-111111111111"
         repository.insert_execution_fact.return_value = 1
 
-        result = LiveJournalProjector(repository=repository).project(batch_size=10)
+        journal_service = Mock()
+        result = LiveJournalProjector(repository=repository, journal_service=journal_service).project(batch_size=10)
 
         self.assertEqual(result["projected"], 1)
         fact = repository.insert_execution_fact.call_args.args[0]
@@ -43,6 +44,10 @@ class LiveJournalProjectorTests(unittest.TestCase):
         self.assertEqual(fact.source_type, "live_fill")
         self.assertEqual(fact.fees_amount, Decimal("22.50"))
         self.assertEqual(fact.taxes_amount, Decimal("8.70"))
+        journal_service.record_v2_execution_fill.assert_called_once()
+        v2_call = journal_service.record_v2_execution_fill.call_args.kwargs
+        self.assertEqual(v2_call["mode"], "live")
+        self.assertEqual(v2_call["external_run_id"], "11111111-1111-4111-8111-111111111111")
 
     def test_unknown_live_fill_imports_to_broker_activity(self):
         repository = Mock()
@@ -66,10 +71,12 @@ class LiveJournalProjectorTests(unittest.TestCase):
         repository.find_open_live_runs_for_instrument.return_value = []
         repository.ensure_imported_broker_run.return_value = "22222222-2222-4222-8222-222222222222"
 
-        result = LiveJournalProjector(repository=repository).project(batch_size=10)
+        journal_service = Mock()
+        result = LiveJournalProjector(repository=repository, journal_service=journal_service).project(batch_size=10)
 
         self.assertEqual(result["imported"], 1)
         repository.ensure_imported_broker_run.assert_called_once()
+        journal_service.record_v2_execution_fill.assert_called_once()
 
     def test_intent_without_journal_run_still_projects_to_strategy_run(self):
         repository = Mock()
@@ -96,13 +103,15 @@ class LiveJournalProjectorTests(unittest.TestCase):
         }
         repository.ensure_live_strategy_run_for_intent.return_value = "33333333-3333-4333-8333-333333333333"
 
-        result = LiveJournalProjector(repository=repository).project(batch_size=10)
+        journal_service = Mock()
+        result = LiveJournalProjector(repository=repository, journal_service=journal_service).project(batch_size=10)
 
         self.assertEqual(result["projected"], 1)
         repository.ensure_live_strategy_run_for_intent.assert_called_once()
         fact = repository.insert_execution_fact.call_args.args[0]
         self.assertEqual(str(fact.run_id), "33333333-3333-4333-8333-333333333333")
         self.assertEqual(fact.source_type, "live_fill")
+        journal_service.record_v2_execution_fill.assert_called_once()
 
 
 if __name__ == "__main__":

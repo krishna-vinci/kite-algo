@@ -576,6 +576,21 @@ class PaperTradingService:
                 "stale_reasons": list(run_state.get("stale_reasons") or []),
             }
 
+        lot_ambiguity_reasons = await self._resolve_strategy_exit_lot_ambiguity(
+            account_scope=account_scope,
+            strategy_id=normalized_strategy_id,
+            linked_positions=linked_positions,
+        )
+        if lot_ambiguity_reasons:
+            return {
+                "mode": "paper",
+                "status": "blocked",
+                "strategy_id": normalized_strategy_id,
+                "results": [],
+                "message": "Strategy-level exit is blocked because open lots cannot be safely attributed for this strategy",
+                "stale_reasons": lot_ambiguity_reasons,
+            }
+
         exit_position_map: Dict[Tuple[int, str], Dict[str, Any]] = {
             (int(position.get("instrument_token") or 0), str(position.get("product") or "")): dict(position)
             for position in linked_positions
@@ -961,6 +976,7 @@ class PaperTradingService:
         )
         await self._record_journal_trade(trade)
         lot_side = self._paper_side_value(order.transaction_type)
+        exit_strategy_id = str((order.metadata or {}).get("exit_for") or "").strip() or None
         if lot_side == PaperOrderSide.BUY.value:
             await asyncio.to_thread(
                 self.repository.upsert_position_lot,
@@ -984,6 +1000,8 @@ class PaperTradingService:
                 instrument_token=order.instrument_token,
                 product=order.product,
                 quantity=order.quantity,
+                preferred_strategy_id=exit_strategy_id,
+                strict_preference=bool(exit_strategy_id),
             )
         new_position.metadata["margin_in_use"] = str(new_margin)
         new_position.metadata["last_price"] = str(fill_price)
@@ -1181,6 +1199,7 @@ class PaperTradingService:
             )
         )
         lot_side = self._paper_side_value(order.transaction_type)
+        exit_strategy_id = str((order.metadata or {}).get("exit_for") or "").strip() or None
         if lot_side == PaperOrderSide.BUY.value:
             uow.upsert_position_lot(
                 PaperPositionLotAttribution(
@@ -1204,6 +1223,8 @@ class PaperTradingService:
                 instrument_token=order.instrument_token,
                 product=order.product,
                 quantity=order.quantity,
+                preferred_strategy_id=exit_strategy_id,
+                strict_preference=bool(exit_strategy_id),
             )
         new_position.metadata["margin_in_use"] = str(new_margin)
         new_position.metadata["last_price"] = str(fill_price)
@@ -1321,7 +1342,16 @@ class PaperTradingService:
         )
         return new_account
 
-    async def _consume_position_lots(self, *, account_scope: str, instrument_token: int, product: str, quantity: int) -> None:
+    async def _consume_position_lots(
+        self,
+        *,
+        account_scope: str,
+        instrument_token: int,
+        product: str,
+        quantity: int,
+        preferred_strategy_id: str | None = None,
+        strict_preference: bool = False,
+    ) -> None:
         remaining = max(0, int(quantity))
         if remaining <= 0:
             return
@@ -1331,7 +1361,12 @@ class PaperTradingService:
             instrument_token=instrument_token,
             product=product,
         )
-        for lot in lots:
+        ordered_lots = self._ordered_lots_for_consumption(
+            lots,
+            preferred_strategy_id=preferred_strategy_id,
+            strict_preference=strict_preference,
+        )
+        for lot in ordered_lots:
             if remaining <= 0:
                 break
             available = int(lot.remaining_quantity)
@@ -1347,12 +1382,27 @@ class PaperTradingService:
             await asyncio.to_thread(self.repository.upsert_position_lot, updated)
             remaining -= consumed
 
-    def _consume_position_lots_uow(self, uow: Any, *, account_scope: str, instrument_token: int, product: str, quantity: int) -> None:
+    def _consume_position_lots_uow(
+        self,
+        uow: Any,
+        *,
+        account_scope: str,
+        instrument_token: int,
+        product: str,
+        quantity: int,
+        preferred_strategy_id: str | None = None,
+        strict_preference: bool = False,
+    ) -> None:
         remaining = max(0, int(quantity))
         if remaining <= 0:
             return
         lots = uow.list_open_position_lots(account_scope, instrument_token=instrument_token, product=product)
-        for lot in lots:
+        ordered_lots = self._ordered_lots_for_consumption(
+            lots,
+            preferred_strategy_id=preferred_strategy_id,
+            strict_preference=strict_preference,
+        )
+        for lot in ordered_lots:
             if remaining <= 0:
                 break
             available = int(lot.remaining_quantity)
@@ -1367,6 +1417,79 @@ class PaperTradingService:
             )
             uow.upsert_position_lot(updated)
             remaining -= consumed
+
+    def _ordered_lots_for_consumption(
+        self,
+        lots: List[PaperPositionLotAttribution],
+        *,
+        preferred_strategy_id: str | None,
+        strict_preference: bool,
+    ) -> List[PaperPositionLotAttribution]:
+        normalized_preferred = str(preferred_strategy_id or "").strip()
+        if not normalized_preferred:
+            return list(lots)
+        preferred: List[PaperPositionLotAttribution] = []
+        others: List[PaperPositionLotAttribution] = []
+        for lot in lots:
+            metadata = dict(lot.metadata or {})
+            if self._strategy_identity(metadata) == normalized_preferred:
+                preferred.append(lot)
+            else:
+                others.append(lot)
+        if strict_preference:
+            return preferred
+        return preferred + others
+
+    async def _resolve_strategy_exit_lot_ambiguity(
+        self,
+        *,
+        account_scope: str,
+        strategy_id: str,
+        linked_positions: List[Dict[str, Any]],
+    ) -> List[str]:
+        reasons: List[str] = []
+        for position in linked_positions:
+            instrument_token = _to_int(position.get("instrument_token"))
+            product = str(position.get("product") or "")
+            if instrument_token <= 0 or not product:
+                continue
+            lots = await asyncio.to_thread(
+                self.repository.list_open_position_lots,
+                account_scope,
+                instrument_token=instrument_token,
+                product=product,
+            )
+            if not lots:
+                continue
+            matching_qty = 0
+            unknown_qty = 0
+            foreign: Dict[str, int] = {}
+            for lot in lots:
+                remaining_qty = max(0, int(lot.remaining_quantity))
+                if remaining_qty <= 0:
+                    continue
+                identity = self._strategy_identity(dict(lot.metadata or {}))
+                if identity == strategy_id:
+                    matching_qty += remaining_qty
+                elif not identity:
+                    unknown_qty += remaining_qty
+                else:
+                    foreign[identity] = foreign.get(identity, 0) + remaining_qty
+            requested_qty = abs(_to_int(position.get("net_quantity")))
+            if unknown_qty > 0:
+                reasons.append(
+                    f"unresolved_lots:{instrument_token}:{product}:missing_strategy_identity_qty={unknown_qty}"
+                )
+            if foreign and matching_qty < requested_qty:
+                foreign_ids = ",".join(sorted(foreign.keys()))
+                reasons.append(
+                    f"ambiguous_lots:{instrument_token}:{product}:foreign_strategies={foreign_ids}"
+                )
+            if matching_qty < requested_qty:
+                reasons.append(
+                    f"insufficient_attributed_lots:{instrument_token}:{product}:needed={requested_qty}:matched={matching_qty}"
+                )
+        return reasons
 
     async def _apply_cash_delta(
         self,

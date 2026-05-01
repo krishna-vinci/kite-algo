@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -27,9 +28,11 @@ from algo_runtime.account_scope import parse_account_scope
 from algo_runtime.execution_attribution import build_execution_attribution, build_paper_execution_attribution
 from auth_service import require_app_user
 from database import SessionLocal
+from journaling.service import JournalService
 
 
 router = APIRouter(prefix="/algo-workers", tags=["Algo Workers"])
+logger = logging.getLogger(__name__)
 
 DEFAULT_WORKER_ACTIONS = {
     "runs:create",
@@ -1220,6 +1223,14 @@ def _market_data_service(request: Any) -> WorkerMarketDataService:
         redis=getattr(getattr(request.app.state, "market_data_runtime", None), "redis", None),
         candle_reader=candle_reader,
     )
+
+
+def _journal_service(request: Any) -> JournalService:
+    service = getattr(request.app.state, "journal_service", None)
+    if service is None:
+        service = JournalService()
+        request.app.state.journal_service = service
+    return service
 
 
 def _parse_csv_values(value: Optional[str]) -> List[str]:
@@ -2496,6 +2507,56 @@ async def create_worker_run(request: Request, payload: WorkerRunCreateRequest):
         payload = payload.model_copy(update={"runtime_state": runtime_state})
 
     strategy_run_id = payload.strategy_run_id or f"run_{uuid.uuid4().hex}"
+
+    metadata = dict(payload.metadata or {})
+    runtime_state = dict(payload.runtime_state or {})
+    worker_source_metadata = {
+        "token_id": token.token_id,
+        "worker_name": token.name,
+        "allowed_templates": list(token.allowed_templates or []),
+    }
+    try:
+        v2_refs = _journal_service(request).ensure_v2_worker_context(
+            execution_mode=payload.execution_mode,
+            account_scope=payload.account_scope,
+            strategy_run_id=strategy_run_id,
+            external_run_id=strategy_run_id,
+            template_id=str(payload.template_id or "").strip() or None,
+            worker_template_id=str(metadata.get("worker_template_id") or payload.template_id or "").strip() or None,
+            strategy_name=str(metadata.get("strategy_name") or payload.template_id or strategy_run_id).strip(),
+            strategy_family=str(metadata.get("strategy_family") or "indicator_strategy").strip(),
+            scenario_key=str(metadata.get("scenario_key") or "").strip() or None,
+            scenario_name=str(metadata.get("scenario_name") or "").strip() or None,
+            deployment_key=str(metadata.get("deployment_key") or "").strip() or None,
+            config_hash=str(metadata.get("config_hash") or "").strip() or None,
+            source_system="algo_worker",
+            entry_surface=str(metadata.get("entry_surface") or "algo_worker").strip() or "algo_worker",
+            source_metadata=worker_source_metadata,
+        )
+        metadata["journal_v2"] = dict(v2_refs)
+        runtime_state["journal_v2"] = {
+            "environment_id": v2_refs.get("environment_id"),
+            "execution_context_id": v2_refs.get("execution_context_id"),
+            "template_id": v2_refs.get("template_id"),
+            "variant_id": v2_refs.get("variant_id"),
+            "deployment_id": v2_refs.get("deployment_id"),
+        }
+        payload = payload.model_copy(update={"metadata": metadata, "runtime_state": runtime_state})
+    except Exception as exc:
+        metadata.setdefault("journal_v2_warning", "context_resolution_failed")
+        metadata.setdefault("journal_v2_warning_detail", str(exc))
+        payload = payload.model_copy(update={"metadata": metadata, "runtime_state": runtime_state})
+        logger.warning(
+            "algo_worker_run_create_journal_v2_context_failed",
+            extra={
+                "strategy_run_id": strategy_run_id,
+                "account_scope": payload.account_scope,
+                "execution_mode": payload.execution_mode,
+                "template_id": payload.template_id,
+                "error": str(exc),
+            },
+        )
+
     return await _repo(request).create_run(token, payload, strategy_run_id=strategy_run_id)
 
 

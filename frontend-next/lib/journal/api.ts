@@ -4,11 +4,20 @@ import type {
   BenchmarkComparison,
   CalendarDay,
   JournalFilterParams,
+  JournalEnvironment,
+  JournalEpisode,
   JournalInsight,
+  JournalNote,
+  JournalNoteRevision,
   JournalRule,
   JournalRun,
   JournalSummary,
+  JournalTimelineEvent,
   JournalTrade,
+  JournalV2AnalyticsSummary,
+  JournalV2PaperLiveComparison,
+  JournalV2StrategyAnalytics,
+  JournalV2UnresolvedQueue,
   Paginated,
   ReviewQueueItem,
   ReviewUpdatePayload,
@@ -30,6 +39,14 @@ function toNumber(value: unknown): number | null {
 
 function mapPeriod(period: AnalysisPeriod): string {
   return period === "inception" ? "since_inception" : period;
+}
+
+function requireEnvironmentId(environmentId: string | undefined | null, helperName: string): string {
+  const normalized = String(environmentId ?? "").trim();
+  if (!normalized) {
+    throw new Error(`${helperName} requires environment_id`);
+  }
+  return normalized;
 }
 
 function mapReviewState(value: unknown): JournalRun["review_status"] {
@@ -110,6 +127,106 @@ function normalizeRun(item: Record<string, unknown>): JournalRun {
     decision_events: [],
   };
 }
+
+function normalizeJournalEnvironment(item: Record<string, unknown>): JournalEnvironment {
+  return {
+    id: String(item.id ?? ""),
+    mode: String(item.mode ?? "paper") as JournalEnvironment["mode"],
+    account_scope: String(item.account_scope ?? ""),
+    display_name: item.display_name != null ? String(item.display_name) : null,
+    broker_user_id: item.broker_user_id != null ? String(item.broker_user_id) : null,
+    paper_account_key: item.paper_account_key != null ? String(item.paper_account_key) : null,
+    environment_epoch: Number(item.environment_epoch ?? 1),
+    metadata: (item.metadata as Record<string, unknown> | undefined) ?? {},
+  };
+}
+
+function normalizeJournalEpisode(item: Record<string, unknown>): JournalEpisode {
+  return {
+    id: String(item.id ?? ""),
+    environment_id: String(item.environment_id ?? ""),
+    execution_context_id: String(item.execution_context_id ?? ""),
+    episode_seq: Number(item.episode_seq ?? 0),
+    status: String(item.status ?? "draft"),
+    opened_at: String(item.opened_at ?? new Date().toISOString()),
+    closed_at: item.closed_at != null ? String(item.closed_at) : null,
+    metadata: (item.metadata as Record<string, unknown> | undefined) ?? {},
+  };
+}
+
+function normalizeJournalTimelineEvent(item: Record<string, unknown>): JournalTimelineEvent {
+  return {
+    id: String(item.id ?? ""),
+    environment_id: String(item.environment_id ?? ""),
+    episode_id: item.episode_id != null ? String(item.episode_id) : null,
+    execution_context_id: item.execution_context_id != null ? String(item.execution_context_id) : null,
+    subject_type: String(item.subject_type ?? ""),
+    subject_id: String(item.subject_id ?? ""),
+    event_type: String(item.event_type ?? ""),
+    channel: item.channel != null ? String(item.channel) : null,
+    actor_type: String(item.actor_type ?? "system"),
+    correlation_id: item.correlation_id != null ? String(item.correlation_id) : null,
+    causation_id: item.causation_id != null ? String(item.causation_id) : null,
+    occurred_at: String(item.occurred_at ?? new Date().toISOString()),
+    payload: (item.payload as Record<string, unknown> | undefined) ?? {},
+  };
+}
+
+function normalizeJournalNote(item: Record<string, unknown>): JournalNote {
+  return {
+    id: String(item.id ?? ""),
+    environment_id: String(item.environment_id ?? ""),
+    subject_type: String(item.subject_type ?? ""),
+    subject_id: String(item.subject_id ?? ""),
+    episode_id: item.episode_id != null ? String(item.episode_id) : null,
+    note_type: String(item.note_type ?? ""),
+    title: String(item.title ?? ""),
+    body_markdown: String(item.body_markdown ?? ""),
+    body_text: item.body_text != null ? String(item.body_text) : "",
+    body_json: (item.body_json as Record<string, unknown> | null | undefined) ?? null,
+    tags: Array.isArray(item.tags) ? item.tags.map((tag) => String(tag)) : [],
+    metadata: (item.metadata as Record<string, unknown> | undefined) ?? {},
+    updated_at: String(item.updated_at ?? new Date().toISOString()),
+  };
+}
+
+type JournalNotesQuery = {
+  environment_id: string;
+  subject_type?: string;
+  subject_id?: string;
+  episode_id?: string;
+  note_type?: string;
+  limit?: number;
+  offset?: number;
+};
+
+type CreateJournalNotePayload = {
+  environment_id: string;
+  subject_type: string;
+  subject_id: string;
+  episode_id?: string;
+  note_type: string;
+  title: string;
+  body_markdown: string;
+  body_json?: Record<string, unknown>;
+  effective_at?: string;
+  author_id?: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+};
+
+type UpdateJournalNotePayload = {
+  environment_id: string;
+  subject_type: string;
+  subject_id: string;
+  title?: string;
+  body_markdown?: string;
+  body_json?: Record<string, unknown>;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+  editor_id?: string;
+  change_reason?: string;
+};
 
 export async function fetchJournalSummary(params: { period?: AnalysisPeriod } & JournalFilterParams = {}): Promise<JournalSummary> {
   const response = await apiFetch<Record<string, unknown>>(
@@ -369,4 +486,127 @@ export async function fetchInsights(): Promise<JournalInsight[]> {
     related_run_ids: [],
     related_rule_ids: [],
   }));
+}
+
+export async function fetchJournalEnvironments(): Promise<JournalEnvironment[]> {
+  const response = await apiFetch<{ items?: Array<Record<string, unknown>> }>("/api/journal/v2/environments");
+  return (response.items ?? []).map(normalizeJournalEnvironment);
+}
+
+export async function fetchJournalEpisodes(params: { environment_id: string; limit?: number; offset?: number }): Promise<JournalEpisode[]> {
+  const environmentId = requireEnvironmentId(params.environment_id, "fetchJournalEpisodes");
+  const response = await apiFetch<{ items?: Array<Record<string, unknown>> }>(
+    `/api/journal/v2/episodes${toSearchParams({
+      environment_id: environmentId,
+      limit: params.limit != null ? String(params.limit) : undefined,
+      offset: params.offset != null ? String(params.offset) : undefined,
+    })}`,
+  );
+  return (response.items ?? []).map(normalizeJournalEpisode);
+}
+
+export async function fetchJournalV2AnalyticsSummary(environment_id: string): Promise<JournalV2AnalyticsSummary> {
+  const environmentId = requireEnvironmentId(environment_id, "fetchJournalV2AnalyticsSummary");
+  return apiFetch<JournalV2AnalyticsSummary>(
+    `/api/journal/v2/analytics/summary${toSearchParams({ environment_id: environmentId })}`,
+  );
+}
+
+export async function fetchJournalV2AnalyticsStrategies(environment_id: string): Promise<JournalV2StrategyAnalytics> {
+  const environmentId = requireEnvironmentId(environment_id, "fetchJournalV2AnalyticsStrategies");
+  return apiFetch<JournalV2StrategyAnalytics>(
+    `/api/journal/v2/analytics/strategies${toSearchParams({ environment_id: environmentId })}`,
+  );
+}
+
+export async function fetchJournalV2PaperLiveComparison(params: {
+  template_id: string;
+  paper_environment_id: string;
+  live_environment_id: string;
+}): Promise<JournalV2PaperLiveComparison> {
+  const templateId = String(params.template_id ?? "").trim();
+  if (!templateId) {
+    throw new Error("fetchJournalV2PaperLiveComparison requires template_id");
+  }
+  const paperEnvironmentId = requireEnvironmentId(params.paper_environment_id, "fetchJournalV2PaperLiveComparison paper_environment_id");
+  const liveEnvironmentId = requireEnvironmentId(params.live_environment_id, "fetchJournalV2PaperLiveComparison live_environment_id");
+  return apiFetch<JournalV2PaperLiveComparison>(
+    `/api/journal/v2/analytics/compare-paper-live${toSearchParams({
+      template_id: templateId,
+      paper_environment_id: paperEnvironmentId,
+      live_environment_id: liveEnvironmentId,
+    })}`,
+  );
+}
+
+export async function fetchJournalV2Unresolved(environment_id: string): Promise<JournalV2UnresolvedQueue> {
+  const environmentId = requireEnvironmentId(environment_id, "fetchJournalV2Unresolved");
+  return apiFetch<JournalV2UnresolvedQueue>(
+    `/api/journal/v2/unresolved${toSearchParams({ environment_id: environmentId })}`,
+  );
+}
+
+export async function fetchJournalEpisode(episodeId: string, environment_id: string): Promise<JournalEpisode> {
+  const environmentId = requireEnvironmentId(environment_id, "fetchJournalEpisode");
+  const response = await apiFetch<Record<string, unknown>>(
+    `/api/journal/v2/episodes/${episodeId}${toSearchParams({ environment_id: environmentId })}`,
+  );
+  return normalizeJournalEpisode(response);
+}
+
+export async function fetchJournalTimeline(episodeId: string, environment_id: string): Promise<JournalTimelineEvent[]> {
+  const environmentId = requireEnvironmentId(environment_id, "fetchJournalTimeline");
+  const response = await apiFetch<{ items?: Array<Record<string, unknown>> }>(
+    `/api/journal/v2/episodes/${episodeId}/timeline${toSearchParams({ environment_id: environmentId })}`,
+  );
+  return (response.items ?? []).map(normalizeJournalTimelineEvent);
+}
+
+export async function fetchJournalNotes(params: JournalNotesQuery): Promise<JournalNote[]> {
+  const environmentId = requireEnvironmentId(params.environment_id, "fetchJournalNotes");
+  const response = await apiFetch<{ items?: Array<Record<string, unknown>> }>(
+    `/api/journal/v2/notes${toSearchParams({
+      environment_id: environmentId,
+      subject_type: params.subject_type,
+      subject_id: params.subject_id,
+      episode_id: params.episode_id,
+      note_type: params.note_type,
+      limit: params.limit != null ? String(params.limit) : undefined,
+      offset: params.offset != null ? String(params.offset) : undefined,
+    })}`,
+  );
+  return (response.items ?? []).map(normalizeJournalNote);
+}
+
+export async function fetchJournalNoteRevisions(noteId: string, environment_id: string): Promise<JournalNoteRevision[]> {
+  const environmentId = requireEnvironmentId(environment_id, "fetchJournalNoteRevisions");
+  const response = await apiFetch<{ items?: Array<Record<string, unknown>> }>(
+    `/api/journal/v2/notes/${noteId}/revisions${toSearchParams({ environment_id: environmentId })}`,
+  );
+  return (response.items ?? []).map((item) => ({
+    note_id: String(item.note_id ?? noteId),
+    revision_no: Number(item.revision_no ?? 0),
+    body_markdown: String(item.body_markdown ?? ""),
+    body_text: item.body_text != null ? String(item.body_text) : undefined,
+    edited_at: item.edited_at != null ? String(item.edited_at) : undefined,
+    change_reason: item.change_reason != null ? String(item.change_reason) : null,
+  }));
+}
+
+export async function createJournalNote(payload: CreateJournalNotePayload): Promise<JournalNote> {
+  requireEnvironmentId(payload.environment_id, "createJournalNote");
+  const response = await apiFetch<Record<string, unknown>>("/api/journal/v2/notes", {
+    method: "POST",
+    json: payload,
+  });
+  return normalizeJournalNote(response);
+}
+
+export async function updateJournalNote(noteId: string, payload: UpdateJournalNotePayload): Promise<JournalNote> {
+  requireEnvironmentId(payload.environment_id, "updateJournalNote");
+  const response = await apiFetch<Record<string, unknown>>(`/api/journal/v2/notes/${noteId}`, {
+    method: "PATCH",
+    json: payload,
+  });
+  return normalizeJournalNote(response);
 }

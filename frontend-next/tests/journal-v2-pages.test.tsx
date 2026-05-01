@@ -1,0 +1,289 @@
+import { render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import JournalAnalyticsPage from "@/app/(app)/journal/analytics/page";
+import JournalEpisodeDetailPage from "@/app/(app)/journal/episodes/[episodeId]/page";
+import JournalEpisodesPage from "@/app/(app)/journal/episodes/page";
+import JournalOverviewPage from "@/app/(app)/journal/page";
+import JournalNotesPage from "@/app/(app)/journal/notes/page";
+import JournalUnresolvedPage from "@/app/(app)/journal/unresolved/page";
+import { EnvironmentSelector } from "@/components/journal/environment-selector";
+import { JournalNav } from "@/components/journal/journal-nav";
+import { JournalWorkspaceProvider, useJournalWorkspace } from "@/components/journal/journal-workspace-provider";
+import { renderWithQueryClient } from "@/tests/render-with-query-client";
+
+const fetchJournalEnvironmentsMock = vi.hoisted(() => vi.fn());
+const fetchJournalEpisodesMock = vi.hoisted(() => vi.fn());
+const fetchJournalEpisodeMock = vi.hoisted(() => vi.fn());
+const fetchJournalTimelineMock = vi.hoisted(() => vi.fn());
+const fetchJournalNotesMock = vi.hoisted(() => vi.fn());
+const fetchJournalNoteRevisionsMock = vi.hoisted(() => vi.fn());
+const fetchJournalV2AnalyticsSummaryMock = vi.hoisted(() => vi.fn());
+const fetchJournalV2AnalyticsStrategiesMock = vi.hoisted(() => vi.fn());
+const fetchJournalV2PaperLiveComparisonMock = vi.hoisted(() => vi.fn());
+const fetchJournalV2UnresolvedMock = vi.hoisted(() => vi.fn());
+
+vi.mock("@/lib/journal/api", () => ({
+  fetchJournalEnvironments: fetchJournalEnvironmentsMock,
+  fetchJournalEpisodes: fetchJournalEpisodesMock,
+  fetchJournalEpisode: fetchJournalEpisodeMock,
+  fetchJournalTimeline: fetchJournalTimelineMock,
+  fetchJournalNotes: fetchJournalNotesMock,
+  fetchJournalNoteRevisions: fetchJournalNoteRevisionsMock,
+  fetchJournalV2AnalyticsSummary: fetchJournalV2AnalyticsSummaryMock,
+  fetchJournalV2AnalyticsStrategies: fetchJournalV2AnalyticsStrategiesMock,
+  fetchJournalV2PaperLiveComparison: fetchJournalV2PaperLiveComparisonMock,
+  fetchJournalV2Unresolved: fetchJournalV2UnresolvedMock,
+}));
+
+describe("journal v2 pages", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    window.history.replaceState({}, "", "/");
+
+    fetchJournalEnvironmentsMock.mockReset();
+    fetchJournalEpisodesMock.mockReset();
+    fetchJournalEpisodeMock.mockReset();
+    fetchJournalTimelineMock.mockReset();
+    fetchJournalNotesMock.mockReset();
+    fetchJournalNoteRevisionsMock.mockReset();
+    fetchJournalV2AnalyticsSummaryMock.mockReset();
+    fetchJournalV2AnalyticsStrategiesMock.mockReset();
+    fetchJournalV2PaperLiveComparisonMock.mockReset();
+    fetchJournalV2UnresolvedMock.mockReset();
+
+    fetchJournalEnvironmentsMock.mockResolvedValue([
+      {
+        id: "env-1",
+        mode: "paper",
+        account_scope: "kite:paper-e2e",
+        display_name: "Paper E2E",
+        broker_user_id: null,
+        paper_account_key: "kite:paper-e2e",
+        environment_epoch: 1,
+        metadata: {},
+      },
+    ]);
+    fetchJournalEpisodesMock.mockResolvedValue([]);
+    fetchJournalEpisodeMock.mockResolvedValue({
+      id: "ep-1",
+      environment_id: "env-1",
+      execution_context_id: "ctx-1",
+      episode_seq: 1,
+      status: "open",
+      opened_at: "2026-05-01T10:00:00Z",
+      closed_at: null,
+      metadata: {},
+    });
+    fetchJournalTimelineMock.mockResolvedValue([]);
+    fetchJournalNotesMock.mockResolvedValue([]);
+    fetchJournalNoteRevisionsMock.mockResolvedValue([]);
+    fetchJournalV2AnalyticsSummaryMock.mockResolvedValue({
+      environment_id: "env-1",
+      closed_episode_count: 0,
+      metrics: { closed_episode_count: 0, net_pnl: 0, total_charges: 0 },
+    });
+    fetchJournalV2AnalyticsStrategiesMock.mockResolvedValue({ environment_id: "env-1", items: [], count: 0 });
+    fetchJournalV2PaperLiveComparisonMock.mockResolvedValue({
+      template_id: "tmpl-1",
+      paper: { closed_episode_count: 0, net_pnl: 0, total_charges: 0 },
+      live: { closed_episode_count: 0, net_pnl: 0, total_charges: 0 },
+      combined: null,
+    });
+    fetchJournalV2UnresolvedMock.mockResolvedValue({ environment_id: "env-1", items: [], count: 0 });
+  });
+
+  function WorkspaceEnvSelector() {
+    const { environments, selectedEnvironmentId, setSelectedEnvironmentId } = useJournalWorkspace();
+    return (
+      <EnvironmentSelector
+        environments={environments}
+        selectedEnvironmentId={selectedEnvironmentId}
+        onSelectEnvironment={setSelectedEnvironmentId}
+      />
+    );
+  }
+
+  it("preserves selected Journal environment across shared workspace renders", async () => {
+    window.history.pushState({}, "", "/journal?environment_id=env-1");
+
+    render(
+      <JournalWorkspaceProvider>
+        <WorkspaceEnvSelector />
+        <WorkspaceEnvSelector />
+      </JournalWorkspaceProvider>,
+    );
+
+    await waitFor(() => expect(fetchJournalEnvironmentsMock).toHaveBeenCalled());
+    expect(screen.getAllByRole("combobox", { name: /Journal V2 environment/i })).toHaveLength(2);
+    for (const selector of screen.getAllByRole("combobox", { name: /Journal V2 environment/i })) {
+      expect(selector).toHaveValue("env-1");
+    }
+  });
+
+  it("shows Journal V2 overview panels from shared environment state", async () => {
+    window.history.pushState({}, "", "/journal?environment_id=env-1");
+    fetchJournalEpisodesMock.mockResolvedValue([
+      {
+        id: "ep-1",
+        environment_id: "env-1",
+        execution_context_id: "ctx-1",
+        episode_seq: 1,
+        status: "closed",
+        opened_at: "2026-05-01T10:00:00Z",
+        closed_at: "2026-05-01T10:05:00Z",
+        metadata: {},
+      },
+    ]);
+
+    renderWithQueryClient(
+      <JournalWorkspaceProvider>
+        <JournalOverviewPage />
+      </JournalWorkspaceProvider>,
+    );
+
+    await waitFor(() => expect(fetchJournalV2AnalyticsSummaryMock).toHaveBeenCalledWith("env-1"));
+    expect(screen.getByText(/Recent V2 episodes/i)).toBeInTheDocument();
+    expect(screen.getByText(/Unresolved queue summary/i)).toBeInTheDocument();
+  });
+
+  it("renders episode ledger entries linked with environment_id", async () => {
+    window.history.pushState({}, "", "/journal/episodes?environment_id=env-1");
+    fetchJournalEpisodesMock.mockResolvedValue([
+      {
+        id: "ep-1",
+        environment_id: "env-1",
+        execution_context_id: "ctx-1",
+        episode_seq: 1,
+        status: "open",
+        opened_at: "2026-05-01T10:00:00Z",
+        closed_at: null,
+        metadata: {},
+      },
+    ]);
+
+    renderWithQueryClient(
+      <JournalWorkspaceProvider>
+        <JournalEpisodesPage />
+      </JournalWorkspaceProvider>,
+    );
+
+    await waitFor(() => expect(fetchJournalEpisodesMock).toHaveBeenCalledWith({ environment_id: "env-1" }));
+    expect(screen.getByRole("link", { name: /Episode #1/i })).toHaveAttribute(
+      "href",
+      expect.stringContaining("environment_id=env-1"),
+    );
+  });
+
+  it("renders V2 Journal nav tabs and preserves environment query in links", async () => {
+    window.history.pushState({}, "", "/journal?environment_id=env-1");
+
+    render(
+      <JournalWorkspaceProvider>
+        <JournalNav />
+      </JournalWorkspaceProvider>,
+    );
+
+    await waitFor(() => expect(fetchJournalEnvironmentsMock).toHaveBeenCalled());
+    expect(screen.getByRole("link", { name: /Episodes/i })).toHaveAttribute(
+      "href",
+      expect.stringContaining("environment_id=env-1"),
+    );
+    expect(screen.getByRole("link", { name: /Unresolved/i })).toBeInTheDocument();
+  });
+
+  it("renders episode review workspace with timeline and note workflow", async () => {
+    window.history.pushState({}, "", "/journal/episodes/ep-1?environment_id=env-1");
+    fetchJournalTimelineMock.mockResolvedValue([
+      {
+        id: "evt-1",
+        environment_id: "env-1",
+        episode_id: "ep-1",
+        execution_context_id: "ctx-1",
+        subject_type: "episode",
+        subject_id: "ep-1",
+        event_type: "episode_opened",
+        channel: "entry",
+        actor_type: "system",
+        correlation_id: null,
+        causation_id: null,
+        occurred_at: "2026-05-01T10:00:00Z",
+        payload: {},
+      },
+    ]);
+    fetchJournalNotesMock.mockResolvedValue([
+      {
+        id: "note-1",
+        environment_id: "env-1",
+        subject_type: "episode",
+        subject_id: "ep-1",
+        episode_id: "ep-1",
+        note_type: "post_exit_review",
+        title: "Review",
+        body_markdown: "# Review",
+        tags: [],
+        updated_at: "2026-05-01T10:05:00Z",
+      },
+    ]);
+
+    render(
+      <JournalWorkspaceProvider>
+        <JournalEpisodeDetailPage params={{ episodeId: "ep-1" }} />
+      </JournalWorkspaceProvider>,
+    );
+
+    await waitFor(() => expect(fetchJournalEpisodeMock).toHaveBeenCalledWith("ep-1", "env-1"));
+    expect(screen.getByRole("heading", { name: /Episode #1/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Episode activity/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Episode note/i })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByDisplayValue("# Review")).toBeInTheDocument());
+    await waitFor(() => expect(fetchJournalNoteRevisionsMock).toHaveBeenCalledWith("note-1", "env-1"));
+    expect(screen.getByRole("heading", { name: /Note revisions/i })).toBeInTheDocument();
+  });
+
+  it("shows notes archive and unresolved queue from shared Journal environment", async () => {
+    window.history.pushState({}, "", "/journal/notes?environment_id=env-1");
+    fetchJournalNotesMock.mockResolvedValue([
+      {
+        id: "note-1",
+        environment_id: "env-1",
+        subject_type: "episode",
+        subject_id: "ep-1",
+        episode_id: "ep-1",
+        note_type: "post_exit_review",
+        title: "Review",
+        body_markdown: "# Review",
+        tags: [],
+        updated_at: "2026-05-01T10:05:00Z",
+      },
+    ]);
+
+    renderWithQueryClient(
+      <JournalWorkspaceProvider>
+        <JournalNotesPage />
+        <JournalUnresolvedPage />
+      </JournalWorkspaceProvider>,
+    );
+
+    await waitFor(() => expect(fetchJournalNotesMock).toHaveBeenCalledWith({ environment_id: "env-1", limit: 50 }));
+    await waitFor(() => expect(fetchJournalV2UnresolvedMock).toHaveBeenCalledWith("env-1"));
+    expect(screen.getByRole("heading", { name: /Notes archive/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Unresolved identity\/activity queue/i })).toBeInTheDocument();
+    expect(screen.getByLabelText(/Markdown note/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Save/i })).toBeInTheDocument();
+    expect(screen.getByText(/Draft locally, then copy into episode\/subject notes as needed./i)).toBeInTheDocument();
+  });
+
+  it("shows analytics page from shared environment selection without mixed totals", async () => {
+    window.history.pushState({}, "", "/journal/analytics?environment_id=env-1");
+    renderWithQueryClient(
+      <JournalWorkspaceProvider>
+        <JournalAnalyticsPage />
+      </JournalWorkspaceProvider>,
+    );
+
+    await waitFor(() => expect(fetchJournalV2AnalyticsSummaryMock).toHaveBeenCalledWith("env-1"));
+    expect(screen.queryByText("Combined P&L")).not.toBeInTheDocument();
+    expect(screen.getByText(/Select a template plus explicit paper and live environments to compare them separately./i)).toBeInTheDocument();
+  });
+});

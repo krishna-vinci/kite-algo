@@ -172,8 +172,6 @@ class PaperRunStateService:
                     stale_reasons.append(f"missing_account_position:{leg.instrument_token}:{leg.product}")
                 elif (leg.net_quantity > 0 > int(position.net_quantity)) or (leg.net_quantity < 0 < int(position.net_quantity)):
                     stale_reasons.append(f"sign_mismatch:{leg.instrument_token}:{leg.product}")
-                elif abs(leg.net_quantity) > abs(int(position.net_quantity)):
-                    stale_reasons.append(f"quantity_mismatch:{leg.instrument_token}:{leg.product}")
             unrealized = 0.0
             if leg.net_quantity > 0:
                 unrealized = (last_price - leg.average_price) * leg.net_quantity

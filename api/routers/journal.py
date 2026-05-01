@@ -46,6 +46,25 @@ def validate_run_id(run_id: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid run_id") from exc
 
 
+def _resolve_v2_environment_or_raise(
+    service: JournalService,
+    *,
+    environment_id: str | None,
+    mode: str | None,
+    account_scope: str | None,
+) -> str:
+    try:
+        return service.resolve_v2_environment_id(
+            environment_id=environment_id,
+            mode=mode,
+            account_scope=account_scope,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 class JournalRunCreateRequest(BaseModel):
     strategy_family: StrategyFamily
     strategy_name: Optional[str] = None
@@ -113,6 +132,47 @@ class JournalRuleUpdateRequest(BaseModel):
 class JournalReviewUpdateRequest(BaseModel):
     review_status: Literal["pending", "in_progress", "completed", "reviewed", "skipped", "waived"]
     notes: Optional[str] = None
+
+
+class JournalV2NoteCreateRequest(BaseModel):
+    environment_id: str = Field(min_length=1)
+    subject_type: str = Field(min_length=1)
+    subject_id: str = Field(min_length=1)
+    note_type: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    body_markdown: str = Field(min_length=1)
+    episode_id: Optional[str] = None
+    body_json: Dict[str, Any] = Field(default_factory=dict)
+    effective_at: Optional[datetime] = None
+    author_id: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class JournalV2NoteUpdateRequest(BaseModel):
+    environment_id: str = Field(min_length=1)
+    subject_type: str = Field(min_length=1)
+    subject_id: str = Field(min_length=1)
+    title: Optional[str] = None
+    body_markdown: Optional[str] = None
+    body_json: Optional[Dict[str, Any]] = None
+    tags: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    editor_id: Optional[str] = None
+    change_reason: Optional[str] = None
+
+
+class JournalV2AttachmentRequest(BaseModel):
+    environment_id: str = Field(min_length=1)
+    subject_type: str = Field(min_length=1)
+    subject_id: str = Field(min_length=1)
+    storage_key: str = Field(min_length=1)
+    mime_type: str = Field(min_length=1)
+    note_id: Optional[str] = None
+    sha256: Optional[str] = None
+    size_bytes: Optional[int] = Field(default=None, ge=0)
+    ocr_text: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 @router.post("/journal/runs")
@@ -424,3 +484,304 @@ def get_insights(request: Request, limit: int = Query(20, ge=1, le=100)):
     require_app_user(request)
     service = get_journal_service(request)
     return service.get_insights_feed(limit=limit)
+
+
+@router.get("/journal/v2/environments")
+def list_v2_environments(
+    request: Request,
+    mode: Optional[str] = Query(None),
+):
+    require_app_user(request)
+    service = get_journal_service(request)
+    return {"items": service.list_v2_environments(mode=mode)}
+
+
+@router.get("/journal/v2/episodes")
+def list_v2_episodes(
+    request: Request,
+    environment_id: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+    account_scope: Optional[str] = Query(None),
+    execution_context_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    require_app_user(request)
+    service = get_journal_service(request)
+    resolved_environment_id = _resolve_v2_environment_or_raise(
+        service,
+        environment_id=environment_id,
+        mode=mode,
+        account_scope=account_scope,
+    )
+    try:
+        items = service.list_v2_episodes(
+            environment_id=resolved_environment_id,
+            execution_context_id=execution_context_id,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "items": items,
+        "count": len(items),
+    }
+
+
+@router.get("/journal/v2/episodes/{episode_id}")
+def get_v2_episode_detail(episode_id: str, request: Request, environment_id: str = Query(...)):
+    require_app_user(request)
+    service = get_journal_service(request)
+    try:
+        episode = service.get_v2_episode_detail(episode_id, environment_id=environment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if episode is None:
+        raise HTTPException(status_code=404, detail=f"Unknown episode_id: {episode_id}")
+    return episode
+
+
+@router.get("/journal/v2/strategies")
+def list_v2_strategies(
+    request: Request,
+    environment_id: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+    account_scope: Optional[str] = Query(None),
+):
+    require_app_user(request)
+    service = get_journal_service(request)
+    resolved_environment_id = _resolve_v2_environment_or_raise(
+        service,
+        environment_id=environment_id,
+        mode=mode,
+        account_scope=account_scope,
+    )
+    return service.list_v2_strategies(environment_id=resolved_environment_id)
+
+
+@router.get("/journal/v2/unresolved")
+def list_v2_unresolved(
+    request: Request,
+    environment_id: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+    account_scope: Optional[str] = Query(None),
+):
+    require_app_user(request)
+    service = get_journal_service(request)
+    resolved_environment_id = _resolve_v2_environment_or_raise(
+        service,
+        environment_id=environment_id,
+        mode=mode,
+        account_scope=account_scope,
+    )
+    return service.list_v2_unresolved(environment_id=resolved_environment_id)
+
+
+@router.get("/journal/v2/analytics/summary")
+def get_v2_analytics_summary(
+    request: Request,
+    environment_id: str = Query(...),
+):
+    require_app_user(request)
+    service = get_journal_service(request)
+    try:
+        return service.compute_v2_environment_metrics(environment_id=environment_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/journal/v2/analytics/strategies")
+def get_v2_analytics_strategies(
+    request: Request,
+    environment_id: str = Query(...),
+):
+    require_app_user(request)
+    service = get_journal_service(request)
+    try:
+        return service.compute_v2_environment_strategy_metrics(environment_id=environment_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/journal/v2/analytics/compare-paper-live")
+def get_v2_compare_paper_live(
+    request: Request,
+    template_id: str = Query(...),
+    paper_environment_id: str = Query(...),
+    live_environment_id: str = Query(...),
+):
+    require_app_user(request)
+    service = get_journal_service(request)
+    try:
+        return service.compare_v2_paper_live_for_template(
+            template_id=template_id,
+            paper_environment_id=paper_environment_id,
+            live_environment_id=live_environment_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/journal/v2/episodes/{episode_id}/timeline")
+def list_v2_episode_timeline(
+    episode_id: str,
+    request: Request,
+    environment_id: str = Query(...),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    require_app_user(request)
+    service = get_journal_service(request)
+    try:
+        items = service.list_v2_timeline(episode_id=episode_id, environment_id=environment_id, limit=limit, offset=offset)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"items": items, "count": len(items)}
+
+
+@router.get("/journal/v2/notes")
+def list_v2_notes(
+    request: Request,
+    environment_id: str = Query(...),
+    subject_type: Optional[str] = Query(None),
+    subject_id: Optional[str] = Query(None),
+    episode_id: Optional[str] = Query(None),
+    note_type: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    require_app_user(request)
+    service = get_journal_service(request)
+    try:
+        items = service.list_v2_notes(
+            environment_id=environment_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            episode_id=episode_id,
+            note_type=note_type,
+            limit=limit,
+            offset=offset,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"items": items, "count": len(items)}
+
+
+@router.post("/journal/v2/notes")
+def create_v2_note(payload: JournalV2NoteCreateRequest, request: Request):
+    require_app_user(request)
+    service = get_journal_service(request)
+    try:
+        note_id = service.create_v2_note(
+            environment_id=payload.environment_id,
+            subject_type=payload.subject_type,
+            subject_id=payload.subject_id,
+            note_type=payload.note_type,
+            title=payload.title,
+            body_markdown=payload.body_markdown,
+            episode_id=payload.episode_id,
+            body_json=payload.body_json,
+            effective_at=payload.effective_at,
+            author_id=payload.author_id,
+            tags=payload.tags,
+            metadata=payload.metadata,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    note = service.get_v2_note(note_id, environment_id=payload.environment_id)
+    return note or {"id": note_id}
+
+
+@router.get("/journal/v2/notes/{note_id}")
+def get_v2_note(note_id: str, request: Request, environment_id: str = Query(...)):
+    require_app_user(request)
+    service = get_journal_service(request)
+    try:
+        note = service.get_v2_note(note_id, environment_id=environment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if note is None:
+        raise HTTPException(status_code=404, detail=f"Unknown note_id: {note_id}")
+    return note
+
+
+@router.patch("/journal/v2/notes/{note_id}")
+def update_v2_note(note_id: str, payload: JournalV2NoteUpdateRequest, request: Request):
+    require_app_user(request)
+    service = get_journal_service(request)
+    try:
+        service.update_v2_note(
+            note_id,
+            environment_id=payload.environment_id,
+            subject_type=payload.subject_type,
+            subject_id=payload.subject_id,
+            title=payload.title,
+            body_markdown=payload.body_markdown,
+            body_json=payload.body_json,
+            tags=payload.tags,
+            metadata=payload.metadata,
+            editor_id=payload.editor_id,
+            change_reason=payload.change_reason,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    note = service.get_v2_note(note_id, environment_id=payload.environment_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail=f"Unknown note_id: {note_id}")
+    return note
+
+
+@router.get("/journal/v2/notes/{note_id}/revisions")
+def list_v2_note_revisions(note_id: str, request: Request, environment_id: str = Query(...)):
+    require_app_user(request)
+    service = get_journal_service(request)
+    try:
+        items = service.list_v2_note_revisions(note_id, environment_id=environment_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"items": items, "count": len(items)}
+
+
+@router.post("/journal/v2/attachments")
+def create_v2_attachment(payload: JournalV2AttachmentRequest, request: Request):
+    require_app_user(request)
+    service = get_journal_service(request)
+    try:
+        attachment_id = service.attach_v2_file_metadata(
+            environment_id=payload.environment_id,
+            subject_type=payload.subject_type,
+            subject_id=payload.subject_id,
+            storage_key=payload.storage_key,
+            mime_type=payload.mime_type,
+            note_id=payload.note_id,
+            sha256=payload.sha256,
+            size_bytes=payload.size_bytes,
+            ocr_text=payload.ocr_text,
+            metadata=payload.metadata,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"id": attachment_id}

@@ -25,6 +25,7 @@ from api.routers.algo_workers import (  # noqa: E402
     get_worker_order,
     get_worker_order_history,
     get_worker_market_candles,
+    get_worker_run,
     get_worker_market_history,
     get_worker_run_pnl,
     get_worker_funds,
@@ -909,6 +910,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
             intent_type="place_basket",
             idempotency_key="entry-0001",
             payload={"orders": [{"exchange": "NSE", "tradingsymbol": "INFY", "transaction_type": "BUY", "quantity": 1}]},
+            metadata={"strategy_run_id": "evil-run", "strategy_name": "Wrong Name"},
         )
         first = await submit_worker_intent(request, "run-worker-1", payload)
         second = await submit_worker_intent(request, "run-worker-1", payload)
@@ -920,6 +922,138 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["account_scope"], "kite:paper-a")
         self.assertEqual(call["attribution"]["strategy_run_id"], "run-worker-1")
         self.assertEqual(call["attribution"]["source"], "algo_worker")
+        self.assertEqual(call["attribution"]["metadata"]["strategy_run_id"], "run-worker-1")
+        self.assertNotEqual(call["attribution"]["metadata"]["strategy_run_id"], "evil-run")
+
+    async def test_paper_run_rejects_live_account_scope(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await create_worker_run(
+                request,
+                WorkerRunCreateRequest(
+                    strategy_run_id="run-paper-live-scope",
+                    template_id="mean_reversion",
+                    account_scope="kite:AB1234",
+                    execution_mode="paper",
+                ),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("paper account_scope", ctx.exception.detail)
+
+    async def test_live_bound_token_can_create_paper_run_but_not_other_live_scope(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["paper", "dry_run", "live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        request = self._request(repo)
+
+        paper_run = await create_worker_run(
+            request,
+            WorkerRunCreateRequest(
+                strategy_run_id="run-live-token-paper",
+                template_id="mean_reversion",
+                account_scope="kite:paper-a",
+                execution_mode="paper",
+            ),
+        )
+        self.assertEqual(paper_run["account_scope"], "kite:paper-a")
+        fetched = await get_worker_run(request, "run-live-token-paper")
+        self.assertEqual(fetched["strategy_run_id"], "run-live-token-paper")
+
+        with self.assertRaises(HTTPException) as ctx:
+            await create_worker_run(
+                request,
+                WorkerRunCreateRequest(
+                    strategy_run_id="run-live-token-other-live",
+                    template_id="mean_reversion",
+                    account_scope="kite:ZZ9999",
+                    execution_mode="live",
+                    metadata={"strategy_family": "indicator_strategy", "strategy_name": "MR"},
+                ),
+            )
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    async def test_paper_worker_run_stores_journal_v2_paper_environment_refs(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["paper", "live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        request = self._request(repo)
+
+        class _FakeJournalService:
+            def ensure_v2_worker_context(self, **kwargs):
+                return {
+                    "environment_id": f"env:{kwargs['execution_mode']}:{kwargs['account_scope']}",
+                    "execution_context_id": f"ctx:{kwargs['strategy_run_id']}",
+                    "template_id": "tmpl-ref-1",
+                    "variant_id": None,
+                    "deployment_id": None,
+                    "identity_rule_version": "journal_v2_identity_v1",
+                    "grouping_rule_version": "journal_v2_grouping_v1",
+                    "ambiguous": False,
+                    "resolution_method": "explicit_template_id",
+                    "resolution_confidence": "1.0",
+                }
+
+        request.app.state.journal_service = _FakeJournalService()
+
+        paper_run = await create_worker_run(
+            request,
+            WorkerRunCreateRequest(
+                strategy_run_id="run-live-token-paper-v2",
+                template_id="mean_reversion",
+                account_scope="kite:paper-a",
+                execution_mode="paper",
+                metadata={"strategy_family": "indicator_strategy", "strategy_name": "MR"},
+            ),
+        )
+
+        assert paper_run["metadata"]["journal_v2"]["environment_id"] == "env:paper:kite:paper-a"
+
+    async def test_live_bound_token_can_read_paper_funds_by_explicit_scope(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["paper", "live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        request = self._request(repo)
+        request.app.state.paper_runtime_service = SimpleNamespace(
+            get_account_summary=AsyncMock(
+                return_value={
+                    "account_scope": "kite:paper-a",
+                    "currency": "INR",
+                    "starting_balance": 100000,
+                    "available_funds": 99000,
+                    "blocked_funds": 1000,
+                    "realized_pnl": 0,
+                    "updated_at": "2026-04-26T08:00:00+00:00",
+                }
+            )
+        )
+
+        response = await get_worker_funds(request, mode="paper", account_scope="kite:paper-a")
+        self.assertEqual(response["account_scope"], "kite:paper-a")
+
+        with self.assertRaises(HTTPException) as ctx:
+            await get_worker_funds(request, mode="live", account_scope="kite:ZZ9999")
+        self.assertEqual(ctx.exception.status_code, 403)
 
     async def test_worker_risk_patch_updates_runtime_state_and_schema_values(self):
         repo = _FakeWorkerRepository()
@@ -1894,6 +2028,34 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertIn("open strategy runs", ctx.exception.detail)
 
+    async def test_paper_worker_exit_does_not_close_run_when_exit_is_blocked(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-paper-blocked"] = {
+            "strategy_run_id": "run-paper-blocked",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "metadata": {},
+            "runtime_state": {},
+        }
+        paper_runtime = SimpleNamespace(
+            exit_strategy=AsyncMock(
+                return_value={
+                    "mode": "paper",
+                    "status": "blocked",
+                    "message": "reconciliation mismatch",
+                }
+            )
+        )
+        request = self._request(repo, paper_runtime=paper_runtime)
+
+        response = await exit_worker_run(request, "run-paper-blocked", WorkerExitRequest(reason="operator"))
+
+        self.assertEqual(response["status"], "blocked")
+        self.assertEqual(response["run"]["status"], "open")
+
     async def test_live_worker_exit_closes_when_reconciled_strategy_is_already_flat(self):
         token = WorkerToken(
             token_id="worker-live",
@@ -2185,6 +2347,9 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
                         "status": "open",
                         "realized_pnl": 10.0,
                         "unrealized_pnl": 5.5,
+                        "gross_pnl": 15.5,
+                        "charges": 1.25,
+                        "net_pnl": 14.25,
                         "last_updated_at": "2026-04-25T12:00:00+00:00",
                         "positions": [
                             {
@@ -2198,6 +2363,9 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
                                 "last_price": 105.5,
                                 "realized_pnl": 10.0,
                                 "unrealized_pnl": 5.5,
+                                "gross_pnl": 15.5,
+                                "charges": 1.25,
+                                "net_pnl": 14.25,
                             }
                         ],
                     },
@@ -2209,9 +2377,9 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         response = await get_worker_run_pnl(request, "run-paper")
 
         self.assertEqual(response["totals"]["gross_pnl"], 15.5)
-        self.assertEqual(response["totals"]["charges"], 0.0)
+        self.assertEqual(response["totals"]["charges"], 1.25)
         self.assertEqual(response["legs"][0]["tradingsymbol"], "INFY")
-        self.assertEqual(response["legs"][0]["net_pnl"], 15.5)
+        self.assertEqual(response["legs"][0]["net_pnl"], 14.25)
 
     async def test_worker_run_pnl_snapshot_returns_live_grouped_totals_and_legs(self):
         token = WorkerToken(
