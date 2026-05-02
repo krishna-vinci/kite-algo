@@ -26,7 +26,7 @@ from api.routers.market_data import router as market_data_router
 from api.routers.marketwatch import router as marketwatch_router
 from api.routers.user_settings import router as user_settings_router
 from auth_service import auth_exempt_path, get_optional_app_user
-from broker_api.broker_api import run_headless_login_and_persist_system_token
+from broker_api.broker_api import run_headless_login_and_persist_system_token, schedule_daily_instruments_update
 from broker_api.candles_api import router as candles_api_router
 from broker_api.index_ingestion import (
     get_index_refresh_state,
@@ -216,6 +216,7 @@ async def combined_lifespan(app: FastAPI):
     # Perform headless login at startup and store the KiteConnect instance
     token_watcher_task = None
     scheduler_task = None
+    instruments_refresh_task = None
     index_refresh_task = None
     order_runtime_task = None
     positions_runtime_task = None
@@ -470,6 +471,7 @@ async def combined_lifespan(app: FastAPI):
         logging.info("[GATE] Initialized and open at startup (will close at next 08:00 IST)")
         set_meta("daily_token_gate", {"ready": True, "last_changed_at": datetime.utcnow().isoformat()})
         scheduler_task = asyncio.create_task(daily_token_scheduler())
+        instruments_refresh_task = asyncio.create_task(schedule_daily_instruments_update())
         index_refresh_task = asyncio.create_task(monthly_index_refresh_scheduler())
         try:
             startup_index_result = await asyncio.to_thread(refresh_live_metrics_for_indices, ["Nifty50", "NiftyBank"])
@@ -696,6 +698,16 @@ async def combined_lifespan(app: FastAPI):
             scheduler_task.cancel()
             try:
                 await scheduler_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel daily instruments refresh scheduler
+    try:
+        if 'instruments_refresh_task' in locals() and instruments_refresh_task:
+            instruments_refresh_task.cancel()
+            try:
+                await instruments_refresh_task
             except Exception:
                 pass
     except Exception:
