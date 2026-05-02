@@ -93,7 +93,7 @@ Example SSE event
 ```
 
 Ntfy (push) — fast and non-blocking
-- Env: kite_alerts_NTFY_URL (e.g., https://ntfy.krishna.quest/kite-alerts) in [.env](.env).  
+- Env: `KITE_ALERTS_NTFY_URL` (e.g., `https://ntfy.example.com/kite-alerts`) in `.env`.  
 - Publisher [Python.notify_alert_triggered()](broker_api/ntfy.py:1) uses httpx (low timeouts) and is scheduled via asyncio.create_task in [Python.AlertsEngine._handle_trigger()](alerts/engine.py:221).  
 - Failure to reach ntfy does not block triggering; it logs and continues.
 
@@ -108,7 +108,7 @@ Ntfy (push) — fast and non-blocking
 
 Backend
 - REDIS_URL (default redis://redis:6379/0) for SSE bus in [broker_api/redis_events.py](broker_api/redis_events.py).  
-- kite_alerts_NTFY_URL for ntfy in [.env](.env).  
+- `KITE_ALERTS_NTFY_URL` for ntfy in `.env`.  
 - Requirements in [requirements.txt](requirements.txt) include redis, httpx.
 
 Frontend
