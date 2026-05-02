@@ -9,14 +9,14 @@ The SDK only calls public Kite Algo worker API endpoints under `/api/algo-worker
 Recommended for public installs and remote strategy servers:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.6.1
+python3 -m pip install kite-algo-worker==0.6.2
 ```
 
 Extras:
 
 ```bash
-python3 -m pip install "kite-algo-worker[dataframe]==0.6.1"
-python3 -m pip install "kite-algo-worker[indicators]==0.6.1"
+python3 -m pip install "kite-algo-worker[dataframe]==0.6.2"
+python3 -m pip install "kite-algo-worker[indicators]==0.6.2"
 ```
 
 Pin to an immutable version in production.
@@ -27,14 +27,14 @@ Use this when you need an exact monorepo tag before or instead of a PyPI release
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.1#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.1#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 ```
 
 Pin to an immutable tag in production. Avoid installing from a moving branch such as `main` on live strategy servers.
@@ -59,9 +59,9 @@ From a Git tag:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker[dataframe] @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.1#subdirectory=sdk/python"
+  "kite-algo-worker[dataframe] @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 python3 -m pip install \
-  "kite-algo-worker[indicators] @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.1#subdirectory=sdk/python"
+  "kite-algo-worker[indicators] @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 ```
 
 ## Release conventions
@@ -76,8 +76,8 @@ The SDK has its own semantic version stream because this repo is a monorepo and 
 After the SDK changes are committed and pushed, bump `sdk/python/pyproject.toml` and create the matching SDK tag from the repository root:
 
 ```bash
-git tag -a kite-algo-worker-v0.6.1 -m "kite-algo-worker v0.6.1"
-git push origin kite-algo-worker-v0.6.1
+git tag -a kite-algo-worker-v0.6.2 -m "kite-algo-worker v0.6.2"
+git push origin kite-algo-worker-v0.6.2
 ```
 
 Pushing a `kite-algo-worker-v*` tag triggers GitHub Actions to:

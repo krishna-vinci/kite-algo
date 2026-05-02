@@ -70,7 +70,7 @@ Start here:
 Public package install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.6.1
+python3 -m pip install kite-algo-worker==0.6.2
 ```
 
 ## Quick start

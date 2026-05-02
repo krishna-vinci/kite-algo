@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kite-algo-worker"
-version = "0.6.1"
+version = "0.6.2"
 description = "Thin Python SDK for external Kite Algo strategy workers"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = "Apache-2.0"

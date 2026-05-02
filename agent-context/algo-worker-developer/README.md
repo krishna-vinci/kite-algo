@@ -36,7 +36,7 @@ If this context pack and the canonical files disagree, trust the canonical files
 ## Current SDK release
 
 - Package name: `kite-algo-worker`
-- Version: `0.6.1`
+- Version: `0.6.2`
 - SDK tag convention: `kite-algo-worker-vX.Y.Z`
 - App tag convention: `vX.Y.Z`
 
@@ -53,14 +53,14 @@ The certification script now prints preview output and capability flags for this
 Remote install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.6.1
+python3 -m pip install kite-algo-worker==0.6.2
 ```
 
 Fallback exact-tag install:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.1#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 ```
 
 This release adds:

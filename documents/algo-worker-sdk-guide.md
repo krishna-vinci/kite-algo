@@ -85,7 +85,7 @@ That makes it safer to version, easier to install remotely, and easier for strat
 Install from PyPI:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.6.1
+python3 -m pip install kite-algo-worker==0.6.2
 ```
 
 Pin to an immutable version in production.
@@ -94,7 +94,7 @@ Fallback for an exact monorepo tag before or instead of a PyPI release:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.1#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 ```
 
 Release conventions:

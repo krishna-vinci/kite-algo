@@ -5,7 +5,7 @@
 Recommended production install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.6.1
+python3 -m pip install kite-algo-worker==0.6.2
 ```
 
 ## Install from Git tag
@@ -14,7 +14,7 @@ Exact-tag fallback:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.1#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 ```
 
 Pin live strategy servers to an immutable tag. Do not install from a moving branch like `main` or `develop` for live trading.
@@ -32,7 +32,7 @@ PY
 Expected version:
 
 ```text
-0.6.1
+0.6.2
 ```
 
 ## Local development install

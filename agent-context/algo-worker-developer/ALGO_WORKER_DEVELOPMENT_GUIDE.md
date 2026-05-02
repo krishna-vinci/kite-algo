@@ -18,17 +18,17 @@ Workers should only call the public worker API, preferably through the Python SD
 Once the SDK changes are published, remote servers should install the exact SDK version from PyPI:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.6.1
+python3 -m pip install kite-algo-worker==0.6.2
 ```
 
 Fallback exact-tag install from the monorepo:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.1#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 ```
 
-Pin live strategy servers to an immutable version such as `0.6.1`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
+Pin live strategy servers to an immutable version such as `0.6.2`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
 
 Release conventions:
 
@@ -38,8 +38,8 @@ Release conventions:
 Create the SDK tag from the repository root after bumping `sdk/python/pyproject.toml`:
 
 ```bash
-git tag -a kite-algo-worker-v0.6.1 -m "kite-algo-worker v0.6.1"
-git push origin kite-algo-worker-v0.6.1
+git tag -a kite-algo-worker-v0.6.2 -m "kite-algo-worker v0.6.2"
+git push origin kite-algo-worker-v0.6.2
 ```
 
 Pushing a `kite-algo-worker-v*` tag triggers GitHub Actions to build, validate, and publish the SDK to PyPI.
