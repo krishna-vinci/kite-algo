@@ -1,13 +1,19 @@
 import type { NextConfig } from "next";
 
+const allowedDevOrigins = (process.env.ALLOWED_DEV_ORIGINS ?? "localhost,127.0.0.1")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+
 const nextConfig: NextConfig = {
-  allowedDevOrigins: ["192.168.0.128", "localhost", "127.0.0.1"],
+  allowedDevOrigins,
   turbopack: {
     root: process.cwd(),
   },
   async rewrites() {
     const backend = process.env.BACKEND_INTERNAL_URL ?? "http://localhost:18777";
-    const marketRuntime = process.env.MARKET_RUNTIME_URL ?? process.env.NEXT_PUBLIC_MARKET_RUNTIME_URL ?? "http://localhost:8780";
+    const marketRuntime =
+      process.env.MARKET_RUNTIME_URL ?? process.env.NEXT_PUBLIC_MARKET_RUNTIME_URL ?? "http://localhost:8780";
     return [
       {
         source: "/api/:path*",

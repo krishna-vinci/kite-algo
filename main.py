@@ -70,6 +70,43 @@ load_dotenv()  # Load environment variables from .env file
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 install_log_buffer()
 
+
+def _validate_auth_config_at_startup() -> None:
+    """Fail fast at startup if required auth secrets are missing in non-dev mode."""
+    app_env = (os.getenv("APP_ENV") or "").strip().lower()
+    allow_insecure = (os.getenv("APP_ALLOW_INSECURE_DEV_AUTH") or "false").strip().lower() == "true"
+    is_dev = app_env == "development" and allow_insecure
+
+    jwt_secret = os.getenv("APP_JWT_SECRET") or os.getenv("JWT_SECRET")
+    if not jwt_secret and not is_dev:
+        raise RuntimeError(
+            "APP_JWT_SECRET is required unless APP_ENV=development and APP_ALLOW_INSECURE_DEV_AUTH=true"
+        )
+
+    has_admin = bool(
+        os.getenv("APP_ADMIN_PASSWORD")
+        or os.getenv("APP_ADMIN_PASSWORD_HASH")
+        or os.getenv("APP_ADMIN_PASSWORD_HASH_B64")
+        or os.getenv("APP_ADMIN_PASSWORD_HASH_FILE")
+    )
+    if not has_admin and not is_dev:
+        raise RuntimeError(
+            "APP_ADMIN_PASSWORD or APP_ADMIN_PASSWORD_HASH* is required unless APP_ENV=development and APP_ALLOW_INSECURE_DEV_AUTH=true"
+        )
+
+    if is_dev:
+        if not jwt_secret:
+            logging.warning(
+                "APP_JWT_SECRET is not set; using insecure development secret because APP_ENV=development and APP_ALLOW_INSECURE_DEV_AUTH=true"
+            )
+        if not has_admin:
+            logging.warning(
+                "APP admin credentials are not configured; allowing development fallback password because APP_ENV=development and APP_ALLOW_INSECURE_DEV_AUTH=true"
+            )
+
+
+_validate_auth_config_at_startup()
+
 # Suppress INFO level logs from httpx for specific API calls
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -796,10 +833,12 @@ def reset_meili_settings():
     except Exception as e:
         logger.error(f"Failed to reset Meilisearch settings: {e}", exc_info=True)
 
-# Add CORS middleware for frontend (production: single allowed origin)
+from runtime_public_config import get_allowed_cors_origins
+
+# Add CORS middleware for frontend (origins are env-driven; defaults are local-only)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://kite.krishna.quest"],
+    allow_origins=get_allowed_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -31,6 +31,8 @@ postgres_data/
 .idea/
 .vscode/
 .kilocode/
+.superpowers/
+.codex
 
 # Local SDK references
 gokiteconnect/
@@ -39,7 +41,7 @@ gokiteconnect/
 .opencode/
 
 # Documentation
-documents/
+docs/
 kite-docs/
 features-doc/
 
@@ -59,5 +61,4 @@ openalgo/openalgo/
 quant-ml-india/
 
 
-# tests
-tests/
+

@@ -52,10 +52,17 @@ from .kite_session import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-SCHEDULER_NTFY_URL = os.getenv("SCHEDULER_NTFY_URL", "https://ntfy.krishna.quest/scheduler-alerts")
+from runtime_public_config import get_scheduler_ntfy_url
+
+
+SCHEDULER_NTFY_URL = get_scheduler_ntfy_url()
+
 
 async def send_ntfy_notification(message: str, title: str = "Kite App Notification", tags: Optional[List[str]] = None):
-    """Sends a notification to the ntfy.sh topic."""
+    """Sends a notification to the configured ntfy topic when enabled."""
+    if not SCHEDULER_NTFY_URL:
+        logger.info("Skipping ntfy notification because SCHEDULER_NTFY_URL is unset")
+        return
     try:
         headers = {"Title": title}
         if tags:

@@ -23,11 +23,24 @@ class AppUser:
     role: str = "admin"
 
 
+def _allow_insecure_dev_auth_defaults() -> bool:
+    app_env = (os.getenv("APP_ENV") or "").strip().lower()
+    allow_flag = (os.getenv("APP_ALLOW_INSECURE_DEV_AUTH") or "false").strip().lower() == "true"
+    return app_env == "development" and allow_flag
+
+
 def _jwt_secret() -> str:
-    secret = os.getenv("APP_JWT_SECRET") or os.getenv("JWT_SECRET") or "dev-insecure-change-me"
-    if secret == "dev-insecure-change-me":
-        logger.warning("APP_JWT_SECRET is not set; using insecure development secret")
-    return secret
+    secret = os.getenv("APP_JWT_SECRET") or os.getenv("JWT_SECRET")
+    if secret:
+        return secret
+    if _allow_insecure_dev_auth_defaults():
+        logger.warning(
+            "APP_JWT_SECRET is not set; using insecure development secret because APP_ENV=development and APP_ALLOW_INSECURE_DEV_AUTH=true"
+        )
+        return "dev-insecure-change-me"
+    raise RuntimeError(
+        "APP_JWT_SECRET is required unless APP_ENV=development and APP_ALLOW_INSECURE_DEV_AUTH=true"
+    )
 
 
 def _access_ttl_minutes() -> int:
@@ -100,12 +113,21 @@ def _verify_password_hash(password: str, encoded_hash: str) -> bool:
 def verify_app_credentials(username: str, password: str) -> bool:
     expected_username = get_configured_app_username()
     expected_password_hash = _get_password_hash_from_env()
-    expected_password = os.getenv("APP_ADMIN_PASSWORD", "admin123")
+    expected_password = os.getenv("APP_ADMIN_PASSWORD")
     if not hmac.compare_digest(username, expected_username):
         return False
     if expected_password_hash:
         return _verify_password_hash(password, expected_password_hash)
-    return hmac.compare_digest(password, expected_password)
+    if expected_password:
+        return hmac.compare_digest(password, expected_password)
+    if _allow_insecure_dev_auth_defaults():
+        logger.warning(
+            "APP admin credentials are not configured; allowing development fallback password because APP_ENV=development and APP_ALLOW_INSECURE_DEV_AUTH=true"
+        )
+        return hmac.compare_digest(password, "admin123")
+    raise RuntimeError(
+        "APP_ADMIN_PASSWORD or APP_ADMIN_PASSWORD_HASH* is required unless APP_ENV=development and APP_ALLOW_INSECURE_DEV_AUTH=true"
+    )
 
 
 def _encode_token(subject: str, role: str, token_type: str, expires_delta: timedelta) -> str:
