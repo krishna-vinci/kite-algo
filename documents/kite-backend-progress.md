@@ -25,6 +25,12 @@ Do not use this file for frontend work.
 
 ## Newly implemented in current branch
 
+- Prepared the Python algo-worker SDK for public PyPI publication:
+  - enriched `sdk/python/pyproject.toml` with public package metadata, classifiers, SPDX license, and project URLs
+  - removed the duplicated hardcoded SDK version and now resolve `kite_algo_worker.__version__` from installed metadata with a source-tree fallback for local repo imports/tests
+  - added `.github/workflows/publish-kite-algo-worker.yml` so pushing `kite-algo-worker-v*` builds, validates, and publishes the package to PyPI via GitHub trusted publishing
+  - updated SDK, agent-context, and root docs to prefer PyPI install while preserving exact Git-tag installs and documenting separate app-vs-SDK release conventions
+
 - Added Journal V2 production-validation gate infrastructure:
   - created `tests/journaling/test_v2_db_integration.py` for real Postgres schema-idempotency, live/paper isolation, V2 projection replay idempotency, V1/V2 replay preservation, and note revision concurrency validation
   - expanded `tests/test_journal_v2_router.py` with stricter V2 route environment-scope checks for ID-only reads, strategies/unresolved resolution, analytics, and paper/live comparison boundaries

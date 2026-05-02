@@ -67,6 +67,12 @@ Start here:
 - [Algo worker + SDK guide](documents/algo-worker-sdk-guide.md)
 - [Python SDK README](sdk/python/README.md)
 
+Public package install:
+
+```bash
+python3 -m pip install kite-algo-worker==0.6.1
+```
+
 ## Quick start
 
 This README shows the simplest **production-style** startup path.

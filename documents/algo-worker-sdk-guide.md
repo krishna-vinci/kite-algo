@@ -82,14 +82,27 @@ It calls public worker endpoints under `/api/algo-workers/worker/*` and does not
 
 That makes it safer to version, easier to install remotely, and easier for strategy authors to adopt.
 
-Install from a Git tag:
+Install from PyPI:
+
+```bash
+python3 -m pip install kite-algo-worker==0.6.1
+```
+
+Pin to an immutable version in production.
+
+Fallback for an exact monorepo tag before or instead of a PyPI release:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.1#subdirectory=sdk/python"
 ```
 
-Pin to an immutable tag in production. Avoid installing from a moving branch.
+Release conventions:
+
+- app/product tags: `vX.Y.Z`
+- SDK package tags: `kite-algo-worker-vX.Y.Z`
+
+Pushing an SDK tag automatically builds and publishes the package to PyPI through GitHub Actions.
 
 ## Core worker endpoint families
 

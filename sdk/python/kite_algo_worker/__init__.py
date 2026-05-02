@@ -1,5 +1,9 @@
 """Thin Python SDK for external Kite Algo strategy workers."""
 
+from importlib.metadata import PackageNotFoundError, version as _package_version
+from pathlib import Path
+import re
+
 from . import options
 from .async_client import AsyncKiteAlgoWorkerClient
 from .client import AlgoWorkerConfig, KiteAlgoWorkerClient, KiteAlgoWorkerError
@@ -61,7 +65,20 @@ except ModuleNotFoundError as exc:
     def ohlcv_arrays(*_args, **_kwargs):  # type: ignore[no-redef]
         raise ModuleNotFoundError("pandas and numpy are required for kite_algo_worker marketdata helpers")
 
-__version__ = "0.6.0"
+
+def _resolve_version() -> str:
+    try:
+        return _package_version("kite-algo-worker")
+    except PackageNotFoundError:
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        try:
+            match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject.read_text(encoding="utf-8"), re.MULTILINE)
+        except OSError:
+            match = None
+        return match.group(1) if match else "0+unknown"
+
+
+__version__ = _resolve_version()
 
 __all__ = [
     "__version__",
