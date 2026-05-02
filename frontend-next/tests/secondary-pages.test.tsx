@@ -1,8 +1,6 @@
 import { screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import ChartsPage from "@/app/(app)/charts/page";
-import CustomDisplayPage from "@/app/(app)/custom-display/page";
 import PaperPage from "@/app/(app)/paper/page";
 import SettingsPage from "@/app/(app)/settings/page";
 import { renderWithQueryClient } from "@/tests/render-with-query-client";
@@ -77,19 +75,4 @@ describe("secondary reference pages", () => {
     expect(screen.getByRole("link", { name: /configuration apis/i })).toHaveAttribute("href", "#configuration-apis");
   });
 
-  it("renders the charts placeholder", () => {
-    renderWithQueryClient(<ChartsPage />);
-
-    expect(screen.getByRole("heading", { name: /charts/i })).toBeInTheDocument();
-    expect(screen.getByText(/charting will return as a dedicated live module/i)).toBeInTheDocument();
-    expect(screen.getByText(/not live yet/i)).toBeInTheDocument();
-  });
-
-  it("renders the custom display composition page", () => {
-    renderWithQueryClient(<CustomDisplayPage />);
-
-    expect(screen.getByRole("heading", { name: /custom display lab/i })).toBeInTheDocument();
-    expect(screen.getByText(/design lab, not a live market surface/i)).toBeInTheDocument();
-    expect(screen.getByText(/not live yet/i)).toBeInTheDocument();
-  });
 });

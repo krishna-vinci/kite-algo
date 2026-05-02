@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from kiteconnect import KiteConnect
 from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from .redis_events import get_redis, publish_event, pubsub_iter
 from .instruments_repository import InstrumentsRepository
@@ -293,9 +294,16 @@ class Trade(BaseModel):
     product: str
     average_price: float
     quantity: int
-    order_timestamp: datetime
-    exchange_timestamp: datetime
-    fill_timestamp: datetime
+    order_timestamp: str | datetime | None = None
+    exchange_timestamp: str | datetime | None = None
+    fill_timestamp: str | datetime | None = None
+
+    @field_validator("order_timestamp", "exchange_timestamp", "fill_timestamp", mode="before")
+    @classmethod
+    def _coerce_trade_timestamp(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
 
 class BasketOrderRequest(BaseModel):
     """Request model for placing multiple orders as a basket"""
@@ -1038,7 +1046,7 @@ class OrdersService:
         return BasketOrderResponse(status=final_status, results=results, errors=errors)
 
 # ---------------- FastAPI Router ----------------
-router = APIRouter(tags=["orders"])
+router = APIRouter(tags=["Orders"])
 service = OrdersService()
 
 @router.post("/orders", response_model=PlaceOrderResponse, description="Place a new order.")
@@ -1759,9 +1767,6 @@ async def delete_gtt_trigger(
 # ═══════════════════════════════════════════════════════════════════════════════
 # KITE CONNECT WEBHOOK / POSTBACK API
 # ═══════════════════════════════════════════════════════════════════════════════
-
-import hashlib
-from sqlalchemy import text
 
 # API Secret for checksum validation
 API_SECRET = os.getenv("KITE_API_SECRET")

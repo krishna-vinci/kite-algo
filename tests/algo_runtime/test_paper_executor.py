@@ -616,6 +616,38 @@ class PaperExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order.status, PaperOrderStatus.REJECTED)
         self.assertEqual(len(self.repository.trades), 0)
 
+    async def test_blocked_funds_clears_after_full_position_exit(self):
+        await self.service.place_order(
+            account_scope="kite:test-paper",
+            order_payload={
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "transaction_type": "BUY",
+                "variety": "regular",
+                "product": "MIS",
+                "order_type": "MARKET",
+                "quantity": 2,
+            },
+            attribution={"strategy_run_id": "run-blocked-clear", "strategy_tag": "blocked_clear"},
+        )
+        await self.service.place_order(
+            account_scope="kite:test-paper",
+            order_payload={
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "transaction_type": "SELL",
+                "variety": "regular",
+                "product": "MIS",
+                "order_type": "MARKET",
+                "quantity": 2,
+            },
+            attribution={"strategy_run_id": "run-blocked-clear", "strategy_tag": "blocked_clear"},
+        )
+
+        account = await self.service.get_account_summary("kite:test-paper")
+        self.assertEqual(account["open_position_count"], 0)
+        self.assertAlmostEqual(account["blocked_funds"], 0.0, places=6)
+
     async def test_all_or_none_rolls_back_when_later_leg_fails_after_prior_fill(self):
         service = PaperTradingService(
             repository=self.repository,
@@ -657,3 +689,63 @@ class PaperExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.repository.trades), 0)
         self.assertEqual(len(self.repository.positions), 0)
         self.assertEqual(len(self.repository.fund_ledger), 0)
+
+    async def test_strategy_exit_prefers_attributed_lots_for_same_symbol(self):
+        await self.service.place_order(
+            account_scope="kite:test-paper",
+            order_payload={
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "transaction_type": "BUY",
+                "variety": "regular",
+                "product": "MIS",
+                "order_type": "MARKET",
+                "quantity": 1,
+            },
+            attribution={"strategy_run_id": "run-a", "strategy_tag": "alpha"},
+        )
+        await self.service.place_order(
+            account_scope="kite:test-paper",
+            order_payload={
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "transaction_type": "BUY",
+                "variety": "regular",
+                "product": "MIS",
+                "order_type": "MARKET",
+                "quantity": 1,
+            },
+            attribution={"strategy_run_id": "run-b", "strategy_tag": "beta"},
+        )
+
+        result = await self.service.exit_strategy(account_scope="kite:test-paper", strategy_id="run-a")
+
+        self.assertEqual(result["status"], "success")
+        positions = await self.service.list_positions("kite:test-paper", only_open=True)
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(int(positions[0].net_quantity), 1)
+        open_lots = self.repository.list_open_position_lots("kite:test-paper", instrument_token=256265, product="MIS")
+        self.assertEqual(len(open_lots), 1)
+        self.assertEqual(str(open_lots[0].metadata.get("strategy_run_id")), "run-b")
+
+    async def test_strategy_exit_blocks_on_legacy_unresolved_lots(self):
+        await self.service.place_order(
+            account_scope="kite:test-paper",
+            order_payload={
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "transaction_type": "BUY",
+                "variety": "regular",
+                "product": "MIS",
+                "order_type": "MARKET",
+                "quantity": 1,
+            },
+            attribution={"strategy_run_id": "run-legacy", "strategy_tag": "legacy"},
+        )
+        for lot in self.repository.position_lots.values():
+            lot.metadata = {}
+
+        result = await self.service.exit_strategy(account_scope="kite:test-paper", strategy_id="run-legacy")
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(any("unresolved_lots" in reason for reason in result.get("stale_reasons", [])))

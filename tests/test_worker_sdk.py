@@ -1,5 +1,7 @@
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,20 +16,45 @@ if str(SDK_ROOT) not in sys.path:
 
 from kite_algo_worker import (  # noqa: E402
     AlgoWorkerConfig,
+    BrokerValidationError,
     BackendProtection,
     BasketProtection,
+    CostContract,
+    WorkerCandle,
+    WorkerHistoricalCandles,
+    WorkerFundsSegment,
+    WorkerFundsSnapshot,
+    OrderPreview,
     KiteAlgoWorkerClient,
     KiteAlgoWorkerError,
+    PreviewPayload,
     OperationalProtection,
     ProtectedPosition,
+    WorkerOrderSnapshot,
+    RunProtectionState,
+    WorkerOrderResult,
+    WorkerRunPnlLeg,
+    WorkerRunPnlSnapshot,
+    WorkerTradeSnapshot,
+    amo_limit_order,
     equity_market_order,
+    ensure_run,
     limit_order,
     market_order,
+    live_equity_market_order,
     option_market_order,
+    preview_then_place_order,
     sl_m_order,
     sl_order,
+    wait_for_fresh_candle,
+    wait_for_history,
+    wait_for_quotes,
+    wait_for_terminal_order_state,
+    warmup_history,
 )
+import kite_algo_worker as kite_algo_worker_pkg  # noqa: E402
 from broker_api.kite_orders import PlaceOrderRequest  # noqa: E402
+from scripts.sdk_worker_certification import main as sdk_worker_certification_main  # noqa: E402
 
 
 class FakeResponse:
@@ -386,6 +413,130 @@ def test_stream_candles_parses_sse_events_and_closes_response(monkeypatch):
     assert response.closed is True
 
 
+def test_sdk_certification_reports_preview_and_stream_capabilities(monkeypatch, capsys):
+    fake_client = SimpleNamespace(
+        health=lambda: {"status": "ok"},
+        get_funds=lambda **kwargs: {"account_scope": "kite:paper-a"},
+        get_quotes=lambda *args, **kwargs: {"quotes": [{"symbol": "NSE:NIFTY 50"}]},
+        get_candles_snapshot=lambda *args, **kwargs: WorkerHistoricalCandles(
+            symbol="NSE:NIFTY 50",
+            interval="5minute",
+            source="runtime",
+            current=WorkerCandle(
+                ts="2026-04-28T09:20:00+05:30",
+                open=100,
+                high=101,
+                low=99,
+                close=100.5,
+                volume=1200,
+                is_complete=False,
+            ),
+            candles=[
+                WorkerCandle(
+                    ts="2026-04-28T09:15:00+05:30",
+                    open=99,
+                    high=100,
+                    low=98.5,
+                    close=99.8,
+                    volume=1000,
+                    is_complete=True,
+                )
+            ],
+            is_stale=False,
+        ),
+        get_historical_candles=lambda *args, **kwargs: {"candles": [{"ts": "2026-04-28T09:15:00+05:30"}]},
+        get_historical_candles_snapshot=lambda *args, **kwargs: WorkerHistoricalCandles(
+            symbol="NSE:NIFTY 50",
+            timeframe="day",
+            candles=[
+                WorkerCandle(
+                    ts="2026-04-27T15:30:00+05:30",
+                    open=99,
+                    high=102,
+                    low=98,
+                    close=101,
+                    volume=5000,
+                    is_complete=True,
+                )
+            ],
+        ),
+        preview_order=lambda *args, **kwargs: {"preview": {"intent_type": "place_order"}},
+    )
+
+    monkeypatch.setattr("scripts.sdk_worker_certification.KiteAlgoWorkerClient", lambda config: fake_client)
+    monkeypatch.setenv("KITE_ALGO_WORKER_TOKEN", "kwa_test")
+    monkeypatch.setenv("KITE_ALGO_RUN_ID", "run-1")
+    monkeypatch.setenv("KITE_ALGO_ACCOUNT_SCOPE", "kite:paper-a")
+    monkeypatch.setenv("KITE_ALGO_SYMBOL", "NSE:NIFTY 50")
+    monkeypatch.setattr(sys, "argv", ["sdk_worker_certification.py", "--mode", "live"])
+
+    assert sdk_worker_certification_main() == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["preview"] == {"preview": {"intent_type": "place_order"}}
+    assert report["capabilities"]["async_client"] is True
+    assert report["capabilities"]["websocket_client"] is True
+    assert report["capabilities"]["preview_order"] is True
+    assert report["capabilities"]["list_orders"] is True
+    assert report["capabilities"]["wait_for_history"] is True
+    assert report["capabilities"]["typed_marketdata"] == {
+        "available": True,
+        "symbol": "NSE:NIFTY 50",
+        "typed_snapshot": True,
+        "snapshot_type": "WorkerHistoricalCandles",
+        "current_type": "WorkerCandle",
+        "candle_count": 1,
+        "is_stale": False,
+        "source": "runtime",
+    }
+    assert report["capabilities"]["recovery_helpers"] == {
+        "wait_for_history": True,
+        "warmup_history": True,
+        "symbol": "NSE:NIFTY 50",
+        "history_ready": True,
+        "history_candle_count": 1,
+        "warmup_ready": True,
+        "warmup_candle_count": 1,
+        "warmup_snapshot_type": "WorkerHistoricalCandles",
+    }
+    websocket_health = report["capabilities"]["websocket_health"]
+    assert websocket_health["available"] is True
+    assert websocket_health["type"] == "StreamHealth"
+    assert set(websocket_health["reconnect_metadata_fields"]) == {
+        "reconnect_count",
+        "last_reconnect_at",
+        "subscription_replayed",
+        "subscription_replayed_at",
+        "is_stale",
+        "last_error",
+        "next_reconnect_delay_seconds",
+    }
+    assert websocket_health["sample"]["stream_name"] == "ticks"
+    indicators = report["capabilities"]["indicators"]
+    assert indicators["available"] is True
+    assert set(indicators["representative"].keys()) == {"sma_last", "ema_last", "rsi_last", "atr_last"}
+    assert indicators["representative"]["sma_last"] is not None
+
+
+def test_marketdata_helpers_fallback_cleanly_without_optional_dependencies():
+    if getattr(kite_algo_worker_pkg, "_MARKETDATA_AVAILABLE", True):
+        pytest.skip("optional marketdata dependencies are installed in this environment")
+
+    with pytest.raises(ModuleNotFoundError, match="pandas and numpy are required"):
+        kite_algo_worker_pkg.candles_to_df([])
+
+
+def test_indicator_helpers_fallback_cleanly_without_optional_dependencies():
+    if getattr(kite_algo_worker_pkg, "NUMBA_AVAILABLE", False) or getattr(kite_algo_worker_pkg, "_MARKETDATA_AVAILABLE", False):
+        # Environment-specific optional deps may be present in some runners.
+        pass
+
+    try:
+        kite_algo_worker_pkg.ta.sma([1, 2, 3], 2)
+    except ModuleNotFoundError as exc:
+        assert "pandas and numpy are required" in str(exc)
+
+
 def test_stream_run_pnl_closes_response_on_non_2xx(monkeypatch):
     response = FakeResponse(status_code=503, payload={"detail": "stream unavailable"})
 
@@ -500,3 +651,392 @@ def test_order_builders_produce_valid_broker_order_payloads():
     for payload in [equity, option, limit, stop_limit, slm]:
         validated = PlaceOrderRequest.model_validate(payload)
         assert validated.tradingsymbol == payload["tradingsymbol"]
+
+
+def test_typed_models_and_exception_hierarchy():
+    preview = OrderPreview.model_validate(
+        {
+            "strategy_run_id": "run-1",
+            "mode": "live",
+            "preview": {
+                "intent_type": "place_order",
+                "cost_contract": {"margin_required": "10.00", "charges_estimate": "2.50"},
+            },
+        }
+    )
+    assert preview.preview.cost_contract.margin_required == "10.00"
+    assert preview.preview.cost_contract.charges_estimate == "2.50"
+
+    order_result = WorkerOrderResult.model_validate({"mode": "paper", "result": {"status": "filled", "order": {"order_id": "PAPER-1"}}})
+    assert order_result.result["order"]["order_id"].startswith("PAPER-")
+
+    state = RunProtectionState.model_validate({"status": "active", "generation": 2})
+    assert state.status == "active"
+    assert state.generation == 2
+
+    err = BrokerValidationError("bad order", status_code=422, response_body={"detail": "bad order"})
+    assert isinstance(err, KiteAlgoWorkerError)
+    assert err.status_code == 422
+
+
+def test_funds_and_pnl_models_validate_nested_payloads():
+    funds = WorkerFundsSnapshot.model_validate(
+        {
+            "account_scope": "kite:paper-a",
+            "mode": "paper",
+            "source": "paper_runtime",
+            "segments": {"equity": {"available_cash": 82000, "net": 100000}},
+            "allocation": {"usable_equity_cash": 82000},
+            "updated_at": "2026-04-28T09:15:00Z",
+        }
+    )
+    pnl = WorkerRunPnlSnapshot.model_validate(
+        {
+            "strategy_run_id": "run-1",
+            "execution_mode": "paper",
+            "status": "open",
+            "totals": {"net_pnl": 12.5},
+            "legs": [{"tradingsymbol": "INFY", "net_pnl": 12.5}],
+            "updated_at": "2026-04-28T09:15:00Z",
+        }
+    )
+
+    assert isinstance(funds.segments["equity"], WorkerFundsSegment)
+    assert funds.segments["equity"].available_cash == 82000.0
+    assert isinstance(pnl.legs[0], WorkerRunPnlLeg)
+    assert pnl.legs[0].tradingsymbol == "INFY"
+
+
+def test_get_typed_snapshots_validate_payloads(monkeypatch):
+    def fake_request(self, method, url, **kwargs):
+        if url.endswith("/worker/funds"):
+            return FakeResponse(
+                payload={
+                    "account_scope": "kite:paper-a",
+                    "mode": "paper",
+                    "source": "paper_runtime",
+                    "segments": {"equity": {"available_cash": "82000", "net": "100000"}},
+                    "allocation": {"usable_equity_cash": 82000},
+                    "updated_at": "2026-04-28T09:15:00Z",
+                }
+            )
+        if url.endswith("/worker/runs/run-1/pnl"):
+            return FakeResponse(
+                payload={
+                    "strategy_run_id": "run-1",
+                    "execution_mode": "paper",
+                    "status": "open",
+                    "totals": {"net_pnl": "12.5"},
+                    "legs": [{"tradingsymbol": "INFY", "net_pnl": "12.5"}],
+                    "updated_at": "2026-04-28T09:15:00Z",
+                }
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    funds = client().get_funds_snapshot(mode="paper", account_scope="kite:paper-a")
+    pnl = client().get_run_pnl_snapshot("run-1")
+
+    assert funds.segments["equity"].available_cash == 82000.0
+    assert pnl.totals.net_pnl == 12.5
+
+
+def test_get_candles_snapshot_returns_typed_models(monkeypatch):
+    def fake_request(self, method, url, **kwargs):
+        if url.endswith("/worker/market/candles"):
+            return FakeResponse(
+                payload={
+                    "symbol": "NSE:SBIN",
+                    "instrument_token": 123,
+                    "interval": "5minute",
+                    "current": {
+                        "ts": "2026-04-28T09:20:00+05:30",
+                        "open": 100,
+                        "high": 101,
+                        "low": 99,
+                        "close": 100.5,
+                        "volume": 1200,
+                        "oi": None,
+                        "is_complete": False,
+                    },
+                    "candles": [
+                        {
+                            "ts": "2026-04-28T09:15:00+05:30",
+                            "open": 99,
+                            "high": 100,
+                            "low": 98.5,
+                            "close": 99.8,
+                            "volume": 1000,
+                            "oi": None,
+                            "is_complete": True,
+                        }
+                    ],
+                    "is_stale": False,
+                    "source": "runtime",
+                }
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    snapshot = client().get_candles_snapshot("NSE:SBIN")
+
+    assert isinstance(snapshot, WorkerHistoricalCandles)
+    assert isinstance(snapshot.current, WorkerCandle)
+    assert isinstance(snapshot.candles[0], WorkerCandle)
+    assert snapshot.current.close == 100.5
+    assert snapshot.candles[0].is_complete is True
+    assert snapshot.model_dump()["source"] == "runtime"
+
+
+def test_get_historical_candles_snapshot_maps_from_and_to(monkeypatch):
+    def fake_request(self, method, url, **kwargs):
+        if url.endswith("/worker/market/history"):
+            return FakeResponse(
+                payload={
+                    "symbol": "NSE:SBIN",
+                    "instrument_token": 123,
+                    "timeframe": "day",
+                    "interval": "day",
+                    "from": "2026-01-01T09:15:00+05:30",
+                    "to": "2026-01-02T15:30:00+05:30",
+                    "count": 1,
+                    "source": "historical_db",
+                    "ingestion": {"status": "disabled"},
+                    "candles": [
+                        {
+                            "ts": "2026-01-01T15:30:00+05:30",
+                            "open": 99,
+                            "high": 100,
+                            "low": 98,
+                            "close": 99.5,
+                            "volume": 500,
+                            "oi": 12,
+                            "is_complete": True,
+                        }
+                    ],
+                }
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    snapshot = client().get_historical_candles_snapshot("NSE:SBIN", timeframe="day")
+
+    assert isinstance(snapshot, WorkerHistoricalCandles)
+    assert snapshot.from_ts == "2026-01-01T09:15:00+05:30"
+    assert snapshot.to_ts == "2026-01-02T15:30:00+05:30"
+    assert snapshot.candles[0].close == 99.5
+    assert snapshot.model_dump()["from"] == "2026-01-01T09:15:00+05:30"
+    assert snapshot.model_dump()["to"] == "2026-01-02T15:30:00+05:30"
+
+
+def test_get_orders_and_order_snapshot_return_typed_models(monkeypatch):
+    def fake_request(self, method, url, **kwargs):
+        if url.endswith("/worker/orders"):
+            return FakeResponse(
+                payload={
+                    "strategy_run_id": "run-1",
+                    "orders": [
+                        {
+                            "order_id": "o1",
+                            "status": "COMPLETE",
+                            "tradingsymbol": "INFY",
+                            "quantity": 2,
+                            "price": 10.5,
+                            "meta": {"source": "worker"},
+                        }
+                    ],
+                }
+            )
+        if url.endswith("/worker/orders/o1"):
+            return FakeResponse(
+                payload={
+                    "strategy_run_id": "run-1",
+                    "order": {
+                        "order_id": "o1",
+                        "status": "COMPLETE",
+                        "tradingsymbol": "INFY",
+                        "quantity": 2,
+                        "price": 10.5,
+                        "meta": {"source": "worker"},
+                    },
+                }
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    orders_snapshot = client().get_orders_snapshot("run-1")
+    order_snapshot = client().get_order_snapshot("run-1", "o1")
+
+    assert isinstance(orders_snapshot.orders[0], WorkerOrderSnapshot)
+    assert orders_snapshot.orders[0].order_id == "o1"
+    assert orders_snapshot.orders[0].model_dump()["meta"] == {"source": "worker"}
+    assert isinstance(order_snapshot, WorkerOrderSnapshot)
+    assert order_snapshot.price == 10.5
+
+
+def test_raw_model_dump_preserves_unknown_none_fields():
+    snapshot = WorkerOrderSnapshot.model_validate(
+        {
+            "order_id": "o1",
+            "status": "COMPLETE",
+            "meta": None,
+        }
+    )
+
+    assert "meta" in snapshot.model_dump()
+    assert snapshot.model_dump()["meta"] is None
+
+
+def test_get_trades_snapshot_returns_typed_models(monkeypatch):
+    def fake_request(self, method, url, **kwargs):
+        if url.endswith("/worker/trades"):
+            return FakeResponse(
+                payload={
+                    "strategy_run_id": "run-1",
+                    "trades": [
+                        {
+                            "trade_id": "abc",
+                            "order_id": "o1",
+                            "quantity": 2,
+                            "average_price": 10.5,
+                            "meta": {"fill": "worker"},
+                        }
+                    ],
+                }
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    trades_snapshot = client().get_trades_snapshot("run-1")
+
+    assert isinstance(trades_snapshot.trades[0], WorkerTradeSnapshot)
+    assert trades_snapshot.trades[0].trade_id == "abc"
+    assert trades_snapshot.trades[0].model_dump()["meta"] == {"fill": "worker"}
+
+
+def test_wait_for_quotes_polls_until_quotes_arrive(monkeypatch):
+    responses = [{"quotes": []}, {"quotes": [{"symbol": "NSE:INFY"}]}]
+    monkeypatch.setattr(KiteAlgoWorkerClient, "get_quotes", lambda *args, **kwargs: responses.pop(0))
+
+    result = wait_for_quotes(client(), ["NSE:INFY"], attempts=2, sleep_seconds=0)
+
+    assert result["quotes"][0]["symbol"] == "NSE:INFY"
+
+
+def test_wait_for_terminal_order_state_polls_until_terminal(monkeypatch):
+    responses = [
+        WorkerOrderSnapshot(order_id="o1", status="OPEN"),
+        WorkerOrderSnapshot(order_id="o1", status="COMPLETE", filled_quantity=1),
+    ]
+    monkeypatch.setattr(KiteAlgoWorkerClient, "get_order_snapshot", lambda *args, **kwargs: responses.pop(0))
+
+    result = wait_for_terminal_order_state(client(), "run-1", "o1", attempts=2, sleep_seconds=0)
+
+    assert isinstance(result, WorkerOrderSnapshot)
+    assert result.status == "COMPLETE"
+
+
+def test_wait_for_fresh_candle_returns_complete_candle(monkeypatch):
+    responses = [
+        WorkerHistoricalCandles(current=WorkerCandle(ts="2026-04-28T09:15:00+05:30", open=100, high=101, low=99, close=100, volume=10, is_complete=False)),
+        WorkerHistoricalCandles(current=WorkerCandle(ts="2026-04-28T09:20:00+05:30", open=101, high=102, low=100, close=101, volume=11, is_complete=True)),
+    ]
+    monkeypatch.setattr(KiteAlgoWorkerClient, "get_candles_snapshot", lambda *args, **kwargs: responses.pop(0))
+
+    result = wait_for_fresh_candle(client(), "NSE:INFY", attempts=2, sleep_seconds=0)
+
+    assert isinstance(result, WorkerCandle)
+    assert result.is_complete is True
+    assert result.close == 101.0
+
+
+def test_warmup_history_returns_typed_snapshot_after_min_candles(monkeypatch):
+    responses = [
+        WorkerHistoricalCandles(candles=[WorkerCandle(ts="2026-04-28T09:00:00+05:30", open=100, high=101, low=99, close=100, volume=10)]),
+        WorkerHistoricalCandles(
+            candles=[
+                WorkerCandle(ts="2026-04-28T09:00:00+05:30", open=100, high=101, low=99, close=100, volume=10),
+                WorkerCandle(ts="2026-04-28T09:05:00+05:30", open=100, high=102, low=99, close=101, volume=12),
+            ]
+        ),
+    ]
+    monkeypatch.setattr(KiteAlgoWorkerClient, "get_historical_candles_snapshot", lambda *args, **kwargs: responses.pop(0))
+
+    result = warmup_history(client(), "NSE:INFY", timeframe="5minute", min_candles=2, attempts=2, sleep_seconds=0)
+
+    assert isinstance(result, WorkerHistoricalCandles)
+    assert len(result.candles) >= 2
+
+
+def test_preview_then_place_order_uses_preview_before_place(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        KiteAlgoWorkerClient,
+        "preview_order",
+        lambda self, run_id, order, metadata=None: calls.append("preview") or {"preview": {"intent_type": "place_order"}},
+    )
+    monkeypatch.setattr(
+        KiteAlgoWorkerClient,
+        "place_order",
+        lambda self, run_id, order, key, metadata=None: calls.append("place") or {"status": "accepted"},
+    )
+
+    result = preview_then_place_order(client(), "run-1", {"exchange": "NSE", "tradingsymbol": "INFY"}, idempotency_key="run-1:entry:1")
+
+    assert result["status"] == "accepted"
+    assert calls == ["preview", "place"]
+
+
+def test_sync_client_order_lifecycle_and_preview_endpoints(captured_requests):
+    client().list_orders("run-1")
+    client().list_trades("run-1")
+    client().cancel_order("run-1", "order-1")
+    client().modify_order("run-1", "order-1", {"quantity": 2}, variety="amo")
+    client().preview_order("run-1", market_order("NSE", "INFY", "BUY", "CNC", 1))
+    client().preview_basket("run-1", [market_order("NSE", "INFY", "BUY", "CNC", 1)], metadata={"source": "test"}, all_or_none=True)
+
+    assert captured_requests[0]["kwargs"]["params"] == {"strategy_run_id": "run-1"}
+    assert captured_requests[1]["kwargs"]["params"] == {"strategy_run_id": "run-1"}
+    assert captured_requests[2]["kwargs"]["json"] == {"strategy_run_id": "run-1", "variety": "regular"}
+    assert captured_requests[3]["kwargs"]["json"] == {"strategy_run_id": "run-1", "variety": "amo", "quantity": 2}
+    assert captured_requests[4]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/preview/order"
+    assert captured_requests[5]["kwargs"]["json"] == {
+        "orders": [market_order("NSE", "INFY", "BUY", "CNC", 1)],
+        "metadata": {"source": "test"},
+        "all_or_none": True,
+    }
+
+
+def test_get_run_protection_state_returns_runtime_state_fragment(monkeypatch):
+    monkeypatch.setattr(KiteAlgoWorkerClient, "get_run", lambda self, run_id: {"runtime_state": {"backend_protection_state": {"status": "active", "generation": 2}}})
+    assert client().get_run_protection_state("run-1") == {"status": "active", "generation": 2}
+
+
+def test_helper_layer_builds_safe_orders_and_recovers_runs(monkeypatch):
+    order = live_equity_market_order("IDEA", "BUY", 1, product="MIS")
+    amo = amo_limit_order("NSE", "IDEA", "BUY", "MIS", 1, price=9.8)
+    assert order["market_protection"] == -1
+    assert order["exchange"] == "NSE"
+    assert amo["variety"] == "amo"
+    assert amo["price"] == 9.8
+
+    responses = [
+        {"candles": []},
+        {"candles": [{"ts": "2026-04-28T00:00:00Z"}]},
+    ]
+    monkeypatch.setattr(KiteAlgoWorkerClient, "get_historical_candles", lambda *args, **kwargs: responses.pop(0))
+    assert wait_for_history(client(), "NSE:IDEA", timeframe="day", attempts=2, sleep_seconds=0)["candles"]
+
+    def _missing_run(self, run_id):
+        raise KiteAlgoWorkerError("missing", status_code=404, response_body={"detail": "missing"})
+
+    monkeypatch.setattr(KiteAlgoWorkerClient, "get_run", _missing_run)
+    monkeypatch.setattr(KiteAlgoWorkerClient, "create_run", lambda self, **kwargs: {"created": kwargs})
+    created = ensure_run(client(), strategy_run_id="run-2", template_id="mean-reversion", account_scope="kite:paper-a", execution_mode="paper", metadata={"x": 1})
+    assert created["created"]["strategy_run_id"] == "run-2"

@@ -4,13 +4,21 @@ import { AppShell } from "@/components/app-shell";
 import { fetchRuntimeStatus } from "@/lib/options/api";
 import { navigation } from "@/lib/navigation";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useEffect, type ReactNode } from "react";
+import { Suspense, useEffect, type ReactNode } from "react";
 
 export default function AppLayout({
   children,
 }: Readonly<{
   children: ReactNode;
 }>) {
+  return (
+    <Suspense fallback={<AppShell navigation={navigation} activeHref="/dashboard"><div className="p-4 text-sm text-muted-foreground">Loading workspace…</div></AppShell>}>
+      <AppLayoutContent>{children}</AppLayoutContent>
+    </Suspense>
+  );
+}
+
+function AppLayoutContent({ children }: Readonly<{ children: ReactNode }>) {
   const pathname = usePathname();
   const router = useRouter();
   const searchParams = useSearchParams();

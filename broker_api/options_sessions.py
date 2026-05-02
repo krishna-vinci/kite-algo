@@ -12,6 +12,15 @@ from broker_api.options_greeks import (
     implied_vol_from_price_black76,
 )
 from broker_api.redis_events import get_redis, publish_event
+from options.market.redis_cache import (
+    OPTION_SNAPSHOT_TTL_SECONDS,
+    option_snapshot_v1_key,
+    option_snapshot_v1_updates_channel,
+    serialize_option_snapshot_v1,
+)
+from options.market.analytics.max_pain import compute_bounded_max_pain
+from options.market.analytics.pcr import compute_put_call_ratio
+from options.market.snapshots import build_bounded_strike_window
 
 
 # Configure logging
@@ -269,6 +278,13 @@ class OptionsSession:
         """
         The synchronous, CPU-bound part of the computation. This method is
         executed in a separate thread pool to avoid blocking the event loop.
+
+        Compatibility/canonical ownership note:
+        - This session computation remains the current source of truth for
+          synthetic-forward and Black-76-derived option Greeks/IV snapshots.
+        - Canonical `/api/options/*` market routes expose these computed
+          snapshots via `OptionsMarketService`; they do not re-compute Greeks
+          independently.
         """
         # 1. Get spot LTP. If unavailable, we can still proceed but all
         #    expiry-level calculations will be skipped.
@@ -305,10 +321,17 @@ class OptionsSession:
                     continue
 
                 T = self._time_to_expiry(expiry)
+                # NOTE: Synthetic forward (F = S + C_atm - P_atm) computed here
+                # remains the session-level source feeding canonical market
+                # snapshots and worker options views.
                 forward, ce_atm_ltp, pe_atm_ltp = self._compute_forward(expiry, atm_strike, spot_ltp)
                 sigma_expiry = self._compute_sigma(expiry, atm_strike, forward, T, ce_atm_ltp, pe_atm_ltp)
 
-                window_strikes = self.manager.instrument_repo.window_strikes(strikes, atm_strike, self.window_size)
+                window_strikes = build_bounded_strike_window(
+                    strikes=strikes,
+                    atm_strike=atm_strike,
+                    window=self.window_size,
+                )
                 
                 strikes_key = tuple(sorted(window_strikes))
                 cache_key = f"instruments:{self.underlying}:{expiry.isoformat()}:{hash(strikes_key)}"
@@ -323,6 +346,7 @@ class OptionsSession:
                     new_desired_tokens.add(inst["instrument_token"])
 
                 # Vectorized computation
+                # Greeks are Black-76 on the synthetic forward/sigma above.
                 greeks_ce, greeks_pe = None, None
                 if forward and T > MIN_T and sigma_expiry:
                     try:
@@ -379,12 +403,17 @@ class OptionsSession:
                         }
                     rows.append(row)
 
+                pcr = compute_put_call_ratio(rows)
+                max_pain = compute_bounded_max_pain(rows)
+
                 per_expiry_data[expiry_str] = {
                     "forward": forward,
                     "sigma_expiry": sigma_expiry,
                     "atm_strike": atm_strike,
                     "strikes": window_strikes,
                     "rows": rows,
+                    "pcr": pcr,
+                    "max_pain": max_pain,
                 }
         else:
             # --- Legacy Path ---
@@ -409,7 +438,9 @@ class OptionsSession:
                 # Compute time to expiry
                 T = self._time_to_expiry(expiry)
 
-                # Strictly compute synthetic forward and sigma
+                # Strictly compute synthetic forward and sigma.
+                # This remains the canonical session math source consumed by
+                # canonical options API snapshots.
                 forward, ce_atm_ltp, pe_atm_ltp = self._compute_forward(
                     expiry, atm_strike, spot_ltp
                 )
@@ -418,8 +449,10 @@ class OptionsSession:
                 )
 
                 # Build window of strikes and fetch instruments
-                window_strikes = self.manager.instrument_repo.window_strikes(
-                    strikes, atm_strike, self.window_size
+                window_strikes = build_bounded_strike_window(
+                    strikes=strikes,
+                    atm_strike=atm_strike,
+                    window=self.window_size,
                 )
                 
                 # Use a cache key for the instruments of the current expiry window
@@ -461,6 +494,8 @@ class OptionsSession:
                         greeks = {}
                         iv = None
                         if forward and T > MIN_T and sigma_expiry:
+                            # Greeks are reported from Black-76 using the
+                            # synthetic forward-derived expiry sigma.
                             iv = sigma_expiry
                             greeks_unit = black76_greeks(
                                 option_type, forward, strike, T, sigma_expiry
@@ -503,12 +538,17 @@ class OptionsSession:
                         }
                     rows.append(row)
 
+                pcr = compute_put_call_ratio(rows)
+                max_pain = compute_bounded_max_pain(rows)
+
                 per_expiry_data[expiry_str] = {
                     "forward": forward,
                     "sigma_expiry": sigma_expiry,
                     "atm_strike": atm_strike,
                     "strikes": window_strikes,
                     "rows": rows,
+                    "pcr": pcr,
+                    "max_pain": max_pain,
                 }
 
         return per_expiry_data, new_desired_tokens, spot_ltp
@@ -519,6 +559,11 @@ class OptionsSession:
         """
         Computes the synthetic forward price: F = Spot + Call_ATM - Put_ATM.
         Returns None for the forward if either ATM option LTP is missing.
+
+        Important:
+        - This synthetic-forward computation is intentionally retained in
+          `broker_api/options_sessions.py` as the active backend computation
+          source for options market snapshots consumed by canonical routes/SDK.
         """
         repo = self.manager.instrument_repo
         atm_insts = repo.get_option_instruments_for_strikes(
@@ -566,6 +611,9 @@ class OptionsSession:
         """
         Computes the implied volatility for the ATM strike. Returns None if inputs
         are missing or the solver fails, with no fallback.
+
+        Sigma is solved from synthetic-forward context and then reused by
+        Black-76 Greeks generation in this session cycle.
         """
         if (
             forward is None
@@ -679,9 +727,16 @@ class OptionsSessionManager:
         # Publish to Redis (best-effort)
         try:
             redis_client = get_redis()
+            v1_snapshot_key = option_snapshot_v1_key(session.underlying)
+            v1_pub_channel = option_snapshot_v1_updates_channel(session.underlying)
             snapshot_key = f"options:snapshot:{session.underlying}"
             pub_channel = f"options:updates:{session.underlying}"
-            await redis_client.set(snapshot_key, str(session.snapshot), ex=120)
+
+            v1_payload_json = serialize_option_snapshot_v1(session.snapshot, session.underlying)
+            await redis_client.set(v1_snapshot_key, v1_payload_json, ex=OPTION_SNAPSHOT_TTL_SECONDS)
+            await redis_client.publish(v1_pub_channel, v1_payload_json)
+
+            await redis_client.set(snapshot_key, str(session.snapshot), ex=OPTION_SNAPSHOT_TTL_SECONDS)
             await publish_event(pub_channel, session.snapshot)
         except Exception as e:
             logger.warning(f"Redis operation failed: {e}")

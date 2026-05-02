@@ -11,8 +11,10 @@ OPENAPI_TAGS = [
     {"name": "Options", "description": "Options session and chain endpoints."},
     {"name": "Candles", "description": "Historical candle query and watchlist APIs."},
     {"name": "Performance", "description": "Index and portfolio performance APIs."},
+    {"name": "Mutual Funds", "description": "Mutual fund orders, SIPs, holdings, and instrument APIs."},
     {"name": "Momentum", "description": "Momentum strategy endpoints."},
-    {"name": "Alerts", "description": "Price alert CRUD and event streams."},
+    {"name": "Algo Workers", "description": "Worker auth, run lifecycle, market-data, orders, and protection endpoints."},
+    {"name": "Control Plane", "description": "Strategy-level exits, cancels, reconciliations, and control snapshots."},
     {"name": "Strategies", "description": "Protected strategy and index stoploss endpoints."},
     {"name": "Trading Journal", "description": "Backend-only trading journal runs, source links, decision events, and summary analytics."},
 ]

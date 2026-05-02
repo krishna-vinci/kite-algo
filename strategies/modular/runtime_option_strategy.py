@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from algo_runtime.models import NoopAction, NotifyAction, OrderIntent, Snapshot, StatePatchAction
-from strategies.option_strategy.models import MetricKind, RuleRole, RuntimeManagedOptionStrategyConfig
+from options.protection.evaluator import evaluate_option_rules
+from options.protection.exit_builder import build_grouped_exit_orders
+from options.strategy.models import MetricKind, RuleRole, RuntimeManagedOptionStrategyConfig
 
 
 TERMINAL_ORDER_STATUSES = {"COMPLETE", "CANCELLED", "REJECTED", "EXPIRED", "FILLED"}
@@ -222,44 +224,31 @@ class RuntimeManagedOptionStrategyAlgo:
 
     def _trigger_rule(self, metrics: Dict[str, Optional[float]]):
         role_order = list(self.config.precedence or [RuleRole.EMERGENCY_GUARD, RuleRole.HARD_STOP, RuleRole.PROFIT_TARGET, RuleRole.TRAILING_STOP])
-        rules = list(self.config.rules)
-        for role in role_order:
-            for rule in rules:
-                if rule.role != role:
-                    continue
-                value = metrics.get(rule.metric.value)
-                if value is None:
-                    continue
-                if rule.operator == "lte" and float(value) <= float(rule.threshold):
-                    return rule
-                if rule.operator == "gte" and float(value) >= float(rule.threshold):
-                    return rule
-        return None
+        return evaluate_option_rules(metrics=metrics, rules=self.config.rules, precedence=role_order)
 
     def _build_exit_orders(self, snapshot: Snapshot, positions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int, set[str]]:
         relevant_orders = ((snapshot.orders or {}).get("relevant", [])) or []
-        exit_orders: List[Dict[str, Any]] = []
-        skipped_positions = 0
         blocked_symbols: set[str] = set()
+        eligible_positions: List[Dict[str, Any]] = []
         for payload in positions:
-            quantity = abs(self._position_quantity(payload))
             tradingsymbol = payload.get("tradingsymbol")
+            quantity = abs(self._position_quantity(payload))
             if quantity == 0 or not tradingsymbol:
-                skipped_positions += 1
+                eligible_positions.append(payload)
                 continue
             transaction_type = "SELL" if self._position_quantity(payload) > 0 else "BUY"
             if self.config.skip_if_exit_order_open and self._has_open_exit_order(relevant_orders, tradingsymbol, transaction_type):
                 blocked_symbols.add(str(tradingsymbol))
                 continue
-            exit_orders.append({
-                "exchange": payload.get("exchange", "NFO"),
-                "tradingsymbol": tradingsymbol,
-                "transaction_type": transaction_type,
-                "variety": self.config.order_variety,
-                "product": self.config.product_override or payload.get("product", "MIS"),
-                "order_type": self.config.exit_order_type,
-                "quantity": quantity,
-            })
+
+            eligible_positions.append(payload)
+
+        exit_orders, skipped_positions = build_grouped_exit_orders(
+            eligible_positions,
+            order_variety=self.config.order_variety,
+            product_override=self.config.product_override,
+            exit_order_type=self.config.exit_order_type,
+        )
         return exit_orders, skipped_positions, blocked_symbols
 
     def _has_open_exit_order(self, orders: List[Dict[str, Any]], tradingsymbol: str, transaction_type: str) -> bool:

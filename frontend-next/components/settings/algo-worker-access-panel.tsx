@@ -18,11 +18,107 @@ import {
 const TOKEN_QUERY_KEY = ["algo-worker-tokens"];
 const DEFAULT_ACCOUNT_SCOPE = "kite:paper-a";
 
+const MODE_OPTIONS = [
+  {
+    value: "paper",
+    label: "Paper",
+    description: "Simulated execution without broker order placement.",
+  },
+  {
+    value: "dry_run",
+    label: "Dry run",
+    description: "Validate order intents and risk flows without live execution.",
+  },
+  {
+    value: "live",
+    label: "Live",
+    description: "Allow real broker-backed runs for the resolved Kite account scope.",
+  },
+] as const;
+
+const ACTION_OPTIONS = [
+  {
+    value: "heartbeat",
+    label: "Heartbeat",
+    description: "Worker health pings and telemetry updates.",
+  },
+  {
+    value: "runs:create",
+    label: "Create runs",
+    description: "Create new strategy runs.",
+  },
+  {
+    value: "runs:read",
+    label: "Read runs",
+    description: "Read run state, orders, trades, funds, and P&L.",
+  },
+  {
+    value: "intents:submit",
+    label: "Submit intents",
+    description: "Submit order/basket intents for the run.",
+  },
+  {
+    value: "risk:update",
+    label: "Update risk",
+    description: "Patch risk and protection values.",
+  },
+  {
+    value: "runs:exit",
+    label: "Exit runs",
+    description: "Request backend-managed exits.",
+  },
+  {
+    value: "funds:read",
+    label: "Read funds",
+    description: "Read account and run funds snapshots.",
+  },
+  {
+    value: "market:read",
+    label: "Read market",
+    description: "Read symbols, quotes, candles, snapshots, and options market data.",
+  },
+  {
+    value: "market:stream",
+    label: "Stream market",
+    description: "Stream worker market ticks/candles.",
+  },
+] as const;
+
+function isPaperScope(value: string | null | undefined): boolean {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return false;
+  const identifier = normalized.startsWith("kite:") ? normalized.slice(5) : normalized;
+  return (
+    identifier === "paper" ||
+    identifier.startsWith("paper-") ||
+    identifier.startsWith("paper_") ||
+    identifier.startsWith("test-paper") ||
+    identifier.endsWith("-paper") ||
+    identifier.endsWith("_paper")
+  );
+}
+
+function describeTokenScope(token: AlgoWorkerToken): string {
+  const scope = token.accountScope?.trim() || "";
+  if (!scope) return "Any paper scope";
+  if (token.allowedModes.includes("live") && !isPaperScope(scope)) {
+    return `Live ${scope} + any paper scope`;
+  }
+  return scope;
+}
+
 function splitTemplateList(value: string): string[] {
   return value
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function toggleSelection(values: string[], value: string, checked: boolean): string[] {
+  if (checked) {
+    return values.includes(value) ? values : [...values, value];
+  }
+  return values.filter((item) => item !== value);
 }
 
 function formatDate(value: string | null): string {
@@ -109,7 +205,7 @@ function TokenRow({
         </div>
         <div className="mt-2 grid gap-2 text-xs text-foreground/55 sm:grid-cols-2 xl:grid-cols-4">
           <span className="min-w-0 truncate font-mono">{token.tokenId}</span>
-          <span>Scope: {token.accountScope || "Any paper scope"}</span>
+          <span>Scope: {describeTokenScope(token)}</span>
           <span>Last used: {formatDate(token.lastUsedAt)}</span>
           <span>Expires: {formatDate(token.expiresAt)}</span>
         </div>
@@ -150,14 +246,20 @@ function WorkerQuickGuide({ token }: { token: CreatedAlgoWorkerToken | null }) {
   const rawToken = token?.token || "kwa_your_token";
   const runId = "run_mean_reversion_001";
   const authHeader = `Authorization: Bearer ${rawToken}`;
+  const sampleMode = token?.allowedModes.includes("paper") ? "paper" : token?.allowedModes.includes("dry_run") ? "dry_run" : "live";
+  const sampleAccountScope = sampleMode === "live" ? token?.accountScope || "kite:YOUR_BROKER_USER_ID" : DEFAULT_ACCOUNT_SCOPE;
   const createRunSnippet = `curl -X POST "$API_BASE/api/algo-workers/worker/runs" \\
   -H "${authHeader}" \\
   -H "Content-Type: application/json" \\
   -d '{
     "strategy_run_id": "${runId}",
     "template_id": "mean-reversion",
-    "account_scope": "${token?.accountScope || DEFAULT_ACCOUNT_SCOPE}",
-    "execution_mode": "paper",
+    "account_scope": "${sampleAccountScope}",
+    "execution_mode": "${sampleMode}",
+    "metadata": {
+      "strategy_family": "indicator_strategy",
+      "strategy_name": "Mean Reversion"
+    },
     "risk_schema": [
       {"key": "stop_loss_pct", "label": "Stop loss %", "type": "number", "value": 1.2, "editable": true},
       {"key": "target_pct", "label": "Target %", "type": "number", "value": 2.4, "editable": true}
@@ -193,6 +295,11 @@ function WorkerQuickGuide({ token }: { token: CreatedAlgoWorkerToken | null }) {
           <Terminal aria-hidden size={15} className="text-primary" />
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-foreground/60">Create run</p>
         </div>
+        {token?.allowedModes.includes("live") && token.accountScope && !isPaperScope(token.accountScope) ? (
+          <p className="mb-3 text-[11px] leading-5 text-foreground/55">
+            This token is live-bound to <span className="font-mono text-primary">{token.accountScope}</span>, but it can still create paper or dry-run runs with <span className="font-mono text-primary">account_scope: "{DEFAULT_ACCOUNT_SCOPE}"</span> when those modes are enabled.
+          </p>
+        ) : null}
         <CodeBlock value={createRunSnippet} />
       </div>
       <div className="rounded-xl border border-border/70 bg-background/45 p-3">
@@ -218,7 +325,8 @@ export function AlgoWorkerAccessPanel() {
   const [name, setName] = useState("paper-worker");
   const [accountScope, setAccountScope] = useState(DEFAULT_ACCOUNT_SCOPE);
   const [templatesText, setTemplatesText] = useState("");
-  const [liveModeEnabled, setLiveModeEnabled] = useState(false);
+  const [selectedModes, setSelectedModes] = useState<string[]>(["paper", "dry_run"]);
+  const [selectedActions, setSelectedActions] = useState<string[]>(ACTION_OPTIONS.map((item) => item.value));
   const [liveAcknowledged, setLiveAcknowledged] = useState(false);
   const [createdToken, setCreatedToken] = useState<CreatedAlgoWorkerToken | null>(null);
 
@@ -234,15 +342,18 @@ export function AlgoWorkerAccessPanel() {
 
   const brokerUserId = kiteProfileQuery.data?.userId ?? null;
   const liveAccountScope = brokerUserId ? `kite:${brokerUserId}` : "";
+  const liveModeEnabled = selectedModes.includes("live");
   const effectiveAccountScope = liveModeEnabled ? liveAccountScope : accountScope.trim() || null;
   const liveTokenBlocked = liveModeEnabled && (!brokerUserId || !liveAcknowledged);
+  const invalidSelection = selectedModes.length === 0 || selectedActions.length === 0;
 
   const createMutation = useMutation({
     mutationFn: () =>
       createAlgoWorkerToken({
         name: name.trim() || "paper-worker",
         accountScope: effectiveAccountScope,
-        allowedModes: liveModeEnabled ? ["paper", "dry_run", "live"] : undefined,
+        allowedModes: selectedModes,
+        allowedActions: selectedActions,
         allowedTemplates: splitTemplateList(templatesText),
       }),
     onSuccess: (token) => {
@@ -297,7 +408,7 @@ export function AlgoWorkerAccessPanel() {
               />
               {liveModeEnabled ? (
                 <span className="text-[11px] leading-4 text-foreground/45">
-                  Live worker tokens are bound to your Kite profile user id. Current profile: {brokerUserId ? <span className="font-mono text-primary">{brokerUserId}</span> : "not available"}.
+                  Live worker tokens are bound to your Kite profile user id for live runs. Current profile: {brokerUserId ? <span className="font-mono text-primary">{brokerUserId}</span> : "not available"}. The same token can still create paper or dry-run runs on scopes like <span className="font-mono text-primary">{DEFAULT_ACCOUNT_SCOPE}</span> when those modes are enabled.
                 </span>
               ) : null}
             </label>
@@ -311,55 +422,107 @@ export function AlgoWorkerAccessPanel() {
               />
             </label>
             <div className="rounded-xl border border-border/70 bg-background/50 p-3">
-              <label className="flex items-start gap-3 text-sm text-foreground">
-                <input
-                  type="checkbox"
-                  checked={liveModeEnabled}
-                  onChange={(event) => {
-                    setLiveModeEnabled(event.target.checked);
-                    setLiveAcknowledged(false);
-                  }}
-                  className="mt-1 h-4 w-4 rounded border-border/70"
-                />
-                <span>
-                  Enable live mode
-                  <span className="mt-1 block text-xs leading-5 text-foreground/55">
-                    Adds <span className="font-mono text-primary">live</span> to this token and binds it to the real broker scope <span className="font-mono text-primary">{liveAccountScope || "kite:<user_id>"}</span>.
-                  </span>
-                </span>
-              </label>
-              {liveModeEnabled ? (
-                <div className="mt-3 rounded-xl border border-amber-400/30 bg-amber-400/10 p-3 text-xs leading-5 text-amber-200">
-                  <div className="flex items-start gap-2">
-                    <AlertTriangle aria-hidden size={15} className="mt-0.5 shrink-0" />
-                    <div>
-                      <p className="font-semibold text-amber-100">Live worker tokens can place real broker orders.</p>
-                      <p className="mt-1 text-amber-100/80">
-                        Keep this token only on trusted worker machines. The worker must still set <span className="font-mono">KITE_ALGO_ENABLE_LIVE=1</span> and create runs with required live metadata.
-                      </p>
-                    </div>
-                  </div>
-                  <label className="mt-3 flex items-start gap-2 text-amber-100/90">
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-foreground/55">Execution modes</p>
+              <div className="mt-2 grid gap-2 md:grid-cols-3">
+                {MODE_OPTIONS.map((mode) => (
+                  <label key={mode.value} className="flex items-start gap-2 rounded-lg border border-border/70 bg-background/35 px-2.5 py-2 text-xs text-foreground/80">
                     <input
                       type="checkbox"
-                      checked={liveAcknowledged}
-                      onChange={(event) => setLiveAcknowledged(event.target.checked)}
-                      disabled={!brokerUserId}
-                      className="mt-1 h-4 w-4 rounded border-amber-200/60"
+                      checked={selectedModes.includes(mode.value)}
+                      onChange={(event) => {
+                        setSelectedModes((previous) => toggleSelection(previous, mode.value, event.target.checked));
+                        if (mode.value === "live" && !event.target.checked) {
+                          setLiveAcknowledged(false);
+                        }
+                      }}
+                      className="mt-0.5 h-4 w-4 rounded border-border/70"
                     />
-                    <span>I understand this token can place live orders for {liveAccountScope || "the resolved Kite account"}.</span>
+                    <span>
+                      <span className="block font-semibold uppercase tracking-[0.14em] text-foreground/85">{mode.label}</span>
+                      <span className="mt-1 block text-[11px] leading-4 text-foreground/55">{mode.description}</span>
+                    </span>
                   </label>
-                  {kiteProfileQuery.isError ? <p className="mt-2 text-amber-100/80">Could not load Kite profile. Login to Kite, then refresh this page before enabling live mode.</p> : null}
+                ))}
+              </div>
+              {selectedModes.length === 0 ? <p className="mt-2 text-[11px] text-amber-200">Select at least one execution mode.</p> : null}
+            </div>
+
+            <div className="rounded-xl border border-border/70 bg-background/50 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-foreground/55">Worker capabilities</p>
+                <button
+                  type="button"
+                  className="rounded-lg border border-border/70 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-foreground/60 transition-colors hover:border-primary/30 hover:text-foreground"
+                  onClick={() => setSelectedActions(ACTION_OPTIONS.map((item) => item.value))}
+                >
+                  Select all
+                </button>
+              </div>
+              <div className="mt-2 grid gap-2 md:grid-cols-2">
+                {ACTION_OPTIONS.map((action) => (
+                  <label key={action.value} className="flex items-start gap-2 rounded-lg border border-border/70 bg-background/35 px-2.5 py-2 text-xs text-foreground/80">
+                    <input
+                      type="checkbox"
+                      checked={selectedActions.includes(action.value)}
+                      onChange={(event) => {
+                        setSelectedActions((previous) => toggleSelection(previous, action.value, event.target.checked));
+                      }}
+                      className="mt-0.5 h-4 w-4 rounded border-border/70"
+                    />
+                    <span>
+                      <span className="block font-semibold text-foreground/90">{action.label}</span>
+                      <span className="block font-mono text-[10px] text-primary/85">{action.value}</span>
+                      <span className="mt-1 block text-[11px] leading-4 text-foreground/55">{action.description}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+              {selectedActions.length === 0 ? <p className="mt-2 text-[11px] text-amber-200">Select at least one worker capability.</p> : null}
+            </div>
+
+            {liveModeEnabled ? (
+              <div className="rounded-xl border border-amber-400/30 bg-amber-400/10 p-3 text-xs leading-5 text-amber-200">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle aria-hidden size={15} className="mt-0.5 shrink-0" />
+                  <div>
+                    <p className="font-semibold text-amber-100">Live worker tokens can place real broker orders.</p>
+                    <p className="mt-1 text-amber-100/80">
+                      Keep this token only on trusted worker machines. The worker must still set <span className="font-mono">KITE_ALGO_ENABLE_LIVE=1</span> and create runs with required live metadata. If paper or dry-run mode is also enabled, this same token can be reused without generating another token.
+                    </p>
+                  </div>
                 </div>
-              ) : null}
+                <label className="mt-3 flex items-start gap-2 text-amber-100/90">
+                  <input
+                    type="checkbox"
+                    checked={liveAcknowledged}
+                    onChange={(event) => setLiveAcknowledged(event.target.checked)}
+                    disabled={!brokerUserId}
+                    className="mt-1 h-4 w-4 rounded border-amber-200/60"
+                  />
+                  <span>I understand this token can place live orders for {liveAccountScope || "the resolved Kite account"}.</span>
+                </label>
+                {kiteProfileQuery.isError ? <p className="mt-2 text-amber-100/80">Could not load Kite profile. Login to Kite, then refresh this page before enabling live mode.</p> : null}
+              </div>
+            ) : null}
+
+            <div className="rounded-xl border border-border/70 bg-background/40 p-3 text-[11px] leading-5 text-foreground/60">
+              <p>
+                <span className="font-semibold text-foreground/80">Options SDK note:</span> <span className="font-mono text-primary">market:read</span> and <span className="font-mono text-primary">runs:read</span> are required for option market snapshots and run-state reads via <span className="font-mono text-primary">/api/algo-workers/worker/options/*</span>.
+              </p>
             </div>
             <IconButton
               icon={<KeyRound aria-hidden size={14} />}
               variant="primary"
-              onClick={() => createMutation.mutate()}
-              disabled={createMutation.isPending || liveTokenBlocked}
+              onClick={() => {
+                if (invalidSelection) {
+                  toast.error("Select at least one execution mode and worker capability");
+                  return;
+                }
+                createMutation.mutate();
+              }}
+              disabled={createMutation.isPending || liveTokenBlocked || invalidSelection}
             >
-              {liveModeEnabled ? "Generate live-enabled token" : "Generate"}
+              {liveModeEnabled ? (selectedModes.includes("paper") ? "Generate paper + live token" : "Generate live-only token") : "Generate"}
             </IconButton>
           </div>
 
@@ -400,7 +563,7 @@ export function AlgoWorkerAccessPanel() {
             <div className="rounded-xl border border-rose-400/30 bg-rose-400/10 p-4 text-sm text-rose-300">Could not load worker tokens.</div>
           ) : sortedTokens.length === 0 ? (
             <div className="rounded-xl border border-dashed border-border/70 bg-background/40 p-4 text-sm text-foreground/55">
-              No worker tokens yet. Generate one for paper or dry-run strategy development.
+              No worker tokens yet. Generate one for paper, dry-run, or a combined paper + dry-run + live worker.
             </div>
           ) : (
             sortedTokens.map((token) => (
@@ -420,10 +583,10 @@ export function AlgoWorkerAccessPanel() {
           <div>
             <p className="text-sm font-semibold text-foreground">Worker usage contract</p>
             <p className="mt-1 text-xs leading-5 text-foreground/55">
-              Set <span className="font-mono text-primary">API_BASE</span>, send the bearer token, create one strategy run, submit idempotent intents, patch risk only through the run, and close the run when the strategy exits.
+              Set <span className="font-mono text-primary">API_BASE</span>, send the bearer token, create one strategy run, submit idempotent intents, patch risk only through the run, and close the run when the strategy exits. A live-bound token can still be reused for paper or dry-run runs when those modes are enabled.
             </p>
           </div>
-          <StatusBadge tone="warning">paper v1</StatusBadge>
+          <StatusBadge tone="warning">multi-mode v1</StatusBadge>
         </div>
         <WorkerQuickGuide token={createdToken} />
       </div>

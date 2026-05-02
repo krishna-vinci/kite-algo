@@ -108,6 +108,22 @@ class WorkerProtectionRuntime:
                 ):
                     await self._persist_state(run, runtime_state, unknown_state)
                 return False
+            if self._is_deferred_exit_result(exit_result):
+                deferred_state = {
+                    **claimed_state,
+                    "exit_submitted": False,
+                    "exit_submission_status": "deferred",
+                    "exit_result": exit_result,
+                }
+                if not await self._persist_state(
+                    run,
+                    runtime_state,
+                    deferred_state,
+                    expected_generation=deferred_state.get("generation"),
+                    expected_exit_claim_id=claim_id,
+                ):
+                    await self._persist_state(run, runtime_state, deferred_state)
+                return False
             next_state = {
                 **claimed_state,
                 "exit_submitted": True,
@@ -145,6 +161,10 @@ class WorkerProtectionRuntime:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return (now.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() < 60
+
+    @staticmethod
+    def _is_deferred_exit_result(result: Any) -> bool:
+        return bool(isinstance(result, dict) and (result.get("deferred") or str(result.get("status") or "").lower() == "deferred"))
 
     async def _persist_state(
         self,

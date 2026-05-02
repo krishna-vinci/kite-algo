@@ -8,6 +8,7 @@ from execution_accounting.contracts import signed_cash_flow
 
 from .models import JournalExecutionFact, SourceType
 from .repository import JournalRepository
+from .service import JournalService
 
 
 def _parse_fill_timestamp(value: Any) -> datetime:
@@ -50,8 +51,9 @@ def resolve_external_fill_run(*, repository: JournalRepository, fill: Dict[str, 
 
 
 class LiveJournalProjector:
-    def __init__(self, repository: Optional[JournalRepository] = None) -> None:
+    def __init__(self, repository: Optional[JournalRepository] = None, journal_service: Optional[JournalService] = None) -> None:
         self.repository = repository or JournalRepository()
+        self.journal_service = journal_service or JournalService(repository=self.repository)
 
     def project(self, *, batch_size: int = 100) -> Dict[str, int]:
         projected = 0
@@ -106,6 +108,38 @@ class LiveJournalProjector:
                     payload={"broker_fill": fill, "cost_contract": cost_contract, "resolution": resolution},
                 )
             )
+            try:
+                attribution: Dict[str, Any] = dict(intent.get("attribution_json") or {}) if intent else {}
+                if fill.get("product") is not None:
+                    attribution.setdefault("product", fill.get("product"))
+                if fill.get("instrument_token") is not None:
+                    attribution.setdefault("instrument_token", fill.get("instrument_token"))
+                strategy_run_id = str(attribution.get("strategy_run_id") or "").strip() if attribution else ""
+                external_run_id = strategy_run_id or str(run_id)
+                self.journal_service.record_v2_execution_fill(
+                    mode="live",
+                    account_scope=str(fill.get("account_id") or ""),
+                    source_system=str(attribution.get("source_system") or attribution.get("source") or "live_projector"),
+                    external_run_id=external_run_id,
+                    source_type=source_type,
+                    source_fact_key=source_key,
+                    side=side,
+                    quantity=quantity,
+                    price=price,
+                    fill_timestamp=_parse_fill_timestamp(fill["fill_timestamp"]),
+                    gross_cash_flow=signed_cash_flow(side=side, price=price, quantity=quantity),
+                    fees_amount=fees,
+                    taxes_amount=total_taxes,
+                    slippage_amount=Decimal("0"),
+                    run_id=str(run_id),
+                    order_id=str(fill["order_id"]),
+                    trade_id=str(fill["trade_id"]),
+                    attribution=attribution,
+                    payload={"broker_fill": fill, "cost_contract": cost_contract, "resolution": resolution},
+                )
+            except Exception:
+                # Preserve existing V1 projection behavior during dual-write period.
+                pass
             if resolution == "external_exit":
                 self.repository.mark_run_externally_closed_if_flat(run_id=run_id)
         return {"projected": projected, "imported": imported, "external_exit": external_exit}

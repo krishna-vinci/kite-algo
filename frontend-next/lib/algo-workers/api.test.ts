@@ -33,6 +33,7 @@ describe("algo worker API client", () => {
       name: "live-worker",
       accountScope: "kite:AB1234",
       allowedModes: ["paper", "dry_run", "live"],
+      allowedActions: ["runs:create"],
       allowedTemplates: ["mean-reversion"],
     });
 
@@ -45,7 +46,7 @@ describe("algo worker API client", () => {
           name: "live-worker",
           account_scope: "kite:AB1234",
           allowed_modes: ["paper", "dry_run", "live"],
-          allowed_actions: ["heartbeat", "runs:create", "runs:read", "intents:submit", "risk:update", "runs:exit", "funds:read"],
+          allowed_actions: ["runs:create"],
           allowed_templates: ["mean-reversion"],
           expires_at: null,
         }),

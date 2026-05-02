@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-04-26
+Last updated: 2026-05-01
 
 ## Scope
 
@@ -24,6 +24,22 @@ Do not use this file for frontend work.
 - Added backend mutual fund router in `broker_api/kite_mutual_funds.py`
 
 ## Newly implemented in current branch
+
+- Added Journal V2 production-validation gate infrastructure:
+  - created `tests/journaling/test_v2_db_integration.py` for real Postgres schema-idempotency, live/paper isolation, V2 projection replay idempotency, V1/V2 replay preservation, and note revision concurrency validation
+  - expanded `tests/test_journal_v2_router.py` with stricter V2 route environment-scope checks for ID-only reads, strategies/unresolved resolution, analytics, and paper/live comparison boundaries
+  - added `scripts/validate_journal_v2_production.py` with schema/API/paper/live-read-only/frontend validation modes plus explicit live-order safety guard for the optional tiny live drill
+  - fixed the unrelated `frontend-next` typecheck blocker by adding typed placeholder page shells for generated routes: `alerts`, `algos`, `charts`, `custom-display`, `quick-trade`, and `screeners`
+  - current validation result in this environment: focused validation tests pass (`19 passed, 5 skipped, 1 warning`), Docker validation DB integration tests pass (`5 passed, 1 warning`), validation runner schema/API/paper/frontend checks pass against `kite_algo_validation`, and frontend typecheck passes
+  - live broker runtime read-only status is connected (`broker.connected=true`, daily token gate ready, websocket `CONNECTED`), but the main DB has no existing `journal_execution_environments` live rows for `kite:XJJ446`; production readiness remains **not yet 100% proven** until a V2-attributed live environment/fill exists and live read-only Journal V2 validation passes
+  - optional tiny live trade still requires explicit operator approval before any live order action
+
+- Completed Journal V2 final production batch (Tasks 23–24):
+  - added production handoff guide at `docs/journal-v2-developer-guide.md` documenting V2 concepts, backend API contracts, safety rules, and frontend alignment notes
+  - completed final Journal V2 verification gate across focused V2 backend suites, worker/paper nearby regression suites, and frontend V2 test files
+  - current backend status: Journal V2 environment/identity/episode/intent/timeline/notes/metrics/unresolved primitives are implemented, reviewed, and verified through the planned test matrix
+  - remaining UI iteration note: frontend is aligned to Journal V2 data boundaries and basic flows, but final UX decisions for editor behavior, episode layout, note templates, analytics visualizations, and unresolved workflow still require trader/developer feedback before considering UI final
+  - typecheck note from final pass: `frontend-next` typecheck currently fails in pre-existing generated `.next/types/validator.ts` imports for unrelated missing pages (`alerts`, `algos`, `charts`, `custom-display`, `quick-trade`, `screeners`)
 
 - Completed backend control-plane Phases 1-3:
   - added authenticated `GET /api/control/strategy-positions`, `POST /api/control/strategies/{strategy_run_id}/exit`, `POST /api/control/strategies/{strategy_run_id}/cancel-orders`, and `POST /api/control/reconcile`
@@ -174,6 +190,63 @@ Do not use this file for frontend work.
   - `/api/algo-workers/worker/market/history` wraps the existing robust backend candle facade under worker auth
   - SDK method `get_historical_candles()` supports symbol/token lookup, timeframe ranges, backend background ingestion, and deliberate Kite passthrough via the backend-controlled system session
   - realtime worker market streams remain SSE-based (`stream_ticks`, `stream_candles`, `stream_run_pnl`), not raw WebSocket connections from workers
+- Extended the algo-worker API and Python SDK core refresh:
+  - added worker order lifecycle routes for grouped live order/trade inspection plus cancel/modify actions under worker auth
+  - added worker preview routes for live order margin/charges inspection and dry-run basket previews
+  - added worker websocket routes for tick streams, candle streams, and grouped run P&L streams with worker-token auth and stream-specific permission checks
+  - refreshed the Python SDK with typed exceptions/models, sync order lifecycle + preview methods, an async client, websocket clients, and helper ergonomics such as `ensure_run(...)`, `wait_for_history(...)`, and `live_equity_market_order(...)`
+  - updated the worker development guide and added `scripts/sdk_worker_certification.py` for lightweight worker SDK certification checks
+- Completed the generic live protection 100% gate for algo workers:
+  - added `sdk/python/kite_algo_worker/live_protection_certification.py` with pure threshold/verdict helpers and `scripts/live_worker_protection_certification.py` for strict ultra-small live protection drills
+  - updated `docs/algo-worker-development-guide.md` with live protection certification usage and safety gates
+  - fixed a live-db compatibility gap where some running environments were missing `canonical_order_events.processing_started_at`, which prevented canonical event processing/trade-fill projection and made live worker P&L stay empty even for filled attributed orders
+  - added runtime self-heal for that schema compatibility in `broker_api/order_runtime.py` and moved startup stuck-row refresh into the guarded worker loop in `main.py` so the order runtime worker cannot die silently before entering its retry loop
+  - re-validated the full generic live protection surface with real tiny broker drills for worker-stale exit, position stoploss, basket stoploss, position target, basket target, and live protection patch mutability
+- Completed Plan A of options-core production closure:
+  - added semantic expiry selectors for explicit, nearest, current-week, next-week, and current-month resolution
+  - completed canonical options market routes for session, chain, mini-chain, Greeks, selection resolve, PCR, and max-pain
+  - added worker-token-protected options market proxy routes under `/api/algo-workers/worker/options/*`
+  - updated the Python worker SDK options namespace so market calls use worker-safe routes
+  - added deterministic route, SDK, auth-boundary, and market edge-case tests; combined Plan A regression passed with `46 passed, 1 warning`
+- Completed Plan B of options-core production closure:
+  - added explicit run-level option product validation and removed the hidden SDK option-leg product default
+  - added canonical option run store/lifecycle primitives with created, previewed, entered, partial-entry, cleanup-required, exiting, partial-exit, and exited states
+  - replaced canonical execution route scaffolds with real grouped run creation, entry preview, enter, exit preview, exit, orders/trades/state behavior
+  - replaced protection route scaffolds with real protection config, evaluated state, and replay/debug behavior
+  - added worker-token-protected options run/protection proxy routes and SDK wrappers for run/protection workflows
+  - verified protection recommendations only target actually open/completed legs and use run-level product plus market protection for market exits
+  - confirmed existing option session Greek math is synthetic-forward/Black-76 based and new canonical routes only expose those computed snapshot fields; combined Plan B regression passed with `63 passed, 1 warning`
+- Completed Plan C of options-core production closure:
+  - added deterministic end-to-end options lifecycle integration tests covering market → strategy preview → run creation → entry/exit/protection flows
+  - added `greeks_source` metadata so canonical Greeks responses expose `synthetic_forward_black76` when session snapshots include forward/sigma context
+  - strengthened worker-token auth boundary tests for market, run, and protection routes while confirming canonical `/api/options/*` routes do not depend on worker auth
+  - added resource behavior coverage for bounded mini-chain output, service-level window validation, snapshot resource-error pass-through, and protection runtime isolation from market/session recomputation
+  - clarified legacy compatibility ownership in old option routers/selectors and documented the completed worker options namespace in the SDK guide
+  - final focused options closure regression passed with `100 passed, 1 warning`; adjacent worker/runtime regression passed with `51 passed, 1 skipped, 1 warning`
+- Added durable canonical options run-state persistence slice:
+  - new Postgres `public.option_run_states` table for canonical `OptionRunState` payloads (status/legs/protection/metadata/orders/trades/leg lifecycle)
+  - added `DurableOptionRunStore` with the same run-store contract as in-memory (`create_run`, `list_runs`, `get_run`, `save_run`, `record_orders`, `record_trades`)
+  - added DB startup compatibility helper for `option_run_states` table/index creation in older environments
+  - added fake-session tests for insert/get/update/append behavior and commit/rollback/close safety without requiring a real Postgres instance
+- Completed the options-core 100% production gate core backend items:
+  - production canonical option routes now use `DurableOptionRunStore` by default while tests can still override with deterministic in-memory stores
+  - added explicit Redis v1 JSON option-chain snapshot key/channel contract while preserving legacy Redis writes
+  - added middleware-equivalent app-auth coverage proving canonical `/api/options/*` requires app auth and worker options routes remain worker-token protected
+  - implemented snapshot-safe `delta_target` / `target_delta` contract selection from existing session delta fields without recomputing Greeks from raw spot
+  - added restart/recovery tests proving durable option run status, protection config, orders, trades, and leg lifecycle survive a new store instance
+  - hardened durable order/trade append with row locking and rejected malformed option instrument tokens instead of coercing them to `0`
+  - added best-effort startup prewarm for the options Black-76/IV math engine and confirmed current mini-chain/session APIs already expose custom window/cadence controls with `cadence_sec >= 1`
+  - updated the worker development guide with durable option run state and delta-target selection semantics
+- Hardened paper-mode isolation and parity for algo workers/runtime:
+  - added centralized account-scope parsing so paper/live routing no longer relies on scattered string heuristics
+  - added a shared execution attribution builder for paper/dry-run flows so canonical run identity wins over caller metadata
+  - worker run access now requires owning `token_id`, not just matching scope/template
+  - paper grouped run P&L now uses a dedicated `PaperRunStateService`, includes charges/staleness metadata, and paper exits stay open/blocked when reconciliation is unsafe instead of falsely closing runs
+  - paper journaling can now auto-resolve/create a per-run journal entry keyed by `strategy_run_id` plus account scope when explicit journal ids are missing
+- Updated worker token scope handling + paper accounting parity:
+  - live-bound worker tokens can now create/access paper and same-account live/dry_run scopes while preserving strict token_id run ownership and cross-live-account isolation
+  - worker paper run P&L payloads now serialize charges/net from the paper run-state source-of-truth instead of hardcoding zero charges
+  - paper fill-time margin release now prefers persisted position `margin_in_use` when present so blocked funds clear to zero after fully closed paper exposure
 
 ## Skill usage
 
@@ -213,13 +286,14 @@ Remaining work:
 - add tests for event lag, retry, replay, and reconciliation drift under database-backed integration paths
 
 ### 3) Live positions / live PnL logic
-Status: **Production-oriented implementation in place**
+Status: **Production-oriented implementation in place and re-validated against real worker-filled live drills**
 
 Current behavior:
 - positions reconcile into durable `account_positions` rows in Postgres
 - Redis now acts as a cache/overlay and pub/sub fanout layer instead of sole state store
 - websocket LTP updates are no longer tied to active SSE subscribers
 - SSE stream exists per broker account via Redis pub/sub
+- live worker P&L fallback recovered correctly after fixing canonical-event projection on a stale live DB that was missing `processing_started_at`
 
 Remaining work:
 - verify incremental trade application math against real broker fills, especially for shorts and partial exits
@@ -228,7 +302,8 @@ Remaining work:
 Conclusion:
 - **Order placement hardening is strong**
 - **order-event ingestion and live positions now have production-grade structure**
-- **main remaining work is verification, tests, and a few medium-risk operational cleanups**
+- **generic live worker protection has now been live-proven for the agreed pre-options gate**
+- **main remaining work is broader verification, tests, and a few medium-risk operational cleanups outside that gate**
 
 ### 4) WebSocket market-data runtime
 Status: **Go runtime now owns websocket infrastructure; live verification/load observation still pending**
@@ -465,6 +540,20 @@ Update after latest verification:
 - baseline Postgres/Redis integration coverage now exists for canonical runtime + failure paths
 - remaining verification gap is mainly live duplicate/replay edge cases and live MF get-by-id/write-path shapes
 - attempted live duplicate/replay verification on 2026-04-05, but the current Kite account had `orders() == 0` and `trades() == 0`, and runtime raw event tables were empty, so there was no real captured order-event bundle available to replay without placing a new live order
+- live worker drill on 2026-04-29 verified that the SDK can stream fresh GOLDM data after subscription, compute indicators from worker-safe historical candles, preview live orders, and place real broker orders from worker runs
+- the same live drill also exposed a critical backend-control-plane gap for generic worker protection: a stale-worker protection exit closed the run `live_protection_idea_1777436466` as already flat even though the broker-side `IDEA` `MIS` buy had filled and remained open until a second manual worker sell flattened it
+- live worker order/trade inspection is not yet trustworthy because real broker orders/trades for those runs were filtered out of `/api/algo-workers/worker/orders` and `/api/algo-workers/worker/trades`, while `order_state_projection` also remained stuck at `PLACED` for both filled order IDs
+- likely root cause from the drill: live worker fills were not linked into `journal_source_links` / `journal_execution_facts` for the worker `strategy_run_id`, so `_list_live_strategy_open_legs_sync(...)` returned no legs and `_exit_live_worker_run(...)` treated the run as flat
+- same-day fixes corrected the worker safety path by:
+  - deriving worker live open legs from `live_order_intents` + trade fills instead of journal tables
+  - recovering durable worker attribution from broker order ids and client-order-ref tags, including canonical order-event tag recovery when direct backfill lags
+  - adding a direct-broker defer guard so a run is not falsely marked flat just because local attribution/projection tables are behind
+  - adding `market_protection=-1` to backend-generated live market exit orders
+  - adding a live worker P&L fallback when journal linkage is missing
+- same-day live re-validation then succeeded for:
+  - grouped live entry/exit round-trip on `live_final_exit_1777441545`
+  - full backend stale-worker auto-exit on `live_stale_auto_1777441609` with real broker fill, trigger at `heartbeat_age_sec=31`, attributed exit order, final closed run, and flat broker account
+- generic worker stoploss/target logic remains strongly unit-tested but not fully forced against real market movement in the same live session; stale-worker protection is the best live-validated generic path so far
 
 If a new agent picks this up, the correct next task is:
 

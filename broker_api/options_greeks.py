@@ -1,11 +1,26 @@
 # broker_api/options_greeks.py
 
-import mibian
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Union
 import numpy as np
-from numba import njit
 from math import exp, log, pi, sqrt, erf
+
+try:
+    from numba import njit
+except ImportError:  # Keep options math usable in lean/dev environments without JIT.
+    def njit(*args, **kwargs):
+        if args and callable(args[0]) and len(args) == 1 and not kwargs:
+            return args[0]
+
+        def decorator(func):
+            return func
+
+        return decorator
+
+try:
+    import mibian
+except ImportError:  # Legacy calculator only; keep Black-76 engine importable without mibian.
+    mibian = None
 
 # --- New Vectorized Engine Configuration ---
 OPTIONS_ENGINE_USE_VECTORIZED = True
@@ -286,7 +301,7 @@ def implied_vol_from_price_black76(
         return result if result is not None and not np.isnan(result) else None
     return ivs
 
-def prewarm_options_engine():
+def prewarm_options_engine() -> bool:
     """
     Executes a minimal call to compile Numba kernels to reduce first-call latency.
     """
@@ -295,9 +310,11 @@ def prewarm_options_engine():
             _black76_price_kernel(True, 100.0, np.array([100.0]), 0.1, 0.2)
             _black76_greeks_kernel(True, 100.0, np.array([100.0]), 0.1, 0.2)
             _implied_vol_kernel(True, 100.0, 100.0, 0.1, 5.0)
-            print("Numba options kernels pre-warmed successfully.")
+            return True
         except Exception as e:
             print(f"Numba kernel pre-warming failed: {e}")
+            return False
+    return True
 
 # --- Original Mibian Implementation (Legacy) ---
 

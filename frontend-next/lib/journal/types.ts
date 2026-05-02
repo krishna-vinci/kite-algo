@@ -25,6 +25,136 @@ export type InsightKind = "pattern" | "rule_suggestion" | "streak" | "anomaly" |
 
 export type AnalysisPeriod = "day" | "week" | "month" | "year" | "inception" | "since_inception";
 
+export type JournalEnvironmentMode = "live" | "paper" | "dry_run_preview";
+
+export type JournalEnvironment = {
+  id: string;
+  mode: JournalEnvironmentMode;
+  account_scope: string;
+  display_name: string | null;
+  broker_user_id: string | null;
+  paper_account_key: string | null;
+  environment_epoch: number;
+  metadata: Record<string, unknown>;
+};
+
+export type JournalEpisode = {
+  id: string;
+  environment_id: string;
+  execution_context_id: string;
+  episode_seq: number;
+  status: string;
+  opened_at: string;
+  closed_at: string | null;
+  metadata: Record<string, unknown>;
+};
+
+export type JournalV2AnalyticsMetrics = {
+  gross_pnl: number | string;
+  net_pnl: number | string;
+  total_charges: number | string;
+  realized_pnl: number | string;
+  hold_seconds: number;
+  closed_episode_count: number;
+  win_rate: number | string | null;
+  average_win: number | string | null;
+  average_loss: number | string | null;
+  expectancy: number | string | null;
+  profit_factor: number | string | null;
+  mae: Record<string, unknown>;
+  mfe: Record<string, unknown>;
+  r_multiple: Record<string, unknown>;
+};
+
+export type JournalV2AnalyticsSummary = {
+  environment_id: string;
+  closed_episode_count: number;
+  metrics: JournalV2AnalyticsMetrics;
+};
+
+export type JournalV2StrategyScorecard = {
+  template_id: string;
+  strategy_family: string;
+  display_name: string;
+  metrics: JournalV2AnalyticsMetrics;
+};
+
+export type JournalV2StrategyAnalytics = {
+  environment_id: string;
+  items: JournalV2StrategyScorecard[];
+  count: number;
+};
+
+export type JournalV2PaperLiveComparison = {
+  template_id: string;
+  paper_environment_id: string;
+  live_environment_id: string;
+  paper: JournalV2AnalyticsMetrics;
+  live: JournalV2AnalyticsMetrics;
+  combined: null;
+};
+
+export type JournalV2UnresolvedItem = {
+  id: string;
+  environment_id: string;
+  execution_context_id: string | null;
+  source_system: string;
+  reason: string;
+  raw_identity: Record<string, unknown>;
+  candidate_mappings: Array<Record<string, unknown>>;
+  metadata: Record<string, unknown>;
+  status: string;
+  created_at: string;
+  resolved_at: string | null;
+};
+
+export type JournalV2UnresolvedQueue = {
+  environment_id: string;
+  items: JournalV2UnresolvedItem[];
+  count: number;
+};
+
+export type JournalTimelineEvent = {
+  id: string;
+  environment_id: string;
+  episode_id: string | null;
+  execution_context_id: string | null;
+  subject_type: string;
+  subject_id: string;
+  event_type: string;
+  channel: string | null;
+  actor_type: string;
+  correlation_id: string | null;
+  causation_id: string | null;
+  occurred_at: string;
+  payload: Record<string, unknown>;
+};
+
+export type JournalNote = {
+  id: string;
+  environment_id: string;
+  subject_type: string;
+  subject_id: string;
+  episode_id: string | null;
+  note_type: string;
+  title: string;
+  body_markdown: string;
+  body_text?: string;
+  body_json?: Record<string, unknown> | null;
+  tags: string[];
+  metadata?: Record<string, unknown>;
+  updated_at: string;
+};
+
+export type JournalNoteRevision = {
+  note_id: string;
+  revision_no: number;
+  body_markdown: string;
+  body_text?: string;
+  edited_at?: string;
+  change_reason?: string | null;
+};
+
 // ---------------------------------------------------------------------------
 // API response types
 // ---------------------------------------------------------------------------

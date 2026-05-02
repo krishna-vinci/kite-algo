@@ -19,23 +19,23 @@ Once the SDK changes are committed and tagged, remote servers can install the ex
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
 ```
 
-Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.4.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
+Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.6.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
 
 Create the tag from the repository root after committing the SDK:
 
 ```bash
-git tag -a kite-algo-worker-v0.4.0 -m "kite-algo-worker v0.4.0"
-git push origin kite-algo-worker-v0.4.0
+git tag -a kite-algo-worker-v0.6.0 -m "kite-algo-worker v0.6.0"
+git push origin kite-algo-worker-v0.6.0
 ```
 
 ### Local development install
@@ -106,6 +106,70 @@ All strategy activity should happen under one stable `strategy_run_id` per strat
 9. `get_run_pnl(...)` or `stream_run_pnl(...)` for grouped realtime run P&L.
 10. `exit_run(...)` to close the grouped strategy run.
 
+## Hardened core surface
+
+Keep new worker code on the production-safe core surface:
+
+- lifecycle/accounting: `health()`, `heartbeat(...)`, `create_run(...)`, `get_run(...)`, `get_funds(...)`, `get_run_funds(...)`, `get_run_pnl(...)`, `stream_run_pnl(...)`
+- execution control: `list_orders(...)`, `list_trades(...)`, `preview_order(...)`, `preview_basket(...)`, `place_order(...)`, `place_basket(...)`, `exit_run(...)`
+- market data: `resolve_ticker(...)`, `search_tickers(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `stream_candles(...)`, `get_historical_candles(...)`, `get_market_snapshot(...)`
+- recovery helpers: `wait_for_history(...)` and the websocket client for reconnectable streams
+
+The certification script at `scripts/sdk_worker_certification.py` exercises this core surface and now reports preview output plus capability flags.
+
+## Options namespace (canonical worker-safe surface)
+
+Worker options SDK calls must use worker-auth-safe routes under:
+
+`/api/algo-workers/worker/options/*`
+
+Use `client.options` for options market + run/protection lifecycle flows. Canonical
+option market snapshots (including Greeks/IV) are exposed by backend option sessions.
+Those session Greeks are computed from synthetic-forward + Black-76 in backend option
+session computation and surfaced through canonical routes/SDK.
+
+Key points:
+
+- Run-level `product` is required for option run creation (`MIS` or `NRML`).
+- Market calls should use `client.options.ensure_session/list_expiries/get_chain/get_mini_chain/get_greeks/...`.
+- Selection resolution supports exact strike, ATM/ITM/OTM offset, and snapshot-safe
+  `delta_target` selection. Delta targeting only uses already-computed session
+  Greek fields; it does not recompute Greeks from raw spot in the worker or route.
+- Run/protection SDK methods exist: create/list/get run, preview/enter/exit,
+  protection get/update/state/replay.
+- Production option runs persist through the durable backend run-state store;
+  tests may still override routes with the in-memory store for deterministic cases.
+- `kite_algo_worker.option_leg(...)` remains only a payload helper and does not
+  imply hidden run-level product defaults.
+
+Example:
+
+```python
+from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, option_leg
+
+client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_..."))
+
+client.options.ensure_session("NIFTY")
+expiries = client.options.list_expiries("NIFTY")
+greeks = client.options.get_greeks("NIFTY", expiry="nearest")
+
+run = client.options.create_run(
+    strategy_name="bull_call_spread",
+    product="MIS",  # required at run level
+    legs=[
+        option_leg("NIFTY26MAY25000CE", "BUY", 75),
+        option_leg("NIFTY26MAY25100CE", "SELL", 75),
+    ],
+)
+
+preview = client.options.preview_entry(run["strategy_run_id"])
+enter_result = client.options.enter(run["strategy_run_id"])
+protection_state = client.options.get_protection_state(run["strategy_run_id"])
+```
+
+For compatibility, generic SDK primitives still exist, but new option strategy
+work should prefer the options namespace above.
+
 The SDK maps to public endpoints only:
 
 | SDK method | Worker endpoint |
@@ -114,6 +178,8 @@ The SDK maps to public endpoints only:
 | `heartbeat(...)` | `POST /api/algo-workers/worker/heartbeat` |
 | `create_run(...)` | `POST /api/algo-workers/worker/runs` |
 | `get_run(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}` |
+| `list_orders(strategy_run_id)` / `list_trades(strategy_run_id)` | `GET /api/algo-workers/worker/orders`, `GET /api/algo-workers/worker/trades` |
+| `preview_order(...)` / `preview_basket(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/preview/*` |
 | `get_funds(...)` | `GET /api/algo-workers/worker/funds` |
 | `get_run_funds(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/funds` |
 | `get_run_pnl(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/pnl` |
@@ -125,6 +191,7 @@ The SDK maps to public endpoints only:
 | `get_market_snapshot(...)` | `POST /api/algo-workers/worker/market/snapshot` |
 | `place_order(...)` / `place_basket(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/intents` |
 | `patch_risk(...)` | `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/risk` |
+| `update_backend_protection(...)` | `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/protection` |
 | `exit_run(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/exit` |
 
 ## Realtime run P&L

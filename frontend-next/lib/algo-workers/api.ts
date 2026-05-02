@@ -41,6 +41,8 @@ const DEFAULT_ALLOWED_ACTIONS = [
   "risk:update",
   "runs:exit",
   "funds:read",
+  "market:read",
+  "market:stream",
 ];
 
 function asStringArray(value: unknown): string[] {

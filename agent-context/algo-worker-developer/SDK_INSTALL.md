@@ -6,14 +6,14 @@ Recommended production install:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
 ```
 
 Pin live strategy servers to an immutable tag. Do not install from a moving branch like `main` or `develop` for live trading.
@@ -31,7 +31,7 @@ PY
 Expected version:
 
 ```text
-0.4.0
+0.6.0
 ```
 
 ## Local development install

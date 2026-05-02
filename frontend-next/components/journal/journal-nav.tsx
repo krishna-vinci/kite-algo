@@ -1,16 +1,17 @@
 "use client";
 
-import Link from "next/link";
 import { usePathname } from "next/navigation";
+
+import { JournalPageLink } from "@/components/journal/journal-page-link";
 import { cn } from "@/lib/utils";
 
 const tabs = [
   { label: "Overview", href: "/journal" },
-  { label: "Calendar", href: "/journal/calendar" },
-  { label: "Trades", href: "/journal/trades" },
+  { label: "Episodes", href: "/journal/episodes" },
+  { label: "Analytics", href: "/journal/analytics" },
+  { label: "Notes", href: "/journal/notes" },
+  { label: "Unresolved", href: "/journal/unresolved" },
   { label: "Strategies", href: "/journal/strategies" },
-  { label: "Rules", href: "/journal/rules" },
-  { label: "Insights", href: "/journal/insights" },
 ] as const;
 
 export function JournalNav() {
@@ -21,7 +22,7 @@ export function JournalNav() {
       {tabs.map((tab) => {
         const active = pathname === tab.href;
         return (
-          <Link
+          <JournalPageLink
             key={tab.href}
             href={tab.href}
             aria-current={active ? "page" : undefined}
@@ -33,7 +34,7 @@ export function JournalNav() {
             )}
           >
             {tab.label}
-          </Link>
+          </JournalPageLink>
         );
       })}
     </nav>

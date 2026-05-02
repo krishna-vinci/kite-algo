@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from .compiler import compile_option_strategy_preview
-from .models import StrategyProtectionPreferences
+from options.strategy import StrategyProtectionPreferences, compile_option_strategy_preview
 
 
 def _risk_schema_from_preview(preview: Dict[str, Any]) -> list[Dict[str, Any]]:

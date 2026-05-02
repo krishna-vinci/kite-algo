@@ -1,12 +1,9 @@
 databases
 fastapi
-feedparser
-fyers_apiv3
 requests
 httpx
 #numpy<1.24
 numpy
-openai
 pandas
 pandas_market_calendars
 plotly
@@ -20,13 +17,11 @@ SQLAlchemy
 starlette
 uvicorn
 yfinance
-jinja2
 python-multipart
 asyncpg
 alembic
 kiteconnect
 indexed-gzip
-fastmcp
 meilisearch>=0.31.0
 redis
 mibian

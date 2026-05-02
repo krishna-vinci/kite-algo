@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "kiteapp": {
-      "type": "streamable-http",
-      "url": "http://finance-app:8777/llm/mcp"
-    }
-  }
-}

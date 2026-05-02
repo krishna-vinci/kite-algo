@@ -8,7 +8,7 @@ from tests.test_support import install_dependency_stubs
 install_dependency_stubs(stub_kite_orders=False)
 sys.modules.pop("broker_api.kite_orders", None)
 
-from broker_api.kite_orders import Exchange, OrderType, Product, TransactionType, Variety
+from broker_api.kite_orders import Exchange, OrderType, Product, Trade, TransactionType, Variety
 from execution_accounting.kite_costs import build_live_order_cost_contract
 
 
@@ -82,6 +82,98 @@ class LiveCostContractTests(unittest.TestCase):
 
         self.assertEqual(contract.charges_status, "unavailable")
         self.assertEqual(contract.raw, {"error": "kite unavailable"})
+
+    def test_live_contract_uses_quote_price_when_preview_has_no_average_price(self):
+        orders_service = Mock()
+        orders_service.order_margins.return_value = [
+            Mock(total=1500.0, model_dump=lambda mode="json": {"total": 1500.0})
+        ]
+        orders_service.charges_orders.return_value = [
+            Mock(charges={"total": 11.25}, model_dump=lambda mode="json": {"charges": {"total": 11.25}})
+        ]
+        kite = Mock()
+        kite.quote.return_value = {"NSE:INFY": {"last_price": 1512.45}}
+
+        build_live_order_cost_contract(
+            kite=kite,
+            orders_service=orders_service,
+            order={
+                "exchange": Exchange.NSE,
+                "tradingsymbol": "INFY",
+                "transaction_type": TransactionType.BUY,
+                "variety": Variety.REGULAR,
+                "product": Product.CNC,
+                "order_type": OrderType.MARKET,
+                "quantity": 1,
+                "price": 0,
+            },
+            corr_id="test",
+        )
+
+        charges_input = orders_service.charges_orders.call_args.args[1][0]
+        self.assertEqual(charges_input.average_price, 1512.45)
+
+    def test_trade_accepts_time_only_timestamps_from_provider(self):
+        trade = Trade.model_validate(
+            {
+                "trade_id": "t1",
+                "order_id": "o1",
+                "exchange": "NSE",
+                "tradingsymbol": "IDEA",
+                "instrument_token": 123,
+                "transaction_type": "BUY",
+                "product": "MIS",
+                "average_price": 9.8,
+                "quantity": 1,
+                "order_timestamp": "09:31:10",
+                "exchange_timestamp": "09:31:11",
+                "fill_timestamp": "09:31:12",
+            }
+        )
+
+        self.assertEqual(trade.order_timestamp, "09:31:10")
+        self.assertEqual(trade.exchange_timestamp, "09:31:11")
+        self.assertEqual(trade.fill_timestamp, "09:31:12")
+
+    def test_live_contract_tolerates_blank_charge_fields(self):
+        orders_service = Mock()
+        orders_service.order_margins.return_value = [
+            Mock(total=1500.0, model_dump=lambda mode="json": {"total": 1500.0})
+        ]
+        orders_service.charges_orders.return_value = [
+            Mock(
+                charges={
+                    "brokerage": "",
+                    "transaction_tax": None,
+                    "exchange_turnover_charge": "2.5",
+                    "sebi_turnover_charge": "",
+                    "stamp_duty": "0",
+                    "gst": "",
+                    "total": "2.5",
+                },
+                model_dump=lambda mode="json": {"charges": {"total": "2.5"}},
+            )
+        ]
+
+        contract = build_live_order_cost_contract(
+            kite=Mock(),
+            orders_service=orders_service,
+            order={
+                "exchange": Exchange.NSE,
+                "tradingsymbol": "INFY",
+                "transaction_type": TransactionType.BUY,
+                "variety": Variety.REGULAR,
+                "product": Product.CNC,
+                "order_type": OrderType.MARKET,
+                "quantity": 1,
+                "price": 1500,
+            },
+            corr_id="test",
+        )
+
+        self.assertEqual(contract.total_charges, Decimal("2.5"))
+        self.assertEqual(contract.exchange_txn_charge, Decimal("2.5"))
+        self.assertEqual(contract.gst, Decimal("0"))
 
 
 if __name__ == "__main__":

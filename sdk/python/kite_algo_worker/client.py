@@ -6,6 +6,17 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
 import requests
 
+from .exceptions import KiteAlgoWorkerError, error_for_status
+from .models import (
+    RunProtectionState,
+    WorkerFundsSnapshot,
+    WorkerHistoricalCandles,
+    WorkerOrderSnapshot,
+    WorkerOrdersResponse,
+    WorkerRunPnlSnapshot,
+    WorkerTradesResponse,
+)
+from .options.client import OptionWorkerClient
 from .protection import BackendProtection
 
 
@@ -20,15 +31,6 @@ class AlgoWorkerConfig:
     token: str
     timeout: float = 10.0
     api_prefix: str = "/api/algo-workers"
-
-
-class KiteAlgoWorkerError(RuntimeError):
-    """Raised when the worker API returns a non-2xx response."""
-
-    def __init__(self, message: str, *, status_code: int, response_body: Any = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.response_body = response_body
 
 
 class KiteAlgoWorkerClient:
@@ -52,6 +54,7 @@ class KiteAlgoWorkerClient:
                 "Content-Type": "application/json",
             }
         )
+        self.options = OptionWorkerClient(self)
 
     def health(self) -> JsonDict:
         return self._request("GET", "/worker/health")
@@ -104,11 +107,78 @@ class KiteAlgoWorkerClient:
     def get_run_pnl(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}/pnl")
 
+    def get_run_pnl_snapshot(self, strategy_run_id: str) -> WorkerRunPnlSnapshot:
+        return WorkerRunPnlSnapshot.model_validate(self.get_run_pnl(strategy_run_id))
+
+    def list_orders(self, strategy_run_id: str) -> JsonDict:
+        return self._request("GET", "/worker/orders", params={"strategy_run_id": strategy_run_id})
+
+    def list_trades(self, strategy_run_id: str) -> JsonDict:
+        return self._request("GET", "/worker/trades", params={"strategy_run_id": strategy_run_id})
+
+    def get_orders_snapshot(self, strategy_run_id: str) -> WorkerOrdersResponse:
+        return WorkerOrdersResponse.model_validate(self.list_orders(strategy_run_id))
+
+    def get_trades_snapshot(self, strategy_run_id: str) -> WorkerTradesResponse:
+        return WorkerTradesResponse.model_validate(self.list_trades(strategy_run_id))
+
+    def get_order_snapshot(self, strategy_run_id: str, order_id: str) -> WorkerOrderSnapshot:
+        response = self._request("GET", f"/worker/orders/{order_id}", params={"strategy_run_id": strategy_run_id})
+        return WorkerOrderSnapshot.model_validate(response.get("order") or response)
+
+    def cancel_order(self, strategy_run_id: str, order_id: str, *, variety: str = "regular") -> JsonDict:
+        return self._request(
+            "POST",
+            f"/worker/orders/{order_id}/cancel",
+            json={"strategy_run_id": strategy_run_id, "variety": variety},
+        )
+
+    def modify_order(self, strategy_run_id: str, order_id: str, patch: Mapping[str, Any], *, variety: str = "regular") -> JsonDict:
+        return self._request(
+            "POST",
+            f"/worker/orders/{order_id}/modify",
+            json={"strategy_run_id": strategy_run_id, "variety": variety, **dict(patch)},
+        )
+
+    def preview_order(self, strategy_run_id: str, order: Mapping[str, Any], *, metadata: Optional[Mapping[str, Any]] = None) -> JsonDict:
+        return self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/preview/order",
+            json={"order": dict(order), "metadata": dict(metadata or {})},
+        )
+
+    def preview_basket(
+        self,
+        strategy_run_id: str,
+        orders: Iterable[Mapping[str, Any]],
+        *,
+        metadata: Optional[Mapping[str, Any]] = None,
+        all_or_none: bool = False,
+    ) -> JsonDict:
+        return self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/preview/basket",
+            json={
+                "orders": [dict(order) for order in orders],
+                "metadata": dict(metadata or {}),
+                "all_or_none": all_or_none,
+            },
+        )
+
+    def get_run_protection_state(self, strategy_run_id: str) -> JsonDict:
+        run = self.get_run(strategy_run_id)
+        runtime_state = dict(run.get("runtime_state") or {})
+        state = dict(runtime_state.get("backend_protection_state") or {})
+        return RunProtectionState.model_validate(state).model_dump()
+
     def get_funds(self, *, mode: str = "paper", account_scope: Optional[str] = None) -> JsonDict:
         params: JsonDict = {"mode": mode}
         if account_scope is not None:
             params["account_scope"] = account_scope
         return self._request("GET", "/worker/funds", params=params)
+
+    def get_funds_snapshot(self, *, mode: str = "paper", account_scope: Optional[str] = None) -> WorkerFundsSnapshot:
+        return WorkerFundsSnapshot.model_validate(self.get_funds(mode=mode, account_scope=account_scope))
 
     def get_run_funds(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}/funds")
@@ -168,6 +238,29 @@ class KiteAlgoWorkerClient:
 
     def get_current_candle(self, instrument: str | int, interval: str = "5minute") -> Optional[JsonDict]:
         return self.get_candles(instrument, interval=interval, lookback=1).get("current")
+
+    def get_candles_snapshot(self, instrument: str | int, interval: str = "5minute", lookback: int = 50) -> WorkerHistoricalCandles:
+        return WorkerHistoricalCandles.model_validate(self.get_candles(instrument, interval=interval, lookback=lookback))
+
+    def get_historical_candles_snapshot(
+        self,
+        instrument: str | int,
+        timeframe: str = "day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        ingest: bool = True,
+        passthrough: bool = False,
+    ) -> WorkerHistoricalCandles:
+        return WorkerHistoricalCandles.model_validate(
+            self.get_historical_candles(
+                instrument,
+                timeframe=timeframe,
+                from_date=from_date,
+                to_date=to_date,
+                ingest=ingest,
+                passthrough=passthrough,
+            )
+        )
 
     def get_historical_candles(
         self,
@@ -399,7 +492,5 @@ class KiteAlgoWorkerClient:
         try:
             body = response.json()
         except ValueError:
-            body = response.text
-        detail = body.get("detail") if isinstance(body, dict) else body
-        message = f"Worker API {method} {path} failed with HTTP {response.status_code}: {detail}"
-        raise KiteAlgoWorkerError(message, status_code=response.status_code, response_body=body)
+            body = {"raw": response.text}
+        raise error_for_status(response.status_code, body, fallback=f"Worker API returned {response.status_code} for {method} {path}")

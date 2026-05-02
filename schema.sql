@@ -2,6 +2,10 @@
 -- Assumes a clean DB (you will drop tables/volume before build).
 -- Uses IF NOT EXISTS and CREATE OR REPLACE for idempotence on repeated runs.
 
+-- Enable UUID generation helpers used by multiple tables.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
 -- =========================================
 -- Tables
 -- =========================================
@@ -98,12 +102,6 @@ ALTER TABLE public.kite_sessions
 CREATE INDEX IF NOT EXISTS idx_kite_sessions_broker_user_id
   ON public.kite_sessions (broker_user_id);
 
-CREATE TABLE IF NOT EXISTS public.fyers_sessions (
-  session_id         VARCHAR(36) PRIMARY KEY,
-  access_token       TEXT NOT NULL,
-  created_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
 -- =========================================
 -- Unified search view
 -- =========================================
@@ -151,100 +149,6 @@ CREATE OR REPLACE VIEW public.instruments_search_v AS
     NULL::VARCHAR(10)  AS option_type,
     idx.last_updated
   FROM public.kite_indices idx;
-
--- =========================================
--- Alerts schema (user-defined alerts)
--- =========================================
-
--- Enable UUID generation extensions if available (safe and idempotent)
--- If pgcrypto is unavailable, uuid-ossp provides uuid_generate_v4().
--- Note: requires sufficient DB privileges; statements are no-ops if not permitted.
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- Alerts: core table
-CREATE TABLE IF NOT EXISTS public.alerts (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  instrument_token BIGINT NOT NULL,
-  comparator TEXT NOT NULL CHECK (comparator IN ('gt', 'lt')),
-  target_type  TEXT NOT NULL CHECK (target_type IN ('absolute', 'percent')),
-  absolute_target NUMERIC(18,6),
-  percent         NUMERIC(9,6),
-  baseline_price  NUMERIC(18,6),
-  one_time BOOLEAN NOT NULL DEFAULT TRUE,
-  name  TEXT,
-  notes TEXT,
-  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('draft', 'active', 'paused', 'canceled', 'triggered')),
-  instrument_exchange     TEXT,
-  instrument_tradingsymbol TEXT,
-  ltp_source_hint TEXT,
-  last_evaluated_price NUMERIC(18,6),
-  triggered_at TIMESTAMP WITH TIME ZONE,
-  created_at   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-  updated_at   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-  -- Consistency: absolute vs percent target semantics
-  CONSTRAINT alerts_abs_or_pct_chk CHECK (
-    (target_type = 'absolute' AND absolute_target IS NOT NULL AND percent IS NULL)
-    OR
-    (target_type = 'percent' AND percent IS NOT NULL)
-  )
-);
-
--- Migration-safe additions for legacy alerts table (idempotent)
--- Ensure required columns exist before index creation.
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS instrument_token BIGINT;
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS comparator TEXT;
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS target_type TEXT;
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS absolute_target NUMERIC(18,6);
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS percent NUMERIC(9,6);
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS baseline_price NUMERIC(18,6);
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS one_time BOOLEAN DEFAULT TRUE;
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS name TEXT;
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS notes TEXT;
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active';
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS instrument_exchange TEXT;
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS instrument_tradingsymbol TEXT;
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS ltp_source_hint TEXT;
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS last_evaluated_price NUMERIC(18,6);
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS triggered_at TIMESTAMP WITH TIME ZONE;
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
-
--- Compatibility shim: legacy code expects alerts.uuid; mirror of id (UUID)
-ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS uuid UUID GENERATED ALWAYS AS (id) STORED;
--- Unique index to support ON CONFLICT (uuid)
-CREATE UNIQUE INDEX IF NOT EXISTS ux_alerts_uuid ON public.alerts (uuid);
-
--- Indexes for scans and evaluation
-CREATE INDEX IF NOT EXISTS idx_alerts_status ON public.alerts (status);
--- Composite indexes (both orders to satisfy different access paths)
-CREATE INDEX IF NOT EXISTS idx_alerts_token_status ON public.alerts (instrument_token, status);
-CREATE INDEX IF NOT EXISTS idx_alerts_status_token ON public.alerts (status, instrument_token);
--- Active-only partial index useful for quick active-set selections
-CREATE INDEX IF NOT EXISTS idx_alerts_active_partial ON public.alerts (id) WHERE status = 'active';
-
--- Alert events table
-CREATE TABLE IF NOT EXISTS public.alert_events (
-  id BIGSERIAL PRIMARY KEY,
-  alert_id UUID NOT NULL REFERENCES public.alerts(id) ON DELETE CASCADE,
-  instrument_token BIGINT NOT NULL,
-  event_type TEXT NOT NULL CHECK (event_type IN ('created','updated','activated','paused','resumed','canceled','triggered','reactivated','deleted')),
-  price_at_event NUMERIC(18,6),
-  direction TEXT CHECK (direction IN ('cross_up','cross_down')),
-  reason TEXT,
-  meta JSONB,
-  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-);
-
--- Useful indexes for event queries
-CREATE INDEX IF NOT EXISTS idx_alert_events_alert_id ON public.alert_events (alert_id);
-CREATE INDEX IF NOT EXISTS idx_alert_events_created_at ON public.alert_events (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_alert_events_alert_id_created_at ON public.alert_events (alert_id, created_at);
-
--- Enforce one-time trigger semantics: only one 'triggered' event per alert
-CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_events_triggered_once
-  ON public.alert_events (alert_id)
-  WHERE event_type = 'triggered';
 
 -- =========================================
 -- Ingestion and Ticker-Specific Data
@@ -1005,6 +909,32 @@ CREATE TABLE IF NOT EXISTS public.option_strategy_runs (
 CREATE INDEX IF NOT EXISTS idx_option_strategy_runs_created ON public.option_strategy_runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_option_strategy_runs_mode_status ON public.option_strategy_runs(execution_mode, status, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS public.option_run_states (
+    strategy_run_id TEXT PRIMARY KEY,
+    strategy_name TEXT NOT NULL,
+    product VARCHAR(8) NOT NULL CHECK (product IN ('MIS', 'NRML')),
+    status VARCHAR(64) NOT NULL,
+    legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    protection JSONB,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    orders JSONB NOT NULL DEFAULT '[]'::jsonb,
+    trades JSONB NOT NULL DEFAULT '[]'::jsonb,
+    completed_legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    failed_legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    pending_legs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_option_run_states_status
+    ON public.option_run_states(status);
+
+CREATE INDEX IF NOT EXISTS idx_option_run_states_updated
+    ON public.option_run_states(updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_option_run_states_product
+    ON public.option_run_states(product);
+
 -- =========================================
 -- Portfolio snapshots and history
 -- =========================================
@@ -1166,20 +1096,273 @@ CREATE TABLE IF NOT EXISTS public.journal_source_links (
     source_key TEXT NOT NULL,
     source_key_2 TEXT,
     linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT journal_source_links_source_type_chk CHECK (source_type IN ('live_order', 'paper_trade', 'paper_order', 'option_strategy_run', 'algo_instance', 'investing_strategy', 'live_fill', 'broker_import'))
+    CONSTRAINT journal_source_links_source_type_chk CHECK (source_type IN ('live_order', 'paper_trade', 'paper_order', 'paper_strategy_run', 'option_strategy_run', 'algo_instance', 'investing_strategy', 'live_fill', 'broker_import'))
 );
 
 ALTER TABLE public.journal_source_links
     DROP CONSTRAINT IF EXISTS journal_source_links_source_type_chk;
 
 ALTER TABLE public.journal_source_links
-    ADD CONSTRAINT journal_source_links_source_type_chk CHECK (source_type IN ('live_order', 'paper_trade', 'paper_order', 'option_strategy_run', 'algo_instance', 'investing_strategy', 'live_fill', 'broker_import'));
+    ADD CONSTRAINT journal_source_links_source_type_chk CHECK (source_type IN ('live_order', 'paper_trade', 'paper_order', 'paper_strategy_run', 'option_strategy_run', 'algo_instance', 'investing_strategy', 'live_fill', 'broker_import'));
 
 CREATE INDEX IF NOT EXISTS idx_journal_source_links_run
     ON public.journal_source_links (run_id, linked_at DESC);
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_source_links_source_key
     ON public.journal_source_links (source_type, source_key, COALESCE(source_key_2, ''));
+
+-- Journal V2 foundation: execution environments, strategy identity, contexts, episodes, intents
+CREATE TABLE IF NOT EXISTS public.journal_execution_environments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    mode TEXT NOT NULL CHECK (mode IN ('live', 'paper', 'dry_run_preview')),
+    account_scope TEXT NOT NULL,
+    broker_user_id TEXT,
+    paper_account_key TEXT,
+    environment_epoch INTEGER NOT NULL DEFAULT 1,
+    display_name TEXT,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    retired_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_execution_environments_identity
+    ON public.journal_execution_environments (
+        mode,
+        account_scope,
+        COALESCE(broker_user_id, ''),
+        COALESCE(paper_account_key, ''),
+        environment_epoch
+    );
+
+CREATE INDEX IF NOT EXISTS idx_journal_execution_environments_mode_scope
+    ON public.journal_execution_environments (mode, account_scope);
+
+CREATE TABLE IF NOT EXISTS public.journal_strategy_templates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_family TEXT NOT NULL,
+    template_key TEXT NOT NULL,
+    display_name TEXT,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_strategy_templates_template_key
+    ON public.journal_strategy_templates (template_key);
+
+CREATE TABLE IF NOT EXISTS public.journal_strategy_variants (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    template_id UUID NOT NULL REFERENCES public.journal_strategy_templates(id) ON DELETE CASCADE,
+    variant_key TEXT NOT NULL,
+    display_name TEXT,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_strategy_variants_template_variant
+    ON public.journal_strategy_variants (template_id, variant_key);
+
+CREATE TABLE IF NOT EXISTS public.journal_strategy_deployments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    template_id UUID NOT NULL REFERENCES public.journal_strategy_templates(id) ON DELETE CASCADE,
+    variant_id UUID REFERENCES public.journal_strategy_variants(id) ON DELETE SET NULL,
+    deployment_key TEXT NOT NULL,
+    display_name TEXT,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_strategy_deployments_template_deployment
+    ON public.journal_strategy_deployments (template_id, deployment_key);
+
+CREATE TABLE IF NOT EXISTS public.journal_execution_contexts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    environment_id UUID NOT NULL REFERENCES public.journal_execution_environments(id) ON DELETE RESTRICT,
+    source_system TEXT NOT NULL,
+    external_run_id TEXT NOT NULL,
+    strategy_template_id UUID REFERENCES public.journal_strategy_templates(id) ON DELETE SET NULL,
+    strategy_variant_id UUID REFERENCES public.journal_strategy_variants(id) ON DELETE SET NULL,
+    strategy_deployment_id UUID REFERENCES public.journal_strategy_deployments(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    closed_at TIMESTAMPTZ,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_execution_contexts_environment_source_external
+    ON public.journal_execution_contexts (environment_id, source_system, external_run_id);
+
+CREATE TABLE IF NOT EXISTS public.journal_episodes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    environment_id UUID NOT NULL REFERENCES public.journal_execution_environments(id) ON DELETE RESTRICT,
+    execution_context_id UUID NOT NULL REFERENCES public.journal_execution_contexts(id) ON DELETE CASCADE,
+    episode_seq INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    closed_at TIMESTAMPTZ,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_episodes_context_seq
+    ON public.journal_episodes (execution_context_id, episode_seq);
+
+CREATE INDEX IF NOT EXISTS idx_journal_episodes_environment_status_opened
+    ON public.journal_episodes (environment_id, status, opened_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.journal_episode_legs (
+    id BIGSERIAL PRIMARY KEY,
+    episode_id UUID NOT NULL REFERENCES public.journal_episodes(id) ON DELETE CASCADE,
+    leg_seq INTEGER NOT NULL DEFAULT 1,
+    instrument_token BIGINT,
+    exchange TEXT,
+    tradingsymbol TEXT,
+    product TEXT,
+    direction TEXT CHECK (direction IN ('long', 'short')),
+    opened_quantity INT NOT NULL DEFAULT 0,
+    closed_quantity INT NOT NULL DEFAULT 0,
+    net_quantity INT NOT NULL DEFAULT 0,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_episode_legs_episode_leg_seq
+    ON public.journal_episode_legs (episode_id, leg_seq);
+
+CREATE TABLE IF NOT EXISTS public.journal_execution_intents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    environment_id UUID NOT NULL REFERENCES public.journal_execution_environments(id) ON DELETE RESTRICT,
+    execution_context_id UUID REFERENCES public.journal_execution_contexts(id) ON DELETE SET NULL,
+    episode_id UUID REFERENCES public.journal_episodes(id) ON DELETE SET NULL,
+    channel TEXT,
+    intent_type TEXT,
+    idempotency_key TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ,
+    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_execution_intents_environment_idempotency
+    ON public.journal_execution_intents (environment_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.journal_timeline_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    environment_id UUID NOT NULL REFERENCES public.journal_execution_environments(id) ON DELETE RESTRICT,
+    episode_id UUID REFERENCES public.journal_episodes(id) ON DELETE SET NULL,
+    execution_context_id UUID REFERENCES public.journal_execution_contexts(id) ON DELETE SET NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    channel TEXT,
+    event_type TEXT NOT NULL,
+    actor_type TEXT NOT NULL DEFAULT 'system',
+    correlation_id TEXT,
+    causation_id TEXT,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_timeline_episode_time
+    ON public.journal_timeline_events (episode_id, occurred_at ASC)
+    WHERE episode_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_journal_timeline_environment_subject_time
+    ON public.journal_timeline_events (environment_id, subject_type, subject_id, occurred_at ASC);
+
+CREATE TABLE IF NOT EXISTS public.journal_notes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    environment_id UUID NOT NULL REFERENCES public.journal_execution_environments(id) ON DELETE RESTRICT,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    episode_id UUID REFERENCES public.journal_episodes(id) ON DELETE SET NULL,
+    note_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body_markdown TEXT NOT NULL,
+    body_text TEXT NOT NULL DEFAULT '',
+    body_json JSONB,
+    effective_at TIMESTAMPTZ,
+    author_id TEXT,
+    tags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    archived_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_notes_environment_subject
+    ON public.journal_notes (environment_id, subject_type, subject_id, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_notes_episode_updated
+    ON public.journal_notes (episode_id, updated_at DESC)
+    WHERE episode_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.journal_note_revisions (
+    id BIGSERIAL PRIMARY KEY,
+    note_id UUID NOT NULL REFERENCES public.journal_notes(id) ON DELETE CASCADE,
+    revision_no INTEGER NOT NULL,
+    body_markdown TEXT NOT NULL,
+    body_text TEXT NOT NULL DEFAULT '',
+    editor_id TEXT,
+    edited_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    change_reason TEXT,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_note_revisions_note_revision
+    ON public.journal_note_revisions (note_id, revision_no);
+
+CREATE TABLE IF NOT EXISTS public.journal_attachments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    environment_id UUID NOT NULL REFERENCES public.journal_execution_environments(id) ON DELETE RESTRICT,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    note_id UUID REFERENCES public.journal_notes(id) ON DELETE SET NULL,
+    storage_key TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    sha256 TEXT,
+    size_bytes BIGINT,
+    ocr_text TEXT,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_attachments_environment_subject_created
+    ON public.journal_attachments (environment_id, subject_type, subject_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_attachments_note_created
+    ON public.journal_attachments (note_id, created_at DESC)
+    WHERE note_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.journal_unresolved_queue (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    environment_id UUID NOT NULL REFERENCES public.journal_execution_environments(id) ON DELETE RESTRICT,
+    execution_context_id UUID REFERENCES public.journal_execution_contexts(id) ON DELETE SET NULL,
+    source_system TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    raw_identity_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    candidate_mappings_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved', 'ignored')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_unresolved_queue_environment_created
+    ON public.journal_unresolved_queue (environment_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_unresolved_queue_status_created
+    ON public.journal_unresolved_queue (status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS public.journal_execution_facts (
     id BIGSERIAL PRIMARY KEY,
@@ -1201,11 +1384,45 @@ CREATE TABLE IF NOT EXISTS public.journal_execution_facts (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS environment_id UUID;
+
+ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS episode_id UUID;
+
+ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS intent_id UUID;
+
+ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS position_effect TEXT;
+
+ALTER TABLE public.journal_execution_facts
+    DROP CONSTRAINT IF EXISTS journal_execution_facts_position_effect_chk;
+
+ALTER TABLE public.journal_execution_facts
+    ADD CONSTRAINT journal_execution_facts_position_effect_chk
+    CHECK (position_effect IS NULL OR position_effect IN ('open', 'add', 'reduce', 'close', 'flip')) NOT VALID;
+
 CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_execution_facts_source_fact
     ON public.journal_execution_facts (source_type, source_fact_key);
 
 CREATE INDEX IF NOT EXISTS idx_journal_execution_facts_run_time
     ON public.journal_execution_facts (run_id, fill_timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_execution_facts_environment_episode_fill_time
+    ON public.journal_execution_facts (environment_id, episode_id, fill_timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS public.journal_v2_projection_claims (
+    source_type TEXT NOT NULL,
+    source_fact_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'projected', 'failed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (source_type, source_fact_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_v2_projection_claims_status_updated
+    ON public.journal_v2_projection_claims (status, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS public.journal_decision_events (
     id BIGSERIAL PRIMARY KEY,
@@ -1318,6 +1535,15 @@ CREATE TABLE IF NOT EXISTS public.journal_metric_snapshots (
     metrics_json JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
+ALTER TABLE public.journal_metric_snapshots
+    ADD COLUMN IF NOT EXISTS environment_id UUID;
+
+ALTER TABLE public.journal_metric_snapshots
+    ADD COLUMN IF NOT EXISTS identity_rule_version TEXT NOT NULL DEFAULT 'v1_legacy';
+
+ALTER TABLE public.journal_metric_snapshots
+    ADD COLUMN IF NOT EXISTS grouping_rule_version TEXT NOT NULL DEFAULT 'v1_legacy';
+
 DO $$
 BEGIN
     IF EXISTS (
@@ -1331,11 +1557,37 @@ BEGIN
     END IF;
 END $$;
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_metric_snapshots_subject_window_version
-    ON public.journal_metric_snapshots (subject_type, subject_id, time_window, calc_version);
+DROP INDEX IF EXISTS public.ux_journal_metric_snapshots_subject_window_version;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_metric_snapshots_legacy_subject_window_version
+    ON public.journal_metric_snapshots (subject_type, subject_id, time_window, calc_version)
+    WHERE environment_id IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_metric_snapshots_v2_environment_subject_window_version
+    ON public.journal_metric_snapshots (
+        environment_id,
+        subject_type,
+        subject_id,
+        time_window,
+        calc_version,
+        identity_rule_version,
+        grouping_rule_version
+    )
+    WHERE environment_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_journal_metric_snapshots_lookup
     ON public.journal_metric_snapshots (subject_type, subject_id, computed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_metric_snapshots_environment_subject_window_version
+    ON public.journal_metric_snapshots (
+        environment_id,
+        subject_type,
+        subject_id,
+        time_window,
+        calc_version,
+        identity_rule_version,
+        grouping_rule_version
+    );
 
 CREATE TABLE IF NOT EXISTS public.journal_projection_state (
     projector_name TEXT PRIMARY KEY,

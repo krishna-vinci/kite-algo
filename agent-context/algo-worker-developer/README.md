@@ -36,12 +36,29 @@ If this context pack and the canonical files disagree, trust the canonical files
 ## Current SDK release
 
 - Package name: `kite-algo-worker`
-- Version: `0.4.0`
-- Git tag: `kite-algo-worker-v0.4.0`
+- Version: `0.6.0`
+- Git tag: `kite-algo-worker-v0.6.0`
+
+Current hardened core surface:
+
+- lifecycle and recovery: `health()`, `heartbeat(...)`, `create_run(...)`, `get_run(...)`
+- accounting: `get_funds(...)`, `get_run_funds(...)`, `get_run_pnl(...)`, `stream_run_pnl(...)`
+- execution control: `list_orders(...)`, `list_trades(...)`, `preview_order(...)`, `preview_basket(...)`, `place_order(...)`, `place_basket(...)`, `exit_run(...)`
+- market data: `resolve_ticker(...)`, `search_tickers(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `stream_candles(...)`, `get_historical_candles(...)`, `get_market_snapshot(...)`
+- recovery helpers: `wait_for_history(...)` and the websocket client for reconnectable streams
+
+The certification script now prints preview output and capability flags for this surface.
 
 Remote install:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.4.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
+
+This release adds:
+
+- grouped order/trade inspection and order lifecycle helpers
+- live order/basket preview APIs for sizing and charges checks
+- async SDK support plus websocket clients for ticks, candles, and grouped run P&L
+- safer worker ergonomics such as `ensure_run(...)`, `wait_for_history(...)`, and `live_equity_market_order(...)`
 ```

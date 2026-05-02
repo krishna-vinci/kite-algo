@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
+import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -29,26 +30,49 @@ from .metrics import (
     win_rate,
 )
 from .models import (
+    CapitalBasisType,
     BenchmarkDailyPrice,
     BenchmarkDefinition,
+    ExecutionMode,
     JournalDecisionEvent,
     JournalEquityPoint,
     JournalExecutionFact,
     JournalMetricSnapshot,
     JournalRule,
+    JournalRunStatus,
     JournalRun,
+    JournalTimelineActorType,
+    JournalTimelineEvent,
+    ReviewState,
     JournalSourceLink,
     ProjectionState,
     SourceType,
+    StrategyFamily,
 )
 from .repository import JournalRepository
+from .v2.environment import resolve_environment_key
+from .v2.episodes import classify_position_effect, next_episode_sequence
+from .v2.identity import (
+    is_low_confidence_resolution,
+    resolve_strategy_identity,
+    unresolved_reason_for_identity,
+)
+from .v2.metrics import (
+    build_environment_episode_metrics,
+    build_episode_outcome,
+    build_paper_live_comparison,
+    build_strategy_template_scorecards,
+)
+from .v2.notes import markdown_to_search_text
 
 
 ZERO = Decimal("0")
 DEFAULT_CALC_VERSION = "v1"
+DEFAULT_V2_CALC_VERSION = "journal_v2_metrics_v1"
 DEFAULT_BENCHMARK_IDS = ("NIFTY50",)
 AGGREGATE_WINDOWS = ("day", "week", "month", "year", "since_inception")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -178,9 +202,922 @@ def _looks_like_uuid(value: str) -> bool:
     return bool(UUID_RE.match(str(value or "").strip()))
 
 
+def _require_uuid(name: str, value: str | None) -> str:
+    normalized = str(value or "").strip()
+    if not _looks_like_uuid(normalized):
+        raise ValueError(f"{name} must be a valid UUID")
+    return normalized
+
+
 class JournalService:
     def __init__(self, repository: Optional[JournalRepository] = None) -> None:
         self.repository = repository or JournalRepository()
+
+    def resolve_v2_environment_id(
+        self,
+        *,
+        environment_id: str | None = None,
+        mode: str | None = None,
+        account_scope: str | None = None,
+        broker_user_id: str | None = None,
+        paper_account_key: str | None = None,
+        environment_epoch: int | None = None,
+    ) -> str:
+        normalized_environment_id = str(environment_id or "").strip()
+        if normalized_environment_id:
+            if not _looks_like_uuid(normalized_environment_id):
+                raise ValueError("environment_id must be a valid UUID")
+            environment = self.repository.get_execution_environment(normalized_environment_id)
+            if environment is None:
+                raise LookupError(f"Unknown environment_id: {normalized_environment_id}")
+            return str(environment.id)
+
+        normalized_mode = str(mode or "").strip()
+        normalized_scope = str(account_scope or "").strip()
+        if not normalized_mode or not normalized_scope:
+            raise ValueError("environment context requires either environment_id or mode + account_scope")
+
+        resolved = resolve_environment_key(
+            mode=normalized_mode,
+            account_scope=normalized_scope,
+            broker_user_id=broker_user_id,
+            paper_account_key=paper_account_key,
+            environment_epoch=int(environment_epoch or 1),
+        )
+        return self.repository.ensure_execution_environment(
+            mode=str(getattr(resolved.mode, "value", resolved.mode)),
+            account_scope=resolved.account_scope,
+            broker_user_id=resolved.broker_user_id,
+            paper_account_key=resolved.paper_account_key,
+            environment_epoch=resolved.environment_epoch,
+            display_name=resolved.display_name,
+            metadata=resolved.metadata,
+        )
+
+    def list_v2_environments(self, *, mode: str | None = None) -> List[Dict[str, Any]]:
+        normalized_mode = str(mode).strip() if mode is not None else None
+        environments = self.repository.list_execution_environments(mode=normalized_mode)
+        return [_serialize_decimal(item.model_dump(mode="python")) for item in environments]
+
+    def list_v2_episodes(
+        self,
+        *,
+        environment_id: str,
+        execution_context_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        normalized_environment_id = _require_uuid("environment_id", environment_id)
+        normalized_context_id = None
+        if execution_context_id is not None:
+            normalized_context_id = _require_uuid("execution_context_id", execution_context_id)
+            self._ensure_v2_context_in_environment(normalized_context_id, normalized_environment_id)
+        episodes = self.repository.list_episodes(
+            environment_id=normalized_environment_id,
+            execution_context_id=normalized_context_id,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        return [_serialize_decimal(item.model_dump(mode="python")) for item in episodes]
+
+    def get_v2_episode_detail(self, episode_id: str, *, environment_id: str) -> Dict[str, Any] | None:
+        normalized_environment_id = _require_uuid("environment_id", environment_id)
+        normalized_episode_id = str(episode_id or "").strip()
+        if not _looks_like_uuid(normalized_episode_id):
+            raise ValueError("episode_id must be a valid UUID")
+        episode = self.repository.get_episode_detail(normalized_episode_id)
+        if episode is None:
+            return None
+        if str(episode.environment_id) != normalized_environment_id:
+            raise ValueError("episode_id does not belong to environment_id")
+        return _serialize_decimal(episode.model_dump(mode="python"))
+
+    def list_v2_timeline(
+        self,
+        *,
+        episode_id: str,
+        environment_id: str,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        normalized_environment_id = _require_uuid("environment_id", environment_id)
+        normalized_episode_id = _require_uuid("episode_id", episode_id)
+        episode = self.repository.get_episode_detail(normalized_episode_id)
+        if episode is None:
+            raise LookupError(f"Unknown episode_id: {normalized_episode_id}")
+        if str(episode.environment_id) != normalized_environment_id:
+            raise ValueError("episode_id does not belong to environment_id")
+        events = self.repository.list_timeline_events(
+            environment_id=normalized_environment_id,
+            episode_id=normalized_episode_id,
+            limit=limit,
+            offset=offset,
+        )
+        return [_serialize_decimal(item.model_dump(mode="python")) for item in events]
+
+    def _ensure_v2_episode_in_environment(self, episode_id: str, environment_id: str) -> None:
+        normalized_episode_id = _require_uuid("episode_id", episode_id)
+        episode = self.repository.get_episode_detail(normalized_episode_id)
+        if episode is None:
+            raise LookupError(f"Unknown episode_id: {normalized_episode_id}")
+        if str(episode.environment_id) != str(environment_id):
+            raise ValueError("episode_id does not belong to environment_id")
+
+    def _ensure_v2_context_in_environment(self, execution_context_id: str, environment_id: str) -> None:
+        normalized_context_id = _require_uuid("execution_context_id", execution_context_id)
+        context = self.repository.get_execution_context(normalized_context_id)
+        if context is None:
+            raise LookupError(f"Unknown execution_context_id: {normalized_context_id}")
+        if str(context.environment_id) != str(environment_id):
+            raise ValueError("execution_context_id does not belong to environment_id")
+
+    def _ensure_v2_note_in_environment(self, note_id: str, environment_id: str) -> None:
+        normalized_note_id = _require_uuid("note_id", note_id)
+        note = self.repository.get_note(normalized_note_id)
+        if note is None:
+            raise LookupError(f"Unknown note_id: {normalized_note_id}")
+        if str(note.environment_id) != str(environment_id):
+            raise ValueError("note_id does not belong to environment_id")
+
+    def append_timeline_event(
+        self,
+        *,
+        environment_id: str,
+        subject_type: str,
+        subject_id: str,
+        event_type: str,
+        episode_id: str | None = None,
+        execution_context_id: str | None = None,
+        channel: str | None = None,
+        actor_type: str = "system",
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+        occurred_at: datetime | None = None,
+        payload: Dict[str, Any] | None = None,
+    ) -> str:
+        normalized_environment_id = _require_uuid("environment_id", environment_id)
+        if episode_id is not None:
+            episode_id = _require_uuid("episode_id", episode_id)
+            self._ensure_v2_episode_in_environment(episode_id, normalized_environment_id)
+        if execution_context_id is not None:
+            execution_context_id = _require_uuid("execution_context_id", execution_context_id)
+            self._ensure_v2_context_in_environment(execution_context_id, normalized_environment_id)
+        try:
+            resolved_actor_type = JournalTimelineActorType(str(actor_type or "system"))
+        except ValueError as exc:
+            raise ValueError("actor_type must be one of: system, user, algo") from exc
+        event = JournalTimelineEvent(
+            environment_id=normalized_environment_id,
+            episode_id=episode_id,
+            execution_context_id=execution_context_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            channel=channel,
+            event_type=event_type,
+            actor_type=resolved_actor_type,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            occurred_at=occurred_at or _utcnow(),
+            payload=payload or {},
+        )
+        return self.repository.append_timeline_event(event)
+
+    def _append_timeline_event_best_effort(self, **kwargs: Any) -> None:
+        try:
+            self.append_timeline_event(**kwargs)
+        except Exception:
+            logger.warning("journal_v2.timeline_emit_failed", extra={"timeline": kwargs}, exc_info=True)
+
+    def ensure_v2_episode(
+        self,
+        *,
+        environment_id: str,
+        execution_context_id: str,
+        episode_seq: int | None = None,
+        status: str = "draft",
+        opened_at: datetime | None = None,
+        metadata: Dict[str, Any] | None = None,
+    ) -> str:
+        episode_id = self.repository.ensure_episode(
+            environment_id=environment_id,
+            execution_context_id=execution_context_id,
+            episode_seq=episode_seq,
+            status=status,
+            opened_at=opened_at,
+            metadata=metadata,
+        )
+        self._append_timeline_event_best_effort(
+            environment_id=environment_id,
+            execution_context_id=execution_context_id,
+            episode_id=episode_id,
+            subject_type="episode",
+            subject_id=episode_id,
+            channel="lifecycle",
+            event_type="episode_opened",
+            payload={"status": status, "episode_seq": episode_seq},
+            occurred_at=opened_at,
+        )
+        return episode_id
+
+    def close_v2_episode(
+        self,
+        episode_id: str,
+        *,
+        status: str = "closed",
+        closed_at: datetime | None = None,
+        metadata: Dict[str, Any] | None = None,
+    ) -> None:
+        episode = self.repository.get_episode_detail(episode_id)
+        if episode is None:
+            raise LookupError(f"Unknown episode_id: {episode_id}")
+        self.repository.update_episode_status(
+            episode_id,
+            status=status,
+            closed_at=closed_at,
+            metadata=metadata,
+        )
+        self._append_timeline_event_best_effort(
+            environment_id=str(episode.environment_id),
+            execution_context_id=str(episode.execution_context_id),
+            episode_id=episode_id,
+            subject_type="episode",
+            subject_id=episode_id,
+            channel="lifecycle",
+            event_type="episode_closed",
+            payload={"status": status},
+            occurred_at=closed_at,
+        )
+
+    def create_v2_execution_intent(
+        self,
+        *,
+        environment_id: str,
+        execution_context_id: str | None = None,
+        episode_id: str | None = None,
+        channel: str | None = None,
+        intent_type: str | None = None,
+        idempotency_key: str | None = None,
+        status: str = "pending",
+        requested_at: datetime | None = None,
+        payload: Dict[str, Any] | None = None,
+        metadata: Dict[str, Any] | None = None,
+    ) -> str:
+        intent_id = self.repository.create_execution_intent(
+            environment_id=environment_id,
+            execution_context_id=execution_context_id,
+            episode_id=episode_id,
+            channel=channel,
+            intent_type=intent_type,
+            idempotency_key=idempotency_key,
+            status=status,
+            requested_at=requested_at,
+            payload=payload,
+            metadata=metadata,
+        )
+        self._append_timeline_event_best_effort(
+            environment_id=environment_id,
+            execution_context_id=execution_context_id,
+            episode_id=episode_id,
+            subject_type="intent",
+            subject_id=intent_id,
+            channel=channel,
+            event_type="intent_created",
+            payload={"intent_type": intent_type, "status": status},
+            occurred_at=requested_at,
+        )
+        return intent_id
+
+    def list_v2_strategies(self, *, environment_id: str) -> Dict[str, Any]:
+        environment_id = _require_uuid("environment_id", environment_id)
+        environment = self.repository.get_execution_environment(environment_id)
+        if environment is None:
+            raise LookupError(f"Unknown environment_id: {environment_id}")
+
+        items: List[Dict[str, Any]] = []
+        for template in self.repository.list_strategy_templates_for_environment(environment_id=environment_id):
+            template_id = str(template.get("template_id") or "")
+            if not template_id:
+                continue
+            items.append(
+                _serialize_decimal(
+                    {
+                        "template_id": template_id,
+                        "strategy_family": template.get("strategy_family") or "unknown_strategy",
+                        "template_key": template.get("template_key") or template_id,
+                        "display_name": template.get("display_name") or template.get("template_key") or template_id,
+                        "deployment_count": 0,
+                        "deployments": [],
+                    }
+                )
+            )
+
+        return {
+            "environment_id": environment_id,
+            "items": items,
+            "count": len(items),
+        }
+
+    def list_v2_unresolved(self, *, environment_id: str) -> Dict[str, Any]:
+        environment_id = _require_uuid("environment_id", environment_id)
+        environment = self.repository.get_execution_environment(environment_id)
+        if environment is None:
+            raise LookupError(f"Unknown environment_id: {environment_id}")
+        items = [
+            _serialize_decimal(item)
+            for item in self.repository.list_unresolved_items(environment_id=environment_id)
+        ]
+        return {
+            "environment_id": environment_id,
+            "items": items,
+            "count": len(items),
+        }
+
+    def compute_v2_environment_metrics(self, *, environment_id: str, calc_version: str = DEFAULT_V2_CALC_VERSION) -> Dict[str, Any]:
+        environment_id = _require_uuid("environment_id", environment_id)
+        environment = self.repository.get_execution_environment(environment_id)
+        if environment is None:
+            raise LookupError(f"Unknown environment_id: {environment_id}")
+
+        closed_episodes = self.repository.list_closed_episodes(environment_id=environment_id, limit=5000)
+        outcomes = []
+        for episode in closed_episodes:
+            facts = self.repository.list_execution_facts_for_episode(str(episode.id))
+            outcomes.append(build_episode_outcome(episode=episode, facts=facts))
+        metrics = build_environment_episode_metrics(outcomes)
+        self.repository.replace_metric_snapshot(
+            JournalMetricSnapshot(
+                environment_id=environment_id,
+                subject_type="environment",
+                subject_id=environment_id,
+                window="since_inception",
+                calc_version=calc_version,
+                identity_rule_version="journal_v2_identity_v1",
+                grouping_rule_version="journal_v2_grouping_v1",
+                computed_at=_utcnow(),
+                metrics=metrics,
+            )
+        )
+        return {
+            "environment_id": environment_id,
+            "closed_episode_count": len(closed_episodes),
+            "metrics": _serialize_decimal(metrics),
+        }
+
+    def compute_v2_environment_strategy_metrics(
+        self,
+        *,
+        environment_id: str,
+        calc_version: str = DEFAULT_V2_CALC_VERSION,
+    ) -> Dict[str, Any]:
+        environment_id = _require_uuid("environment_id", environment_id)
+        environment = self.repository.get_execution_environment(environment_id)
+        if environment is None:
+            raise LookupError(f"Unknown environment_id: {environment_id}")
+
+        rows: list[dict[str, Any]] = []
+        for template_row in self.repository.list_strategy_templates_for_environment(environment_id=environment_id):
+            template_id = str(template_row.get("template_id") or "")
+            if not template_id:
+                continue
+            closed_episodes = self.repository.list_closed_episodes_for_environment_template(
+                environment_id=environment_id,
+                template_id=template_id,
+                limit=5000,
+            )
+            outcomes = [
+                build_episode_outcome(
+                    episode=episode,
+                    facts=self.repository.list_execution_facts_for_episode(str(episode.id)),
+                )
+                for episode in closed_episodes
+            ]
+            metrics = build_environment_episode_metrics(outcomes)
+            self.repository.replace_metric_snapshot(
+                JournalMetricSnapshot(
+                    environment_id=environment_id,
+                    subject_type="strategy_template",
+                    subject_id=template_id,
+                    window="since_inception",
+                    calc_version=calc_version,
+                    identity_rule_version="journal_v2_identity_v1",
+                    grouping_rule_version="journal_v2_grouping_v1",
+                    computed_at=_utcnow(),
+                    metrics=metrics,
+                )
+            )
+            rows.append(
+                {
+                    "template_id": template_id,
+                    "strategy_family": template_row.get("strategy_family") or "unknown_strategy",
+                    "display_name": template_row.get("display_name") or template_row.get("template_key") or template_id,
+                    "metrics": _serialize_decimal(metrics),
+                }
+            )
+
+        scorecards = [
+            _serialize_decimal(
+                {
+                    "template_id": scorecard.template_id,
+                    "strategy_family": scorecard.strategy_family,
+                    "display_name": scorecard.display_name,
+                    "metrics": scorecard.metrics,
+                }
+            )
+            for scorecard in build_strategy_template_scorecards(rows)
+        ]
+        return {"environment_id": environment_id, "items": scorecards, "count": len(scorecards)}
+
+    def compare_v2_paper_live_for_template(
+        self,
+        *,
+        template_id: str,
+        paper_environment_id: str,
+        live_environment_id: str,
+        calc_version: str = DEFAULT_V2_CALC_VERSION,
+    ) -> Dict[str, Any]:
+        normalized_template_id = str(template_id or "").strip()
+        if not normalized_template_id:
+            raise ValueError("template_id is required")
+        paper_environment_id = _require_uuid("paper_environment_id", paper_environment_id)
+        live_environment_id = _require_uuid("live_environment_id", live_environment_id)
+
+        paper_environment = self.repository.get_execution_environment(paper_environment_id)
+        if paper_environment is None:
+            raise LookupError(f"Unknown paper_environment_id: {paper_environment_id}")
+        live_environment = self.repository.get_execution_environment(live_environment_id)
+        if live_environment is None:
+            raise LookupError(f"Unknown live_environment_id: {live_environment_id}")
+        if str(getattr(paper_environment.mode, "value", paper_environment.mode)) != "paper":
+            raise ValueError("paper_environment_id must reference a paper environment")
+        if str(getattr(live_environment.mode, "value", live_environment.mode)) != "live":
+            raise ValueError("live_environment_id must reference a live environment")
+
+        def _metrics_for_environment(environment_id: str) -> dict[str, Any]:
+            episodes = self.repository.list_closed_episodes_for_environment_template(
+                environment_id=environment_id,
+                template_id=normalized_template_id,
+                limit=5000,
+            )
+            outcomes = [
+                build_episode_outcome(
+                    episode=episode,
+                    facts=self.repository.list_execution_facts_for_episode(str(episode.id)),
+                )
+                for episode in episodes
+            ]
+            metrics = build_environment_episode_metrics(outcomes)
+            return _serialize_decimal(metrics)
+
+        paper_metrics = _metrics_for_environment(paper_environment_id)
+        live_metrics = _metrics_for_environment(live_environment_id)
+        payload = build_paper_live_comparison(
+            template_id=normalized_template_id,
+            paper_metrics=paper_metrics,
+            live_metrics=live_metrics,
+        )
+        payload["paper_environment_id"] = paper_environment_id
+        payload["live_environment_id"] = live_environment_id
+        return _serialize_decimal(payload)
+
+    def recompute_v2_metrics(
+        self,
+        *,
+        environment_id: str,
+        subject_type: str,
+        subject_id: str,
+        window: str = "since_inception",
+        calc_version: str = DEFAULT_V2_CALC_VERSION,
+    ) -> Dict[str, Any]:
+        environment_id = _require_uuid("environment_id", environment_id)
+        normalized_subject_type = str(subject_type or "").strip()
+        normalized_window = _normalize_period(window)
+        if normalized_window != "since_inception":
+            raise ValueError("V2 recompute currently supports window=since_inception only")
+
+        if normalized_subject_type == "environment":
+            return self.compute_v2_environment_metrics(environment_id=environment_id, calc_version=calc_version)
+
+        if normalized_subject_type == "strategy_template":
+            episodes = self.repository.list_closed_episodes_for_environment_template(
+                environment_id=environment_id,
+                template_id=subject_id,
+                limit=5000,
+            )
+        elif normalized_subject_type == "strategy_deployment":
+            episodes = self.repository.list_closed_episodes_for_environment_deployment(
+                environment_id=environment_id,
+                deployment_id=subject_id,
+                limit=5000,
+            )
+        elif normalized_subject_type == "episode":
+            episode = self.repository.get_episode_detail(subject_id)
+            if episode is None:
+                raise LookupError(f"Unknown episode_id: {subject_id}")
+            if str(episode.environment_id) != str(environment_id):
+                raise ValueError("episode_id does not belong to environment_id")
+            episodes = [episode] if str(episode.status) == "closed" else []
+        else:
+            raise ValueError("subject_type must be one of: episode, strategy_template, strategy_deployment, environment")
+
+        outcomes = [
+            build_episode_outcome(
+                episode=episode,
+                facts=self.repository.list_execution_facts_for_episode(str(episode.id)),
+            )
+            for episode in episodes
+        ]
+        metrics = build_environment_episode_metrics(outcomes)
+        self.repository.replace_metric_snapshot(
+            JournalMetricSnapshot(
+                environment_id=environment_id,
+                subject_type=normalized_subject_type,
+                subject_id=subject_id,
+                window=normalized_window,
+                calc_version=calc_version,
+                identity_rule_version="journal_v2_identity_v1",
+                grouping_rule_version="journal_v2_grouping_v1",
+                computed_at=_utcnow(),
+                metrics=metrics,
+            )
+        )
+        return {
+            "environment_id": environment_id,
+            "subject_type": normalized_subject_type,
+            "subject_id": subject_id,
+            "window": normalized_window,
+            "metrics": _serialize_decimal(metrics),
+            "closed_episode_count": len(episodes),
+        }
+
+    def _queue_unresolved_identity(
+        self,
+        *,
+        environment_id: str,
+        execution_context_id: str | None,
+        source_system: str,
+        identity: Any,
+    ) -> None:
+        reason = unresolved_reason_for_identity(identity)
+        self.repository.create_unresolved_item(
+            environment_id=environment_id,
+            execution_context_id=execution_context_id,
+            source_system=source_system,
+            reason=reason,
+            raw_identity=dict(getattr(identity, "raw_identity", {}) or {}),
+            candidate_mappings=[dict(getattr(identity, "resolved_identity", {}) or {})],
+            metadata={
+                "resolution_method": getattr(identity, "resolution_method", None),
+                "resolution_confidence": str(getattr(identity, "resolution_confidence", "0")),
+                "identity_rule_version": getattr(identity, "identity_rule_version", "journal_v2_identity_v1"),
+                "grouping_rule_version": getattr(identity, "grouping_rule_version", "journal_v2_grouping_v1"),
+            },
+        )
+
+    def create_v2_note(
+        self,
+        *,
+        environment_id: str,
+        subject_type: str,
+        subject_id: str,
+        note_type: str,
+        title: str,
+        body_markdown: str,
+        episode_id: str | None = None,
+        body_json: Dict[str, Any] | None = None,
+        effective_at: datetime | None = None,
+        author_id: str | None = None,
+        tags: List[str] | None = None,
+        metadata: Dict[str, Any] | None = None,
+    ) -> str:
+        normalized_environment_id = _require_uuid("environment_id", environment_id)
+        environment = self.repository.get_execution_environment(normalized_environment_id)
+        if environment is None:
+            raise LookupError(f"Unknown environment_id: {normalized_environment_id}")
+        normalized_episode_id = None
+        if episode_id is not None:
+            normalized_episode_id = _require_uuid("episode_id", episode_id)
+            self._ensure_v2_episode_in_environment(normalized_episode_id, normalized_environment_id)
+
+        body_text = markdown_to_search_text(body_markdown)
+        note_id = self.repository.create_note(
+            environment_id=normalized_environment_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            episode_id=normalized_episode_id,
+            note_type=note_type,
+            title=title,
+            body_markdown=body_markdown,
+            body_text=body_text,
+            body_json=body_json,
+            effective_at=effective_at,
+            author_id=author_id,
+            tags=tags,
+            metadata=metadata,
+        )
+        self._append_timeline_event_best_effort(
+            environment_id=normalized_environment_id,
+            episode_id=normalized_episode_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            channel="notes",
+            event_type="note_created",
+            payload={"note_id": note_id, "note_type": note_type, "title": title},
+            occurred_at=effective_at,
+        )
+        return note_id
+
+    def update_v2_note(
+        self,
+        note_id: str,
+        *,
+        environment_id: str | None = None,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        title: str | None = None,
+        body_markdown: str | None = None,
+        body_json: Dict[str, Any] | None = None,
+        tags: List[str] | None = None,
+        metadata: Dict[str, Any] | None = None,
+        editor_id: str | None = None,
+        change_reason: str | None = None,
+    ) -> None:
+        existing = self.repository.get_note(note_id)
+        if existing is None:
+            raise LookupError(f"Unknown note_id: {note_id}")
+
+        if environment_id is not None and str(existing.environment_id) != str(environment_id):
+            raise ValueError("environment_id mismatch for note update")
+        if subject_type is not None and str(existing.subject_type) != str(subject_type):
+            raise ValueError("subject_type mismatch for note update")
+        if subject_id is not None and str(existing.subject_id) != str(subject_id):
+            raise ValueError("subject_id mismatch for note update")
+
+        body_text: str | None = None
+        if body_markdown is not None:
+            body_text = markdown_to_search_text(body_markdown)
+
+        self.repository.update_note(
+            note_id,
+            title=title,
+            body_markdown=body_markdown,
+            body_text=body_text,
+            body_json=body_json,
+            tags=tags,
+            metadata=metadata,
+            editor_id=editor_id,
+            change_reason=change_reason,
+        )
+        self._append_timeline_event_best_effort(
+            environment_id=str(existing.environment_id),
+            episode_id=existing.episode_id,
+            subject_type=str(existing.subject_type),
+            subject_id=str(existing.subject_id),
+            channel="notes",
+            event_type="note_updated",
+            payload={"note_id": note_id, "title": title, "change_reason": change_reason},
+        )
+
+    def get_v2_note(self, note_id: str, *, environment_id: str) -> Dict[str, Any] | None:
+        normalized_environment_id = _require_uuid("environment_id", environment_id)
+        normalized_note_id = _require_uuid("note_id", note_id)
+        note = self.repository.get_note(normalized_note_id)
+        if note is None:
+            return None
+        if str(note.environment_id) != normalized_environment_id:
+            raise ValueError("note_id does not belong to environment_id")
+        return _serialize_decimal(note.model_dump(mode="python"))
+
+    def list_v2_notes(
+        self,
+        environment_id: str,
+        *,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        episode_id: str | None = None,
+        note_type: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        normalized_environment_id = _require_uuid("environment_id", environment_id)
+        environment = self.repository.get_execution_environment(normalized_environment_id)
+        if environment is None:
+            raise LookupError(f"Unknown environment_id: {normalized_environment_id}")
+        normalized_episode_id = None
+        if episode_id is not None:
+            normalized_episode_id = _require_uuid("episode_id", episode_id)
+            self._ensure_v2_episode_in_environment(normalized_episode_id, normalized_environment_id)
+        notes = self.repository.list_notes(
+            normalized_environment_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            episode_id=normalized_episode_id,
+            note_type=note_type,
+            limit=limit,
+            offset=offset,
+        )
+        return [_serialize_decimal(item.model_dump(mode="python")) for item in notes]
+
+    def list_v2_note_revisions(self, note_id: str, *, environment_id: str) -> List[Dict[str, Any]]:
+        normalized_environment_id = _require_uuid("environment_id", environment_id)
+        normalized_note_id = _require_uuid("note_id", note_id)
+        note = self.repository.get_note(normalized_note_id)
+        if note is None:
+            raise LookupError(f"Unknown note_id: {normalized_note_id}")
+        if str(note.environment_id) != normalized_environment_id:
+            raise ValueError("note_id does not belong to environment_id")
+        revisions = self.repository.list_note_revisions(normalized_note_id)
+        return [_serialize_decimal(item.model_dump(mode="python")) for item in revisions]
+
+    def attach_v2_file_metadata(
+        self,
+        *,
+        environment_id: str,
+        subject_type: str,
+        subject_id: str,
+        storage_key: str,
+        mime_type: str,
+        note_id: str | None = None,
+        sha256: str | None = None,
+        size_bytes: int | None = None,
+        ocr_text: str | None = None,
+        metadata: Dict[str, Any] | None = None,
+    ) -> str:
+        normalized_environment_id = _require_uuid("environment_id", environment_id)
+        environment = self.repository.get_execution_environment(normalized_environment_id)
+        if environment is None:
+            raise LookupError(f"Unknown environment_id: {normalized_environment_id}")
+        normalized_note_id = None
+        if note_id is not None:
+            normalized_note_id = _require_uuid("note_id", note_id)
+            self._ensure_v2_note_in_environment(normalized_note_id, normalized_environment_id)
+
+        return self.repository.attach_file_metadata(
+            environment_id=normalized_environment_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            storage_key=storage_key,
+            mime_type=mime_type,
+            note_id=normalized_note_id,
+            sha256=sha256,
+            size_bytes=size_bytes,
+            ocr_text=ocr_text,
+            metadata=metadata,
+        )
+
+    def ensure_v2_worker_context(
+        self,
+        *,
+        execution_mode: str,
+        account_scope: str,
+        strategy_run_id: str | None = None,
+        external_run_id: str | None = None,
+        template_id: str | None = None,
+        worker_template_id: str | None = None,
+        strategy_name: str | None = None,
+        strategy_family: str | None = None,
+        scenario_key: str | None = None,
+        scenario_name: str | None = None,
+        deployment_key: str | None = None,
+        config_hash: str | None = None,
+        source_system: str = "algo_worker",
+        entry_surface: str | None = None,
+        source_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        resolved_environment = resolve_environment_key(
+            mode=execution_mode,
+            account_scope=account_scope,
+            metadata={"source_system": source_system, **dict(source_metadata or {})},
+        )
+        environment_id = self.repository.ensure_execution_environment(
+            mode=str(getattr(resolved_environment.mode, "value", resolved_environment.mode)),
+            account_scope=resolved_environment.account_scope,
+            broker_user_id=resolved_environment.broker_user_id,
+            paper_account_key=resolved_environment.paper_account_key,
+            environment_epoch=resolved_environment.environment_epoch,
+            display_name=resolved_environment.display_name,
+            metadata=resolved_environment.metadata,
+        )
+
+        resolved_identity = resolve_strategy_identity(
+            template_id=template_id,
+            worker_template_id=worker_template_id,
+            strategy_name=strategy_name,
+            strategy_family=strategy_family,
+            scenario_key=scenario_key,
+            scenario_name=scenario_name,
+            deployment_key=deployment_key,
+            config_hash=config_hash,
+            execution_mode=execution_mode,
+            account_scope=account_scope,
+            strategy_run_id=strategy_run_id,
+            external_run_id=external_run_id,
+        )
+
+        low_confidence_identity = is_low_confidence_resolution(resolved_identity)
+        template_ref_id: str | None = None
+        if not low_confidence_identity:
+            template_ref_id = self.repository.ensure_strategy_template(
+                template_key=resolved_identity.template_id,
+                strategy_family=resolved_identity.strategy_family,
+                display_name=resolved_identity.display_name,
+                metadata={
+                    "source_system": source_system,
+                    "entry_surface": entry_surface,
+                },
+            )
+
+        variant_ref_id: str | None = None
+        if template_ref_id is not None and resolved_identity.variant_key:
+            variant_ref_id = self.repository.ensure_strategy_variant(
+                template_id=template_ref_id,
+                variant_key=resolved_identity.variant_key,
+                display_name=scenario_name,
+                metadata={"scenario_key": scenario_key, "config_hash": config_hash},
+            )
+
+        deployment_ref_id: str | None = None
+        if template_ref_id is not None and resolved_identity.deployment_key:
+            deployment_ref_id = self.repository.ensure_strategy_deployment(
+                template_id=template_ref_id,
+                variant_id=variant_ref_id,
+                deployment_key=resolved_identity.deployment_key,
+                display_name=deployment_key,
+                metadata={"source_system": source_system, **dict(source_metadata or {})},
+            )
+
+        resolved_external_run_id = str(external_run_id or strategy_run_id or "").strip()
+        if not resolved_external_run_id:
+            raise ValueError("external_run_id or strategy_run_id is required")
+
+        execution_context_id = self.repository.ensure_execution_context(
+            environment_id=environment_id,
+            source_system=source_system,
+            external_run_id=resolved_external_run_id,
+            template_id=template_ref_id,
+            variant_id=variant_ref_id,
+            deployment_id=deployment_ref_id,
+            raw_identity=resolved_identity.raw_identity,
+            resolved_identity=resolved_identity.resolved_identity,
+            resolution_method=resolved_identity.resolution_method,
+            resolution_confidence=resolved_identity.resolution_confidence,
+            identity_rule_version=resolved_identity.identity_rule_version,
+            metadata={
+                "grouping_rule_version": resolved_identity.grouping_rule_version,
+                "strategy_template_id": template_ref_id,
+                "strategy_variant_id": variant_ref_id,
+                "strategy_deployment_id": deployment_ref_id,
+                **dict(source_metadata or {}),
+            },
+        )
+        if low_confidence_identity:
+            self._queue_unresolved_identity(
+                environment_id=environment_id,
+                execution_context_id=execution_context_id,
+                source_system=source_system,
+                identity=resolved_identity,
+            )
+
+        self._append_timeline_event_best_effort(
+            environment_id=environment_id,
+            execution_context_id=execution_context_id,
+            subject_type="execution_context",
+            subject_id=execution_context_id,
+            channel="context",
+            event_type="execution_context_created",
+            payload={
+                "source_system": source_system,
+                "external_run_id": resolved_external_run_id,
+            },
+        )
+        self._append_timeline_event_best_effort(
+            environment_id=environment_id,
+            execution_context_id=execution_context_id,
+            subject_type="execution_context",
+            subject_id=execution_context_id,
+            channel="identity",
+            event_type="identity_reclassified",
+            payload={
+                "resolution_method": resolved_identity.resolution_method,
+                "resolution_confidence": str(resolved_identity.resolution_confidence),
+                "identity_rule_version": resolved_identity.identity_rule_version,
+                "grouping_rule_version": resolved_identity.grouping_rule_version,
+            },
+        )
+
+        return {
+            "environment_id": environment_id,
+            "execution_context_id": execution_context_id,
+            "template_id": template_ref_id,
+            "variant_id": variant_ref_id,
+            "deployment_id": deployment_ref_id,
+            "identity_rule_version": resolved_identity.identity_rule_version,
+            "grouping_rule_version": resolved_identity.grouping_rule_version,
+            "ambiguous": resolved_identity.ambiguous,
+            "resolution_method": resolved_identity.resolution_method,
+            "resolution_confidence": str(resolved_identity.resolution_confidence),
+        }
 
     def create_run(
         self,
@@ -717,6 +1654,54 @@ class JournalService:
         )
         return str(link.run_id) if link else None
 
+    def ensure_paper_strategy_run(self, *, attribution: Dict[str, Any]) -> Optional[str]:
+        strategy_run_id = str(attribution.get("strategy_run_id") or "").strip()
+        account_ref = str(attribution.get("account_ref") or attribution.get("account_scope") or "").strip()
+        if not strategy_run_id or not account_ref:
+            return None
+        strategy_family_value = str(attribution.get("strategy_family") or StrategyFamily.INDICATOR.value).strip()
+        try:
+            strategy_family = StrategyFamily(strategy_family_value)
+        except ValueError:
+            strategy_family = StrategyFamily.INDICATOR
+
+        existing = self.repository.find_source_link(
+            source_type=SourceType.PAPER_STRATEGY_RUN,
+            source_key=strategy_run_id,
+            source_key_2=account_ref,
+        )
+        if existing is not None:
+            return str(existing.run_id)
+
+        run = self.create_run(
+            JournalRun(
+                strategy_family=strategy_family,
+                strategy_name=str(attribution.get("strategy_name") or strategy_run_id),
+                entry_surface=str(attribution.get("entry_surface") or "paper_runtime"),
+                execution_mode=ExecutionMode(str(attribution.get("execution_mode") or ExecutionMode.PAPER.value)),
+                account_ref=account_ref,
+                status=JournalRunStatus.OPEN,
+                benchmark_id="NIFTY50",
+                capital_basis_type=CapitalBasisType.MARGIN_USED,
+                review_state=ReviewState.PENDING,
+                source_summary={"source": "paper_runtime", "strategy_run_id": strategy_run_id},
+                metadata={"created_by": "paper_runtime", "paper_attribution": _serialize_decimal(attribution)},
+            ),
+        )
+        run_id = str(run.get("id") or "") if isinstance(run, dict) else ""
+        if not run_id:
+            return None
+        self.link_source(
+            run_id,
+            JournalSourceLink(
+                run_id=run_id,
+                source_type=SourceType.PAPER_STRATEGY_RUN,
+                source_key=str(strategy_run_id),
+                source_key_2=account_ref,
+            ),
+        )
+        return run_id
+
     def mirror_option_strategy_run(
         self,
         *,
@@ -940,6 +1925,573 @@ class JournalService:
                 slippage_amount=_to_decimal(slippage_amount),
                 payload=payload or {},
             )
+        )
+        run = self.repository.get_run(run_id)
+        if run is None:
+            return
+        timeline_meta = dict((run.metadata or {}).get("journal_v2") or {})
+        environment_id = timeline_meta.get("environment_id")
+        if environment_id:
+            self._append_timeline_event_best_effort(
+                environment_id=str(environment_id),
+                execution_context_id=timeline_meta.get("execution_context_id"),
+                episode_id=timeline_meta.get("episode_id"),
+                subject_type="execution_fact",
+                subject_id=str(trade_id),
+                channel="fills",
+                event_type="fill_recorded",
+                occurred_at=trade_timestamp,
+                payload={
+                    "run_id": run_id,
+                    "trade_id": str(trade_id),
+                    "order_id": str(order_id) if order_id else None,
+                    "side": side,
+                    "quantity": int(quantity),
+                    "price": str(price_decimal),
+                },
+            )
+        attribution_payload = dict(payload or {})
+        account_scope = str(attribution_payload.get("account_ref") or attribution_payload.get("account_scope") or run.account_ref or "").strip()
+        external_run_id = str(attribution_payload.get("strategy_run_id") or run_id).strip()
+        if account_scope and external_run_id:
+            try:
+                self.record_v2_execution_fill(
+                    mode="paper",
+                    account_scope=account_scope,
+                    source_system=str(attribution_payload.get("source_system") or attribution_payload.get("source") or "paper_runtime"),
+                    external_run_id=external_run_id,
+                    source_type=SourceType.PAPER_TRADE,
+                    source_fact_key=str(trade_id),
+                    side=side,
+                    quantity=int(quantity),
+                    price=price_decimal,
+                    fill_timestamp=trade_timestamp,
+                    gross_cash_flow=computed_cash_flow,
+                    fees_amount=_to_decimal(fees_amount),
+                    taxes_amount=_to_decimal(taxes_amount),
+                    slippage_amount=_to_decimal(slippage_amount),
+                    run_id=run_id,
+                    order_id=str(order_id) if order_id else None,
+                    trade_id=str(trade_id),
+                    attribution=attribution_payload,
+                    payload={
+                        "paper_trade": attribution_payload,
+                        "run_id": run_id,
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "journal_v2.paper_fill_projection_failed",
+                    extra={"run_id": run_id, "trade_id": str(trade_id)},
+                    exc_info=True,
+                )
+
+    def _normalize_attribution_source_system(self, attribution: Dict[str, Any] | None, *, default: str) -> str:
+        payload = dict(attribution or {})
+        return str(payload.get("source_system") or payload.get("source") or default).strip() or default
+
+    def _ensure_v2_execution_context(
+        self,
+        *,
+        mode: str,
+        account_scope: str,
+        source_system: str,
+        external_run_id: str,
+        attribution: Dict[str, Any] | None = None,
+        broker_user_id: str | None = None,
+        paper_account_key: str | None = None,
+        environment_epoch: int | None = None,
+    ) -> tuple[str, str, str | None, str | None, str | None]:
+        payload = dict(attribution or {})
+        environment_id = self.resolve_v2_environment_id(
+            mode=mode,
+            account_scope=account_scope,
+            broker_user_id=broker_user_id,
+            paper_account_key=paper_account_key,
+            environment_epoch=environment_epoch,
+        )
+
+        resolved_identity = resolve_strategy_identity(
+            template_id=payload.get("template_id"),
+            worker_template_id=payload.get("worker_template_id"),
+            strategy_family=payload.get("strategy_family"),
+            strategy_name=payload.get("strategy_name"),
+            scenario_key=payload.get("scenario_key"),
+            scenario_name=payload.get("scenario_name"),
+            deployment_key=payload.get("deployment_key"),
+            config_hash=payload.get("config_hash"),
+            source_system=source_system,
+            entry_surface=payload.get("entry_surface"),
+        )
+        low_confidence_identity = is_low_confidence_resolution(resolved_identity)
+        template_id: str | None = None
+        if not low_confidence_identity:
+            template_id = self.repository.ensure_strategy_template(
+                template_key=resolved_identity.template_id,
+                strategy_family=resolved_identity.strategy_family,
+                display_name=resolved_identity.display_name,
+                metadata={"source_system": source_system},
+            )
+        variant_id: str | None = None
+        if template_id is not None and resolved_identity.variant_key:
+            variant_id = self.repository.ensure_strategy_variant(
+                template_id=template_id,
+                variant_key=resolved_identity.variant_key,
+                display_name=str(payload.get("scenario_name") or "").strip() or None,
+                metadata={"scenario_key": payload.get("scenario_key"), "config_hash": payload.get("config_hash")},
+            )
+        deployment_id: str | None = None
+        if template_id is not None and resolved_identity.deployment_key:
+            deployment_id = self.repository.ensure_strategy_deployment(
+                template_id=template_id,
+                variant_id=variant_id,
+                deployment_key=resolved_identity.deployment_key,
+                display_name=str(payload.get("deployment_key") or "").strip() or None,
+                metadata={"source_system": source_system},
+            )
+
+        context_id = self.repository.ensure_execution_context(
+            environment_id=environment_id,
+            source_system=source_system,
+            external_run_id=external_run_id,
+            template_id=template_id,
+            variant_id=variant_id,
+            deployment_id=deployment_id,
+            raw_identity=resolved_identity.raw_identity,
+            resolved_identity=resolved_identity.resolved_identity,
+            resolution_method=resolved_identity.resolution_method,
+            resolution_confidence=resolved_identity.resolution_confidence,
+            identity_rule_version=resolved_identity.identity_rule_version,
+            metadata={
+                "grouping_rule_version": resolved_identity.grouping_rule_version,
+                "strategy_template_id": template_id,
+                "strategy_variant_id": variant_id,
+                "strategy_deployment_id": deployment_id,
+            },
+        )
+        if low_confidence_identity:
+            self._queue_unresolved_identity(
+                environment_id=environment_id,
+                execution_context_id=context_id,
+                source_system=source_system,
+                identity=resolved_identity,
+            )
+        return environment_id, context_id, template_id, variant_id, deployment_id
+
+    def _resolve_episode_for_fill(
+        self,
+        *,
+        environment_id: str,
+        execution_context_id: str,
+        instrument_key: str,
+        side: str,
+        quantity: int,
+        fill_timestamp: datetime,
+    ) -> tuple[str, str, int, int]:
+        episodes = self.repository.list_episodes(environment_id=environment_id, execution_context_id=execution_context_id, limit=200)
+        sequence_values = [int(item.episode_seq) for item in episodes]
+        active_episode = None
+        for episode in episodes:
+            if str(episode.status) not in {"closed", "cancelled", "unresolved"}:
+                active_episode = episode
+                break
+
+        previous_qty = 0
+        if active_episode is not None:
+            position_map = dict((active_episode.metadata or {}).get("net_quantity_by_instrument") or {})
+            previous_qty = int(position_map.get(instrument_key) or 0)
+
+        if active_episode is None:
+            episode_id = self.repository.ensure_episode(
+                environment_id=environment_id,
+                execution_context_id=execution_context_id,
+                episode_seq=next_episode_sequence(sequence_values),
+                status="open",
+                opened_at=fill_timestamp,
+                metadata={"net_quantity_by_instrument": {instrument_key: 0}},
+            )
+            active_episode = self.repository.get_episode_detail(episode_id)
+            previous_qty = 0
+        if active_episode is None:
+            raise RuntimeError("Failed to resolve active V2 episode")
+
+        position_effect = classify_position_effect(previous_qty=previous_qty, side=side, quantity=quantity)
+        delta = int(quantity) if str(side or "").upper() == "BUY" else -int(quantity)
+        position_map = dict((active_episode.metadata or {}).get("net_quantity_by_instrument") or {})
+
+        def _all_positions_flat(values: Dict[str, Any]) -> bool:
+            return all(int(value or 0) == 0 for value in values.values())
+
+        if position_effect == "flip":
+            current_episode_id = str(active_episode.id)
+            other_position_map = dict(position_map)
+            other_position_map[instrument_key] = 0
+            if not _all_positions_flat(other_position_map):
+                position_map[instrument_key] = previous_qty + delta
+                self.repository.update_episode_status(
+                    current_episode_id,
+                    status="open",
+                    metadata={"net_quantity_by_instrument": position_map},
+                )
+                return current_episode_id, position_effect, previous_qty, previous_qty + delta
+
+            self.repository.update_episode_status(
+                current_episode_id,
+                status="closed",
+                closed_at=fill_timestamp,
+                metadata={"close_reason": "position_flip", "net_quantity_by_instrument": other_position_map},
+            )
+            next_seq = next_episode_sequence(sequence_values)
+            episode_id = self.repository.ensure_episode(
+                environment_id=environment_id,
+                execution_context_id=execution_context_id,
+                episode_seq=next_seq,
+                status="open",
+                opened_at=fill_timestamp,
+                metadata={"net_quantity_by_instrument": {instrument_key: delta}},
+            )
+            return episode_id, position_effect, 0, delta
+
+        next_qty = previous_qty + delta
+        episode_id = str(active_episode.id)
+        position_map[instrument_key] = next_qty
+        episode_is_flat = _all_positions_flat(position_map)
+        self.repository.update_episode_status(
+            episode_id,
+            status="closed" if episode_is_flat else "open",
+            closed_at=fill_timestamp if episode_is_flat else None,
+            metadata={"net_quantity_by_instrument": position_map},
+        )
+        return episode_id, position_effect, previous_qty, next_qty
+
+    def record_v2_execution_fill(
+        self,
+        *,
+        mode: str,
+        account_scope: str,
+        source_system: str,
+        external_run_id: str,
+        source_type: SourceType | str,
+        source_fact_key: str,
+        side: str,
+        quantity: int,
+        price: Any,
+        fill_timestamp: datetime,
+        gross_cash_flow: Any,
+        fees_amount: Any = ZERO,
+        taxes_amount: Any = ZERO,
+        slippage_amount: Any = ZERO,
+        run_id: str | None = None,
+        order_id: str | None = None,
+        trade_id: str | None = None,
+        attribution: Dict[str, Any] | None = None,
+        payload: Dict[str, Any] | None = None,
+        broker_user_id: str | None = None,
+        paper_account_key: str | None = None,
+        environment_epoch: int | None = None,
+    ) -> Dict[str, Any]:
+        normalized_source_system = str(source_system or "").strip() or "journal"
+        normalized_external_run_id = str(external_run_id or "").strip()
+        if not normalized_external_run_id:
+            raise ValueError("external_run_id is required for v2 execution fill")
+        normalized_source_type = source_type if isinstance(source_type, SourceType) else SourceType(str(source_type))
+        source_type_value = str(getattr(normalized_source_type, "value", normalized_source_type))
+        claim_projection = getattr(self.repository, "claim_v2_projection_source", None)
+        mark_projection = getattr(self.repository, "mark_v2_projection_source", None)
+        if callable(claim_projection):
+            claimed = bool(claim_projection(source_type=source_type_value, source_fact_key=str(source_fact_key)))
+            if not claimed:
+                find_existing_after_claim = getattr(self.repository, "find_v2_execution_fact_by_source", None)
+                existing_after_claim = (
+                    find_existing_after_claim(source_type=source_type_value, source_fact_key=str(source_fact_key))
+                    if callable(find_existing_after_claim)
+                    else None
+                )
+                return {
+                    "environment_id": str(getattr(existing_after_claim, "environment_id", None) or ""),
+                    "execution_context_id": None,
+                    "episode_id": str(getattr(existing_after_claim, "episode_id", None) or "") or None,
+                    "intent_id": str(getattr(existing_after_claim, "intent_id", None) or "") or None,
+                    "position_effect": getattr(existing_after_claim, "position_effect", None),
+                    "duplicate": True,
+                    "pending": existing_after_claim is None,
+                }
+        find_existing = getattr(self.repository, "find_v2_execution_fact_by_source", None)
+        if callable(find_existing):
+            existing_fact = find_existing(source_type=source_type_value, source_fact_key=str(source_fact_key))
+            if existing_fact is not None and existing_fact.environment_id:
+                return {
+                    "environment_id": str(existing_fact.environment_id),
+                    "execution_context_id": None,
+                    "episode_id": str(existing_fact.episode_id) if existing_fact.episode_id else None,
+                    "intent_id": str(existing_fact.intent_id) if existing_fact.intent_id else None,
+                    "position_effect": existing_fact.position_effect,
+                    "duplicate": True,
+                }
+        attribution_payload = dict(attribution or {})
+        fill_payload = dict(payload or {})
+        environment_id, execution_context_id, template_id, variant_id, deployment_id = self._ensure_v2_execution_context(
+            mode=mode,
+            account_scope=account_scope,
+            source_system=normalized_source_system,
+            external_run_id=normalized_external_run_id,
+            attribution=attribution_payload,
+            broker_user_id=broker_user_id,
+            paper_account_key=paper_account_key,
+            environment_epoch=environment_epoch,
+        )
+
+        instrument_token = fill_payload.get("instrument_token")
+        if instrument_token is None:
+            instrument_token = attribution_payload.get("instrument_token")
+        if instrument_token is None and isinstance(fill_payload.get("broker_fill"), dict):
+            instrument_token = fill_payload.get("broker_fill", {}).get("instrument_token")
+        product_value = (
+            fill_payload.get("product")
+            or attribution_payload.get("product")
+            or (fill_payload.get("broker_fill", {}) if isinstance(fill_payload.get("broker_fill"), dict) else {}).get("product")
+            or ""
+        )
+        instrument_key = f"{instrument_token or 'unknown'}:{str(product_value or '').upper()}"
+
+        episode_id, position_effect, previous_qty, next_qty = self._resolve_episode_for_fill(
+            environment_id=environment_id,
+            execution_context_id=execution_context_id,
+            instrument_key=instrument_key,
+            side=side,
+            quantity=int(quantity),
+            fill_timestamp=fill_timestamp,
+        )
+
+        intent_id = self.repository.create_execution_intent(
+            environment_id=environment_id,
+            execution_context_id=execution_context_id,
+            episode_id=episode_id,
+            channel="fills",
+            intent_type=str(source_type),
+            idempotency_key=f"{source_fact_key}:intent",
+            status="resolved",
+            requested_at=fill_timestamp,
+            resolved_at=fill_timestamp,
+            payload={
+                "source_system": normalized_source_system,
+                "external_run_id": normalized_external_run_id,
+                "source_fact_key": source_fact_key,
+            },
+            result={"position_effect": position_effect, "previous_qty": previous_qty, "next_qty": next_qty},
+            metadata={
+                "strategy_template_id": template_id,
+                "strategy_variant_id": variant_id,
+                "strategy_deployment_id": deployment_id,
+            },
+        )
+
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            raise ValueError("run_id is required for v2 execution fill")
+
+        self.repository.insert_execution_fact(
+            JournalExecutionFact(
+                run_id=normalized_run_id,
+                environment_id=environment_id,
+                episode_id=episode_id,
+                intent_id=intent_id,
+                source_type=normalized_source_type,
+                source_fact_key=source_fact_key,
+                order_id=order_id,
+                trade_id=trade_id,
+                fill_timestamp=fill_timestamp,
+                side=side,
+                quantity=int(quantity),
+                price=_to_decimal(price),
+                gross_cash_flow=_to_decimal(gross_cash_flow),
+                fees_amount=_to_decimal(fees_amount),
+                taxes_amount=_to_decimal(taxes_amount),
+                slippage_amount=_to_decimal(slippage_amount),
+                position_effect=position_effect,
+                payload={
+                    **fill_payload,
+                    "attribution": attribution_payload,
+                    "environment_id": environment_id,
+                    "execution_context_id": execution_context_id,
+                    "episode_id": episode_id,
+                    "intent_id": intent_id,
+                },
+            )
+        )
+
+        if callable(mark_projection):
+            mark_projection(source_type=source_type_value, source_fact_key=str(source_fact_key), status="projected")
+
+        self._append_timeline_event_best_effort(
+            environment_id=environment_id,
+            execution_context_id=execution_context_id,
+            episode_id=episode_id,
+            subject_type="execution_fact",
+            subject_id=str(trade_id or source_fact_key),
+            channel="fills",
+            event_type="fill_recorded",
+            occurred_at=fill_timestamp,
+            payload={
+                    "source_fact_key": source_fact_key,
+                    "source_type": str(normalized_source_type),
+                    "side": side,
+                    "quantity": int(quantity),
+                    "position_effect": position_effect,
+            },
+        )
+        return {
+            "environment_id": environment_id,
+            "execution_context_id": execution_context_id,
+            "episode_id": episode_id,
+            "intent_id": intent_id,
+            "position_effect": position_effect,
+        }
+
+    def backfill_v1_review_notes_to_v2(
+        self,
+        *,
+        apply: bool,
+        limit: int,
+        mode: str | None = None,
+        account_scope: str | None = None,
+    ) -> Dict[str, Any]:
+        mode_filter = str(mode or "").strip().lower() or None
+        if mode_filter not in {None, "live", "paper"}:
+            raise ValueError("mode must be one of: live, paper")
+
+        scanned = 0
+        created = 0
+        updated = 0
+        unresolved = 0
+        skipped = 0
+        failed = 0
+        candidates = self.repository.list_v1_review_note_candidates(
+            limit=max(1, int(limit)),
+            environment_mode=mode_filter,
+            account_scope=(str(account_scope or "").strip() or None),
+        )
+        preview: List[Dict[str, Any]] = []
+
+        for row in candidates:
+            scanned += 1
+            run_id = str(row.get("id") or "").strip()
+            review_notes = str(row.get("review_notes") or "").strip()
+            execution_mode = str(row.get("execution_mode") or "").strip().lower()
+            if not run_id or not review_notes:
+                skipped += 1
+                continue
+
+            resolved_mode = "paper" if execution_mode == "paper" else "live"
+            account_scope = str(row.get("account_ref") or "").strip()
+            if not account_scope:
+                account_scope = f"legacy:{resolved_mode}:{run_id}"
+
+            source_links = self.repository.list_source_links(run_id)
+            resolution_confidence = "0.90" if source_links else "0.55"
+            preview_item = {
+                "run_id": run_id,
+                "execution_mode": resolved_mode,
+                "account_scope": account_scope,
+                "resolution_confidence": resolution_confidence,
+            }
+            preview.append(preview_item)
+            if not apply:
+                continue
+            try:
+                environment_id = self.resolve_v2_environment_id(mode=resolved_mode, account_scope=account_scope)
+                context_id = self.repository.ensure_execution_context(
+                    environment_id=environment_id,
+                    source_system="v1_journal_run",
+                    external_run_id=run_id,
+                    status="closed",
+                    metadata={
+                        "identity_rule_version": "v1_legacy_backfill",
+                        "resolution_confidence": resolution_confidence,
+                    },
+                )
+                episode_id = self.repository.ensure_episode(
+                    environment_id=environment_id,
+                    execution_context_id=context_id,
+                    episode_seq=1,
+                    status="closed",
+                    metadata={
+                        "identity_rule_version": "v1_legacy_backfill",
+                        "resolution_confidence": resolution_confidence,
+                    },
+                )
+                note_id = self.create_v2_note(
+                    environment_id=environment_id,
+                    subject_type="run",
+                    subject_id=run_id,
+                    episode_id=episode_id,
+                    note_type="post_exit_review",
+                    title="Backfilled V1 review notes",
+                    body_markdown=review_notes,
+                    metadata={
+                        "source": "v1_review_notes",
+                        "identity_rule_version": "v1_legacy_backfill",
+                        "resolution_confidence": resolution_confidence,
+                    },
+                )
+                created += 1
+
+                decision_events = self.repository.list_decision_events(run_id)
+                for decision in decision_events:
+                    self._append_timeline_event_best_effort(
+                        environment_id=environment_id,
+                        execution_context_id=context_id,
+                        episode_id=episode_id,
+                        subject_type="run",
+                        subject_id=run_id,
+                        channel="decision",
+                        event_type="legacy_decision_event_backfilled",
+                        occurred_at=decision.occurred_at,
+                        payload={
+                            "decision_event_id": decision.id,
+                            "decision_type": decision.decision_type,
+                            "actor_type": decision.actor_type,
+                            "summary": decision.summary,
+                            "context": decision.context,
+                            "source": "v1_decision_events",
+                            "backfilled_note_id": note_id,
+                            "identity_rule_version": "v1_legacy_backfill",
+                            "resolution_confidence": resolution_confidence,
+                        },
+                    )
+                    updated += 1
+            except LookupError:
+                unresolved += 1
+            except Exception:
+                failed += 1
+
+        return {
+            "apply": apply,
+            "limit": max(1, int(limit)),
+            "mode": mode_filter,
+            "account_scope": (str(account_scope or "").strip() or None),
+            "scanned": scanned,
+            "created": created,
+            "updated": updated,
+            "unresolved": unresolved,
+            "skipped": skipped,
+            "failed": failed,
+            "items": preview,
+        }
+
+    def backfill_journal_v2(
+        self,
+        *,
+        apply: bool,
+        limit: int,
+        mode: str | None = None,
+        account_scope: str | None = None,
+    ) -> Dict[str, Any]:
+        return self.backfill_v1_review_notes_to_v2(
+            apply=apply,
+            limit=limit,
+            mode=mode,
+            account_scope=account_scope,
         )
 
     def update_run_review(self, run_id: str, *, review_status: str, notes: Optional[str] = None) -> Dict[str, Any]:
