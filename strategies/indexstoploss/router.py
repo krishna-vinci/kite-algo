@@ -33,7 +33,7 @@ from broker_api.kite_orders import get_correlation_id, realtime_positions_servic
 from broker_api.kite_session import get_kite_session_id, get_session_account_id
 from database import SessionLocal
 from options.api.strategy_router import preview_option_strategy as canonical_preview_option_strategy
-from strategies.option_strategy import (
+from options.strategy import (
     StrategyExecutionMode,
     StrategyProtectionPreferences,
     compile_option_strategy_preview,

@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-import server
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,7 +62,6 @@ from options.api.protection_router import router as options_protection_router
 from options.api.strategy_router import router as options_strategy_router
 from options.api.worker_options_router import router as worker_options_router
 from runtime_monitor import heartbeat, install_log_buffer, set_component_status, set_meta
-from server import mcp
 from strategies.indexstoploss.router import router as indexstoploss_router
 
 load_dotenv()  # Load environment variables from .env file
@@ -97,55 +95,6 @@ market_data_runtime: Optional[MarketDataRuntime] = None
 
 # Daily gating event (set once headless login succeeds; cleared before daily rotation)
 daily_token_ready: asyncio.Event = asyncio.Event()
-
-# 1. Create the MCP's ASGI app
-mcp_app = mcp.http_app(path='/mcp')
-
-# Wrap the MCP ASGI app to inject a per-request KiteConnect (based on cookie 'kite_session_id')
-class MCPAuthWrapper:
-    def __init__(self, app):
-        self.app = app
-
-    @staticmethod
-    def _get_cookie(scope, name: str) -> str | None:
-        headers = dict(scope.get("headers") or [])
-        raw = headers.get(b"cookie")
-        if not raw:
-            return None
-        try:
-            cookie_str = raw.decode("latin-1")
-            for part in cookie_str.split(";"):
-                k_v = part.strip().split("=", 1)
-                if len(k_v) == 2 and k_v[0] == name:
-                    return k_v[1]
-        except Exception:
-            return None
-        return None
-
-    async def __call__(self, scope, receive, send):
-        # Intercept all HTTP requests for this mounted app to inject request-scoped KiteConnect
-        if scope.get("type") != "http":
-            return await self.app(scope, receive, send)
-
-        ctx_token = None
-        try:
-            sid = self._get_cookie(scope, "kite_session_id")
-            if sid:
-                db = SessionLocal()
-                try:
-                    ks = db.query(KiteSession).filter_by(session_id=sid).first()
-                    if ks:
-                        kite = build_kite_client(ks.access_token, session_id=sid)
-                        ctx_token = server.set_request_kite(kite)
-                finally:
-                    db.close()
-            return await self.app(scope, receive, send)
-        finally:
-            if ctx_token is not None:
-                server.reset_request_kite(ctx_token)
-
-# Wrapped app that injects request-scoped KiteConnect into FastMCP tools
-mcp_app_wrapped = MCPAuthWrapper(mcp_app)
 
 def run_schema_migrations() -> None:
     """
@@ -316,8 +265,6 @@ async def combined_lifespan(app: FastAPI):
             except Exception:
                 pass
 
-        server.mcp_kite_instance = kite
-        logging.info("MCP Kite instance initialized successfully.")
         app.state.journal_service = JournalService()
         journal_runtime_worker = JournalRuntimeWorker(service=app.state.journal_service)
         await journal_runtime_worker.start()
@@ -450,7 +397,6 @@ async def combined_lifespan(app: FastAPI):
 
         positions_runtime_task = asyncio.create_task(_positions_runtime_subscription_worker())
 
-        # Start background token watcher so MCP-facing system client follows DB token rotation.
         async def _system_token_watcher():
             poll_seconds = int(os.getenv("SYSTEM_TOKEN_POLL_SEC", "45"))
             last_token = at
@@ -468,7 +414,6 @@ async def combined_lifespan(app: FastAPI):
                         old_fp = (last_token[-6:] if isinstance(last_token, str) else "")
                         new_fp = (new_token[-6:] if isinstance(new_token, str) else "")
                         logging.info("System token change detected; market runtime will rotate from DB token (..%s -> ..%s)", old_fp, new_fp)
-                        server.mcp_kite_instance = build_kite_client(new_token, session_id="system")
                         set_component_status("market_runtime", "healthy", detail="Market runtime observing rotated system token", meta={"token_suffix": new_fp})
                         last_token = new_token
                 except asyncio.CancelledError:
@@ -690,15 +635,11 @@ async def combined_lifespan(app: FastAPI):
             "last_error": str(e),
             "last_failure_at": datetime.utcnow().isoformat(),
         })
-        # Depending on the desired behavior, you might want to exit the application
-        # or proceed without a valid Kite instance for MCP.
-        server.mcp_kite_instance = None
         raise
 
     set_component_status("app", startup_status, detail=startup_detail)
 
-    async with mcp_app.lifespan(app):
-        yield
+    yield
     
     # Cleanup on shutdown
     # Cancel token watcher first
@@ -816,17 +757,7 @@ async def combined_lifespan(app: FastAPI):
 
 app = FastAPI(title="Kite App API", lifespan=combined_lifespan, openapi_tags=OPENAPI_TAGS)
 
-# 3. Mount the MCP app at a subpath so normal FastAPI routes remain reachable
-# Final MCP endpoint will be available at /llm/mcp (since mcp_app was created with path='/mcp')
-app.mount("/llm", mcp_app_wrapped)
-
-# 3b. Also expose MCP directly at /mcp for clients expecting the legacy path
-# For this mount, set the MCP ASGI app path to "/" so the full endpoint is exactly "/mcp"
-mcp_app_direct = mcp.http_app(path="/")
-mcp_app_direct_wrapped = MCPAuthWrapper(mcp_app_direct)
-app.mount("/mcp", mcp_app_direct_wrapped)
-
-# 4. Include API routes under /api
+# 3. Include API routes under /api
 app.include_router(auth_router, prefix="/api")
 app.include_router(market_data_router, prefix="/api")
 app.include_router(instruments_router, prefix="/api")

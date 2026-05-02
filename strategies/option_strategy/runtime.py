@@ -7,12 +7,13 @@ from algo_runtime.models import (
     AlgoLifecycleState,
     DependencySpec,
     ExecutionMode,
+    MarketDataMode,
     OrderScope,
     PositionFilter,
     TriggerType,
 )
 
-from .models import CanonicalOptionStrategyPreview, RuntimeManagedOptionStrategyConfig, SelectedOptionLeg
+from options.strategy import CanonicalOptionStrategyPreview, RuntimeManagedOptionStrategyConfig, SelectedOptionLeg
 
 
 def build_runtime_option_instance(*,
@@ -31,9 +32,9 @@ def build_runtime_option_instance(*,
         raise ValueError("runtime-managed option strategy requires at least one selected leg")
 
     triggers = {TriggerType.POSITION_UPDATE, TriggerType.ORDER_UPDATE, TriggerType.FILL_UPDATE}
-    market_tokens: Dict[int, str] = {}
+    market_tokens: Dict[int, MarketDataMode] = {}
     if spot_token is not None:
-        market_tokens[int(spot_token)] = 'ltp'
+        market_tokens[int(spot_token)] = MarketDataMode.LTP
         triggers.add(TriggerType.TICK)
 
     dependency_spec = DependencySpec(

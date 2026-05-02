@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from algo_runtime.models import NoopAction, NotifyAction, OrderIntent, Snapshot, StatePatchAction
 from options.protection.evaluator import evaluate_option_rules
 from options.protection.exit_builder import build_grouped_exit_orders
-from strategies.option_strategy.models import MetricKind, RuleRole, RuntimeManagedOptionStrategyConfig
+from options.strategy.models import MetricKind, RuleRole, RuntimeManagedOptionStrategyConfig
 
 
 TERMINAL_ORDER_STATUSES = {"COMPLETE", "CANCELLED", "REJECTED", "EXPIRED", "FILLED"}
