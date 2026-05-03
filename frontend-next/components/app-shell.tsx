@@ -14,14 +14,13 @@ export function AppShell({ navigation, activeHref, children }: AppShellProps) {
   const activeItem = navigation.find(
     (item) => activeHref === item.href || (item.href !== "/dashboard" && activeHref.startsWith(item.href)),
   );
-  const hideGlobalDock = activeHref.startsWith("/options");
 
   return (
     <div className="grid min-h-screen grid-cols-[68px_1fr] grid-rows-[52px_1fr_auto] bg-[var(--bg)] text-[var(--text)]">
       <LeftRail navigation={navigation} activeHref={activeHref} />
       <TopBar title={activeItem?.label ?? "Dashboard"} />
       <main className="min-w-0 overflow-auto p-4 lg:p-5">{children}</main>
-      {hideGlobalDock ? <div /> : <BottomDock workspace={activeHref} />}
+      <BottomDock workspace={activeHref} />
     </div>
   );
 }

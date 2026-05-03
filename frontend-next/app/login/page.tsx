@@ -3,8 +3,9 @@
 import { Suspense, useEffect, useMemo, useState, type FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
-import type { RuntimeStatus } from "@/components/options/types";
-import { fetchRuntimeStatus, loginApp } from "@/lib/options/api";
+import { fetchTradingRuntimeStatus } from "@/features/trading/api";
+import type { RuntimeStatus } from "@/lib/runtime-status";
+import { loginApp } from "@/lib/options/api";
 
 function fallbackStatus(): RuntimeStatus {
   return {
@@ -42,6 +43,13 @@ function sanitizeNextHref(value: string | null) {
   return value;
 }
 
+function hardNavigate(nextHref: string) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.location.assign(nextHref);
+}
+
 export default function LoginPage() {
   return (
     <Suspense fallback={null}>
@@ -54,8 +62,6 @@ function LoginPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const nextHref = useMemo(() => sanitizeNextHref(searchParams.get("next")), [searchParams]);
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
   const [pending, setPending] = useState(false);
   const [status, setStatus] = useState<RuntimeStatus>(fallbackStatus());
 
@@ -63,11 +69,11 @@ function LoginPageContent() {
     let disposed = false;
     async function load() {
       try {
-        const next = await fetchRuntimeStatus();
+        const next = await fetchTradingRuntimeStatus();
         if (disposed) return;
         setStatus(next);
         if (next.appAuthenticated) {
-          router.replace(nextHref);
+          hardNavigate(nextHref);
         }
       } catch {
         if (!disposed) {
@@ -83,12 +89,18 @@ function LoginPageContent() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const formData = new FormData(event.currentTarget);
+    const username = String(formData.get("username") ?? "").trim();
+    const password = String(formData.get("password") ?? "");
+    if (!username || !password) {
+      toast.error("Enter username and password");
+      return;
+    }
     setPending(true);
     try {
       await loginApp({ username, password });
       toast.success("Signed in");
-      router.replace(nextHref);
-      router.refresh();
+      hardNavigate(nextHref);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Login failed");
     } finally {
@@ -109,9 +121,9 @@ function LoginPageContent() {
               Username
               <input
                 aria-label="app username"
-                value={username}
-                onChange={(event) => setUsername(event.currentTarget.value)}
+                name="username"
                 placeholder="Username"
+                autoComplete="username"
                 className="rounded-xl border border-[var(--border)] bg-[var(--bg)] px-4 py-3 text-[var(--text)] outline-none"
               />
             </label>
@@ -120,15 +132,15 @@ function LoginPageContent() {
               <input
                 aria-label="app password"
                 type="password"
-                value={password}
-                onChange={(event) => setPassword(event.currentTarget.value)}
+                name="password"
                 placeholder="Password"
+                autoComplete="current-password"
                 className="rounded-xl border border-[var(--border)] bg-[var(--bg)] px-4 py-3 text-[var(--text)] outline-none"
               />
             </label>
             <button
               type="submit"
-              disabled={pending || !username || !password}
+              disabled={pending}
               className="rounded-xl border border-[var(--accent-border)] bg-[var(--accent-soft)] px-4 py-3 text-sm font-semibold text-[var(--accent)] disabled:opacity-60"
             >
               {pending ? "Signing in…" : "Login to app"}

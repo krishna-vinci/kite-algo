@@ -20,43 +20,42 @@ function formatDateTime(value: string | null) {
 export default function JournalEpisodesPage() {
   const [period, setPeriod] = useState<AnalysisPeriod>("month");
   const { selectedEnvironmentId, selectedEnvironment } = useJournalWorkspace();
-  const [episodes, setEpisodes] = useState<JournalEpisode[]>([]);
-  const [episodesLoading, setEpisodesLoading] = useState(false);
-  const [episodesError, setEpisodesError] = useState<string | null>(null);
+  const [episodesState, setEpisodesState] = useState<{
+    environmentId: string;
+    items: JournalEpisode[];
+    error: string | null;
+  }>({ environmentId: "", items: [], error: null });
 
   useEffect(() => {
     let closed = false;
     if (!selectedEnvironmentId) {
-      setEpisodes([]);
-      setEpisodesError(null);
-      setEpisodesLoading(false);
       return () => {
         closed = true;
       };
     }
-    setEpisodesLoading(true);
     fetchJournalEpisodes({ environment_id: selectedEnvironmentId })
       .then((items) => {
         if (!closed) {
-          setEpisodes(items);
-          setEpisodesError(null);
+          setEpisodesState({ environmentId: selectedEnvironmentId, items, error: null });
         }
       })
       .catch((error) => {
         if (!closed) {
-          setEpisodes([]);
-          setEpisodesError(error instanceof Error ? error.message : "Failed to load episodes");
-        }
-      })
-      .finally(() => {
-        if (!closed) {
-          setEpisodesLoading(false);
+          setEpisodesState({
+            environmentId: selectedEnvironmentId,
+            items: [],
+            error: error instanceof Error ? error.message : "Failed to load episodes",
+          });
         }
       });
     return () => {
       closed = true;
     };
   }, [selectedEnvironmentId]);
+
+  const displayedEpisodes = selectedEnvironmentId && episodesState.environmentId === selectedEnvironmentId ? episodesState.items : [];
+  const displayedEpisodesLoading = Boolean(selectedEnvironmentId) && episodesState.environmentId !== selectedEnvironmentId;
+  const displayedEpisodesError = selectedEnvironmentId && episodesState.environmentId === selectedEnvironmentId ? episodesState.error : null;
 
   return (
     <div className="space-y-5 pb-5">
@@ -73,17 +72,17 @@ export default function JournalEpisodesPage() {
         title="Episode ledger"
         className="p-4 md:p-5"
       >
-        {episodesLoading ? <p className="text-sm text-foreground/60">Loading episodes…</p> : null}
-        {episodesError ? <p className="text-sm text-destructive">{episodesError}</p> : null}
-        {!episodesLoading && !episodesError && selectedEnvironment && episodes.length === 0 ? (
+        {displayedEpisodesLoading ? <p className="text-sm text-foreground/60">Loading episodes…</p> : null}
+        {displayedEpisodesError ? <p className="text-sm text-destructive">{displayedEpisodesError}</p> : null}
+        {!displayedEpisodesLoading && !displayedEpisodesError && selectedEnvironment && displayedEpisodes.length === 0 ? (
           <div className="rounded-xl border border-dashed border-border/70 bg-background/35 px-4 py-6 text-sm text-foreground/65">
             No episodes found for this environment yet.
           </div>
         ) : null}
 
-        {!episodesLoading && !episodesError && episodes.length > 0 ? (
+        {!displayedEpisodesLoading && !displayedEpisodesError && displayedEpisodes.length > 0 ? (
           <div className="space-y-3">
-            {episodes.map((episode) => (
+            {displayedEpisodes.map((episode) => (
               <JournalPageLink
                 key={episode.id}
                 href={`/journal/episodes/${episode.id}`}

@@ -15,12 +15,12 @@ const tabs = [
 ] as const;
 
 export function JournalNav() {
-  const pathname = usePathname();
+  const pathname = usePathname() ?? "";
 
   return (
     <nav aria-label="Journal sections" className="flex items-center gap-1 overflow-x-auto">
       {tabs.map((tab) => {
-        const active = pathname === tab.href;
+        const active = tab.href === "/journal" ? pathname === tab.href : pathname === tab.href || pathname.startsWith(`${tab.href}/`);
         return (
           <JournalPageLink
             key={tab.href}

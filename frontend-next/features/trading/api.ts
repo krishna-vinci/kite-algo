@@ -1,4 +1,4 @@
-import type { RuntimeStatus } from "@/components/options/types";
+import type { RuntimeStatus } from "@/lib/runtime-status";
 import type {
   ControlPlaneSnapshot,
   TradingPaperAccount,
@@ -11,7 +11,8 @@ import type {
   TradingStrategyGroup,
   TradingTimelineItem,
 } from "@/features/trading/types";
-import { apiFetch } from "@/lib/api/client";
+import { ApiClientError, apiFetch } from "@/lib/api/client";
+import { clearKiteBrowserSessionHint } from "@/lib/kite-browser-session";
 
 type SessionStatusResponse = {
   app?: { authenticated?: boolean };
@@ -140,15 +141,17 @@ function normalizeTimeline(items: unknown): TradingTimelineItem[] {
 }
 
 export function normalizeRuntimeStatus(response: SessionStatusResponse): RuntimeStatus {
+  const brokerStatus = String(response?.broker?.status ?? "unknown").toLowerCase();
+  const websocketStatus = String(response?.runtime?.websocket?.status ?? "unknown").toLowerCase();
   return {
     brokerConnected: Boolean(response?.broker?.connected),
-    brokerStatus: String(response?.broker?.status ?? "unknown") as RuntimeStatus["brokerStatus"],
+    brokerStatus: brokerStatus as RuntimeStatus["brokerStatus"],
     brokerMode: response?.broker?.mode ?? "system",
     brokerLastSuccessAt: response?.broker?.last_login?.last_success_at ?? null,
     brokerLastFailureAt: response?.broker?.last_login?.last_failure_at ?? null,
     brokerLastError: response?.broker?.last_login?.last_error ?? null,
     brokerNextRefreshAt: response?.broker?.scheduler?.next_run ?? null,
-    websocketStatus: String(response?.runtime?.websocket?.status ?? "unknown"),
+    websocketStatus,
     paperAvailable: Boolean(response?.runtime?.paper_runtime?.available),
     appAuthenticated: Boolean(response?.app?.authenticated),
   };
@@ -235,8 +238,29 @@ export function normalizeBrokerPositions(response: BrokerPositionsResponse): Tra
 }
 
 export async function fetchBrokerPositions(): Promise<TradingBrokerSnapshot> {
-  const response = await apiFetch<BrokerPositionsResponse>("/api/positions/realtime");
-  return normalizeBrokerPositions(response);
+  try {
+    const response = await apiFetch<BrokerPositionsResponse>("/api/positions/realtime");
+    return normalizeBrokerPositions(response);
+  } catch (error) {
+    if (error instanceof ApiClientError && error.status === 409) {
+      try {
+        await apiFetch("/api/positions/initialize", { method: "POST" });
+        const response = await apiFetch<BrokerPositionsResponse>("/api/positions/realtime");
+        return normalizeBrokerPositions(response);
+      } catch (initError) {
+        if (initError instanceof ApiClientError && (initError.status === 401 || initError.status === 409)) {
+          clearKiteBrowserSessionHint();
+          return normalizeBrokerPositions({ positions: {} });
+        }
+        throw initError;
+      }
+    }
+    if (error instanceof ApiClientError && (error.status === 401 || error.status === 409)) {
+      clearKiteBrowserSessionHint();
+      return normalizeBrokerPositions({ positions: {} });
+    }
+    throw error;
+  }
 }
 
 export function normalizeControlPlaneSnapshot(response: Record<string, unknown>): ControlPlaneSnapshot {

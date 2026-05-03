@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 
-import { useJournalWorkspace } from "@/components/journal/journal-workspace-provider";
+import { useOptionalJournalWorkspace } from "@/components/journal/journal-workspace-provider";
 
 type JournalPageLinkProps = {
   href: string;
@@ -19,13 +19,10 @@ function appendEnvironmentId(href: string, environmentId: string) {
 }
 
 export function JournalPageLink({ href, children, className, "aria-current": ariaCurrent }: JournalPageLinkProps) {
-  let selectedEnvironmentId = "";
-  try {
-    selectedEnvironmentId = useJournalWorkspace().selectedEnvironmentId;
-  } catch {
-    selectedEnvironmentId =
-      typeof window !== "undefined" ? (new URLSearchParams(window.location.search).get("environment_id") ?? "") : "";
-  }
+  const workspace = useOptionalJournalWorkspace();
+  const selectedEnvironmentId =
+    workspace?.selectedEnvironmentId ??
+    (typeof window !== "undefined" ? (new URLSearchParams(window.location.search).get("environment_id") ?? "") : "");
 
   const nextHref = appendEnvironmentId(href, selectedEnvironmentId);
 

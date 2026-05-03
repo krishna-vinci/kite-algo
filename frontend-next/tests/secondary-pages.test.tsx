@@ -1,13 +1,33 @@
 import { screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import PaperPage from "@/app/(app)/paper/page";
 import SettingsPage from "@/app/(app)/settings/page";
+import StrategiesPage from "@/app/(app)/strategies/page";
 import { renderWithQueryClient } from "@/tests/render-with-query-client";
 
-vi.mock("@/features/trading/hooks/use-paper-strategy-summary", () => ({
-  usePaperStrategySummary: () => ({
-    data: {
+const replaceMock = vi.fn();
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ replace: replaceMock }),
+  useSearchParams: () => new URLSearchParams(window.location.search),
+}));
+
+vi.mock("@/features/trading/hooks/use-trading-console-data", () => ({
+  useTradingConsoleData: () => ({
+    runtime: {
+      brokerConnected: true,
+      brokerStatus: "connected",
+      brokerMode: "system",
+      brokerLastSuccessAt: null,
+      brokerLastFailureAt: null,
+      brokerLastError: null,
+      brokerNextRefreshAt: null,
+      websocketStatus: "connected",
+      paperAvailable: true,
+      appAuthenticated: true,
+    },
+    quotes: [],
+    paper: {
       accountScope: "default",
       account: {
         accountScope: "default",
@@ -22,6 +42,7 @@ vi.mock("@/features/trading/hooks/use-paper-strategy-summary", () => ({
       activeStrategyCount: 1,
       strategies: [
         {
+          strategyRunId: "paper-1",
           strategyId: "paper-1",
           displayName: "Paper Iron Condor",
           strategyTag: "options_runtime",
@@ -33,15 +54,8 @@ vi.mock("@/features/trading/hooks/use-paper-strategy-summary", () => ({
           realizedPnl: 700,
           unrealizedPnl: 300,
           marginInUse: 19000,
-          riskControls: {
-            indexLowerBoundary: null,
-            indexUpperBoundary: null,
-            combinedPremiumTarget: 18,
-            combinedPremiumStoploss: 32,
-            basketMtmTarget: null,
-            basketMtmStoploss: null,
-          },
-          capabilities: { canEditRisk: true, editRiskReason: null },
+          summaryFields: [],
+          capabilities: { canEditRisk: true, editRiskReason: null, canExitStrategy: true, exitReason: null, allowedActions: ["edit_risk", "exit_strategy"], riskSchema: [] },
           positions: [],
           orders: [],
           trades: [],
@@ -49,19 +63,18 @@ vi.mock("@/features/trading/hooks/use-paper-strategy-summary", () => ({
         },
       ],
     },
-    isLoading: false,
-    isFetching: false,
-    error: null,
-    refetch: vi.fn(),
+    broker: { positions: [], activeCount: 0 },
+    control: { generatedAt: null, totals: { strategyCount: 1, openStrategyCount: 1, positionCount: 0, staleWorkerCount: 0, realizedPnl: 0, unrealizedPnl: 0, netPnl: 0 }, strategies: [], unattributed: { displayName: "Manual / unattributed broker exposure", positions: [], orders: [], realizedPnl: 0, unrealizedPnl: 0, netPnl: 0 } },
   }),
 }));
 
 describe("secondary reference pages", () => {
-  it("renders the shared paper workspace", () => {
-    renderWithQueryClient(<PaperPage />);
+  it("renders the paper tab inside the shared strategies workspace", () => {
+    window.history.replaceState({}, "", "/strategies?mode=paper");
+    renderWithQueryClient(<StrategiesPage />);
 
     expect(screen.getByRole("heading", { name: /paper account/i })).toBeInTheDocument();
-    expect(screen.getByText(/strategy groups/i)).toBeInTheDocument();
+    expect(screen.getByText(/paper iron condor/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /exit/i })).toBeInTheDocument();
   });
 

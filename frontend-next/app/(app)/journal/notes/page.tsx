@@ -1,13 +1,20 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
+import { JournalNoteCreateForm } from "@/components/journal/journal-note-create-form";
 import { JournalWorkspaceHeader } from "@/components/journal/journal-workspace-header";
 import { useJournalWorkspace } from "@/components/journal/journal-workspace-provider";
-import { MarkdownNoteEditor } from "@/components/journal/markdown-note-editor";
 import { Panel } from "@/components/operator/panel";
 import { fetchJournalNotes } from "@/lib/journal/api";
 import type { AnalysisPeriod, JournalNote } from "@/lib/journal/types";
+
+type NotesState = {
+  environmentId: string;
+  items: JournalNote[];
+  loading: boolean;
+  error: string | null;
+};
 
 function formatDateTime(value: string | null | undefined) {
   if (!value) return "—";
@@ -17,43 +24,53 @@ function formatDateTime(value: string | null | undefined) {
 export default function JournalNotesPage() {
   const [period, setPeriod] = useState<AnalysisPeriod>("month");
   const { selectedEnvironmentId, selectedEnvironment } = useJournalWorkspace();
-  const [notes, setNotes] = useState<JournalNote[]>([]);
-  const [notesLoading, setNotesLoading] = useState(false);
-  const [notesError, setNotesError] = useState<string | null>(null);
+  const [notesState, setNotesState] = useState<NotesState>({ environmentId: "", items: [], loading: false, error: null });
+
+  const loadNotes = useCallback(async (environmentId: string) => {
+    try {
+      const items = await fetchJournalNotes({ environment_id: environmentId, limit: 50 });
+      setNotesState({ environmentId, items, loading: false, error: null });
+    } catch (error) {
+      setNotesState({
+        environmentId,
+        items: [],
+        loading: false,
+        error: error instanceof Error ? error.message : "Failed to load notes",
+      });
+    }
+  }, []);
 
   useEffect(() => {
-    let closed = false;
     if (!selectedEnvironmentId) {
-      setNotes([]);
-      setNotesLoading(false);
-      setNotesError(null);
-      return () => {
-        closed = true;
-      };
+      return;
     }
-    setNotesLoading(true);
+
+    let closed = false;
     fetchJournalNotes({ environment_id: selectedEnvironmentId, limit: 50 })
       .then((items) => {
         if (!closed) {
-          setNotes(items);
-          setNotesError(null);
+          setNotesState({ environmentId: selectedEnvironmentId, items, loading: false, error: null });
         }
       })
       .catch((error) => {
         if (!closed) {
-          setNotes([]);
-          setNotesError(error instanceof Error ? error.message : "Failed to load notes");
-        }
-      })
-      .finally(() => {
-        if (!closed) {
-          setNotesLoading(false);
+          setNotesState({
+            environmentId: selectedEnvironmentId,
+            items: [],
+            loading: false,
+            error: error instanceof Error ? error.message : "Failed to load notes",
+          });
         }
       });
     return () => {
       closed = true;
     };
   }, [selectedEnvironmentId]);
+
+  const showingSelectedEnvironment = notesState.environmentId === selectedEnvironmentId;
+  const notes = showingSelectedEnvironment ? notesState.items : [];
+  const notesLoading = Boolean(selectedEnvironmentId) && (!showingSelectedEnvironment || notesState.loading);
+  const notesError = showingSelectedEnvironment ? notesState.error : null;
 
   return (
     <div className="space-y-5 pb-5">
@@ -89,17 +106,11 @@ export default function JournalNotesPage() {
         ) : null}
       </Panel>
 
-      <Panel title="Quick note capture" className="p-4 md:p-5">
-        <p className="mb-3 text-sm text-foreground/65">
-          Capture fast context while reviewing episodes. This editor is environment-scoped and suitable for short operator notes.
-        </p>
-        <MarkdownNoteEditor
-          title="Scratchpad"
-          helperText={selectedEnvironmentId ? "Draft locally, then copy into episode/subject notes as needed." : "Select an environment before capturing notes."}
-          placeholder="Write a quick review thought, TODO, or follow-up cue..."
-          disabled={!selectedEnvironmentId}
-          onSave={async () => undefined}
-        />
+      <Panel title="Create note" className="p-4 md:p-5">
+        {!selectedEnvironmentId ? <p className="text-sm text-foreground/60">Select an environment before creating notes.</p> : null}
+        {selectedEnvironmentId ? (
+          <JournalNoteCreateForm environmentId={selectedEnvironmentId} onCreated={() => loadNotes(selectedEnvironmentId)} />
+        ) : null}
       </Panel>
     </div>
   );

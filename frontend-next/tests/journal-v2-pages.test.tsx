@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import JournalAnalyticsPage from "@/app/(app)/journal/analytics/page";
@@ -6,6 +6,7 @@ import JournalEpisodeDetailPage from "@/app/(app)/journal/episodes/[episodeId]/p
 import JournalEpisodesPage from "@/app/(app)/journal/episodes/page";
 import JournalOverviewPage from "@/app/(app)/journal/page";
 import JournalNotesPage from "@/app/(app)/journal/notes/page";
+import JournalStrategiesPage from "@/app/(app)/journal/strategies/page";
 import JournalUnresolvedPage from "@/app/(app)/journal/unresolved/page";
 import { EnvironmentSelector } from "@/components/journal/environment-selector";
 import { JournalNav } from "@/components/journal/journal-nav";
@@ -18,6 +19,7 @@ const fetchJournalEpisodeMock = vi.hoisted(() => vi.fn());
 const fetchJournalTimelineMock = vi.hoisted(() => vi.fn());
 const fetchJournalNotesMock = vi.hoisted(() => vi.fn());
 const fetchJournalNoteRevisionsMock = vi.hoisted(() => vi.fn());
+const createJournalNoteMock = vi.hoisted(() => vi.fn());
 const fetchJournalV2AnalyticsSummaryMock = vi.hoisted(() => vi.fn());
 const fetchJournalV2AnalyticsStrategiesMock = vi.hoisted(() => vi.fn());
 const fetchJournalV2PaperLiveComparisonMock = vi.hoisted(() => vi.fn());
@@ -30,6 +32,7 @@ vi.mock("@/lib/journal/api", () => ({
   fetchJournalTimeline: fetchJournalTimelineMock,
   fetchJournalNotes: fetchJournalNotesMock,
   fetchJournalNoteRevisions: fetchJournalNoteRevisionsMock,
+  createJournalNote: createJournalNoteMock,
   fetchJournalV2AnalyticsSummary: fetchJournalV2AnalyticsSummaryMock,
   fetchJournalV2AnalyticsStrategies: fetchJournalV2AnalyticsStrategiesMock,
   fetchJournalV2PaperLiveComparison: fetchJournalV2PaperLiveComparisonMock,
@@ -47,6 +50,7 @@ describe("journal v2 pages", () => {
     fetchJournalTimelineMock.mockReset();
     fetchJournalNotesMock.mockReset();
     fetchJournalNoteRevisionsMock.mockReset();
+    createJournalNoteMock.mockReset();
     fetchJournalV2AnalyticsSummaryMock.mockReset();
     fetchJournalV2AnalyticsStrategiesMock.mockReset();
     fetchJournalV2PaperLiveComparisonMock.mockReset();
@@ -78,14 +82,28 @@ describe("journal v2 pages", () => {
     fetchJournalTimelineMock.mockResolvedValue([]);
     fetchJournalNotesMock.mockResolvedValue([]);
     fetchJournalNoteRevisionsMock.mockResolvedValue([]);
+    createJournalNoteMock.mockResolvedValue({
+      id: "note-1",
+      environment_id: "env-1",
+      subject_type: "environment",
+      subject_id: "env-1",
+      episode_id: null,
+      note_type: "review",
+      title: "Review note",
+      body_markdown: "body",
+      tags: [],
+      updated_at: "2026-05-01T10:05:00Z",
+    });
     fetchJournalV2AnalyticsSummaryMock.mockResolvedValue({
       environment_id: "env-1",
       closed_episode_count: 0,
-      metrics: { closed_episode_count: 0, net_pnl: 0, total_charges: 0 },
+      metrics: { closed_episode_count: 0, net_pnl: 0, total_charges: 0, win_rate: 0 },
     });
     fetchJournalV2AnalyticsStrategiesMock.mockResolvedValue({ environment_id: "env-1", items: [], count: 0 });
     fetchJournalV2PaperLiveComparisonMock.mockResolvedValue({
       template_id: "tmpl-1",
+      paper_environment_id: "env-1",
+      live_environment_id: "env-live-1",
       paper: { closed_episode_count: 0, net_pnl: 0, total_charges: 0 },
       live: { closed_episode_count: 0, net_pnl: 0, total_charges: 0 },
       combined: null,
@@ -143,8 +161,13 @@ describe("journal v2 pages", () => {
     );
 
     await waitFor(() => expect(fetchJournalV2AnalyticsSummaryMock).toHaveBeenCalledWith("env-1"));
-    expect(screen.getByText(/Recent V2 episodes/i)).toBeInTheDocument();
-    expect(screen.getByText(/Unresolved queue summary/i)).toBeInTheDocument();
+    expect(screen.getByText(/Environment-scoped review/i)).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /live/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /paper/i })).toBeInTheDocument();
+    expect(screen.getByText(/Recent episodes/i)).toBeInTheDocument();
+    expect(screen.getByText(/Unresolved queue/i)).toBeInTheDocument();
+    expect(screen.queryByText(/dev notice/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Combined P&L/i)).not.toBeInTheDocument();
   });
 
   it("renders episode ledger entries linked with environment_id", async () => {
@@ -241,7 +264,7 @@ describe("journal v2 pages", () => {
     expect(screen.getByRole("heading", { name: /Note revisions/i })).toBeInTheDocument();
   });
 
-  it("shows notes archive and unresolved queue from shared Journal environment", async () => {
+  it("shows backend-backed notes archive and unresolved queue from shared Journal environment", async () => {
     window.history.pushState({}, "", "/journal/notes?environment_id=env-1");
     fetchJournalNotesMock.mockResolvedValue([
       {
@@ -268,10 +291,58 @@ describe("journal v2 pages", () => {
     await waitFor(() => expect(fetchJournalNotesMock).toHaveBeenCalledWith({ environment_id: "env-1", limit: 50 }));
     await waitFor(() => expect(fetchJournalV2UnresolvedMock).toHaveBeenCalledWith("env-1"));
     expect(screen.getByRole("heading", { name: /Notes archive/i })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /Unresolved identity\/activity queue/i })).toBeInTheDocument();
+    expect(screen.getByText(/Create environment note/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Unresolved queue/i })).toBeInTheDocument();
     expect(screen.getByLabelText(/Markdown note/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Save/i })).toBeInTheDocument();
-    expect(screen.getByText(/Draft locally, then copy into episode\/subject notes as needed./i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Save note/i })).toBeInTheDocument();
+    expect(screen.queryByText(/Draft locally/i)).not.toBeInTheDocument();
+  });
+
+  it("creates a real environment note and refreshes the list", async () => {
+    window.history.pushState({}, "", "/journal/notes?environment_id=env-1");
+    fetchJournalNotesMock
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          id: "note-1",
+          environment_id: "env-1",
+          subject_type: "environment",
+          subject_id: "env-1",
+          episode_id: null,
+          note_type: "review",
+          title: "Review note",
+          body_markdown: "First review",
+          tags: ["tag-a"],
+          updated_at: "2026-05-01T10:05:00Z",
+        },
+      ]);
+
+    renderWithQueryClient(
+      <JournalWorkspaceProvider>
+        <JournalNotesPage />
+      </JournalWorkspaceProvider>,
+    );
+
+    await waitFor(() => expect(fetchJournalNotesMock).toHaveBeenCalledWith({ environment_id: "env-1", limit: 50 }));
+
+    fireEvent.change(screen.getByLabelText(/Markdown note/i), { target: { value: "First review" } });
+    fireEvent.change(screen.getByLabelText(/Note tags/i), { target: { value: "tag-a" } });
+    fireEvent.click(screen.getByRole("button", { name: /Save note/i }));
+
+    await waitFor(() =>
+      expect(createJournalNoteMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          environment_id: "env-1",
+          subject_type: "environment",
+          subject_id: "env-1",
+          note_type: "review",
+          body_markdown: "First review",
+          tags: ["tag-a"],
+        }),
+      ),
+    );
+    await waitFor(() => expect(fetchJournalNotesMock).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/Review note/i)).toBeInTheDocument();
   });
 
   it("shows analytics page from shared environment selection without mixed totals", async () => {
@@ -284,6 +355,66 @@ describe("journal v2 pages", () => {
 
     await waitFor(() => expect(fetchJournalV2AnalyticsSummaryMock).toHaveBeenCalledWith("env-1"));
     expect(screen.queryByText("Combined P&L")).not.toBeInTheDocument();
+    expect(screen.getByText(/Paper vs Live Comparison/i)).toBeInTheDocument();
     expect(screen.getByText(/Select a template plus explicit paper and live environments to compare them separately./i)).toBeInTheDocument();
+  });
+
+  it("shows strategy scorecards with formatted metrics", async () => {
+    window.history.pushState({}, "", "/journal/strategies?environment_id=env-1");
+    fetchJournalV2AnalyticsStrategiesMock.mockResolvedValue({
+      environment_id: "env-1",
+      count: 1,
+      items: [
+        {
+          template_id: "tmpl-1",
+          strategy_family: "options_strategy",
+          display_name: "Breakout Review",
+          metrics: { closed_episode_count: 12, net_pnl: 15234, total_charges: 412, win_rate: 58.3 },
+        },
+      ],
+    });
+
+    renderWithQueryClient(
+      <JournalWorkspaceProvider>
+        <JournalStrategiesPage />
+      </JournalWorkspaceProvider>,
+    );
+
+    await waitFor(() => expect(fetchJournalV2AnalyticsStrategiesMock).toHaveBeenCalledWith("env-1"));
+    expect(screen.getByText(/Strategy Template Scorecards/i)).toBeInTheDocument();
+    expect(screen.getByText(/Net P&L: ₹15,234/i)).toBeInTheDocument();
+    expect(screen.getByText(/Win rate: 58.3%/i)).toBeInTheDocument();
+  });
+
+  it("shows reusable unresolved queue guidance on the full page", async () => {
+    window.history.pushState({}, "", "/journal/unresolved?environment_id=env-1");
+    fetchJournalV2UnresolvedMock.mockResolvedValue({
+      environment_id: "env-1",
+      count: 1,
+      items: [
+        {
+          id: "uq-1",
+          environment_id: "env-1",
+          execution_context_id: "ctx-1",
+          source_system: "broker_import",
+          reason: "Missing strategy identity",
+          raw_identity: {},
+          candidate_mappings: [{ template_id: "tmpl-1" }],
+          metadata: {},
+          status: "pending",
+          created_at: "2026-05-01T10:00:00Z",
+          resolved_at: null,
+        },
+      ],
+    });
+
+    renderWithQueryClient(
+      <JournalWorkspaceProvider>
+        <JournalUnresolvedPage />
+      </JournalWorkspaceProvider>,
+    );
+
+    await waitFor(() => expect(fetchJournalV2UnresolvedMock).toHaveBeenCalledWith("env-1"));
+    expect(screen.getByText(/Resolve actions are shown only/i)).toBeInTheDocument();
   });
 });

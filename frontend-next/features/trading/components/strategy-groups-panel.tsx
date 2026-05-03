@@ -10,6 +10,9 @@ type StrategyGroupsPanelProps = {
   strategies: TradingStrategyGroup[];
   emptyCopy?: string;
   renderActions?: (strategy: TradingStrategyGroup) => ReactNode;
+  title?: string;
+  eyebrow?: string;
+  testId?: string;
 };
 
 function formatUpdatedAt(value?: string | null) {
@@ -29,10 +32,11 @@ function formatCurrency(value: number) {
 }
 
 function riskSummary(s: TradingStrategyGroup) {
-  if (s.summaryFields.length === 0) {
+  const summaryFields = s.summaryFields ?? [];
+  if (summaryFields.length === 0) {
     return "No summary fields available";
   }
-  return s.summaryFields
+  return summaryFields
     .map((field) => `${field.label} ${field.value ?? "—"}${field.unit ? ` ${field.unit}` : ""}`)
     .join(" · ");
 }
@@ -41,12 +45,15 @@ export function StrategyGroupsPanel({
   strategies,
   emptyCopy = "No strategies loaded",
   renderActions,
+  title = "Strategy groups",
+  eyebrow = "strategies",
+  testId = "strategy-groups-panel",
 }: StrategyGroupsPanelProps) {
   const [editTarget, setEditTarget] = useState<TradingStrategyGroup | null>(null);
 
   return (
     <>
-        <Panel eyebrow="strategies" title="Strategy groups" data-testid="strategy-groups-panel">
+      <Panel eyebrow={eyebrow} title={title} data-testid={testId}>
         {strategies.length === 0 && (
           <p className="py-4 text-center text-sm text-foreground/40">{emptyCopy}</p>
         )}
@@ -104,7 +111,7 @@ export function StrategyGroupsPanel({
                 <p className="font-mono text-[11px] text-foreground/40">{riskSummary(s)}</p>
                 <div className="flex items-center gap-2">
                   {renderActions?.(s)}
-                  {s.capabilities.canEditRisk && s.capabilities.riskSchema.length > 0 && (
+                  {s.capabilities.canEditRisk && (s.capabilities.riskSchema ?? []).length > 0 && (
                     <button
                       onClick={() => setEditTarget(s)}
                       className="rounded-md border border-border/50 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-foreground/60 hover:border-primary/40 hover:text-foreground/80"
@@ -127,7 +134,7 @@ export function StrategyGroupsPanel({
           }}
           strategyId={editTarget.strategyRunId}
           displayName={editTarget.displayName}
-          riskSchema={editTarget.capabilities.riskSchema}
+          riskSchema={editTarget.capabilities.riskSchema ?? []}
         />
       )}
     </>

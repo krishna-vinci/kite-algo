@@ -1,6 +1,6 @@
 "use client";
 
-import type { RuntimeStatus } from "@/components/options/types";
+import type { RuntimeStatus } from "@/lib/runtime-status";
 import { StatusBadge } from "@/components/operator/status-badge";
 import { Panel } from "@/components/operator/panel";
 

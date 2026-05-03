@@ -6,6 +6,7 @@ type EnvironmentSelectorProps = {
   environments: JournalEnvironment[];
   selectedEnvironmentId?: string;
   onSelectEnvironment: (environmentId: string) => void;
+  label?: string;
   loading?: boolean;
   error?: string | null;
   disabled?: boolean;
@@ -15,6 +16,7 @@ export function EnvironmentSelector({
   environments,
   selectedEnvironmentId,
   onSelectEnvironment,
+  label = "Environment",
   loading = false,
   error = null,
   disabled = false,
@@ -34,7 +36,7 @@ export function EnvironmentSelector({
     <section className="rounded-xl border border-border/60 bg-background/60 p-3">
       <div className="flex flex-wrap items-center gap-2">
         <label htmlFor="journal-v2-environment" className="text-xs uppercase tracking-[0.18em] text-foreground/60">
-          Environment
+          {label}
         </label>
         <select
           id="journal-v2-environment"

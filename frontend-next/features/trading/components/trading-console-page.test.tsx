@@ -1,9 +1,16 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import type { ReactElement } from "react";
-import { describe, it, expect } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 import { TradingConsolePage } from "./trading-console-page";
 import type { TradingConsoleSnapshot } from "@/features/trading/types";
+
+const replaceMock = vi.fn();
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ replace: replaceMock }),
+  useSearchParams: () => new URLSearchParams(window.location.search),
+}));
 
 const MOCK_SNAPSHOT: TradingConsoleSnapshot = {
   runtime: {
@@ -53,6 +60,23 @@ const MOCK_SNAPSHOT: TradingConsoleSnapshot = {
           { key: "combined_premium_stoploss", label: "Premium stoploss", value: 160, unit: "pts", group: "primary" },
         ],
         capabilities: { canEditRisk: true, editRiskReason: null, canExitStrategy: true, exitReason: null, allowedActions: ["edit_risk", "exit_strategy"], riskSchema: [] },
+        positions: [],
+        orders: [],
+        trades: [],
+        timeline: [],
+      },
+      {
+        strategyRunId: "dry-run-1",
+        strategyId: "dry-run-1",
+        displayName: "Hidden Dry Run",
+        mode: "dry_run",
+        status: "open",
+        isOpen: true,
+        openLegCount: 1,
+        realizedPnl: 0,
+        unrealizedPnl: 0,
+        summaryFields: [],
+        capabilities: { canEditRisk: false, editRiskReason: null, canExitStrategy: false, exitReason: null, allowedActions: [], riskSchema: [] },
         positions: [],
         orders: [],
         trades: [],
@@ -151,14 +175,18 @@ function renderWithQueryClient(ui: ReactElement) {
 }
 
 describe("TradingConsolePage", () => {
+  beforeEach(() => {
+    window.history.replaceState({}, "", "/strategies");
+  });
+
   it("renders the heading", () => {
     renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
-    expect(screen.getByText("Trading console")).toBeInTheDocument();
+    expect(screen.getByText("Strategies")).toBeInTheDocument();
   });
 
   it("renders strategy name", () => {
     renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
-    expect(screen.getByText("Iron Condor NIFTY")).toBeInTheDocument();
+    expect(screen.getByText("Mean Reversion")).toBeInTheDocument();
   });
 
   it("renders broker positions section with active positions only", () => {
@@ -175,12 +203,18 @@ describe("TradingConsolePage", () => {
     expect(screen.getByText("NIFTY")).toBeInTheDocument();
   });
 
-  it("renders control plane without losing existing panels", () => {
+  it("renders live sections without losing summary panels", () => {
     renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
 
-    expect(screen.getByTestId("control-plane-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("live-active-strategies-panel")).toBeInTheDocument();
     expect(screen.getByText("Mean Reversion")).toBeInTheDocument();
-    expect(screen.getByTestId("strategy-groups-panel")).toBeInTheDocument();
     expect(screen.getByTestId("broker-positions-panel")).toBeInTheDocument();
+  });
+
+  it("filters dry-run records from the primary operator sections", () => {
+    renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
+
+    expect(screen.getByText(/dry-run records hidden/i)).toBeInTheDocument();
+    expect(screen.queryByText("Hidden Dry Run")).not.toBeInTheDocument();
   });
 });

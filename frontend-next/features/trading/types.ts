@@ -1,4 +1,4 @@
-import type { RuntimeStatus } from "@/components/options/types";
+import type { RuntimeStatus } from "@/lib/runtime-status";
 
 export type TradingMode = "paper" | "dry_run" | "live";
 

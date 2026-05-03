@@ -1,7 +1,8 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { StrategyGroupsPanel } from "@/features/trading/components/strategy-groups-panel";
+import { renderWithQueryClient } from "@/tests/render-with-query-client";
 
 vi.mock("@/features/trading/api", () => ({
   updatePaperStrategyRisk: vi.fn(),
@@ -9,7 +10,7 @@ vi.mock("@/features/trading/api", () => ({
 
 describe("StrategyGroupsPanel", () => {
   it("renders backend-driven risk schema fields in the editor", () => {
-    render(
+    renderWithQueryClient(
       <StrategyGroupsPanel
         strategies={[
           {
@@ -59,7 +60,7 @@ describe("StrategyGroupsPanel", () => {
   });
 
   it("hides the edit button when the run exposes no editable risk fields", () => {
-    render(
+    renderWithQueryClient(
       <StrategyGroupsPanel
         strategies={[
           {

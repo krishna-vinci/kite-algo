@@ -114,6 +114,39 @@ describe("journal v2 API helpers", () => {
     );
   });
 
+  it("creates a Journal V2 environment note", async () => {
+    apiFetchMock.mockResolvedValueOnce({
+      id: "note-1",
+      environment_id: "env-1",
+      subject_type: "environment",
+      subject_id: "env-1",
+      note_type: "review",
+      title: "Review note",
+      body_markdown: "body",
+      tags: ["tag"],
+      updated_at: "2026-05-03T00:00:00Z",
+    });
+
+    const note = await createJournalNote({
+      environment_id: "env-1",
+      subject_type: "environment",
+      subject_id: "env-1",
+      note_type: "review",
+      title: "Review note",
+      body_markdown: "body",
+      tags: ["tag"],
+    });
+
+    expect(note.id).toBe("note-1");
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      "/api/journal/v2/notes",
+      expect.objectContaining({
+        method: "POST",
+        json: expect.objectContaining({ subject_type: "environment", subject_id: "env-1" }),
+      }),
+    );
+  });
+
   it("fetches analytics summary with explicit environment", async () => {
     apiFetchMock.mockResolvedValueOnce({ environment_id: "env-1", closed_episode_count: 0, metrics: {} });
 
