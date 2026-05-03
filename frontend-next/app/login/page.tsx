@@ -4,8 +4,8 @@ import { Suspense, useEffect, useMemo, useState, type FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import { fetchTradingRuntimeStatus } from "@/features/trading/api";
+import { loginApp } from "@/lib/app-auth";
 import type { RuntimeStatus } from "@/lib/runtime-status";
-import { loginApp } from "@/lib/options/api";
 
 function fallbackStatus(): RuntimeStatus {
   return {
