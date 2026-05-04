@@ -43,13 +43,13 @@ export function CompactTradingDock({ workspace, paper, broker }: CompactTradingD
             <span className="text-[9px] uppercase tracking-[0.06em] text-[var(--dim)]">unrealized</span>
             <span className="text-[9px] uppercase tracking-[0.06em] text-[var(--dim)]">risk</span>
             {activeStrategies.map((strategy) => (
-              <Fragment key={strategy.strategyId}>
-                <span key={`${strategy.strategyId}:name`} className="rounded bg-[var(--accent-soft)] px-2 py-1 text-[9px] font-bold text-[var(--accent)]">{strategy.displayName}</span>
-                <span key={`${strategy.strategyId}:mode`}>{strategy.mode}</span>
-                <span key={`${strategy.strategyId}:legs`}>{strategy.openLegCount}</span>
-                <span key={`${strategy.strategyId}:realized`} className={strategy.realizedPnl >= 0 ? "text-[var(--green)]" : "text-[var(--red)]"}>{formatPnl(strategy.realizedPnl)}</span>
-                <span key={`${strategy.strategyId}:unrealized`} className={strategy.unrealizedPnl >= 0 ? "text-[var(--green)]" : "text-[var(--red)]"}>{formatPnl(strategy.unrealizedPnl)}</span>
-                <span key={`${strategy.strategyId}:risk`} className="truncate">{strategy.capabilities.canEditRisk ? "editable" : "locked"}</span>
+              <Fragment key={strategy.strategyRunId}>
+                <span key={`${strategy.strategyRunId}:name`} className="rounded bg-[var(--accent-soft)] px-2 py-1 text-[9px] font-bold text-[var(--accent)]">{strategy.displayName}</span>
+                <span key={`${strategy.strategyRunId}:mode`}>{strategy.mode}</span>
+                <span key={`${strategy.strategyRunId}:legs`}>{strategy.openLegCount}</span>
+                <span key={`${strategy.strategyRunId}:realized`} className={strategy.realizedPnl >= 0 ? "text-[var(--green)]" : "text-[var(--red)]"}>{formatPnl(strategy.realizedPnl)}</span>
+                <span key={`${strategy.strategyRunId}:unrealized`} className={strategy.unrealizedPnl >= 0 ? "text-[var(--green)]" : "text-[var(--red)]"}>{formatPnl(strategy.unrealizedPnl)}</span>
+                <span key={`${strategy.strategyRunId}:risk`} className="truncate">{strategy.capabilities.canEditRisk ? "editable" : "locked"}</span>
               </Fragment>
             ))}
           </div>

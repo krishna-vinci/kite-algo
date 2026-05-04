@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from kiteconnect import KiteConnect
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from algo_runtime.admin import (
     update_instance_status as update_algo_runtime_instance_status_impl,
@@ -31,7 +32,7 @@ from broker_api.broker_api import get_kite
 from broker_api.instruments_repository import InstrumentsRepository
 from broker_api.kite_orders import get_correlation_id, realtime_positions_service, run_kite_write_action
 from broker_api.kite_session import get_kite_session_id, get_session_account_id
-from database import SessionLocal
+from database import SessionLocal, get_db
 from options.api.strategy_router import preview_option_strategy as canonical_preview_option_strategy
 from options.strategy import (
     StrategyExecutionMode,
@@ -311,7 +312,7 @@ async def suggest_strikes(req: SuggestStrikesRequest, request: Request):
 async def build_position(
     req: BuildPositionRequest,
     request: Request,
-    kite: KiteConnect = Depends(get_kite),
+    db: Session = Depends(get_db),
     corr_id: str = Depends(get_correlation_id),
 ):
     strategy_id = None
@@ -440,6 +441,7 @@ async def build_position(
 
         orders_placed = []
         orders_failed = []
+        kite = get_kite(request, db)
         for order in plan["orders"]:
             try:
                 order_id = await run_kite_write_action(
