@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { SectionTabs } from "@/components/shared/section-tabs";
 import { DateNav } from "@/components/shared/date-nav";
+import { PeriodSelector, type Period } from "@/components/shared/period-selector";
 import { ModeToggle } from "@/components/workspace/mode-toggle";
 import { EnvironmentSelector } from "@/components/workspace/environment-selector";
 import { useWorkspace } from "@/components/workspace/workspace-provider";
@@ -30,8 +31,22 @@ const TABS = [
   { href: "/journal", label: "Day", exact: true },
   { href: "/journal/week", label: "Week" },
   { href: "/journal/month", label: "Month" },
-  { href: "/analytics/strategies", label: "Strategy" },
 ] as const;
+
+const ANALYTICS_TABS = [
+  { href: "/journal/analytics", label: "Overview", exact: true },
+  { href: "/journal/analytics/strategies", label: "Strategies" },
+  { href: "/journal/analytics/equity", label: "Equity" },
+  { href: "/journal/analytics/costs", label: "Costs" },
+] as const;
+
+const PERIODS: { value: Period; label: string }[] = [
+  { value: "day", label: "Day" },
+  { value: "week", label: "Week" },
+  { value: "month", label: "Month" },
+  { value: "year", label: "Year" },
+  { value: "since_inception", label: "All" },
+];
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -53,9 +68,9 @@ function todayIso(): string {
  * JournalShell — top-level layout for the Journal section.
  *
  * Provides:
- *   - Title + Analytics link
+ *   - Title + Review/Analytics mode switch
  *   - ModeToggle + EnvironmentSelector from shared WorkspaceProvider
- *   - SectionTabs (Day, Week, Month, Strategies)
+ *   - SectionTabs for Review mode OR Analytics mode
  *   - DateNav shown only in day-view context (exact path /journal)
  */
 export function JournalShell({ children }: JournalShellProps) {
@@ -74,20 +89,61 @@ export function JournalShell({ children }: JournalShellProps) {
   } = useWorkspace();
 
   const isDayView = pathname === "/journal";
+  const isWeekView = pathname === "/journal/week";
+  const isMonthView = pathname === "/journal/month";
+  const isAnalyticsRoute = pathname.startsWith("/journal/analytics");
 
   // Current date from URL or today
   const currentDate = searchParams.get("date") ?? todayIso();
 
-  // Env + mode from URL (used to build analytics link)
-  const envParam = searchParams.get("env") ?? "";
-  const modeParam = searchParams.get("mode") ?? "";
+  // Env + mode from URL with workspace fallback (for bare /journal entry hydration)
+  const envParam = searchParams.get("env") ?? selectedEnvironmentId ?? "";
+  const modeParam = searchParams.get("mode") ?? selectedMode;
+  const periodParam = searchParams.get("period") ?? "";
+  const dateParam = searchParams.get("date") ?? "";
+  const reviewParam = searchParams.get("review") ?? "";
+  const periodParamValue = (searchParams.get("period") ?? "month") as Period;
 
-  // Build analytics link preserving current params
+  const currentReviewView = isWeekView ? "week" : isMonthView ? "month" : "day";
+  const reviewTarget =
+    reviewParam === "week" || reviewParam === "month" || reviewParam === "day"
+      ? reviewParam
+      : periodParam === "week"
+        ? "week"
+        : periodParam === "month"
+          ? "month"
+          : currentReviewView;
+
+  const reviewBase =
+    reviewTarget === "week"
+      ? "/journal/week"
+      : reviewTarget === "month"
+        ? "/journal/month"
+        : "/journal";
+
+  // Build mode links preserving current params where sensible
   const analyticsHref = buildParamHref("/journal/analytics", {
     env: envParam,
     mode: modeParam,
-    date: isDayView ? currentDate : undefined,
+    date: dateParam || (isDayView ? currentDate : undefined),
+    period: periodParam || undefined,
+    review: currentReviewView,
   });
+
+  const reviewHref = buildParamHref(reviewBase, {
+    env: envParam,
+    mode: modeParam,
+    date: dateParam || currentDate,
+  });
+
+  const handlePeriodChange = useCallback(
+    (period: Period) => {
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("period", period);
+      router.push(`${pathname}?${params.toString()}`);
+    },
+    [pathname, router, searchParams],
+  );
 
   // Handle date change in day view — push new URL
   const handleDateChange = useCallback(
@@ -113,17 +169,39 @@ export function JournalShell({ children }: JournalShellProps) {
         </div>
 
         <div className="flex items-center gap-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 gap-1.5 px-2.5 text-xs text-muted-foreground"
-            asChild
+          <div
+            role="tablist"
+            aria-label="Journal mode"
+            className="inline-flex items-center rounded-lg border border-border/70 bg-background/40 p-1"
           >
-            <Link href={analyticsHref}>
-              <BarChart2Icon data-icon="inline-start" />
-              Analytics
-            </Link>
-          </Button>
+            <Button
+              variant={isAnalyticsRoute ? "ghost" : "secondary"}
+              size="sm"
+              className={cn(
+                "h-7 px-2.5 text-xs",
+                !isAnalyticsRoute && "shadow-sm",
+              )}
+              asChild
+            >
+              <Link href={reviewHref} role="tab" aria-selected={!isAnalyticsRoute}>
+                Review
+              </Link>
+            </Button>
+            <Button
+              variant={isAnalyticsRoute ? "secondary" : "ghost"}
+              size="sm"
+              className={cn(
+                "h-7 gap-1.5 px-2.5 text-xs",
+                isAnalyticsRoute && "shadow-sm",
+              )}
+              asChild
+            >
+              <Link href={analyticsHref} role="tab" aria-selected={isAnalyticsRoute}>
+                <BarChart2Icon data-icon="inline-start" />
+                Analytics
+              </Link>
+            </Button>
+          </div>
         </div>
       </div>
 
@@ -142,12 +220,22 @@ export function JournalShell({ children }: JournalShellProps) {
           loading={environmentsLoading}
           error={environmentsError}
         />
+
+        {isAnalyticsRoute ? (
+          <PeriodSelector
+            value={periodParamValue}
+            onChange={handlePeriodChange}
+            options={PERIODS}
+          />
+        ) : null}
       </div>
 
       {/* ── Section tabs ─────────────────────────────────────────── */}
       <SectionTabs
-        tabs={TABS as unknown as import("@/components/shared/section-tabs").SectionTab[]}
-        preserveParams={["env", "mode", "date"]}
+        tabs={
+          (isAnalyticsRoute ? ANALYTICS_TABS : TABS) as unknown as import("@/components/shared/section-tabs").SectionTab[]
+        }
+        preserveParams={isAnalyticsRoute ? ["env", "mode", "date", "period", "review"] : ["env", "mode", "date"]}
         className="px-1"
       />
 

@@ -1,58 +1,16 @@
-"use client";
+import { redirect } from "next/navigation";
 
-import { useSearchParams } from "next/navigation";
-import { useQuery } from "@tanstack/react-query";
-
-import { fetchEquityCurve } from "@/lib/analytics/api";
-import { EquityCurveChart } from "@/components/analytics/equity-curve-chart";
-import type { Period } from "@/components/shared/period-selector";
-
-export default function EquityPage() {
-  const searchParams = useSearchParams();
-  const envId = searchParams.get("env") ?? "";
-  const period = (searchParams.get("period") ?? "month") as Period;
-
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["analytics-equity", envId, period],
-    queryFn: () => fetchEquityCurve({ environment_id: envId, period }),
-    enabled: !!envId,
-  });
-
-  if (!envId) {
-    return (
-      <div className="rounded-xl border border-border/60 bg-muted/20 px-4 py-8 text-center text-sm text-muted-foreground">
-        Select an environment to view the equity curve.
-      </div>
-    );
+export default async function AnalyticsEquityRedirect({
+  searchParams,
+}: {
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const resolved = (await searchParams) ?? {};
+  const sp = new URLSearchParams();
+  for (const [key, value] of Object.entries(resolved)) {
+    if (typeof value === "string") sp.set(key, value);
+    else if (Array.isArray(value) && value[0]) sp.set(key, value[0]);
   }
-
-  if (isLoading) {
-    return (
-      <div className="h-[320px] animate-pulse rounded-xl border border-border/70 bg-background/40" />
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="rounded-xl border border-rose-400/30 bg-rose-400/5 px-4 py-3 text-sm text-rose-300">
-        Failed to load equity curve: {error instanceof Error ? error.message : "Unknown error"}
-      </div>
-    );
-  }
-
-  const points = data?.points ?? [];
-
-  return (
-    <div className="flex flex-col gap-4">
-      <div>
-        <h3 className="mb-1 text-sm font-medium text-foreground/70">Equity Curve</h3>
-        <p className="text-xs text-muted-foreground">
-          Cumulative net P&L with benchmark and excess return overlays.
-        </p>
-      </div>
-      <div className="rounded-xl border border-border/60 bg-background/40 p-4">
-        <EquityCurveChart points={points} height={320} />
-      </div>
-    </div>
-  );
+  const qs = sp.toString();
+  redirect(`/journal/analytics/equity${qs ? `?${qs}` : ""}`);
 }

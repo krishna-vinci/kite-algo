@@ -57,6 +57,7 @@ describe("StrategyGroupsPanel", () => {
     expect(within(sheet).getByText(/premium stoploss/i)).toBeInTheDocument();
     expect(within(sheet).getByDisplayValue("18")).toBeInTheDocument();
     expect(within(sheet).getByDisplayValue("32")).toBeInTheDocument();
+    expect(screen.getByLabelText(/P&L \+500/i)).toBeInTheDocument();
   });
 
   it("hides the edit button when the run exposes no editable risk fields", () => {

@@ -1,22 +1,22 @@
 "use client";
 
-import { useSearchParams, useRouter } from "next/navigation";
-import { useCallback, useMemo } from "react";
+import { useSearchParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
-import { AlertCircleIcon } from "lucide-react";
+import { AlertCircleIcon, CalendarDaysIcon } from "lucide-react";
 
 import { fetchDailyView } from "@/lib/journal/api-v2";
 import { useWorkspace } from "@/components/workspace/workspace-provider";
+import { cn } from "@/lib/utils";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Separator } from "@/components/ui/separator";
+import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { MetricValue } from "@/components/shared/metric-value";
 import { PnlBadge } from "@/components/shared/pnl-badge";
 import { CostBreakdownTable } from "@/components/shared/cost-breakdown-table";
+import { JournalKpiCard } from "@/components/journal/journal-kpi-card";
 import type {
   AnalyticsMetrics,
   CostBreakdown,
@@ -24,7 +24,6 @@ import type {
   JournalV2OpenEpisodeCard,
   JournalV2StrategyGroup,
 } from "@/lib/journal/types-v2";
-import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -70,10 +69,11 @@ function costBreakdownNums(cb: CostBreakdown) {
 function buildEpisodeHref(
   episodeId: string,
   params: URLSearchParams,
+  workspace: { env?: string; mode?: string },
 ): string {
   const sp = new URLSearchParams();
-  const env = params.get("env");
-  const mode = params.get("mode");
+  const env = params.get("env") ?? workspace.env;
+  const mode = params.get("mode") ?? workspace.mode;
   const date = params.get("date");
   if (env) sp.set("env", env);
   if (mode) sp.set("mode", mode);
@@ -85,27 +85,6 @@ function buildEpisodeHref(
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
-
-function KpiCard({
-  label,
-  children,
-  className,
-}: {
-  label: string;
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <Card className={cn("gap-3 py-4", className)}>
-      <CardHeader className="px-4 pb-0 pt-0">
-        <CardTitle className="text-[11px] font-medium uppercase tracking-widest text-muted-foreground">
-          {label}
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="px-4">{children}</CardContent>
-    </Card>
-  );
-}
 
 function KpiSkeleton() {
   return (
@@ -120,18 +99,16 @@ function KpiSkeleton() {
 function SummaryKpis({ metrics, openCount }: { metrics: AnalyticsMetrics; openCount: number }) {
   return (
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-      <KpiCard label="Net P&L">
+      <JournalKpiCard label="Net P&L">
         <PnlBadge value={metrics.net_pnl} className="text-base font-semibold" />
-      </KpiCard>
-      <KpiCard label="Gross P&L">
+      </JournalKpiCard>
+      <JournalKpiCard label="Gross P&L">
         <PnlBadge value={metrics.gross_pnl} className="text-base font-semibold" />
-      </KpiCard>
-      <KpiCard label="Total Charges">
-        <span className="text-base font-semibold tabular-nums text-[var(--red)]">
-          <MetricValue value={fmtNum(metrics.total_charges)} />
-        </span>
-      </KpiCard>
-      <KpiCard label="Episodes">
+      </JournalKpiCard>
+      <JournalKpiCard label="Total Charges">
+        <PnlBadge value={-Math.abs(Number(metrics.total_charges) || 0)} showSign={false} className="text-base font-semibold" />
+      </JournalKpiCard>
+      <JournalKpiCard label="Episodes">
         <div className="flex flex-wrap items-baseline gap-2">
           <span className="text-base font-semibold tabular-nums">
             {metrics.closed_episode_count}
@@ -143,12 +120,36 @@ function SummaryKpis({ metrics, openCount }: { metrics: AnalyticsMetrics; openCo
             </Badge>
           )}
         </div>
-      </KpiCard>
-      <KpiCard label="Win Rate">
+      </JournalKpiCard>
+      <JournalKpiCard label="Win Rate">
         <span className="text-base font-semibold tabular-nums">
           <MetricValue value={fmtPct(metrics.win_rate)} />
         </span>
-      </KpiCard>
+      </JournalKpiCard>
+    </div>
+  );
+}
+
+function directionToneClass(direction?: string | null) {
+  const normalized = String(direction ?? "").trim().toLowerCase();
+  if (normalized === "long") return "bg-sky-500/10 text-sky-300";
+  if (normalized === "short") return "bg-orange-500/10 text-orange-300";
+  return "bg-foreground/[0.06] text-foreground/65";
+}
+
+function SectionHeader({
+  label,
+  count,
+}: {
+  label: string;
+  count?: string;
+}) {
+  return (
+    <div className="mb-2 flex items-center justify-between gap-3">
+      <h3 className="text-[11px] font-medium uppercase tracking-[0.22em] text-muted-foreground/70">
+        {label}
+      </h3>
+      {count ? <span className="font-mono text-[10px] text-muted-foreground/60">{count}</span> : null}
     </div>
   );
 }
@@ -156,31 +157,32 @@ function SummaryKpis({ metrics, openCount }: { metrics: AnalyticsMetrics; openCo
 function OpenEpisodeRow({
   episode,
   params,
+  workspace,
 }: {
   episode: JournalV2OpenEpisodeCard;
   params: URLSearchParams;
+  workspace: { env?: string; mode?: string };
 }) {
-  const href = buildEpisodeHref(episode.episode_id, params);
+  const href = buildEpisodeHref(episode.episode_id, params, workspace);
   const pnl = episode.current_pnl_estimate;
 
   return (
-    <div className="flex items-center justify-between gap-3 py-1.5 text-sm">
-      <Link
-        href={href}
-        className="truncate font-medium text-foreground hover:underline"
-      >
-        {episode.strategy?.display_name ?? episode.strategy?.template_key ?? "Episode"}
-        <span className="ml-1.5 text-xs font-normal text-muted-foreground">
+    <div className="flex items-center justify-between gap-3 py-2 text-sm">
+      <div className="min-w-0 flex-1">
+        <Link href={href} className="truncate font-medium text-foreground hover:underline">
+          {episode.strategy?.display_name ?? episode.strategy?.template_key ?? "Episode"}
+        </Link>
+        <span className="ml-2 font-mono text-[10px] text-muted-foreground/40">
           {episode.episode_id.slice(0, 8)}
         </span>
-      </Link>
+      </div>
       <div className="flex shrink-0 items-center gap-3">
         {episode.direction && (
-          <Badge variant="outline" className="text-[10px]">
+          <span className={cn("rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em]", directionToneClass(episode.direction))}>
             {episode.direction}
-          </Badge>
+          </span>
         )}
-        <PnlBadge value={pnl} />
+        <PnlBadge value={pnl} className="text-sm font-semibold" />
       </div>
     </div>
   );
@@ -189,30 +191,31 @@ function OpenEpisodeRow({
 function EpisodeRow({
   episode,
   params,
+  workspace,
 }: {
   episode: JournalV2EpisodeCard;
   params: URLSearchParams;
+  workspace: { env?: string; mode?: string };
 }) {
-  const href = buildEpisodeHref(episode.episode_id, params);
+  const href = buildEpisodeHref(episode.episode_id, params, workspace);
 
   return (
-    <div className="flex items-center justify-between gap-3 py-1.5 text-sm">
-      <Link
-        href={href}
-        className="truncate font-medium text-foreground hover:underline"
-      >
-        {episode.strategy?.display_name ?? episode.strategy?.template_key ?? "Episode"}
-        <span className="ml-1.5 text-xs font-normal text-muted-foreground">
+    <div className="flex items-center justify-between gap-3 py-2 text-sm">
+      <div className="min-w-0 flex-1">
+        <Link href={href} className="truncate font-medium text-foreground hover:underline">
+          {episode.strategy?.display_name ?? episode.strategy?.template_key ?? "Episode"}
+        </Link>
+        <span className="ml-2 font-mono text-[10px] text-muted-foreground/40">
           {episode.episode_id.slice(0, 8)}
         </span>
-      </Link>
+      </div>
       <div className="flex shrink-0 items-center gap-3">
         {episode.direction && (
-          <Badge variant="outline" className="text-[10px]">
+          <span className={cn("rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em]", directionToneClass(episode.direction))}>
             {episode.direction}
-          </Badge>
+          </span>
         )}
-        <PnlBadge value={episode.outcome.net_pnl} />
+        <PnlBadge value={episode.outcome.net_pnl} className="text-sm font-semibold" />
       </div>
     </div>
   );
@@ -221,9 +224,11 @@ function EpisodeRow({
 function StrategyGroupSection({
   group,
   params,
+  workspace,
 }: {
   group: JournalV2StrategyGroup;
   params: URLSearchParams;
+  workspace: { env?: string; mode?: string };
 }) {
   const strategyName =
     group.strategy.display_name ??
@@ -232,20 +237,18 @@ function StrategyGroupSection({
 
   return (
     <div className="flex flex-col gap-1">
-      <div className="flex items-center justify-between gap-2 py-1">
+      <div className="flex items-center justify-between gap-2 py-1.5">
         <div className="flex items-center gap-2">
-          <span className="text-xs font-semibold text-foreground">
+          <span className="text-[13px] font-medium text-foreground">
             {strategyName}
           </span>
-          <Badge variant="outline" className="text-[10px]">
-            {group.episodes.length} ep
-          </Badge>
+          <span className="font-mono text-[10px] text-muted-foreground/60">{group.episodes.length} ep</span>
         </div>
-        <PnlBadge value={group.metrics.net_pnl} className="text-xs" />
+        <PnlBadge value={group.metrics.net_pnl} className="text-sm font-semibold" />
       </div>
       <div className="divide-y divide-border/50">
         {group.episodes.map((ep) => (
-          <EpisodeRow key={ep.episode_id} episode={ep} params={params} />
+          <EpisodeRow key={ep.episode_id} episode={ep} params={params} workspace={workspace} />
         ))}
       </div>
     </div>
@@ -278,7 +281,8 @@ function DayViewSkeleton() {
 
 function EmptyDayState({ date }: { date: string }) {
   return (
-    <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border py-12 text-center">
+    <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-border/40 bg-muted/10 px-6 py-12 text-center">
+      <CalendarDaysIcon className="h-4 w-4 text-muted-foreground/40" />
       <p className="text-sm font-medium text-muted-foreground">
         No trading activity on {date}
       </p>
@@ -295,10 +299,10 @@ function EmptyDayState({ date }: { date: string }) {
 
 export default function JournalDayPage() {
   const searchParams = useSearchParams();
-  const { selectedEnvironmentId } = useWorkspace();
+  const { selectedEnvironmentId, selectedMode } = useWorkspace();
 
   // Prefer workspace context for environment; URL param as override for deep-links
-  const environmentId = selectedEnvironmentId ?? searchParams?.get("env") ?? "";
+  const environmentId = searchParams?.get("env") ?? selectedEnvironmentId ?? "";
   const date = searchParams?.get("date") ?? todayIso();
 
   const queryEnabled = Boolean(environmentId);
@@ -312,6 +316,10 @@ export default function JournalDayPage() {
 
   // Stable fallback so sub-components never receive null
   const safeParams = searchParams ?? new URLSearchParams();
+  const linkScope = {
+    env: safeParams.get("env") ?? selectedEnvironmentId ?? undefined,
+    mode: safeParams.get("mode") ?? selectedMode,
+  };
 
   // No environment selected
   if (!queryEnabled) {
@@ -365,18 +373,11 @@ export default function JournalDayPage() {
       {/* Open episodes */}
       {hasOpenEpisodes && (
         <section aria-label="Open episodes">
-          <div className="mb-2 flex items-center gap-2">
-            <h3 className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">
-              Open Episodes
-            </h3>
-            <Badge variant="secondary" className="text-[10px]">
-              {open_episodes.length}
-            </Badge>
-          </div>
+          <SectionHeader label="Open Episodes" count={`${open_episodes.length} active`} />
           <Card className="gap-0 py-0">
-            <CardContent className="divide-y divide-border/50 px-4 py-2">
+            <CardContent className="divide-y divide-border/50 px-3 py-1.5">
               {open_episodes.map((ep) => (
-                <OpenEpisodeRow key={ep.episode_id} episode={ep} params={safeParams} />
+                <OpenEpisodeRow key={ep.episode_id} episode={ep} params={safeParams} workspace={linkScope} />
               ))}
             </CardContent>
           </Card>
@@ -386,21 +387,15 @@ export default function JournalDayPage() {
       {/* Strategy groups with closed episodes */}
       {hasClosedEpisodes && (
         <section aria-label="Closed episodes by strategy">
-          <div className="mb-2 flex items-center gap-2">
-            <h3 className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">
-              Closed Episodes
-            </h3>
-            <Badge variant="secondary" className="text-[10px]">
-              {metrics.closed_episode_count}
-            </Badge>
-          </div>
+          <SectionHeader label="Closed Episodes" count={`${metrics.closed_episode_count} closed`} />
           <Card className="gap-0 py-0">
-            <CardContent className="flex flex-col divide-y divide-border/50 px-4 py-2">
+            <CardContent className="flex flex-col divide-y divide-border/50 px-3 py-1.5">
               {strategy_groups.map((group) => (
                 <StrategyGroupSection
                   key={group.strategy.template_id}
                   group={group}
                   params={safeParams}
+                  workspace={linkScope}
                 />
               ))}
             </CardContent>
@@ -410,16 +405,10 @@ export default function JournalDayPage() {
 
       {/* Cost breakdown */}
       <section aria-label="Cost breakdown">
-        <div className="mb-2">
-          <h3 className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">
-            Cost Breakdown
-          </h3>
+        <SectionHeader label="Cost Breakdown" />
+        <div className="rounded-lg border border-border/50 bg-muted/20 px-3 py-3">
+          <CostBreakdownTable values={costBreakdown} />
         </div>
-        <Card className="py-4">
-          <CardContent className="px-4">
-            <CostBreakdownTable values={costBreakdown} />
-          </CardContent>
-        </Card>
       </section>
     </div>
   );

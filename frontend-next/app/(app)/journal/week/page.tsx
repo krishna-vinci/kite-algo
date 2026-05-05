@@ -76,10 +76,11 @@ function buildHref(
   base: string,
   date: string,
   params: URLSearchParams,
+  workspace: { env?: string; mode?: string },
 ): string {
   const sp = new URLSearchParams();
-  const env = params.get("env");
-  const mode = params.get("mode");
+  const env = params.get("env") ?? workspace.env;
+  const mode = params.get("mode") ?? workspace.mode;
   if (env) sp.set("env", env);
   if (mode) sp.set("mode", mode);
   sp.set("date", date);
@@ -93,11 +94,13 @@ function buildHref(
 function DayRow({
   bucket,
   params,
+  workspace,
 }: {
   bucket: JournalV2PeriodBucket;
   params: URLSearchParams;
+  workspace: { env?: string; mode?: string };
 }) {
-  const href = buildHref("/journal", bucket.bucket_start, params);
+  const href = buildHref("/journal", bucket.bucket_start, params, workspace);
   const { metrics } = bucket;
 
   return (
@@ -153,9 +156,9 @@ function WeekViewSkeleton() {
 export default function JournalWeekPage() {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const { selectedEnvironmentId } = useWorkspace();
+  const { selectedEnvironmentId, selectedMode } = useWorkspace();
 
-  const environmentId = selectedEnvironmentId ?? searchParams?.get("env") ?? "";
+  const environmentId = searchParams?.get("env") ?? selectedEnvironmentId ?? "";
   const anchorDate = searchParams?.get("date") ?? todayIso();
   const [from, to] = weekRange(anchorDate);
 
@@ -175,6 +178,10 @@ export default function JournalWeekPage() {
   });
 
   const safeParams = searchParams ?? new URLSearchParams();
+  const linkScope = {
+    env: safeParams.get("env") ?? selectedEnvironmentId ?? undefined,
+    mode: safeParams.get("mode") ?? selectedMode,
+  };
 
   const handleDateChange = useCallback(
     (newDate: string) => {
@@ -213,7 +220,7 @@ export default function JournalWeekPage() {
       ) : !data ? (
         <EmptyWeekState from={from} to={to} />
       ) : (
-        <WeekContent data={data} params={safeParams} from={from} to={to} />
+        <WeekContent data={data} params={safeParams} from={from} to={to} workspace={linkScope} />
       )}
     </div>
   );
@@ -230,11 +237,13 @@ function WeekContent({
   params,
   from,
   to,
+  workspace,
 }: {
   data: PeriodData;
   params: URLSearchParams;
   from: string;
   to: string;
+  workspace: { env?: string; mode?: string };
 }) {
   const { summary, buckets, strategies } = data;
   const hasBuckets = buckets.length > 0;
@@ -291,6 +300,7 @@ function WeekContent({
                     key={bucket.bucket_start}
                     bucket={bucket}
                     params={params}
+                    workspace={workspace}
                   />
                 ))}
               </div>

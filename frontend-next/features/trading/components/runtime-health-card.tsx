@@ -23,7 +23,7 @@ function wsTone(status: string) {
 
 export function RuntimeHealthCard({ runtime }: RuntimeHealthCardProps) {
   return (
-    <Panel eyebrow="runtime" title="System health">
+    <Panel eyebrow="runtime" title="System health" tone="subtle">
       <div className="grid gap-2 sm:grid-cols-3">
         <div className="flex items-center justify-between rounded-lg border border-border/50 bg-background/50 px-3 py-2">
           <span className="text-xs text-foreground/50">Broker</span>

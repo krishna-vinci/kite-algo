@@ -138,11 +138,29 @@ export function EquityCurveChart({ points, height = 320 }: EquityCurveChartProps
 
   if (points.length === 0) {
     return (
-      <div className="flex h-[320px] items-center justify-center rounded-xl border border-border/60 bg-muted/10 text-sm text-muted-foreground">
-        No equity curve data for this period.
+      <div
+        className="flex items-center justify-center rounded-xl border border-border/60 bg-muted/10 text-sm text-muted-foreground"
+        style={{ height }}
+      >
+        No equity curve data for the selected period.
       </div>
     );
   }
 
-  return <div ref={containerRef} className="h-[320px] w-full" style={{ height }} />;
+  return (
+    <div className="w-full">
+      <div ref={containerRef} className="w-full" style={{ height }} />
+      <div className="mt-2 flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
+        <span className="inline-flex items-center gap-1">
+          <span className="inline-block h-2 w-2 rounded-full bg-[var(--green)]" /> Net P&amp;L
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <span className="inline-block h-2 w-2 rounded-full bg-muted-foreground" /> Benchmark
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <span className="inline-block h-2 w-2 rounded-full bg-foreground" /> Excess
+        </span>
+      </div>
+    </div>
+  );
 }

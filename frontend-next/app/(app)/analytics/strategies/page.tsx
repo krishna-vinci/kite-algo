@@ -1,36 +1,16 @@
-"use client";
+import { redirect } from "next/navigation";
 
-import { useSearchParams } from "next/navigation";
-
-/**
- * /analytics/strategies — landing page shown when the Strategy tab is clicked
- * but no specific template has been selected yet.
- *
- * Users arrive here from the Strategy tab in the analytics shell; individual
- * strategy rows on the dashboard link to /analytics/strategies/[templateId].
- */
-export default function StrategiesIndexPage() {
-  const searchParams = useSearchParams();
-  const hasEnv = !!searchParams.get("env");
-
-  if (!hasEnv) {
-    return (
-      <div className="rounded-xl border border-border/60 bg-muted/20 px-4 py-8 text-center text-sm text-muted-foreground">
-        Select an environment to view strategy analytics.
-      </div>
-    );
+export default async function AnalyticsStrategiesIndexRedirect({
+  searchParams,
+}: {
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const resolved = (await searchParams) ?? {};
+  const sp = new URLSearchParams();
+  for (const [key, value] of Object.entries(resolved)) {
+    if (typeof value === "string") sp.set(key, value);
+    else if (Array.isArray(value) && value[0]) sp.set(key, value[0]);
   }
-
-  return (
-    <div className="rounded-xl border border-border/60 bg-muted/20 px-4 py-8 text-center text-sm text-muted-foreground">
-      Select a strategy from the{" "}
-      <a
-        href={`/analytics?${searchParams.toString()}`}
-        className="underline underline-offset-2 hover:text-foreground"
-      >
-        Dashboard
-      </a>{" "}
-      to view its deep-dive analytics.
-    </div>
-  );
+  const qs = sp.toString();
+  redirect(`/journal/analytics/strategies${qs ? `?${qs}` : ""}`);
 }

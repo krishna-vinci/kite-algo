@@ -23,6 +23,7 @@ import {
   PeriodKpiSkeleton,
   StrategySummaryTable,
 } from "@/components/journal/period-kpi-grid";
+import { CalendarHeatmap } from "@/components/journal/calendar-heatmap";
 import type { JournalV2PeriodBucket } from "@/lib/journal/types-v2";
 
 // ---------------------------------------------------------------------------
@@ -92,10 +93,15 @@ function fmtNum(v: string | number | null | undefined, dp = 2): string | null {
 // Build link preserving env/mode search params
 // ---------------------------------------------------------------------------
 
-function buildHref(base: string, date: string, params: URLSearchParams): string {
+function buildHref(
+  base: string,
+  date: string,
+  params: URLSearchParams,
+  workspace: { env?: string; mode?: string },
+): string {
   const sp = new URLSearchParams();
-  const env = params.get("env");
-  const mode = params.get("mode");
+  const env = params.get("env") ?? workspace.env;
+  const mode = params.get("mode") ?? workspace.mode;
   if (env) sp.set("env", env);
   if (mode) sp.set("mode", mode);
   sp.set("date", date);
@@ -109,13 +115,15 @@ function buildHref(base: string, date: string, params: URLSearchParams): string 
 function WeekRow({
   bucket,
   params,
+  workspace,
 }: {
   bucket: JournalV2PeriodBucket;
   params: URLSearchParams;
+  workspace: { env?: string; mode?: string };
 }) {
   // Link to the week page anchored to the Monday of this bucket
   const monday = weekMonday(bucket.bucket_start);
-  const href = buildHref("/journal/week", monday, params);
+  const href = buildHref("/journal/week", monday, params, workspace);
   const { metrics } = bucket;
 
   return (
@@ -188,9 +196,9 @@ function EmptyMonthState({ from, to }: { from: string; to: string }) {
 export default function JournalMonthPage() {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const { selectedEnvironmentId } = useWorkspace();
+  const { selectedEnvironmentId, selectedMode } = useWorkspace();
 
-  const environmentId = selectedEnvironmentId ?? searchParams?.get("env") ?? "";
+  const environmentId = searchParams?.get("env") ?? selectedEnvironmentId ?? "";
   const anchorDate = searchParams?.get("date") ?? todayIso();
   const [from, to] = monthRange(anchorDate);
 
@@ -209,7 +217,28 @@ export default function JournalMonthPage() {
     staleTime: 60_000,
   });
 
+  const {
+    data: calendarData,
+    isLoading: isCalendarLoading,
+    error: calendarError,
+  } = useQuery({
+    queryKey: ["journal", "period", environmentId, from, to, "day", "calendar"],
+    queryFn: () =>
+      fetchPeriodView({
+        environment_id: environmentId,
+        from,
+        to,
+        granularity: "day",
+      }),
+    enabled: queryEnabled,
+    staleTime: 60_000,
+  });
+
   const safeParams = searchParams ?? new URLSearchParams();
+  const linkScope = {
+    env: safeParams.get("env") ?? selectedEnvironmentId ?? undefined,
+    mode: safeParams.get("mode") ?? selectedMode,
+  };
 
   const handleDateChange = useCallback(
     (newDate: string) => {
@@ -248,7 +277,30 @@ export default function JournalMonthPage() {
       ) : !data ? (
         <EmptyMonthState from={from} to={to} />
       ) : (
-        <MonthContent data={data} params={safeParams} from={from} to={to} />
+        <MonthContent
+          data={data}
+          params={safeParams}
+          from={from}
+          to={to}
+          workspace={linkScope}
+          calendarDays={
+            calendarData?.buckets.map((bucket) => ({
+              date: bucket.bucket_start,
+              net_pnl: Number(bucket.metrics.net_pnl) || 0,
+              run_count: bucket.metrics.closed_episode_count,
+              win_count: bucket.metrics.win_count,
+              loss_count: bucket.metrics.loss_count,
+            })) ?? []
+          }
+          calendarLoading={isCalendarLoading}
+          calendarError={
+            calendarError
+              ? calendarError instanceof Error
+                ? calendarError.message
+                : "Failed to load calendar"
+              : null
+          }
+        />
       )}
     </div>
   );
@@ -265,11 +317,25 @@ function MonthContent({
   params,
   from,
   to,
+  workspace,
+  calendarDays,
+  calendarLoading,
+  calendarError,
 }: {
   data: PeriodData;
   params: URLSearchParams;
   from: string;
   to: string;
+  workspace: { env?: string; mode?: string };
+  calendarDays: Array<{
+    date: string;
+    net_pnl: number;
+    run_count: number;
+    win_count: number;
+    loss_count: number;
+  }>;
+  calendarLoading: boolean;
+  calendarError: string | null;
 }) {
   const { summary, buckets, strategies } = data;
   const hasBuckets = buckets.length > 0;
@@ -325,6 +391,7 @@ function MonthContent({
                     key={bucket.bucket_start}
                     bucket={bucket}
                     params={params}
+                    workspace={workspace}
                   />
                 ))}
               </div>
@@ -332,6 +399,19 @@ function MonthContent({
           </Card>
         </section>
       )}
+
+      {/* Calendar intelligence */}
+      <section aria-label="Monthly calendar heatmap">
+        <CalendarHeatmap
+          days={calendarDays}
+          loading={calendarLoading}
+          error={calendarError}
+          month={parseDate(from).getUTCMonth() + 1}
+          year={parseDate(from).getUTCFullYear()}
+          env={params.get("env") ?? workspace.env}
+          mode={params.get("mode") ?? workspace.mode}
+        />
+      </section>
 
       {/* Strategy summary */}
       {hasStrategies && (

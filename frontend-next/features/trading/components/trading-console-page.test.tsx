@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import type { ReactElement } from "react";
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import { TradingConsolePage } from "./trading-console-page";
@@ -177,11 +178,12 @@ function renderWithQueryClient(ui: ReactElement) {
 describe("TradingConsolePage", () => {
   beforeEach(() => {
     window.history.replaceState({}, "", "/strategies");
+    replaceMock.mockReset();
   });
 
   it("renders the heading", () => {
     renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
-    expect(screen.getByText("Strategies")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /^strategies$/i })).toBeInTheDocument();
   });
 
   it("renders strategy name", () => {
@@ -203,6 +205,19 @@ describe("TradingConsolePage", () => {
     expect(screen.getByText("NIFTY")).toBeInTheDocument();
   });
 
+  it("exposes disconnected quote state accessibly", () => {
+    renderWithQueryClient(
+      <TradingConsolePage
+        snapshot={{
+          ...MOCK_SNAPSHOT,
+          quotes: [{ ...MOCK_SNAPSHOT.quotes[0], connected: false }],
+        }}
+      />,
+    );
+
+    expect(screen.getByLabelText(/nifty disconnected/i)).toBeInTheDocument();
+  });
+
   it("renders live sections without losing summary panels", () => {
     renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
 
@@ -216,5 +231,16 @@ describe("TradingConsolePage", () => {
 
     expect(screen.getByText(/dry-run records hidden/i)).toBeInTheDocument();
     expect(screen.queryByText("Hidden Dry Run")).not.toBeInTheDocument();
+  });
+
+  it("supports keyboard mode switching semantics", async () => {
+    const user = userEvent.setup();
+    renderWithQueryClient(<TradingConsolePage snapshot={MOCK_SNAPSHOT} />);
+
+    const liveTab = screen.getByRole("tab", { name: /live/i });
+    liveTab.focus();
+
+    await user.keyboard("{ArrowRight}");
+    expect(replaceMock).toHaveBeenCalledWith("/strategies?mode=paper");
   });
 });

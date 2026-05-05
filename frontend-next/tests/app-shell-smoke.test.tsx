@@ -66,4 +66,14 @@ describe("AppShell", () => {
     expect(journalLink).toBeInTheDocument();
     expect(journalLink).toHaveAttribute("href", "/journal");
   });
+
+  it("does not render trading dock on journal workspace", () => {
+    renderWithQueryClient(
+      <AppShell navigation={navigation} activeHref="/journal">
+        <div>content</div>
+      </AppShell>,
+    );
+
+    expect(screen.queryByText(/active strategies/i)).not.toBeInTheDocument();
+  });
 });

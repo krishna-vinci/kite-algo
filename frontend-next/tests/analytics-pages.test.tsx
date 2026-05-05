@@ -1,10 +1,11 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import AnalyticsDashboardPage from "@/app/(app)/analytics/page";
-import AnalyticsEquityPage from "@/app/(app)/analytics/equity/page";
-import AnalyticsCostsPage from "@/app/(app)/analytics/costs/page";
-import StrategyDeepDivePage from "@/app/(app)/analytics/strategies/[templateId]/page";
+import AnalyticsDashboardPage from "@/app/(app)/journal/analytics/page";
+import AnalyticsEquityPage from "@/app/(app)/journal/analytics/equity/page";
+import AnalyticsCostsPage from "@/app/(app)/journal/analytics/costs/page";
+import AnalyticsStrategiesIndexPage from "@/app/(app)/journal/analytics/strategies/page";
+import StrategyDeepDivePage from "@/app/(app)/journal/analytics/strategies/[templateId]/page";
 import { WorkspaceProvider } from "@/components/workspace/workspace-provider";
 import { renderWithQueryClient } from "@/tests/render-with-query-client";
 
@@ -185,16 +186,23 @@ describe("analytics pages", () => {
 
   // ── Dashboard ────────────────────────────────────────────────────────────
 
-  it("dashboard: shows placeholder when no environment selected", () => {
-    window.history.pushState({}, "", "/analytics");
+  it("dashboard: hydrates env/mode from workspace state when URL is bare", async () => {
+    window.history.pushState({}, "", "/journal/analytics");
+    fetchAnalyticsSummaryMock.mockResolvedValue(SUMMARY_FIXTURE);
     withWorkspace(<AnalyticsDashboardPage />);
 
-    expect(screen.getByText(/Select an environment/i)).toBeInTheDocument();
-    expect(fetchAnalyticsSummaryMock).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(fetchAnalyticsSummaryMock).toHaveBeenCalledWith(
+        expect.objectContaining({ environment_id: "env-1", period: "month" }),
+      ),
+    );
+
+    await waitFor(() => expect(window.location.search).toContain("env=env-1"));
+    await waitFor(() => expect(window.location.search).toContain("mode=paper"));
   });
 
   it("dashboard: fetches summary and renders KPI cards", async () => {
-    window.history.pushState({}, "", "/analytics?env=env-1&period=month");
+    window.history.pushState({}, "", "/journal/analytics?env=env-1&period=month");
     fetchAnalyticsSummaryMock.mockResolvedValue(SUMMARY_FIXTURE);
 
     withWorkspace(<AnalyticsDashboardPage />);
@@ -209,24 +217,26 @@ describe("analytics pages", () => {
     expect(screen.getAllByText(/Win Rate/i).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/Sharpe Ratio/i)).toBeInTheDocument();
     expect(screen.getAllByText(/Max Drawdown/i).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/Best strategy/i)).toBeInTheDocument();
+    expect(screen.getByText(/Worst strategy/i)).toBeInTheDocument();
   });
 
   it("dashboard: renders strategy breakdown table with formatted values", async () => {
-    window.history.pushState({}, "", "/analytics?env=env-1&period=month");
+    window.history.pushState({}, "", "/journal/analytics?env=env-1&period=month");
     fetchAnalyticsSummaryMock.mockResolvedValue(SUMMARY_FIXTURE);
 
     withWorkspace(<AnalyticsDashboardPage />);
 
     await waitFor(() => expect(fetchAnalyticsSummaryMock).toHaveBeenCalled());
 
-    await waitFor(() => expect(screen.getByText(/Iron Condor/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("link", { name: /Iron Condor/i })).toBeInTheDocument());
     expect(screen.getByText(/Strategy Breakdown/i)).toBeInTheDocument();
     // win rate formatted
     expect(screen.getAllByText(/64\.0%/).length).toBeGreaterThanOrEqual(1);
   });
 
   it("dashboard: shows error state when fetch fails", async () => {
-    window.history.pushState({}, "", "/analytics?env=env-1&period=month");
+    window.history.pushState({}, "", "/journal/analytics?env=env-1&period=month");
     fetchAnalyticsSummaryMock.mockRejectedValue(new Error("Server error"));
 
     withWorkspace(<AnalyticsDashboardPage />);
@@ -240,7 +250,7 @@ describe("analytics pages", () => {
   // ── Equity curve ─────────────────────────────────────────────────────────
 
   it("equity: shows placeholder when no environment selected", () => {
-    window.history.pushState({}, "", "/analytics/equity");
+    window.history.pushState({}, "", "/journal/analytics/equity");
     withWorkspace(<AnalyticsEquityPage />);
 
     expect(screen.getByText(/Select an environment/i)).toBeInTheDocument();
@@ -248,7 +258,7 @@ describe("analytics pages", () => {
   });
 
   it("equity: fetches data and renders chart container", async () => {
-    window.history.pushState({}, "", "/analytics/equity?env=env-1&period=month");
+    window.history.pushState({}, "", "/journal/analytics/equity?env=env-1&period=month");
     fetchEquityCurveMock.mockResolvedValue(EQUITY_FIXTURE);
 
     withWorkspace(<AnalyticsEquityPage />);
@@ -260,10 +270,12 @@ describe("analytics pages", () => {
     );
 
     await waitFor(() => expect(screen.getByText(/Equity Curve/i)).toBeInTheDocument());
+    expect(screen.getByText(/Cumulative Return/i)).toBeInTheDocument();
+    expect(screen.getByText(/Total Charges/i)).toBeInTheDocument();
   });
 
   it("equity: shows error state when fetch fails", async () => {
-    window.history.pushState({}, "", "/analytics/equity?env=env-1&period=month");
+    window.history.pushState({}, "", "/journal/analytics/equity?env=env-1&period=month");
     fetchEquityCurveMock.mockRejectedValue(new Error("Timeout"));
 
     withWorkspace(<AnalyticsEquityPage />);
@@ -276,7 +288,7 @@ describe("analytics pages", () => {
   // ── Costs ─────────────────────────────────────────────────────────────────
 
   it("costs: shows placeholder when no environment selected", () => {
-    window.history.pushState({}, "", "/analytics/costs");
+    window.history.pushState({}, "", "/journal/analytics/costs");
     withWorkspace(<AnalyticsCostsPage />);
 
     expect(screen.getByText(/Select an environment/i)).toBeInTheDocument();
@@ -284,7 +296,7 @@ describe("analytics pages", () => {
   });
 
   it("costs: fetches data and renders cost breakdown table", async () => {
-    window.history.pushState({}, "", "/analytics/costs?env=env-1&period=month");
+    window.history.pushState({}, "", "/journal/analytics/costs?env=env-1&period=month");
     fetchCostAnalysisMock.mockResolvedValue(COST_ANALYSIS_FIXTURE);
 
     withWorkspace(<AnalyticsCostsPage />);
@@ -296,13 +308,14 @@ describe("analytics pages", () => {
     );
 
     await waitFor(() => expect(screen.getByText(/Environment Total/i)).toBeInTheDocument());
-    expect(screen.getByText(/Brokerage/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/Brokerage/i).length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/Per Strategy/i).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/Iron Condor/i)).toBeInTheDocument();
+    expect(screen.getByText(/Cost \/ Ep/i)).toBeInTheDocument();
   });
 
   it("costs: shows error state when fetch fails", async () => {
-    window.history.pushState({}, "", "/analytics/costs?env=env-1&period=month");
+    window.history.pushState({}, "", "/journal/analytics/costs?env=env-1&period=month");
     fetchCostAnalysisMock.mockRejectedValue(new Error("Network error"));
 
     withWorkspace(<AnalyticsCostsPage />);
@@ -313,7 +326,7 @@ describe("analytics pages", () => {
   });
 
   it("costs: shows cost ratio per strategy", async () => {
-    window.history.pushState({}, "", "/analytics/costs?env=env-1&period=month");
+    window.history.pushState({}, "", "/journal/analytics/costs?env=env-1&period=month");
     fetchCostAnalysisMock.mockResolvedValue(COST_ANALYSIS_FIXTURE);
 
     withWorkspace(<AnalyticsCostsPage />);
@@ -326,15 +339,28 @@ describe("analytics pages", () => {
   // ── Strategy deep-dive ────────────────────────────────────────────────────
 
   it("strategy: shows placeholder when no environment selected", () => {
-    window.history.pushState({}, "", "/analytics/strategies/tmpl-1");
+    window.history.pushState({}, "", "/journal/analytics/strategies/tmpl-1");
     withWorkspace(<StrategyDeepDivePage />);
 
     expect(screen.getByText(/Select an environment/i)).toBeInTheDocument();
     expect(fetchStrategyDeepDiveMock).not.toHaveBeenCalled();
   });
 
+  it("strategies index: hydrates scope from workspace when URL is bare", async () => {
+    window.history.pushState({}, "", "/journal/analytics/strategies");
+    withWorkspace(<AnalyticsStrategiesIndexPage />);
+
+    await waitFor(() =>
+      expect(screen.queryByText(/Select an environment to view strategy analytics/i)).not.toBeInTheDocument(),
+    );
+
+    const overviewLink = screen.getByRole("link", { name: /Analytics Overview/i });
+    expect(overviewLink).toHaveAttribute("href", expect.stringContaining("env=env-1"));
+    expect(overviewLink).toHaveAttribute("href", expect.stringContaining("mode=paper"));
+  });
+
   it("strategy: fetches data and renders strategy name + metrics", async () => {
-    window.history.pushState({}, "", "/analytics/strategies/tmpl-1?env=env-1&period=month");
+    window.history.pushState({}, "", "/journal/analytics/strategies/tmpl-1?env=env-1&period=month");
     fetchStrategyDeepDiveMock.mockResolvedValue(DEEP_DIVE_FIXTURE);
 
     withWorkspace(<StrategyDeepDivePage />);
@@ -348,12 +374,13 @@ describe("analytics pages", () => {
     await waitFor(() => expect(screen.getByText(/Iron Condor/i)).toBeInTheDocument());
     // metric sections rendered
     expect(screen.getByText(/Performance Breakdown/i)).toBeInTheDocument();
-    expect(screen.getByText(/Win \/ Loss/i)).toBeInTheDocument();
+    expect(screen.getByText(/Wins \/ Losses/i)).toBeInTheDocument();
+    expect(screen.getByText(/Win \/ Loss Distribution/i)).toBeInTheDocument();
     expect(screen.getByText(/Equity Curve/i)).toBeInTheDocument();
   });
 
   it("strategy: shows error state when fetch fails", async () => {
-    window.history.pushState({}, "", "/analytics/strategies/tmpl-1?env=env-1&period=month");
+    window.history.pushState({}, "", "/journal/analytics/strategies/tmpl-1?env=env-1&period=month");
     fetchStrategyDeepDiveMock.mockRejectedValue(new Error("Strategy not found"));
 
     withWorkspace(<StrategyDeepDivePage />);
@@ -365,15 +392,15 @@ describe("analytics pages", () => {
   });
 
   it("dashboard: strategy row links to deep-dive page with params", async () => {
-    window.history.pushState({}, "", "/analytics?env=env-1&mode=paper&period=month");
+    window.history.pushState({}, "", "/journal/analytics?env=env-1&mode=paper&period=month");
     fetchAnalyticsSummaryMock.mockResolvedValue(SUMMARY_FIXTURE);
 
     withWorkspace(<AnalyticsDashboardPage />);
 
-    await waitFor(() => expect(screen.getByText(/Iron Condor/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("link", { name: /Iron Condor/i })).toBeInTheDocument());
 
     const link = screen.getByRole("link", { name: /Iron Condor/i });
-    expect(link).toHaveAttribute("href", expect.stringContaining("/analytics/strategies/tmpl-1"));
+    expect(link).toHaveAttribute("href", expect.stringContaining("/journal/analytics/strategies/tmpl-1"));
     expect(link).toHaveAttribute("href", expect.stringContaining("env=env-1"));
     expect(link).toHaveAttribute("href", expect.stringContaining("period=month"));
   });

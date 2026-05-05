@@ -88,13 +88,14 @@ describe("reference pages", () => {
 
     expect(screen.getByRole("heading", { name: /operator overview/i })).toBeInTheDocument();
     expect(screen.getByText(/system health/i)).toBeInTheDocument();
-    expect(screen.getAllByText(/active strategies/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/watch and handoff/i)).toBeInTheDocument();
   });
 
   it("renders the primary strategies operator workspace", () => {
     renderWithQueryClient(<StrategiesPage />);
 
-    expect(screen.getByRole("heading", { name: /strategies/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /^strategies$/i })).toBeInTheDocument();
+    expect(screen.getByText(/strategies workspace/i)).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /live/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /paper/i })).toBeInTheDocument();
   });

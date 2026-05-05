@@ -3,6 +3,7 @@
 import { useState, type ReactNode } from "react";
 import { Panel } from "@/components/operator/panel";
 import { StatusBadge } from "@/components/operator/status-badge";
+import { PnlBadge } from "@/components/shared/pnl-badge";
 import type { TradingStrategyGroup } from "@/features/trading/types";
 import { RiskAdjustmentSheet } from "./risk-adjustment-sheet";
 
@@ -57,11 +58,11 @@ export function StrategyGroupsPanel({
         {strategies.length === 0 && (
           <p className="py-4 text-center text-sm text-foreground/40">{emptyCopy}</p>
         )}
-        <div className="space-y-3">
+        <div className="divide-y divide-border/45 overflow-hidden rounded-xl border border-border/45 bg-background/25">
           {strategies.map((s) => (
             <div
               key={s.strategyRunId}
-              className="rounded-xl border border-border/50 bg-background/50 px-4 py-3"
+              className="px-4 py-3"
             >
               {/* Header row */}
               <div className="flex items-center justify-between gap-3">
@@ -103,6 +104,10 @@ export function StrategyGroupsPanel({
                   <span className={s.unrealizedPnl >= 0 ? "text-emerald-400" : "text-rose-400"}>
                     {formatCurrency(s.unrealizedPnl)}
                   </span>
+                </span>
+                <span className="ml-auto flex items-center gap-2 text-foreground/50">
+                  Net
+                  <PnlBadge value={s.realizedPnl + s.unrealizedPnl} formatter={(n) => formatCurrency(n).replace(/^\+/, "")} className="text-xs font-semibold" />
                 </span>
               </div>
 

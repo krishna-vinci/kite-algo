@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { usePathname, useSearchParams } from "next/navigation";
 
 import { fetchJournalEnvironments } from "@/lib/journal/api";
 import type { JournalEnvironment } from "@/lib/journal/types";
@@ -65,6 +66,9 @@ const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
 // ---------------------------------------------------------------------------
 
 export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const searchParamsKey = searchParams.toString();
   const [environments, setEnvironments] = useState<JournalEnvironment[]>([]);
   const [environmentsLoading, setEnvironmentsLoading] = useState(true);
   const [environmentsError, setEnvironmentsError] = useState<string | null>(null);
@@ -205,7 +209,107 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
     ? selectedEnvironment.mode === "live"
       ? "live"
       : "paper"
-    : selectedModeState;
+    : (searchParams.get("mode") === "live" || searchParams.get("mode") === "paper"
+      ? (searchParams.get("mode") as WorkspaceMode)
+      : selectedModeState);
+
+  const applyUrlScopeToState = useCallback(() => {
+    if (typeof window === "undefined") return;
+    if (!window.location.pathname.startsWith("/journal")) return;
+
+    const params = new URLSearchParams(window.location.search);
+    const urlEnv = params.get("env") ?? params.get("environment_id") ?? "";
+    const urlModeRaw = params.get("mode");
+    const urlMode: WorkspaceMode | null =
+      urlModeRaw === "live" || urlModeRaw === "paper" ? urlModeRaw : null;
+
+    const envEntity = urlEnv ? environments.find((e) => e.id === urlEnv) ?? null : null;
+
+    if (envEntity) {
+      const envMode: WorkspaceMode = envEntity.mode === "live" ? "live" : "paper";
+      setSelectedEnvironmentIdState((prev) => (prev === envEntity.id ? prev : envEntity.id));
+      setSelectedModeState((prev) => (prev === envMode ? prev : envMode));
+      window.sessionStorage.setItem(SESSION_KEY_ENV, envEntity.id);
+      window.sessionStorage.setItem(SESSION_KEY_MODE, envMode);
+      return;
+    }
+
+    if (!urlEnv && urlMode) {
+      const matching = environments.find((e) => (e.mode === "live" ? "live" : "paper") === urlMode);
+      if (matching) {
+        setSelectedEnvironmentIdState((prev) => (prev === matching.id ? prev : matching.id));
+        window.sessionStorage.setItem(SESSION_KEY_ENV, matching.id);
+      }
+      setSelectedModeState((prev) => (prev === urlMode ? prev : urlMode));
+      window.sessionStorage.setItem(SESSION_KEY_MODE, urlMode);
+      return;
+    }
+
+    if (urlEnv) {
+      setSelectedEnvironmentIdState((prev) => (prev === urlEnv ? prev : urlEnv));
+      window.sessionStorage.setItem(SESSION_KEY_ENV, urlEnv);
+    }
+
+    if (urlMode) {
+      setSelectedModeState((prev) => (prev === urlMode ? prev : urlMode));
+      window.sessionStorage.setItem(SESSION_KEY_MODE, urlMode);
+    }
+  }, [environments]);
+
+  // Keep workspace state aligned with URL scope on app-router navigations.
+  useEffect(() => {
+    applyUrlScopeToState();
+  }, [applyUrlScopeToState, pathname, searchParamsKey]);
+
+  // Also align on browser history navigation.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onPopState = () => applyUrlScopeToState();
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [applyUrlScopeToState]);
+
+  // Keep /journal* URL scope canonical with workspace state.
+  // This fixes the case where provider auto-selects an environment/mode in state
+  // but the URL remains bare (e.g. /journal), causing downstream links to drop scope.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!window.location.pathname.startsWith("/journal")) return;
+
+    let canonicalEnvId = selectedEnvironmentId;
+    let canonicalMode: WorkspaceMode = selectedMode;
+
+    if (!canonicalEnvId) {
+      const matching = environments.find((e) => (e.mode === "live" ? "live" : "paper") === selectedMode);
+      if (matching) {
+        canonicalEnvId = matching.id;
+        canonicalMode = matching.mode === "live" ? "live" : "paper";
+        setSelectedEnvironmentIdState(matching.id);
+      }
+    }
+
+    if (!canonicalEnvId) return;
+
+    const url = new URL(window.location.href);
+    const currentEnv = url.searchParams.get("env") ?? url.searchParams.get("environment_id") ?? "";
+    const currentMode = url.searchParams.get("mode") ?? "";
+
+    const needsUpdate =
+      currentEnv !== canonicalEnvId ||
+      currentMode !== canonicalMode ||
+      url.searchParams.has("environment_id");
+
+    if (!needsUpdate) return;
+
+    url.searchParams.set("env", canonicalEnvId);
+    url.searchParams.set("mode", canonicalMode);
+    url.searchParams.delete("environment_id");
+
+    window.sessionStorage.setItem(SESSION_KEY_ENV, canonicalEnvId);
+    window.sessionStorage.setItem(SESSION_KEY_MODE, canonicalMode);
+
+    window.history.replaceState({}, "", url.toString());
+  }, [environments, selectedEnvironmentId, selectedMode]);
 
   const value = useMemo<WorkspaceContextValue>(
     () => ({
@@ -222,8 +326,8 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
       environments,
       environmentsError,
       environmentsLoading,
-      selectedEnvironment,
       selectedEnvironmentId,
+      selectedEnvironment,
       selectedMode,
       setSelectedEnvironmentId,
       setSelectedMode,

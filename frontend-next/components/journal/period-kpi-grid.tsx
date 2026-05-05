@@ -1,10 +1,10 @@
 "use client";
 
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { MetricValue } from "@/components/shared/metric-value";
 import { PnlBadge } from "@/components/shared/pnl-badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { JournalKpiCard } from "@/components/journal/journal-kpi-card";
 import type { AnalyticsMetrics } from "@/lib/journal/types-v2";
 import { cn } from "@/lib/utils";
 
@@ -31,31 +31,6 @@ function fmtRatio(v: string | number | null | undefined): string | null {
   const n = Number(v);
   if (v === null || v === undefined || v === "" || isNaN(n)) return null;
   return n.toFixed(2);
-}
-
-// ---------------------------------------------------------------------------
-// Sub-components
-// ---------------------------------------------------------------------------
-
-function KpiCard({
-  label,
-  children,
-  className,
-}: {
-  label: string;
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <Card className={cn("gap-3 py-4", className)}>
-      <CardHeader className="px-4 pb-0 pt-0">
-        <CardTitle className="text-[11px] font-medium uppercase tracking-widest text-muted-foreground">
-          {label}
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="px-4">{children}</CardContent>
-    </Card>
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -86,34 +61,34 @@ export function PeriodKpiSkeleton({ count = 5 }: { count?: number }) {
 export function PeriodKpiGrid({ metrics }: { metrics: AnalyticsMetrics }) {
   return (
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-      <KpiCard label="Net P&L">
+      <JournalKpiCard label="Net P&L">
         <PnlBadge value={metrics.net_pnl} className="text-base font-semibold" />
-      </KpiCard>
+      </JournalKpiCard>
 
-      <KpiCard label="Gross P&L">
+      <JournalKpiCard label="Gross P&L">
         <PnlBadge value={metrics.gross_pnl} className="text-base font-semibold" />
-      </KpiCard>
+      </JournalKpiCard>
 
-      <KpiCard label="Total Charges">
+      <JournalKpiCard label="Total Charges">
         <span className="text-base font-semibold tabular-nums text-[var(--red)]">
           <MetricValue value={fmtNum(metrics.total_charges)} />
         </span>
-      </KpiCard>
+      </JournalKpiCard>
 
-      <KpiCard label="Episodes">
+      <JournalKpiCard label="Episodes">
         <div className="flex flex-wrap items-baseline gap-2">
           <span className="text-base font-semibold tabular-nums">
             {metrics.closed_episode_count}
           </span>
           <span className="text-xs text-muted-foreground">closed</span>
         </div>
-      </KpiCard>
+      </JournalKpiCard>
 
-      <KpiCard label="Win Rate">
+      <JournalKpiCard label="Win Rate">
         <span className="text-base font-semibold tabular-nums">
           <MetricValue value={fmtPct(metrics.win_rate)} />
         </span>
-      </KpiCard>
+      </JournalKpiCard>
     </div>
   );
 }
@@ -124,37 +99,37 @@ export function PeriodKpiGrid({ metrics }: { metrics: AnalyticsMetrics }) {
 export function PeriodKpiGridExtended({ metrics }: { metrics: AnalyticsMetrics }) {
   return (
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-      <KpiCard label="Net P&L">
+      <JournalKpiCard label="Net P&L">
         <PnlBadge value={metrics.net_pnl} className="text-base font-semibold" />
-      </KpiCard>
+      </JournalKpiCard>
 
-      <KpiCard label="Gross P&L">
+      <JournalKpiCard label="Gross P&L">
         <PnlBadge value={metrics.gross_pnl} className="text-base font-semibold" />
-      </KpiCard>
+      </JournalKpiCard>
 
-      <KpiCard label="Total Charges">
+      <JournalKpiCard label="Total Charges">
         <span className="text-base font-semibold tabular-nums text-[var(--red)]">
           <MetricValue value={fmtNum(metrics.total_charges)} />
         </span>
-      </KpiCard>
+      </JournalKpiCard>
 
-      <KpiCard label="Episodes">
+      <JournalKpiCard label="Episodes">
         <span className="text-base font-semibold tabular-nums">
           {metrics.closed_episode_count}
         </span>
-      </KpiCard>
+      </JournalKpiCard>
 
-      <KpiCard label="Win Rate">
+      <JournalKpiCard label="Win Rate">
         <span className="text-base font-semibold tabular-nums">
           <MetricValue value={fmtPct(metrics.win_rate)} />
         </span>
-      </KpiCard>
+      </JournalKpiCard>
 
-      <KpiCard label="Profit Factor">
+      <JournalKpiCard label="Profit Factor">
         <span className="text-base font-semibold tabular-nums">
           <MetricValue value={fmtRatio(metrics.profit_factor)} />
         </span>
-      </KpiCard>
+      </JournalKpiCard>
     </div>
   );
 }
