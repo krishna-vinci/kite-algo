@@ -1,7 +1,28 @@
 import pytest
 
-from journaling.models import JournalEnvironmentMode
+from journaling.models import JournalEnvironmentMode, JournalExecutionEnvironment
+from journaling.service import JournalService
 from journaling.v2 import environment_identity_tuple, resolve_environment_key
+
+
+class _EnvironmentRepository:
+    def __init__(self) -> None:
+        self.created = False
+        self.environments: list[JournalExecutionEnvironment] = []
+
+    def get_execution_environment(self, environment_id: str):
+        return None
+
+    def list_execution_environments(self, mode: str | None = None):
+        return [
+            env
+            for env in self.environments
+            if mode is None or str(getattr(env.mode, "value", env.mode)) == mode
+        ]
+
+    def ensure_execution_environment(self, **kwargs):
+        self.created = True
+        return "created-env-id"
 
 
 def test_live_account_resolves_with_live_mode_and_scope_preserved() -> None:
@@ -111,3 +132,39 @@ def test_identity_tuple_uses_empty_strings_for_missing_ids() -> None:
 def test_unsupported_mode_rejected() -> None:
     with pytest.raises(ValueError, match="Unsupported environment mode"):
         resolve_environment_key(mode="sandbox", account_scope="kite:XJJ446")
+
+
+def test_service_read_only_environment_resolution_does_not_create_missing_environment() -> None:
+    repository = _EnvironmentRepository()
+    service = JournalService(repository=repository)  # type: ignore[arg-type]
+
+    with pytest.raises(LookupError, match="Unknown environment"):
+        service.resolve_v2_environment_id(
+            mode="paper",
+            account_scope="kite:paper-read-only",
+            create_if_missing=False,
+        )
+
+    assert repository.created is False
+
+
+def test_service_read_only_environment_resolution_returns_existing_environment() -> None:
+    repository = _EnvironmentRepository()
+    repository.environments.append(
+        JournalExecutionEnvironment(
+            id="existing-env-id",
+            mode=JournalEnvironmentMode.PAPER,
+            account_scope="kite:paper-read-only",
+            paper_account_key="kite:paper-read-only",
+        )
+    )
+    service = JournalService(repository=repository)  # type: ignore[arg-type]
+
+    resolved = service.resolve_v2_environment_id(
+        mode="paper",
+        account_scope="kite:paper-read-only",
+        create_if_missing=False,
+    )
+
+    assert resolved == "existing-env-id"
+    assert repository.created is False

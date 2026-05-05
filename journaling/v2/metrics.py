@@ -5,6 +5,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Iterable
 
+from journaling.models import CostBreakdown, EpisodeOutcome
+
 
 ZERO = Decimal("0")
 
@@ -17,26 +19,29 @@ def _to_decimal(value: Any) -> Decimal:
     return Decimal(str(value))
 
 
-@dataclass(slots=True)
-class EpisodeOutcome:
-    episode_id: str
-    gross_pnl: Decimal
-    total_charges: Decimal
-    net_pnl: Decimal
-    realized_pnl: Decimal
-    hold_seconds: int
-
-
 def build_episode_outcome(*, episode: Any, facts: Iterable[Any]) -> EpisodeOutcome:
     gross_pnl = ZERO
-    total_charges = ZERO
+    legacy_total_charges = ZERO
+    itemized = CostBreakdown()
     for fact in facts:
         gross_pnl += _to_decimal(getattr(fact, "gross_cash_flow", None))
-        total_charges += (
+        itemized = CostBreakdown(
+            brokerage=itemized.brokerage + _to_decimal(getattr(fact, "brokerage", None)),
+            exchange_txn_charge=itemized.exchange_txn_charge + _to_decimal(getattr(fact, "exchange_txn_charge", None)),
+            stt=itemized.stt + _to_decimal(getattr(fact, "stt", None)),
+            stamp_duty=itemized.stamp_duty + _to_decimal(getattr(fact, "stamp_duty", None)),
+            sebi_charge=itemized.sebi_charge + _to_decimal(getattr(fact, "sebi_charge", None)),
+            gst=itemized.gst + _to_decimal(getattr(fact, "gst", None)),
+        )
+        legacy_total_charges += (
             _to_decimal(getattr(fact, "fees_amount", None))
             + _to_decimal(getattr(fact, "taxes_amount", None))
             + _to_decimal(getattr(fact, "slippage_amount", None))
         )
+
+    total_charges = itemized.total_charges if itemized.total_charges else legacy_total_charges
+    if not itemized.total_charges and legacy_total_charges:
+        itemized = CostBreakdown(total_charges=legacy_total_charges)
 
     opened_at = getattr(episode, "opened_at", None)
     closed_at = getattr(episode, "closed_at", None)
@@ -52,6 +57,7 @@ def build_episode_outcome(*, episode: Any, facts: Iterable[Any]) -> EpisodeOutco
         net_pnl=net_pnl,
         realized_pnl=gross_pnl,
         hold_seconds=hold_seconds,
+        cost_breakdown=itemized,
     )
 
 
@@ -63,6 +69,16 @@ def build_environment_episode_metrics(outcomes: Iterable[EpisodeOutcome]) -> dic
     net_pnl = sum((item.net_pnl for item in rows), ZERO)
     realized_pnl = sum((item.realized_pnl for item in rows), ZERO)
     hold_seconds = sum((item.hold_seconds for item in rows), 0)
+    cost_breakdown = CostBreakdown(
+        brokerage=sum((item.cost_breakdown.brokerage for item in rows), ZERO),
+        exchange_txn_charge=sum((item.cost_breakdown.exchange_txn_charge for item in rows), ZERO),
+        stt=sum((item.cost_breakdown.stt for item in rows), ZERO),
+        stamp_duty=sum((item.cost_breakdown.stamp_duty for item in rows), ZERO),
+        sebi_charge=sum((item.cost_breakdown.sebi_charge for item in rows), ZERO),
+        gst=sum((item.cost_breakdown.gst for item in rows), ZERO),
+        total_taxes=sum((item.cost_breakdown.total_taxes for item in rows), ZERO),
+        total_charges=total_charges,
+    )
 
     winning = [item.net_pnl for item in rows if item.net_pnl > ZERO]
     losing = [item.net_pnl for item in rows if item.net_pnl < ZERO]
@@ -82,26 +98,22 @@ def build_environment_episode_metrics(outcomes: Iterable[EpisodeOutcome]) -> dic
     if gross_losses > ZERO:
         profit_factor = gross_wins / gross_losses
 
-    unsupported = {
-        "supported": False,
-        "reason": "Market path and risk-plan inputs are not available yet",
-    }
-
     return {
         "gross_pnl": gross_pnl,
         "net_pnl": net_pnl,
         "total_charges": total_charges,
         "realized_pnl": realized_pnl,
         "hold_seconds": hold_seconds,
+        "cost_breakdown": cost_breakdown.model_dump(),
         "closed_episode_count": closed_episode_count,
         "win_rate": win_rate,
         "average_win": average_win,
         "average_loss": average_loss,
         "expectancy": expectancy,
         "profit_factor": profit_factor,
-        "mae": dict(unsupported),
-        "mfe": dict(unsupported),
-        "r_multiple": dict(unsupported),
+        "mae": None,
+        "mfe": None,
+        "r_multiple": None,
     }
 
 

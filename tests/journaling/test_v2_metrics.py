@@ -85,14 +85,75 @@ def test_episode_outcome_entry_and_exit_produces_single_episode_metrics():
     assert metrics["net_pnl"] == Decimal("76.4")
     assert metrics["realized_pnl"] == Decimal("80")
     assert metrics["hold_seconds"] == 900
+    assert outcome.cost_breakdown.total_charges == Decimal("3.6")
     assert metrics["win_rate"] == Decimal("1")
     assert metrics["average_win"] == Decimal("76.4")
     assert metrics["average_loss"] is None
     assert metrics["expectancy"] is None
     assert metrics["profit_factor"] is None
-    assert metrics["mae"]["supported"] is False
-    assert metrics["mfe"]["supported"] is False
-    assert metrics["r_multiple"]["supported"] is False
+    assert metrics["cost_breakdown"]["total_charges"] == Decimal("3.6")
+    assert metrics["mae"] is None
+    assert metrics["mfe"] is None
+    assert metrics["r_multiple"] is None
+
+
+def test_episode_outcome_prefers_itemized_cost_breakdown_when_present():
+    episode = SimpleNamespace(
+        id="episode-itemized",
+        opened_at=datetime(2026, 5, 1, 9, 15, tzinfo=timezone.utc),
+        closed_at=datetime(2026, 5, 1, 9, 20, tzinfo=timezone.utc),
+    )
+    facts = [
+        SimpleNamespace(
+            gross_cash_flow=Decimal("50"),
+            fees_amount=Decimal("9"),
+            taxes_amount=Decimal("9"),
+            slippage_amount=Decimal("9"),
+            brokerage=Decimal("1.5"),
+            exchange_txn_charge=Decimal("0.5"),
+            stt=Decimal("0.3"),
+            stamp_duty=Decimal("0.2"),
+            sebi_charge=Decimal("0.1"),
+            gst=Decimal("0.4"),
+        )
+    ]
+
+    outcome = build_episode_outcome(episode=episode, facts=facts)
+
+    assert outcome.total_charges == Decimal("3.0")
+    assert outcome.net_pnl == Decimal("47.0")
+    assert outcome.cost_breakdown.brokerage == Decimal("1.5")
+    assert outcome.cost_breakdown.exchange_txn_charge == Decimal("0.5")
+    assert outcome.cost_breakdown.total_taxes == Decimal("1.0")
+    assert outcome.cost_breakdown.total_charges == Decimal("3.0")
+
+
+def test_episode_outcome_falls_back_to_legacy_charges_when_itemized_total_is_zero():
+    episode = SimpleNamespace(
+        id="episode-legacy",
+        opened_at=datetime(2026, 5, 1, 9, 15, tzinfo=timezone.utc),
+        closed_at=datetime(2026, 5, 1, 9, 45, tzinfo=timezone.utc),
+    )
+    facts = [
+        SimpleNamespace(
+            gross_cash_flow=Decimal("25"),
+            fees_amount=Decimal("1.2"),
+            taxes_amount=Decimal("0.5"),
+            slippage_amount=Decimal("0.3"),
+            brokerage=None,
+            exchange_txn_charge=None,
+            stt=None,
+            stamp_duty=None,
+            sebi_charge=None,
+            gst=None,
+        )
+    ]
+
+    outcome = build_episode_outcome(episode=episode, facts=facts)
+
+    assert outcome.total_charges == Decimal("2.0")
+    assert outcome.cost_breakdown.total_charges == Decimal("2.0")
+    assert outcome.cost_breakdown.total_taxes == Decimal("0")
 
 
 def test_paper_live_comparison_payload_never_returns_combined_totals():

@@ -6,6 +6,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
+from execution_accounting.contracts import ExecutionCostContract
 from journaling.models import DecisionActorType, DecisionType, JournalDecisionEvent, JournalSourceLink, SourceType
 from journaling.service import JournalService
 from scripts.backfill_journal_v2 import run_backfill
@@ -404,6 +405,135 @@ def test_paper_charges_flow_into_v2_fact_and_episode_metrics():
     metrics_result = service.compute_v2_environment_metrics(environment_id=second["environment_id"])
     assert metrics_result["metrics"]["closed_episode_count"] == 1
     assert Decimal(metrics_result["metrics"]["total_charges"]) == Decimal("3.0")
+
+
+def test_record_v2_execution_fill_cost_contract_persists_itemized_fields_and_aggregates():
+    repo = _FakeV2FillRepository()
+    service = JournalService(repository=repo)  # type: ignore[arg-type]
+
+    result = service.record_v2_execution_fill(
+        mode="paper",
+        account_scope="kite:paper-e2e",
+        source_system="paper_runtime",
+        external_run_id="paper-run-cost-contract",
+        source_type="paper_trade",
+        source_fact_key="paper:cost-contract",
+        side="BUY",
+        quantity=1,
+        price=Decimal("100"),
+        fill_timestamp=datetime(2026, 5, 1, 9, 15, tzinfo=timezone.utc),
+        gross_cash_flow=Decimal("-100"),
+        fees_amount=Decimal("999"),
+        taxes_amount=Decimal("999"),
+        cost_contract=ExecutionCostContract.model_validate(
+            {
+                "brokerage": "1.25",
+                "exchange_txn_charge": "0.75",
+                "stt": "0.50",
+                "stamp_duty": "0.10",
+                "sebi_charge": "0.05",
+                "gst": "0.36",
+                "margin_required": "5000",
+                "charges_status": "broker_quoted",
+            }
+        ),
+        run_id="66666666-6666-4666-8666-666666666666",
+        order_id="O5",
+        trade_id="T5",
+        attribution={"strategy_run_id": "paper-run-cost-contract", "strategy_family": "indicator_strategy", "strategy_name": "MR"},
+    )
+
+    fact = repo.find_v2_execution_fact_by_source(source_type="paper_trade", source_fact_key="paper:cost-contract")
+    assert result["episode_id"]
+    assert fact is not None
+    assert fact.fees_amount == Decimal("2.00")
+    assert fact.taxes_amount == Decimal("1.01")
+    assert fact.brokerage == Decimal("1.25")
+    assert fact.exchange_txn_charge == Decimal("0.75")
+    assert fact.stt == Decimal("0.50")
+    assert fact.stamp_duty == Decimal("0.10")
+    assert fact.sebi_charge == Decimal("0.05")
+    assert fact.gst == Decimal("0.36")
+    assert fact.margin_required == Decimal("5000")
+    assert fact.charges_status == "broker_quoted"
+    assert fact.payload["cost_contract"]["brokerage"] == "1.25"
+
+
+def test_record_v2_execution_fill_without_cost_contract_preserves_aggregate_only():
+    repo = _FakeV2FillRepository()
+    service = JournalService(repository=repo)  # type: ignore[arg-type]
+
+    service.record_v2_execution_fill(
+        mode="paper",
+        account_scope="kite:paper-e2e",
+        source_system="paper_runtime",
+        external_run_id="paper-run-aggregate-only",
+        source_type="paper_trade",
+        source_fact_key="paper:aggregate-only",
+        side="BUY",
+        quantity=1,
+        price=Decimal("100"),
+        fill_timestamp=datetime(2026, 5, 1, 9, 15, tzinfo=timezone.utc),
+        gross_cash_flow=Decimal("-100"),
+        fees_amount=Decimal("1.0"),
+        taxes_amount=Decimal("0.5"),
+        run_id="77777777-7777-4777-8777-777777777777",
+        order_id="O6",
+        trade_id="T6",
+        attribution={"strategy_run_id": "paper-run-aggregate-only", "strategy_family": "indicator_strategy", "strategy_name": "MR"},
+    )
+
+    fact = repo.find_v2_execution_fact_by_source(source_type="paper_trade", source_fact_key="paper:aggregate-only")
+    assert fact is not None
+    assert fact.fees_amount == Decimal("1.0")
+    assert fact.taxes_amount == Decimal("0.5")
+    assert fact.brokerage is None
+    assert fact.exchange_txn_charge is None
+    assert fact.stt is None
+    assert fact.stamp_duty is None
+    assert fact.sebi_charge is None
+    assert fact.gst is None
+    assert fact.margin_required is None
+    assert fact.charges_status is None
+    assert "cost_contract" not in fact.payload
+
+
+def test_record_v2_execution_fill_empty_cost_contract_becomes_unavailable_zero_itemized():
+    repo = _FakeV2FillRepository()
+    service = JournalService(repository=repo)  # type: ignore[arg-type]
+
+    service.record_v2_execution_fill(
+        mode="live",
+        account_scope="kite:AB1234",
+        source_system="live_projector",
+        external_run_id="live-run-unavailable-contract",
+        source_type="live_fill",
+        source_fact_key="live:unavailable-contract",
+        side="BUY",
+        quantity=1,
+        price=Decimal("100"),
+        fill_timestamp=datetime(2026, 5, 1, 9, 15, tzinfo=timezone.utc),
+        gross_cash_flow=Decimal("-100"),
+        cost_contract={},
+        run_id="88888888-8888-4888-8888-888888888888",
+        order_id="O7",
+        trade_id="T7",
+        attribution={"strategy_run_id": "live-run-unavailable-contract", "strategy_family": "indicator_strategy", "strategy_name": "MR"},
+    )
+
+    fact = repo.find_v2_execution_fact_by_source(source_type="live_fill", source_fact_key="live:unavailable-contract")
+    assert fact is not None
+    assert fact.fees_amount == Decimal("0")
+    assert fact.taxes_amount == Decimal("0")
+    assert fact.brokerage == Decimal("0")
+    assert fact.exchange_txn_charge == Decimal("0")
+    assert fact.stt == Decimal("0")
+    assert fact.stamp_duty == Decimal("0")
+    assert fact.sebi_charge == Decimal("0")
+    assert fact.gst == Decimal("0")
+    assert fact.margin_required == Decimal("0")
+    assert fact.charges_status == "unavailable"
+    assert fact.payload["cost_contract"]["charges_status"] == "unavailable"
 
 
 def test_episode_remains_open_until_all_instruments_are_flat():

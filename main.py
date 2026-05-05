@@ -16,6 +16,7 @@ from sqlalchemy import text
 
 from api.openapi import OPENAPI_TAGS
 from api.routers.algo_workers import router as algo_workers_router
+from api.routers.analytics import router as analytics_router
 from api.routers.auth import router as auth_router
 from api.routers.control import router as control_router
 from api.routers.historical import router as historical_router
@@ -817,6 +818,7 @@ app.include_router(marketwatch_router, prefix="/api")
 app.include_router(algo_workers_router, prefix="/api")
 app.include_router(control_router, prefix="/api")
 app.include_router(journal_router, prefix="/api")
+app.include_router(analytics_router, prefix="/api")
 app.include_router(kite_orders_router, prefix="/api")
 app.include_router(kite_mutual_funds_router, prefix="/api")
 app.include_router(candles_api_router, prefix="/api")  # Unified candles API with all historical endpoints

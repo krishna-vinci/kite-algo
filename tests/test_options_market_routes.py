@@ -17,12 +17,19 @@ class _FakeManager:
     def __init__(self, snapshot: dict | None):
         self.instrument_repo = _FakeInstrumentRepo()
         self._snapshot = snapshot
+        self.start_sessions_calls: list[tuple[list[dict], bool]] = []
 
     def normalize_underlying_symbol(self, value: str):
         return value.strip().upper()
 
     def get_snapshot(self, _underlying: str):
         return self._snapshot
+
+    async def start_sessions(self, items: list[dict], replace: bool = False):
+        self.start_sessions_calls.append((items, replace))
+
+    def get_watchlist(self):
+        return [{"underlying": self._snapshot.get("underlying", "NIFTY"), "is_running": True}] if self._snapshot else []
 
 
 def _build_snapshot() -> dict:
@@ -72,6 +79,41 @@ def test_market_session_route_returns_snapshot_packet():
     assert body["underlying"] == "NIFTY"
     assert "expiries" in body
     assert body["snapshot"]["updated_at"] == "2026-04-29T10:00:00Z"
+
+
+def test_legacy_market_session_route_returns_raw_snapshot_packet():
+    response = _client(_build_snapshot()).get("/api/options/session/NIFTY")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["underlying"] == "NIFTY"
+    assert body["spot_ltp"] == 22520.0
+    assert "per_expiry" in body
+
+
+def test_start_sessions_route_delegates_to_manager():
+    snapshot = _build_snapshot()
+    manager = _FakeManager(snapshot)
+    app = FastAPI()
+    app.include_router(market_router)
+    app.dependency_overrides[get_options_session_manager] = lambda: manager
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/options/sessions",
+        json={
+            "replace": False,
+            "items": [
+                {"underlying": "NIFTY", "window": 12, "cadence_sec": 5},
+                {"underlying": "BANKNIFTY", "window": 12, "cadence_sec": 5},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert manager.start_sessions_calls == [([
+        {"underlying": "NIFTY", "window": 12, "cadence_sec": 5},
+        {"underlying": "BANKNIFTY", "window": 12, "cadence_sec": 5},
+    ], False)]
 
 
 def test_market_routes_return_option_session_not_found_when_missing():

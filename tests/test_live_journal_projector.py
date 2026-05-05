@@ -30,7 +30,16 @@ class LiveJournalProjectorTests(unittest.TestCase):
         ]
         repository.find_live_order_intent.return_value = {
             "journal_run_id": "11111111-1111-4111-8111-111111111111",
-            "cost_contract_json": {"total_charges": "31.20", "total_taxes": "8.70", "charges_status": "broker_quoted"},
+            "cost_contract_json": {
+                "brokerage": "20.00",
+                "exchange_txn_charge": "2.50",
+                "stt": "5.00",
+                "stamp_duty": "1.00",
+                "sebi_charge": "0.20",
+                "gst": "2.50",
+                "margin_required": "1500.00",
+                "charges_status": "broker_quoted",
+            },
         }
         repository.ensure_live_strategy_run_for_intent.return_value = "11111111-1111-4111-8111-111111111111"
         repository.insert_execution_fact.return_value = 1
@@ -44,10 +53,20 @@ class LiveJournalProjectorTests(unittest.TestCase):
         self.assertEqual(fact.source_type, "live_fill")
         self.assertEqual(fact.fees_amount, Decimal("22.50"))
         self.assertEqual(fact.taxes_amount, Decimal("8.70"))
+        self.assertEqual(fact.brokerage, Decimal("20.00"))
+        self.assertEqual(fact.exchange_txn_charge, Decimal("2.50"))
+        self.assertEqual(fact.stt, Decimal("5.00"))
+        self.assertEqual(fact.stamp_duty, Decimal("1.00"))
+        self.assertEqual(fact.sebi_charge, Decimal("0.20"))
+        self.assertEqual(fact.gst, Decimal("2.50"))
+        self.assertEqual(fact.margin_required, Decimal("1500.00"))
+        self.assertEqual(fact.charges_status, "broker_quoted")
         journal_service.record_v2_execution_fill.assert_called_once()
         v2_call = journal_service.record_v2_execution_fill.call_args.kwargs
         self.assertEqual(v2_call["mode"], "live")
         self.assertEqual(v2_call["external_run_id"], "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(v2_call["cost_contract"].brokerage, Decimal("20.00"))
+        self.assertEqual(v2_call["payload"]["cost_contract"]["charges_status"], "broker_quoted")
 
     def test_unknown_live_fill_imports_to_broker_activity(self):
         repository = Mock()
@@ -77,6 +96,10 @@ class LiveJournalProjectorTests(unittest.TestCase):
         self.assertEqual(result["imported"], 1)
         repository.ensure_imported_broker_run.assert_called_once()
         journal_service.record_v2_execution_fill.assert_called_once()
+        fact = repository.insert_execution_fact.call_args.args[0]
+        self.assertEqual(fact.fees_amount, Decimal("0"))
+        self.assertEqual(fact.taxes_amount, Decimal("0"))
+        self.assertEqual(fact.charges_status, "unavailable")
 
     def test_intent_without_journal_run_still_projects_to_strategy_run(self):
         repository = Mock()
@@ -111,6 +134,7 @@ class LiveJournalProjectorTests(unittest.TestCase):
         fact = repository.insert_execution_fact.call_args.args[0]
         self.assertEqual(str(fact.run_id), "33333333-3333-4333-8333-333333333333")
         self.assertEqual(fact.source_type, "live_fill")
+        self.assertEqual(fact.charges_status, "unavailable")
         journal_service.record_v2_execution_fill.assert_called_once()
 
 

@@ -1,6 +1,7 @@
 import json
 import unittest
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, cast
 from uuid import uuid4
 
@@ -38,6 +39,8 @@ class _FakeSession:
         self.strategy_templates = []
         self.strategy_variants = []
         self.strategy_deployments = []
+        self.execution_facts = []
+        self.timeline_events = []
         self.metric_snapshots = []
         self.notes = []
         self.note_revisions = []
@@ -281,12 +284,24 @@ class _FakeSession:
                 "status": params["status"],
                 "opened_at": params.get("opened_at"),
                 "closed_at": params.get("closed_at"),
+                "notes": params.get("notes") or "",
                 "metadata_json": params["metadata_json"],
                 "created_at": None,
                 "updated_at": None,
             }
             self.episodes.append(row)
             return _FakeResult(scalar=episode_id)
+
+        if "UPDATE public.journal_episodes" in sql and "SET notes = :notes" in sql:
+            episode_id = params["episode_id"]
+            environment_id = params["environment_id"]
+            for row in self.episodes:
+                if row["id"] != episode_id or row["environment_id"] != environment_id:
+                    continue
+                row["notes"] = params["notes"]
+                row["updated_at"] = datetime.now(timezone.utc)
+                return _FakeResult(row={"id": episode_id})
+            return _FakeResult(row=None)
 
         if "UPDATE public.journal_episodes" in sql:
             episode_id = params["episode_id"]
@@ -325,6 +340,19 @@ class _FakeSession:
             start = int(params.get("offset") or 0)
             end = start + int(params.get("limit") or len(rows))
             return _FakeResult(rows=rows[start:end])
+
+        if "FROM public.journal_execution_facts" in sql and "episode_id IN" in sql:
+            episode_ids = set(params.get("episode_ids") or [])
+            rows = [row for row in self.execution_facts if row.get("episode_id") in episode_ids]
+            rows = sorted(
+                rows,
+                key=lambda item: (
+                    str(item.get("episode_id") or ""),
+                    item.get("fill_timestamp") or "",
+                    item.get("id") or 0,
+                ),
+            )
+            return _FakeResult(rows=rows)
 
         if "FROM public.journal_execution_intents" in sql and "idempotency_key = :idempotency_key" in sql and "environment_id = CAST(:environment_id AS uuid)" in sql:
             for row in self.execution_intents:
@@ -1391,6 +1419,151 @@ class JournalRepositoryV2Tests(unittest.TestCase):
         assert row["storage_key"] == "attachments/n1.png"
         assert row["mime_type"] == "image/png"
         assert json.loads(row["metadata_json"]) == {"label": "entry"}
+
+    def test_execution_fact_row_mapper_includes_itemized_costs(self):
+        fact = self.repository._execution_fact_from_row(
+            {
+                "id": 1,
+                "run_id": str(uuid4()),
+                "environment_id": str(uuid4()),
+                "episode_id": str(uuid4()),
+                "intent_id": str(uuid4()),
+                "source_type": "paper_trade",
+                "source_fact_key": "paper:fact-1",
+                "fill_timestamp": datetime(2026, 5, 4, 9, 15, tzinfo=timezone.utc),
+                "side": "BUY",
+                "quantity": 1,
+                "price": Decimal("100"),
+                "gross_cash_flow": Decimal("-100"),
+                "fees_amount": Decimal("5"),
+                "taxes_amount": Decimal("3"),
+                "slippage_amount": Decimal("1"),
+                "brokerage": Decimal("1.25"),
+                "exchange_txn_charge": Decimal("0.45"),
+                "stt": Decimal("0.80"),
+                "stamp_duty": Decimal("0.10"),
+                "sebi_charge": Decimal("0.02"),
+                "gst": Decimal("0.31"),
+                "margin_required": Decimal("2500"),
+                "charges_status": "reconciled",
+                "payload_json": json.dumps({"source": "unit"}),
+            }
+        )
+
+        assert fact.brokerage == Decimal("1.25")
+        assert fact.exchange_txn_charge == Decimal("0.45")
+        assert fact.stt == Decimal("0.80")
+        assert fact.stamp_duty == Decimal("0.10")
+        assert fact.sebi_charge == Decimal("0.02")
+        assert fact.gst == Decimal("0.31")
+        assert fact.margin_required == Decimal("2500")
+        assert fact.charges_status == "reconciled"
+
+    def test_episode_row_mapper_defaults_notes_to_empty_string(self):
+        episode = self.repository._episode_from_row(
+            {
+                "id": str(uuid4()),
+                "environment_id": str(uuid4()),
+                "execution_context_id": str(uuid4()),
+                "episode_seq": 1,
+                "status": "open",
+                "opened_at": datetime(2026, 5, 4, 9, 15, tzinfo=timezone.utc),
+                "metadata_json": json.dumps({"source": "unit"}),
+            }
+        )
+
+        assert episode.notes == ""
+
+    def test_list_execution_facts_for_episodes_groups_rows_and_handles_empty_input(self):
+        episode_a = str(uuid4())
+        episode_b = str(uuid4())
+        environment_id = str(uuid4())
+        run_id = str(uuid4())
+        self.session.execution_facts.extend(
+            [
+                {
+                    "id": 1,
+                    "run_id": run_id,
+                    "environment_id": environment_id,
+                    "episode_id": episode_a,
+                    "source_type": "paper_trade",
+                    "source_fact_key": "paper:a1",
+                    "fill_timestamp": datetime(2026, 5, 4, 9, 15, tzinfo=timezone.utc),
+                    "side": "BUY",
+                    "quantity": 1,
+                    "price": Decimal("100"),
+                    "payload_json": json.dumps({}),
+                },
+                {
+                    "id": 2,
+                    "run_id": run_id,
+                    "environment_id": environment_id,
+                    "episode_id": episode_b,
+                    "source_type": "paper_trade",
+                    "source_fact_key": "paper:b1",
+                    "fill_timestamp": datetime(2026, 5, 4, 9, 16, tzinfo=timezone.utc),
+                    "side": "SELL",
+                    "quantity": 1,
+                    "price": Decimal("101"),
+                    "payload_json": json.dumps({}),
+                },
+            ]
+        )
+
+        assert self.repository.list_execution_facts_for_episodes([]) == {}
+
+        grouped = self.repository.list_execution_facts_for_episodes([episode_a, episode_b])
+
+        assert set(grouped) == {episode_a, episode_b}
+        assert [fact.source_fact_key for fact in grouped[episode_a]] == ["paper:a1"]
+        assert [fact.source_fact_key for fact in grouped[episode_b]] == ["paper:b1"]
+
+    def test_update_episode_notes_is_environment_scoped_and_can_clear(self):
+        episode_id = str(uuid4())
+        environment_id = str(uuid4())
+        other_environment_id = str(uuid4())
+        self.session.episodes.append(
+            {
+                "id": episode_id,
+                "environment_id": environment_id,
+                "execution_context_id": str(uuid4()),
+                "episode_seq": 1,
+                "status": "open",
+                "opened_at": datetime(2026, 5, 4, 9, 15, tzinfo=timezone.utc),
+                "closed_at": None,
+                "notes": "",
+                "metadata_json": json.dumps({}),
+                "created_at": None,
+                "updated_at": None,
+            }
+        )
+
+        assert self.repository.update_episode_notes(
+            episode_id=episode_id,
+            environment_id=other_environment_id,
+            notes="wrong env",
+        ) is False
+        episode = self.repository.get_episode_detail(episode_id)
+        assert episode is not None
+        assert episode.notes == ""
+
+        assert self.repository.update_episode_notes(
+            episode_id=episode_id,
+            environment_id=environment_id,
+            notes="trader note",
+        ) is True
+        episode = self.repository.get_episode_detail(episode_id)
+        assert episode is not None
+        assert episode.notes == "trader note"
+
+        assert self.repository.update_episode_notes(
+            episode_id=episode_id,
+            environment_id=environment_id,
+            notes="",
+        ) is True
+        episode = self.repository.get_episode_detail(episode_id)
+        assert episode is not None
+        assert episode.notes == ""
 
 
 if __name__ == "__main__":

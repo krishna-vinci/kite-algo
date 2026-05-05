@@ -28,6 +28,9 @@ def _has_route(path: str, method: str) -> bool:
 
 def test_options_market_expiries_route_is_registered() -> None:
     assert _has_route("/api/options/underlyings/{underlying}/expiries", "GET")
+    assert _has_route("/api/options/sessions", "POST")
+    assert _has_route("/api/options/session/{underlying}", "GET")
+    assert _has_route("/api/options/underlyings/{underlying}/stream", "GET")
 
 
 def test_options_strategy_preview_route_is_registered() -> None:

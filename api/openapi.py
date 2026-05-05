@@ -17,4 +17,5 @@ OPENAPI_TAGS = [
     {"name": "Control Plane", "description": "Strategy-level exits, cancels, reconciliations, and control snapshots."},
     {"name": "Strategies", "description": "Protected strategy and index stoploss endpoints."},
     {"name": "Trading Journal", "description": "Backend-only trading journal runs, source links, decision events, and summary analytics."},
+    {"name": "Analytics", "description": "Journal V2 analytics summaries, strategy deep dives, equity curves, cost analysis, and paper-vs-live comparisons."},
 ]

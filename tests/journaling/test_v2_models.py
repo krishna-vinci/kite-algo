@@ -1,15 +1,20 @@
+from decimal import Decimal
+
 import pytest
 from pydantic import ValidationError
 
 from journaling.models import (
+    CostBreakdown,
     JournalEpisode,
     JournalEpisodeStatus,
     JournalEnvironmentMode,
     JournalExecutionContext,
     JournalExecutionEnvironment,
+    JournalExecutionFact,
     JournalExecutionIntent,
     JournalIntentChannel,
     JournalMetricSnapshot,
+    SourceType,
     JournalStrategyDeployment,
     JournalStrategyTemplate,
     JournalStrategyVariant,
@@ -117,6 +122,58 @@ def test_execution_intent_idempotency_key_validation() -> None:
 
     model = JournalExecutionIntent(environment_id="env-1", idempotency_key=None)
     assert model.idempotency_key is None
+
+
+def test_cost_breakdown_derives_totals_when_zero() -> None:
+    model = CostBreakdown(
+        brokerage=Decimal("10.5"),
+        exchange_txn_charge=Decimal("1.5"),
+        stt=Decimal("2"),
+        stamp_duty=Decimal("0.5"),
+        sebi_charge=Decimal("0.1"),
+        gst=Decimal("2.2"),
+    )
+
+    assert model.total_taxes == Decimal("4.8")
+    assert model.total_charges == Decimal("16.8")
+
+
+def test_execution_fact_accepts_nullable_itemized_cost_fields() -> None:
+    model = JournalExecutionFact(
+        run_id="run-1",
+        source_type=SourceType.PAPER_TRADE,
+        source_fact_key="fact-1",
+        side="buy",
+        quantity=1,
+        price=Decimal("100"),
+        brokerage=None,
+        exchange_txn_charge=None,
+        stt=None,
+        stamp_duty=None,
+        sebi_charge=None,
+        gst=None,
+        margin_required=None,
+        charges_status=None,
+    )
+
+    assert model.brokerage is None
+    assert model.exchange_txn_charge is None
+    assert model.stt is None
+    assert model.stamp_duty is None
+    assert model.sebi_charge is None
+    assert model.gst is None
+    assert model.margin_required is None
+    assert model.charges_status is None
+
+
+def test_episode_notes_default_to_empty_string() -> None:
+    model = JournalEpisode(
+        environment_id="env-1",
+        execution_context_id="ctx-1",
+        episode_seq=1,
+    )
+
+    assert model.notes == ""
 
 
 def test_v2_enums_serialize_as_strings_with_json_dump() -> None:

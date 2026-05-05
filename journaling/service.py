@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from calendar import monthrange
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -9,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from sqlalchemy import text
 
-from execution_accounting.contracts import signed_cash_flow
+from execution_accounting.contracts import ChargesStatus, ExecutionCostContract, signed_cash_flow
 
 from .benchmark import compare_return_series
 from .metrics import (
@@ -30,11 +31,16 @@ from .metrics import (
     win_rate,
 )
 from .models import (
+    AnalyticsMetrics,
     CapitalBasisType,
     BenchmarkDailyPrice,
     BenchmarkDefinition,
+    CostBreakdown,
+    EpisodeOutcome,
     ExecutionMode,
+    JournalEnvironmentRef,
     JournalDecisionEvent,
+    JournalEpisodeLegDirection,
     JournalEquityPoint,
     JournalExecutionFact,
     JournalMetricSnapshot,
@@ -43,12 +49,28 @@ from .models import (
     JournalRun,
     JournalTimelineActorType,
     JournalTimelineEvent,
+    JournalV2DailyResponse,
+    JournalV2DailySummary,
+    JournalV2EpisodeCard,
+    JournalV2EpisodeDetailResponse,
+    JournalV2EpisodeLegView,
+    JournalV2ExecutionFillView,
+    JournalV2OpenEpisodeCard,
+    JournalV2PeriodBucket,
+    JournalV2PeriodResponse,
+    JournalV2StrategyGroup,
+    JournalV2StrategyListResponse,
+    JournalV2StrategyRef,
+    JournalV2StrategySummaryItem,
+    JournalV2TimelineEventView,
+    MetricPeriod,
     ReviewState,
     JournalSourceLink,
     ProjectionState,
     SourceType,
     StrategyFamily,
 )
+from .periods import IST, day_bounds_utc, period_bounds_utc
 from .repository import JournalRepository
 from .v2.environment import resolve_environment_key
 from .v2.episodes import classify_position_effect, next_episode_sequence
@@ -99,6 +121,16 @@ def _serialize_decimal(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _serialize_decimal(item) for key, item in value.items()}
     return value
+
+
+def _normalize_cost_contract(value: ExecutionCostContract | Dict[str, Any] | None) -> ExecutionCostContract | None:
+    if value is None:
+        return None
+    if isinstance(value, ExecutionCostContract):
+        return value
+    if isinstance(value, dict) and value:
+        return ExecutionCostContract.model_validate(value)
+    return ExecutionCostContract(charges_status=ChargesStatus.UNAVAILABLE)
 
 
 def _normalize_interval_day(value: date) -> datetime:
@@ -222,6 +254,7 @@ class JournalService:
         broker_user_id: str | None = None,
         paper_account_key: str | None = None,
         environment_epoch: int | None = None,
+        create_if_missing: bool = True,
     ) -> str:
         normalized_environment_id = str(environment_id or "").strip()
         if normalized_environment_id:
@@ -244,6 +277,19 @@ class JournalService:
             paper_account_key=paper_account_key,
             environment_epoch=int(environment_epoch or 1),
         )
+        if not create_if_missing:
+            resolved_mode = str(getattr(resolved.mode, "value", resolved.mode))
+            for environment in self.repository.list_execution_environments(mode=resolved_mode):
+                if (
+                    str(environment.account_scope) == str(resolved.account_scope)
+                    and str(environment.broker_user_id or "") == str(resolved.broker_user_id or "")
+                    and str(environment.paper_account_key or "") == str(resolved.paper_account_key or "")
+                    and int(environment.environment_epoch) == int(resolved.environment_epoch)
+                ):
+                    return str(environment.id)
+            raise LookupError(
+                "Unknown environment for mode/account_scope; provide environment_id or create the environment first"
+            )
         return self.repository.ensure_execution_environment(
             mode=str(getattr(resolved.mode, "value", resolved.mode)),
             account_scope=resolved.account_scope,
@@ -259,16 +305,275 @@ class JournalService:
         environments = self.repository.list_execution_environments(mode=normalized_mode)
         return [_serialize_decimal(item.model_dump(mode="python")) for item in environments]
 
+    def _require_v2_environment(self, environment_id: str):
+        normalized_environment_id = _require_uuid("environment_id", environment_id)
+        environment = self.repository.get_execution_environment(normalized_environment_id)
+        if environment is None:
+            raise LookupError(f"Unknown environment_id: {normalized_environment_id}")
+        return normalized_environment_id, environment
+
+    def _current_ist_date(self) -> date:
+        return datetime.now(IST).date()
+
+    def _to_environment_ref(self, environment: Any) -> JournalEnvironmentRef:
+        return JournalEnvironmentRef(
+            environment_id=str(environment.id),
+            mode=str(getattr(environment.mode, "value", environment.mode)),
+            account_scope=environment.account_scope,
+            display_name=environment.display_name,
+            broker_user_id=environment.broker_user_id,
+            paper_account_key=environment.paper_account_key,
+        )
+
+    def _context_template_id(self, context: Any | None) -> str | None:
+        if context is None:
+            return None
+        metadata = dict(getattr(context, "metadata", {}) or {})
+        return (
+            str(getattr(context, "strategy_template_id", None) or "").strip()
+            or str(metadata.get("strategy_template_id") or "").strip()
+            or None
+        )
+
+    def _to_strategy_ref(self, context: Any | None) -> JournalV2StrategyRef | None:
+        template_id = self._context_template_id(context)
+        metadata = dict(getattr(context, "metadata", {}) or {}) if context is not None else {}
+        if template_id:
+            template = self.repository.get_strategy_template(template_id)
+            if template is not None:
+                return JournalV2StrategyRef(
+                    template_id=str(template.id),
+                    strategy_family=str(getattr(template.strategy_family, "value", template.strategy_family)),
+                    template_key=template.template_key,
+                    display_name=template.display_name or template.template_key or str(template.id),
+                )
+        resolved_identity = dict(metadata.get("resolved_identity") or {})
+        template_key = str(resolved_identity.get("template_id") or template_id or "").strip()
+        if not template_key:
+            return None
+        return JournalV2StrategyRef(
+            template_id=template_id or template_key,
+            strategy_family=str(resolved_identity.get("strategy_family") or metadata.get("strategy_family") or "unknown_strategy"),
+            template_key=template_key,
+            display_name=str(resolved_identity.get("display_name") or metadata.get("display_name") or template_key),
+        )
+
+    def _cost_breakdown_from_fact(self, fact: JournalExecutionFact) -> CostBreakdown:
+        total_charges = (
+            _to_decimal(fact.brokerage)
+            + _to_decimal(fact.exchange_txn_charge)
+            + _to_decimal(fact.stt)
+            + _to_decimal(fact.stamp_duty)
+            + _to_decimal(fact.sebi_charge)
+            + _to_decimal(fact.gst)
+        )
+        if total_charges == ZERO:
+            total_charges = _to_decimal(fact.fees_amount) + _to_decimal(fact.taxes_amount) + _to_decimal(fact.slippage_amount)
+        return CostBreakdown(
+            brokerage=_to_decimal(fact.brokerage),
+            exchange_txn_charge=_to_decimal(fact.exchange_txn_charge),
+            stt=_to_decimal(fact.stt),
+            stamp_duty=_to_decimal(fact.stamp_duty),
+            sebi_charge=_to_decimal(fact.sebi_charge),
+            gst=_to_decimal(fact.gst),
+            total_charges=total_charges,
+        )
+
+    def _to_fill_view(self, fact: JournalExecutionFact) -> JournalV2ExecutionFillView:
+        breakdown = self._cost_breakdown_from_fact(fact)
+        return JournalV2ExecutionFillView(
+            fact_id=fact.id,
+            leg_id=fact.leg_id,
+            source_type=fact.source_type,
+            source_fact_key=fact.source_fact_key,
+            order_id=fact.order_id,
+            trade_id=fact.trade_id,
+            fill_timestamp=fact.fill_timestamp,
+            side=fact.side,
+            quantity=fact.quantity,
+            price=fact.price,
+            gross_cash_flow=fact.gross_cash_flow,
+            fees_amount=fact.fees_amount,
+            taxes_amount=fact.taxes_amount,
+            slippage_amount=fact.slippage_amount,
+            brokerage=breakdown.brokerage,
+            exchange_txn_charge=breakdown.exchange_txn_charge,
+            stt=breakdown.stt,
+            stamp_duty=breakdown.stamp_duty,
+            sebi_charge=breakdown.sebi_charge,
+            gst=breakdown.gst,
+            margin_required=fact.margin_required,
+            charges_status=fact.charges_status,
+            payload=dict(fact.payload or {}),
+        )
+
+    def _build_leg_views(self, facts: list[JournalExecutionFact]) -> list[JournalV2EpisodeLegView]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for fact in facts:
+            payload = dict(fact.payload or {})
+            broker_fill = dict(payload.get("broker_fill") or {}) if isinstance(payload.get("broker_fill"), dict) else {}
+            instrument_token = payload.get("instrument_token", broker_fill.get("instrument_token"))
+            exchange = payload.get("exchange") or broker_fill.get("exchange")
+            tradingsymbol = payload.get("tradingsymbol") or broker_fill.get("tradingsymbol")
+            product = payload.get("product") or broker_fill.get("product")
+            key = str(fact.leg_id) if fact.leg_id is not None else f"{instrument_token}:{exchange}:{tradingsymbol}:{product}"
+            if key not in grouped:
+                grouped[key] = {
+                    "leg_id": fact.leg_id,
+                    "leg_seq": len(grouped) + 1,
+                    "instrument_token": instrument_token,
+                    "exchange": exchange,
+                    "tradingsymbol": tradingsymbol,
+                    "product": product,
+                    "opened_quantity": 0,
+                    "closed_quantity": 0,
+                    "net_quantity": 0,
+                    "direction": None,
+                    "metadata": {},
+                }
+            leg = grouped[key]
+            delta = int(fact.quantity) if str(fact.side or "").upper() == "BUY" else -int(fact.quantity)
+            previous = int(leg["net_quantity"])
+            if previous == 0 or (previous > 0 and delta > 0) or (previous < 0 and delta < 0):
+                leg["opened_quantity"] += abs(delta)
+            elif abs(delta) <= abs(previous):
+                leg["closed_quantity"] += abs(delta)
+            else:
+                leg["closed_quantity"] += abs(previous)
+                leg["opened_quantity"] += abs(delta) - abs(previous)
+            leg["net_quantity"] = previous + delta
+            if leg["direction"] is None and delta != 0:
+                leg["direction"] = JournalEpisodeLegDirection.LONG if delta > 0 else JournalEpisodeLegDirection.SHORT
+            leg["metadata"] = {**leg["metadata"], "position_effect": fact.position_effect}
+        return [JournalV2EpisodeLegView(**item) for item in grouped.values()]
+
+    def _derive_episode_direction(self, legs: list[JournalV2EpisodeLegView]) -> JournalEpisodeLegDirection | None:
+        for leg in legs:
+            if leg.direction is not None:
+                return leg.direction
+        return None
+
+    def _to_timeline_view(self, event: JournalTimelineEvent) -> JournalV2TimelineEventView:
+        return JournalV2TimelineEventView(
+            event_id=event.id,
+            subject_type=event.subject_type,
+            subject_id=event.subject_id,
+            channel=event.channel,
+            event_type=event.event_type,
+            actor_type=event.actor_type,
+            correlation_id=event.correlation_id,
+            causation_id=event.causation_id,
+            occurred_at=event.occurred_at,
+            payload=dict(event.payload or {}),
+        )
+
+    def _analytics_metrics(self, outcomes: list[EpisodeOutcome]) -> AnalyticsMetrics:
+        rows = list(outcomes)
+        payload = dict(build_environment_episode_metrics(rows))
+        hold_seconds_total = sum((int(item.hold_seconds) for item in rows), 0)
+        closed_episode_count = len(rows)
+        win_count = sum(1 for item in rows if item.net_pnl > ZERO)
+        loss_count = sum(1 for item in rows if item.net_pnl < ZERO)
+        payload["hold_seconds_total"] = hold_seconds_total
+        payload["hold_seconds_avg"] = int(hold_seconds_total / closed_episode_count) if closed_episode_count else None
+        payload["win_count"] = win_count
+        payload["loss_count"] = loss_count
+        payload["cost_ratio"] = _safe_ratio(_to_decimal(payload.get("total_charges")), _to_decimal(payload.get("gross_pnl")))
+        streak = streaks([item.net_pnl for item in rows]) if rows else {"wins": 0, "losses": 0}
+        payload["max_win_streak"] = int(streak.get("wins") or 0)
+        payload["max_loss_streak"] = int(streak.get("losses") or 0)
+        return AnalyticsMetrics.model_validate(payload)
+
+    def _unknown_strategy_ref(self, key: str = "unknown_strategy") -> JournalV2StrategyRef:
+        normalized = str(key or "unknown_strategy")
+        return JournalV2StrategyRef(
+            template_id=normalized,
+            strategy_family="unknown_strategy",
+            template_key=normalized,
+            display_name="Unknown strategy",
+        )
+
+    def _episode_matches_date_range(self, episode: Any, from_date: date | None, to_date: date | None) -> bool:
+        if from_date is None and to_date is None:
+            return True
+        start_at = getattr(episode, "opened_at", None)
+        end_at = getattr(episode, "closed_at", None) or start_at
+        if start_at is None or end_at is None:
+            return False
+        start_day = start_at.astimezone(IST).date()
+        end_day = end_at.astimezone(IST).date()
+        if from_date is not None and end_day < from_date:
+            return False
+        if to_date is not None and start_day > to_date:
+            return False
+        return True
+
+    def _strategy_matches_filter(self, strategy_ref: JournalV2StrategyRef | None, strategy_filter: str | None) -> bool:
+        if not strategy_filter:
+            return True
+        normalized = str(strategy_filter or "").strip().lower()
+        if not normalized:
+            return True
+        candidates = [
+            str(strategy_ref.template_id).lower() if strategy_ref else "",
+            str(strategy_ref.template_key or "").lower() if strategy_ref else "",
+            str(strategy_ref.display_name or "").lower() if strategy_ref else "",
+        ]
+        return normalized in {item for item in candidates if item}
+
+    def _closed_episode_date(self, episode: Any) -> date | None:
+        closed_at = getattr(episode, "closed_at", None)
+        if closed_at is None:
+            return None
+        return closed_at.astimezone(IST).date()
+
+    def _bucket_start_for_date(self, value: date, granularity: str) -> date:
+        if granularity == "day":
+            return value
+        if granularity == "week":
+            return value - timedelta(days=value.weekday())
+        if granularity == "month":
+            return value.replace(day=1)
+        raise ValueError("granularity must be one of: day, week, month")
+
+    def _bucket_end_for_start(self, bucket_start: date, granularity: str) -> date:
+        if granularity == "day":
+            return bucket_start
+        if granularity == "week":
+            return bucket_start + timedelta(days=6)
+        if granularity == "month":
+            return bucket_start.replace(day=monthrange(bucket_start.year, bucket_start.month)[1])
+        raise ValueError("granularity must be one of: day, week, month")
+
+    def _next_bucket_start(self, bucket_start: date, granularity: str) -> date:
+        if granularity == "day":
+            return bucket_start + timedelta(days=1)
+        if granularity == "week":
+            return bucket_start + timedelta(days=7)
+        if granularity == "month":
+            if bucket_start.month == 12:
+                return date(bucket_start.year + 1, 1, 1)
+            return date(bucket_start.year, bucket_start.month + 1, 1)
+        raise ValueError("granularity must be one of: day, week, month")
+
+    def _bucket_label(self, bucket_start: date, granularity: str) -> str:
+        if granularity == "month":
+            return bucket_start.strftime("%Y-%m")
+        return bucket_start.isoformat()
+
     def list_v2_episodes(
         self,
         *,
         environment_id: str,
         execution_context_id: str | None = None,
         status: str | None = None,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        strategy: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        normalized_environment_id = _require_uuid("environment_id", environment_id)
+        normalized_environment_id, _environment = self._require_v2_environment(environment_id)
         normalized_context_id = None
         if execution_context_id is not None:
             normalized_context_id = _require_uuid("execution_context_id", execution_context_id)
@@ -280,10 +585,63 @@ class JournalService:
             limit=limit,
             offset=offset,
         )
-        return [_serialize_decimal(item.model_dump(mode="python")) for item in episodes]
+        items: list[dict[str, Any]] = []
+        for episode in episodes:
+            if not self._episode_matches_date_range(episode, from_date, to_date):
+                continue
+            context = self.repository.get_execution_context(str(episode.execution_context_id))
+            strategy_ref = self._to_strategy_ref(context)
+            if not self._strategy_matches_filter(strategy_ref, strategy):
+                continue
+            facts = self.repository.list_execution_facts_for_episode(str(episode.id))
+            legs = self._build_leg_views(facts)
+            card = JournalV2EpisodeCard(
+                episode_id=str(episode.id),
+                status=str(getattr(episode.status, "value", episode.status)),
+                opened_at=episode.opened_at,
+                closed_at=episode.closed_at,
+                strategy=strategy_ref,
+                direction=self._derive_episode_direction(legs),
+                outcome=build_episode_outcome(episode=episode, facts=facts),
+                fill_count=len(facts),
+                leg_count=len(legs),
+                notes=str(getattr(episode, "notes", "") or ""),
+            )
+            items.append(_serialize_decimal(card.model_dump(mode="python")))
+        return items
 
-    def get_v2_episode_detail(self, episode_id: str, *, environment_id: str) -> Dict[str, Any] | None:
-        normalized_environment_id = _require_uuid("environment_id", environment_id)
+    def _build_v2_episode_detail_response(self, episode: Any, environment: Any) -> JournalV2EpisodeDetailResponse:
+        context = self.repository.get_execution_context(str(episode.execution_context_id))
+        strategy_ref = self._to_strategy_ref(context)
+        facts = self.repository.list_execution_facts_for_episode(str(episode.id))
+        legs = self._build_leg_views(facts)
+        fills = [self._to_fill_view(fact) for fact in facts]
+        timeline = [
+            self._to_timeline_view(event)
+            for event in self.repository.list_timeline_events(environment_id=str(environment.id), episode_id=str(episode.id), limit=500)
+        ]
+        return JournalV2EpisodeDetailResponse(
+            environment=self._to_environment_ref(environment),
+            episode=JournalV2EpisodeCard(
+                episode_id=str(episode.id),
+                status=str(getattr(episode.status, "value", episode.status)),
+                opened_at=episode.opened_at,
+                closed_at=episode.closed_at,
+                strategy=strategy_ref,
+                direction=self._derive_episode_direction(legs),
+                outcome=build_episode_outcome(episode=episode, facts=facts),
+                fill_count=len(fills),
+                leg_count=len(legs),
+                notes=str(getattr(episode, "notes", "") or ""),
+            ),
+            legs=legs,
+            fills=fills,
+            timeline=timeline,
+            notes=str(getattr(episode, "notes", "") or ""),
+        )
+
+    def get_v2_episode_detail(self, episode_id: str, *, environment_id: str) -> JournalV2EpisodeDetailResponse | None:
+        normalized_environment_id, environment = self._require_v2_environment(environment_id)
         normalized_episode_id = str(episode_id or "").strip()
         if not _looks_like_uuid(normalized_episode_id):
             raise ValueError("episode_id must be a valid UUID")
@@ -292,7 +650,236 @@ class JournalService:
             return None
         if str(episode.environment_id) != normalized_environment_id:
             raise ValueError("episode_id does not belong to environment_id")
-        return _serialize_decimal(episode.model_dump(mode="python"))
+        return self._build_v2_episode_detail_response(episode, environment)
+
+    def get_v2_daily(self, *, environment_id: str, trading_date: date | None = None) -> JournalV2DailyResponse:
+        normalized_environment_id, environment = self._require_v2_environment(environment_id)
+        resolved_trading_date = trading_date or self._current_ist_date()
+        day_start_utc, day_end_utc = day_bounds_utc(resolved_trading_date)
+        episodes = self.repository.list_episodes(environment_id=normalized_environment_id, limit=5000)
+        closed_episodes = [
+            episode
+            for episode in episodes
+            if episode.closed_at is not None and day_start_utc <= episode.closed_at < day_end_utc
+        ]
+        open_episodes = [
+            episode
+            for episode in episodes
+            if episode.opened_at < day_end_utc and (episode.closed_at is None or episode.closed_at >= day_end_utc)
+        ]
+        episode_ids = [str(episode.id) for episode in [*closed_episodes, *open_episodes] if getattr(episode, "id", None) is not None]
+        facts_by_episode = self.repository.list_execution_facts_for_episodes(episode_ids)
+        context_cache: dict[str, Any | None] = {}
+
+        def _context_for(episode: Any) -> Any | None:
+            context_id = str(getattr(episode, "execution_context_id", "") or "")
+            if not context_id:
+                return None
+            if context_id not in context_cache:
+                context_cache[context_id] = self.repository.get_execution_context(context_id)
+            return context_cache[context_id]
+
+        grouped_cards: dict[str, list[JournalV2EpisodeCard]] = defaultdict(list)
+        grouped_outcomes: dict[str, list[EpisodeOutcome]] = defaultdict(list)
+        strategy_refs: dict[str, JournalV2StrategyRef] = {}
+        notes_count = 0
+
+        for episode in closed_episodes:
+            context = _context_for(episode)
+            strategy_ref = self._to_strategy_ref(context)
+            facts = facts_by_episode.get(str(episode.id), [])
+            legs = self._build_leg_views(facts)
+            outcome = build_episode_outcome(episode=episode, facts=facts)
+            key = str(strategy_ref.template_id if strategy_ref else f"unmapped:{episode.execution_context_id}")
+            if strategy_ref is not None:
+                strategy_refs[key] = strategy_ref
+            grouped_outcomes[key].append(outcome)
+            grouped_cards[key].append(
+                JournalV2EpisodeCard(
+                    episode_id=str(episode.id),
+                    status=str(getattr(episode.status, "value", episode.status)),
+                    opened_at=episode.opened_at,
+                    closed_at=episode.closed_at,
+                    strategy=strategy_ref,
+                    direction=self._derive_episode_direction(legs),
+                    outcome=outcome,
+                    fill_count=len(facts),
+                    leg_count=len(legs),
+                    notes=str(getattr(episode, "notes", "") or ""),
+                )
+            )
+            if str(getattr(episode, "notes", "") or "").strip():
+                notes_count += 1
+
+        strategy_groups: list[JournalV2StrategyGroup] = []
+        for key, cards in grouped_cards.items():
+            strategy_groups.append(
+                JournalV2StrategyGroup(
+                    strategy=strategy_refs.get(key) or self._unknown_strategy_ref(key),
+                    metrics=self._analytics_metrics(grouped_outcomes[key]),
+                    episodes=cards,
+                )
+            )
+
+        open_episode_cards: list[JournalV2OpenEpisodeCard] = []
+        for episode in open_episodes:
+            context = _context_for(episode)
+            strategy_ref = self._to_strategy_ref(context)
+            facts = facts_by_episode.get(str(episode.id), [])
+            legs = self._build_leg_views(facts)
+            open_episode_cards.append(
+                JournalV2OpenEpisodeCard(
+                    episode_id=str(episode.id),
+                    status=str(getattr(episode.status, "value", episode.status)),
+                    opened_at=episode.opened_at,
+                    strategy=strategy_ref,
+                    direction=self._derive_episode_direction(legs),
+                    fill_count=len(facts),
+                    leg_count=len(legs),
+                    current_pnl_estimate=None,
+                    notes=str(getattr(episode, "notes", "") or ""),
+                )
+            )
+            if str(getattr(episode, "notes", "") or "").strip():
+                notes_count += 1
+
+        all_closed_outcomes = [outcome for values in grouped_outcomes.values() for outcome in values]
+        return JournalV2DailyResponse(
+            environment=self._to_environment_ref(environment),
+            trading_date=resolved_trading_date,
+            summary=JournalV2DailySummary(
+                trading_date=resolved_trading_date,
+                metrics=self._analytics_metrics(all_closed_outcomes),
+                closed_episode_count=len(closed_episodes),
+                open_episode_count=len(open_episodes),
+                strategy_count=len(strategy_groups),
+                notes_count=notes_count,
+            ),
+            strategy_groups=strategy_groups,
+            open_episodes=open_episode_cards,
+        )
+
+    def get_v2_period(
+        self,
+        *,
+        environment_id: str,
+        from_date: date,
+        to_date: date,
+        granularity: str = "day",
+    ) -> JournalV2PeriodResponse:
+        normalized_environment_id, environment = self._require_v2_environment(environment_id)
+        normalized_granularity = str(granularity or "day").strip().lower()
+        if normalized_granularity not in {"day", "week", "month"}:
+            raise ValueError("granularity must be one of: day, week, month")
+        if to_date < from_date:
+            raise ValueError("to_date must be on or after from_date")
+        start_at, _ = day_bounds_utc(from_date)
+        _, end_at = day_bounds_utc(to_date)
+        filtered = [
+            episode
+            for episode in self.repository.list_closed_episodes(environment_id=normalized_environment_id, limit=5000)
+            if episode.closed_at is not None and start_at <= episode.closed_at < end_at
+        ]
+        episode_ids = [str(episode.id) for episode in filtered if getattr(episode, "id", None) is not None]
+        facts_by_episode = self.repository.list_execution_facts_for_episodes(episode_ids)
+        context_cache: dict[str, Any | None] = {}
+
+        def _context_for(episode: Any) -> Any | None:
+            context_id = str(getattr(episode, "execution_context_id", "") or "")
+            if not context_id:
+                return None
+            if context_id not in context_cache:
+                context_cache[context_id] = self.repository.get_execution_context(context_id)
+            return context_cache[context_id]
+
+        grouped_buckets: dict[date, list[EpisodeOutcome]] = defaultdict(list)
+        grouped_strategies: dict[str, dict[str, Any]] = {}
+        overall_outcomes: list[EpisodeOutcome] = []
+        for episode in filtered:
+            facts = facts_by_episode.get(str(episode.id), [])
+            outcome = build_episode_outcome(episode=episode, facts=facts)
+            overall_outcomes.append(outcome)
+            closed_day = self._closed_episode_date(episode)
+            if closed_day is None:
+                continue
+            bucket_start = self._bucket_start_for_date(closed_day, normalized_granularity)
+            grouped_buckets[bucket_start].append(outcome)
+            context = _context_for(episode)
+            strategy_ref = self._to_strategy_ref(context)
+            key = str(strategy_ref.template_id if strategy_ref else f"unmapped:{episode.execution_context_id}")
+            if key not in grouped_strategies:
+                grouped_strategies[key] = {
+                    "strategy": strategy_ref or self._unknown_strategy_ref(key),
+                    "outcomes": [],
+                }
+            grouped_strategies[key]["outcomes"].append(outcome)
+
+        buckets: list[JournalV2PeriodBucket] = []
+        cursor = self._bucket_start_for_date(from_date, normalized_granularity)
+        while cursor <= to_date:
+            buckets.append(
+                JournalV2PeriodBucket(
+                    bucket_start=cursor,
+                    bucket_end=min(self._bucket_end_for_start(cursor, normalized_granularity), to_date),
+                    label=self._bucket_label(cursor, normalized_granularity),
+                    metrics=self._analytics_metrics(grouped_buckets.get(cursor, [])),
+                    closed_episode_count=len(grouped_buckets.get(cursor, [])),
+                )
+            )
+            cursor = self._next_bucket_start(cursor, normalized_granularity)
+
+        strategies = [
+            JournalV2StrategySummaryItem(
+                strategy=value["strategy"],
+                metrics=self._analytics_metrics(value["outcomes"]),
+                episode_count=len(value["outcomes"]),
+            )
+            for value in grouped_strategies.values()
+        ]
+        strategies.sort(key=lambda item: (item.metrics.net_pnl, item.episode_count), reverse=True)
+
+        return JournalV2PeriodResponse(
+            environment=self._to_environment_ref(environment),
+            from_date=from_date,
+            to_date=to_date,
+            granularity=normalized_granularity,
+            summary=self._analytics_metrics(overall_outcomes),
+            buckets=buckets,
+            strategies=strategies,
+        )
+
+    def patch_v2_episode_notes(
+        self,
+        episode_id: str,
+        *,
+        environment_id: str,
+        notes: str,
+    ) -> JournalV2EpisodeDetailResponse:
+        normalized_environment_id, _environment = self._require_v2_environment(environment_id)
+        normalized_episode_id = _require_uuid("episode_id", episode_id)
+        updated = self.repository.update_episode_notes(
+            episode_id=normalized_episode_id,
+            environment_id=normalized_environment_id,
+            notes=str(notes or ""),
+        )
+        if not updated:
+            raise LookupError(f"Unknown episode_id: {normalized_episode_id}")
+        episode = self.repository.get_episode_detail(normalized_episode_id)
+        if episode is not None:
+            self._append_timeline_event_best_effort(
+                environment_id=normalized_environment_id,
+                execution_context_id=str(getattr(episode, "execution_context_id", "") or "") or None,
+                episode_id=normalized_episode_id,
+                subject_type="episode",
+                subject_id=normalized_episode_id,
+                channel="notes",
+                event_type="notes_updated",
+                payload={"notes_length": len(str(notes or ""))},
+            )
+        detail = self.get_v2_episode_detail(normalized_episode_id, environment_id=normalized_environment_id)
+        if detail is None:
+            raise LookupError(f"Unknown episode_id: {normalized_episode_id}")
+        return detail
 
     def list_v2_timeline(
         self,
@@ -489,35 +1076,87 @@ class JournalService:
         )
         return intent_id
 
-    def list_v2_strategies(self, *, environment_id: str) -> Dict[str, Any]:
-        environment_id = _require_uuid("environment_id", environment_id)
-        environment = self.repository.get_execution_environment(environment_id)
-        if environment is None:
-            raise LookupError(f"Unknown environment_id: {environment_id}")
+    def list_v2_strategies(
+        self,
+        *,
+        environment_id: str,
+        period: str = "since_inception",
+        anchor_date: date | None = None,
+    ) -> JournalV2StrategyListResponse:
+        normalized_environment_id, environment = self._require_v2_environment(environment_id)
+        normalized_period = MetricPeriod(str(getattr(period, "value", period) or "since_inception").strip().lower())
+        resolved_anchor = anchor_date
+        if normalized_period != MetricPeriod.SINCE_INCEPTION and resolved_anchor is None:
+            resolved_anchor = self._current_ist_date()
+        _from_date, _to_date, start_at, end_at = period_bounds_utc(normalized_period.value, resolved_anchor)
 
-        items: List[Dict[str, Any]] = []
-        for template in self.repository.list_strategy_templates_for_environment(environment_id=environment_id):
-            template_id = str(template.get("template_id") or "")
-            if not template_id:
+        grouped: dict[str, dict[str, Any]] = {}
+        for episode in self.repository.list_closed_episodes(environment_id=normalized_environment_id, limit=5000):
+            if start_at is not None and (episode.closed_at is None or episode.closed_at < start_at):
                 continue
-            items.append(
-                _serialize_decimal(
-                    {
-                        "template_id": template_id,
-                        "strategy_family": template.get("strategy_family") or "unknown_strategy",
-                        "template_key": template.get("template_key") or template_id,
-                        "display_name": template.get("display_name") or template.get("template_key") or template_id,
-                        "deployment_count": 0,
-                        "deployments": [],
-                    }
-                )
-            )
+            if end_at is not None and (episode.closed_at is None or episode.closed_at >= end_at):
+                continue
+            context = self.repository.get_execution_context(str(episode.execution_context_id))
+            strategy_ref = self._to_strategy_ref(context)
+            key = str(strategy_ref.template_id if strategy_ref else f"unmapped:{episode.execution_context_id}")
+            if key not in grouped:
+                grouped[key] = {
+                    "strategy": strategy_ref or JournalV2StrategyRef(template_id=key, strategy_family="unknown_strategy", template_key=key, display_name=key),
+                    "outcomes": [],
+                }
+            grouped[key]["outcomes"].append(build_episode_outcome(episode=episode, facts=self.repository.list_execution_facts_for_episode(str(episode.id))))
 
-        return {
-            "environment_id": environment_id,
-            "items": items,
-            "count": len(items),
-        }
+        items = [
+            JournalV2StrategySummaryItem(
+                strategy=value["strategy"],
+                metrics=self._analytics_metrics(value["outcomes"]),
+                episode_count=len(value["outcomes"]),
+            )
+            for value in grouped.values()
+        ]
+        items.sort(key=lambda item: (item.metrics.net_pnl, item.episode_count), reverse=True)
+        return JournalV2StrategyListResponse(
+            environment=self._to_environment_ref(environment),
+            period=normalized_period,
+            anchor_date=resolved_anchor if normalized_period != MetricPeriod.SINCE_INCEPTION else None,
+            items=items,
+        )
+
+    def patch_v2_episode_notes(
+        self,
+        episode_id: str,
+        *,
+        environment_id: str,
+        notes: str,
+    ) -> JournalV2EpisodeDetailResponse:
+        normalized_environment_id, environment = self._require_v2_environment(environment_id)
+        normalized_episode_id = _require_uuid("episode_id", episode_id)
+        episode = self.repository.get_episode_detail(normalized_episode_id)
+        if episode is None:
+            raise LookupError(f"Unknown episode_id: {normalized_episode_id}")
+        if str(episode.environment_id) != normalized_environment_id:
+            raise ValueError("episode_id does not belong to environment_id")
+        updated = self.repository.update_episode_notes(
+            episode_id=normalized_episode_id,
+            environment_id=normalized_environment_id,
+            notes=str(notes or ""),
+        )
+        if not updated:
+            raise LookupError(f"Unknown episode_id: {normalized_episode_id}")
+        self._append_timeline_event_best_effort(
+            environment_id=normalized_environment_id,
+            execution_context_id=str(episode.execution_context_id),
+            episode_id=normalized_episode_id,
+            subject_type="episode",
+            subject_id=normalized_episode_id,
+            channel="notes",
+            event_type="notes_updated",
+            payload={"notes": str(notes or "")},
+        )
+        refreshed = self.repository.get_episode_detail(normalized_episode_id)
+        if refreshed is None:
+            raise LookupError(f"Unknown episode_id: {normalized_episode_id}")
+        return self._build_v2_episode_detail_response(refreshed, environment)
 
     def list_v2_unresolved(self, *, environment_id: str) -> Dict[str, Any]:
         environment_id = _require_uuid("environment_id", environment_id)
@@ -2181,6 +2820,7 @@ class JournalService:
         fees_amount: Any = ZERO,
         taxes_amount: Any = ZERO,
         slippage_amount: Any = ZERO,
+        cost_contract: ExecutionCostContract | dict[str, Any] | None = None,
         run_id: str | None = None,
         order_id: str | None = None,
         trade_id: str | None = None,
@@ -2230,6 +2870,19 @@ class JournalService:
                 }
         attribution_payload = dict(attribution or {})
         fill_payload = dict(payload or {})
+        normalized_cost_contract = _normalize_cost_contract(cost_contract)
+        if normalized_cost_contract is not None:
+            fees_value = normalized_cost_contract.brokerage + normalized_cost_contract.exchange_txn_charge
+            taxes_value = (
+                normalized_cost_contract.stt
+                + normalized_cost_contract.stamp_duty
+                + normalized_cost_contract.sebi_charge
+                + normalized_cost_contract.gst
+            )
+            fill_payload["cost_contract"] = normalized_cost_contract.model_dump(mode="json")
+        else:
+            fees_value = _to_decimal(fees_amount)
+            taxes_value = _to_decimal(taxes_amount)
         environment_id, execution_context_id, template_id, variant_id, deployment_id = self._ensure_v2_execution_context(
             mode=mode,
             account_scope=account_scope,
@@ -2305,9 +2958,17 @@ class JournalService:
                 quantity=int(quantity),
                 price=_to_decimal(price),
                 gross_cash_flow=_to_decimal(gross_cash_flow),
-                fees_amount=_to_decimal(fees_amount),
-                taxes_amount=_to_decimal(taxes_amount),
+                fees_amount=fees_value,
+                taxes_amount=taxes_value,
                 slippage_amount=_to_decimal(slippage_amount),
+                brokerage=(normalized_cost_contract.brokerage if normalized_cost_contract is not None else None),
+                exchange_txn_charge=(normalized_cost_contract.exchange_txn_charge if normalized_cost_contract is not None else None),
+                stt=(normalized_cost_contract.stt if normalized_cost_contract is not None else None),
+                stamp_duty=(normalized_cost_contract.stamp_duty if normalized_cost_contract is not None else None),
+                sebi_charge=(normalized_cost_contract.sebi_charge if normalized_cost_contract is not None else None),
+                gst=(normalized_cost_contract.gst if normalized_cost_contract is not None else None),
+                margin_required=(normalized_cost_contract.margin_required if normalized_cost_contract is not None else None),
+                charges_status=(str(normalized_cost_contract.charges_status.value) if normalized_cost_contract is not None else None),
                 position_effect=position_effect,
                 payload={
                     **fill_payload,

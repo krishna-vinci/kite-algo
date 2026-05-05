@@ -5,7 +5,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _utcnow() -> datetime:
@@ -160,6 +160,309 @@ class JournalBaseModel(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
 
 
+class CostBreakdown(JournalBaseModel):
+    brokerage: Decimal = Decimal("0")
+    exchange_txn_charge: Decimal = Decimal("0")
+    stt: Decimal = Decimal("0")
+    stamp_duty: Decimal = Decimal("0")
+    sebi_charge: Decimal = Decimal("0")
+    gst: Decimal = Decimal("0")
+    total_taxes: Decimal = Decimal("0")
+    total_charges: Decimal = Decimal("0")
+
+    @model_validator(mode="after")
+    def derive_totals(self) -> "CostBreakdown":
+        derived_taxes = self.stt + self.stamp_duty + self.sebi_charge + self.gst
+        derived_total = self.brokerage + self.exchange_txn_charge + derived_taxes
+        if self.total_taxes == Decimal("0"):
+            self.total_taxes = derived_taxes
+        if self.total_charges == Decimal("0"):
+            self.total_charges = derived_total
+        return self
+
+
+class MetricPeriod(str, Enum):
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+    YEAR = "year"
+    SINCE_INCEPTION = "since_inception"
+
+
+class EpisodeOutcome(JournalBaseModel):
+    episode_id: str
+    gross_pnl: Decimal = Decimal("0")
+    net_pnl: Decimal = Decimal("0")
+    total_charges: Decimal = Decimal("0")
+    realized_pnl: Decimal = Decimal("0")
+    hold_seconds: int = 0
+    cost_breakdown: CostBreakdown = Field(default_factory=CostBreakdown)
+
+
+class AnalyticsMetrics(JournalBaseModel):
+    gross_pnl: Decimal = Decimal("0")
+    net_pnl: Decimal = Decimal("0")
+    total_charges: Decimal = Decimal("0")
+    realized_pnl: Decimal = Decimal("0")
+    cost_breakdown: CostBreakdown = Field(default_factory=CostBreakdown)
+    cost_ratio: Optional[Decimal] = None
+    closed_episode_count: int = 0
+    hold_seconds_total: int = 0
+    hold_seconds_avg: Optional[int] = None
+    win_count: int = 0
+    loss_count: int = 0
+    win_rate: Optional[Decimal] = None
+    average_win: Optional[Decimal] = None
+    average_loss: Optional[Decimal] = None
+    expectancy: Optional[Decimal] = None
+    profit_factor: Optional[Decimal] = None
+    sharpe_ratio: Optional[Decimal] = None
+    sortino_ratio: Optional[Decimal] = None
+    max_drawdown: Optional[Decimal] = None
+    max_drawdown_duration_days: Optional[int] = None
+    cumulative_return: Optional[Decimal] = None
+    max_win_streak: int = 0
+    max_loss_streak: int = 0
+    mae: Optional[Decimal] = None
+    mfe: Optional[Decimal] = None
+    r_multiple: Optional[Decimal] = None
+
+
+class JournalEnvironmentRef(JournalBaseModel):
+    environment_id: str
+    mode: JournalEnvironmentMode
+    account_scope: str
+    display_name: Optional[str] = None
+    broker_user_id: Optional[str] = None
+    paper_account_key: Optional[str] = None
+
+
+class JournalV2StrategyRef(JournalBaseModel):
+    template_id: str
+    strategy_family: str
+    template_key: Optional[str] = None
+    display_name: Optional[str] = None
+
+
+class JournalV2EpisodeLegView(JournalBaseModel):
+    leg_id: Optional[int] = None
+    leg_seq: int = 1
+    instrument_token: Optional[int] = None
+    exchange: Optional[str] = None
+    tradingsymbol: Optional[str] = None
+    product: Optional[str] = None
+    direction: Optional[JournalEpisodeLegDirection] = None
+    opened_quantity: int = 0
+    closed_quantity: int = 0
+    net_quantity: int = 0
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class JournalV2ExecutionFillView(JournalBaseModel):
+    fact_id: Optional[int] = None
+    leg_id: Optional[int] = None
+    source_type: SourceType
+    source_fact_key: str
+    order_id: Optional[str] = None
+    trade_id: Optional[str] = None
+    fill_timestamp: datetime = Field(default_factory=_utcnow)
+    side: str
+    quantity: int
+    price: Decimal
+    gross_cash_flow: Optional[Decimal] = None
+    fees_amount: Decimal = Decimal("0")
+    taxes_amount: Decimal = Decimal("0")
+    slippage_amount: Decimal = Decimal("0")
+    brokerage: Optional[Decimal] = None
+    exchange_txn_charge: Optional[Decimal] = None
+    stt: Optional[Decimal] = None
+    stamp_duty: Optional[Decimal] = None
+    sebi_charge: Optional[Decimal] = None
+    gst: Optional[Decimal] = None
+    margin_required: Optional[Decimal] = None
+    charges_status: Optional[str] = None
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class JournalV2TimelineEventView(JournalBaseModel):
+    event_id: Optional[str] = None
+    subject_type: str
+    subject_id: str
+    channel: Optional[str] = None
+    event_type: str
+    actor_type: JournalTimelineActorType = JournalTimelineActorType.SYSTEM
+    correlation_id: Optional[str] = None
+    causation_id: Optional[str] = None
+    occurred_at: datetime = Field(default_factory=_utcnow)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class JournalV2EpisodeCard(JournalBaseModel):
+    episode_id: str
+    status: JournalEpisodeStatus
+    opened_at: datetime
+    closed_at: Optional[datetime] = None
+    strategy: Optional[JournalV2StrategyRef] = None
+    direction: Optional[JournalEpisodeLegDirection] = None
+    outcome: EpisodeOutcome = Field(default_factory=lambda: EpisodeOutcome(episode_id=""))
+    fill_count: int = 0
+    leg_count: int = 0
+    notes: str = ""
+
+
+class JournalV2StrategyGroup(JournalBaseModel):
+    strategy: JournalV2StrategyRef
+    metrics: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+    episodes: list[JournalV2EpisodeCard] = Field(default_factory=list)
+
+
+class JournalV2OpenEpisodeCard(JournalBaseModel):
+    episode_id: str
+    status: JournalEpisodeStatus
+    opened_at: datetime
+    strategy: Optional[JournalV2StrategyRef] = None
+    direction: Optional[JournalEpisodeLegDirection] = None
+    fill_count: int = 0
+    leg_count: int = 0
+    current_pnl_estimate: Optional[Decimal] = None
+    notes: str = ""
+
+
+class JournalV2DailySummary(JournalBaseModel):
+    trading_date: date
+    metrics: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+    closed_episode_count: int = 0
+    open_episode_count: int = 0
+    strategy_count: int = 0
+    notes_count: int = 0
+
+
+class JournalV2DailyResponse(JournalBaseModel):
+    environment: JournalEnvironmentRef
+    trading_date: date
+    summary: JournalV2DailySummary
+    strategy_groups: list[JournalV2StrategyGroup] = Field(default_factory=list)
+    open_episodes: list[JournalV2OpenEpisodeCard] = Field(default_factory=list)
+
+
+class JournalV2PeriodBucket(JournalBaseModel):
+    bucket_start: date
+    bucket_end: date
+    label: str
+    metrics: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+    closed_episode_count: int = 0
+
+
+class JournalV2StrategySummaryItem(JournalBaseModel):
+    strategy: JournalV2StrategyRef
+    metrics: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+    episode_count: int = 0
+
+
+class JournalV2PeriodResponse(JournalBaseModel):
+    environment: JournalEnvironmentRef
+    from_date: date
+    to_date: date
+    granularity: str
+    summary: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+    buckets: list[JournalV2PeriodBucket] = Field(default_factory=list)
+    strategies: list[JournalV2StrategySummaryItem] = Field(default_factory=list)
+
+
+class JournalV2EpisodeDetailResponse(JournalBaseModel):
+    environment: JournalEnvironmentRef
+    episode: JournalV2EpisodeCard
+    legs: list[JournalV2EpisodeLegView] = Field(default_factory=list)
+    fills: list[JournalV2ExecutionFillView] = Field(default_factory=list)
+    timeline: list[JournalV2TimelineEventView] = Field(default_factory=list)
+    notes: str = ""
+
+
+class JournalV2StrategyListResponse(JournalBaseModel):
+    environment: JournalEnvironmentRef
+    period: MetricPeriod
+    anchor_date: Optional[date] = None
+    items: list[JournalV2StrategySummaryItem] = Field(default_factory=list)
+
+
+class AnalyticsStrategySummaryItem(JournalBaseModel):
+    strategy: JournalV2StrategyRef
+    metrics: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+
+
+class AnalyticsSummaryResponse(JournalBaseModel):
+    environment: JournalEnvironmentRef
+    period: MetricPeriod
+    anchor_date: Optional[date] = None
+    metrics: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+    strategies: list[AnalyticsStrategySummaryItem] = Field(default_factory=list)
+
+
+class EquityCurvePointResponse(JournalBaseModel):
+    trading_date: date
+    realized_pnl: Decimal = Decimal("0")
+    total_charges: Decimal = Decimal("0")
+    ending_equity: Optional[Decimal] = None
+    starting_equity: Optional[Decimal] = None
+    return_pct: Optional[Decimal] = None
+    benchmark_return_pct: Optional[Decimal] = None
+    excess_return_pct: Optional[Decimal] = None
+
+
+class EquityCurveResponse(JournalBaseModel):
+    environment: JournalEnvironmentRef
+    period: MetricPeriod
+    anchor_date: Optional[date] = None
+    template_id: Optional[str] = None
+    metrics: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+    points: list[EquityCurvePointResponse] = Field(default_factory=list)
+
+
+class StrategyDeepDiveResponse(JournalBaseModel):
+    environment: JournalEnvironmentRef
+    period: MetricPeriod
+    anchor_date: Optional[date] = None
+    strategy: JournalV2StrategyRef
+    metrics: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+    equity_curve: list[EquityCurvePointResponse] = Field(default_factory=list)
+
+
+class StrategyCostAnalysisItem(JournalBaseModel):
+    strategy: JournalV2StrategyRef
+    cost_breakdown: CostBreakdown = Field(default_factory=CostBreakdown)
+    total_charges: Decimal = Decimal("0")
+    cost_ratio: Optional[Decimal] = None
+    closed_episode_count: int = 0
+
+
+class CostAnalysisResponse(JournalBaseModel):
+    environment: JournalEnvironmentRef
+    period: MetricPeriod
+    anchor_date: Optional[date] = None
+    metrics: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+    cost_breakdown: CostBreakdown = Field(default_factory=CostBreakdown)
+    strategies: list[StrategyCostAnalysisItem] = Field(default_factory=list)
+
+
+class ComparisonMetricDelta(JournalBaseModel):
+    paper: Optional[Decimal] = None
+    live: Optional[Decimal] = None
+    delta: Optional[Decimal] = None
+    deviation_pct: Optional[Decimal] = None
+
+
+class PaperLiveComparisonResponse(JournalBaseModel):
+    template_id: str
+    period: MetricPeriod = MetricPeriod.SINCE_INCEPTION
+    anchor_date: Optional[date] = None
+    paper_environment: Optional[JournalEnvironmentRef] = None
+    live_environment: Optional[JournalEnvironmentRef] = None
+    paper: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+    live: AnalyticsMetrics = Field(default_factory=AnalyticsMetrics)
+    delta: Dict[str, ComparisonMetricDelta] = Field(default_factory=dict)
+    combined: Optional[Dict[str, Any]] = None
+
+
 class JournalExecutionEnvironment(JournalBaseModel):
     id: Optional[str] = None
     mode: JournalEnvironmentMode
@@ -258,6 +561,7 @@ class JournalEpisode(JournalBaseModel):
     status: JournalEpisodeStatus = JournalEpisodeStatus.DRAFT
     opened_at: datetime = Field(default_factory=_utcnow)
     closed_at: Optional[datetime] = None
+    notes: str = ""
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
@@ -487,6 +791,14 @@ class JournalExecutionFact(JournalBaseModel):
     fees_amount: Decimal = Decimal("0")
     taxes_amount: Decimal = Decimal("0")
     slippage_amount: Decimal = Decimal("0")
+    brokerage: Optional[Decimal] = None
+    exchange_txn_charge: Optional[Decimal] = None
+    stt: Optional[Decimal] = None
+    stamp_duty: Optional[Decimal] = None
+    sebi_charge: Optional[Decimal] = None
+    gst: Optional[Decimal] = None
+    margin_required: Optional[Decimal] = None
+    charges_status: Optional[str] = None
     position_effect: Optional[str] = None
     payload: Dict[str, Any] = Field(default_factory=dict)
 
