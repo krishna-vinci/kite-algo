@@ -2,7 +2,6 @@
 
 import { EnvironmentSelector } from "@/components/journal/environment-selector";
 import { JournalHeader } from "@/components/journal/journal-header";
-import { JournalNav } from "@/components/journal/journal-nav";
 import { useJournalWorkspace } from "@/components/journal/journal-workspace-provider";
 import type { AnalysisPeriod } from "@/lib/journal/types";
 
@@ -19,7 +18,6 @@ export function JournalWorkspaceHeader({ period, setPeriod }: JournalWorkspaceHe
   return (
     <div className="space-y-4">
       <JournalHeader period={period} onPeriodChange={setPeriod} showPeriodSelector={false} />
-      <JournalNav />
       <div className="flex flex-wrap items-center gap-2" role="tablist" aria-label="Journal modes">
         {(["live", "paper"] as const).map((mode) => {
           const active = selectedMode === mode;

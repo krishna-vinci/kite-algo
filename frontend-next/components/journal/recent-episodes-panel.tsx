@@ -1,4 +1,4 @@
-import { JournalPageLink } from "@/components/journal/journal-page-link";
+import Link from "next/link";
 import { Panel } from "@/components/operator/panel";
 import { StatusBadge } from "@/components/operator/status-badge";
 import type { JournalEpisode } from "@/lib/journal/types";
@@ -21,7 +21,7 @@ export function RecentEpisodesPanel({
       {!loading && !error && episodes.length === 0 ? <p className="text-sm text-foreground/60">No episodes found for this environment.</p> : null}
       <div className="space-y-3">
         {episodes.map((episode) => (
-          <JournalPageLink key={episode.id} href={`/journal/episodes/${episode.id}`} className="block rounded-2xl border border-border/70 bg-background/35 p-4 hover:border-primary/30">
+          <Link key={episode.id} href={`/journal/episodes/${episode.id}`} className="block rounded-2xl border border-border/70 bg-background/35 p-4 hover:border-primary/30">
             <div className="flex items-start justify-between gap-3">
               <div>
                 <p className="text-sm font-semibold text-foreground">Episode #{episode.episode_seq}</p>
@@ -33,7 +33,7 @@ export function RecentEpisodesPanel({
               <span>Opened: {formatDateTime(episode.opened_at)}</span>
               <span>Closed: {formatDateTime(episode.closed_at)}</span>
             </div>
-          </JournalPageLink>
+          </Link>
         ))}
       </div>
     </Panel>

@@ -1,6 +1,7 @@
 import Link from "next/link";
 import {
   Activity,
+  BarChart2,
   BookOpen,
   LayoutDashboard,
   LayoutGrid,
@@ -19,6 +20,7 @@ const iconByHref: Record<string, LucideIcon> = {
   "/dashboard": LayoutDashboard,
   "/strategies": Activity,
   "/journal": BookOpen,
+  "/analytics": BarChart2,
   "/settings": Settings,
 };
 
