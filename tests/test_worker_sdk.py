@@ -29,6 +29,7 @@ from kite_algo_worker import (  # noqa: E402
     KiteAlgoWorkerClient,
     KiteAlgoWorkerError,
     PreviewPayload,
+    SafetyCheckResult,
     OperationalProtection,
     ProtectedPosition,
     WorkerOrderSnapshot,
@@ -242,6 +243,73 @@ def test_get_run_pnl_uses_worker_pnl_endpoint(captured_requests):
     client().get_run_pnl("run-1")
 
     assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/pnl"
+
+
+def test_safety_check_uses_new_endpoint(monkeypatch):
+    calls = []
+
+    def fake_request(self, method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse(
+            payload={
+                "strategy_run_id": "run-1",
+                "can_trade": True,
+                "run_status": "open",
+                "safety_token": "abc",
+                "token_expires_at": "2026-05-06T10:00:10Z",
+                "blocking_reasons": [],
+                "generic_protection": {"status": "active"},
+                "options_protection": {"applicable": False},
+                "evaluated_at": "2026-05-06T10:00:00Z",
+            }
+        )
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+    sdk_client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test"))
+    result = sdk_client.safety_check("run-1")
+
+    assert isinstance(result, SafetyCheckResult)
+    assert result.can_trade is True
+    assert calls[0][0] == "GET"
+    assert calls[0][1] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/safety-check"
+
+
+def test_place_order_includes_safety_token_when_supplied(monkeypatch):
+    calls = []
+
+    def fake_request(self, method, url, **kwargs):
+        calls.append(kwargs["json"])
+        return FakeResponse(payload={"status": "accepted", "result": {"status": "ok"}})
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+    sdk_client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test"))
+    sdk_client.place_order(
+        "run-1",
+        {"exchange": "NSE", "tradingsymbol": "INFY"},
+        "run-1:entry:001",
+        safety_token="signed-token",
+    )
+
+    assert calls[0]["safety_token"] == "signed-token"
+
+
+def test_place_basket_includes_safety_token_when_supplied(monkeypatch):
+    calls = []
+
+    def fake_request(self, method, url, **kwargs):
+        calls.append(kwargs["json"])
+        return FakeResponse(payload={"status": "accepted", "result": {"status": "ok"}})
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+    sdk_client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test"))
+    sdk_client.place_basket(
+        "run-1",
+        [{"exchange": "NSE", "tradingsymbol": "INFY", "transaction_type": "BUY", "quantity": 1}],
+        "run-1:basket:001",
+        safety_token="signed-token",
+    )
+
+    assert calls[0]["safety_token"] == "signed-token"
 
 
 def test_get_funds_uses_worker_funds_endpoint(captured_requests):

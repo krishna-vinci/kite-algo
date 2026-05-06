@@ -4,10 +4,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import secrets
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response, WebSocket
@@ -23,6 +24,12 @@ from api.worker_market_data import (
     WorkerMarketSnapshotRequest,
     WorkerQuoteRequest,
     normalize_instrument_token,
+)
+from api.worker_safety import (
+    build_safety_fingerprint,
+    build_signed_safety_token,
+    option_run_status_blocks_trading,
+    verify_signed_safety_token,
 )
 from algo_runtime.account_scope import parse_account_scope
 from algo_runtime.execution_attribution import build_execution_attribution, build_paper_execution_attribution
@@ -45,6 +52,8 @@ DEFAULT_WORKER_ACTIONS = {
     "market:stream",
     "funds:read",
 }
+
+_OPTION_PROTECTION_STATE_UNAVAILABLE = "__options_protection_state_unavailable__"
 ALLOWED_V1_MODES = {"paper", "dry_run", "live"}
 LIVE_REQUIRED_RUN_METADATA = {"strategy_family", "strategy_name"}
 VALID_WORKER_STRATEGY_FAMILIES = {
@@ -202,6 +211,7 @@ class WorkerIntentRequest(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
     idempotency_key: str = Field(min_length=8, max_length=160)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    safety_token: str | None = None
 
 
 class WorkerExitRequest(BaseModel):
@@ -2412,6 +2422,50 @@ def _token_allows_account_scope(token: WorkerToken, account_scope: str) -> bool:
     return requested_parsed.normalized == token_parsed.normalized
 
 
+async def _option_run_status_for_worker(request: Request, strategy_run_id: str) -> str | None:
+    try:
+        from options.execution.store import get_option_run_store
+
+        store = get_option_run_store()
+        run = await asyncio.to_thread(store.get_run, strategy_run_id)
+        return str(run.status or "")
+    except KeyError:
+        return None
+    except Exception:
+        return _OPTION_PROTECTION_STATE_UNAVAILABLE
+
+
+def _worker_safety_secret(request: Request) -> str:
+    _ = request
+    secret = os.getenv("WORKER_SAFETY_TOKEN_SECRET") or os.getenv("APP_JWT_SECRET")
+    if secret:
+        return str(secret)
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return "test-worker-safety-secret"
+    raise HTTPException(status_code=503, detail="Worker safety token secret is not configured")
+
+
+def _safety_blocking_reasons(
+    *,
+    run_status: str,
+    generic_status: str,
+    generic_exit_submitted: bool,
+    option_status: str | None,
+) -> list[str]:
+    blocking_reasons: list[str] = []
+    if run_status != "open":
+        blocking_reasons.append("RUN_NOT_OPEN")
+    if generic_status == "triggered":
+        blocking_reasons.append("GENERIC_PROTECTION_TRIGGERED")
+    if generic_exit_submitted:
+        blocking_reasons.append("GENERIC_EXIT_IN_PROGRESS")
+    if option_status == _OPTION_PROTECTION_STATE_UNAVAILABLE:
+        blocking_reasons.append("OPTIONS_PROTECTION_STATE_UNAVAILABLE")
+    elif option_status and option_run_status_blocks_trading(option_status):
+        blocking_reasons.append("OPTIONS_RUN_NOT_ACTIVE")
+    return blocking_reasons
+
+
 def _require_live_run(run: Dict[str, Any], *, feature: str) -> None:
     if str(run.get("execution_mode") or "").lower() != "live":
         raise HTTPException(status_code=409, detail=f"{feature} is only supported for live runs")
@@ -2569,6 +2623,80 @@ async def get_worker_run(request: Request, strategy_run_id: str):
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     return run
+
+
+@router.get("/worker/runs/{strategy_run_id}/safety-check")
+async def get_worker_run_safety_check(request: Request, strategy_run_id: str):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+
+    runtime_state = dict(run.get("runtime_state") or {})
+    generic = dict(runtime_state.get("backend_protection_state") or {})
+    option_status = await _option_run_status_for_worker(request, strategy_run_id)
+    generic_status = str(generic.get("status") or "active")
+    generic_exit_submitted = bool(generic.get("exit_submitted"))
+    run_status = str(run.get("status") or "open")
+
+    blocking_reasons = _safety_blocking_reasons(
+        run_status=run_status,
+        generic_status=generic_status,
+        generic_exit_submitted=generic_exit_submitted,
+        option_status=option_status,
+    )
+    can_trade = not blocking_reasons
+    now = _utcnow()
+    fingerprint = build_safety_fingerprint(
+        run_status=run_status,
+        generic_status=generic_status,
+        generic_exit_submitted=generic_exit_submitted,
+        option_run_status=option_status,
+    )
+    token_expires_at = (now + timedelta(seconds=10)).isoformat() if can_trade else None
+    token_value = (
+        build_signed_safety_token(
+            strategy_run_id=strategy_run_id,
+            fingerprint=fingerprint,
+            secret=_worker_safety_secret(request),
+            now=now,
+        )
+        if can_trade
+        else None
+    )
+
+    option_state_unavailable = option_status == _OPTION_PROTECTION_STATE_UNAVAILABLE
+    option_blocking = option_state_unavailable or bool(option_status and option_run_status_blocks_trading(option_status))
+    return {
+        "strategy_run_id": strategy_run_id,
+        "can_trade": can_trade,
+        "run_status": run_status,
+        "execution_mode": str(run.get("execution_mode") or "paper"),
+        "safety_token": token_value,
+        "token_expires_at": token_expires_at,
+        "blocking_reasons": blocking_reasons,
+        "generic_protection": {
+            "status": generic_status,
+            "triggered_rule": generic.get("triggered_rule"),
+            "exit_submitted": generic_exit_submitted,
+            "heartbeat_age_sec": generic.get("heartbeat_age_sec"),
+            "last_checked_at": generic.get("last_checked_at"),
+        },
+        "options_protection": {
+            "applicable": option_status is not None,
+            "run_status": None if option_state_unavailable else option_status,
+            "evaluation_mode": "status_only_v1",
+            "blocking": option_blocking,
+            "blocking_reason": (
+                "OPTIONS_PROTECTION_STATE_UNAVAILABLE"
+                if option_state_unavailable
+                else ("OPTIONS_RUN_NOT_ACTIVE" if option_blocking else None)
+            ),
+        },
+        "evaluated_at": now.isoformat(),
+    }
 
 
 @router.get("/worker/market/instruments/resolve")
@@ -3043,6 +3171,41 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
     existing = await _repo(request).get_intent_result(strategy_run_id, payload.idempotency_key)
     if existing is not None:
         return {"status": "deduped", "result": existing}
+
+    if payload.safety_token:
+        runtime_state = dict(run.get("runtime_state") or {})
+        generic = dict(runtime_state.get("backend_protection_state") or {})
+        option_status = await _option_run_status_for_worker(request, strategy_run_id)
+        run_status = str(run.get("status") or "open")
+        generic_status = str(generic.get("status") or "active")
+        generic_exit_submitted = bool(generic.get("exit_submitted"))
+        current_fingerprint = build_safety_fingerprint(
+            run_status=run_status,
+            generic_status=generic_status,
+            generic_exit_submitted=generic_exit_submitted,
+            option_run_status=option_status,
+        )
+        verified = verify_signed_safety_token(
+            payload.safety_token,
+            strategy_run_id,
+            _worker_safety_secret(request),
+            now=_utcnow(),
+        )
+        if verified is None or verified.get("fingerprint") != current_fingerprint:
+            blocking_reasons = _safety_blocking_reasons(
+                run_status=run_status,
+                generic_status=generic_status,
+                generic_exit_submitted=generic_exit_submitted,
+                option_status=option_status,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "rejection_reason": "SAFETY_TOKEN_EXPIRED",
+                    "blocking_reasons": blocking_reasons or ["SAFETY_STATE_UNKNOWN"],
+                    "strategy_run_id": strategy_run_id,
+                },
+            )
 
     result: Dict[str, Any]
     if mode == "dry_run":

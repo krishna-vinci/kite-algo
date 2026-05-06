@@ -25,6 +25,13 @@ Do not use this file for frontend work.
 
 ## Newly implemented in current branch
 
+- Implemented unified worker run safety-check v1 end-to-end:
+  - preserved caller-supplied option `strategy_run_id` during run creation (while retaining existing auto-generated IDs when omitted)
+  - added `api/worker_safety.py` fingerprint/sign/verify helpers and conservative option-run status blocking projection
+  - added `GET /api/algo-workers/worker/runs/{strategy_run_id}/safety-check` plus optional `safety_token` enforcement on generic worker intents to reject stale safety state
+  - hardened the safety gate so option-run status lookup errors fail closed with `OPTIONS_PROTECTION_STATE_UNAVAILABLE` and production token signing requires `WORKER_SAFETY_TOKEN_SECRET` or `APP_JWT_SECRET`
+  - added SDK `SafetyCheckResult`, `KiteAlgoWorkerClient.safety_check(...)`, and optional `safety_token` plumbing on generic order/basket intent helpers
+
 - Added Journal V2 Phase B6 analytics separation:
   - created `journaling/analytics_service.py` with period-aware analytics summary, strategy deep-dive, dense equity curve, cost analysis, and paper-vs-live comparison computation on top of V2 episodes/facts
   - added authenticated `/api/analytics/v1/summary`, `/api/analytics/v1/strategy/{template_id}`, `/api/analytics/v1/equity-curve`, `/api/analytics/v1/cost-analysis`, and `/api/analytics/v1/compare`

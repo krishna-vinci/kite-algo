@@ -26,6 +26,7 @@ class OptionRunCreateRequest(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
+    strategy_run_id: str | None = None
     strategy_name: str
     product: Literal["MIS", "NRML"]
     legs: list[dict[str, Any]]

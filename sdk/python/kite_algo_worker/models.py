@@ -460,6 +460,30 @@ class WorkerTradesResponse(ModelMixin):
         object.__setattr__(self, "trades", trades)
 
 
+@dataclass(frozen=True)
+class SafetyCheckResult(ModelMixin):
+    strategy_run_id: str
+    can_trade: bool
+    run_status: str
+    safety_token: str | None = None
+    token_expires_at: str | None = None
+    blocking_reasons: list[str] = field(default_factory=list)
+    generic_protection: dict[str, Any] = field(default_factory=dict)
+    options_protection: dict[str, Any] = field(default_factory=dict)
+    evaluated_at: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "can_trade", bool(self.can_trade))
+        object.__setattr__(self, "run_status", str(self.run_status))
+        object.__setattr__(self, "safety_token", None if self.safety_token is None else str(self.safety_token))
+        object.__setattr__(self, "token_expires_at", None if self.token_expires_at is None else str(self.token_expires_at))
+        object.__setattr__(self, "blocking_reasons", [str(item) for item in list(self.blocking_reasons or [])])
+        object.__setattr__(self, "generic_protection", dict(self.generic_protection or {}))
+        object.__setattr__(self, "options_protection", dict(self.options_protection or {}))
+        object.__setattr__(self, "evaluated_at", str(self.evaluated_at))
+
+
 __all__ = [
     "CostContract",
     "WorkerCandle",
@@ -474,6 +498,7 @@ __all__ = [
     "WorkerRunPnlSnapshot",
     "WorkerRunPnlTotals",
     "RunProtectionState",
+    "SafetyCheckResult",
     "WorkerOrderResult",
     "WorkerOrdersResponse",
     "WorkerTradesResponse",

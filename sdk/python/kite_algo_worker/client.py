@@ -9,6 +9,7 @@ import requests
 from .exceptions import KiteAlgoWorkerError, error_for_status
 from .models import (
     RunProtectionState,
+    SafetyCheckResult,
     WorkerFundsSnapshot,
     WorkerHistoricalCandles,
     WorkerOrderSnapshot,
@@ -103,6 +104,9 @@ class KiteAlgoWorkerClient:
 
     def get_run(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}")
+
+    def safety_check(self, strategy_run_id: str) -> SafetyCheckResult:
+        return SafetyCheckResult.model_validate(self._request("GET", f"/worker/runs/{strategy_run_id}/safety-check"))
 
     def get_run_pnl(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}/pnl")
@@ -379,18 +383,18 @@ class KiteAlgoWorkerClient:
         order: Mapping[str, Any],
         idempotency_key: str,
         metadata: Optional[Mapping[str, Any]] = None,
+        safety_token: Optional[str] = None,
     ) -> JsonDict:
         key = self._require_idempotency_key(idempotency_key)
-        return self._request(
-            "POST",
-            f"/worker/runs/{strategy_run_id}/intents",
-            json={
-                "intent_type": "place_order",
-                "payload": {"order": dict(order)},
-                "idempotency_key": key,
-                "metadata": dict(metadata or {}),
-            },
-        )
+        payload: JsonDict = {
+            "intent_type": "place_order",
+            "payload": {"order": dict(order)},
+            "idempotency_key": key,
+            "metadata": dict(metadata or {}),
+        }
+        if safety_token is not None:
+            payload["safety_token"] = str(safety_token)
+        return self._request("POST", f"/worker/runs/{strategy_run_id}/intents", json=payload)
 
     def place_basket(
         self,
@@ -401,19 +405,19 @@ class KiteAlgoWorkerClient:
         *,
         all_or_none: bool = False,
         dry_run: bool = False,
+        safety_token: Optional[str] = None,
     ) -> JsonDict:
         key = self._require_idempotency_key(idempotency_key)
         order_list: List[JsonDict] = [dict(order) for order in orders]
-        return self._request(
-            "POST",
-            f"/worker/runs/{strategy_run_id}/intents",
-            json={
-                "intent_type": "place_basket",
-                "payload": {"basket": {"orders": order_list, "all_or_none": all_or_none, "dry_run": dry_run}},
-                "idempotency_key": key,
-                "metadata": dict(metadata or {}),
-            },
-        )
+        payload: JsonDict = {
+            "intent_type": "place_basket",
+            "payload": {"basket": {"orders": order_list, "all_or_none": all_or_none, "dry_run": dry_run}},
+            "idempotency_key": key,
+            "metadata": dict(metadata or {}),
+        }
+        if safety_token is not None:
+            payload["safety_token"] = str(safety_token)
+        return self._request("POST", f"/worker/runs/{strategy_run_id}/intents", json=payload)
 
     def patch_risk(
         self,

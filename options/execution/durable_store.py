@@ -96,8 +96,8 @@ class DurableOptionRunStore:
             raise ValueError("strategy_run_id is required")
 
     def create_run(self, request: OptionRunCreateRequest) -> OptionRunState:
-        strategy_run_id = self._id_factory()
-        if not strategy_run_id.startswith("opt_run_"):
+        strategy_run_id = str(request.strategy_run_id or self._id_factory())
+        if not strategy_run_id.startswith("opt_run_") and not request.strategy_run_id:
             strategy_run_id = f"opt_run_{strategy_run_id}"
 
         run = OptionRunState.from_create_request(request, strategy_run_id=strategy_run_id)

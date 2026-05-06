@@ -1,4 +1,5 @@
 # pyright: reportArgumentType=false
+import os
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ from api.routers.algo_workers import (  # noqa: E402
     get_worker_order_history,
     get_worker_market_candles,
     get_worker_run,
+    get_worker_run_safety_check,
     get_worker_market_history,
     get_worker_run_pnl,
     get_worker_funds,
@@ -942,6 +944,157 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("paper account_scope", ctx.exception.detail)
+
+    async def test_safety_check_reports_generic_and_option_projection(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-safe-1"] = {
+            "strategy_run_id": "run-safe-1",
+            "token_id": "worker-1",
+            "template_id": "mean-reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {
+                "backend_protection_state": {
+                    "status": "active",
+                    "exit_submitted": False,
+                    "last_checked_at": "2026-05-06T10:00:00+00:00",
+                }
+            },
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        with patch("api.routers.algo_workers._option_run_status_for_worker", AsyncMock(return_value=None)):
+            response = await get_worker_run_safety_check(request, "run-safe-1")
+
+        self.assertTrue(response["can_trade"])
+        self.assertIsNotNone(response["safety_token"])
+        self.assertEqual(response["blocking_reasons"], [])
+        self.assertEqual(response["generic_protection"]["status"], "active")
+        self.assertFalse(response["options_protection"]["applicable"])
+
+    async def test_submit_worker_intent_rejects_stale_safety_token(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-safe-2"] = {
+            "strategy_run_id": "run-safe-2",
+            "token_id": "worker-1",
+            "template_id": "mean-reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {
+                "backend_protection_state": {
+                    "status": "active",
+                    "exit_submitted": False,
+                }
+            },
+            "metadata": {},
+        }
+        request = self._request(repo, paper_runtime=SimpleNamespace(place_order=AsyncMock(return_value={"status": "success"})))
+
+        with patch("api.routers.algo_workers._worker_safety_secret", lambda _request: "secret-key"), patch(
+            "api.routers.algo_workers._option_run_status_for_worker",
+            AsyncMock(return_value=None),
+        ):
+            check = await get_worker_run_safety_check(request, "run-safe-2")
+            repo.runs["run-safe-2"]["runtime_state"]["backend_protection_state"]["status"] = "triggered"
+
+            with self.assertRaises(HTTPException) as ctx:
+                await submit_worker_intent(
+                    request,
+                    "run-safe-2",
+                    WorkerIntentRequest(
+                        intent_type="place_order",
+                        payload={"order": {"exchange": "NSE", "tradingsymbol": "INFY", "transaction_type": "BUY", "quantity": 1}},
+                        idempotency_key="run-safe-2:entry:001",
+                        metadata={},
+                        safety_token=check["safety_token"],
+                    ),
+                )
+
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.detail["rejection_reason"], "SAFETY_TOKEN_EXPIRED")
+
+    async def test_safety_check_blocks_when_option_state_is_unavailable(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-safe-3"] = {
+            "strategy_run_id": "run-safe-3",
+            "token_id": "worker-1",
+            "template_id": "mean-reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {
+                "backend_protection_state": {
+                    "status": "active",
+                    "exit_submitted": False,
+                }
+            },
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        with patch(
+            "api.routers.algo_workers._option_run_status_for_worker",
+            AsyncMock(return_value="__options_protection_state_unavailable__"),
+        ):
+            response = await get_worker_run_safety_check(request, "run-safe-3")
+
+        self.assertFalse(response["can_trade"])
+        self.assertIsNone(response["safety_token"])
+        self.assertEqual(response["blocking_reasons"], ["OPTIONS_PROTECTION_STATE_UNAVAILABLE"])
+        self.assertTrue(response["options_protection"]["applicable"])
+        self.assertTrue(response["options_protection"]["blocking"])
+        self.assertEqual(response["options_protection"]["blocking_reason"], "OPTIONS_PROTECTION_STATE_UNAVAILABLE")
+
+    async def test_safety_check_requires_configured_secret_outside_pytest_fallback(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-safe-4"] = {
+            "strategy_run_id": "run-safe-4",
+            "token_id": "worker-1",
+            "template_id": "mean-reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {
+                "backend_protection_state": {
+                    "status": "active",
+                    "exit_submitted": False,
+                }
+            },
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        env_overrides = {key: os.environ.get(key) for key in ("WORKER_SAFETY_TOKEN_SECRET", "APP_JWT_SECRET", "PYTEST_CURRENT_TEST")}
+        for key in env_overrides:
+            os.environ.pop(key, None)
+        try:
+            with patch("api.routers.algo_workers._option_run_status_for_worker", AsyncMock(return_value=None)):
+                with self.assertRaises(HTTPException) as ctx:
+                    await get_worker_run_safety_check(request, "run-safe-4")
+        finally:
+            for key, value in env_overrides.items():
+                if value is not None:
+                    os.environ[key] = value
+                else:
+                    os.environ.pop(key, None)
+
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail, "Worker safety token secret is not configured")
 
     async def test_live_bound_token_can_create_paper_run_but_not_other_live_scope(self):
         token = WorkerToken(

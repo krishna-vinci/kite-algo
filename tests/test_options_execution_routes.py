@@ -68,6 +68,57 @@ def test_create_run_requires_product_and_persists_it():
     assert fetched.json()["product"] == "MIS"
 
 
+def test_create_run_preserves_caller_supplied_strategy_run_id():
+    client, _ = _client()
+    response = client.post(
+        "/api/options/runs",
+        json={
+            "strategy_run_id": "run_ic_worker_001",
+            "strategy_name": "iron_condor",
+            "product": "MIS",
+            "legs": [
+                {
+                    "leg_id": "sell_ce",
+                    "transaction_type": "SELL",
+                    "tradingsymbol": "NIFTY26MAY25100CE",
+                    "quantity": 75,
+                    "ltp": 82.5,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strategy_run_id"] == "run_ic_worker_001"
+    fetched = client.get("/api/options/runs/run_ic_worker_001")
+    assert fetched.status_code == 200
+    assert fetched.json()["strategy_run_id"] == "run_ic_worker_001"
+
+
+def test_create_run_still_autogenerates_when_strategy_run_id_missing():
+    client, _ = _client()
+    response = client.post(
+        "/api/options/runs",
+        json={
+            "strategy_name": "bull_call_spread",
+            "product": "MIS",
+            "legs": [
+                {
+                    "leg_id": "buy_ce",
+                    "transaction_type": "BUY",
+                    "tradingsymbol": "NIFTY26MAY25000CE",
+                    "quantity": 75,
+                    "ltp": 100.0,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["strategy_run_id"].startswith("opt_run_")
+
+
 def test_preview_entry_applies_run_product_and_buy_first_sorting():
     client, _ = _client()
     strategy_run_id = _create_run(client)
