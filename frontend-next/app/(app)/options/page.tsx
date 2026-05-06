@@ -1,5 +1,5 @@
-import { OptionsWorkspace } from "@/components/options/options-workspace";
+import { redirect } from "next/navigation";
 
 export default function OptionsPage() {
-  return <OptionsWorkspace />;
+  redirect("/strategies");
 }

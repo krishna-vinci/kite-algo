@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from decimal import InvalidOperation
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from broker_api.kite_orders import ChargesOrderInput, OrderMarginInput
 
@@ -98,6 +98,23 @@ def _contract_from_kite_payload(*, margin_required: Decimal, charges: Mapping[st
     )
 
 
+def _sum_charge_rows(rows: Iterable[Any]) -> dict[str, Decimal]:
+    totals = {
+        "brokerage": Decimal("0"),
+        "transaction_tax": Decimal("0"),
+        "exchange_turnover_charge": Decimal("0"),
+        "sebi_turnover_charge": Decimal("0"),
+        "stamp_duty": Decimal("0"),
+        "gst": Decimal("0"),
+        "total": Decimal("0"),
+    }
+    for row in rows:
+        charges = dict(getattr(row, "charges", {}) or {})
+        for key in totals:
+            totals[key] += _decimal(charges.get(key, 0))
+    return totals
+
+
 def build_live_order_cost_contract(*, kite: Any, orders_service: Any, order: dict[str, Any], corr_id: str) -> ExecutionCostContract:
     try:
         margin_items = [OrderMarginInput(**order)]
@@ -115,5 +132,29 @@ def build_live_order_cost_contract(*, kite: Any, orders_service: Any, order: dic
         raw={
             "margin": _dump_model(margin_rows[0]) if margin_rows else None,
             "charges": _dump_model(charge_rows[0]) if charge_rows else None,
+        },
+    )
+
+
+def build_live_basket_cost_contract(*, kite: Any, orders_service: Any, orders: list[dict[str, Any]], corr_id: str) -> ExecutionCostContract:
+    try:
+        margin_items = [OrderMarginInput(**order) for order in orders]
+        margins = orders_service.basket_margins(kite, margin_items, consider_positions=True, corr_id=corr_id, mode="compact")
+        charge_rows = orders_service.charges_orders(
+            kite,
+            [_charges_input_from_order(_with_quote_average_price(kite=kite, order=order)) for order in orders],
+            corr_id,
+        )
+    except Exception as exc:
+        return ExecutionCostContract(charges_status=ChargesStatus.UNAVAILABLE, raw={"error": str(exc)})
+
+    initial_margin_required = _decimal(getattr(getattr(margins, "initial", None), "total", 0) if margins else 0)
+    charges = _sum_charge_rows(charge_rows)
+    return _contract_from_kite_payload(
+        margin_required=initial_margin_required,
+        charges=charges,
+        raw={
+            "margin": _dump_model(margins) if margins else None,
+            "charges": [_dump_model(row) for row in charge_rows],
         },
     )

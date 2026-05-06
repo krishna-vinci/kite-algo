@@ -1203,16 +1203,27 @@ CREATE TABLE IF NOT EXISTS public.journal_episodes (
     status TEXT NOT NULL DEFAULT 'draft',
     opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     closed_at TIMESTAMPTZ,
+    notes TEXT NOT NULL DEFAULT '',
     metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE public.journal_episodes
+    ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT '';
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_episodes_context_seq
     ON public.journal_episodes (execution_context_id, episode_seq);
 
 CREATE INDEX IF NOT EXISTS idx_journal_episodes_environment_status_opened
     ON public.journal_episodes (environment_id, status, opened_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_episodes_environment_opened_at
+    ON public.journal_episodes (environment_id, opened_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_episodes_environment_closed_at
+    ON public.journal_episodes (environment_id, closed_at DESC)
+    WHERE closed_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS public.journal_episode_legs (
     id BIGSERIAL PRIMARY KEY,
@@ -1380,6 +1391,14 @@ CREATE TABLE IF NOT EXISTS public.journal_execution_facts (
     fees_amount NUMERIC(18,6) NOT NULL DEFAULT 0,
     taxes_amount NUMERIC(18,6) NOT NULL DEFAULT 0,
     slippage_amount NUMERIC(18,6) NOT NULL DEFAULT 0,
+    brokerage NUMERIC(18,6) NOT NULL DEFAULT 0,
+    exchange_txn_charge NUMERIC(18,6) NOT NULL DEFAULT 0,
+    stt NUMERIC(18,6) NOT NULL DEFAULT 0,
+    stamp_duty NUMERIC(18,6) NOT NULL DEFAULT 0,
+    sebi_charge NUMERIC(18,6) NOT NULL DEFAULT 0,
+    gst NUMERIC(18,6) NOT NULL DEFAULT 0,
+    margin_required NUMERIC(18,6) NOT NULL DEFAULT 0,
+    charges_status TEXT NOT NULL DEFAULT 'unavailable',
     payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -1397,11 +1416,49 @@ ALTER TABLE public.journal_execution_facts
     ADD COLUMN IF NOT EXISTS position_effect TEXT;
 
 ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS brokerage NUMERIC(18,6) NOT NULL DEFAULT 0;
+
+ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS exchange_txn_charge NUMERIC(18,6) NOT NULL DEFAULT 0;
+
+ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS stt NUMERIC(18,6) NOT NULL DEFAULT 0;
+
+ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS stamp_duty NUMERIC(18,6) NOT NULL DEFAULT 0;
+
+ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS sebi_charge NUMERIC(18,6) NOT NULL DEFAULT 0;
+
+ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS gst NUMERIC(18,6) NOT NULL DEFAULT 0;
+
+ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS margin_required NUMERIC(18,6) NOT NULL DEFAULT 0;
+
+ALTER TABLE public.journal_execution_facts
+    ADD COLUMN IF NOT EXISTS charges_status TEXT NOT NULL DEFAULT 'unavailable';
+
+ALTER TABLE public.journal_execution_facts
     DROP CONSTRAINT IF EXISTS journal_execution_facts_position_effect_chk;
 
 ALTER TABLE public.journal_execution_facts
     ADD CONSTRAINT journal_execution_facts_position_effect_chk
     CHECK (position_effect IS NULL OR position_effect IN ('open', 'add', 'reduce', 'close', 'flip')) NOT VALID;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'journal_execution_facts_charges_status_chk'
+          AND conrelid = 'public.journal_execution_facts'::regclass
+    ) THEN
+        ALTER TABLE public.journal_execution_facts
+            ADD CONSTRAINT journal_execution_facts_charges_status_chk
+            CHECK (charges_status IN ('estimated', 'broker_quoted', 'reconciled', 'unavailable')) NOT VALID;
+    END IF;
+END $$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_journal_execution_facts_source_fact
     ON public.journal_execution_facts (source_type, source_fact_key);
@@ -1411,6 +1468,10 @@ CREATE INDEX IF NOT EXISTS idx_journal_execution_facts_run_time
 
 CREATE INDEX IF NOT EXISTS idx_journal_execution_facts_environment_episode_fill_time
     ON public.journal_execution_facts (environment_id, episode_id, fill_timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_journal_execution_facts_environment_fill_timestamp
+    ON public.journal_execution_facts (environment_id, fill_timestamp DESC)
+    WHERE environment_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS public.journal_v2_projection_claims (
     source_type TEXT NOT NULL,

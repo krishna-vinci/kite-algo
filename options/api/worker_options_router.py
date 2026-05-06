@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 
 from api.routers.algo_workers import require_worker_token
 from options.api.execution_router import (
@@ -129,32 +129,35 @@ async def create_worker_option_run(
 @router.post("/runs/{strategy_run_id}/preview-entry")
 async def preview_worker_option_run_entry(
     strategy_run_id: str,
+    request: Request,
     payload: dict | None = None,
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
 ):
-    return await preview_option_run_entry(strategy_run_id, payload, store)
+    return await preview_option_run_entry(strategy_run_id, request, payload, store)
 
 
 @router.post("/runs/{strategy_run_id}/enter")
 async def enter_worker_option_run(
     strategy_run_id: str,
+    request: Request,
     payload: dict | None = None,
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
     runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
 ):
-    return await enter_option_run(strategy_run_id, payload, store, runtime)
+    return await enter_option_run(strategy_run_id, request, payload, store, runtime)
 
 
 @router.post("/runs/{strategy_run_id}/preview-exit")
 async def preview_worker_option_run_exit(
     strategy_run_id: str,
+    request: Request,
     payload: dict | None = None,
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
 ):
-    return await preview_option_run_exit(strategy_run_id, payload, store)
+    return await preview_option_run_exit(strategy_run_id, request, payload, store)
 
 
 @router.post("/runs/{strategy_run_id}/exit")

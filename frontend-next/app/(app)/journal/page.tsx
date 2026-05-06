@@ -1,290 +1,415 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { useQuery } from "@tanstack/react-query";
+import Link from "next/link";
+import { AlertCircleIcon, CalendarDaysIcon } from "lucide-react";
 
-import { JournalPageLink } from "@/components/journal/journal-page-link";
-import { JournalWorkspaceHeader } from "@/components/journal/journal-workspace-header";
-import { useJournalWorkspace } from "@/components/journal/journal-workspace-provider";
-import { KpiCard } from "@/components/operator/kpi-card";
-import { Panel } from "@/components/operator/panel";
-import { StatusBadge } from "@/components/operator/status-badge";
-import { fetchJournalEpisodes, fetchJournalV2AnalyticsSummary, fetchJournalV2Unresolved } from "@/lib/journal/api";
-import type { AnalysisPeriod, JournalEpisode, JournalV2AnalyticsMetrics, JournalV2UnresolvedItem } from "@/lib/journal/types";
+import { fetchDailyView } from "@/lib/journal/api-v2";
+import { useWorkspace } from "@/components/workspace/workspace-provider";
+import { cn } from "@/lib/utils";
 
-function formatAmount(value: number | string | null | undefined) {
-  const amount = typeof value === "number" ? value : Number(value ?? 0);
-  if (!Number.isFinite(amount)) {
-    return "—";
-  }
-  return new Intl.NumberFormat("en-IN", {
-    style: "currency",
-    currency: "INR",
-    maximumFractionDigits: 0,
-  }).format(amount);
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { MetricValue } from "@/components/shared/metric-value";
+import { PnlBadge } from "@/components/shared/pnl-badge";
+import { CostBreakdownTable } from "@/components/shared/cost-breakdown-table";
+import { JournalKpiCard } from "@/components/journal/journal-kpi-card";
+import type {
+  AnalyticsMetrics,
+  CostBreakdown,
+  JournalV2EpisodeCard,
+  JournalV2OpenEpisodeCard,
+  JournalV2StrategyGroup,
+} from "@/lib/journal/types-v2";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function todayIso(): string {
+  const d = new Date();
+  return [
+    d.getFullYear(),
+    String(d.getMonth() + 1).padStart(2, "0"),
+    String(d.getDate()).padStart(2, "0"),
+  ].join("-");
 }
 
-function formatPercent(value: number | string | null | undefined) {
-  const amount = typeof value === "number" ? value : Number(value ?? null);
-  if (!Number.isFinite(amount)) {
-    return "—";
-  }
-  return `${amount.toFixed(1)}%`;
+function fmtNum(v: string | number | null | undefined, dp = 2): string | null {
+  const n = Number(v);
+  if (v === null || v === undefined || v === "" || isNaN(n)) return null;
+  return n.toLocaleString("en-IN", {
+    minimumFractionDigits: dp,
+    maximumFractionDigits: dp,
+  });
 }
 
-function formatDateTime(value: string | null) {
-  if (!value) {
-    return "Open";
-  }
-  return new Date(value).toLocaleString();
+function fmtPct(v: string | number | null | undefined): string | null {
+  const n = Number(v);
+  if (v === null || v === undefined || v === "" || isNaN(n)) return null;
+  return `${n.toFixed(1)}%`;
 }
 
-export default function JournalOverviewPage() {
-  const [period, setPeriod] = useState<AnalysisPeriod>("month");
-  const { environments, environmentsLoading, environmentsError, selectedEnvironmentId, selectedEnvironment } =
-    useJournalWorkspace();
-  const [v2Metrics, setV2Metrics] = useState<JournalV2AnalyticsMetrics | null>(null);
-  const [v2MetricsLoading, setV2MetricsLoading] = useState(false);
-  const [v2MetricsError, setV2MetricsError] = useState<string | null>(null);
-  const [episodes, setEpisodes] = useState<JournalEpisode[]>([]);
-  const [episodesLoading, setEpisodesLoading] = useState(false);
-  const [episodesError, setEpisodesError] = useState<string | null>(null);
-  const [unresolvedItems, setUnresolvedItems] = useState<JournalV2UnresolvedItem[]>([]);
-  const [unresolvedLoading, setUnresolvedLoading] = useState(false);
-  const [unresolvedError, setUnresolvedError] = useState<string | null>(null);
+function costBreakdownNums(cb: CostBreakdown) {
+  return {
+    brokerage: Number(cb.brokerage) || 0,
+    exchange_txn_charge: Number(cb.exchange_txn_charge) || 0,
+    stt: Number(cb.stt) || 0,
+    stamp_duty: Number(cb.stamp_duty) || 0,
+    sebi_charge: Number(cb.sebi_charge) || 0,
+    gst: Number(cb.gst) || 0,
+    total_taxes: Number(cb.total_taxes) || 0,
+    total_charges: Number(cb.total_charges) || 0,
+  };
+}
 
-  useEffect(() => {
-    if (!selectedEnvironmentId) {
-      setV2Metrics(null);
-      setV2MetricsError(null);
-      setEpisodes([]);
-      setEpisodesError(null);
-      setUnresolvedItems([]);
-      setUnresolvedError(null);
-      return;
-    }
+function buildEpisodeHref(
+  episodeId: string,
+  params: URLSearchParams,
+  workspace: { env?: string; mode?: string },
+): string {
+  const sp = new URLSearchParams();
+  const env = params.get("env") ?? workspace.env;
+  const mode = params.get("mode") ?? workspace.mode;
+  const date = params.get("date");
+  if (env) sp.set("env", env);
+  if (mode) sp.set("mode", mode);
+  if (date) sp.set("date", date);
+  const qs = sp.toString();
+  return `/journal/episodes/${episodeId}${qs ? `?${qs}` : ""}`;
+}
 
-    let closed = false;
-    setV2MetricsLoading(true);
-    setEpisodesLoading(true);
-    setUnresolvedLoading(true);
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
 
-    fetchJournalV2AnalyticsSummary(selectedEnvironmentId)
-      .then((payload) => {
-        if (closed) {
-          return;
-        }
-        setV2Metrics(payload.metrics);
-        setV2MetricsError(null);
-      })
-      .catch((error) => {
-        if (closed) {
-          return;
-        }
-        setV2Metrics(null);
-        setV2MetricsError(error instanceof Error ? error.message : "Failed to load Journal V2 analytics");
-      })
-      .finally(() => {
-        if (!closed) {
-          setV2MetricsLoading(false);
-        }
-      });
+function KpiSkeleton() {
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+      {Array.from({ length: 5 }).map((_, i) => (
+        <Skeleton key={i} className="h-20 rounded-xl" />
+      ))}
+    </div>
+  );
+}
 
-    fetchJournalEpisodes({ environment_id: selectedEnvironmentId, limit: 5 })
-      .then((items) => {
-        if (closed) {
-          return;
-        }
-        setEpisodes(items);
-        setEpisodesError(null);
-      })
-      .catch((error) => {
-        if (closed) {
-          return;
-        }
-        setEpisodes([]);
-        setEpisodesError(error instanceof Error ? error.message : "Failed to load recent episodes");
-      })
-      .finally(() => {
-        if (!closed) {
-          setEpisodesLoading(false);
-        }
-      });
+function SummaryKpis({ metrics, openCount }: { metrics: AnalyticsMetrics; openCount: number }) {
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+      <JournalKpiCard label="Net P&L">
+        <PnlBadge value={metrics.net_pnl} className="text-base font-semibold" />
+      </JournalKpiCard>
+      <JournalKpiCard label="Gross P&L">
+        <PnlBadge value={metrics.gross_pnl} className="text-base font-semibold" />
+      </JournalKpiCard>
+      <JournalKpiCard label="Total Charges">
+        <PnlBadge value={-Math.abs(Number(metrics.total_charges) || 0)} showSign={false} className="text-base font-semibold" />
+      </JournalKpiCard>
+      <JournalKpiCard label="Episodes">
+        <div className="flex flex-wrap items-baseline gap-2">
+          <span className="text-base font-semibold tabular-nums">
+            {metrics.closed_episode_count}
+          </span>
+          <span className="text-xs text-muted-foreground">closed</span>
+          {openCount > 0 && (
+            <Badge variant="secondary" className="text-[10px]">
+              {openCount} open
+            </Badge>
+          )}
+        </div>
+      </JournalKpiCard>
+      <JournalKpiCard label="Win Rate">
+        <span className="text-base font-semibold tabular-nums">
+          <MetricValue value={fmtPct(metrics.win_rate)} />
+        </span>
+      </JournalKpiCard>
+    </div>
+  );
+}
 
-    fetchJournalV2Unresolved(selectedEnvironmentId)
-      .then((payload) => {
-        if (closed) {
-          return;
-        }
-        setUnresolvedItems(payload.items ?? []);
-        setUnresolvedError(null);
-      })
-      .catch((error) => {
-        if (closed) {
-          return;
-        }
-        setUnresolvedItems([]);
-        setUnresolvedError(error instanceof Error ? error.message : "Failed to load unresolved queue");
-      })
-      .finally(() => {
-        if (!closed) {
-          setUnresolvedLoading(false);
-        }
-      });
+function directionToneClass(direction?: string | null) {
+  const normalized = String(direction ?? "").trim().toLowerCase();
+  if (normalized === "long") return "bg-sky-500/10 text-sky-300";
+  if (normalized === "short") return "bg-orange-500/10 text-orange-300";
+  return "bg-foreground/[0.06] text-foreground/65";
+}
 
-    return () => {
-      closed = true;
-    };
-  }, [selectedEnvironmentId]);
+function SectionHeader({
+  label,
+  count,
+}: {
+  label: string;
+  count?: string;
+}) {
+  return (
+    <div className="mb-2 flex items-center justify-between gap-3">
+      <h3 className="text-[11px] font-medium uppercase tracking-[0.22em] text-muted-foreground/70">
+        {label}
+      </h3>
+      {count ? <span className="font-mono text-[10px] text-muted-foreground/60">{count}</span> : null}
+    </div>
+  );
+}
 
-  const liveEnvironmentExists = environments.some((item) => item.mode === "live");
-  const quickLinks = [
-    { label: "Episodes", href: "/journal/episodes", description: "Inspect episode-level flow and notes." },
-    { label: "Analytics", href: "/journal/analytics", description: "Review environment and template scorecards." },
-    { label: "Notes", href: "/journal/notes", description: "Browse and capture Journal V2 notes." },
-    { label: "Strategies", href: "/journal/strategies", description: "Compare template performance in one environment." },
-  ] as const;
+function OpenEpisodeRow({
+  episode,
+  params,
+  workspace,
+}: {
+  episode: JournalV2OpenEpisodeCard;
+  params: URLSearchParams;
+  workspace: { env?: string; mode?: string };
+}) {
+  const href = buildEpisodeHref(episode.episode_id, params, workspace);
+  const pnl = episode.current_pnl_estimate;
 
   return (
-    <div className="space-y-5 pb-5">
-      <JournalWorkspaceHeader period={period} setPeriod={setPeriod} />
-
-      <Panel
-        eyebrow="Journal V2"
-        title="Environment-scoped overview"
-        className="p-4 md:p-5"
-      >
-        <div className="space-y-4">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div className="space-y-1">
-              <p className="text-sm text-foreground/70">
-                Start from a single environment so episode, analytics, and note data stay safely scoped.
-              </p>
-              {selectedEnvironment ? (
-                <StatusBadge tone={selectedEnvironment.mode === "live" ? "warning" : "neutral"}>
-                  {selectedEnvironment.display_name || selectedEnvironment.account_scope} · {selectedEnvironment.mode}
-                </StatusBadge>
-              ) : null}
-            </div>
-            {!liveEnvironmentExists && environments.length > 0 ? (
-              <div className="max-w-md rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
-                Live validation environment does not exist yet, so live-side Journal V2 validation is still pending.
-              </div>
-            ) : null}
-          </div>
-          {environmentsLoading ? <p className="text-sm text-foreground/60">Loading available environments…</p> : null}
-          {environmentsError ? <p className="text-sm text-destructive">{environmentsError}</p> : null}
-          {!environmentsLoading && !environmentsError && environments.length === 0 ? (
-            <div className="rounded-xl border border-dashed border-border/70 bg-background/40 px-4 py-5 text-sm text-foreground/65">
-              No Journal V2 environments are available yet. Create or sync one before using overview analytics.
-            </div>
-          ) : null}
-        </div>
-      </Panel>
-
-      {!selectedEnvironmentId ? (
-        <Panel title="Waiting for environment" className="p-4 md:p-5">
-          <p className="text-sm text-foreground/65">
-            Select an environment above to load Journal V2 summary cards, recent episodes, unresolved queue signals, and scoped navigation links.
-          </p>
-        </Panel>
-      ) : null}
-
-      {selectedEnvironmentId ? (
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-          <KpiCard
-            label="Environment / Mode"
-            value={selectedEnvironment ? `${selectedEnvironment.display_name || selectedEnvironment.account_scope}` : "—"}
-            note={selectedEnvironment ? `${selectedEnvironment.mode} · epoch ${selectedEnvironment.environment_epoch}` : "Not selected"}
-            className="xl:col-span-1 [&_p:last-child]:text-xs [&_p:nth-child(2)]:text-lg [&_p:nth-child(2)]:font-semibold [&_p:nth-child(2)]:text-foreground"
-          />
-          <KpiCard label="Closed episodes" value={String(v2Metrics?.closed_episode_count ?? 0)} note="Scoped to selected Journal V2 environment" />
-          <KpiCard label="Net P&L" value={formatAmount(v2Metrics?.net_pnl)} note="Realized net performance only" />
-          <KpiCard label="Win rate" value={formatPercent(v2Metrics?.win_rate)} note="Closed episodes with positive outcome" />
-          <KpiCard label="Charges" value={formatAmount(v2Metrics?.total_charges)} note="Brokerage and related costs" />
-        </div>
-      ) : null}
-
-      {selectedEnvironmentId && v2MetricsLoading ? <p className="text-sm text-foreground/60">Loading Journal V2 overview metrics…</p> : null}
-      {selectedEnvironmentId && v2MetricsError ? <p className="text-sm text-destructive">{v2MetricsError}</p> : null}
-
-      <div className="grid gap-4 xl:grid-cols-[1.6fr_1fr]">
-        <Panel eyebrow="Recent activity" title="Recent V2 episodes" className="p-4 md:p-5">
-          {!selectedEnvironmentId ? <p className="text-sm text-foreground/65">Choose an environment to inspect recent Journal V2 episodes.</p> : null}
-          {episodesLoading ? <p className="text-sm text-foreground/60">Loading recent episodes…</p> : null}
-          {episodesError ? <p className="text-sm text-destructive">{episodesError}</p> : null}
-          {selectedEnvironmentId && !episodesLoading && !episodesError && episodes.length === 0 ? (
-            <div className="rounded-xl border border-dashed border-border/70 bg-background/30 px-4 py-5 text-sm text-foreground/65">
-              No V2 episodes were found for this environment yet.
-            </div>
-          ) : null}
-          <div className="space-y-3">
-            {episodes.map((episode) => (
-              <JournalPageLink
-                key={episode.id}
-                href={`/journal/episodes/${episode.id}`}
-                className="block rounded-2xl border border-border/70 bg-background/35 p-4 transition-colors hover:border-primary/30 hover:bg-background/55"
-              >
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-semibold text-foreground">Episode #{episode.episode_seq}</p>
-                    <p className="mt-1 text-xs text-foreground/60">{episode.execution_context_id || "No execution context recorded"}</p>
-                  </div>
-                  <StatusBadge tone={episode.closed_at ? "positive" : "warning"}>{episode.status}</StatusBadge>
-                </div>
-                <div className="mt-3 grid gap-2 text-xs text-foreground/65 md:grid-cols-2">
-                  <p>Opened: {formatDateTime(episode.opened_at)}</p>
-                  <p>Closed: {formatDateTime(episode.closed_at)}</p>
-                </div>
-              </JournalPageLink>
-            ))}
-          </div>
-        </Panel>
-
-        <div className="space-y-4">
-          <Panel eyebrow="Queue health" title="Unresolved queue summary" className="p-4 md:p-5">
-            {!selectedEnvironmentId ? <p className="text-sm text-foreground/65">Choose an environment to check unresolved identity or mapping issues.</p> : null}
-            {unresolvedLoading ? <p className="text-sm text-foreground/60">Loading unresolved queue…</p> : null}
-            {unresolvedError ? <p className="text-sm text-destructive">{unresolvedError}</p> : null}
-            {selectedEnvironmentId && !unresolvedLoading && !unresolvedError ? (
-              <>
-                <div className="rounded-2xl border border-border/70 bg-background/35 p-4">
-                  <p className="text-[11px] uppercase tracking-[0.24em] text-foreground/45">Open items</p>
-                  <p className="mt-2 text-3xl font-semibold tracking-tight text-foreground">{unresolvedItems.length}</p>
-                  <p className="mt-1 text-sm text-foreground/60">Identity or mapping issues still needing action.</p>
-                </div>
-                {unresolvedItems.length === 0 ? (
-                  <p className="text-sm text-foreground/65">No unresolved items for this environment.</p>
-                ) : (
-                  <ul className="space-y-2">
-                    {unresolvedItems.slice(0, 3).map((item) => (
-                      <li key={item.id} className="rounded-xl border border-border/70 bg-background/30 p-3 text-sm">
-                        <p className="font-medium text-foreground">{item.reason}</p>
-                        <p className="mt-1 text-xs text-foreground/60">{item.source_system}</p>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </>
-            ) : null}
-          </Panel>
-
-          <Panel eyebrow="Navigate" title="Quick links" className="p-4 md:p-5">
-            <div className="grid gap-3 sm:grid-cols-2">
-              {quickLinks.map((link) => (
-                <JournalPageLink
-                  key={link.href}
-                  href={link.href}
-                  className="rounded-2xl border border-border/70 bg-background/35 p-4 transition-colors hover:border-primary/30 hover:bg-background/55"
-                >
-                  <p className="text-sm font-semibold text-foreground">{link.label}</p>
-                  <p className="mt-1 text-xs leading-5 text-foreground/60">{link.description}</p>
-                </JournalPageLink>
-              ))}
-            </div>
-          </Panel>
-        </div>
+    <div className="flex items-center justify-between gap-3 py-2 text-sm">
+      <div className="min-w-0 flex-1">
+        <Link href={href} className="truncate font-medium text-foreground hover:underline">
+          {episode.strategy?.display_name ?? episode.strategy?.template_key ?? "Episode"}
+        </Link>
+        <span className="ml-2 font-mono text-[10px] text-muted-foreground/40">
+          {episode.episode_id.slice(0, 8)}
+        </span>
       </div>
+      <div className="flex shrink-0 items-center gap-3">
+        {episode.direction && (
+          <span className={cn("rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em]", directionToneClass(episode.direction))}>
+            {episode.direction}
+          </span>
+        )}
+        <PnlBadge value={pnl} className="text-sm font-semibold" />
+      </div>
+    </div>
+  );
+}
 
+function EpisodeRow({
+  episode,
+  params,
+  workspace,
+}: {
+  episode: JournalV2EpisodeCard;
+  params: URLSearchParams;
+  workspace: { env?: string; mode?: string };
+}) {
+  const href = buildEpisodeHref(episode.episode_id, params, workspace);
+
+  return (
+    <div className="flex items-center justify-between gap-3 py-2 text-sm">
+      <div className="min-w-0 flex-1">
+        <Link href={href} className="truncate font-medium text-foreground hover:underline">
+          {episode.strategy?.display_name ?? episode.strategy?.template_key ?? "Episode"}
+        </Link>
+        <span className="ml-2 font-mono text-[10px] text-muted-foreground/40">
+          {episode.episode_id.slice(0, 8)}
+        </span>
+      </div>
+      <div className="flex shrink-0 items-center gap-3">
+        {episode.direction && (
+          <span className={cn("rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em]", directionToneClass(episode.direction))}>
+            {episode.direction}
+          </span>
+        )}
+        <PnlBadge value={episode.outcome.net_pnl} className="text-sm font-semibold" />
+      </div>
+    </div>
+  );
+}
+
+function StrategyGroupSection({
+  group,
+  params,
+  workspace,
+}: {
+  group: JournalV2StrategyGroup;
+  params: URLSearchParams;
+  workspace: { env?: string; mode?: string };
+}) {
+  const strategyName =
+    group.strategy.display_name ??
+    group.strategy.template_key ??
+    group.strategy.template_id;
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center justify-between gap-2 py-1.5">
+        <div className="flex items-center gap-2">
+          <span className="text-[13px] font-medium text-foreground">
+            {strategyName}
+          </span>
+          <span className="font-mono text-[10px] text-muted-foreground/60">{group.episodes.length} ep</span>
+        </div>
+        <PnlBadge value={group.metrics.net_pnl} className="text-sm font-semibold" />
+      </div>
+      <div className="divide-y divide-border/50">
+        {group.episodes.map((ep) => (
+          <EpisodeRow key={ep.episode_id} episode={ep} params={params} workspace={workspace} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Skeleton sections
+// ---------------------------------------------------------------------------
+
+function DayViewSkeleton() {
+  return (
+    <div className="flex flex-col gap-6">
+      <KpiSkeleton />
+      <div className="flex flex-col gap-2">
+        <Skeleton className="h-4 w-32" />
+        <Skeleton className="h-24 rounded-xl" />
+      </div>
+      <div className="flex flex-col gap-2">
+        <Skeleton className="h-4 w-48" />
+        <Skeleton className="h-32 rounded-xl" />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Empty state
+// ---------------------------------------------------------------------------
+
+function EmptyDayState({ date }: { date: string }) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-border/40 bg-muted/10 px-6 py-12 text-center">
+      <CalendarDaysIcon className="h-4 w-4 text-muted-foreground/40" />
+      <p className="text-sm font-medium text-muted-foreground">
+        No trading activity on {date}
+      </p>
+      <p className="text-xs text-muted-foreground/70">
+        Use the date navigator to move to a different day.
+      </p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
+
+export default function JournalDayPage() {
+  const searchParams = useSearchParams();
+  const { selectedEnvironmentId, selectedMode } = useWorkspace();
+
+  // Prefer workspace context for environment; URL param as override for deep-links
+  const environmentId = searchParams?.get("env") ?? selectedEnvironmentId ?? "";
+  const date = searchParams?.get("date") ?? todayIso();
+
+  const queryEnabled = Boolean(environmentId);
+
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["journal", "daily", environmentId, date],
+    queryFn: () => fetchDailyView({ environment_id: environmentId, date }),
+    enabled: queryEnabled,
+    staleTime: 60_000,
+  });
+
+  // Stable fallback so sub-components never receive null
+  const safeParams = searchParams ?? new URLSearchParams();
+  const linkScope = {
+    env: safeParams.get("env") ?? selectedEnvironmentId ?? undefined,
+    mode: safeParams.get("mode") ?? selectedMode,
+  };
+
+  // No environment selected
+  if (!queryEnabled) {
+    return (
+      <div className="rounded-xl border border-dashed border-border/70 bg-background/40 px-4 py-8 text-center text-sm text-muted-foreground">
+        Select an environment to view the daily journal.
+      </div>
+    );
+  }
+
+  // Loading
+  if (isLoading) {
+    return <DayViewSkeleton />;
+  }
+
+  // Error
+  if (error) {
+    return (
+      <Alert variant="destructive">
+        <AlertCircleIcon />
+        <AlertTitle>Failed to load daily view</AlertTitle>
+        <AlertDescription>
+          {error instanceof Error ? error.message : "Unknown error"}
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  // No data
+  if (!data) {
+    return <EmptyDayState date={date} />;
+  }
+
+  const { summary, strategy_groups, open_episodes } = data;
+  const { metrics } = summary;
+  const hasClosedEpisodes = strategy_groups.length > 0;
+  const hasOpenEpisodes = open_episodes.length > 0;
+  const hasAnyActivity = hasClosedEpisodes || hasOpenEpisodes;
+
+  if (!hasAnyActivity) {
+    return <EmptyDayState date={date} />;
+  }
+
+  const costBreakdown = costBreakdownNums(metrics.cost_breakdown);
+
+  return (
+    <div className="flex flex-col gap-6 pb-8">
+      {/* KPI cards */}
+      <SummaryKpis metrics={metrics} openCount={summary.open_episode_count} />
+
+      {/* Open episodes */}
+      {hasOpenEpisodes && (
+        <section aria-label="Open episodes">
+          <SectionHeader label="Open Episodes" count={`${open_episodes.length} active`} />
+          <Card className="gap-0 py-0">
+            <CardContent className="divide-y divide-border/50 px-3 py-1.5">
+              {open_episodes.map((ep) => (
+                <OpenEpisodeRow key={ep.episode_id} episode={ep} params={safeParams} workspace={linkScope} />
+              ))}
+            </CardContent>
+          </Card>
+        </section>
+      )}
+
+      {/* Strategy groups with closed episodes */}
+      {hasClosedEpisodes && (
+        <section aria-label="Closed episodes by strategy">
+          <SectionHeader label="Closed Episodes" count={`${metrics.closed_episode_count} closed`} />
+          <Card className="gap-0 py-0">
+            <CardContent className="flex flex-col divide-y divide-border/50 px-3 py-1.5">
+              {strategy_groups.map((group) => (
+                <StrategyGroupSection
+                  key={group.strategy.template_id}
+                  group={group}
+                  params={safeParams}
+                  workspace={linkScope}
+                />
+              ))}
+            </CardContent>
+          </Card>
+        </section>
+      )}
+
+      {/* Cost breakdown */}
+      <section aria-label="Cost breakdown">
+        <SectionHeader label="Cost Breakdown" />
+        <div className="rounded-lg border border-border/50 bg-muted/20 px-3 py-3">
+          <CostBreakdownTable values={costBreakdown} />
+        </div>
+      </section>
     </div>
   );
 }

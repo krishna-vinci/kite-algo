@@ -8,6 +8,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
+*.egg-info/
 
 # Node
 node_modules/
@@ -59,6 +60,5 @@ scripts/
 openalgo/
 openalgo/openalgo/
 quant-ml-india/
-
 
 

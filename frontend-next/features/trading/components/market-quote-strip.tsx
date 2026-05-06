@@ -27,7 +27,7 @@ export function MarketQuoteStrip({ quotes, compact = false, className }: MarketQ
         <div
           key={q.symbol}
           className={cn(
-            "flex items-center gap-2 rounded-lg border border-border/50 bg-background/50 px-3",
+            "flex items-center gap-2 rounded-lg border border-border/40 bg-background/35 px-3",
             compact ? "py-1" : "py-2",
           )}
         >
@@ -54,7 +54,10 @@ export function MarketQuoteStrip({ quotes, compact = false, className }: MarketQ
             </span>
           )}
           {!q.connected && (
-            <span className="h-1.5 w-1.5 rounded-full bg-amber-400" title="Disconnected" />
+            <span className="flex items-center gap-1" aria-label={`${q.symbol} disconnected`}>
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-400" aria-hidden="true" />
+              <span className="sr-only">Disconnected</span>
+            </span>
           )}
         </div>
       ))}

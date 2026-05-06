@@ -297,7 +297,7 @@ function WorkerQuickGuide({ token }: { token: CreatedAlgoWorkerToken | null }) {
         </div>
         {token?.allowedModes.includes("live") && token.accountScope && !isPaperScope(token.accountScope) ? (
           <p className="mb-3 text-[11px] leading-5 text-foreground/55">
-            This token is live-bound to <span className="font-mono text-primary">{token.accountScope}</span>, but it can still create paper or dry-run runs with <span className="font-mono text-primary">account_scope: "{DEFAULT_ACCOUNT_SCOPE}"</span> when those modes are enabled.
+            This token is live-bound to <span className="font-mono text-primary">{token.accountScope}</span>, but it can still create paper or dry-run runs with <span className="font-mono text-primary">account_scope: &quot;{DEFAULT_ACCOUNT_SCOPE}&quot;</span> when those modes are enabled.
           </p>
         ) : null}
         <CodeBlock value={createRunSnippet} />

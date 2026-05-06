@@ -9,10 +9,58 @@ install_dependency_stubs(stub_kite_orders=False)
 sys.modules.pop("broker_api.kite_orders", None)
 
 from broker_api.kite_orders import Exchange, OrderType, Product, Trade, TransactionType, Variety
-from execution_accounting.kite_costs import build_live_order_cost_contract
+from execution_accounting.kite_costs import build_live_basket_cost_contract, build_live_order_cost_contract
 
 
 class LiveCostContractTests(unittest.TestCase):
+    def test_live_basket_contract_uses_broker_initial_margin_and_summed_charges(self):
+        orders_service = Mock()
+        orders_service.basket_margins.return_value = Mock(
+            initial=Mock(total=208605.8),
+            final=Mock(total=184692.3),
+            model_dump=lambda mode="json": {
+                "initial": {"total": 208605.8},
+                "final": {"total": 184692.3},
+            },
+        )
+        orders_service.charges_orders.return_value = [
+            Mock(charges={"total": 39.04, "brokerage": 11.23}, model_dump=lambda mode="json": {"charges": {"total": 39.04}}),
+            Mock(charges={"total": 30.48, "brokerage": 8.77}, model_dump=lambda mode="json": {"charges": {"total": 30.48}}),
+        ]
+
+        contract = build_live_basket_cost_contract(
+            kite=Mock(),
+            orders_service=orders_service,
+            orders=[
+                {
+                    "exchange": Exchange.NFO,
+                    "tradingsymbol": "NIFTY2650524000CE",
+                    "transaction_type": TransactionType.SELL,
+                    "variety": Variety.REGULAR,
+                    "product": Product.MIS,
+                    "order_type": OrderType.MARKET,
+                    "quantity": 65,
+                    "price": 206.6,
+                },
+                {
+                    "exchange": Exchange.NFO,
+                    "tradingsymbol": "NIFTY2650524000PE",
+                    "transaction_type": TransactionType.SELL,
+                    "variety": Variety.REGULAR,
+                    "product": Product.MIS,
+                    "order_type": OrderType.MARKET,
+                    "quantity": 65,
+                    "price": 161.3,
+                },
+            ],
+            corr_id="test",
+        )
+
+        self.assertEqual(contract.margin_required, Decimal("208605.8"))
+        self.assertEqual(contract.total_charges, Decimal("69.52"))
+        self.assertEqual(contract.brokerage, Decimal("20.00"))
+        self.assertEqual(contract.charges_status, "broker_quoted")
+
     def test_live_contract_uses_broker_margin_and_charges(self):
         orders_service = Mock()
         orders_service.order_margins.return_value = [

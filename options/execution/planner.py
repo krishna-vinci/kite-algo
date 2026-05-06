@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List
 
 
-def sort_entry_orders_buy_first(orders: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def sort_orders_buy_first(orders: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     normalized = [dict(order) for order in orders]
     buys = [order for order in normalized if str(order.get("transaction_type", "")).upper() == "BUY"]
     sells = [order for order in normalized if str(order.get("transaction_type", "")).upper() == "SELL"]
@@ -13,6 +13,10 @@ def sort_entry_orders_buy_first(orders: Iterable[Dict[str, Any]]) -> List[Dict[s
         if str(order.get("transaction_type", "")).upper() not in {"BUY", "SELL"}
     ]
     return buys + sells + others
+
+
+def sort_entry_orders_buy_first(orders: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sort_orders_buy_first(orders)
 
 
 def build_entry_order_plan(
@@ -46,4 +50,4 @@ def build_entry_order_plan(
                 order[optional_key] = leg.get(optional_key)
         orders.append(order)
 
-    return sort_entry_orders_buy_first(orders)
+    return sort_orders_buy_first(orders)

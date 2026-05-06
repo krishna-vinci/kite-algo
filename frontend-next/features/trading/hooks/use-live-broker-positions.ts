@@ -1,21 +1,31 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { fetchBrokerPositions, normalizeBrokerPositions, type BrokerPositionsResponse } from "@/features/trading/api";
+import { hasKiteBrowserSessionHint, onKiteBrowserSessionHintChange } from "@/lib/kite-browser-session";
 
 const QUERY_KEY = ["trading", "broker-positions"] as const;
 
 export function useLiveBrokerPositions() {
   const queryClient = useQueryClient();
+  const [enabled, setEnabled] = useState(() => hasKiteBrowserSessionHint());
+
+  useEffect(() => onKiteBrowserSessionHintChange(() => setEnabled(hasKiteBrowserSessionHint())), []);
+
   const query = useQuery({
     queryKey: QUERY_KEY,
     queryFn: fetchBrokerPositions,
     refetchInterval: 15_000,
+    enabled,
   });
+  const streamReady = enabled && Boolean(query.data);
 
   useEffect(() => {
+    if (!streamReady) {
+      return;
+    }
     const source = new EventSource("/api/positions/stream");
 
     source.onmessage = (event) => {
@@ -66,7 +76,7 @@ export function useLiveBrokerPositions() {
     };
 
     return () => source.close();
-  }, [queryClient]);
+  }, [queryClient, streamReady]);
 
   return query;
 }

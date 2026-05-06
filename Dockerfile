@@ -8,7 +8,6 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY alerts ./alerts
 COPY algo_runtime ./algo_runtime
 COPY api ./api
 COPY alembic ./alembic
@@ -18,7 +17,7 @@ COPY journaling ./journaling
 COPY options ./options
 COPY paper_runtime ./paper_runtime
 COPY strategies ./strategies
-COPY alembic.ini auth_service.py database.py main.py runtime_monitor.py schema.sql ./
+COPY alembic.ini auth_service.py database.py main.py runtime_monitor.py runtime_public_config.py schema.sql ./
 
 EXPOSE 8777
 

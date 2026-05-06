@@ -41,18 +41,18 @@ vi.mock("@/features/trading/hooks/use-trading-console-data", () => ({
 describe("AppShell", () => {
   it("renders the terminal shell chrome", () => {
     renderWithQueryClient(
-      <AppShell navigation={navigation} activeHref="/custom-display">
+      <AppShell navigation={navigation} activeHref="/strategies">
         <section aria-label="smoke content">
-          <h1>Custom Display</h1>
+          <h1>Strategies</h1>
         </section>
       </AppShell>,
     );
 
     expect(screen.getByText("K")).toBeInTheDocument();
-    expect(screen.getByTitle("Custom Display")).toHaveAttribute("href", "/custom-display");
-    expect(screen.getByText("CUSTOM DISPLAY")).toBeInTheDocument();
+    expect(screen.getByTitle("Strategies")).toHaveAttribute("href", "/strategies");
+    expect(screen.getByText("STRATEGIES")).toBeInTheDocument();
     expect(screen.getByText(/no active strategies/i)).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Custom Display" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Strategies" })).toBeInTheDocument();
   });
 
   it("includes Journal in the navigation rail", () => {
@@ -65,5 +65,15 @@ describe("AppShell", () => {
     const journalLink = screen.getByTitle("Journal");
     expect(journalLink).toBeInTheDocument();
     expect(journalLink).toHaveAttribute("href", "/journal");
+  });
+
+  it("does not render trading dock on journal workspace", () => {
+    renderWithQueryClient(
+      <AppShell navigation={navigation} activeHref="/journal">
+        <div>content</div>
+      </AppShell>,
+    );
+
+    expect(screen.queryByText(/active strategies/i)).not.toBeInTheDocument();
   });
 });

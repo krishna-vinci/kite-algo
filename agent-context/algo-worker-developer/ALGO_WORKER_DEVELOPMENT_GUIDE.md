@@ -13,30 +13,36 @@ Workers should only call the public worker API, preferably through the Python SD
 
 ## Install/use the SDK
 
-### Recommended: install from a Git tag on remote strategy servers
+### Recommended: install from PyPI on remote strategy servers
 
-Once the SDK changes are committed and tagged, remote servers can install the exact SDK version directly from Git:
+Once the SDK changes are published, remote servers should install the exact SDK version from PyPI:
+
+```bash
+python3 -m pip install kite-algo-worker==0.6.2
+```
+
+Fallback exact-tag install from the monorepo:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 ```
 
-HTTPS form:
+Pin live strategy servers to an immutable version such as `0.6.2`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
+
+Release conventions:
+
+- app/product tags: `vX.Y.Z`
+- SDK package tags: `kite-algo-worker-vX.Y.Z`
+
+Create the SDK tag from the repository root after bumping `sdk/python/pyproject.toml`:
 
 ```bash
-python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
+git tag -a kite-algo-worker-v0.6.2 -m "kite-algo-worker v0.6.2"
+git push origin kite-algo-worker-v0.6.2
 ```
 
-Pin live strategy servers to an immutable tag such as `kite-algo-worker-v0.6.0`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
-
-Create the tag from the repository root after committing the SDK:
-
-```bash
-git tag -a kite-algo-worker-v0.6.0 -m "kite-algo-worker v0.6.0"
-git push origin kite-algo-worker-v0.6.0
-```
+Pushing a `kite-algo-worker-v*` tag triggers GitHub Actions to build, validate, and publish the SDK to PyPI.
 
 ### Local development install
 

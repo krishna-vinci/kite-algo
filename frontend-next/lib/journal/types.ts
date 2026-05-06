@@ -1,7 +1,3 @@
-// ---------------------------------------------------------------------------
-// Journal domain types — API response shapes and view-model types
-// ---------------------------------------------------------------------------
-
 export type StrategyFamily =
   | "options_strategy"
   | "indicator_strategy"
@@ -66,32 +62,11 @@ export type JournalV2AnalyticsMetrics = {
   r_multiple: Record<string, unknown>;
 };
 
-export type JournalV2AnalyticsSummary = {
-  environment_id: string;
-  closed_episode_count: number;
-  metrics: JournalV2AnalyticsMetrics;
-};
-
 export type JournalV2StrategyScorecard = {
   template_id: string;
   strategy_family: string;
   display_name: string;
   metrics: JournalV2AnalyticsMetrics;
-};
-
-export type JournalV2StrategyAnalytics = {
-  environment_id: string;
-  items: JournalV2StrategyScorecard[];
-  count: number;
-};
-
-export type JournalV2PaperLiveComparison = {
-  template_id: string;
-  paper_environment_id: string;
-  live_environment_id: string;
-  paper: JournalV2AnalyticsMetrics;
-  live: JournalV2AnalyticsMetrics;
-  combined: null;
 };
 
 export type JournalV2UnresolvedItem = {
@@ -106,12 +81,6 @@ export type JournalV2UnresolvedItem = {
   status: string;
   created_at: string;
   resolved_at: string | null;
-};
-
-export type JournalV2UnresolvedQueue = {
-  environment_id: string;
-  items: JournalV2UnresolvedItem[];
-  count: number;
 };
 
 export type JournalTimelineEvent = {
@@ -129,35 +98,6 @@ export type JournalTimelineEvent = {
   occurred_at: string;
   payload: Record<string, unknown>;
 };
-
-export type JournalNote = {
-  id: string;
-  environment_id: string;
-  subject_type: string;
-  subject_id: string;
-  episode_id: string | null;
-  note_type: string;
-  title: string;
-  body_markdown: string;
-  body_text?: string;
-  body_json?: Record<string, unknown> | null;
-  tags: string[];
-  metadata?: Record<string, unknown>;
-  updated_at: string;
-};
-
-export type JournalNoteRevision = {
-  note_id: string;
-  revision_no: number;
-  body_markdown: string;
-  body_text?: string;
-  edited_at?: string;
-  change_reason?: string | null;
-};
-
-// ---------------------------------------------------------------------------
-// API response types
-// ---------------------------------------------------------------------------
 
 export type JournalSummary = {
   period: AnalysisPeriod;
@@ -302,10 +242,6 @@ export type JournalInsight = {
   related_run_ids: string[];
   related_rule_ids: string[];
 };
-
-// ---------------------------------------------------------------------------
-// Paginated response wrapper
-// ---------------------------------------------------------------------------
 
 export type Paginated<T> = {
   items: T[];

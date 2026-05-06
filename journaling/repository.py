@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, Iterator, List, Optional
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from database import SessionLocal
@@ -98,6 +98,18 @@ def _require_uuid_str(name: str, value: str | None) -> str:
     except ValueError as exc:
         raise ValueError(f"{name} must be a valid UUID") from exc
     return cleaned
+
+
+_ITEMIZED_EXECUTION_FACT_FIELDS = (
+    "brokerage",
+    "exchange_txn_charge",
+    "stt",
+    "stamp_duty",
+    "sebi_charge",
+    "gst",
+    "margin_required",
+    "charges_status",
+)
 
 
 class JournalRepository:
@@ -1014,9 +1026,52 @@ class JournalRepository:
     def insert_execution_fact(self, fact: JournalExecutionFact) -> int:
         db = self.session_factory()
         try:
+            has_itemized_costs = any(
+                getattr(fact, field, None) is not None for field in _ITEMIZED_EXECUTION_FACT_FIELDS
+            )
+            itemized_insert_columns = """
+                        brokerage,
+                        exchange_txn_charge,
+                        stt,
+                        stamp_duty,
+                        sebi_charge,
+                        gst,
+                        margin_required,
+                        charges_status,
+            """ if has_itemized_costs else ""
+            itemized_insert_values = """
+                        :brokerage,
+                        :exchange_txn_charge,
+                        :stt,
+                        :stamp_duty,
+                        :sebi_charge,
+                        :gst,
+                        :margin_required,
+                        :charges_status,
+            """ if has_itemized_costs else ""
+            itemized_update_set = """
+                        brokerage = COALESCE(EXCLUDED.brokerage, public.journal_execution_facts.brokerage),
+                        exchange_txn_charge = COALESCE(EXCLUDED.exchange_txn_charge, public.journal_execution_facts.exchange_txn_charge),
+                        stt = COALESCE(EXCLUDED.stt, public.journal_execution_facts.stt),
+                        stamp_duty = COALESCE(EXCLUDED.stamp_duty, public.journal_execution_facts.stamp_duty),
+                        sebi_charge = COALESCE(EXCLUDED.sebi_charge, public.journal_execution_facts.sebi_charge),
+                        gst = COALESCE(EXCLUDED.gst, public.journal_execution_facts.gst),
+                        margin_required = COALESCE(EXCLUDED.margin_required, public.journal_execution_facts.margin_required),
+                        charges_status = COALESCE(EXCLUDED.charges_status, public.journal_execution_facts.charges_status),
+            """ if has_itemized_costs else ""
+            itemized_params = {
+                "brokerage": fact.brokerage,
+                "exchange_txn_charge": fact.exchange_txn_charge,
+                "stt": fact.stt,
+                "stamp_duty": fact.stamp_duty,
+                "sebi_charge": fact.sebi_charge,
+                "gst": fact.gst,
+                "margin_required": fact.margin_required,
+                "charges_status": fact.charges_status,
+            }
             row = db.execute(
                 text(
-                    """
+                    f"""
                     INSERT INTO public.journal_execution_facts (
                         run_id,
                         environment_id,
@@ -1035,6 +1090,7 @@ class JournalRepository:
                         fees_amount,
                         taxes_amount,
                         slippage_amount,
+                        {itemized_insert_columns}
                         position_effect,
                         payload_json
                     ) VALUES (
@@ -1055,6 +1111,7 @@ class JournalRepository:
                         :fees_amount,
                         :taxes_amount,
                         :slippage_amount,
+                        {itemized_insert_values}
                         :position_effect,
                         CAST(:payload_json AS jsonb)
                     )
@@ -1074,6 +1131,7 @@ class JournalRepository:
                         fees_amount = EXCLUDED.fees_amount,
                         taxes_amount = EXCLUDED.taxes_amount,
                         slippage_amount = EXCLUDED.slippage_amount,
+                        {itemized_update_set}
                         position_effect = COALESCE(EXCLUDED.position_effect, public.journal_execution_facts.position_effect),
                         payload_json = EXCLUDED.payload_json
                     RETURNING id
@@ -1097,6 +1155,7 @@ class JournalRepository:
                     "fees_amount": fact.fees_amount,
                     "taxes_amount": fact.taxes_amount,
                     "slippage_amount": fact.slippage_amount,
+                    **itemized_params,
                     "position_effect": fact.position_effect,
                     "payload_json": _json_dumps(fact.payload),
                 },
@@ -2901,6 +2960,64 @@ class JournalRepository:
         finally:
             db.close()
 
+    def list_execution_facts_for_episodes(self, episode_ids: list[str]) -> dict[str, list[JournalExecutionFact]]:
+        normalized_episode_ids = [_require_uuid_str("episode_id", episode_id) for episode_id in episode_ids]
+        if not normalized_episode_ids:
+            return {}
+
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT *
+                    FROM public.journal_execution_facts
+                    WHERE episode_id IN :episode_ids
+                    ORDER BY episode_id ASC, fill_timestamp ASC, id ASC
+                    """
+                ).bindparams(bindparam("episode_ids", expanding=True)),
+                {"episode_ids": normalized_episode_ids},
+            ).mappings().all()
+            grouped: dict[str, list[JournalExecutionFact]] = {}
+            for row in rows:
+                fact = self._execution_fact_from_row(row)
+                if fact.episode_id is None:
+                    continue
+                grouped.setdefault(fact.episode_id, []).append(fact)
+            return grouped
+        finally:
+            db.close()
+
+    def update_episode_notes(self, *, episode_id: str, environment_id: str, notes: str) -> bool:
+        normalized_episode_id = _require_uuid_str("episode_id", episode_id)
+        normalized_environment_id = _require_uuid_str("environment_id", environment_id)
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE public.journal_episodes
+                    SET notes = :notes,
+                        updated_at = NOW()
+                    WHERE id = CAST(:episode_id AS uuid)
+                      AND environment_id = CAST(:environment_id AS uuid)
+                    RETURNING id
+                    """
+                ),
+                {
+                    "episode_id": normalized_episode_id,
+                    "environment_id": normalized_environment_id,
+                    "notes": str(notes or ""),
+                },
+            ).mappings().first()
+            db.commit()
+            return row is not None
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
     def create_execution_intent(
         self,
         *,
@@ -3636,6 +3753,34 @@ class JournalRepository:
         finally:
             db.close()
 
+    def list_episode_timeline_events_for_episodes(self, episode_ids: list[str]) -> dict[str, list[JournalTimelineEvent]]:
+        normalized_episode_ids = [_require_uuid_str("episode_id", episode_id) for episode_id in episode_ids]
+        if not normalized_episode_ids:
+            return {}
+
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT *
+                    FROM public.journal_timeline_events
+                    WHERE episode_id IN :episode_ids
+                    ORDER BY episode_id ASC, occurred_at ASC, id ASC
+                    """
+                ).bindparams(bindparam("episode_ids", expanding=True)),
+                {"episode_ids": normalized_episode_ids},
+            ).mappings().all()
+            grouped: dict[str, list[JournalTimelineEvent]] = {}
+            for row in rows:
+                event = self._timeline_event_from_row(row)
+                if event.episode_id is None:
+                    continue
+                grouped.setdefault(event.episode_id, []).append(event)
+            return grouped
+        finally:
+            db.close()
+
     def set_projection_state(self, state: ProjectionState) -> None:
         db = self.session_factory()
         try:
@@ -3879,6 +4024,7 @@ class JournalRepository:
             status=payload.get("status") or "draft",
             opened_at=payload.get("opened_at") or datetime.utcnow(),
             closed_at=payload.get("closed_at"),
+            notes=payload.get("notes") or "",
             metadata=_decode_json_field(payload.get("metadata_json")) or {},
             created_at=payload.get("created_at") or datetime.utcnow(),
             updated_at=payload.get("updated_at") or datetime.utcnow(),
@@ -3990,6 +4136,14 @@ class JournalRepository:
             fees_amount=payload.get("fees_amount") or Decimal("0"),
             taxes_amount=payload.get("taxes_amount") or Decimal("0"),
             slippage_amount=payload.get("slippage_amount") or Decimal("0"),
+            brokerage=payload.get("brokerage"),
+            exchange_txn_charge=payload.get("exchange_txn_charge"),
+            stt=payload.get("stt"),
+            stamp_duty=payload.get("stamp_duty"),
+            sebi_charge=payload.get("sebi_charge"),
+            gst=payload.get("gst"),
+            margin_required=payload.get("margin_required"),
+            charges_status=payload.get("charges_status"),
             position_effect=payload.get("position_effect"),
             payload=_decode_json_field(payload.get("payload_json")) or {},
         )

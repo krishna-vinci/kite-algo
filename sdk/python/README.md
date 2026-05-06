@@ -4,20 +4,37 @@ Thin Python SDK for external Kite Algo strategy workers.
 
 The SDK only calls public Kite Algo worker API endpoints under `/api/algo-workers/worker/*`. It does not call broker internals, paper-runtime internals, market-runtime internals, or the database.
 
+## Install from PyPI
+
+Recommended for public installs and remote strategy servers:
+
+```bash
+python3 -m pip install kite-algo-worker==0.6.2
+```
+
+Extras:
+
+```bash
+python3 -m pip install "kite-algo-worker[dataframe]==0.6.2"
+python3 -m pip install "kite-algo-worker[indicators]==0.6.2"
+```
+
+Pin to an immutable version in production.
+
 ## Install from a Git tag
 
-Recommended for remote strategy servers:
+Use this when you need an exact monorepo tag before or instead of a PyPI release:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 ```
 
 HTTPS form:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 ```
 
 Pin to an immutable tag in production. Avoid installing from a moving branch such as `main` on live strategy servers.
@@ -42,21 +59,42 @@ From a Git tag:
 
 ```bash
 python3 -m pip install \
-  "kite-algo-worker[dataframe] @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
+  "kite-algo-worker[dataframe] @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 python3 -m pip install \
-  "kite-algo-worker[indicators] @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
+  "kite-algo-worker[indicators] @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
 ```
 
-## Create the release tag
+## Release conventions
 
-After the SDK changes are committed and pushed, create and push a tag from the repository root:
+- app/product tags: `vX.Y.Z`
+- SDK package tags: `kite-algo-worker-vX.Y.Z`
+
+The SDK has its own semantic version stream because this repo is a monorepo and backend changes should not force SDK releases.
+
+## Publish the SDK
+
+After the SDK changes are committed and pushed, bump `sdk/python/pyproject.toml` and create the matching SDK tag from the repository root:
 
 ```bash
-git tag -a kite-algo-worker-v0.6.0 -m "kite-algo-worker v0.6.0"
-git push origin kite-algo-worker-v0.6.0
+git tag -a kite-algo-worker-v0.6.2 -m "kite-algo-worker v0.6.2"
+git push origin kite-algo-worker-v0.6.2
 ```
 
-Then remote servers can install the exact SDK version using the Git-tag install command above.
+Pushing a `kite-algo-worker-v*` tag triggers GitHub Actions to:
+
+1. build the wheel and source distribution from `sdk/python`
+2. run `twine check`
+3. publish the package to PyPI as `kite-algo-worker`
+
+### First-time PyPI setup
+
+Configure PyPI trusted publishing for `kite-algo-worker` to trust the GitHub workflow:
+
+- repository: `krishna-vinci/kite-algo`
+- workflow: `publish-kite-algo-worker.yml`
+- environment: `pypi`
+
+After that, remote servers should prefer the PyPI install command above.
 
 ## Minimal usage
 

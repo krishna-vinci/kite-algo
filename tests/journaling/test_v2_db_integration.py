@@ -40,6 +40,71 @@ def _apply_schema_twice() -> None:
             conn.commit()
 
 
+def _table_columns(db, table_name: str) -> set[str]:
+    rows = db.execute(
+        text(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = :table_name
+            """
+        ),
+        {"table_name": table_name},
+    )
+    return {row[0] for row in rows}
+
+
+def _table_column_details(db, table_name: str) -> dict[str, dict[str, str | None]]:
+    rows = db.execute(
+        text(
+            """
+            SELECT column_name, data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = :table_name
+            """
+        ),
+        {"table_name": table_name},
+    )
+    return {
+        row[0]: {
+            "data_type": row[1],
+            "is_nullable": row[2],
+            "column_default": row[3],
+        }
+        for row in rows
+    }
+
+
+def _table_constraint_defs(db, table_name: str) -> dict[str, str]:
+    rows = db.execute(
+        text(
+            """
+            SELECT c.conname, pg_get_constraintdef(c.oid)
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = 'public' AND t.relname = :table_name
+            """
+        ),
+        {"table_name": table_name},
+    )
+    return {row[0]: row[1] for row in rows}
+
+
+def _table_index_defs(db, table_name: str) -> dict[str, str]:
+    rows = db.execute(
+        text(
+            """
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = 'public' AND tablename = :table_name
+            """
+        ),
+        {"table_name": table_name},
+    )
+    return {row[0]: row[1] for row in rows}
+
+
 @unittest.skipUnless(_db_ready(), "TEST_DATABASE_URL not configured")
 class JournalV2DatabaseIntegrationTests(unittest.TestCase):
     @classmethod
@@ -149,6 +214,65 @@ class JournalV2DatabaseIntegrationTests(unittest.TestCase):
     def test_schema_sql_applies_twice_to_real_postgres(self):
         _apply_schema_twice()
 
+    def test_journal_v2_schema_has_itemized_cost_notes_constraint_and_indexes(self):
+        db = self.SessionLocal()
+        try:
+            fact_columns = _table_column_details(db, "journal_execution_facts")
+            for name in [
+                "brokerage",
+                "exchange_txn_charge",
+                "stt",
+                "stamp_duty",
+                "sebi_charge",
+                "gst",
+                "margin_required",
+                "charges_status",
+            ]:
+                assert name in fact_columns
+                assert fact_columns[name]["is_nullable"] == "NO"
+
+            for name in [
+                "brokerage",
+                "exchange_txn_charge",
+                "stt",
+                "stamp_duty",
+                "sebi_charge",
+                "gst",
+                "margin_required",
+            ]:
+                assert fact_columns[name]["data_type"] == "numeric"
+                assert fact_columns[name]["column_default"] == "0"
+
+            assert fact_columns["charges_status"]["data_type"] == "text"
+            assert fact_columns["charges_status"]["column_default"] == "'unavailable'::text"
+
+            episode_columns = _table_column_details(db, "journal_episodes")
+            assert "notes" in episode_columns
+            assert episode_columns["notes"]["data_type"] == "text"
+            assert episode_columns["notes"]["is_nullable"] == "NO"
+            assert episode_columns["notes"]["column_default"] == "''::text"
+
+            fact_constraints = _table_constraint_defs(db, "journal_execution_facts")
+            assert "journal_execution_facts_charges_status_chk" in fact_constraints
+            constraint_def = fact_constraints["journal_execution_facts_charges_status_chk"]
+            for expected_status in ["estimated", "broker_quoted", "reconciled", "unavailable"]:
+                assert expected_status in constraint_def
+
+            episode_indexes = _table_index_defs(db, "journal_episodes")
+            assert "idx_journal_episodes_environment_opened_at" in episode_indexes
+            assert "idx_journal_episodes_environment_closed_at" in episode_indexes
+            assert "opened_at DESC" in episode_indexes["idx_journal_episodes_environment_opened_at"]
+            assert "closed_at DESC" in episode_indexes["idx_journal_episodes_environment_closed_at"]
+            assert "WHERE (closed_at IS NOT NULL)" in episode_indexes["idx_journal_episodes_environment_closed_at"]
+
+            fact_indexes = _table_index_defs(db, "journal_execution_facts")
+            assert "idx_journal_execution_facts_environment_fill_timestamp" in fact_indexes
+            fact_index = fact_indexes["idx_journal_execution_facts_environment_fill_timestamp"]
+            assert "fill_timestamp DESC" in fact_index
+            assert "WHERE (environment_id IS NOT NULL)" in fact_index
+        finally:
+            db.close()
+
     def test_live_and_paper_same_external_run_id_create_separate_contexts_and_episodes(self):
         live_run_id = self._create_run(execution_mode="live", account_ref="kite:AB1234")
         paper_run_id = self._create_run(execution_mode="paper", account_ref="kite:paper-journal-v2-db")
@@ -212,6 +336,33 @@ class JournalV2DatabaseIntegrationTests(unittest.TestCase):
         self.repository.insert_execution_fact(
             JournalExecutionFact(
                 run_id=run_id,
+                environment_id=first["environment_id"],
+                episode_id=first["episode_id"],
+                intent_id=first["intent_id"],
+                source_type=SourceType.PAPER_TRADE,
+                source_fact_key="paper:v1-replay-db-fill",
+                order_id=f"OID-paper:v1-replay-db-fill",
+                trade_id=f"TRD-paper:v1-replay-db-fill",
+                fill_timestamp=datetime(2026, 5, 1, 9, 15, tzinfo=timezone.utc),
+                side="BUY",
+                quantity=1,
+                price=Decimal("100"),
+                gross_cash_flow=Decimal("-100"),
+                brokerage=Decimal("1.25"),
+                exchange_txn_charge=Decimal("0.45"),
+                stt=Decimal("0.80"),
+                stamp_duty=Decimal("0.10"),
+                sebi_charge=Decimal("0.02"),
+                gst=Decimal("0.31"),
+                margin_required=Decimal("2500"),
+                charges_status="reconciled",
+                payload={"source": "v2-enriched"},
+            )
+        )
+
+        self.repository.insert_execution_fact(
+            JournalExecutionFact(
+                run_id=run_id,
                 source_type=SourceType.PAPER_TRADE,
                 source_fact_key="paper:v1-replay-db-fill",
                 fill_timestamp=datetime(2026, 5, 1, 9, 16, tzinfo=timezone.utc),
@@ -231,6 +382,218 @@ class JournalV2DatabaseIntegrationTests(unittest.TestCase):
         assert str(fact.environment_id) == first["environment_id"]
         assert str(fact.episode_id) == first["episode_id"]
         assert str(fact.intent_id) == first["intent_id"]
+        assert fact.brokerage == Decimal("1.25")
+        assert fact.exchange_txn_charge == Decimal("0.45")
+        assert fact.stt == Decimal("0.80")
+        assert fact.stamp_duty == Decimal("0.10")
+        assert fact.sebi_charge == Decimal("0.02")
+        assert fact.gst == Decimal("0.31")
+        assert fact.margin_required == Decimal("2500")
+        assert fact.charges_status == "reconciled"
+
+    def test_repository_reads_itemized_execution_costs_from_execution_fact_rows(self):
+        run_id = self._create_run(execution_mode="paper", account_ref="kite:paper-journal-v2-db")
+        recorded = self._record_fill(
+            mode="paper",
+            account_scope="kite:paper-journal-v2-db",
+            external_run_id="itemized-db-run",
+            source_type="paper_trade",
+            source_fact_key="paper:itemized-db-fill",
+            run_id=run_id,
+        )
+
+        self.repository.insert_execution_fact(
+            JournalExecutionFact(
+                run_id=run_id,
+                environment_id=recorded["environment_id"],
+                episode_id=recorded["episode_id"],
+                intent_id=recorded["intent_id"],
+                source_type=SourceType.PAPER_TRADE,
+                source_fact_key="paper:itemized-db-fill",
+                order_id="OID-paper:itemized-db-fill",
+                trade_id="TRD-paper:itemized-db-fill",
+                fill_timestamp=datetime(2026, 5, 1, 9, 15, tzinfo=timezone.utc),
+                side="BUY",
+                quantity=1,
+                price=Decimal("100"),
+                gross_cash_flow=Decimal("-100"),
+                brokerage=Decimal("1.50"),
+                exchange_txn_charge=Decimal("0.55"),
+                stt=Decimal("0.90"),
+                stamp_duty=Decimal("0.11"),
+                sebi_charge=Decimal("0.03"),
+                gst=Decimal("0.37"),
+                margin_required=Decimal("3000"),
+                charges_status="broker_quoted",
+                payload={"source": "itemized-read"},
+            )
+        )
+
+        fact = self.repository.find_v2_execution_fact_by_source(
+            source_type="paper_trade",
+            source_fact_key="paper:itemized-db-fill",
+        )
+
+        assert fact is not None
+        assert fact.brokerage == Decimal("1.50")
+        assert fact.exchange_txn_charge == Decimal("0.55")
+        assert fact.stt == Decimal("0.90")
+        assert fact.stamp_duty == Decimal("0.11")
+        assert fact.sebi_charge == Decimal("0.03")
+        assert fact.gst == Decimal("0.37")
+        assert fact.margin_required == Decimal("3000")
+        assert fact.charges_status == "broker_quoted"
+
+    def test_itemized_upsert_preserves_unspecified_existing_cost_fields(self):
+        run_id = self._create_run(execution_mode="paper", account_ref="kite:paper-journal-v2-db")
+        recorded = self._record_fill(
+            mode="paper",
+            account_scope="kite:paper-journal-v2-db",
+            external_run_id="partial-itemized-db-run",
+            source_type="paper_trade",
+            source_fact_key="paper:partial-itemized-db-fill",
+            run_id=run_id,
+        )
+
+        self.repository.insert_execution_fact(
+            JournalExecutionFact(
+                run_id=run_id,
+                environment_id=recorded["environment_id"],
+                episode_id=recorded["episode_id"],
+                intent_id=recorded["intent_id"],
+                source_type=SourceType.PAPER_TRADE,
+                source_fact_key="paper:partial-itemized-db-fill",
+                order_id="OID-paper:partial-itemized-db-fill",
+                trade_id="TRD-paper:partial-itemized-db-fill",
+                fill_timestamp=datetime(2026, 5, 1, 9, 15, tzinfo=timezone.utc),
+                side="BUY",
+                quantity=1,
+                price=Decimal("100"),
+                gross_cash_flow=Decimal("-100"),
+                brokerage=Decimal("1.50"),
+                exchange_txn_charge=Decimal("0.55"),
+                stt=Decimal("0.90"),
+                stamp_duty=Decimal("0.11"),
+                sebi_charge=Decimal("0.03"),
+                gst=Decimal("0.37"),
+                margin_required=Decimal("3000"),
+                charges_status="broker_quoted",
+                payload={"source": "itemized-seed"},
+            )
+        )
+
+        self.repository.insert_execution_fact(
+            JournalExecutionFact(
+                run_id=run_id,
+                environment_id=recorded["environment_id"],
+                episode_id=recorded["episode_id"],
+                intent_id=recorded["intent_id"],
+                source_type=SourceType.PAPER_TRADE,
+                source_fact_key="paper:partial-itemized-db-fill",
+                order_id="OID-paper:partial-itemized-db-fill",
+                trade_id="TRD-paper:partial-itemized-db-fill",
+                fill_timestamp=datetime(2026, 5, 1, 9, 16, tzinfo=timezone.utc),
+                side="BUY",
+                quantity=1,
+                price=Decimal("100"),
+                gross_cash_flow=Decimal("-100"),
+                stt=Decimal("1.10"),
+                charges_status="reconciled",
+                payload={"source": "itemized-partial-update"},
+            )
+        )
+
+        fact = self.repository.find_v2_execution_fact_by_source(
+            source_type="paper_trade",
+            source_fact_key="paper:partial-itemized-db-fill",
+        )
+
+        assert fact is not None
+        assert fact.brokerage == Decimal("1.50")
+        assert fact.exchange_txn_charge == Decimal("0.55")
+        assert fact.stt == Decimal("1.10")
+        assert fact.stamp_duty == Decimal("0.11")
+        assert fact.sebi_charge == Decimal("0.03")
+        assert fact.gst == Decimal("0.37")
+        assert fact.margin_required == Decimal("3000")
+        assert fact.charges_status == "reconciled"
+
+    def test_update_episode_notes_is_environment_scoped_and_can_clear_empty_string(self):
+        first = self._record_fill(
+            mode="paper",
+            account_scope="kite:paper-journal-v2-db",
+            external_run_id="notes-db-run-a",
+            source_type="paper_trade",
+            source_fact_key="paper:notes-db-fill-a",
+        )
+        second = self._record_fill(
+            mode="paper",
+            account_scope="kite:paper-journal-v2-db-2",
+            external_run_id="notes-db-run-b",
+            source_type="paper_trade",
+            source_fact_key="paper:notes-db-fill-b",
+        )
+
+        assert self.repository.update_episode_notes(
+            episode_id=first["episode_id"],
+            environment_id=second["environment_id"],
+            notes="wrong environment",
+        ) is False
+
+        episode = self.repository.get_episode_detail(first["episode_id"])
+        assert episode is not None
+        assert episode.notes == ""
+
+        assert self.repository.update_episode_notes(
+            episode_id=first["episode_id"],
+            environment_id=first["environment_id"],
+            notes="Initial note",
+        ) is True
+
+        episode = self.repository.get_episode_detail(first["episode_id"])
+        assert episode is not None
+        assert episode.notes == "Initial note"
+
+        assert self.repository.update_episode_notes(
+            episode_id=first["episode_id"],
+            environment_id=first["environment_id"],
+            notes="",
+        ) is True
+
+        episode = self.repository.get_episode_detail(first["episode_id"])
+        other_episode = self.repository.get_episode_detail(second["episode_id"])
+        assert episode is not None
+        assert other_episode is not None
+        assert episode.notes == ""
+        assert other_episode.notes == ""
+
+    def test_list_execution_facts_for_episodes_groups_rows_and_empty_input_returns_empty_dict(self):
+        first = self._record_fill(
+            mode="paper",
+            account_scope="kite:paper-journal-v2-db",
+            external_run_id="batch-db-run-a",
+            source_type="paper_trade",
+            source_fact_key="paper:batch-db-fill-a",
+        )
+        second = self._record_fill(
+            mode="paper",
+            account_scope="kite:paper-journal-v2-db",
+            external_run_id="batch-db-run-b",
+            source_type="paper_trade",
+            source_fact_key="paper:batch-db-fill-b",
+            side="SELL",
+        )
+
+        assert self.repository.list_execution_facts_for_episodes([]) == {}
+
+        grouped = self.repository.list_execution_facts_for_episodes([
+            first["episode_id"],
+            second["episode_id"],
+        ])
+
+        assert set(grouped) == {first["episode_id"], second["episode_id"]}
+        assert [fact.source_fact_key for fact in grouped[first["episode_id"]]] == ["paper:batch-db-fill-a"]
+        assert [fact.source_fact_key for fact in grouped[second["episode_id"]]] == ["paper:batch-db-fill-b"]
 
     def test_concurrent_note_updates_serialize_revisions(self):
         run_id = self._create_run(execution_mode="paper", account_ref="kite:paper-journal-v2-db")

@@ -6,7 +6,7 @@ const PUBLIC_PATHS = new Set(["/login"]);
 export function middleware(request: NextRequest) {
   const { pathname, search } = request.nextUrl;
 
-  if (pathname.startsWith("/_next") || pathname.startsWith("/api") || pathname === "/favicon.ico") {
+  if (pathname.startsWith("/_next") || pathname.startsWith("/api") || pathname.startsWith("/ws") || pathname === "/favicon.ico") {
     return NextResponse.next();
   }
 

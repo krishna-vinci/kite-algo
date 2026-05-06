@@ -129,7 +129,7 @@ class OptionStrategyRouterTests(unittest.IsolatedAsyncioTestCase):
     async def test_build_position_dry_run_returns_strategy_preview(self):
         request = self._request()
 
-        response = await build_position(self._payload(), request, kite=None, corr_id="corr-1")
+        response = await build_position(self._payload(), request, db=None, corr_id="corr-1")
 
         self.assertEqual(response["mode"], "dry_run")
         self.assertIn("strategy", response)
@@ -142,7 +142,7 @@ class OptionStrategyRouterTests(unittest.IsolatedAsyncioTestCase):
         with patch("strategies.indexstoploss.router.require_app_user", return_value=SimpleNamespace(username="admin")), \
             patch("strategies.indexstoploss.router._build_runtime_instance_for_plan", return_value=SimpleNamespace(model_copy=lambda update=None: SimpleNamespace(status=update.get("status") if update else None))), \
             patch("strategies.indexstoploss.router._arm_runtime_monitoring", AsyncMock(return_value="option-strategy:run-123")):
-            response = await build_position(self._payload(execution_mode="paper"), request, kite=None, corr_id="corr-1")
+            response = await build_position(self._payload(execution_mode="paper"), request, db=None, corr_id="corr-1")
 
         self.assertEqual(response["mode"], "paper")
         self.assertEqual(response["strategy_run_id"], "run-123")
@@ -159,7 +159,7 @@ class OptionStrategyRouterTests(unittest.IsolatedAsyncioTestCase):
         with patch("strategies.indexstoploss.router.require_app_user", return_value=SimpleNamespace(username="admin")), \
             patch("strategies.indexstoploss.router._build_runtime_instance_for_plan", return_value=SimpleNamespace(instance_id="option-strategy:run-123")) as build_runtime, \
             patch("strategies.indexstoploss.router._arm_runtime_monitoring", AsyncMock(return_value="option-strategy:run-123")) as arm_runtime:
-            response = await build_position(self._payload(execution_mode="paper"), request, kite=None, corr_id="corr-1")
+            response = await build_position(self._payload(execution_mode="paper"), request, db=None, corr_id="corr-1")
 
         build_runtime.assert_called_once()
         arm_runtime.assert_awaited_once()
@@ -180,8 +180,9 @@ class OptionStrategyRouterTests(unittest.IsolatedAsyncioTestCase):
         with patch("strategies.indexstoploss.router._build_runtime_instance_for_plan", return_value=SimpleNamespace(model_copy=lambda update=None: SimpleNamespace(status=update.get("status") if update else None))), \
             patch("strategies.indexstoploss.router._arm_runtime_monitoring", AsyncMock(return_value="option-strategy:run-123")), \
             patch("strategies.indexstoploss.router._disarm_runtime_monitoring", AsyncMock()) as disarm, \
-            patch("strategies.indexstoploss.router.run_kite_write_action", _run_kite_write_action_inline):
-            response = await build_position(self._payload(execution_mode="live"), request, kite=_BrokenKite(), corr_id="corr-1")
+            patch("strategies.indexstoploss.router.run_kite_write_action", _run_kite_write_action_inline), \
+            patch("strategies.indexstoploss.router.get_kite", return_value=_BrokenKite()):
+            response = await build_position(self._payload(execution_mode="live"), request, db=None, corr_id="corr-1")
 
         disarm.assert_awaited_once_with(request, "option-strategy:run-123")
 
@@ -195,8 +196,9 @@ class OptionStrategyRouterTests(unittest.IsolatedAsyncioTestCase):
         with patch("strategies.indexstoploss.router._build_runtime_instance_for_plan", return_value=SimpleNamespace(model_copy=lambda update=None: SimpleNamespace(status=update.get("status") if update else None))), \
             patch("strategies.indexstoploss.router._arm_runtime_monitoring", AsyncMock(return_value="option-strategy:run-123")), \
             patch("strategies.indexstoploss.router._activate_runtime_monitoring", AsyncMock()), \
-            patch("strategies.indexstoploss.router.run_kite_write_action", AsyncMock(return_value="OID-123")) as write_action:
-            response = await build_position(self._payload(execution_mode="live"), request, kite=SimpleNamespace(), corr_id="corr-1")
+            patch("strategies.indexstoploss.router.run_kite_write_action", AsyncMock(return_value="OID-123")) as write_action, \
+            patch("strategies.indexstoploss.router.get_kite", return_value=SimpleNamespace()):
+            response = await build_position(self._payload(execution_mode="live"), request, db=None, corr_id="corr-1")
 
         self.assertEqual(response["status"], "success")
         self.assertEqual(response["strategy_run_id"], "run-123")

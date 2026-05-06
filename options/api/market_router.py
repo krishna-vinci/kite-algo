@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from broker_api.instruments_repository import InstrumentsRepository
 from broker_api.options_sessions import OptionsSessionManager
@@ -8,6 +13,17 @@ from database import SessionLocal
 from options.market.service import OptionsMarketService
 
 router = APIRouter(prefix="/api/options", tags=["Options"])
+
+
+class OptionsSessionItemPayload(BaseModel):
+    underlying: str = Field(min_length=1)
+    window: int = Field(default=12, ge=1, le=100)
+    cadence_sec: int = Field(default=5, ge=1, le=3600)
+
+
+class OptionsSessionsStartPayload(BaseModel):
+    replace: bool = False
+    items: list[OptionsSessionItemPayload]
 
 
 def get_options_session_manager(request: Request):
@@ -23,12 +39,68 @@ def get_options_session_manager(request: Request):
     return request.app.state.options_session_manager
 
 
+def _raw_session_snapshot(manager: OptionsSessionManager, underlying: str) -> dict:
+    normalized, _ = manager.instrument_repo.normalize_underlying_symbol(underlying)
+    snapshot = manager.get_snapshot(normalized)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail={"code": "OPTION_SESSION_NOT_FOUND", "message": "No active option session for the requested underlying"})
+    return OptionsMarketService(manager)._json_safe(snapshot)
+
+
+@router.post("/sessions")
+async def start_option_sessions(
+    payload: OptionsSessionsStartPayload,
+    manager=Depends(get_options_session_manager),
+):
+    await manager.start_sessions(
+        [item.model_dump() for item in payload.items],
+        replace=payload.replace,
+    )
+    return {"status": "ok", "watchlist": manager.get_watchlist()}
+
+
+@router.get("/session/{underlying}")
+async def get_option_session_legacy(
+    underlying: str,
+    manager=Depends(get_options_session_manager),
+):
+    return _raw_session_snapshot(manager, underlying)
+
+
 @router.get("/underlyings/{underlying}/session")
 async def get_option_session(
     underlying: str,
     manager=Depends(get_options_session_manager),
 ):
     return OptionsMarketService(manager).get_session(underlying)
+
+
+@router.get("/underlyings/{underlying}/stream")
+async def stream_option_session(
+    underlying: str,
+    manager=Depends(get_options_session_manager),
+):
+    initial_payload = OptionsMarketService(manager).get_session(underlying)
+    normalized = str(initial_payload.get("underlying") or underlying).upper()
+    queue = await manager.register_client(normalized)
+
+    async def event_stream():
+        try:
+            yield f"data: {json.dumps(initial_payload)}\n\n"
+            while True:
+                await queue.get()
+                payload = OptionsMarketService(manager).get_session(normalized)
+                yield f"data: {json.dumps(payload)}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            manager.deregister_client(normalized, queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/underlyings/{underlying}/expiries")

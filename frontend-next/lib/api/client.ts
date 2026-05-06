@@ -50,6 +50,14 @@ async function refreshAppSession() {
   return refreshPromise;
 }
 
+function isAppAuthFailure(body: unknown) {
+  if (!body || typeof body !== "object" || !("detail" in body)) {
+    return false;
+  }
+  const detail = String((body as { detail?: unknown }).detail ?? "").toLowerCase();
+  return detail.includes("app authentication") || detail.includes("token expired") || detail.includes("invalid token");
+}
+
 export async function apiFetch<T>(
   input: string,
   options: ApiFetchOptions = {},
@@ -73,6 +81,11 @@ export async function apiFetch<T>(
   let response = await fetch(`${baseUrl}${input}`, requestInit);
 
   if (response.status === 401 && !input.includes("/auth/login") && !input.includes("/auth/refresh")) {
+    const body = safeParseJson(await response.clone().text());
+    if (!isAppAuthFailure(body)) {
+      const text = await response.text();
+      throw new ApiClientError(response.status, text ? safeParseJson(text) : body, response.statusText || `Request failed with status ${response.status}`);
+    }
     try {
       await refreshAppSession();
       response = await fetch(`${baseUrl}${input}`, requestInit);

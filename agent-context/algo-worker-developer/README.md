@@ -2,7 +2,7 @@
 
 This folder is a copyable context pack for agents that build external Kite Algo strategies.
 
-Give the whole folder to an algo developer agent when you want it to write workers on another machine or in another repo. The agent does **not** need backend source access for normal strategy work; it should install the SDK from the Git tag and follow the contracts in this folder.
+Give the whole folder to an algo developer agent when you want it to write workers on another machine or in another repo. The agent does **not** need backend source access for normal strategy work; it should install the SDK from PyPI and follow the contracts in this folder.
 
 ## Start here
 
@@ -36,8 +36,9 @@ If this context pack and the canonical files disagree, trust the canonical files
 ## Current SDK release
 
 - Package name: `kite-algo-worker`
-- Version: `0.6.0`
-- Git tag: `kite-algo-worker-v0.6.0`
+- Version: `0.6.2`
+- SDK tag convention: `kite-algo-worker-vX.Y.Z`
+- App tag convention: `vX.Y.Z`
 
 Current hardened core surface:
 
@@ -52,8 +53,15 @@ The certification script now prints preview output and capability flags for this
 Remote install:
 
 ```bash
+python3 -m pip install kite-algo-worker==0.6.2
+```
+
+Fallback exact-tag install:
+
+```bash
 python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.0#subdirectory=sdk/python"
+  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
+```
 
 This release adds:
 
@@ -61,4 +69,3 @@ This release adds:
 - live order/basket preview APIs for sizing and charges checks
 - async SDK support plus websocket clients for ticks, candles, and grouped run P&L
 - safer worker ergonomics such as `ensure_run(...)`, `wait_for_history(...)`, and `live_equity_market_order(...)`
-```

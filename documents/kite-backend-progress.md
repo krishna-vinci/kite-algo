@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-05-01
+Last updated: 2026-05-04
 
 ## Scope
 
@@ -24,6 +24,24 @@ Do not use this file for frontend work.
 - Added backend mutual fund router in `broker_api/kite_mutual_funds.py`
 
 ## Newly implemented in current branch
+
+- Added Journal V2 Phase B6 analytics separation:
+  - created `journaling/analytics_service.py` with period-aware analytics summary, strategy deep-dive, dense equity curve, cost analysis, and paper-vs-live comparison computation on top of V2 episodes/facts
+  - added authenticated `/api/analytics/v1/summary`, `/api/analytics/v1/strategy/{template_id}`, `/api/analytics/v1/equity-curve`, `/api/analytics/v1/cost-analysis`, and `/api/analytics/v1/compare`
+  - wired the analytics router into `main.py`, added an OpenAPI Analytics tag, and added focused service/router regression coverage
+
+- Added Journal V2 Phase B5 journal read surface:
+  - added `journaling/periods.py` with IST day/week/month/year/since-inception UTC boundary helpers
+  - `JournalService.resolve_v2_environment_id(..., create_if_missing=False)` now supports read-only mode/account-scope resolution without auto-creating environments
+  - added `get_v2_daily`, `get_v2_period`, enriched `list_v2_episodes`, enriched `get_v2_episode_detail`, period-aware `list_v2_strategies`, and `patch_v2_episode_notes`
+  - added authenticated `/api/journal/v2/daily`, `/api/journal/v2/period`, enhanced episodes/detail/strategies, and episode-notes patch routes while keeping older V2 timeline/notes/analytics/unresolved/attachments routes mounted as deprecated
+  - focused router regression for the new read surface passes with `25 passed, 1 warning`
+
+- Prepared the Python algo-worker SDK for public PyPI publication:
+  - enriched `sdk/python/pyproject.toml` with public package metadata, classifiers, SPDX license, and project URLs
+  - removed the duplicated hardcoded SDK version and now resolve `kite_algo_worker.__version__` from installed metadata with a source-tree fallback for local repo imports/tests
+  - added `.github/workflows/publish-kite-algo-worker.yml` so pushing `kite-algo-worker-v*` builds, validates, and publishes the package to PyPI via GitHub trusted publishing
+  - updated SDK, agent-context, and root docs to prefer PyPI install while preserving exact Git-tag installs and documenting separate app-vs-SDK release conventions
 
 - Added Journal V2 production-validation gate infrastructure:
   - created `tests/journaling/test_v2_db_integration.py` for real Postgres schema-idempotency, live/paper isolation, V2 projection replay idempotency, V1/V2 replay preservation, and note revision concurrency validation
@@ -247,6 +265,10 @@ Do not use this file for frontend work.
   - live-bound worker tokens can now create/access paper and same-account live/dry_run scopes while preserving strict token_id run ownership and cross-live-account isolation
   - worker paper run P&L payloads now serialize charges/net from the paper run-state source-of-truth instead of hardcoding zero charges
   - paper fill-time margin release now prefers persisted position `margin_in_use` when present so blocked funds clear to zero after fully closed paper exposure
+- Completed Journal analytics separation Phase B4 backend slice:
+  - live journal projection now normalizes `ExecutionCostContract` payloads and writes itemized execution-cost columns with unavailable-safe fallback
+  - Journal V2 `record_v2_execution_fill(...)` now accepts explicit cost contracts, derives legacy fee/tax aggregates from itemized values, preserves cost-contract payload JSON, and keeps aggregate-only writes non-clobbering when no contract is supplied
+  - focused projector/V2 projection regressions cover itemized live fills, unavailable fallback handling, and direct V2 cost-contract persistence
 
 ## Skill usage
 

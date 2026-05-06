@@ -1,7 +1,7 @@
 "use client";
 
 import { AppShell } from "@/components/app-shell";
-import { fetchRuntimeStatus } from "@/lib/options/api";
+import { fetchTradingRuntimeStatus } from "@/features/trading/api";
 import { navigation } from "@/lib/navigation";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, type ReactNode } from "react";
@@ -27,7 +27,7 @@ function AppLayoutContent({ children }: Readonly<{ children: ReactNode }>) {
     let disposed = false;
     async function verifySession() {
       try {
-        const status = await fetchRuntimeStatus();
+        const status = await fetchTradingRuntimeStatus();
         if (!disposed && !status.appAuthenticated) {
           const search = searchParams.toString();
           const next = `${pathname && pathname !== "/" ? pathname : "/dashboard"}${search ? `?${search}` : ""}`;

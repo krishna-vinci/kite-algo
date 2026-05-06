@@ -158,7 +158,10 @@ class InstrumentsRepository:
         self, underlying: str, today: date
     ) -> List[date]:
         """
-        Selects a rolling window of 4 weekly and 3 monthly expiries.
+        Selects the frontend expiry window for an underlying.
+
+        - NIFTY: 3 weekly + 2 monthly expiries
+        - others: 4 weekly + 3 monthly expiries
         """
         all_expiries = self.get_expiries(underlying, today)
         if not all_expiries:
@@ -173,8 +176,13 @@ class InstrumentsRepository:
         )
         monthlies = sorted(list(all_monthly_expiries))
 
-        target_weeklies = weeklies[:4]
-        target_monthlies = monthlies[:3]
+        normalized_underlying = (underlying or "").strip().upper()
+        if normalized_underlying == "NIFTY":
+            target_weeklies = weeklies[:3]
+            target_monthlies = monthlies[:2]
+        else:
+            target_weeklies = weeklies[:4]
+            target_monthlies = monthlies[:3]
 
         target_expiries = sorted(list(set(target_weeklies + target_monthlies)))
         return target_expiries
@@ -206,7 +214,7 @@ class InstrumentsRepository:
             return []
         query = text(
             """
-            SELECT instrument_token, tradingsymbol, strike, option_type
+            SELECT instrument_token, tradingsymbol, strike, option_type, lot_size
             FROM kite_instruments
             WHERE exchange='NFO' AND underlying=:underlying AND expiry=:expiry
             AND strike IN :strikes AND instrument_type IN ('CE', 'PE')

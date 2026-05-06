@@ -390,6 +390,7 @@ class OptionsSession:
                         row[option_type] = {
                             "token": inst["instrument_token"],
                             "tsym": inst["tradingsymbol"],
+                            "lot_size": inst.get("lot_size"),
                             "ltp": ltp,
                             "iv": sigma_expiry,
                             "oi": tick.get("oi") if tick else None,
@@ -525,6 +526,7 @@ class OptionsSession:
                         row[option_type] = {
                             "token": inst["instrument_token"],
                             "tsym": inst["tradingsymbol"],
+                            "lot_size": inst.get("lot_size"),
                             "ltp": ltp,
                             "iv": iv,
                             "oi": tick.get("oi") if tick else None,

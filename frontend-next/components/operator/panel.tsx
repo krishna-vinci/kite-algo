@@ -5,12 +5,18 @@ type PanelProps = HTMLAttributes<HTMLElement> & {
   eyebrow?: string;
   title?: string;
   action?: ReactNode;
+  tone?: "default" | "subtle";
 };
 
-export function Panel({ eyebrow, title, action, className, children, ...props }: PanelProps) {
+const toneClasses: Record<NonNullable<PanelProps["tone"]>, string> = {
+  default: "rounded-[1.35rem] border border-border/70 bg-card/80 p-5 shadow-[0_18px_40px_rgba(0,0,0,0.18)] backdrop-blur",
+  subtle: "rounded-[1.1rem] border border-border/55 bg-card/50 p-4",
+};
+
+export function Panel({ eyebrow, title, action, tone = "default", className, children, ...props }: PanelProps) {
   return (
     <section
-      className={cn("rounded-[1.35rem] border border-border/70 bg-card/80 p-5 shadow-[0_18px_40px_rgba(0,0,0,0.18)] backdrop-blur", className)}
+      className={cn(toneClasses[tone], className)}
       {...props}
     >
       {(eyebrow || title || action) && (

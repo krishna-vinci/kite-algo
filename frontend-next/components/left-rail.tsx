@@ -2,7 +2,6 @@ import Link from "next/link";
 import {
   Activity,
   BookOpen,
-  FlaskConical,
   LayoutDashboard,
   LayoutGrid,
   Settings,
@@ -18,10 +17,8 @@ type LeftRailProps = Readonly<{
 
 const iconByHref: Record<string, LucideIcon> = {
   "/dashboard": LayoutDashboard,
-  "/trading": Activity,
-  "/options": Activity,
+  "/strategies": Activity,
   "/journal": BookOpen,
-  "/paper": FlaskConical,
   "/settings": Settings,
 };
 

@@ -1681,7 +1681,7 @@ async def schedule_daily_instruments_update():
             now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
             now_ist = now_utc.astimezone(IST)
 
-            # Calculate next run time for 8:00 AM IST
+            # Calculate next run time for 07:00 AM IST
             next_run_ist = now_ist.replace(hour=7, minute=0, second=0, microsecond=0)
             if now_ist >= next_run_ist:
                 next_run_ist += timedelta(days=1)

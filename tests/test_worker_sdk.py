@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,6 +94,14 @@ def captured_requests(monkeypatch):
 
 def client():
     return KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test", timeout=3))
+
+
+def test_package_version_matches_sdk_pyproject():
+    pyproject_text = (SDK_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_text, re.MULTILINE)
+
+    assert match is not None
+    assert kite_algo_worker_pkg.__version__ == match.group(1)
 
 
 def test_authorization_header_is_sent(captured_requests):

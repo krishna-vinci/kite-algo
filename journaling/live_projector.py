@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
-from execution_accounting.contracts import signed_cash_flow
+from execution_accounting.contracts import ChargesStatus, ExecutionCostContract, signed_cash_flow
 
 from .models import JournalExecutionFact, SourceType
 from .repository import JournalRepository
@@ -19,6 +19,14 @@ def _parse_fill_timestamp(value: Any) -> datetime:
 
 def _decimal(value: Any) -> Decimal:
     return Decimal(str(value or "0"))
+
+
+def _cost_contract(value: Any) -> ExecutionCostContract:
+    if isinstance(value, ExecutionCostContract):
+        return value
+    if isinstance(value, dict) and value:
+        return ExecutionCostContract.model_validate(value)
+    return ExecutionCostContract(charges_status=ChargesStatus.UNAVAILABLE)
 
 
 def _is_reducing_fill(*, net_quantity: int, side: str, quantity: int) -> bool:
@@ -65,31 +73,31 @@ class LiveJournalProjector:
             if intent:
                 run_id = self.repository.ensure_live_strategy_run_for_intent(intent=intent)
                 source_type = SourceType.LIVE_FILL
-                cost_contract = intent.get("cost_contract_json") or {}
+                contract = _cost_contract(intent.get("cost_contract_json"))
                 projected += 1
             else:
                 resolved = resolve_external_fill_run(repository=self.repository, fill=fill)
                 if resolved["resolution"] == "external_exit" and resolved.get("run_id"):
                     run_id = resolved["run_id"]
                     source_type = SourceType.LIVE_FILL
-                    cost_contract = {}
+                    contract = _cost_contract(None)
                     resolution = "external_exit"
                     external_exit += 1
                     projected += 1
                 else:
                     run_id = self.repository.ensure_imported_broker_run(account_id=str(fill["account_id"]))
                     source_type = SourceType.BROKER_IMPORT
-                    cost_contract = {}
+                    contract = _cost_contract(None)
                     resolution = "broker_import"
                     imported += 1
 
-            total_charges = _decimal(cost_contract.get("total_charges"))
-            total_taxes = _decimal(cost_contract.get("total_taxes"))
-            fees = total_charges - total_taxes
+            fees = contract.brokerage + contract.exchange_txn_charge
+            taxes = contract.stt + contract.stamp_duty + contract.sebi_charge + contract.gst
             price = _decimal(fill["price"])
             quantity = int(fill["quantity"])
             side = str(fill["transaction_type"])
             source_key = f"{fill['account_id']}:{fill['trade_id']}"
+            cost_contract_payload = contract.model_dump(mode="json")
 
             self.repository.insert_execution_fact(
                 JournalExecutionFact(
@@ -104,8 +112,16 @@ class LiveJournalProjector:
                     price=price,
                     gross_cash_flow=signed_cash_flow(side=side, price=price, quantity=quantity),
                     fees_amount=fees,
-                    taxes_amount=total_taxes,
-                    payload={"broker_fill": fill, "cost_contract": cost_contract, "resolution": resolution},
+                    taxes_amount=taxes,
+                    brokerage=contract.brokerage,
+                    exchange_txn_charge=contract.exchange_txn_charge,
+                    stt=contract.stt,
+                    stamp_duty=contract.stamp_duty,
+                    sebi_charge=contract.sebi_charge,
+                    gst=contract.gst,
+                    margin_required=contract.margin_required,
+                    charges_status=str(contract.charges_status.value),
+                    payload={"broker_fill": fill, "cost_contract": cost_contract_payload, "resolution": resolution},
                 )
             )
             try:
@@ -129,13 +145,14 @@ class LiveJournalProjector:
                     fill_timestamp=_parse_fill_timestamp(fill["fill_timestamp"]),
                     gross_cash_flow=signed_cash_flow(side=side, price=price, quantity=quantity),
                     fees_amount=fees,
-                    taxes_amount=total_taxes,
+                    taxes_amount=taxes,
                     slippage_amount=Decimal("0"),
+                    cost_contract=contract,
                     run_id=str(run_id),
                     order_id=str(fill["order_id"]),
                     trade_id=str(fill["trade_id"]),
                     attribution=attribution,
-                    payload={"broker_fill": fill, "cost_contract": cost_contract, "resolution": resolution},
+                    payload={"broker_fill": fill, "cost_contract": cost_contract_payload, "resolution": resolution},
                 )
             except Exception:
                 # Preserve existing V1 projection behavior during dual-write period.

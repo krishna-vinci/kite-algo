@@ -457,11 +457,11 @@ class CanonicalOrderEventRuntime:
 
     async def process_pending_events(self, batch_size: int = 100) -> int:
         await ensure_order_runtime_schema_compatibility()
-        db = SessionLocal()
+        db = await _acquire_advisory_lock_session(EVENT_PROCESSOR_LOCK_ID, timeout_seconds=5.0)
+        if db is None:
+            return 0
+        invalidate_connection = False
         try:
-            if not _try_advisory_lock(db, EVENT_PROCESSOR_LOCK_ID):
-                db.rollback()
-                return 0
             claimed = self._claim_pending_events(db, batch_size)
             db.commit()
             processed = 0
@@ -491,9 +491,10 @@ class CanonicalOrderEventRuntime:
             try:
                 _release_advisory_lock(db, EVENT_PROCESSOR_LOCK_ID)
             except Exception as exc:
+                invalidate_connection = True
                 logger.error("Failed to release canonical event processor lock: %s", exc, exc_info=True)
             finally:
-                db.close()
+                _close_locked_session(db, invalidate_connection=invalidate_connection)
 
     async def sync_dirty_orders(
         self,

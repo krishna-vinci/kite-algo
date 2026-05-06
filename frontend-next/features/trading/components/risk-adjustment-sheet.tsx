@@ -1,5 +1,6 @@
 "use client";
 
+import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo, useState } from "react";
 import type { StrategyRiskField } from "@/features/trading/types";
 import { updatePaperStrategyRisk } from "@/features/trading/api";
@@ -19,6 +20,7 @@ export function RiskAdjustmentSheet({
   displayName,
   riskSchema,
 }: RiskAdjustmentSheetProps) {
+  const queryClient = useQueryClient();
   const editableFields = useMemo(() => riskSchema.filter((field) => field.key && field.type !== "boolean"), [riskSchema]);
   const [values, setValues] = useState<Record<string, string>>(() => {
     const init: Record<string, string> = {};
@@ -40,13 +42,14 @@ export function RiskAdjustmentSheet({
         payload[field.key] = raw ? Number(raw) : null;
       }
       await updatePaperStrategyRisk(strategyId, payload);
+      await queryClient.invalidateQueries({ queryKey: ["trading", "paper-summary"] });
       onOpenChange(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to update risk");
     } finally {
       setSaving(false);
     }
-  }, [editableFields, strategyId, values, onOpenChange]);
+  }, [editableFields, onOpenChange, queryClient, strategyId, values]);
 
   if (!open) return null;
 

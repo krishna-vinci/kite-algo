@@ -2,8 +2,15 @@ import { screen } from "@testing-library/react";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import DashboardPage from "@/app/(app)/dashboard/page";
-import OptionsPage from "@/app/(app)/options/page";
+import StrategiesPage from "@/app/(app)/strategies/page";
 import { renderWithQueryClient } from "@/tests/render-with-query-client";
+
+const replaceMock = vi.fn();
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ replace: replaceMock }),
+  useSearchParams: () => new URLSearchParams(window.location.search),
+}));
 
 class MockEventSource {
   onmessage: ((event: MessageEvent<string>) => void) | null = null;
@@ -44,6 +51,7 @@ vi.mock("@/features/trading/hooks/use-trading-console-data", () => ({
       activeStrategyCount: 1,
       strategies: [
         {
+          strategyRunId: "run-1",
           strategyId: "run-1",
           displayName: "Short Straddle",
           strategyTag: "options_runtime",
@@ -56,15 +64,8 @@ vi.mock("@/features/trading/hooks/use-trading-console-data", () => ({
           unrealizedPnl: 1200,
           marginInUse: 15000,
           lastUpdatedAt: "2026-04-16T09:00:00Z",
-          riskControls: {
-            indexLowerBoundary: null,
-            indexUpperBoundary: null,
-            combinedPremiumTarget: null,
-            combinedPremiumStoploss: null,
-            basketMtmTarget: null,
-            basketMtmStoploss: null,
-          },
-          capabilities: { canEditRisk: true, editRiskReason: null },
+          summaryFields: [],
+          capabilities: { canEditRisk: true, editRiskReason: null, canExitStrategy: true, exitReason: null, allowedActions: ["edit_risk", "exit_strategy"], riskSchema: [] },
           positions: [],
           orders: [],
           trades: [],
@@ -73,30 +74,8 @@ vi.mock("@/features/trading/hooks/use-trading-console-data", () => ({
       ],
     },
     broker: { positions: [], activeCount: 0 },
+    control: { generatedAt: null, totals: { strategyCount: 0, openStrategyCount: 0, positionCount: 0, staleWorkerCount: 0, realizedPnl: 0, unrealizedPnl: 0, netPnl: 0 }, strategies: [], unattributed: { displayName: "Manual / unattributed broker exposure", positions: [], orders: [], realizedPnl: 0, unrealizedPnl: 0, netPnl: 0 } },
   }),
-}));
-
-vi.mock("@/lib/options/api", () => ({
-  ensureOptionsSessions: vi.fn().mockResolvedValue(undefined),
-  fetchOptionSession: vi.fn().mockResolvedValue({
-    underlying: "NIFTY",
-    spotLtp: 24300,
-    atmStrike: 24300,
-    expiries: ["2026-04-30"],
-    perExpiry: {
-      "2026-04-30": { forward: 24320, sigmaExpiry: null, atmStrike: 24300, strikes: [], rows: [] },
-    },
-    rows: [],
-    updatedAt: null,
-  }),
-  fetchNifty50Impact: vi.fn().mockResolvedValue([]),
-  loginToBroker: vi.fn().mockResolvedValue({ authenticated: true }),
-  mergeOptionSessionSnapshot: vi.fn((_current, next) => next),
-  normalizeOptionSessionSnapshot: vi.fn((payload) => payload),
-  buildOptionsSessionSseUrl: vi.fn(() => "/api/sse/options/session/NIFTY"),
-  previewOptionStrategy: vi.fn(),
-  buildPositionDryRun: vi.fn(),
-  executePaperOptionStrategy: vi.fn(),
 }));
 
 beforeAll(() => {
@@ -109,15 +88,16 @@ describe("reference pages", () => {
 
     expect(screen.getByRole("heading", { name: /operator overview/i })).toBeInTheDocument();
     expect(screen.getByText(/system health/i)).toBeInTheDocument();
-    expect(screen.getAllByText(/active strategies/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/watch and handoff/i)).toBeInTheDocument();
   });
 
-  it("renders the productionized options workspace", () => {
-    renderWithQueryClient(<OptionsPage />);
+  it("renders the primary strategies operator workspace", () => {
+    renderWithQueryClient(<StrategiesPage />);
 
-    expect(screen.getByRole("heading", { name: /options/i })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /strategy builder/i })).toBeInTheDocument();
-    expect(screen.getByText(/canonical paper \+ broker state/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /^strategies$/i })).toBeInTheDocument();
+    expect(screen.getByText(/strategies workspace/i)).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /live/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /paper/i })).toBeInTheDocument();
   });
 
 });

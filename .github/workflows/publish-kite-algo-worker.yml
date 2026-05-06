@@ -1,0 +1,88 @@
+name: Publish kite-algo-worker
+
+on:
+  push:
+    tags:
+      - "kite-algo-worker-v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine pytest
+
+      - name: Install SDK test dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run focused SDK tests
+        run: python -m pytest tests/test_worker_sdk.py tests/test_worker_sdk_async.py tests/test_worker_sdk_ws.py tests/test_worker_sdk_options.py tests/test_worker_sdk_options_market.py -q
+
+      - name: Verify tag matches SDK version
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: sdk/python
+        run: |
+          actual_version=$(python - <<'PY'
+          import pathlib
+          import re
+
+          text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+          if not match:
+              raise SystemExit("Could not determine SDK version from sdk/python/pyproject.toml")
+          print(match.group(1))
+          PY
+          )
+
+          expected_tag="kite-algo-worker-v${actual_version}"
+          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match SDK version ${actual_version}"
+            exit 1
+          fi
+
+      - name: Build distributions
+        working-directory: sdk/python
+        run: python -m build
+
+      - name: Check distributions
+        working-directory: sdk/python
+        run: python -m twine check dist/*
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: kite-algo-worker-dist
+          path: sdk/python/dist/*
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/kite-algo-worker
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: kite-algo-worker-dist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
