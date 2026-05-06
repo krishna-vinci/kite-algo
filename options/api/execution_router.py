@@ -11,6 +11,7 @@ from execution_accounting.contracts import ChargesStatus, ExecutionCostContract
 from execution_accounting.kite_costs import build_live_basket_cost_contract
 
 from options.execution import (
+    OptionRunActionRequest,
     OptionRunCreateRequest,
     get_option_run_store,
     mark_cleanup_required,
@@ -299,11 +300,14 @@ async def preview_option_run_entry(
 async def enter_option_run(
     strategy_run_id: str,
     request: Request,
-    payload: dict | None = None,
+    payload: OptionRunActionRequest | dict | None = None,
     store: OptionRunStore = Depends(get_option_run_store),
     runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
 ):
-    payload = payload or {}
+    if isinstance(payload, OptionRunActionRequest):
+        payload = payload.model_dump(exclude_none=True)
+    else:
+        payload = OptionRunActionRequest.model_validate(payload or {}).model_dump(exclude_none=True)
     run = _get_run_or_404(store, strategy_run_id)
     try:
         run = mark_entering(run)
@@ -392,11 +396,14 @@ async def preview_option_run_exit(
 @router.post("/runs/{strategy_run_id}/exit")
 async def exit_option_run(
     strategy_run_id: str,
-    payload: dict | None = None,
+    payload: OptionRunActionRequest | dict | None = None,
     store: OptionRunStore = Depends(get_option_run_store),
     runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
 ):
-    payload = payload or {}
+    if isinstance(payload, OptionRunActionRequest):
+        payload = payload.model_dump(exclude_none=True)
+    else:
+        payload = OptionRunActionRequest.model_validate(payload or {}).model_dump(exclude_none=True)
     run = _get_run_or_404(store, strategy_run_id)
     try:
         run = mark_exiting(run, pending_legs=run.completed_legs)

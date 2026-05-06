@@ -133,6 +133,12 @@ def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
         class BasketOrderRequest(BaseModel):
             pass
 
+        class ChargesOrderInput(BaseModel):
+            pass
+
+        class OrderMarginInput(BaseModel):
+            pass
+
         class OrdersService:
             async def place_order(self, *args, **kwargs):
                 return types.SimpleNamespace(model_dump=lambda mode=None: {"order_id": "OID-1"})
@@ -144,6 +150,8 @@ def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
         kite_orders.run_kite_write_action = run_kite_write_action
         kite_orders.PlaceOrderRequest = PlaceOrderRequest
         kite_orders.BasketOrderRequest = BasketOrderRequest
+        kite_orders.ChargesOrderInput = ChargesOrderInput
+        kite_orders.OrderMarginInput = OrderMarginInput
         kite_orders.OrdersService = OrdersService
         sys.modules["broker_api.kite_orders"] = kite_orders
 

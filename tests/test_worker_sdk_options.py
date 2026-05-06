@@ -10,6 +10,7 @@ if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 
 from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, option_leg  # noqa: E402
+from kite_algo_worker.options.models import OptionExecutionLeg, OptionRunCreateRequest  # noqa: E402
 
 
 class FakeResponse:
@@ -87,7 +88,9 @@ def test_options_list_expiries_uses_worker_safe_options_route(monkeypatch):
 def test_option_leg_structure_helper_builds_preview_ready_payload():
     payload = option_leg("NIFTY26MAY25000CE", "BUY", 75, tag="entry")
 
+    assert payload["leg_id"].startswith("leg_")
     assert payload == {
+        "leg_id": payload["leg_id"],
         "exchange": "NFO",
         "tradingsymbol": "NIFTY26MAY25000CE",
         "transaction_type": "BUY",
@@ -126,7 +129,7 @@ def test_options_run_and_protection_methods_use_worker_safe_paths(monkeypatch):
     client.options.create_run(
         strategy_name="bull_call_spread",
         product="MIS",
-        legs=[{"symbol": "NIFTY", "option_type": "CE", "strike": 25000, "expiry": "2026-05-28"}],
+        legs=[{"tradingsymbol": "NIFTY26MAY25000CE", "transaction_type": "BUY", "quantity": 75}],
         protection={"enabled": True},
         metadata={"source": "sdk-test"},
     )
@@ -187,7 +190,7 @@ def test_options_create_run_payload_includes_product_protection_and_metadata(mon
     _client().options.create_run(
         strategy_name="iron_condor",
         product="NRML",
-        legs=[{"symbol": "NIFTY", "option_type": "PE", "strike": 24800, "expiry": "2026-05-28"}],
+        legs=[{"tradingsymbol": "NIFTY26MAY24800PE", "transaction_type": "SELL", "quantity": 50}],
         protection={"rules": [{"metric": "strategy_mtm", "operator": "lte", "threshold": -1000}]},
         metadata={"note": "nightly"},
     )
@@ -197,7 +200,18 @@ def test_options_create_run_payload_includes_product_protection_and_metadata(mon
     assert captured["json"] == {
         "strategy_name": "iron_condor",
         "product": "NRML",
-        "legs": [{"symbol": "NIFTY", "option_type": "PE", "strike": 24800, "expiry": "2026-05-28"}],
+        "legs": [
+            {
+                "leg_id": captured["json"]["legs"][0]["leg_id"],
+                "tradingsymbol": "NIFTY26MAY24800PE",
+                "transaction_type": "SELL",
+                "quantity": 50,
+                "exchange": "NFO",
+                "product": "NRML",
+                "order_type": "MARKET",
+                "metadata": {},
+            }
+        ],
         "protection": {"rules": [{"metric": "strategy_mtm", "operator": "lte", "threshold": -1000}]},
         "metadata": {"note": "nightly"},
     }
@@ -230,3 +244,73 @@ def test_options_preview_entry_compatibility_orders_still_use_preview_basket(mon
         "all_or_none": True,
     }
     assert result == {"ok": True}
+
+
+def test_sdk_option_leg_builder_emits_default_leg_id():
+    payload = option_leg("NIFTY26MAY25000CE", "BUY", 75)
+
+    assert payload["leg_id"].startswith("leg_")
+    assert payload["transaction_type"] == "BUY"
+
+
+def test_sdk_option_run_create_request_coerces_typed_legs():
+    request = OptionRunCreateRequest(
+        strategy_name="bull_call_spread",
+        product="MIS",
+        legs=[{"tradingsymbol": "NIFTY26MAY25000CE", "transaction_type": "BUY", "quantity": 75}],
+    )
+
+    assert isinstance(request.legs[0], OptionExecutionLeg)
+    assert request.legs[0].product == "MIS"
+
+
+def test_option_client_enter_includes_safety_token(monkeypatch):
+    captured = {}
+
+    def fake_request(_session, method, url, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        captured["json"] = kwargs.get("json")
+        return FakeResponse(payload={"ok": True})
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    _client().options.enter("run-42", safety_token="signed-token")
+
+    assert captured["url"] == "http://localhost:8000/api/algo-workers/worker/options/runs/run-42/enter"
+    assert captured["json"]["safety_token"] == "signed-token"
+
+
+def test_option_client_exit_includes_safety_token(monkeypatch):
+    captured = {}
+
+    def fake_request(_session, method, url, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        captured["json"] = kwargs.get("json")
+        return FakeResponse(payload={"ok": True})
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    _client().options.exit("run-42", safety_token="signed-token")
+
+    assert captured["url"] == "http://localhost:8000/api/algo-workers/worker/options/runs/run-42/exit"
+    assert captured["json"]["safety_token"] == "signed-token"
+
+
+def test_option_client_mutations_include_session_nonce(monkeypatch):
+    calls = []
+
+    def fake_request(_session, method, url, **kwargs):
+        calls.append({"method": method, "url": url, "headers": kwargs.get("headers")})
+        return FakeResponse(payload={"ok": True})
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+    sdk = _client()
+    sdk.options.enter("run-42", session_nonce="nonce-1")
+    sdk.options.exit("run-42", session_nonce="nonce-1")
+    sdk.options.update_protection("run-42", {"rules": []}, session_nonce="nonce-1")
+
+    assert calls[0]["headers"] == {"X-Worker-Session-Nonce": "nonce-1"}
+    assert calls[1]["headers"] == {"X-Worker-Session-Nonce": "nonce-1"}
+    assert calls[2]["headers"] == {"X-Worker-Session-Nonce": "nonce-1"}

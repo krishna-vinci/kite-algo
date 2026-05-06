@@ -782,10 +782,22 @@ CREATE TABLE IF NOT EXISTS public.algo_worker_runs (
   allowed_actions_json JSONB NOT NULL DEFAULT '[]'::jsonb,
   runtime_state_json JSONB NOT NULL DEFAULT '{}'::jsonb,
   metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  worker_session_nonce TEXT,
+  worker_session_claimed_at TIMESTAMPTZ,
+  last_heartbeat_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   closed_at TIMESTAMPTZ
 );
+
+ALTER TABLE public.algo_worker_runs
+  ADD COLUMN IF NOT EXISTS worker_session_nonce TEXT;
+
+ALTER TABLE public.algo_worker_runs
+  ADD COLUMN IF NOT EXISTS worker_session_claimed_at TIMESTAMPTZ;
+
+ALTER TABLE public.algo_worker_runs
+  ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_algo_worker_runs_account_status
   ON public.algo_worker_runs (account_scope, status, updated_at DESC);

@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-05-04
+Last updated: 2026-05-06
 
 ## Scope
 
@@ -24,6 +24,27 @@ Do not use this file for frontend work.
 - Added backend mutual fund router in `broker_api/kite_mutual_funds.py`
 
 ## Newly implemented in current branch
+
+- Implemented Spec 3 worker runtime reliability & recovery slice end-to-end:
+  - extended `algo_worker_runs` persistence with run-scoped lease/heartbeat fields (`worker_session_nonce`, `worker_session_claimed_at`, `last_heartbeat_at`) and exposed those fields in repository run views
+  - added worker session lifecycle routes for run ownership and heartbeat:
+    - `POST /api/algo-workers/worker/runs/{strategy_run_id}/claim-session`
+    - `DELETE /api/algo-workers/worker/runs/{strategy_run_id}/claim-session`
+    - `POST /api/algo-workers/worker/runs/{strategy_run_id}/heartbeat`
+  - enforced active session nonce (`X-Worker-Session-Nonce`) on covered worker mutation paths (generic intents/risk/protection/exit and worker-option enter/exit/protection update) while preserving legacy compatibility for unclaimed runs
+  - added dedicated runtime recovery module `api/worker_runtime_recovery.py` with stale-run sweep + exiting-run closure checks, and wired separate startup loops/components in `main.py`
+  - stale-run recovery follows conservative exclusion/ownership boundaries:
+    - excludes protection-owned stale-worker runs (`backend_protection.enabled && operations.exit_on_worker_stale`) to avoid races with `WorkerProtectionRuntime`
+    - stale live unprotected runs are marked action-required, not auto-exited
+    - no live exit re-submission logic added
+  - added run-health projection fields (`heartbeat_age_sec`, `health_status`, `session_status`, `recovery_status`, `recovery_action_required`) on worker run reads and control-plane strategy rows
+  - verification in this environment:
+    - `rtk pytest tests/test_worker_runtime_recovery.py -v` → `3 passed`
+    - `rtk pytest tests/test_algo_worker_api.py -v` → `91 passed`
+    - `rtk pytest tests/test_options_api_routes.py -v` → `9 passed`
+    - `rtk pytest tests/test_control_plane_api.py -v` → `14 passed`
+    - `rtk pytest tests/test_worker_sdk.py -v` → `55 passed`
+    - `rtk pytest tests/test_worker_sdk_options.py -v` → `13 passed`
 
 - Implemented unified worker run safety-check v1 end-to-end:
   - preserved caller-supplied option `strategy_run_id` during run creation (while retaining existing auto-generated IDs when omitted)

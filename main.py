@@ -15,6 +15,10 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from api.openapi import OPENAPI_TAGS
+from api.routers.algo_workers import (
+    WORKER_RUN_STALE_ACTION_SECONDS,
+    WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
+)
 from api.routers.algo_workers import router as algo_workers_router
 from api.routers.analytics import router as analytics_router
 from api.routers.auth import router as auth_router
@@ -26,6 +30,7 @@ from api.routers.journal import router as journal_router
 from api.routers.market_data import router as market_data_router
 from api.routers.marketwatch import router as marketwatch_router
 from api.routers.user_settings import router as user_settings_router
+from api.worker_runtime_recovery import build_worker_runtime_recovery_service
 from auth_service import auth_exempt_path, get_optional_app_user
 from broker_api.broker_api import run_headless_login_and_persist_system_token, schedule_daily_instruments_update
 from broker_api.candles_api import router as candles_api_router
@@ -210,6 +215,56 @@ async def _worker_protection_loop(app: FastAPI):
             set_component_status("worker_protection", "degraded", detail=str(exc))
         await asyncio.sleep(interval)
 
+
+async def _worker_runtime_recovery_stale_loop(app: FastAPI):
+    interval = max(1.0, float(os.getenv("WORKER_RUNTIME_STALE_RECOVERY_INTERVAL_SECONDS", "30")))
+    service = build_worker_runtime_recovery_service(
+        app,
+        stale_action_seconds=WORKER_RUN_STALE_ACTION_SECONDS,
+        claimed_without_heartbeat_seconds=WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
+    )
+    set_component_status("worker_runtime_stale_recovery", "healthy", detail="Worker stale recovery runtime started")
+    while True:
+        try:
+            result = await service.recover_stale_runs_once()
+            heartbeat(
+                "worker_runtime_stale_recovery",
+                detail="Recovered stale worker runs",
+                meta={**result, "interval_seconds": interval},
+            )
+        except asyncio.CancelledError:
+            set_component_status("worker_runtime_stale_recovery", "stopped", detail="Worker stale recovery runtime cancelled")
+            break
+        except Exception as exc:
+            logging.warning("Worker stale recovery loop failed: %s", exc, exc_info=True)
+            set_component_status("worker_runtime_stale_recovery", "degraded", detail=str(exc))
+        await asyncio.sleep(interval)
+
+
+async def _worker_runtime_recovery_exiting_loop(app: FastAPI):
+    interval = max(1.0, float(os.getenv("WORKER_RUNTIME_EXITING_RECOVERY_INTERVAL_SECONDS", "10")))
+    service = build_worker_runtime_recovery_service(
+        app,
+        stale_action_seconds=WORKER_RUN_STALE_ACTION_SECONDS,
+        claimed_without_heartbeat_seconds=WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
+    )
+    set_component_status("worker_runtime_exiting_recovery", "healthy", detail="Worker exiting recovery runtime started")
+    while True:
+        try:
+            result = await service.recover_exiting_runs_once()
+            heartbeat(
+                "worker_runtime_exiting_recovery",
+                detail="Recovered exiting worker runs",
+                meta={**result, "interval_seconds": interval},
+            )
+        except asyncio.CancelledError:
+            set_component_status("worker_runtime_exiting_recovery", "stopped", detail="Worker exiting recovery runtime cancelled")
+            break
+        except Exception as exc:
+            logging.warning("Worker exiting recovery loop failed: %s", exc, exc_info=True)
+            set_component_status("worker_runtime_exiting_recovery", "degraded", detail=str(exc))
+        await asyncio.sleep(interval)
+
 # 2. Combine the lifespans
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
@@ -222,6 +277,8 @@ async def combined_lifespan(app: FastAPI):
     order_runtime_task = None
     positions_runtime_task = None
     worker_protection_task = None
+    worker_runtime_stale_recovery_task = None
+    worker_runtime_exiting_recovery_task = None
     journal_runtime_worker = None
     set_component_status("app", "starting", detail="Application startup in progress")
     try:
@@ -664,6 +721,9 @@ async def combined_lifespan(app: FastAPI):
             worker_protection_task = asyncio.create_task(_worker_protection_loop(app))
         else:
             set_component_status("worker_protection", "disabled", detail="Worker protection runtime disabled by WORKER_PROTECTION_ENABLED")
+
+        worker_runtime_stale_recovery_task = asyncio.create_task(_worker_runtime_recovery_stale_loop(app))
+        worker_runtime_exiting_recovery_task = asyncio.create_task(_worker_runtime_recovery_exiting_loop(app))
     except Exception as e:
         logging.error(f"Failed to initialize broker bootstrap or market runtime: {e}", exc_info=True)
         startup_status = "degraded"
@@ -749,6 +809,26 @@ async def combined_lifespan(app: FastAPI):
             worker_protection_task.cancel()
             try:
                 await worker_protection_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel worker runtime stale recovery runtime
+    try:
+        if 'worker_runtime_stale_recovery_task' in locals() and worker_runtime_stale_recovery_task:
+            worker_runtime_stale_recovery_task.cancel()
+            try:
+                await worker_runtime_stale_recovery_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel worker runtime exiting recovery runtime
+    try:
+        if 'worker_runtime_exiting_recovery_task' in locals() and worker_runtime_exiting_recovery_task:
+            worker_runtime_exiting_recovery_task.cancel()
+            try:
+                await worker_runtime_exiting_recovery_task
             except Exception:
                 pass
     except Exception:

@@ -1,5 +1,6 @@
 # pyright: reportArgumentType=false
 import os
+import asyncio
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -37,6 +38,7 @@ from api.routers.algo_workers import (  # noqa: E402
     list_worker_orders,
     list_worker_trades,
     cancel_worker_order,
+    claim_worker_run_session,
     preview_worker_order,
     WorkerOrderActionRequest,
     WorkerOrderPreviewRequest,
@@ -51,6 +53,8 @@ from api.routers.algo_workers import (  # noqa: E402
     create_worker_token,
     patch_worker_run_risk,
     patch_worker_run_protection,
+    release_worker_run_session,
+    heartbeat_worker_run_session,
     exit_worker_run,
     resolve_worker_market_ticker,
     resolve_worker_market_tickers,
@@ -93,6 +97,50 @@ def _sqlite_algo_worker_repo() -> SqlAlchemyAlgoWorkerRepository:
         cursor.close()
 
     with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.algo_worker_tokens (
+                    token_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    token_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    allowed_modes TEXT,
+                    allowed_actions TEXT,
+                    allowed_templates TEXT,
+                    expires_at TEXT,
+                    account_scope TEXT,
+                    heartbeat_json TEXT,
+                    last_heartbeat_at TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.algo_worker_runs (
+                    strategy_run_id TEXT PRIMARY KEY,
+                    token_id TEXT NOT NULL,
+                    template_id TEXT NOT NULL,
+                    account_scope TEXT NOT NULL,
+                    execution_mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    summary_fields_json TEXT,
+                    risk_schema_json TEXT,
+                    allowed_actions_json TEXT,
+                    runtime_state_json TEXT,
+                    metadata_json TEXT,
+                    worker_session_nonce TEXT,
+                    worker_session_claimed_at TEXT,
+                    last_heartbeat_at TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    closed_at TEXT
+                )
+                """
+            )
+        )
         conn.execute(
             text(
                 """
@@ -178,6 +226,54 @@ class _FakeWorkerRepository:
         self.live_order_attribution_refs = {}
         self.live_broker_positions = {}
 
+    async def claim_run_session(self, strategy_run_id, *, freshness_seconds, claimed_without_heartbeat_seconds):
+        _ = (freshness_seconds, claimed_without_heartbeat_seconds)
+        run = self.runs.get(strategy_run_id)
+        if not run:
+            return None
+        if run.get("worker_session_nonce"):
+            return None
+        run["worker_session_nonce"] = f"nonce-{strategy_run_id}"
+        run["worker_session_claimed_at"] = datetime.now(timezone.utc)
+        return dict(run)
+
+    async def release_run_session(self, strategy_run_id, *, expected_nonce):
+        run = self.runs.get(strategy_run_id)
+        if not run:
+            return None
+        if str(run.get("worker_session_nonce") or "") != str(expected_nonce):
+            return None
+        run["worker_session_nonce"] = None
+        run["worker_session_claimed_at"] = None
+        return dict(run)
+
+    async def record_run_heartbeat(self, strategy_run_id, *, expected_nonce):
+        run = self.runs.get(strategy_run_id)
+        if not run:
+            return None
+        if str(run.get("worker_session_nonce") or "") != str(expected_nonce):
+            return None
+        run["last_heartbeat_at"] = datetime.now(timezone.utc)
+        return dict(run)
+
+    async def list_stale_recovery_runs(self):
+        rows = []
+        for run in self.runs.values():
+            if str(run.get("status") or "") not in {"open", "paused"}:
+                continue
+            if not run.get("worker_session_nonce") and not run.get("last_heartbeat_at"):
+                continue
+            runtime_state = dict(run.get("runtime_state") or {})
+            protection = dict(runtime_state.get("backend_protection") or {})
+            operations = dict(protection.get("operations") or {})
+            if protection.get("enabled") and operations.get("exit_on_worker_stale"):
+                continue
+            rows.append(dict(run))
+        return rows
+
+    async def list_exiting_recovery_runs(self):
+        return [dict(run) for run in self.runs.values() if str(run.get("status") or "") == "exiting"]
+
     async def create_token(self, payload, *, raw_token, token_id):
         self.tokens[token_id] = {
             "token_id": token_id,
@@ -212,6 +308,9 @@ class _FakeWorkerRepository:
             "allowed_actions": payload.allowed_actions,
             "runtime_state": payload.runtime_state,
             "metadata": payload.metadata,
+            "worker_session_nonce": None,
+            "worker_session_claimed_at": None,
+            "last_heartbeat_at": None,
         }
         self.runs[strategy_run_id] = run
         return dict(run)
@@ -968,7 +1067,22 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         }
         request = self._request(repo)
 
-        with patch("api.routers.algo_workers._option_run_status_for_worker", AsyncMock(return_value=None)):
+        with patch(
+            "api.routers.algo_workers._option_run_protection_snapshot_for_worker",
+            AsyncMock(
+                return_value={
+                    "applicable": False,
+                    "run_status": None,
+                    "evaluation_mode": "run_state",
+                    "triggered": False,
+                    "blocking": False,
+                    "blocking_reason": None,
+                    "matched_rule": None,
+                    "metrics": {},
+                    "recommended_exit_orders_count": 0,
+                }
+            ),
+        ):
             response = await get_worker_run_safety_check(request, "run-safe-1")
 
         self.assertTrue(response["can_trade"])
@@ -1000,8 +1114,20 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo, paper_runtime=SimpleNamespace(place_order=AsyncMock(return_value={"status": "success"})))
 
         with patch("api.routers.algo_workers._worker_safety_secret", lambda _request: "secret-key"), patch(
-            "api.routers.algo_workers._option_run_status_for_worker",
-            AsyncMock(return_value=None),
+            "api.routers.algo_workers._option_run_protection_snapshot_for_worker",
+            AsyncMock(
+                return_value={
+                    "applicable": False,
+                    "run_status": None,
+                    "evaluation_mode": "run_state",
+                    "triggered": False,
+                    "blocking": False,
+                    "blocking_reason": None,
+                    "matched_rule": None,
+                    "metrics": {},
+                    "recommended_exit_orders_count": 0,
+                }
+            ),
         ):
             check = await get_worker_run_safety_check(request, "run-safe-2")
             repo.runs["run-safe-2"]["runtime_state"]["backend_protection_state"]["status"] = "triggered"
@@ -1045,8 +1171,20 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
 
         with patch(
-            "api.routers.algo_workers._option_run_status_for_worker",
-            AsyncMock(return_value="__options_protection_state_unavailable__"),
+            "api.routers.algo_workers._option_run_protection_snapshot_for_worker",
+            AsyncMock(
+                return_value={
+                    "applicable": True,
+                    "run_status": None,
+                    "evaluation_mode": "run_state",
+                    "triggered": False,
+                    "blocking": True,
+                    "blocking_reason": "OPTIONS_PROTECTION_STATE_UNAVAILABLE",
+                    "matched_rule": None,
+                    "metrics": {},
+                    "recommended_exit_orders_count": 0,
+                }
+            ),
         ):
             response = await get_worker_run_safety_check(request, "run-safe-3")
 
@@ -1083,7 +1221,22 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         for key in env_overrides:
             os.environ.pop(key, None)
         try:
-            with patch("api.routers.algo_workers._option_run_status_for_worker", AsyncMock(return_value=None)):
+            with patch(
+                "api.routers.algo_workers._option_run_protection_snapshot_for_worker",
+                AsyncMock(
+                    return_value={
+                        "applicable": False,
+                        "run_status": None,
+                        "evaluation_mode": "run_state",
+                        "triggered": False,
+                        "blocking": False,
+                        "blocking_reason": None,
+                        "matched_rule": None,
+                        "metrics": {},
+                        "recommended_exit_orders_count": 0,
+                    }
+                ),
+            ):
                 with self.assertRaises(HTTPException) as ctx:
                     await get_worker_run_safety_check(request, "run-safe-4")
         finally:
@@ -1095,6 +1248,43 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ctx.exception.status_code, 503)
         self.assertEqual(ctx.exception.detail, "Worker safety token secret is not configured")
+
+    async def test_safety_check_uses_run_state_option_protection_evaluation(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-opt-safe"] = {
+            "strategy_run_id": "run-opt-safe",
+            "token_id": "worker-1",
+            "template_id": "iron_condor",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {"backend_protection_state": {"status": "active", "exit_submitted": False}},
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        with patch(
+            "api.routers.algo_workers._option_run_protection_snapshot_for_worker",
+            AsyncMock(
+                return_value={
+                    "applicable": True,
+                    "run_status": "entered",
+                    "evaluation_mode": "run_state",
+                    "triggered": True,
+                    "blocking": True,
+                    "blocking_reason": "OPTIONS_PROTECTION_TRIGGERED",
+                    "matched_rule": {"key": "rule_1", "role": "hard_stop"},
+                    "metrics": {"open_quantity": 75},
+                    "recommended_exit_orders_count": 4,
+                }
+            ),
+        ):
+            response = await get_worker_run_safety_check(request, "run-opt-safe")
+
+        self.assertFalse(response["can_trade"])
+        self.assertEqual(response["blocking_reasons"], ["OPTIONS_PROTECTION_TRIGGERED"])
+        self.assertEqual(response["options_protection"]["evaluation_mode"], "run_state")
+        self.assertTrue(response["options_protection"]["triggered"])
 
     async def test_live_bound_token_can_create_paper_run_but_not_other_live_scope(self):
         token = WorkerToken(
@@ -2751,6 +2941,400 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
+    def test_run_view_includes_run_session_fields(self):
+        repo = _sqlite_algo_worker_repo()
+        with repo.session_factory() as db:
+            db.execute(text("INSERT INTO public.algo_worker_tokens (token_id, name, token_hash, status) VALUES ('worker-1', 'Worker', 'hash', 'active')"))
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.algo_worker_runs (
+                        strategy_run_id, token_id, template_id, account_scope, execution_mode, status,
+                        worker_session_nonce, worker_session_claimed_at, last_heartbeat_at
+                    ) VALUES (
+                        'run-1', 'worker-1', 'tmpl', 'kite:paper-a', 'paper', 'open',
+                        'nonce-1', '2026-05-06T09:15:00+00:00', '2026-05-06T09:16:00+00:00'
+                    )
+                    """
+                )
+            )
+            db.commit()
+
+        row = repo._get_run_sync("run-1")
+        if row is None:
+            self.fail("expected run row")
+        self.assertEqual(row["worker_session_nonce"], "nonce-1")
+        self.assertIsNotNone(row["worker_session_claimed_at"])
+        self.assertIsNotNone(row["last_heartbeat_at"])
+
+    def test_claim_run_session_single_winner(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-claim"] = {
+            "strategy_run_id": "run-claim",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {},
+            "metadata": {},
+        }
+        first = asyncio.run(repo.claim_run_session("run-claim", freshness_seconds=60, claimed_without_heartbeat_seconds=120))
+        second = asyncio.run(repo.claim_run_session("run-claim", freshness_seconds=60, claimed_without_heartbeat_seconds=120))
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+
+    def test_release_run_session_clears_claim_keeps_last_heartbeat(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-release"] = {
+            "strategy_run_id": "run-release",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {},
+            "metadata": {},
+            "worker_session_nonce": "nonce-1",
+            "worker_session_claimed_at": datetime.now(timezone.utc),
+            "last_heartbeat_at": datetime.now(timezone.utc),
+        }
+
+        released = asyncio.run(repo.release_run_session("run-release", expected_nonce="nonce-1"))
+        if released is None:
+            self.fail("expected released row")
+        self.assertIsNone(released["worker_session_nonce"])
+        self.assertIsNone(released["worker_session_claimed_at"])
+        self.assertIsNotNone(released["last_heartbeat_at"])
+
+    def test_record_run_heartbeat_rejects_mismatched_nonce(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-heartbeat"] = {
+            "strategy_run_id": "run-heartbeat",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {},
+            "metadata": {},
+            "worker_session_nonce": "nonce-1",
+            "worker_session_claimed_at": datetime.now(timezone.utc),
+        }
+
+        rejected = asyncio.run(repo.record_run_heartbeat("run-heartbeat", expected_nonce="wrong"))
+        accepted = asyncio.run(repo.record_run_heartbeat("run-heartbeat", expected_nonce="nonce-1"))
+        self.assertIsNone(rejected)
+        if accepted is None:
+            self.fail("expected accepted row")
+        self.assertIsNotNone(accepted["last_heartbeat_at"])
+
+    def test_run_view_with_worker_falls_back_to_token_heartbeat_for_legacy_run(self):
+        repo = _sqlite_algo_worker_repo()
+        with repo.session_factory() as db:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.algo_worker_tokens (
+                        token_id, name, token_hash, status, last_heartbeat_at, heartbeat_json
+                    ) VALUES (
+                        'worker-legacy', 'Worker', 'hash-legacy', 'active',
+                        '2026-05-06T09:16:00+00:00', '{"worker_id":"w-1"}'
+                    )
+                    """
+                )
+            )
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.algo_worker_runs (
+                        strategy_run_id, token_id, template_id, account_scope, execution_mode, status
+                    ) VALUES (
+                        'run-legacy-heartbeat', 'worker-legacy', 'tmpl', 'kite:paper-a', 'paper', 'open'
+                    )
+                    """
+                )
+            )
+            db.commit()
+
+        rows = repo._list_runs_for_control_plane_sync()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(str(rows[0]["token_last_heartbeat_at"]), "2026-05-06T09:16:00+00:00")
+        self.assertEqual(str(rows[0]["last_heartbeat_at"]), "2026-05-06T09:16:00+00:00")
+
+    async def test_stale_recovery_list_includes_claimed_without_heartbeat_runs(self):
+        repo = _sqlite_algo_worker_repo()
+        with repo.session_factory() as db:
+            db.execute(text("INSERT INTO public.algo_worker_tokens (token_id, name, token_hash, status) VALUES ('worker-2', 'Worker', 'hash-2', 'active')"))
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.algo_worker_runs (
+                        strategy_run_id, token_id, template_id, account_scope, execution_mode, status,
+                        worker_session_nonce, worker_session_claimed_at
+                    ) VALUES (
+                        'run-claimed-no-heartbeat', 'worker-2', 'tmpl', 'kite:paper-a', 'paper', 'open',
+                        'nonce-claimed', '2020-01-01T00:00:00+00:00'
+                    )
+                    """
+                )
+            )
+            db.commit()
+
+        rows = await repo.list_stale_recovery_runs()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["strategy_run_id"], "run-claimed-no-heartbeat")
+
+    async def test_claim_session_returns_nonce_for_owned_run(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-claim-route"] = {
+            "strategy_run_id": "run-claim-route",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {},
+            "metadata": {},
+        }
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer secret-token"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+        response = await claim_worker_run_session(request, "run-claim-route")
+        self.assertEqual(response["strategy_run_id"], "run-claim-route")
+        self.assertTrue(response["worker_session_nonce"])
+
+    async def test_submit_worker_intent_rejects_missing_session_nonce(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-session-enforced"] = {
+            "strategy_run_id": "run-session-enforced",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {},
+            "metadata": {},
+            "worker_session_nonce": "nonce-active",
+        }
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer secret-token"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo, paper_runtime_service=SimpleNamespace(place_order=AsyncMock(return_value={"status": "success"})))),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+        with self.assertRaises(HTTPException) as exc:
+            await submit_worker_intent(
+                request,
+                "run-session-enforced",
+                WorkerIntentRequest(intent_type="place_order", payload={"order": {}}, idempotency_key="run-session-enforced:intent:1"),
+            )
+        self.assertEqual(exc.exception.status_code, 409)
+        self.assertEqual(exc.exception.detail["rejection_reason"], "WORKER_SESSION_REQUIRED")
+
+    async def test_submit_worker_intent_accepts_legacy_run_without_claimed_session(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-legacy"] = {
+            "strategy_run_id": "run-legacy",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {},
+            "metadata": {},
+        }
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer secret-token"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo, paper_runtime_service=SimpleNamespace(place_order=AsyncMock(return_value={"status": "success"})))),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+        response = await submit_worker_intent(
+            request,
+            "run-legacy",
+            WorkerIntentRequest(intent_type="place_order", payload={"order": {}}, idempotency_key="run-legacy:intent:1"),
+        )
+        self.assertEqual(response["status"], "accepted")
+
+    async def test_stale_recovery_list_excludes_protection_owned_runs(self):
+        repo = _sqlite_algo_worker_repo()
+        with repo.session_factory() as db:
+            db.execute(text("INSERT INTO public.algo_worker_tokens (token_id, name, token_hash, status) VALUES ('worker-1', 'Worker', 'hash', 'active')"))
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.algo_worker_runs (
+                        strategy_run_id, token_id, template_id, account_scope, execution_mode, status,
+                        runtime_state_json, worker_session_nonce, last_heartbeat_at
+                    ) VALUES (
+                        'run-protected', 'worker-1', 'tmpl', 'kite:paper-a', 'live', 'open',
+                        '{"backend_protection":{"enabled":true,"operations":{"exit_on_worker_stale":true}}}',
+                        'nonce-1', '2026-05-06T09:00:00+00:00'
+                    )
+                    """
+                )
+            )
+            db.commit()
+
+        rows = await repo.list_stale_recovery_runs()
+        self.assertEqual(rows, [])
+
+    async def test_exiting_recovery_list_includes_exiting_runs(self):
+        repo = _sqlite_algo_worker_repo()
+        with repo.session_factory() as db:
+            db.execute(text("INSERT INTO public.algo_worker_tokens (token_id, name, token_hash, status) VALUES ('worker-1', 'Worker', 'hash', 'active')"))
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.algo_worker_runs (
+                        strategy_run_id, token_id, template_id, account_scope, execution_mode, status
+                    ) VALUES (
+                        'run-exiting', 'worker-1', 'tmpl', 'kite:paper-a', 'live', 'exiting'
+                    )
+                    """
+                )
+            )
+            db.commit()
+
+        rows = await repo.list_exiting_recovery_runs()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["strategy_run_id"], "run-exiting")
+
+    async def test_release_session_and_run_heartbeat_routes(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-session-routes"] = {
+            "strategy_run_id": "run-session-routes",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {},
+            "metadata": {},
+            "worker_session_nonce": "nonce-1",
+            "worker_session_claimed_at": datetime.now(timezone.utc),
+        }
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer secret-token", "X-Worker-Session-Nonce": "nonce-1"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+        heartbeat = await heartbeat_worker_run_session(request, "run-session-routes", payload=SimpleNamespace())
+        self.assertEqual(heartbeat["status"], "ok")
+        released = await release_worker_run_session(request, "run-session-routes")
+        self.assertEqual(released["status"], "released")
+
+    async def test_claimed_session_route_conflict_and_missing_nonce(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-claim-conflict"] = {
+            "strategy_run_id": "run-claim-conflict",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {},
+            "metadata": {},
+            "worker_session_nonce": "nonce-existing",
+        }
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer secret-token"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+        with self.assertRaises(HTTPException) as claim_exc:
+            await claim_worker_run_session(request, "run-claim-conflict")
+        self.assertEqual(claim_exc.exception.status_code, 409)
+        self.assertEqual(claim_exc.exception.detail["rejection_reason"], "WORKER_SESSION_CONFLICT")
+
+        with self.assertRaises(HTTPException) as heartbeat_exc:
+            await heartbeat_worker_run_session(request, "run-claim-conflict", payload=SimpleNamespace())
+        self.assertEqual(heartbeat_exc.exception.status_code, 409)
+        self.assertEqual(heartbeat_exc.exception.detail["rejection_reason"], "WORKER_SESSION_REQUIRED")
+
+    async def test_worker_run_read_surface_includes_health_fields(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-health"] = {
+            "strategy_run_id": "run-health",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {
+                "runtime_recovery": {"recovery_status": "action_required", "action_required": True}
+            },
+            "metadata": {},
+            "worker_session_nonce": "nonce-1",
+            "last_heartbeat_at": datetime(2026, 5, 6, 9, 0, tzinfo=timezone.utc),
+        }
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer secret-token"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+        with patch("api.routers.algo_workers._utcnow", return_value=datetime(2026, 5, 6, 9, 10, tzinfo=timezone.utc)):
+            run = await get_worker_run(request, "run-health")
+
+        self.assertEqual(run["health_status"], "disconnected")
+        self.assertEqual(run["heartbeat_age_sec"], 600)
+        self.assertEqual(run["session_status"], "stale")
+        self.assertEqual(run["recovery_status"], "action_required")
+        self.assertTrue(run["recovery_action_required"])
+
+    async def test_worker_mutations_reject_conflicting_session_nonce(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-conflict"] = {
+            "strategy_run_id": "run-conflict",
+            "token_id": "worker-1",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {},
+            "metadata": {},
+            "worker_session_nonce": "nonce-expected",
+        }
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer secret-token", "X-Worker-Session-Nonce": "nonce-wrong"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo, paper_runtime_service=SimpleNamespace(place_order=AsyncMock(return_value={"status": "success"}), exit_strategy=AsyncMock(return_value={"status": "success"})))),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+        with self.assertRaises(HTTPException) as intent_exc:
+            await submit_worker_intent(
+                request,
+                "run-conflict",
+                WorkerIntentRequest(intent_type="place_order", payload={"order": {}}, idempotency_key="run-conflict:intent:1"),
+            )
+        self.assertEqual(intent_exc.exception.status_code, 409)
+        self.assertEqual(intent_exc.exception.detail["rejection_reason"], "WORKER_SESSION_CONFLICT")
+
+        with self.assertRaises(HTTPException) as risk_exc:
+            await patch_worker_run_risk(request, "run-conflict", WorkerRiskPatchRequest(patch={"x": 1}))
+        self.assertEqual(risk_exc.exception.status_code, 409)
+        self.assertEqual(risk_exc.exception.detail["rejection_reason"], "WORKER_SESSION_CONFLICT")
+
+        with self.assertRaises(HTTPException) as protection_exc:
+            await patch_worker_run_protection(
+                request,
+                "run-conflict",
+                WorkerProtectionPatchRequest(backend_protection={"enabled": False}),
+            )
+        self.assertEqual(protection_exc.exception.status_code, 409)
+        self.assertEqual(protection_exc.exception.detail["rejection_reason"], "WORKER_SESSION_CONFLICT")
+
+        with self.assertRaises(HTTPException) as exit_exc:
+            await exit_worker_run(request, "run-conflict", WorkerExitRequest(reason="x"))
+        self.assertEqual(exit_exc.exception.status_code, 409)
+        self.assertEqual(exit_exc.exception.detail["rejection_reason"], "WORKER_SESSION_CONFLICT")
+
     def test_run_view_with_worker_includes_heartbeat_fields(self):
         repository = SqlAlchemyAlgoWorkerRepository(session_factory=lambda: None)
         row = {

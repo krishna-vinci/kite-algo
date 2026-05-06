@@ -274,6 +274,30 @@ def test_safety_check_uses_new_endpoint(monkeypatch):
     assert calls[0][1] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/safety-check"
 
 
+def test_claim_session_uses_expected_endpoint(captured_requests):
+    client().claim_session("run-1")
+
+    assert captured_requests[0]["method"] == "POST"
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/claim-session"
+
+
+def test_release_session_sends_nonce_header(captured_requests):
+    client().release_session("run-1", session_nonce="nonce-1")
+
+    assert captured_requests[0]["method"] == "DELETE"
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/claim-session"
+    assert captured_requests[0]["kwargs"]["headers"] == {"X-Worker-Session-Nonce": "nonce-1"}
+
+
+def test_run_heartbeat_sends_nonce_header_and_payload(captured_requests):
+    client().run_heartbeat("run-1", session_nonce="nonce-1", worker_id="w-1", status="healthy", metrics={"cpu": 10})
+
+    assert captured_requests[0]["method"] == "POST"
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/heartbeat"
+    assert captured_requests[0]["kwargs"]["headers"] == {"X-Worker-Session-Nonce": "nonce-1"}
+    assert captured_requests[0]["kwargs"]["json"] == {"worker_id": "w-1", "status": "healthy", "metrics": {"cpu": 10}}
+
+
 def test_place_order_includes_safety_token_when_supplied(monkeypatch):
     calls = []
 
@@ -293,6 +317,25 @@ def test_place_order_includes_safety_token_when_supplied(monkeypatch):
     assert calls[0]["safety_token"] == "signed-token"
 
 
+def test_place_order_includes_session_nonce_when_supplied(monkeypatch):
+    calls = []
+
+    def fake_request(self, method, url, **kwargs):
+        calls.append(kwargs)
+        return FakeResponse(payload={"status": "accepted", "result": {"status": "ok"}})
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+    sdk_client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test"))
+    sdk_client.place_order(
+        "run-1",
+        {"exchange": "NSE", "tradingsymbol": "INFY"},
+        "run-1:entry:001",
+        session_nonce="nonce-1",
+    )
+
+    assert calls[0]["headers"] == {"X-Worker-Session-Nonce": "nonce-1"}
+
+
 def test_place_basket_includes_safety_token_when_supplied(monkeypatch):
     calls = []
 
@@ -310,6 +353,14 @@ def test_place_basket_includes_safety_token_when_supplied(monkeypatch):
     )
 
     assert calls[0]["safety_token"] == "signed-token"
+
+
+def test_patch_risk_and_exit_include_session_nonce(captured_requests):
+    client().patch_risk("run-1", {"stop_loss_pct": 1.2}, session_nonce="nonce-1")
+    client().exit_run("run-1", session_nonce="nonce-1")
+
+    assert captured_requests[0]["kwargs"]["headers"] == {"X-Worker-Session-Nonce": "nonce-1"}
+    assert captured_requests[1]["kwargs"]["headers"] == {"X-Worker-Session-Nonce": "nonce-1"}
 
 
 def test_get_funds_uses_worker_funds_endpoint(captured_requests):

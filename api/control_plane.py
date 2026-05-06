@@ -74,6 +74,18 @@ def compute_worker_health(last_heartbeat_at: Optional[datetime], *, now: Optiona
     }
 
 
+def _session_status_for_run(run: Dict[str, Any], health: Dict[str, Any]) -> str:
+    nonce = str(run.get("worker_session_nonce") or "").strip()
+    if not nonce:
+        return "missing"
+    health_status = str(health.get("health_status") or "unknown")
+    if health_status == "healthy":
+        return "claimed"
+    if health_status in {"stale", "disconnected"}:
+        return "stale"
+    return "takeover_required"
+
+
 def build_empty_snapshot(*, now: Optional[datetime] = None) -> Dict[str, Any]:
     generated = now or utcnow()
     return {
@@ -194,9 +206,12 @@ async def _worker_strategy_rows(request: Any, *, broker_account_id: Optional[str
             continue
         if broker_account_id and str(run.get("account_scope") or "") != str(broker_account_id):
             continue
-        health = compute_worker_health(run.get("last_heartbeat_at"), now=now)
+        run_heartbeat = run.get("last_heartbeat_at")
+        token_heartbeat = run.get("token_last_heartbeat_at")
+        health = compute_worker_health(run_heartbeat or token_heartbeat, now=now)
         metadata = dict(run.get("metadata") or {})
         runtime_state = dict(run.get("runtime_state") or {})
+        recovery_state = dict(runtime_state.get("runtime_recovery") or {})
         heartbeat_json = dict(run.get("heartbeat_json") or {})
         pnl = await _worker_pnl_or_empty(request, run)
         totals = dict(pnl.get("totals") or {})
@@ -233,6 +248,9 @@ async def _worker_strategy_rows(request: Any, *, broker_account_id: Optional[str
                 "worker_name": run.get("worker_name"),
                 "worker_metrics": dict(heartbeat_json.get("metrics") or {}),
                 **health,
+                "session_status": _session_status_for_run(run, health),
+                "recovery_status": recovery_state.get("recovery_status"),
+                "recovery_action_required": bool(recovery_state.get("action_required")),
                 "is_open": is_open,
                 "realized_pnl": to_float(totals.get("realized_pnl")),
                 "unrealized_pnl": to_float(totals.get("unrealized_pnl")),

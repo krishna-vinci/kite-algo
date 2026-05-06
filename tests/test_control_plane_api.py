@@ -39,6 +39,8 @@ class _FakeWorkerRepository:
                 "token_id": "worker-token-1",
                 "worker_name": "ml-box-worker",
                 "last_heartbeat_at": datetime(2026, 4, 25, 11, 59, 30, tzinfo=timezone.utc),
+                "token_last_heartbeat_at": datetime(2026, 4, 25, 11, 59, 29, tzinfo=timezone.utc),
+                "worker_session_nonce": "nonce-1",
                 "heartbeat_json": {"worker_id": "w-1", "metrics": {"machine_id": "ml-box-01"}},
             }
         ]
@@ -227,6 +229,15 @@ class _FakeExitWorkerRepository(_FakeWorkerRepository):
 
 
 class ControlPlaneHealthTests(unittest.TestCase):
+    def test_compute_worker_health_prefers_run_heartbeat_and_flags_action_required_for_stale_live_unprotected(self):
+        health = compute_worker_health(
+            datetime.fromisoformat("2026-05-06T09:00:00+00:00"),
+            now=datetime.fromisoformat("2026-05-06T09:10:00+00:00"),
+        )
+
+        self.assertEqual(health["heartbeat_age_sec"], 600)
+        self.assertEqual(health["health_status"], "disconnected")
+
     def test_worker_health_unknown_without_heartbeat(self):
         health = compute_worker_health(None, now=datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc))
 
@@ -282,6 +293,7 @@ class ControlPlaneAggregationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["strategies"][0]["strategy_run_id"], "paper-1")
         self.assertEqual(snapshot["strategies"][1]["strategy_run_id"], "run-live-1")
         self.assertEqual(snapshot["strategies"][1]["health_status"], "healthy")
+        self.assertEqual(snapshot["strategies"][1]["session_status"], "claimed")
         self.assertEqual(snapshot["unattributed"]["positions"][0]["tradingsymbol"], "MANUAL")
         self.assertEqual(snapshot["strategies"][1]["action_reasons"]["cancel_orders"], "Strategy-scoped cancel is disabled until a broker-safe open-order lookup is registered")
 
@@ -357,6 +369,37 @@ class ControlPlaneAggregationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(snapshot["strategies"][0]["protection"]["status"], "error")
         self.assertIn("runtime down", snapshot["strategies"][0]["protection"]["details"]["error"])
+
+    async def test_snapshot_marks_recovery_action_required_when_runtime_state_requests_it(self):
+        repo = _FakeWorkerRepository()
+
+        async def _runs():
+            items = await _FakeWorkerRepository().list_runs_for_control_plane()
+            items[0]["runtime_state"] = {"runtime_recovery": {"action_required": True, "recovery_status": "stalled"}}
+            return items
+
+        repo.list_runs_for_control_plane = _runs  # type: ignore[method-assign]
+        request = SimpleNamespace(
+            headers={},
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    algo_worker_repository=repo,
+                    paper_runtime_service=_FakePaperRuntime(),
+                    realtime_positions_service=_FakeRealtimePositionsService(),
+                )
+            ),
+        )
+
+        snapshot = await build_strategy_positions_snapshot(
+            request,
+            account_scope="default",
+            broker_account_id="kite:AB1234",
+            now=datetime(2026, 4, 25, 12, 10, tzinfo=timezone.utc),
+        )
+
+        live_row = snapshot["strategies"][1]
+        self.assertTrue(live_row["recovery_action_required"])
+        self.assertEqual(live_row["recovery_status"], "stalled")
 
 
 class ControlPlaneActionTests(unittest.IsolatedAsyncioTestCase):

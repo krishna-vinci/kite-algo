@@ -62,6 +62,9 @@ VALID_WORKER_STRATEGY_FAMILIES = {
     "investment_strategy",
     "discretionary_strategy",
 }
+WORKER_SESSION_FRESHNESS_SECONDS = int(os.getenv("WORKER_SESSION_FRESHNESS_SECONDS", "60"))
+WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS = int(os.getenv("WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS", "120"))
+WORKER_RUN_STALE_ACTION_SECONDS = int(os.getenv("WORKER_RUN_STALE_ACTION_SECONDS", "180"))
 
 
 def _utcnow() -> datetime:
@@ -413,6 +416,32 @@ class SqlAlchemyAlgoWorkerRepository:
     async def update_run_status(self, strategy_run_id: str, status: str, *, state_patch: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._update_run_status_sync, strategy_run_id, status, state_patch)
 
+    async def claim_run_session(
+        self,
+        strategy_run_id: str,
+        *,
+        freshness_seconds: int,
+        claimed_without_heartbeat_seconds: int,
+    ) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._claim_run_session_sync,
+            strategy_run_id,
+            freshness_seconds,
+            claimed_without_heartbeat_seconds,
+        )
+
+    async def release_run_session(self, strategy_run_id: str, *, expected_nonce: str) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(self._release_run_session_sync, strategy_run_id, expected_nonce)
+
+    async def record_run_heartbeat(self, strategy_run_id: str, *, expected_nonce: str) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(self._record_run_heartbeat_sync, strategy_run_id, expected_nonce)
+
+    async def list_stale_recovery_runs(self) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._list_stale_recovery_runs_sync)
+
+    async def list_exiting_recovery_runs(self) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._list_exiting_recovery_runs_sync)
+
     async def list_live_strategy_open_legs(self, *, strategy_run_id: str, account_id: str) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(self._list_live_strategy_open_legs_sync, strategy_run_id, account_id)
 
@@ -634,7 +663,7 @@ class SqlAlchemyAlgoWorkerRepository:
                     SELECT
                         r.*,
                         t.name AS worker_name,
-                        t.last_heartbeat_at,
+                        t.last_heartbeat_at AS token_last_heartbeat_at,
                         t.heartbeat_json
                     FROM public.algo_worker_runs r
                     LEFT JOIN public.algo_worker_tokens t ON t.token_id = r.token_id
@@ -655,7 +684,7 @@ class SqlAlchemyAlgoWorkerRepository:
                     SELECT
                         r.*,
                         t.name AS worker_name,
-                        t.last_heartbeat_at,
+                        t.last_heartbeat_at AS token_last_heartbeat_at,
                         t.heartbeat_json
                     FROM public.algo_worker_runs r
                     LEFT JOIN public.algo_worker_tokens t ON t.token_id = r.token_id
@@ -740,6 +769,164 @@ class SqlAlchemyAlgoWorkerRepository:
         except Exception:
             db.rollback()
             raise
+        finally:
+            db.close()
+
+    def _claim_run_session_sync(
+        self,
+        strategy_run_id: str,
+        freshness_seconds: int,
+        claimed_without_heartbeat_seconds: int,
+    ) -> Optional[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE public.algo_worker_runs
+                    SET worker_session_nonce = :nonce,
+                        worker_session_claimed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND (
+                        worker_session_nonce IS NULL
+                        OR (
+                          last_heartbeat_at IS NOT NULL
+                          AND last_heartbeat_at < NOW() - (:freshness_seconds::TEXT || ' seconds')::INTERVAL
+                        )
+                        OR (
+                          last_heartbeat_at IS NULL
+                          AND worker_session_claimed_at IS NOT NULL
+                          AND worker_session_claimed_at < NOW() - (:claimed_without_heartbeat_seconds::TEXT || ' seconds')::INTERVAL
+                        )
+                      )
+                    RETURNING *
+                    """
+                ),
+                {
+                    "strategy_run_id": strategy_run_id,
+                    "nonce": f"wsn_{uuid.uuid4().hex}",
+                    "freshness_seconds": max(1, int(freshness_seconds)),
+                    "claimed_without_heartbeat_seconds": max(1, int(claimed_without_heartbeat_seconds)),
+                },
+            ).fetchone()
+            db.commit()
+            return self._run_view(row) if row else None
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _release_run_session_sync(self, strategy_run_id: str, expected_nonce: str) -> Optional[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE public.algo_worker_runs
+                    SET worker_session_nonce = NULL,
+                        worker_session_claimed_at = NULL,
+                        updated_at = NOW()
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND worker_session_nonce = :expected_nonce
+                    RETURNING *
+                    """
+                ),
+                {
+                    "strategy_run_id": strategy_run_id,
+                    "expected_nonce": expected_nonce,
+                },
+            ).fetchone()
+            db.commit()
+            return self._run_view(row) if row else None
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _record_run_heartbeat_sync(self, strategy_run_id: str, expected_nonce: str) -> Optional[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    UPDATE public.algo_worker_runs
+                    SET last_heartbeat_at = NOW(),
+                        updated_at = NOW()
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND worker_session_nonce = :expected_nonce
+                    RETURNING *
+                    """
+                ),
+                {
+                    "strategy_run_id": strategy_run_id,
+                    "expected_nonce": expected_nonce,
+                },
+            ).fetchone()
+            db.commit()
+            return self._run_view(row) if row else None
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _list_stale_recovery_runs_sync(self) -> List[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT r.*
+                    FROM public.algo_worker_runs r
+                    WHERE r.status IN ('open', 'paused')
+                      AND NOT (
+                        r.worker_session_nonce IS NULL
+                        AND r.last_heartbeat_at IS NULL
+                      )
+                      AND NOT (
+                        COALESCE((r.runtime_state_json -> 'backend_protection' ->> 'enabled')::BOOLEAN, FALSE) = TRUE
+                        AND COALESCE((r.runtime_state_json -> 'backend_protection' -> 'operations' ->> 'exit_on_worker_stale')::BOOLEAN, FALSE) = TRUE
+                      )
+                      AND (
+                        (
+                          r.last_heartbeat_at IS NOT NULL
+                          AND r.last_heartbeat_at < NOW() - (:stale_seconds::TEXT || ' seconds')::INTERVAL
+                        )
+                        OR (
+                          r.last_heartbeat_at IS NULL
+                          AND r.worker_session_claimed_at IS NOT NULL
+                          AND r.worker_session_claimed_at < NOW() - (:claimed_without_heartbeat_seconds::TEXT || ' seconds')::INTERVAL
+                        )
+                      )
+                    ORDER BY COALESCE(r.updated_at, r.created_at) ASC
+                    """
+                ),
+                {
+                    "stale_seconds": max(1, int(WORKER_RUN_STALE_ACTION_SECONDS)),
+                    "claimed_without_heartbeat_seconds": max(1, int(WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS)),
+                },
+            ).fetchall()
+            return [self._run_view(row) for row in rows]
+        finally:
+            db.close()
+
+    def _list_exiting_recovery_runs_sync(self) -> List[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT *
+                    FROM public.algo_worker_runs
+                    WHERE status = 'exiting'
+                    ORDER BY COALESCE(updated_at, created_at) ASC
+                    """
+                )
+            ).fetchall()
+            return [self._run_view(row) for row in rows]
         finally:
             db.close()
 
@@ -1184,6 +1371,9 @@ class SqlAlchemyAlgoWorkerRepository:
             "allowed_actions": _json_loads(payload.get("allowed_actions_json"), []),
             "runtime_state": _json_loads(payload.get("runtime_state_json"), {}),
             "metadata": _json_loads(payload.get("metadata_json"), {}),
+            "worker_session_nonce": payload.get("worker_session_nonce"),
+            "worker_session_claimed_at": payload.get("worker_session_claimed_at"),
+            "last_heartbeat_at": payload.get("last_heartbeat_at"),
             "created_at": payload.get("created_at"),
             "updated_at": payload.get("updated_at"),
             "closed_at": payload.get("closed_at"),
@@ -1193,7 +1383,9 @@ class SqlAlchemyAlgoWorkerRepository:
         payload = self._run_view(row)
         raw = _row_mapping(row)
         payload["worker_name"] = raw.get("worker_name")
-        payload["last_heartbeat_at"] = raw.get("last_heartbeat_at")
+        payload["token_last_heartbeat_at"] = raw.get("token_last_heartbeat_at")
+        if payload.get("last_heartbeat_at") is None:
+            payload["last_heartbeat_at"] = raw.get("token_last_heartbeat_at")
         payload["heartbeat_json"] = _json_loads(raw.get("heartbeat_json"), {})
         return payload
 
@@ -1275,6 +1467,62 @@ def _extract_ws_token(websocket: WebSocket) -> str:
     if not token:
         raise HTTPException(status_code=401, detail="Worker websocket token required")
     return token
+
+
+def _worker_session_nonce_from_request(request: Request) -> str:
+    return str(request.headers.get("X-Worker-Session-Nonce") or "").strip()
+
+
+async def require_active_worker_run_session(request: Request, run: Dict[str, Any]) -> str:
+    active_nonce = str(run.get("worker_session_nonce") or "").strip()
+    if not active_nonce:
+        return ""
+    nonce = _worker_session_nonce_from_request(request)
+    if not nonce:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "WORKER_SESSION_REQUIRED",
+                "strategy_run_id": str(run.get("strategy_run_id") or ""),
+            },
+        )
+    if nonce != active_nonce:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "WORKER_SESSION_CONFLICT",
+                "strategy_run_id": str(run.get("strategy_run_id") or ""),
+            },
+        )
+    return nonce
+
+
+def _session_status_for_run(run: Dict[str, Any], health: Dict[str, Any]) -> str:
+    nonce = str(run.get("worker_session_nonce") or "").strip()
+    if not nonce:
+        return "missing"
+    health_status = str(health.get("health_status") or "unknown")
+    if health_status == "healthy":
+        return "claimed"
+    if health_status in {"stale", "disconnected"}:
+        return "stale"
+    return "takeover_required"
+
+
+def _enrich_run_health_fields(run: Dict[str, Any]) -> Dict[str, Any]:
+    from api.control_plane import compute_worker_health
+
+    payload = dict(run)
+    now = _utcnow()
+    health = compute_worker_health(payload.get("last_heartbeat_at"), now=now)
+    runtime_state = dict(payload.get("runtime_state") or {})
+    recovery_state = dict(runtime_state.get("runtime_recovery") or {})
+    payload["heartbeat_age_sec"] = health.get("heartbeat_age_sec")
+    payload["health_status"] = health.get("health_status")
+    payload["session_status"] = _session_status_for_run(payload, health)
+    payload["recovery_status"] = recovery_state.get("recovery_status")
+    payload["recovery_action_required"] = bool(recovery_state.get("action_required"))
+    return payload
 
 
 async def require_worker_token(request: Request) -> WorkerToken:
@@ -2435,6 +2683,61 @@ async def _option_run_status_for_worker(request: Request, strategy_run_id: str) 
         return _OPTION_PROTECTION_STATE_UNAVAILABLE
 
 
+async def _option_run_protection_snapshot_for_worker(request: Request, strategy_run_id: str) -> dict[str, Any]:
+    try:
+        from options.execution.store import get_option_run_store
+        from options.protection.runtime import evaluate_option_protection_state
+
+        store = get_option_run_store()
+        run = await asyncio.to_thread(store.get_run, strategy_run_id)
+        run_status = str(run.status or "")
+        verdict = await asyncio.to_thread(evaluate_option_protection_state, run=run)
+        triggered = bool(verdict.get("triggered"))
+        status_blocks = bool(run_status and option_run_status_blocks_trading(run_status))
+        if triggered:
+            blocking_reason = "OPTIONS_PROTECTION_TRIGGERED"
+        elif status_blocks:
+            blocking_reason = "OPTIONS_RUN_NOT_ACTIVE"
+        else:
+            blocking_reason = None
+        recommended_exit_orders = list(verdict.get("recommended_exit_orders") or [])
+        return {
+            "applicable": True,
+            "run_status": run_status,
+            "evaluation_mode": "run_state",
+            "triggered": triggered,
+            "blocking": bool(triggered or status_blocks),
+            "blocking_reason": blocking_reason,
+            "matched_rule": verdict.get("matched_rule"),
+            "metrics": dict(verdict.get("metrics") or {}),
+            "recommended_exit_orders_count": len(recommended_exit_orders),
+        }
+    except KeyError:
+        return {
+            "applicable": False,
+            "run_status": None,
+            "evaluation_mode": "run_state",
+            "triggered": False,
+            "blocking": False,
+            "blocking_reason": None,
+            "matched_rule": None,
+            "metrics": {},
+            "recommended_exit_orders_count": 0,
+        }
+    except Exception:
+        return {
+            "applicable": True,
+            "run_status": None,
+            "evaluation_mode": "run_state",
+            "triggered": False,
+            "blocking": True,
+            "blocking_reason": "OPTIONS_PROTECTION_STATE_UNAVAILABLE",
+            "matched_rule": None,
+            "metrics": {},
+            "recommended_exit_orders_count": 0,
+        }
+
+
 def _worker_safety_secret(request: Request) -> str:
     _ = request
     secret = os.getenv("WORKER_SAFETY_TOKEN_SECRET") or os.getenv("APP_JWT_SECRET")
@@ -2464,6 +2767,61 @@ def _safety_blocking_reasons(
     elif option_status and option_run_status_blocks_trading(option_status):
         blocking_reasons.append("OPTIONS_RUN_NOT_ACTIVE")
     return blocking_reasons
+
+
+async def validate_worker_run_safety_token(
+    request: Request,
+    strategy_run_id: str,
+    safety_token: str,
+    *,
+    run: dict[str, Any] | None = None,
+) -> None:
+    current_run = run if run is not None else await _repo(request).get_run(strategy_run_id)
+    if current_run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+
+    runtime_state = dict(current_run.get("runtime_state") or {})
+    generic = dict(runtime_state.get("backend_protection_state") or {})
+    option_snapshot = await _option_run_protection_snapshot_for_worker(request, strategy_run_id)
+    option_status = (
+        _OPTION_PROTECTION_STATE_UNAVAILABLE
+        if option_snapshot.get("blocking_reason") == "OPTIONS_PROTECTION_STATE_UNAVAILABLE"
+        else option_snapshot.get("run_status")
+    )
+    run_status = str(current_run.get("status") or "open")
+    generic_status = str(generic.get("status") or "active")
+    generic_exit_submitted = bool(generic.get("exit_submitted"))
+
+    current_fingerprint = build_safety_fingerprint(
+        run_status=run_status,
+        generic_status=generic_status,
+        generic_exit_submitted=generic_exit_submitted,
+        option_run_status=option_status,
+    )
+    verified = verify_signed_safety_token(
+        safety_token,
+        strategy_run_id,
+        _worker_safety_secret(request),
+        now=_utcnow(),
+    )
+    if verified is None or verified.get("fingerprint") != current_fingerprint:
+        blocking_reasons = _safety_blocking_reasons(
+            run_status=run_status,
+            generic_status=generic_status,
+            generic_exit_submitted=generic_exit_submitted,
+            option_status=option_status,
+        )
+        if option_snapshot.get("triggered"):
+            blocking_reasons.append("OPTIONS_PROTECTION_TRIGGERED")
+        blocking_reasons = list(dict.fromkeys(blocking_reasons))
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "SAFETY_TOKEN_EXPIRED",
+                "blocking_reasons": blocking_reasons or ["SAFETY_STATE_UNKNOWN"],
+                "strategy_run_id": strategy_run_id,
+            },
+        )
 
 
 def _require_live_run(run: Dict[str, Any], *, feature: str) -> None:
@@ -2522,6 +2880,97 @@ async def worker_heartbeat(request: Request, payload: WorkerHeartbeatRequest):
     token = await require_worker_token(request)
     _require_action(token, "heartbeat")
     return await _repo(request).record_heartbeat(token.token_id, payload)
+
+
+@router.post("/worker/runs/{strategy_run_id}/claim-session")
+async def claim_worker_run_session(request: Request, strategy_run_id: str):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    claimed = await _repo(request).claim_run_session(
+        strategy_run_id,
+        freshness_seconds=WORKER_SESSION_FRESHNESS_SECONDS,
+        claimed_without_heartbeat_seconds=WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
+    )
+    if claimed is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "WORKER_SESSION_CONFLICT",
+                "strategy_run_id": strategy_run_id,
+            },
+        )
+    return {
+        "strategy_run_id": strategy_run_id,
+        "worker_session_nonce": claimed.get("worker_session_nonce"),
+        "worker_session_claimed_at": claimed.get("worker_session_claimed_at"),
+    }
+
+
+@router.delete("/worker/runs/{strategy_run_id}/claim-session")
+async def release_worker_run_session(request: Request, strategy_run_id: str):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    nonce = _worker_session_nonce_from_request(request)
+    if not nonce:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "WORKER_SESSION_REQUIRED",
+                "strategy_run_id": strategy_run_id,
+            },
+        )
+    released = await _repo(request).release_run_session(strategy_run_id, expected_nonce=nonce)
+    if released is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "WORKER_SESSION_CONFLICT",
+                "strategy_run_id": strategy_run_id,
+            },
+        )
+    return {"status": "released", "strategy_run_id": strategy_run_id}
+
+
+@router.post("/worker/runs/{strategy_run_id}/heartbeat")
+async def heartbeat_worker_run_session(request: Request, strategy_run_id: str, payload: WorkerHeartbeatRequest):
+    _ = payload
+    token = await require_worker_token(request)
+    _require_action(token, "heartbeat")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    nonce = _worker_session_nonce_from_request(request)
+    if not nonce:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "WORKER_SESSION_REQUIRED",
+                "strategy_run_id": strategy_run_id,
+            },
+        )
+    updated = await _repo(request).record_run_heartbeat(strategy_run_id, expected_nonce=nonce)
+    if updated is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "WORKER_SESSION_CONFLICT",
+                "strategy_run_id": strategy_run_id,
+            },
+        )
+    return {
+        "status": "ok",
+        "strategy_run_id": strategy_run_id,
+        "last_heartbeat_at": updated.get("last_heartbeat_at"),
+    }
 
 
 @router.post("/worker/runs")
@@ -2622,7 +3071,7 @@ async def get_worker_run(request: Request, strategy_run_id: str):
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
-    return run
+    return _enrich_run_health_fields(run)
 
 
 @router.get("/worker/runs/{strategy_run_id}/safety-check")
@@ -2636,7 +3085,12 @@ async def get_worker_run_safety_check(request: Request, strategy_run_id: str):
 
     runtime_state = dict(run.get("runtime_state") or {})
     generic = dict(runtime_state.get("backend_protection_state") or {})
-    option_status = await _option_run_status_for_worker(request, strategy_run_id)
+    option_snapshot = await _option_run_protection_snapshot_for_worker(request, strategy_run_id)
+    option_status = (
+        _OPTION_PROTECTION_STATE_UNAVAILABLE
+        if option_snapshot.get("blocking_reason") == "OPTIONS_PROTECTION_STATE_UNAVAILABLE"
+        else option_snapshot.get("run_status")
+    )
     generic_status = str(generic.get("status") or "active")
     generic_exit_submitted = bool(generic.get("exit_submitted"))
     run_status = str(run.get("status") or "open")
@@ -2647,6 +3101,9 @@ async def get_worker_run_safety_check(request: Request, strategy_run_id: str):
         generic_exit_submitted=generic_exit_submitted,
         option_status=option_status,
     )
+    if option_snapshot.get("triggered"):
+        blocking_reasons.append("OPTIONS_PROTECTION_TRIGGERED")
+    blocking_reasons = list(dict.fromkeys(blocking_reasons))
     can_trade = not blocking_reasons
     now = _utcnow()
     fingerprint = build_safety_fingerprint(
@@ -2667,8 +3124,6 @@ async def get_worker_run_safety_check(request: Request, strategy_run_id: str):
         else None
     )
 
-    option_state_unavailable = option_status == _OPTION_PROTECTION_STATE_UNAVAILABLE
-    option_blocking = option_state_unavailable or bool(option_status and option_run_status_blocks_trading(option_status))
     return {
         "strategy_run_id": strategy_run_id,
         "can_trade": can_trade,
@@ -2684,17 +3139,7 @@ async def get_worker_run_safety_check(request: Request, strategy_run_id: str):
             "heartbeat_age_sec": generic.get("heartbeat_age_sec"),
             "last_checked_at": generic.get("last_checked_at"),
         },
-        "options_protection": {
-            "applicable": option_status is not None,
-            "run_status": None if option_state_unavailable else option_status,
-            "evaluation_mode": "status_only_v1",
-            "blocking": option_blocking,
-            "blocking_reason": (
-                "OPTIONS_PROTECTION_STATE_UNAVAILABLE"
-                if option_state_unavailable
-                else ("OPTIONS_RUN_NOT_ACTIVE" if option_blocking else None)
-            ),
-        },
+        "options_protection": option_snapshot,
         "evaluated_at": now.isoformat(),
     }
 
@@ -2894,6 +3339,7 @@ async def patch_worker_run_risk(request: Request, strategy_run_id: str, payload:
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await require_active_worker_run_session(request, run)
     if run.get("status") in {"closed", "failed"}:
         raise HTTPException(status_code=409, detail="Closed strategy runs cannot be risk-edited")
     return await _repo(request).update_run_risk(strategy_run_id, payload.patch)
@@ -2907,6 +3353,7 @@ async def patch_worker_run_protection(request: Request, strategy_run_id: str, pa
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await require_active_worker_run_session(request, run)
     if run.get("status") in {"closed", "failed"}:
         raise HTTPException(status_code=409, detail="Closed strategy runs cannot be protection-edited")
 
@@ -3161,6 +3608,7 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await require_active_worker_run_session(request, run)
     if str(run.get("status") or "open") != "open":
         raise HTTPException(status_code=409, detail="Worker intents can only be submitted for open strategy runs")
     mode = str(run.get("execution_mode") or "").lower()
@@ -3173,39 +3621,12 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
         return {"status": "deduped", "result": existing}
 
     if payload.safety_token:
-        runtime_state = dict(run.get("runtime_state") or {})
-        generic = dict(runtime_state.get("backend_protection_state") or {})
-        option_status = await _option_run_status_for_worker(request, strategy_run_id)
-        run_status = str(run.get("status") or "open")
-        generic_status = str(generic.get("status") or "active")
-        generic_exit_submitted = bool(generic.get("exit_submitted"))
-        current_fingerprint = build_safety_fingerprint(
-            run_status=run_status,
-            generic_status=generic_status,
-            generic_exit_submitted=generic_exit_submitted,
-            option_run_status=option_status,
-        )
-        verified = verify_signed_safety_token(
-            payload.safety_token,
+        await validate_worker_run_safety_token(
+            request,
             strategy_run_id,
-            _worker_safety_secret(request),
-            now=_utcnow(),
+            payload.safety_token,
+            run=run,
         )
-        if verified is None or verified.get("fingerprint") != current_fingerprint:
-            blocking_reasons = _safety_blocking_reasons(
-                run_status=run_status,
-                generic_status=generic_status,
-                generic_exit_submitted=generic_exit_submitted,
-                option_status=option_status,
-            )
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "rejection_reason": "SAFETY_TOKEN_EXPIRED",
-                    "blocking_reasons": blocking_reasons or ["SAFETY_STATE_UNKNOWN"],
-                    "strategy_run_id": strategy_run_id,
-                },
-            )
 
     result: Dict[str, Any]
     if mode == "dry_run":
@@ -3274,6 +3695,7 @@ async def exit_worker_run(request: Request, strategy_run_id: str, payload: Worke
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await require_active_worker_run_session(request, run)
     mode = str(run.get("execution_mode") or "").lower()
     _require_v1_mode(mode)
     if mode == "dry_run":

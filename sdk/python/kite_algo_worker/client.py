@@ -105,6 +105,35 @@ class KiteAlgoWorkerClient:
     def get_run(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}")
 
+    def claim_session(self, strategy_run_id: str) -> JsonDict:
+        return self._request("POST", f"/worker/runs/{strategy_run_id}/claim-session")
+
+    def release_session(self, strategy_run_id: str, *, session_nonce: str) -> JsonDict:
+        return self._request(
+            "DELETE",
+            f"/worker/runs/{strategy_run_id}/claim-session",
+            headers={"X-Worker-Session-Nonce": str(session_nonce)},
+        )
+
+    def run_heartbeat(
+        self,
+        strategy_run_id: str,
+        *,
+        session_nonce: str,
+        worker_id: Optional[str] = None,
+        status: str = "healthy",
+        metrics: Optional[Mapping[str, Any]] = None,
+    ) -> JsonDict:
+        payload: JsonDict = {"status": status, "metrics": dict(metrics or {})}
+        if worker_id is not None:
+            payload["worker_id"] = worker_id
+        return self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/heartbeat",
+            headers={"X-Worker-Session-Nonce": str(session_nonce)},
+            json=payload,
+        )
+
     def safety_check(self, strategy_run_id: str) -> SafetyCheckResult:
         return SafetyCheckResult.model_validate(self._request("GET", f"/worker/runs/{strategy_run_id}/safety-check"))
 
@@ -384,6 +413,7 @@ class KiteAlgoWorkerClient:
         idempotency_key: str,
         metadata: Optional[Mapping[str, Any]] = None,
         safety_token: Optional[str] = None,
+        session_nonce: Optional[str] = None,
     ) -> JsonDict:
         key = self._require_idempotency_key(idempotency_key)
         payload: JsonDict = {
@@ -394,7 +424,8 @@ class KiteAlgoWorkerClient:
         }
         if safety_token is not None:
             payload["safety_token"] = str(safety_token)
-        return self._request("POST", f"/worker/runs/{strategy_run_id}/intents", json=payload)
+        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
+        return self._request("POST", f"/worker/runs/{strategy_run_id}/intents", json=payload, headers=headers)
 
     def place_basket(
         self,
@@ -406,6 +437,7 @@ class KiteAlgoWorkerClient:
         all_or_none: bool = False,
         dry_run: bool = False,
         safety_token: Optional[str] = None,
+        session_nonce: Optional[str] = None,
     ) -> JsonDict:
         key = self._require_idempotency_key(idempotency_key)
         order_list: List[JsonDict] = [dict(order) for order in orders]
@@ -417,18 +449,22 @@ class KiteAlgoWorkerClient:
         }
         if safety_token is not None:
             payload["safety_token"] = str(safety_token)
-        return self._request("POST", f"/worker/runs/{strategy_run_id}/intents", json=payload)
+        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
+        return self._request("POST", f"/worker/runs/{strategy_run_id}/intents", json=payload, headers=headers)
 
     def patch_risk(
         self,
         strategy_run_id: str,
         patch: Mapping[str, Any],
         reason: Optional[str] = None,
+        session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
         return self._request(
             "PATCH",
             f"/worker/runs/{strategy_run_id}/risk",
             json={"patch": dict(patch), "reason": reason},
+            headers=headers,
         )
 
     def update_backend_protection(
@@ -438,7 +474,9 @@ class KiteAlgoWorkerClient:
         *,
         reason: Optional[str] = None,
         reset_trailing: bool = True,
+        session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
         return self._request(
             "PATCH",
             f"/worker/runs/{strategy_run_id}/protection",
@@ -447,6 +485,7 @@ class KiteAlgoWorkerClient:
                 "reason": reason,
                 "reset_trailing": reset_trailing,
             },
+            headers=headers,
         )
 
     def exit_run(
@@ -455,11 +494,14 @@ class KiteAlgoWorkerClient:
         reason: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         dry_run: bool = False,
+        session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
         return self._request(
             "POST",
             f"/worker/runs/{strategy_run_id}/exit",
             json={"reason": reason, "idempotency_key": idempotency_key, "dry_run": dry_run},
+            headers=headers,
         )
 
     @staticmethod
