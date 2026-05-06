@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs(stub_kite_orders=False)
@@ -9,7 +11,8 @@ SDK_ROOT = Path(__file__).resolve().parents[1] / "sdk" / "python"
 if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 
-from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, option_leg  # noqa: E402
+from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, KiteAlgoWorkerError, option_leg  # noqa: E402
+from kite_algo_worker.options import SpreadSpec, resolve_option_contracts, resolve_spread  # noqa: E402
 from kite_algo_worker.options.models import OptionExecutionLeg, OptionRunCreateRequest  # noqa: E402
 
 
@@ -314,3 +317,108 @@ def test_option_client_mutations_include_session_nonce(monkeypatch):
     assert calls[0]["headers"] == {"X-Worker-Session-Nonce": "nonce-1"}
     assert calls[1]["headers"] == {"X-Worker-Session-Nonce": "nonce-1"}
     assert calls[2]["headers"] == {"X-Worker-Session-Nonce": "nonce-1"}
+
+
+def test_resolve_option_contracts_returns_normalized_contract_rows():
+    fake_options = type(
+        "FakeOptions",
+        (),
+        {
+            "resolve_contracts": staticmethod(
+                lambda underlying, payload: {
+                    "underlying": underlying,
+                    "contracts": [
+                        {
+                            "tradingsymbol": "NIFTY26MAY25000CE",
+                            "instrument_token": 123,
+                            "strike": 25000,
+                            "option_type": "CE",
+                            "expiry_key": "2026-05-28",
+                            "lot_size": 75,
+                            "ltp": 110.5,
+                        }
+                    ],
+                }
+            )
+        },
+    )()
+
+    resolved = resolve_option_contracts(
+        fake_options,
+        underlying="NIFTY",
+        selection_payload={"legs": [{"option_type": "CE", "moneyness": "ATM"}]},
+    )
+
+    assert resolved[0]["tradingsymbol"] == "NIFTY26MAY25000CE"
+    assert resolved[0]["lot_size"] == 75
+
+
+def test_resolve_spread_builds_option_execution_legs_with_explicit_product():
+    calls = []
+
+    class FakeOptions:
+        @staticmethod
+        def resolve_contracts(underlying, payload):
+            calls.append({"underlying": underlying, "payload": payload})
+            return {
+                "contracts": [
+                    {
+                        "tradingsymbol": "NIFTY26MAY25000CE",
+                        "instrument_token": 1,
+                        "strike": 25000,
+                        "option_type": "CE",
+                        "expiry_key": "2026-05-28",
+                        "lot_size": 75,
+                        "ltp": 100.0,
+                    },
+                    {
+                        "tradingsymbol": "NIFTY26MAY25100CE",
+                        "instrument_token": 2,
+                        "strike": 25100,
+                        "option_type": "CE",
+                        "expiry_key": "2026-05-28",
+                        "lot_size": 75,
+                        "ltp": 60.0,
+                    },
+                ]
+            }
+
+    spec = SpreadSpec(
+        spread_type="vertical_call_spread",
+        expiry="current_week",
+        legs=[
+            {"selection": {"option_type": "CE", "moneyness": "ATM"}, "transaction_type": "BUY", "lots": 1},
+            {"selection": {"option_type": "CE", "moneyness": "+1_strike"}, "transaction_type": "SELL", "lots": 1},
+        ],
+    )
+
+    legs = resolve_spread(FakeOptions(), underlying="NIFTY", product="MIS", spec=spec)
+
+    assert len(calls) == 1
+    assert calls[0]["payload"] == {
+        "expiry": "current_week",
+        "legs": [
+            {"option_type": "CE", "moneyness": "ATM"},
+            {"option_type": "CE", "moneyness": "+1_strike"},
+        ],
+    }
+    assert [leg.transaction_type for leg in legs] == ["BUY", "SELL"]
+    assert all(leg.product == "MIS" for leg in legs)
+    assert all(leg.quantity == 75 for leg in legs)
+
+
+def test_resolve_spread_raises_worker_error_for_missing_contracts():
+    class FakeOptions:
+        @staticmethod
+        def resolve_contracts(underlying, payload):
+            _ = (underlying, payload)
+            return {"contracts": []}
+
+    spec = SpreadSpec(
+        spread_type="vertical_call_spread",
+        expiry="current_week",
+        legs=[{"selection": {"option_type": "CE", "moneyness": "ATM"}, "transaction_type": "BUY", "lots": 1}],
+    )
+
+    with pytest.raises(KiteAlgoWorkerError, match="Expected 1 resolved contracts"):
+        resolve_spread(FakeOptions(), underlying="NIFTY", product="MIS", spec=spec)

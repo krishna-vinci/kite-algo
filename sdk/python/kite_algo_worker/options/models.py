@@ -129,3 +129,42 @@ class OptionRunActionRequest(ModelMixin):
         object.__setattr__(self, "order_results", None if self.order_results is None else [dict(item) for item in list(self.order_results)])
         object.__setattr__(self, "trade_results", None if self.trade_results is None else [dict(item) for item in list(self.trade_results)])
         object.__setattr__(self, "safety_token", None if self.safety_token is None else str(self.safety_token))
+
+
+@dataclass(frozen=True)
+class SpreadLegSelection(ModelMixin):
+    selection: Dict[str, Any] = field(default_factory=dict)
+    transaction_type: str = ""
+    lots: int = 1
+    order_type: str = "MARKET"
+    price: Optional[float] = None
+    trigger_price: Optional[float] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "selection", dict(self.selection or {}))
+        object.__setattr__(self, "transaction_type", str(self.transaction_type or "").strip().upper())
+        object.__setattr__(self, "lots", max(1, int(self.lots or 1)))
+        object.__setattr__(self, "order_type", str(self.order_type or "MARKET").strip().upper())
+        object.__setattr__(self, "price", None if self.price is None else float(self.price))
+        object.__setattr__(self, "trigger_price", None if self.trigger_price is None else float(self.trigger_price))
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+
+
+@dataclass(frozen=True)
+class SpreadSpec(ModelMixin):
+    spread_type: str
+    expiry: str
+    legs: List[SpreadLegSelection] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "spread_type", str(self.spread_type or "").strip())
+        object.__setattr__(self, "expiry", str(self.expiry or "").strip())
+        object.__setattr__(
+            self,
+            "legs",
+            [
+                leg if isinstance(leg, SpreadLegSelection) else SpreadLegSelection.model_validate(dict(leg))
+                for leg in list(self.legs or [])
+            ],
+        )

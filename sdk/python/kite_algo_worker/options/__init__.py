@@ -5,7 +5,10 @@ from .models import (
     OptionExpirySnapshot,
     OptionRunActionRequest,
     OptionRunCreateRequest,
+    SpreadLegSelection,
+    SpreadSpec,
 )
+from .resolvers import resolve_option_contracts, resolve_spread
 from .structures import option_leg
 
 __all__ = [
@@ -15,5 +18,9 @@ __all__ = [
     "OptionExpirySnapshot",
     "OptionRunActionRequest",
     "OptionRunCreateRequest",
+    "SpreadLegSelection",
+    "SpreadSpec",
     "option_leg",
+    "resolve_option_contracts",
+    "resolve_spread",
 ]

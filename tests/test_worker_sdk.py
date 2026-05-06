@@ -29,6 +29,8 @@ from kite_algo_worker import (  # noqa: E402
     KiteAlgoWorkerClient,
     KiteAlgoWorkerError,
     PreviewPayload,
+    ManagedRun,
+    RunConfig,
     SafetyCheckResult,
     OperationalProtection,
     ProtectedPosition,
@@ -95,6 +97,206 @@ def captured_requests(monkeypatch):
 
 def client():
     return KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test", timeout=3))
+
+
+def test_run_config_builds_create_run_payload_without_mutating_original():
+    base = RunConfig(
+        template_id="mean-reversion",
+        account_scope="kite:paper-a",
+        execution_mode="paper",
+    )
+    updated = base.with_summary_field("symbol", "NSE:INFY").with_metadata(strategy_name="MR Demo").with_risk_patch(stop_loss_pct=1.2)
+
+    assert base.summary_fields == []
+    assert base.metadata == {}
+    assert base.runtime_state == {}
+    assert updated.summary_fields == [{"key": "symbol", "value": "NSE:INFY"}]
+    assert updated.metadata["strategy_name"] == "MR Demo"
+    assert updated.runtime_state["risk"] == {"stop_loss_pct": 1.2}
+
+
+def test_run_config_with_allowed_actions_appends_without_dropping_defaults():
+    config = RunConfig(template_id="mean-reversion", account_scope="kite:paper-a")
+
+    updated = config.with_allowed_actions("runs:exit", "edit_risk")
+
+    assert config.allowed_actions == ["edit_risk", "exit_strategy"]
+    assert updated.allowed_actions == ["edit_risk", "exit_strategy", "runs:exit"]
+
+
+def test_create_run_from_config_matches_raw_create_run_payload(monkeypatch):
+    captured = {}
+
+    def fake_request(_session, method, url, **kwargs):
+        captured["method"] = method
+        captured["url"] = url
+        captured["json"] = kwargs.get("json")
+        return FakeResponse(payload={"status": "ok"})
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+
+    sdk_client = client()
+    config = RunConfig(
+        strategy_run_id="run-1",
+        template_id="mean-reversion",
+        account_scope="kite:paper-a",
+        execution_mode="paper",
+        metadata={"strategy_name": "MR Demo"},
+    ).with_summary_field("symbol", "NSE:INFY")
+
+    sdk_client.create_run_from_config(config)
+
+    assert captured["json"] == {
+        "strategy_run_id": "run-1",
+        "template_id": "mean-reversion",
+        "account_scope": "kite:paper-a",
+        "execution_mode": "paper",
+        "summary_fields": [{"key": "symbol", "value": "NSE:INFY"}],
+        "risk_schema": [],
+        "allowed_actions": ["edit_risk", "exit_strategy"],
+        "runtime_state": {},
+        "metadata": {"strategy_name": "MR Demo"},
+    }
+
+
+def test_client_run_claims_session_and_releases_on_exit():
+    events = []
+
+    class FakeClient(KiteAlgoWorkerClient):
+        def get_run(self, strategy_run_id: str):
+            raise KiteAlgoWorkerError("missing", status_code=404)
+
+        def create_run_from_config(self, config: RunConfig):
+            events.append(("create", config.strategy_run_id))
+            return {
+                "strategy_run_id": config.strategy_run_id,
+                "template_id": config.template_id,
+                "account_scope": config.account_scope,
+                "execution_mode": config.execution_mode,
+            }
+
+        def claim_session(self, strategy_run_id: str):
+            events.append(("claim", strategy_run_id))
+            return {"strategy_run_id": strategy_run_id, "worker_session_nonce": "nonce-1"}
+
+        def run_heartbeat(self, strategy_run_id: str, *, session_nonce: str, worker_id=None, status="healthy", metrics=None):
+            events.append(("heartbeat", strategy_run_id, session_nonce))
+            return {"status": "ok"}
+
+        def release_session(self, strategy_run_id: str, *, session_nonce: str):
+            events.append(("release", strategy_run_id, session_nonce))
+            return {"status": "released"}
+
+    fake = FakeClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test"))
+    config = RunConfig(strategy_run_id="run-ctx", template_id="demo", account_scope="kite:paper-a", execution_mode="paper")
+
+    with fake.run(config) as run:
+        assert run.run_id == "run-ctx"
+        assert run.session_nonce == "nonce-1"
+
+    assert events == [
+        ("create", "run-ctx"),
+        ("claim", "run-ctx"),
+        ("heartbeat", "run-ctx", "nonce-1"),
+        ("release", "run-ctx", "nonce-1"),
+    ]
+
+
+def test_client_run_rejects_heartbeat_on_enter_without_claim_session():
+    config = RunConfig(strategy_run_id="run-ctx", template_id="demo", account_scope="kite:paper-a", execution_mode="paper")
+
+    with pytest.raises(ValueError, match="heartbeat_on_enter"):
+        with client().run(config, claim_session=False, heartbeat_on_enter=True):
+            pass
+
+
+def test_client_run_raises_on_existing_run_contract_mismatch():
+    class FakeClientWithExistingRun(KiteAlgoWorkerClient):
+        def __init__(self, existing_run):
+            super().__init__(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test"))
+            self._existing_run = existing_run
+
+        def get_run(self, strategy_run_id: str):
+            assert strategy_run_id == self._existing_run["strategy_run_id"]
+            return dict(self._existing_run)
+
+    fake = FakeClientWithExistingRun(
+        {
+            "strategy_run_id": "run-ctx",
+            "template_id": "old-template",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+        }
+    )
+    config = RunConfig(strategy_run_id="run-ctx", template_id="new-template", account_scope="kite:paper-a", execution_mode="paper")
+
+    with pytest.raises(KiteAlgoWorkerError, match="RunConfig mismatch"):
+        with fake.run(config):
+            pass
+
+
+def test_managed_run_place_order_forwards_session_nonce_and_safety_token():
+    captured = {}
+
+    class FakeClient:
+        def place_order(self, strategy_run_id, order, idempotency_key, metadata=None, safety_token=None, session_nonce=None):
+            captured.update(
+                strategy_run_id=strategy_run_id,
+                order=dict(order),
+                idempotency_key=idempotency_key,
+                metadata=dict(metadata or {}),
+                safety_token=safety_token,
+                session_nonce=session_nonce,
+            )
+            return {"status": "accepted"}
+
+    run = ManagedRun(
+        client=FakeClient(),
+        config=RunConfig(template_id="demo", account_scope="kite:paper-a"),
+        run={"strategy_run_id": "run-1"},
+        session_nonce="nonce-1",
+    )
+    run.place_order({"exchange": "NSE"}, idempotency_key="run-1:entry:1", safety_token="safe-1")
+
+    assert captured["strategy_run_id"] == "run-1"
+    assert captured["safety_token"] == "safe-1"
+    assert captured["session_nonce"] == "nonce-1"
+
+
+def test_managed_run_heartbeat_requires_claimed_session_nonce():
+    run = ManagedRun(
+        client=object(),
+        config=RunConfig(template_id="demo", account_scope="kite:paper-a"),
+        run={"strategy_run_id": "run-1"},
+        session_nonce=None,
+    )
+
+    with pytest.raises(ValueError, match="claimed session nonce"):
+        run.heartbeat()
+
+
+def test_managed_run_refresh_updates_local_run_payload():
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def get_run(self, strategy_run_id):
+            self.calls.append(strategy_run_id)
+            return {"strategy_run_id": strategy_run_id, "status": "open", "metadata": {"refreshed": True}}
+
+    fake = FakeClient()
+    run = ManagedRun(
+        client=fake,
+        config=RunConfig(template_id="demo", account_scope="kite:paper-a"),
+        run={"strategy_run_id": "run-1", "status": "created"},
+        session_nonce="nonce-1",
+    )
+
+    refreshed = run.refresh()
+
+    assert fake.calls == ["run-1"]
+    assert refreshed["metadata"]["refreshed"] is True
+    assert run.run["metadata"]["refreshed"] is True
 
 
 def test_package_version_matches_sdk_pyproject():

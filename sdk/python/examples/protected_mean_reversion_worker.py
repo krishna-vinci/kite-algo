@@ -14,9 +14,9 @@ from kite_algo_worker import (  # noqa: E402
     BackendProtection,
     BasketProtection,
     KiteAlgoWorkerClient,
-    KiteAlgoWorkerError,
     OperationalProtection,
     ProtectedPosition,
+    RunConfig,
     equity_market_order,
 )
 
@@ -50,31 +50,32 @@ def main() -> None:
         operations=OperationalProtection(exit_on_worker_stale=True, worker_stale_sec=300),
     )
 
-    try:
-        client.get_run(strategy_run_id)
-    except KiteAlgoWorkerError as exc:
-        if exc.status_code != 404:
-            raise
-        client.create_run(
+    config = (
+        RunConfig(
             strategy_run_id=strategy_run_id,
             template_id="protected-mean-reversion-demo",
             account_scope=os.getenv("KITE_ALGO_ACCOUNT_SCOPE", "kite:paper-a"),
             execution_mode=execution_mode,
-            backend_protection=protection,
             metadata={
                 "strategy_family": "indicator_strategy",
                 "strategy_name": "Protected Mean Reversion Demo",
                 "entry_surface": "external_algo_worker",
             },
         )
-
-    client.place_order(
-        strategy_run_id,
-        equity_market_order(symbol, "BUY", 1),
-        idempotency_key=f"{strategy_run_id}:entry:{symbol}:001",
+        .with_backend_protection(protection)
+        .with_summary_field("symbol", symbol_key)
     )
 
-    client.update_backend_protection(strategy_run_id, protection, reason="post-entry protection sync")
+    with client.run(config) as run:
+        safety = run.safety_check()
+        if not safety.can_trade:
+            return
+        run.place_order(
+            equity_market_order(symbol, "BUY", 1),
+            idempotency_key=f"{run.run_id}:entry:{symbol}:001",
+            safety_token=safety.safety_token,
+        )
+        run.update_backend_protection(protection, reason="post-entry protection sync")
 
 
 if __name__ == "__main__":

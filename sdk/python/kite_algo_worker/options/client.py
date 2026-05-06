@@ -8,7 +8,10 @@ from .models import (
     OptionExpirySnapshot,
     OptionRunActionRequest,
     OptionRunCreateRequest,
+    SpreadSpec,
 )
+from .resolvers import resolve_option_contracts as _resolve_option_contracts
+from .resolvers import resolve_spread as _resolve_spread
 
 
 class OptionWorkerClient:
@@ -55,6 +58,12 @@ class OptionWorkerClient:
             self._options_path(underlying, "selection/resolve"),
             json=payload,
         )
+
+    def resolve_option_contracts(self, *, underlying: str, selection_payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+        return _resolve_option_contracts(self, underlying=underlying, selection_payload=selection_payload)
+
+    def resolve_spread(self, *, underlying: str, product: str, spec: SpreadSpec) -> list[OptionExecutionLeg]:
+        return _resolve_spread(self, underlying=underlying, product=product, spec=spec)
 
     def get_pcr(self, underlying: str, *, expiry: str | None = None) -> dict[str, Any]:
         return self._client._request(

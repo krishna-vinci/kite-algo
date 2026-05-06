@@ -37,7 +37,7 @@ Every worker strategy should operate under one stable `strategy_run_id` per life
 Typical flow:
 
 1. `health()` to verify the worker token
-2. `create_run(...)` once for the strategy lifecycle
+2. `create_run(...)` once for the strategy lifecycle (or use `RunConfig` + `client.run(...)`)
 3. read quotes, history, ticks, or candles
 4. preview/place explicit intents with idempotency keys
 5. read grouped run funds and grouped P&L
@@ -81,6 +81,24 @@ The SDK is intentionally thin.
 It calls public worker endpoints under `/api/algo-workers/worker/*` and does not import backend internals, database logic, or market-runtime internals.
 
 That makes it safer to version, easier to install remotely, and easier for strategy authors to adopt.
+
+### Explicit helper layer (Spec 4)
+
+The SDK now includes an explicit ergonomics layer with no hidden trading behavior:
+
+- `RunConfig`: immutable typed run builder for `create_run(...)` payload parity.
+- `client.create_run_from_config(config)`: thin call-through.
+- `client.run(config, ...)`: context manager for run/session lifecycle.
+- `ManagedRun`: run-bound helper object for explicit calls (`safety_check`, `place_order`, `place_basket`, `patch_risk`, `update_backend_protection`, `exit_run`, `heartbeat`).
+
+Important boundaries:
+
+- `client.run()` owns session claim/heartbeat-on-enter/release lifecycle only.
+- It does **not** auto-exit your strategy.
+- `ManagedRun` does **not** auto-call `safety_check()`.
+- Trading decisions and call ordering stay explicit in worker code.
+
+Use the raw client directly when you want full manual control. Use `RunConfig` + `client.run()` when you want cleaner lifecycle wiring while keeping all safety and mutation calls visible.
 
 Install from PyPI:
 
@@ -138,6 +156,35 @@ run = ensure_run(
 order = equity_market_order("INFY", "BUY", 1)
 client.place_order(run["strategy_run_id"], order, "run_demo_001:entry:001")
 ```
+
+## Managed run shape (explicit safety + session lifecycle)
+
+```python
+from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, RunConfig, equity_market_order
+
+client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:18777", token="kwa_..."))
+
+config = RunConfig(
+    strategy_run_id="run_demo_002",
+    template_id="demo-strategy",
+    account_scope="kite:paper-a",
+    execution_mode="paper",
+)
+
+with client.run(config) as run:
+    safety = run.safety_check()
+    if not safety.can_trade:
+        return
+    run.place_order(
+        equity_market_order("INFY", "BUY", 1),
+        idempotency_key=f"{run.run_id}:entry:001",
+        safety_token=safety.safety_token,
+    )
+```
+
+## Option resolver helpers (non-deploying)
+
+`resolve_option_contracts(...)` and `resolve_spread(...)` are pure SDK helpers layered on existing worker-safe options routes. They only resolve contracts and construct `OptionExecutionLeg` payloads. They do not create runs, place orders, or enter/exit option runs.
 
 ## Grouped funds and run allocation
 

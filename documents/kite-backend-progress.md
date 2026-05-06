@@ -53,6 +53,13 @@ Do not use this file for frontend work.
   - hardened the safety gate so option-run status lookup errors fail closed with `OPTIONS_PROTECTION_STATE_UNAVAILABLE` and production token signing requires `WORKER_SAFETY_TOKEN_SECRET` or `APP_JWT_SECRET`
   - added SDK `SafetyCheckResult`, `KiteAlgoWorkerClient.safety_check(...)`, and optional `safety_token` plumbing on generic order/basket intent helpers
 
+- Implemented Spec 4 SDK explicit-helper ergonomics (SDK-only scope, no backend behavior changes):
+  - added immutable `RunConfig` builder plus `create_run_from_config(...)` payload-parity helper
+  - added explicit run/session lifecycle context manager `client.run(...)` with bound `ManagedRun` helpers
+  - mutation helper methods forward claimed session nonce when present; no implicit safety checks, no implicit exits
+  - added pure option resolver helpers `resolve_option_contracts(...)` and `resolve_spread(...)` with explicit `OptionExecutionLeg` construction (`quantity = lot_size * lots`)
+  - refreshed SDK examples and guide for explicit safety-check + managed-run posture
+
 - Added Journal V2 Phase B6 analytics separation:
   - created `journaling/analytics_service.py` with period-aware analytics summary, strategy deep-dive, dense equity curve, cost analysis, and paper-vs-live comparison computation on top of V2 episodes/facts
   - added authenticated `/api/analytics/v1/summary`, `/api/analytics/v1/strategy/{template_id}`, `/api/analytics/v1/equity-curve`, `/api/analytics/v1/cost-analysis`, and `/api/analytics/v1/compare`

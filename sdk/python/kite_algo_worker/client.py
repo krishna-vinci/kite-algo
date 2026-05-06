@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
 import requests
 
 from .exceptions import KiteAlgoWorkerError, error_for_status
+from .run_config import RunConfig
 from .models import (
     RunProtectionState,
     SafetyCheckResult,
@@ -101,6 +103,48 @@ class KiteAlgoWorkerClient:
         if strategy_run_id is not None:
             payload["strategy_run_id"] = strategy_run_id
         return self._request("POST", "/worker/runs", json=payload)
+
+    def create_run_from_config(self, config: RunConfig) -> JsonDict:
+        return self._request("POST", "/worker/runs", json=config.to_create_run_payload())
+
+    @contextmanager
+    def run(
+        self,
+        config: RunConfig,
+        *,
+        claim_session: bool = True,
+        heartbeat_on_enter: bool = True,
+        release_on_exit: bool = True,
+    ):
+        if heartbeat_on_enter and not claim_session:
+            raise ValueError("heartbeat_on_enter requires claim_session=True")
+
+        run_payload = _get_or_create_run_with_validation(self, config)
+        run_id = str(run_payload["strategy_run_id"])
+        session_nonce: str | None = None
+
+        if claim_session:
+            claim = self.claim_session(run_id)
+            session_nonce = str(claim["worker_session_nonce"])
+            if heartbeat_on_enter:
+                self.run_heartbeat(run_id, session_nonce=session_nonce)
+
+        from .managed_run import ManagedRun
+
+        managed = ManagedRun(client=self, config=config, run=run_payload, session_nonce=session_nonce)
+        body_error: Exception | None = None
+        try:
+            yield managed
+        except Exception as exc:
+            body_error = exc
+            raise
+        finally:
+            if release_on_exit and session_nonce:
+                try:
+                    self.release_session(run_id, session_nonce=session_nonce)
+                except Exception:
+                    if body_error is None:
+                        raise
 
     def get_run(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}")
@@ -540,3 +584,26 @@ class KiteAlgoWorkerClient:
         except ValueError:
             body = {"raw": response.text}
         raise error_for_status(response.status_code, body, fallback=f"Worker API returned {response.status_code} for {method} {path}")
+
+
+def _get_or_create_run_with_validation(client: KiteAlgoWorkerClient, config: RunConfig) -> dict[str, Any]:
+    if config.strategy_run_id:
+        try:
+            existing = client.get_run(config.strategy_run_id)
+        except KiteAlgoWorkerError as exc:
+            if exc.status_code != 404:
+                raise
+        else:
+            mismatches = {
+                "template_id": (existing.get("template_id"), config.template_id),
+                "account_scope": (existing.get("account_scope"), config.account_scope),
+                "execution_mode": (existing.get("execution_mode"), config.execution_mode),
+            }
+            wrong = {key: value for key, value in mismatches.items() if str(value[0]) != str(value[1])}
+            if wrong:
+                raise KiteAlgoWorkerError(
+                    f"RunConfig mismatch for {config.strategy_run_id}: {wrong}",
+                    status_code=409,
+                )
+            return existing
+    return client.create_run_from_config(config)
