@@ -127,3 +127,29 @@ def test_exiting_live_run_remains_stalled_when_flatness_not_proven():
     assert result["stalled"] == 1
     assert repo.updated_statuses[-1][1] == "exiting"
     assert repo.run["runtime_state"]["runtime_recovery"]["recovery_status"] == "stalled"
+
+
+def test_exiting_live_run_defers_when_active_basket_exists():
+    repo = FakeRecoveryRepo(
+        run={
+            "strategy_run_id": "run-live",
+            "execution_mode": "live",
+            "status": "exiting",
+            "runtime_state": {},
+        }
+    )
+    service = WorkerRuntimeRecoveryService(
+        repo=repo,
+        now_fn=lambda: dt("2026-05-06T09:10:00Z"),
+        stale_action_seconds=180,
+        claimed_without_heartbeat_seconds=120,
+        paper_exit_submitter=AsyncMock(),
+        live_flatness_loader=AsyncMock(return_value={"is_flat": True}),
+        active_basket_loader=lambda run_id: run_id == "run-live",
+    )
+
+    result = asyncio.run(service.recover_exiting_runs_once())
+
+    assert result["stalled"] == 1
+    assert repo.updated_statuses[-1] == ("run-live", "exiting")
+    assert repo.run["runtime_state"]["runtime_recovery"]["reason"] == "active_basket_execution"

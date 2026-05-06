@@ -54,6 +54,8 @@ def _intent_params(
     attribution: OrderAttribution,
     cost_contract: Dict[str, Any],
     idempotency_key: Optional[str],
+    basket_execution_id: Optional[str] = None,
+    basket_leg_index: Optional[int] = None,
 ) -> Dict[str, Any]:
     attribution_json = attribution.model_dump(mode="json")
     return {
@@ -67,6 +69,8 @@ def _intent_params(
         "execution_mode": attribution.execution_mode,
         "entry_surface": attribution.entry_surface,
         "idempotency_key": idempotency_key or attribution.idempotency_key,
+        "basket_execution_id": basket_execution_id,
+        "basket_leg_index": basket_leg_index,
         "attribution_json": _json_dumps(attribution_json),
         "cost_contract_json": _json_dumps(cost_contract),
     }
@@ -77,11 +81,15 @@ def create_live_order_intent(
     attribution: OrderAttribution,
     cost_contract: Dict[str, Any],
     idempotency_key: Optional[str],
+    basket_execution_id: Optional[str] = None,
+    basket_leg_index: Optional[int] = None,
+    db: Any = None,
 ) -> str:
     intent_id = f"lint_{uuid.uuid4().hex}"
-    db = SessionLocal()
+    owns_db = db is None
+    session = db or SessionLocal()
     try:
-        db.execute(
+        session.execute(
             text(
                 """
                 INSERT INTO public.live_order_intents (
@@ -95,6 +103,8 @@ def create_live_order_intent(
                     execution_mode,
                     entry_surface,
                     idempotency_key,
+                    basket_execution_id,
+                    basket_leg_index,
                     attribution_json,
                     cost_contract_json
                 ) VALUES (
@@ -108,6 +118,8 @@ def create_live_order_intent(
                     :execution_mode,
                     :entry_surface,
                     :idempotency_key,
+                    :basket_execution_id,
+                    :basket_leg_index,
                     CAST(:attribution_json AS jsonb),
                     CAST(:cost_contract_json AS jsonb)
                 )
@@ -118,15 +130,20 @@ def create_live_order_intent(
                 attribution=attribution,
                 cost_contract=cost_contract,
                 idempotency_key=idempotency_key,
+                basket_execution_id=basket_execution_id,
+                basket_leg_index=basket_leg_index,
             ),
         )
-        db.commit()
+        if owns_db:
+            session.commit()
         return intent_id
     except Exception:
-        db.rollback()
+        if owns_db:
+            session.rollback()
         raise
     finally:
-        db.close()
+        if owns_db:
+            session.close()
 
 
 def mark_live_order_intent_placed(*, client_order_ref: str, broker_order_id: str) -> None:

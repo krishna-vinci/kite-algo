@@ -87,6 +87,7 @@ class WorkerRuntimeRecoveryService:
         claimed_without_heartbeat_seconds: int,
         paper_exit_submitter: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]],
         live_flatness_loader: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]],
+        active_basket_loader: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.repo = repo
         self.now_fn = now_fn
@@ -94,6 +95,7 @@ class WorkerRuntimeRecoveryService:
         self.claimed_without_heartbeat_seconds = max(1, int(claimed_without_heartbeat_seconds))
         self.paper_exit_submitter = paper_exit_submitter
         self.live_flatness_loader = live_flatness_loader
+        self.active_basket_loader = active_basket_loader
 
     async def recover_stale_runs_once(self) -> Dict[str, int]:
         rows = await self.repo.list_stale_recovery_runs()
@@ -215,6 +217,21 @@ class WorkerRuntimeRecoveryService:
                     result["closed"] += 1
                     continue
 
+                if self.active_basket_loader and self.active_basket_loader(strategy_run_id):
+                    await self.repo.update_run_status(
+                        strategy_run_id,
+                        "exiting",
+                        state_patch=_runtime_recovery_patch(
+                            run,
+                            recovery_status="stalled",
+                            action_required=True,
+                            reason="active_basket_execution",
+                            details={"active_basket_execution": True},
+                        ),
+                    )
+                    result["stalled"] += 1
+                    continue
+
                 flatness = await self.live_flatness_loader(run)
                 is_flat = bool((flatness or {}).get("is_flat"))
                 if is_flat:
@@ -280,6 +297,8 @@ def build_worker_runtime_recovery_service(app: Any, *, stale_action_seconds: int
     async def _live_flatness_loader(run: Dict[str, Any]) -> Dict[str, Any]:
         return await load_live_run_flatness(request, run)
 
+    from broker_api.basket_execution import basket_execution_store
+
     return WorkerRuntimeRecoveryService(
         repo=repo,
         now_fn=_utcnow,
@@ -287,4 +306,5 @@ def build_worker_runtime_recovery_service(app: Any, *, stale_action_seconds: int
         claimed_without_heartbeat_seconds=claimed_without_heartbeat_seconds,
         paper_exit_submitter=_paper_exit_submitter,
         live_flatness_loader=_live_flatness_loader,
+        active_basket_loader=basket_execution_store.has_active_basket_execution,
     )

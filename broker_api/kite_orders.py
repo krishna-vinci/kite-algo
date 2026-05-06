@@ -326,6 +326,10 @@ class BasketOrderResponse(BaseModel):
     errors: List[Dict[str, Any]] = []
     margins: Optional[BasketMarginsResponse] = None
     note: Optional[str] = None
+    basket_execution_id: Optional[str] = None
+    basket_status: Optional[str] = None
+    action_required: bool = False
+    action_reason: Optional[str] = None
 
 def get_correlation_id(request: Request) -> str:
     """Dependency to get or generate a correlation ID."""
@@ -586,7 +590,9 @@ class OrdersService:
         corr_id: str,
         idempotency_key: Optional[str] = None,
         session_id: Optional[str] = None,
-        response: Response = None,
+        response: Optional[Response] = None,
+        basket_execution_id: Optional[str] = None,
+        basket_leg_index: Optional[int] = None,
     ) -> PlaceOrderResponse:
         log_ctx = self._log_context(corr_id, kite, variety=req.variety.value, symbol=req.tradingsymbol)
         redis_client = None
@@ -638,6 +644,8 @@ class OrdersService:
                     attribution=attribution,
                     cost_contract=cost_contract.journal_payload(),
                     idempotency_key=idempotency_key,
+                    basket_execution_id=basket_execution_id,
+                    basket_leg_index=basket_leg_index,
                 )
             variety = params.pop('variety')
             variety_value = variety.value if isinstance(variety, Variety) else str(variety)
@@ -933,7 +941,8 @@ class OrdersService:
         corr_id: str,
         session_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
-        response: Response = None,
+        response: Optional[Response] = None,
+        basket_execution_id: Optional[str] = None,
     ) -> BasketOrderResponse:
         """
         Place a basket of orders sequentially.
@@ -974,6 +983,32 @@ class OrdersService:
         results: List[BasketOrderResultItem] = []
         placed: List[Dict[str, Any]] = []  # Track placed orders for rollback
         errors: List[Dict[str, Any]] = []
+        basket_snapshot: Optional[Dict[str, Any]] = None
+
+        if session_id:
+            from database import SessionLocal
+            from broker_api.basket_execution import basket_execution_store
+            from broker_api.live_order_intents import validate_live_order_attribution
+
+            first_order_payload = req.orders[0].model_dump(mode="json", exclude_none=True)
+            first_attribution = validate_live_order_attribution({"attribution": first_order_payload.get("attribution") or {}})
+            if not basket_execution_id:
+                db = SessionLocal()
+                try:
+                    basket_snapshot = basket_execution_store.create_live_basket_execution(
+                        db,
+                        strategy_run_id=first_attribution.strategy_run_id,
+                        account_id=first_attribution.account_ref,
+                        all_or_none=bool(req.all_or_none),
+                        orders=[order.model_dump(mode="json", exclude_none=True) for order in req.orders],
+                    )
+                    basket_execution_id = str(basket_snapshot.get("basket_execution_id") or "") or None
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                finally:
+                    db.close()
 
         for idx, order_req in enumerate(req.orders):
             try:
@@ -986,7 +1021,29 @@ class OrdersService:
                     idempotency_key=child_idempotency_key,
                     session_id=session_id,
                     response=response,
+                    basket_execution_id=basket_execution_id,
+                    basket_leg_index=idx if basket_execution_id else None,
                 )
+
+                if basket_execution_id:
+                    from database import SessionLocal
+                    from broker_api.basket_execution import basket_execution_store
+
+                    db = SessionLocal()
+                    try:
+                        basket_execution_store.mark_leg_working(
+                            db,
+                            basket_execution_id=basket_execution_id,
+                            leg_index=idx,
+                            broker_order_id=str(place_result.order_id),
+                            client_order_ref=str(getattr(order_req, "tag", "") or "") or None,
+                        )
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                        raise
+                    finally:
+                        db.close()
                 
                 placed.append({"index": idx, "order_id": place_result.order_id, "variety": order_req.variety.value})
                 results.append(
@@ -1020,30 +1077,100 @@ class OrdersService:
                     )
                 )
 
+                if basket_execution_id:
+                    from database import SessionLocal
+                    from broker_api.basket_execution import basket_execution_store
+
+                    db = SessionLocal()
+                    try:
+                        basket_execution_store.mark_leg_submit_failed(
+                            db,
+                            basket_execution_id=basket_execution_id,
+                            leg_index=idx,
+                            error_message=err_msg,
+                        )
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                        raise
+                    finally:
+                        db.close()
+
                 # Handle all_or_none: attempt rollback
                 if req.all_or_none:
                     logger.info("Attempting rollback due to all_or_none policy", extra=log_ctx)
+                    rollback_failed = False
                     for p in placed:
                         try:
                             await self.cancel_order(kite, p["variety"], p["order_id"], corr_id)
                             logger.info(f"Rolled back order {p['order_id']}", extra=log_ctx)
                         except Exception as cancel_error:
+                            rollback_failed = True
                             logger.error(
                                 f"Rollback failed for order {p['order_id']}",
                                 extra={**log_ctx, "error": str(cancel_error)},
                                 exc_info=True
                             )
-                    
+
+                    if basket_execution_id:
+                        from database import SessionLocal
+                        from broker_api.basket_execution import basket_execution_store
+
+                        db = SessionLocal()
+                        try:
+                            basket_snapshot = basket_execution_store.finalize_submission(
+                                db,
+                                basket_execution_id=basket_execution_id,
+                                rollback_status="failed" if rollback_failed else "completed",
+                                action_required=rollback_failed,
+                                action_reason="rollback_incomplete" if rollback_failed else None,
+                            )
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                            raise
+                        finally:
+                            db.close()
+
                     return BasketOrderResponse(
                         status="failed",
                         results=results,
                         errors=errors,
-                        note="Best-effort rollback attempted; some orders may already be executed."
+                        note="Best-effort rollback attempted; some orders may already be executed.",
+                        basket_execution_id=basket_execution_id,
+                        basket_status=(basket_snapshot or {}).get("status"),
+                        action_required=bool((basket_snapshot or {}).get("action_required")),
+                        action_reason=(basket_snapshot or {}).get("action_reason"),
                     )
 
         final_status = "success" if not errors else "partial"
         logger.info(f"Basket order completed with status: {final_status}", extra={**log_ctx, "success_count": len(placed), "error_count": len(errors)})
-        return BasketOrderResponse(status=final_status, results=results, errors=errors)
+        if basket_execution_id:
+            from database import SessionLocal
+            from broker_api.basket_execution import basket_execution_store
+
+            db = SessionLocal()
+            try:
+                basket_snapshot = basket_execution_store.finalize_submission(
+                    db,
+                    basket_execution_id=basket_execution_id,
+                    rollback_status="none",
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+        return BasketOrderResponse(
+            status=final_status,
+            results=results,
+            errors=errors,
+            basket_execution_id=basket_execution_id,
+            basket_status=(basket_snapshot or {}).get("status"),
+            action_required=bool((basket_snapshot or {}).get("action_required")),
+            action_reason=(basket_snapshot or {}).get("action_reason"),
+        )
 
 # ---------------- FastAPI Router ----------------
 router = APIRouter(tags=["Orders"])

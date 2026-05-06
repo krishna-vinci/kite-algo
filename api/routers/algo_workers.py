@@ -36,6 +36,8 @@ from algo_runtime.execution_attribution import build_execution_attribution, buil
 from auth_service import require_app_user
 from database import SessionLocal
 from journaling.service import JournalService
+from broker_api.basket_execution import basket_execution_store
+from broker_api.redis_events import get_redis
 
 
 router = APIRouter(prefix="/algo-workers", tags=["Algo Workers"])
@@ -462,6 +464,48 @@ class SqlAlchemyAlgoWorkerRepository:
             request=request,
             status=status,
             result=result,
+        )
+
+    async def begin_intent(
+        self,
+        *,
+        token_id: str,
+        strategy_run_id: str,
+        request: WorkerIntentRequest,
+        initial_result: Dict[str, Any],
+        status: str = "pending",
+        db: Optional[Session] = None,
+    ) -> Dict[str, Any]:
+        if db is not None:
+            return self._begin_intent_sync(token_id, strategy_run_id, request, initial_result, status, db)
+        return await asyncio.to_thread(
+            self._begin_intent_sync,
+            token_id,
+            strategy_run_id,
+            request,
+            initial_result,
+            status,
+            db,
+        )
+
+    async def finalize_intent_result(
+        self,
+        *,
+        strategy_run_id: str,
+        idempotency_key: str,
+        status: str,
+        result: Dict[str, Any],
+        db: Optional[Session] = None,
+    ) -> Dict[str, Any]:
+        if db is not None:
+            return self._finalize_intent_result_sync(strategy_run_id, idempotency_key, status, result, db)
+        return await asyncio.to_thread(
+            self._finalize_intent_result_sync,
+            strategy_run_id,
+            idempotency_key,
+            status,
+            result,
+            db,
         )
 
     def _create_token_sync(self, payload: WorkerTokenCreateRequest, raw_token: str, token_id: str) -> Dict[str, Any]:
@@ -1341,6 +1385,128 @@ class SqlAlchemyAlgoWorkerRepository:
             raise
         finally:
             db.close()
+
+    def _begin_intent_sync(
+        self,
+        token_id: str,
+        strategy_run_id: str,
+        request: WorkerIntentRequest,
+        initial_result: Dict[str, Any],
+        status: str,
+        db: Optional[Session] = None,
+    ) -> Dict[str, Any]:
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            inserted = session.execute(
+                text(
+                    """
+                    INSERT INTO public.algo_worker_intents (
+                        token_id, strategy_run_id, idempotency_key, intent_type,
+                        request_json, status, result_json
+                    ) VALUES (
+                        :token_id, :strategy_run_id, :idempotency_key, :intent_type,
+                        CAST(:request_json AS JSONB), :status, CAST(:result_json AS JSONB)
+                    )
+                    ON CONFLICT (strategy_run_id, idempotency_key) DO NOTHING
+                    RETURNING status, result_json
+                    """
+                ),
+                {
+                    "token_id": token_id,
+                    "strategy_run_id": strategy_run_id,
+                    "idempotency_key": request.idempotency_key,
+                    "intent_type": request.intent_type,
+                    "request_json": request.model_dump_json(),
+                    "status": status,
+                    "result_json": _json_dumps(initial_result),
+                },
+            ).fetchone()
+            if inserted is not None:
+                if owns_db:
+                    session.commit()
+                mapped = _row_mapping(inserted)
+                return {
+                    "status": str(mapped.get("status") or status),
+                    "result": _json_loads(mapped.get("result_json"), initial_result),
+                    "claimed": True,
+                }
+
+            row = session.execute(
+                text(
+                    """
+                    SELECT status, result_json
+                    FROM public.algo_worker_intents
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND idempotency_key = :idempotency_key
+                    """
+                ),
+                {
+                    "strategy_run_id": strategy_run_id,
+                    "idempotency_key": request.idempotency_key,
+                },
+            ).fetchone()
+            if owns_db:
+                session.commit()
+            mapped = _row_mapping(row)
+            return {
+                "status": str(mapped.get("status") or status),
+                "result": _json_loads(mapped.get("result_json"), initial_result),
+                "claimed": False,
+            }
+        except Exception:
+            if owns_db:
+                session.rollback()
+            raise
+        finally:
+            if owns_db:
+                session.close()
+
+    def _finalize_intent_result_sync(
+        self,
+        strategy_run_id: str,
+        idempotency_key: str,
+        status: str,
+        result: Dict[str, Any],
+        db: Optional[Session] = None,
+    ) -> Dict[str, Any]:
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            row = session.execute(
+                text(
+                    """
+                    UPDATE public.algo_worker_intents
+                    SET status = :status,
+                        result_json = CAST(:result_json AS JSONB)
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND idempotency_key = :idempotency_key
+                    RETURNING status, result_json
+                    """
+                ),
+                {
+                    "strategy_run_id": strategy_run_id,
+                    "idempotency_key": idempotency_key,
+                    "status": status,
+                    "result_json": _json_dumps(result),
+                },
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Intent not found for finalize: {strategy_run_id}:{idempotency_key}")
+            if owns_db:
+                session.commit()
+            mapped = _row_mapping(row)
+            return {
+                "status": str(mapped.get("status") or status),
+                "result": _json_loads(mapped.get("result_json"), result),
+            }
+        except Exception:
+            if owns_db:
+                session.rollback()
+            raise
+        finally:
+            if owns_db:
+                session.close()
 
     def _token_view(self, row: Any) -> Dict[str, Any]:
         payload = _row_mapping(row)
@@ -2351,15 +2517,101 @@ async def _submit_live_worker_intent(*, request: Request, token: WorkerToken, ru
         orders = [_inject_live_attribution(order, attribution) for order in basket_payload.get("orders") or []]
         basket_payload["orders"] = orders
         req = BasketOrderRequest.model_validate(basket_payload)
-        result = await orders_service.place_basket(
-            kite,
-            req,
-            corr_id,
-            session_id=worker_session_id,
+        basket_execution_id = _live_basket_execution_id(
+            strategy_run_id=str(run["strategy_run_id"]),
             idempotency_key=payload.idempotency_key,
-            response=Response(),
         )
-        return {"mode": "live", "intent_type": payload.intent_type, "result": result.model_dump(mode="json")}
+        db = SessionLocal()
+        basket_snapshot: Optional[Dict[str, Any]] = None
+        try:
+            pending_result = {
+                "mode": "live",
+                "intent_type": payload.intent_type,
+                "basket_execution_id": basket_execution_id,
+                "basket_status": "submitting",
+                "action_required": False,
+                "action_reason": None,
+                "result": {"status": "pending", "results": [], "errors": []},
+            }
+            begun = await _repo(request).begin_intent(
+                token_id=token.token_id,
+                strategy_run_id=str(run["strategy_run_id"]),
+                request=payload,
+                initial_result=pending_result,
+                status="pending",
+                db=db,
+            )
+            if bool(begun.get("claimed")):
+                basket_snapshot = basket_execution_store.create_live_basket_execution(
+                    db,
+                    strategy_run_id=str(run["strategy_run_id"]),
+                    account_id=str(run["account_scope"]),
+                    all_or_none=bool(getattr(req, "all_or_none", basket_payload.get("all_or_none", False))),
+                    orders=orders,
+                    basket_execution_id=basket_execution_id,
+                )
+            db.commit()
+
+            if not bool(begun.get("claimed")):
+                return dict(begun.get("result") or pending_result)
+
+            try:
+                result = await orders_service.place_basket(
+                    kite,
+                    req,
+                    corr_id,
+                    session_id=worker_session_id,
+                    idempotency_key=payload.idempotency_key,
+                    response=Response(),
+                    basket_execution_id=basket_execution_id,
+                )
+                read_db = SessionLocal()
+                try:
+                    latest = basket_execution_store.get_basket_for_run(
+                        read_db,
+                        strategy_run_id=str(run["strategy_run_id"]),
+                        basket_execution_id=basket_execution_id,
+                    )
+                finally:
+                    read_db.close()
+                enriched_result = {
+                    "mode": "live",
+                    "intent_type": payload.intent_type,
+                    "basket_execution_id": basket_execution_id,
+                    "basket_status": str((latest or {}).get("status") or result.basket_status or "submitting"),
+                    "action_required": bool((latest or {}).get("action_required") or result.action_required),
+                    "action_reason": (latest or {}).get("action_reason") or result.action_reason,
+                    "result": result.model_dump(mode="json"),
+                }
+                await _repo(request).finalize_intent_result(
+                    strategy_run_id=str(run["strategy_run_id"]),
+                    idempotency_key=payload.idempotency_key,
+                    status=str(result.status or "accepted"),
+                    result=enriched_result,
+                )
+                return enriched_result
+            except Exception as exc:
+                failed_result = {
+                    "mode": "live",
+                    "intent_type": payload.intent_type,
+                    "basket_execution_id": basket_execution_id,
+                    "basket_status": "failed",
+                    "action_required": True,
+                    "action_reason": "submit_failed",
+                    "result": {"status": "failed", "results": [], "errors": [{"error": str(exc)}]},
+                }
+                await _repo(request).finalize_intent_result(
+                    strategy_run_id=str(run["strategy_run_id"]),
+                    idempotency_key=payload.idempotency_key,
+                    status="failed",
+                    result=failed_result,
+                )
+                raise
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     raise HTTPException(status_code=400, detail=f"Unsupported intent_type '{payload.intent_type}'")
 
@@ -2507,6 +2759,11 @@ def _live_exit_idempotency_key(*, strategy_run_id: str, legs: List[Dict[str, Any
     digest = hashlib.sha1(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:12]
     run_digest = hashlib.sha1(strategy_run_id.encode("utf-8")).hexdigest()[:8]
     return f"live-exit:{run_digest}:{digest}"
+
+
+def _live_basket_execution_id(*, strategy_run_id: str, idempotency_key: str) -> str:
+    digest = hashlib.sha1(f"{strategy_run_id}:{idempotency_key}".encode("utf-8")).hexdigest()[:20]
+    return f"bex_{digest}"
 
 
 async def _exit_live_worker_run(*, request: Request, token: WorkerToken, run: Dict[str, Any], payload: WorkerExitRequest) -> Dict[str, Any]:
@@ -3677,6 +3934,9 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported intent_type '{payload.intent_type}'")
 
+    if mode == "live" and payload.intent_type == "place_basket":
+        return {"status": "accepted", "result": result}
+
     stored = await _repo(request).save_intent_result(
         token_id=token.token_id,
         strategy_run_id=strategy_run_id,
@@ -3685,6 +3945,174 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
         result=result,
     )
     return {"status": "accepted", "result": stored}
+
+
+@router.get("/worker/runs/{strategy_run_id}/baskets")
+async def list_worker_baskets(
+    request: Request,
+    strategy_run_id: str,
+    limit: int = Query(100, ge=1, le=500),
+):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+
+    def _load() -> List[Dict[str, Any]]:
+        db = SessionLocal()
+        try:
+            return basket_execution_store.list_baskets_for_run(db, strategy_run_id=strategy_run_id, limit=limit)
+        finally:
+            db.close()
+
+    baskets = await asyncio.to_thread(_load)
+    return {"strategy_run_id": strategy_run_id, "baskets": baskets}
+
+
+@router.get("/worker/runs/{strategy_run_id}/baskets/{basket_execution_id}")
+async def get_worker_basket(request: Request, strategy_run_id: str, basket_execution_id: str):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+
+    def _load() -> Optional[Dict[str, Any]]:
+        db = SessionLocal()
+        try:
+            return basket_execution_store.get_basket_for_run(
+                db,
+                strategy_run_id=strategy_run_id,
+                basket_execution_id=basket_execution_id,
+            )
+        finally:
+            db.close()
+
+    basket = await asyncio.to_thread(_load)
+    if basket is None:
+        raise HTTPException(status_code=404, detail="Basket execution not found")
+    return basket
+
+
+@router.get("/worker/runs/{strategy_run_id}/execution-events")
+async def list_worker_execution_events(
+    request: Request,
+    strategy_run_id: str,
+    after_cursor: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=1000),
+    basket_execution_id: Optional[str] = None,
+    event_type: Optional[str] = None,
+):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+
+    def _load() -> List[Dict[str, Any]]:
+        db = SessionLocal()
+        try:
+            return basket_execution_store.list_worker_execution_events(
+                db,
+                strategy_run_id=strategy_run_id,
+                after_cursor=after_cursor,
+                limit=limit,
+                basket_execution_id=basket_execution_id,
+                event_type=event_type,
+            )
+        finally:
+            db.close()
+
+    events = await asyncio.to_thread(_load)
+    last_cursor = max([after_cursor] + [int(item.get("cursor") or 0) for item in events])
+    return {
+        "strategy_run_id": strategy_run_id,
+        "after_cursor": after_cursor,
+        "last_cursor": last_cursor,
+        "events": events,
+    }
+
+
+@router.get("/worker/runs/{strategy_run_id}/execution-events/stream")
+async def stream_worker_execution_events(
+    request: Request,
+    strategy_run_id: str,
+    after_cursor: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=2000),
+    basket_execution_id: Optional[str] = None,
+    event_type: Optional[str] = None,
+):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+
+    channel = f"worker.execution.events:{strategy_run_id}"
+
+    async def _event_stream() -> AsyncGenerator[str, None]:
+        redis = get_redis()
+        pubsub = redis.pubsub()
+        await pubsub.subscribe(channel)
+        last_sent = max(0, int(after_cursor))
+        try:
+            def _initial_load() -> List[Dict[str, Any]]:
+                db = SessionLocal()
+                try:
+                    return basket_execution_store.list_worker_execution_events(
+                        db,
+                        strategy_run_id=strategy_run_id,
+                        after_cursor=last_sent,
+                        limit=limit,
+                        basket_execution_id=basket_execution_id,
+                        event_type=event_type,
+                    )
+                finally:
+                    db.close()
+
+            rows = await asyncio.to_thread(_initial_load)
+            for row in rows:
+                cursor = int(row.get("cursor") or 0)
+                if cursor <= last_sent:
+                    continue
+                yield f"data: {json.dumps(row, default=_json_default)}\n\n"
+                last_sent = cursor
+
+            while True:
+                if await request.is_disconnected():
+                    break
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=15)
+                if not message or message.get("type") != "message":
+                    yield ": heartbeat\n\n"
+                    continue
+                data = message.get("data")
+                if isinstance(data, str):
+                    payload = json.loads(data)
+                elif isinstance(data, dict):
+                    payload = data
+                else:
+                    continue
+                cursor = int(payload.get("cursor") or 0)
+                if cursor <= last_sent:
+                    continue
+                if basket_execution_id and str(payload.get("basket_execution_id") or "") != str(basket_execution_id):
+                    continue
+                if event_type and str(payload.get("event_type") or "") != str(event_type):
+                    continue
+                yield f"data: {json.dumps(payload, default=_json_default)}\n\n"
+                last_sent = cursor
+        finally:
+            try:
+                await pubsub.unsubscribe(channel)
+            finally:
+                await pubsub.aclose()
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
 @router.post("/worker/runs/{strategy_run_id}/exit")

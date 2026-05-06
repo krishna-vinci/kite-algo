@@ -61,6 +61,9 @@ from api.routers.algo_workers import (  # noqa: E402
     stream_worker_market_candles,
     stream_worker_market_ticks,
     stream_worker_run_pnl,
+    list_worker_baskets,
+    get_worker_basket,
+    list_worker_execution_events,
     submit_worker_intent,
     WorkerExitRequest,
     worker_ticks_ws,
@@ -150,6 +153,76 @@ def _sqlite_algo_worker_repo() -> SqlAlchemyAlgoWorkerRepository:
                     account_id TEXT NOT NULL,
                     strategy_run_id TEXT NOT NULL,
                     broker_order_id TEXT,
+                    basket_execution_id TEXT,
+                    basket_leg_index INTEGER,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.basket_executions (
+                    basket_execution_id TEXT PRIMARY KEY,
+                    strategy_run_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    execution_mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    all_or_none INTEGER NOT NULL DEFAULT 0,
+                    action_required INTEGER NOT NULL DEFAULT 0,
+                    action_reason TEXT,
+                    rollback_status TEXT NOT NULL DEFAULT 'none',
+                    requested_leg_count INTEGER NOT NULL DEFAULT 0,
+                    completed_leg_count INTEGER NOT NULL DEFAULT 0,
+                    terminal_leg_count INTEGER NOT NULL DEFAULT 0,
+                    total_requested_quantity INTEGER NOT NULL DEFAULT 0,
+                    total_filled_quantity INTEGER NOT NULL DEFAULT 0,
+                    latest_event_cursor INTEGER,
+                    latest_event_at TEXT,
+                    request_json TEXT NOT NULL DEFAULT '{}',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.basket_execution_legs (
+                    basket_execution_id TEXT NOT NULL,
+                    leg_index INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    exchange TEXT,
+                    tradingsymbol TEXT,
+                    product TEXT,
+                    transaction_type TEXT,
+                    requested_quantity INTEGER NOT NULL DEFAULT 0,
+                    broker_order_id TEXT,
+                    client_order_ref TEXT,
+                    latest_broker_status TEXT,
+                    last_seen_filled_quantity INTEGER NOT NULL DEFAULT 0,
+                    average_price REAL,
+                    request_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (basket_execution_id, leg_index)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.worker_execution_events (
+                    cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_run_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    basket_execution_id TEXT,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -394,6 +467,23 @@ class _FakeWorkerRepository:
     async def save_intent_result(self, *, token_id, strategy_run_id, request, status, result):
         self.intent_results[(strategy_run_id, request.idempotency_key)] = result
         return result
+
+    async def begin_intent(self, *, token_id, strategy_run_id, request, initial_result, status="pending", db=None):
+        _ = (token_id, db)
+        key = (strategy_run_id, request.idempotency_key)
+        if key not in self.intent_results:
+            self.intent_results[key] = dict(initial_result)
+            self.intent_results[(strategy_run_id, f"__status__:{request.idempotency_key}")] = status
+            return {"status": status, "result": dict(initial_result), "claimed": True}
+        existing_status = self.intent_results.get((strategy_run_id, f"__status__:{request.idempotency_key}"), "accepted")
+        return {"status": existing_status, "result": dict(self.intent_results[key]), "claimed": False}
+
+    async def finalize_intent_result(self, *, strategy_run_id, idempotency_key, status, result, db=None):
+        _ = db
+        key = (strategy_run_id, idempotency_key)
+        self.intent_results[key] = dict(result)
+        self.intent_results[(strategy_run_id, f"__status__:{idempotency_key}")] = status
+        return {"status": status, "result": dict(result)}
 
 
 def _test_client(*, repo, market_data_service=None):
@@ -1761,6 +1851,308 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req.attribution["account_ref"], "kite:AB1234")
         self.assertEqual(req.attribution["source"], "algo_worker")
         self.assertEqual(call.kwargs["idempotency_key"], "live-0001")
+
+    async def test_live_place_basket_returns_basket_execution_id(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-1"] = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = SimpleNamespace(
+            place_basket=AsyncMock(
+                return_value=SimpleNamespace(
+                    status="success",
+                    basket_status="active",
+                    action_required=False,
+                    action_reason=None,
+                    model_dump=lambda mode="json": {
+                        "status": "success",
+                        "results": [{"index": 0, "tradingsymbol": "INFY", "order_id": "OID-1", "status": "success"}],
+                        "errors": [],
+                        "basket_execution_id": "will-be-overridden",
+                        "basket_status": "active",
+                        "action_required": False,
+                        "action_reason": None,
+                    },
+                )
+            )
+        )
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ), patch(
+            "api.routers.algo_workers.basket_execution_store.create_live_basket_execution",
+            return_value={"basket_execution_id": "basket-live-1", "status": "submitting", "action_required": False, "action_reason": None},
+        ), patch(
+            "api.routers.algo_workers.basket_execution_store.get_basket_for_run",
+            return_value={"basket_execution_id": "basket-live-1", "status": "active", "action_required": False, "action_reason": None},
+        ):
+            response = await submit_worker_intent(
+                request,
+                "run-live-1",
+                WorkerIntentRequest(
+                    intent_type="place_basket",
+                    idempotency_key="basket-1",
+                    payload={
+                        "basket": {
+                            "orders": [
+                                {
+                                    "exchange": "NSE",
+                                    "tradingsymbol": "INFY",
+                                    "transaction_type": "BUY",
+                                    "variety": "regular",
+                                    "product": "CNC",
+                                    "order_type": "MARKET",
+                                    "quantity": 1,
+                                }
+                            ]
+                        }
+                    },
+                ),
+            )
+
+        self.assertEqual(response["status"], "accepted")
+        self.assertTrue(response["result"]["basket_execution_id"])
+        self.assertIn(response["result"]["basket_status"], {"submitting", "active", "failed", "completed", "partial"})
+
+    async def test_live_place_basket_deduped_replay_returns_same_basket_execution_id(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-1"] = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = SimpleNamespace(
+            place_basket=AsyncMock(
+                return_value=SimpleNamespace(
+                    status="success",
+                    basket_status="active",
+                    action_required=False,
+                    action_reason=None,
+                    model_dump=lambda mode="json": {
+                        "status": "success",
+                        "results": [{"index": 0, "tradingsymbol": "INFY", "order_id": "OID-1", "status": "success"}],
+                        "errors": [],
+                    },
+                )
+            )
+        )
+
+        intent = WorkerIntentRequest(
+            intent_type="place_basket",
+            idempotency_key="basket-dup",
+            payload={
+                "basket": {
+                    "orders": [
+                        {
+                            "exchange": "NSE",
+                            "tradingsymbol": "INFY",
+                            "transaction_type": "BUY",
+                            "variety": "regular",
+                            "product": "CNC",
+                            "order_type": "MARKET",
+                            "quantity": 1,
+                        }
+                    ]
+                }
+            },
+        )
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ), patch(
+            "api.routers.algo_workers.basket_execution_store.create_live_basket_execution",
+            return_value={"basket_execution_id": "basket-live-dup", "status": "submitting", "action_required": False, "action_reason": None},
+        ), patch(
+            "api.routers.algo_workers.basket_execution_store.get_basket_for_run",
+            return_value={"basket_execution_id": "basket-live-dup", "status": "active", "action_required": False, "action_reason": None},
+        ):
+            first = await submit_worker_intent(request, "run-live-1", intent)
+            second = await submit_worker_intent(request, "run-live-1", intent)
+
+        self.assertEqual(second["status"], "deduped")
+        self.assertEqual(second["result"]["basket_execution_id"], first["result"]["basket_execution_id"])
+
+    async def test_live_place_basket_pending_replay_does_not_resubmit_orders(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-1"] = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        repo.intent_results[("run-live-1", "basket-pending")] = {
+            "mode": "live",
+            "intent_type": "place_basket",
+            "basket_execution_id": "bex_existing",
+            "basket_status": "submitting",
+            "action_required": False,
+            "action_reason": None,
+            "result": {"status": "pending", "results": [], "errors": []},
+        }
+        repo.intent_results[("run-live-1", "__status__:basket-pending")] = "pending"
+        request = self._request(repo)
+        live_orders = SimpleNamespace(place_basket=AsyncMock())
+        request.app.state.algo_worker_orders_service = live_orders
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ), patch(
+            "api.routers.algo_workers.basket_execution_store.create_live_basket_execution"
+        ) as create_basket:
+            response = await submit_worker_intent(
+                request,
+                "run-live-1",
+                WorkerIntentRequest(
+                    intent_type="place_basket",
+                    idempotency_key="basket-pending",
+                    payload={
+                        "basket": {
+                            "orders": [
+                                {
+                                    "exchange": "NSE",
+                                    "tradingsymbol": "INFY",
+                                    "transaction_type": "BUY",
+                                    "variety": "regular",
+                                    "product": "CNC",
+                                    "order_type": "MARKET",
+                                    "quantity": 1,
+                                }
+                            ]
+                        }
+                    },
+                ),
+            )
+
+        self.assertEqual(response["status"], "deduped")
+        self.assertEqual(response["result"]["basket_execution_id"], "bex_existing")
+        create_basket.assert_not_called()
+        live_orders.place_basket.assert_not_awaited()
+
+    async def test_get_worker_basket_returns_persisted_snapshot(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=["runs:read"],
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-1"] = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-1",
+            "template_id": "tmpl",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {},
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        with patch(
+            "api.routers.algo_workers.basket_execution_store.get_basket_for_run",
+            return_value={"basket_execution_id": "basket-1", "status": "active", "legs": []},
+        ):
+            response = await get_worker_basket(request, "run-live-1", "basket-1")
+
+        self.assertEqual(response["basket_execution_id"], "basket-1")
+        self.assertIn(response["status"], {"active", "partial", "completed", "failed", "submitting"})
+
+    async def test_list_worker_execution_events_filters_by_basket_and_cursor(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=["runs:read"],
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-1"] = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-1",
+            "template_id": "tmpl",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {},
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        with patch(
+            "api.routers.algo_workers.basket_execution_store.list_worker_execution_events",
+            return_value=[
+                {
+                    "cursor": 11,
+                    "strategy_run_id": "run-live-1",
+                    "account_id": "kite:AB1234",
+                    "basket_execution_id": "basket-1",
+                    "event_type": "basket.status_changed",
+                    "payload": {},
+                }
+            ],
+        ):
+            response = await list_worker_execution_events(
+                request,
+                "run-live-1",
+                after_cursor=10,
+                basket_execution_id="basket-1",
+                event_type="basket.status_changed",
+                limit=50,
+            )
+
+        self.assertTrue(all(item["cursor"] > 10 for item in response["events"]))
+        self.assertTrue(all(item.get("basket_execution_id") == "basket-1" for item in response["events"]))
 
     async def test_worker_can_list_live_orders_for_grouped_run(self):
         token = WorkerToken(

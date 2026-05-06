@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-05-06
+Last updated: 2026-05-07
 
 ## Scope
 
@@ -24,6 +24,33 @@ Do not use this file for frontend work.
 - Added backend mutual fund router in `broker_api/kite_mutual_funds.py`
 
 ## Newly implemented in current branch
+
+- Implemented combined Spec 5 + Spec 6 live execution observability and basket state slice:
+  - added durable schema primitives for basket execution + worker execution outbox:
+    - `basket_executions`
+    - `basket_execution_legs`
+    - `worker_execution_events`
+    - `live_order_intents.basket_execution_id` / `basket_leg_index`
+  - added `broker_api/basket_execution.py` store with deterministic basket recompute + leg normalization helpers, exact linked projection updates, and run-scoped execution-event reads
+  - preserved `algo_worker_intents` compatibility envelope while adding live basket pending-intent reservation + basket skeleton creation before broker child submits
+  - live basket deduped replay now returns the same durable `basket_execution_id` (no duplicate basket execution creation)
+  - extended live order intent creation to carry exact basket linkage for child orders
+  - integrated inline basket projection under existing canonical event processing lock (`EVENT_PROCESSOR_LOCK_ID`) and publish-after-commit run-scoped events (`worker.execution.events:{strategy_run_id}`)
+  - basket projection runs under nested savepoint semantics; projection failures mark linked basket as `action_required=true` / `action_reason='projection_inconsistent'` without poisoning valid order projection
+  - added worker-safe basket and execution observability routes:
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/baskets`
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/baskets/{basket_execution_id}`
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/execution-events`
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/execution-events/stream` (SSE subscribe-first / drain-second / dedupe-by-cursor)
+  - integrated recovery guard using `active_basket_loader` in recovery decision layer so exiting live runs with active baskets defer safe-close with `active_basket_execution`
+  - verification in this environment:
+    - `rtk pytest tests/test_schema_live_order_attribution.py -k "basket_execution_tables_and_links" -v` → `1 passed`
+    - `rtk pytest tests/test_basket_execution.py -v` → `3 passed`
+    - `rtk pytest tests/test_order_runtime.py -k "linked_basket_leg or non_basket_order_updated_event or basket_projection_failure" -v` → `2 passed`
+    - `rtk pytest tests/integration_order_runtime.py -k "linked_basket_leg or updates_linked_basket_leg_and_aggregate" -v` → `1 skipped` (integration env not configured)
+    - `rtk pytest tests/test_algo_worker_api.py -k "basket_execution_id or basket_deduped_replay or worker_basket_returns_persisted_snapshot or execution_events_filters_by_basket" -v` → `4 passed`
+    - `rtk pytest tests/test_worker_runtime_recovery.py -k "active_basket_execution or exiting_live_run_defers_when_active_basket_exists" -v` → `1 passed`
+    - `rtk pytest tests/test_order_runtime.py tests/test_basket_execution.py tests/test_schema_live_order_attribution.py tests/test_worker_runtime_recovery.py tests/test_algo_worker_api.py -k "basket or execution_events or active_basket_execution or linked_basket_leg" -v` → `14 passed`
 
 - Implemented Spec 3 worker runtime reliability & recovery slice end-to-end:
   - extended `algo_worker_runs` persistence with run-scoped lease/heartbeat fields (`worker_session_nonce`, `worker_session_claimed_at`, `last_heartbeat_at`) and exposed those fields in repository run views

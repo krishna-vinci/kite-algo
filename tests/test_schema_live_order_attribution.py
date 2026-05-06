@@ -8,3 +8,12 @@ def test_schema_has_live_order_intents_and_broker_import_source():
     assert "client_order_ref TEXT NOT NULL" in schema
     assert "broker_import" in schema
     assert "live_fill" in schema
+
+
+def test_schema_has_basket_execution_tables_and_links():
+    schema = Path("schema.sql").read_text()
+    assert "CREATE TABLE IF NOT EXISTS public.basket_executions" in schema
+    assert "CREATE TABLE IF NOT EXISTS public.basket_execution_legs" in schema
+    assert "CREATE TABLE IF NOT EXISTS public.worker_execution_events" in schema
+    assert "ADD COLUMN IF NOT EXISTS basket_execution_id TEXT" in schema
+    assert "ADD COLUMN IF NOT EXISTS basket_leg_index INTEGER" in schema

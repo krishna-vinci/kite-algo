@@ -40,6 +40,10 @@ def truncate_runtime_tables(session_factory) -> None:
                     ws_order_events,
                     order_state_projection,
                     order_trade_fills,
+                    worker_execution_events,
+                    basket_execution_legs,
+                    basket_executions,
+                    live_order_intents,
                     account_positions,
                     kite_sessions
                 RESTART IDENTITY CASCADE

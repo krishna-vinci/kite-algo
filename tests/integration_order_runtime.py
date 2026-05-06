@@ -251,3 +251,90 @@ class OrderRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(positions, [(12345, 2)])
         self.assertTrue(fills[0])
+
+    async def test_process_pending_events_updates_linked_basket_leg_and_aggregate(self):
+        db = self.SessionLocal()
+        try:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO basket_executions (
+                        basket_execution_id, strategy_run_id, account_id, execution_mode, status,
+                        request_json, metadata_json
+                    ) VALUES (
+                        'basket-1', 'run-live-1', :account_id, 'live', 'active', '{}'::jsonb, '{}'::jsonb
+                    )
+                    """
+                ),
+                {"account_id": self.account_id},
+            )
+            db.execute(
+                text(
+                    """
+                    INSERT INTO basket_execution_legs (
+                        basket_execution_id, leg_index, status, exchange, tradingsymbol, product,
+                        transaction_type, requested_quantity, broker_order_id, client_order_ref, request_json
+                    ) VALUES (
+                        'basket-1', 0, 'working', 'NSE', 'INFY', 'CNC', 'BUY', 10, 'OID-1', 'KATAG1', '{}'::jsonb
+                    )
+                    """
+                )
+            )
+            db.execute(
+                text(
+                    """
+                    INSERT INTO live_order_intents (
+                        intent_id, client_order_ref, account_id, strategy_run_id, strategy_family,
+                        strategy_name, execution_mode, entry_surface, basket_execution_id, basket_leg_index,
+                        attribution_json, cost_contract_json
+                    ) VALUES (
+                        'lint-1', 'KATAG1', :account_id, 'run-live-1', 'indicator_strategy',
+                        'MR', 'live', 'algo_worker', 'basket-1', 0, '{}'::jsonb, '{}'::jsonb
+                    )
+                    """
+                ),
+                {"account_id": self.account_id},
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        with patch("broker_api.order_runtime.SessionLocal", self.SessionLocal):
+            await self.runtime.ingest_ws_event(
+                {
+                    "order_id": "OID-1",
+                    "status": "COMPLETE",
+                    "filled_quantity": 10,
+                    "quantity": 10,
+                    "average_price": 100.0,
+                    "tradingsymbol": "INFY",
+                    "exchange": "NSE",
+                    "product": "CNC",
+                    "transaction_type": "BUY",
+                    "user_id": "AB1234",
+                },
+                corr_id="basket-linked",
+            )
+            processed = await self.runtime.process_pending_events(batch_size=10)
+
+        self.assertEqual(processed, 1)
+
+        db = self.SessionLocal()
+        try:
+            basket = db.execute(
+                text("SELECT status, total_filled_quantity FROM basket_executions WHERE basket_execution_id = 'basket-1'")
+            ).fetchone()
+            leg = db.execute(
+                text("SELECT status, last_seen_filled_quantity FROM basket_execution_legs WHERE basket_execution_id = 'basket-1' AND leg_index = 0")
+            ).fetchone()
+            events = db.execute(
+                text("SELECT event_type FROM worker_execution_events WHERE strategy_run_id = 'run-live-1' ORDER BY cursor ASC")
+            ).fetchall()
+        finally:
+            db.close()
+
+        self.assertEqual(basket[0], "completed")
+        self.assertEqual(int(basket[1]), 10)
+        self.assertEqual(leg[0], "filled")
+        self.assertEqual(int(leg[1]), 10)
+        self.assertIn(("basket.leg_updated",), events)

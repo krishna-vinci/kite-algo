@@ -1,5 +1,6 @@
 import json
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -419,6 +420,131 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         positions_service.sync_account_cache_from_db.assert_awaited_once_with("kite:AB1234")
         positions_service.publish_snapshot.assert_awaited_once_with("kite:AB1234", reason="trade_sync")
         projector.project.assert_called_once_with(batch_size=50)
+
+    async def test_process_pending_events_projects_linked_basket_and_publishes_run_event(self):
+        basket_store = MagicMock()
+        basket_store.apply_order_event.return_value = [
+            {
+                "cursor": 11,
+                "strategy_run_id": "run-1",
+                "account_id": "kite:AB1234",
+                "basket_execution_id": "basket-1",
+                "event_type": "basket.status_changed",
+                "payload": {"status": "completed"},
+            }
+        ]
+        runtime = CanonicalOrderEventRuntime(basket_store=basket_store)
+        row = SimpleNamespace(
+            id=1,
+            account_id="kite:AB1234",
+            order_id="OID-1",
+            status="COMPLETE",
+            event_timestamp="2026-05-07T10:00:00+00:00",
+            filled_quantity=1,
+            quantity=1,
+            exchange="NSE",
+            tradingsymbol="INFY",
+            instrument_token=408065,
+            product="CNC",
+            transaction_type="BUY",
+            average_price=100.0,
+        )
+        db = MagicMock()
+        db.begin_nested.return_value = nullcontext()
+
+        with patch("broker_api.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
+            "broker_api.order_runtime._acquire_advisory_lock_session",
+            AsyncMock(return_value=db),
+        ), patch("broker_api.order_runtime._release_advisory_lock"), patch(
+            "broker_api.order_runtime._close_locked_session"
+        ), patch.object(runtime, "_claim_pending_events", return_value=[row]), patch.object(
+            runtime, "_upsert_projection_from_event"
+        ), patch("broker_api.order_runtime.publish_event", AsyncMock()) as publish_event:
+            processed = await runtime.process_pending_events(batch_size=10)
+
+        self.assertEqual(processed, 1)
+        basket_store.apply_order_event.assert_called_once()
+        publish_event.assert_awaited_once_with("worker.execution.events:run-1", basket_store.apply_order_event.return_value[0])
+
+    async def test_process_pending_events_basket_projection_failure_does_not_poison_order_projection(self):
+        basket_store = MagicMock()
+        basket_store.apply_order_event.side_effect = RuntimeError("boom")
+        runtime = CanonicalOrderEventRuntime(basket_store=basket_store)
+        row = SimpleNamespace(
+            id=1,
+            account_id="kite:AB1234",
+            order_id="OID-1",
+            status="COMPLETE",
+            event_timestamp="2026-05-07T10:00:00+00:00",
+            filled_quantity=1,
+            quantity=1,
+            exchange="NSE",
+            tradingsymbol="INFY",
+            instrument_token=408065,
+            product="CNC",
+            transaction_type="BUY",
+            average_price=100.0,
+        )
+        db = MagicMock()
+        db.begin_nested.return_value = nullcontext()
+
+        with patch("broker_api.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
+            "broker_api.order_runtime._acquire_advisory_lock_session",
+            AsyncMock(return_value=db),
+        ), patch("broker_api.order_runtime._release_advisory_lock"), patch(
+            "broker_api.order_runtime._close_locked_session"
+        ), patch.object(runtime, "_claim_pending_events", return_value=[row]), patch.object(
+            runtime, "_upsert_projection_from_event"
+        ), patch("broker_api.order_runtime.publish_event", AsyncMock()) as publish_event:
+            processed = await runtime.process_pending_events(batch_size=10)
+
+        self.assertEqual(processed, 1)
+        basket_store.mark_projection_inconsistent_if_linked.assert_called_once()
+        publish_event.assert_not_awaited()
+
+    async def test_process_pending_events_emits_non_basket_order_updated_event(self):
+        basket_store = MagicMock()
+        basket_store.apply_order_event.return_value = [
+            {
+                "cursor": 5,
+                "strategy_run_id": "run-2",
+                "account_id": "kite:AB1234",
+                "basket_execution_id": None,
+                "event_type": "order.updated",
+                "payload": {"order_id": "OID-2", "status": "COMPLETE"},
+            }
+        ]
+        runtime = CanonicalOrderEventRuntime(basket_store=basket_store)
+        row = SimpleNamespace(
+            id=2,
+            account_id="kite:AB1234",
+            order_id="OID-2",
+            status="COMPLETE",
+            event_timestamp="2026-05-07T10:00:00+00:00",
+            filled_quantity=1,
+            quantity=1,
+            exchange="NSE",
+            tradingsymbol="INFY",
+            instrument_token=408065,
+            product="CNC",
+            transaction_type="BUY",
+            average_price=100.0,
+        )
+        db = MagicMock()
+        db.begin_nested.return_value = nullcontext()
+
+        with patch("broker_api.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
+            "broker_api.order_runtime._acquire_advisory_lock_session",
+            AsyncMock(return_value=db),
+        ), patch("broker_api.order_runtime._release_advisory_lock"), patch(
+            "broker_api.order_runtime._close_locked_session"
+        ), patch.object(runtime, "_claim_pending_events", return_value=[row]), patch.object(
+            runtime, "_upsert_projection_from_event"
+        ), patch("broker_api.order_runtime.publish_event", AsyncMock()) as publish_event:
+            processed = await runtime.process_pending_events(batch_size=10)
+
+        self.assertEqual(processed, 1)
+        publish_event.assert_awaited_once_with("worker.execution.events:run-2", basket_store.apply_order_event.return_value[0])
 
 
 class InstrumentsRepositoryTests(unittest.TestCase):

@@ -16,6 +16,7 @@ from database import SessionLocal, engine
 from journaling.live_projector import LiveJournalProjector
 from .redis_events import get_redis, publish_event, pubsub_iter
 from .kite_session import KiteSession, get_session_account_id, make_account_id
+from .basket_execution import BasketExecutionStore, basket_execution_store
 
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,9 @@ class PositionPnL(BaseModel):
 
 
 class CanonicalOrderEventRuntime:
+    def __init__(self, *, basket_store: BasketExecutionStore = basket_execution_store) -> None:
+        self.basket_store = basket_store
+
     def _event_fingerprint(self, source: str, payload: Dict[str, Any]) -> str:
         stable = {
             "source": source,
@@ -467,7 +471,13 @@ class CanonicalOrderEventRuntime:
             processed = 0
             for row in claimed:
                 try:
+                    basket_events: List[Dict[str, Any]] = []
                     self._upsert_projection_from_event(db, row)
+                    try:
+                        with db.begin_nested():
+                            basket_events = self.basket_store.apply_order_event(db, canonical_event=row)
+                    except Exception:
+                        self.basket_store.mark_projection_inconsistent_if_linked(db, canonical_event=row)
                     db.execute(
                         text(
                             "UPDATE canonical_order_events SET processing_state = 'processed', processed_at = NOW(), last_error = NULL WHERE id = :id"
@@ -475,6 +485,8 @@ class CanonicalOrderEventRuntime:
                         {"id": row.id},
                     )
                     db.commit()
+                    for event in basket_events:
+                        await publish_event(f"worker.execution.events:{event['strategy_run_id']}", event)
                     processed += 1
                 except Exception as exc:
                     db.rollback()

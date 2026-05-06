@@ -821,6 +821,69 @@ CREATE TABLE IF NOT EXISTS public.algo_worker_intents (
 CREATE INDEX IF NOT EXISTS idx_algo_worker_intents_run_created
   ON public.algo_worker_intents (strategy_run_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS public.basket_executions (
+  basket_execution_id TEXT PRIMARY KEY,
+  strategy_run_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  execution_mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+  all_or_none BOOLEAN NOT NULL DEFAULT FALSE,
+  action_required BOOLEAN NOT NULL DEFAULT FALSE,
+  action_reason TEXT,
+  rollback_status TEXT NOT NULL DEFAULT 'none',
+  requested_leg_count INTEGER NOT NULL DEFAULT 0,
+  completed_leg_count INTEGER NOT NULL DEFAULT 0,
+  terminal_leg_count INTEGER NOT NULL DEFAULT 0,
+  total_requested_quantity INTEGER NOT NULL DEFAULT 0,
+  total_filled_quantity INTEGER NOT NULL DEFAULT 0,
+  latest_event_cursor BIGINT,
+  latest_event_at TIMESTAMPTZ,
+  request_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.basket_execution_legs (
+  basket_execution_id TEXT NOT NULL REFERENCES public.basket_executions(basket_execution_id) ON DELETE CASCADE,
+  leg_index INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  exchange TEXT,
+  tradingsymbol TEXT,
+  product TEXT,
+  transaction_type TEXT,
+  requested_quantity INTEGER NOT NULL DEFAULT 0,
+  broker_order_id TEXT,
+  client_order_ref TEXT,
+  latest_broker_status TEXT,
+  last_seen_filled_quantity INTEGER NOT NULL DEFAULT 0,
+  average_price DOUBLE PRECISION,
+  request_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (basket_execution_id, leg_index)
+);
+
+CREATE TABLE IF NOT EXISTS public.worker_execution_events (
+  cursor BIGSERIAL PRIMARY KEY,
+  strategy_run_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  basket_execution_id TEXT,
+  event_type TEXT NOT NULL,
+  payload_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_basket_executions_run_status
+  ON public.basket_executions (strategy_run_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_worker_execution_events_run_cursor
+  ON public.worker_execution_events (strategy_run_id, cursor);
+
+CREATE INDEX IF NOT EXISTS idx_worker_execution_events_basket_cursor
+  ON public.worker_execution_events (basket_execution_id, cursor)
+  WHERE basket_execution_id IS NOT NULL;
+
 -- =========================================
 -- Index Stoploss Strategy Tables
 -- =========================================
@@ -1092,6 +1155,10 @@ CREATE TABLE IF NOT EXISTS public.live_order_intents (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE public.live_order_intents
+  ADD COLUMN IF NOT EXISTS basket_execution_id TEXT,
+  ADD COLUMN IF NOT EXISTS basket_leg_index INTEGER;
+
 CREATE UNIQUE INDEX IF NOT EXISTS ux_live_order_intents_client_order_ref
   ON public.live_order_intents (client_order_ref);
 
@@ -1100,6 +1167,9 @@ CREATE INDEX IF NOT EXISTS idx_live_order_intents_broker_order
 
 CREATE INDEX IF NOT EXISTS idx_live_order_intents_strategy
   ON public.live_order_intents (strategy_run_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_live_order_intents_account_order_basket
+  ON public.live_order_intents (account_id, broker_order_id, basket_execution_id);
 
 CREATE TABLE IF NOT EXISTS public.journal_source_links (
     id BIGSERIAL PRIMARY KEY,
