@@ -14,32 +14,16 @@ from api.config.openapi import OPENAPI_TAGS
 from app.bootstrap import combined_lifespan
 from app.middleware import setup_middleware
 
-from api.routers.worker_auth import router as worker_auth_router
-from api.routers.worker_execution import router as worker_execution_router
-from api.routers.worker_market import router as worker_market_router
-from api.routers.worker_protection import router as worker_protection_router
-from api.routers.analytics import router as analytics_router
-from api.routers.auth import router as auth_router
-from api.routers.control import router as control_router
-from api.routers.historical import router as historical_router
-from api.routers.ingestion import router as ingestion_router
-from api.routers.instruments import router as instruments_router
-from api.routers.journal import router as journal_router
-from api.routers.market_data import router as market_data_router
-from api.routers.marketwatch import router as marketwatch_router
-from api.routers.user_settings import router as user_settings_router
+from api.routers import ALL_ROUTERS
 from broker_api.market.candles_api import router as candles_api_router
-from broker_api.core.routes import router as broker_core_router
 from broker_api.core.historical_routes import router as broker_historical_routes_router
 from broker_api.instruments.routes import router as broker_instruments_router
 from broker_api.mutual_funds.kite_mutual_funds import router as kite_mutual_funds_router
-from broker_api.orders import router as kite_orders_router
 from broker_api.performance.performance_router import router as performance_router
 from options.api.execution_router import router as options_execution_router
 from options.api.market_router import router as options_market_router
 from options.api.protection_router import router as options_protection_router
 from options.api.strategy_router import router as options_strategy_router
-from options.api.worker_options_router import router as worker_options_router
 from app.monitor import install_log_buffer
 from strategies.indexstoploss.router import router as indexstoploss_router
 
@@ -110,24 +94,11 @@ app = FastAPI(title="Kite App API", lifespan=combined_lifespan, openapi_tags=OPE
 setup_middleware(app)
 
 # 3. Include API routes under /api
-app.include_router(auth_router, prefix="/api")
-app.include_router(market_data_router, prefix="/api")
-app.include_router(instruments_router, prefix="/api")
-app.include_router(historical_router, prefix="/api")
-app.include_router(ingestion_router, prefix="/api")
-app.include_router(user_settings_router, prefix="/api")
-app.include_router(marketwatch_router, prefix="/api")
-app.include_router(worker_auth_router, prefix="/api")
-app.include_router(worker_market_router, prefix="/api")
-app.include_router(worker_execution_router, prefix="/api")
-app.include_router(worker_protection_router, prefix="/api")
-app.include_router(control_router, prefix="/api")
-app.include_router(journal_router, prefix="/api")
-app.include_router(analytics_router, prefix="/api")
-app.include_router(kite_orders_router, prefix="/api")
+for router, prefix in ALL_ROUTERS:
+    app.include_router(router, prefix=prefix)
+
 app.include_router(kite_mutual_funds_router, prefix="/api")
 app.include_router(candles_api_router, prefix="/api")  # Unified candles API with all historical endpoints
-app.include_router(broker_core_router, prefix="/api")
 app.include_router(broker_historical_routes_router, prefix="/api")
 app.include_router(broker_instruments_router, prefix="/api")
 app.include_router(performance_router, prefix="/api")
@@ -136,7 +107,6 @@ app.include_router(options_market_router)
 app.include_router(options_strategy_router)
 app.include_router(options_execution_router)
 app.include_router(options_protection_router)
-app.include_router(worker_options_router)
 
 from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
 

@@ -57,13 +57,14 @@ Use `compose.dev.yml` for contributor workflows. The production-oriented stack i
 
 | Path | Responsibility |
 | --- | --- |
-| `api/` | Public backend routes and API helpers |
-| `broker_api/` | Broker-facing services and session handling |
+| `api/` | Public backend routes; support modules now live under `api/services/` |
+| `broker_api/` | Broker-facing services and session handling (organized by subdirectories such as `orders/`, `core/`, `market/`) |
 | `algo_runtime/` | Strategy lifecycle, attribution, and execution wiring |
 | `options/` | Options sessions, strategy flows, protection, and execution helpers |
 | `paper_runtime/` | Durable paper execution state |
 | `execution_accounting/` | Shared attribution and cost contracts |
-| `journaling/` | Run history, journal views, summaries, review flows |
+| `journaling/` | Run history, journal views, summaries, review flows (repositories in `journaling/repositories/`) |
+| `app/` | App-level bootstrap, middleware, monitors, and startup helpers |
 | `market-runtime/` | Go websocket runtime |
 | `sdk/python/` | Python SDK for external algo workers |
 | `frontend-next/` | Next.js frontend |
@@ -72,6 +73,8 @@ Use `compose.dev.yml` for contributor workflows. The production-oriented stack i
 | `tests/` | Verification suites |
 
 ## Contribution lanes
+
+Note: backend structure recently moved from flatter modules to grouped packages (for example `api/services/`, `broker_api/orders/`, and worker routes split into `api/routers/worker_*.py`). Prefer those locations when adding new code.
 
 | Area | Good contribution examples | Start here |
 | --- | --- | --- |

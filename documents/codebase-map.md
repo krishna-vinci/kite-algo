@@ -11,6 +11,7 @@ This document helps contributors answer three questions quickly:
 | Path | Ownership |
 | --- | --- |
 | `main.py` | FastAPI app wiring, router registration, startup/runtime hooks |
+| `app/` | App bootstrap, middleware, monitoring, and shared app-level helpers |
 | `api/` | Public backend contracts, route handlers, API composition |
 | `broker_api/` | Broker integration, sessions, market/broker service helpers |
 | `algo_runtime/` | Strategy lifecycle, attribution, intent flow, runtime state |
@@ -30,7 +31,10 @@ This document helps contributors answer three questions quickly:
 | Path | What it contains |
 | --- | --- |
 | `api/routers/auth.py` | App auth and broker-login-related routes |
-| `api/routers/algo_workers.py` | Worker lifecycle, worker execution, worker-safe flows |
+| `api/routers/worker_auth.py` | Worker auth/session and token-safe access surfaces |
+| `api/routers/worker_market.py` | Worker market-data and worker-safe market surfaces |
+| `api/routers/worker_execution.py` | Worker execution lifecycle, timeline, and run actions |
+| `api/routers/worker_protection.py` | Worker safety/protection and guardrail endpoints |
 | `api/routers/control.py` | Strategy/control-plane actions |
 | `api/routers/journal.py` | Journal and review endpoints |
 | `api/routers/market_data.py` | Market and quote surfaces |
@@ -46,13 +50,13 @@ If you are changing API behavior, start by reading the router file, then the ser
 
 | Concern | Start here |
 | --- | --- |
-| Worker run lifecycle | `api/routers/algo_workers.py`, `algo_runtime/` |
+| Worker run lifecycle | `api/routers/worker_*.py`, `algo_runtime/` |
 | Execution attribution | `algo_runtime/`, `execution_accounting/` |
 | Options sessions and protection | `options/`, worker options endpoints, frontend options pages |
 | Paper execution behavior | `paper_runtime/service.py`, `paper_runtime/executor.py`, `paper_runtime/run_state.py` |
 | Live broker order flow | `broker_api/`, live order intent paths, accounting notes in `documents/live-paper-accounting-and-worker-live-execution.md` |
 | Tick ownership and fanout | `market-runtime/cmd/market-runtime/main.go`, `market-runtime/internal/service/` |
-| Journal projection and summaries | `journaling/service.py`, `journaling/runtime.py` |
+| Journal projection and summaries | `journaling/service.py`, `journaling/runtime.py`, `journaling/repositories/` |
 
 ## Frontend map
 
@@ -78,7 +82,14 @@ If you are changing API behavior, start by reading the router file, then the ser
 | Change type | First files to read |
 | --- | --- |
 | Add or change a backend endpoint | `api/routers/<area>.py`, then the called service/runtime module |
-| Change worker lifecycle behavior | `api/routers/algo_workers.py`, `algo_runtime/` |
+| Change worker lifecycle behavior | `api/routers/worker_*.py`, `algo_runtime/` |
+
+## Recent structure updates
+
+- Worker API routes are split across `api/routers/worker_*.py` modules (no single `algo_workers.py`).
+- Broker order code is owned under `broker_api/orders/` (module package), and broker surfaces are organized in subdirectories under `broker_api/`.
+- Journaling persistence modules are under `journaling/repositories/`.
+- App-level standalone wiring/helpers are grouped under `app/`, and API support/service modules are grouped under `api/services/`.
 | Improve paper execution correctness | `paper_runtime/`, `execution_accounting/`, related tests |
 | Improve grouped funds/P&L behavior | `execution_accounting/`, `paper_runtime/`, `algo_runtime/`, journaling summaries |
 | Improve options workflows | `options/`, worker options endpoints, frontend options pages |

@@ -38,7 +38,7 @@ from sqlalchemy.orm import Session, relationship, sessionmaker
 from app.auth import require_app_user
 from app.database import database
 
-from .kite_auth import login_headless
+from broker_api.session.kite_auth import login_headless
 from broker_api.session.kite_session import (
     KiteSession,
     build_kite_client,
@@ -1900,7 +1900,7 @@ def parse_fo_query(query: str) -> Dict[str, Any]:
     return result
 
 ####KITE
-from .historical_data import fetch_and_store_historical_data, fetch_and_store_indices_historical_data
+from broker_api.market.historical_data import fetch_and_store_historical_data, fetch_and_store_indices_historical_data
 from app.database import get_db_connection
 
 @router.post("/clear_historical_data")
