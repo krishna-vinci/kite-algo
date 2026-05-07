@@ -20,7 +20,6 @@ install_dependency_stubs()
 
 from api.routers.algo_workers import (  # noqa: E402
     DEFAULT_WORKER_ACTIONS,
-    SqlAlchemyAlgoWorkerRepository,
     WorkerIntentRequest,
     WorkerInstrumentResolveRequest,
     WorkerMarketSnapshotRequest,
@@ -48,7 +47,6 @@ from api.routers.algo_workers import (  # noqa: E402
     WorkerRiskPatchRequest,
     WorkerProtectionPatchRequest,
     WorkerRunCreateRequest,
-    WorkerToken,
     WorkerTokenCreateRequest,
     create_worker_run,
     create_worker_token,
@@ -87,6 +85,7 @@ from api.routers.algo_workers import (  # noqa: E402
     worker_run_pnl_ws,
     router,
 )
+from api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository, WorkerToken  # noqa: E402
 from api.routers.algo_workers import _hash_token  # noqa: E402
 from api.worker_market_data import WorkerMarketDataService  # noqa: E402
 from sqlalchemy import create_engine, event, text  # noqa: E402

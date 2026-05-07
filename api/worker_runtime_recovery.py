@@ -334,7 +334,7 @@ class WorkerRuntimeRecoveryService:
 def build_worker_runtime_recovery_service(app: Any, *, stale_action_seconds: int, claimed_without_heartbeat_seconds: int) -> WorkerRuntimeRecoveryService:
     repo = getattr(app.state, "algo_worker_repository", None)
     if repo is None:
-        from api.routers.algo_workers import SqlAlchemyAlgoWorkerRepository
+        from api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository
 
         repo = SqlAlchemyAlgoWorkerRepository()
         app.state.algo_worker_repository = repo

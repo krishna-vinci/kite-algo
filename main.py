@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from api.openapi import OPENAPI_TAGS
-from api.routers.algo_workers import (
+from api.repositories.algo_worker_repo import (
     WORKER_RUN_STALE_ACTION_SECONDS,
     WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
 )
@@ -188,7 +188,7 @@ def _worker_protection_squareoff_schedule() -> dict[str, str]:
 async def _worker_protection_loop(app: FastAPI):
     from types import SimpleNamespace
 
-    from api.routers.algo_workers import SqlAlchemyAlgoWorkerRepository
+    from api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository
     from api.worker_protection_runtime import (
         WorkerProtectionRuntime,
         load_worker_run_pnl_for_protection,
