@@ -17,7 +17,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 
 from .candle_storage import CandleStorage, IST
 from broker_api.core.redis_events import get_redis
-from .market_runtime_client import get_market_runtime_client, market_runtime_enabled
+from broker_api.orders.market_runtime_client import get_market_runtime_client, market_runtime_enabled
 from app.database import get_db
 from sqlalchemy.orm import Session
 from sqlalchemy import text

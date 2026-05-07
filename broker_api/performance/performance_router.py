@@ -6,8 +6,8 @@ from sqlalchemy.orm import Session
 from kiteconnect import KiteConnect
 
 from .performance_logic import calculate_performance
-from .candles_api import get_kite_db
-from .broker_api import get_db, PortfolioSnapshot, PortfolioHistory
+from broker_api.market.candles_api import get_kite_db
+from broker_api.broker_api import get_db, PortfolioSnapshot, PortfolioHistory
 
 router = APIRouter(tags=["Performance"])
 

@@ -22,7 +22,7 @@ from sqlalchemy import text
 from .candle_storage import CandleStorage, IST
 from .candle_aggregator import get_aggregator, SUPPORTED_INTERVALS
 from .candle_ingestion import CandleIngestion, IngestionScheduler
-from .kite_auth import API_KEY
+from broker_api.session.kite_auth import API_KEY
 from broker_api.session.kite_session import KiteSession, build_kite_client
 from broker_api.instruments.instruments_repository import InstrumentsRepository
 from app.database import get_db, get_db_connection
