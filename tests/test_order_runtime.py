@@ -510,7 +510,11 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "strategy_run_id": "run-2",
                 "account_id": "kite:AB1234",
                 "basket_execution_id": None,
+                "event_kind": "execution",
+                "event_source": "basket_runtime",
                 "event_type": "order.updated",
+                "related_resource_type": "broker_order",
+                "related_resource_id": "OID-2",
                 "payload": {"order_id": "OID-2", "status": "COMPLETE"},
             }
         ]
@@ -556,7 +560,11 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "strategy_run_id": "run-1",
                 "account_id": "kite:AB1234",
                 "basket_execution_id": None,
+                "event_kind": "execution",
+                "event_source": "bracket_runtime",
                 "event_type": "bracket.state_changed",
+                "related_resource_type": "bracket_intent",
+                "related_resource_id": "brk-1",
                 "payload": {"bracket_intent_id": "brk-1", "status": "arming_exits"},
             }
         ]

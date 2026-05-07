@@ -39,6 +39,7 @@ from kite_algo_worker import (  # noqa: E402
     WorkerOrderResult,
     WorkerRunPnlLeg,
     WorkerRunPnlSnapshot,
+    WorkerTimelineResponse,
     WorkerTradeSnapshot,
     amo_limit_order,
     equity_market_order,
@@ -1341,6 +1342,73 @@ def test_sync_client_order_lifecycle_and_preview_endpoints(captured_requests):
         "metadata": {"source": "test"},
         "all_or_none": True,
     }
+
+
+def test_sdk_log_decision_event_posts_normalized_payload(captured_requests):
+    client().log_decision_event(
+        "run-1",
+        decision_type="entry",
+        action="enter",
+        summary="Entered on breakout",
+        related_resource_type="basket_execution",
+        related_resource_id="basket-1",
+        metadata={"signal": "breakout"},
+    )
+
+    assert captured_requests[0]["method"] == "POST"
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/decision-events"
+    assert captured_requests[0]["kwargs"]["json"] == {
+        "decision_type": "entry",
+        "action": "enter",
+        "summary": "Entered on breakout",
+        "related_resource_type": "basket_execution",
+        "related_resource_id": "basket-1",
+        "metadata": {"signal": "breakout"},
+    }
+
+
+def test_sdk_timeline_helpers_use_expected_routes(captured_requests):
+    client().list_timeline("run-1", after_cursor=10, event_kind="decision")
+    client().stream_timeline("run-1", after_cursor=11)
+
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/timeline"
+    assert captured_requests[0]["kwargs"]["params"] == {"after_cursor": 10, "event_kind": "decision"}
+    assert captured_requests[1]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/timeline/stream"
+    assert captured_requests[1]["kwargs"]["params"] == {"after_cursor": 11}
+
+
+def test_sdk_timeline_snapshot_is_typed(monkeypatch):
+    monkeypatch.setattr(
+        KiteAlgoWorkerClient,
+        "list_timeline",
+        lambda self, run_id, **params: {
+            "strategy_run_id": run_id,
+            "after_cursor": params.get("after_cursor", 0),
+            "last_cursor": 21,
+            "events": [
+                {
+                    "cursor": 21,
+                    "strategy_run_id": run_id,
+                    "account_id": "kite:AB1234",
+                    "basket_execution_id": None,
+                    "event_kind": "decision",
+                    "event_source": "worker",
+                    "event_type": "decision.entry",
+                    "related_resource_type": "basket_execution",
+                    "related_resource_id": "basket-1",
+                    "summary": "Entered on breakout",
+                    "payload": {"decision_type": "entry", "action": "enter"},
+                    "created_at": "2026-05-07T10:00:00+00:00",
+                }
+            ],
+        },
+    )
+
+    snapshot = client().list_timeline_snapshot("run-1", after_cursor=20)
+
+    assert isinstance(snapshot, WorkerTimelineResponse)
+    assert snapshot.last_cursor == 21
+    assert snapshot.events[0].event_kind == "decision"
 
 
 def test_get_run_protection_state_returns_runtime_state_fragment(monkeypatch):

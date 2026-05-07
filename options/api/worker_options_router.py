@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query, Request
 
 from api.routers.algo_workers import (
+    observe_worker_option_protection_timeline_state,
     _repo,
     require_active_worker_run_session,
     require_worker_token,
@@ -227,10 +228,19 @@ async def update_worker_option_run_protection(
 @router.get("/runs/{strategy_run_id}/protection/state")
 async def get_worker_option_run_protection_state(
     strategy_run_id: str,
+    request: Request,
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
 ):
-    return await get_option_run_protection_state(strategy_run_id, store)
+    state = await get_option_run_protection_state(strategy_run_id, store)
+    worker_run = await _repo(request).get_run(strategy_run_id)
+    if worker_run is not None:
+        _snapshot, _events = await observe_worker_option_protection_timeline_state(
+            request,
+            strategy_run_id,
+            worker_run=worker_run,
+        )
+    return state
 
 
 @router.post("/runs/{strategy_run_id}/protection/replay")

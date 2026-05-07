@@ -12,6 +12,7 @@ from .models import (
     WorkerOrderSnapshot,
     WorkerOrdersResponse,
     WorkerRunPnlSnapshot,
+    WorkerTimelineResponse,
     WorkerTradesResponse,
 )
 
@@ -65,6 +66,15 @@ class AsyncKiteAlgoWorkerClient:
 
     async def get_run_funds(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", f"/worker/runs/{strategy_run_id}/funds")
+
+    async def log_decision_event(self, strategy_run_id: str, **payload: Any) -> JsonDict:
+        return await self._request("POST", f"/worker/runs/{strategy_run_id}/decision-events", json=dict(payload))
+
+    async def list_timeline(self, strategy_run_id: str, **params: Any) -> JsonDict:
+        return await self._request("GET", f"/worker/runs/{strategy_run_id}/timeline", params=dict(params or {}))
+
+    async def list_timeline_snapshot(self, strategy_run_id: str, **params: Any) -> WorkerTimelineResponse:
+        return WorkerTimelineResponse.model_validate(await self.list_timeline(strategy_run_id, **params))
 
     async def list_orders(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", "/worker/orders", params={"strategy_run_id": strategy_run_id})

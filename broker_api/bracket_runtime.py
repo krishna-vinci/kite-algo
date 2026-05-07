@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
+from broker_api.worker_timeline import worker_timeline_store
 
 logger = logging.getLogger(__name__)
 _BRACKET_EXECUTOR_WAKE_EVENT: Optional[asyncio.Event] = None
@@ -567,18 +568,23 @@ class BracketRuntimeStore:
                             action_type="place_target",
                             payload=target,
                         )
-                    emitted.append(
-                        {
-                            "strategy_run_id": strategy_run_id,
-                            "account_id": account_id,
-                            "basket_execution_id": None,
-                            "event_type": "bracket.state_changed",
-                            "payload": {
-                                "bracket_intent_id": bracket_intent_id,
-                                "status": "arming_exits",
-                            },
-                        }
+                    event_row = worker_timeline_store.append_event(
+                        db=db,
+                        strategy_run_id=strategy_run_id,
+                        account_id=account_id,
+                        basket_execution_id=None,
+                        event_kind="execution",
+                        event_source="bracket_runtime",
+                        event_type="bracket.state_changed",
+                        related_resource_type="bracket_intent",
+                        related_resource_id=bracket_intent_id,
+                        summary=None,
+                        payload={
+                            "bracket_intent_id": bracket_intent_id,
+                            "status": "arming_exits",
+                        },
                     )
+                    emitted.append(event_row)
             elif status in {"CANCELLED", "REJECTED", "LAPSED"} and 0 < filled_quantity < quantity_requested:
                 self.update_bracket_status(
                     db,

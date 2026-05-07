@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
+from broker_api.worker_timeline import worker_timeline_store
 
 
 TERMINAL_LEG_STATES = {"submit_failed", "filled", "cancelled", "rejected", "partial_terminal"}
@@ -393,24 +394,17 @@ class BasketExecutionStore:
 
         emitted: List[Dict[str, Any]] = []
         if basket_execution_id is None or basket_leg_index is None:
-            cursor = self.append_worker_execution_event(
+            event_row = self.append_worker_execution_event(
                 db,
                 strategy_run_id=strategy_run_id,
                 account_id=account_id,
                 basket_execution_id=None,
                 event_type="order.updated",
+                related_resource_type="broker_order",
+                related_resource_id=order_id,
                 payload=payload,
             )
-            emitted.append(
-                {
-                    "cursor": cursor,
-                    "strategy_run_id": strategy_run_id,
-                    "account_id": account_id,
-                    "basket_execution_id": None,
-                    "event_type": "order.updated",
-                    "payload": payload,
-                }
-            )
+            emitted.append(event_row)
             return emitted
 
         leg_row = db.execute(
@@ -468,7 +462,7 @@ class BasketExecutionStore:
                 "basket_leg_index": int(basket_leg_index),
                 "leg_status": leg_status,
             }
-            leg_cursor = self.append_worker_execution_event(
+            leg_event_row = self.append_worker_execution_event(
                 db,
                 strategy_run_id=strategy_run_id,
                 account_id=account_id,
@@ -476,16 +470,7 @@ class BasketExecutionStore:
                 event_type="basket.leg_updated",
                 payload=leg_event,
             )
-            emitted.append(
-                {
-                    "cursor": leg_cursor,
-                    "strategy_run_id": strategy_run_id,
-                    "account_id": account_id,
-                    "basket_execution_id": str(basket_execution_id),
-                    "event_type": "basket.leg_updated",
-                    "payload": leg_event,
-                }
-            )
+            emitted.append(leg_event_row)
 
             if status_after != status_before:
                 status_event = {
@@ -497,7 +482,7 @@ class BasketExecutionStore:
                     "total_requested_quantity": summary.get("total_requested_quantity"),
                     "total_filled_quantity": summary.get("total_filled_quantity"),
                 }
-                status_cursor = self.append_worker_execution_event(
+                status_event_row = self.append_worker_execution_event(
                     db,
                     strategy_run_id=strategy_run_id,
                     account_id=account_id,
@@ -505,16 +490,7 @@ class BasketExecutionStore:
                     event_type="basket.status_changed",
                     payload=status_event,
                 )
-                emitted.append(
-                    {
-                        "cursor": status_cursor,
-                        "strategy_run_id": strategy_run_id,
-                        "account_id": account_id,
-                        "basket_execution_id": str(basket_execution_id),
-                        "event_type": "basket.status_changed",
-                        "payload": status_event,
-                    }
-                )
+                emitted.append(status_event_row)
 
             if emitted:
                 latest_cursor = int(emitted[-1].get("cursor") or 0)
@@ -544,36 +520,27 @@ class BasketExecutionStore:
         account_id: str,
         basket_execution_id: Optional[str],
         event_type: str,
+        related_resource_type: Optional[str] = None,
+        related_resource_id: Optional[str] = None,
         payload: Dict[str, Any],
-    ) -> int:
-        row = db.execute(
-            text(
-                """
-                INSERT INTO public.worker_execution_events (
-                    strategy_run_id,
-                    account_id,
-                    basket_execution_id,
-                    event_type,
-                    payload_json
-                ) VALUES (
-                    :strategy_run_id,
-                    :account_id,
-                    :basket_execution_id,
-                    :event_type,
-                    CAST(:payload_json AS JSONB)
-                )
-                RETURNING cursor
-                """
-            ),
-            {
-                "strategy_run_id": strategy_run_id,
-                "account_id": account_id,
-                "basket_execution_id": basket_execution_id,
-                "event_type": event_type,
-                "payload_json": _json_dumps(payload),
-            },
-        ).fetchone()
-        return _to_int(_row_mapping(row).get("cursor"), 0)
+    ) -> Dict[str, Any]:
+        if related_resource_type is None and basket_execution_id:
+            related_resource_type = "basket_execution"
+        if related_resource_id is None and basket_execution_id:
+            related_resource_id = str(basket_execution_id)
+        return worker_timeline_store.append_event(
+            db=db,
+            strategy_run_id=strategy_run_id,
+            account_id=account_id,
+            basket_execution_id=basket_execution_id,
+            event_kind="execution",
+            event_source="basket_runtime",
+            event_type=event_type,
+            related_resource_type=related_resource_type,
+            related_resource_id=related_resource_id,
+            summary=None,
+            payload=payload,
+        )
 
     def list_baskets_for_run(self, db: Session, *, strategy_run_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         rows = db.execute(
@@ -616,42 +583,15 @@ class BasketExecutionStore:
         basket_execution_id: Optional[str] = None,
         event_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        rows = db.execute(
-            text(
-                """
-                SELECT cursor, strategy_run_id, account_id, basket_execution_id, event_type, payload_json, created_at
-                FROM public.worker_execution_events
-                WHERE strategy_run_id = :strategy_run_id
-                  AND cursor > :after_cursor
-                  AND (:basket_execution_id IS NULL OR basket_execution_id = :basket_execution_id)
-                  AND (:event_type IS NULL OR event_type = :event_type)
-                ORDER BY cursor ASC
-                LIMIT :limit
-                """
-            ),
-            {
-                "strategy_run_id": strategy_run_id,
-                "after_cursor": max(0, _to_int(after_cursor)),
-                "basket_execution_id": basket_execution_id,
-                "event_type": event_type,
-                "limit": max(1, min(int(limit), 1000)),
-            },
-        ).fetchall()
-        events: List[Dict[str, Any]] = []
-        for row in rows:
-            payload = _row_mapping(row)
-            events.append(
-                {
-                    "cursor": _to_int(payload.get("cursor")),
-                    "strategy_run_id": payload.get("strategy_run_id"),
-                    "account_id": payload.get("account_id"),
-                    "basket_execution_id": payload.get("basket_execution_id"),
-                    "event_type": payload.get("event_type"),
-                    "payload": _json_loads(payload.get("payload_json"), {}),
-                    "created_at": payload.get("created_at"),
-                }
-            )
-        return events
+        return worker_timeline_store.list_events(
+            db=db,
+            strategy_run_id=strategy_run_id,
+            after_cursor=after_cursor,
+            limit=limit,
+            event_kind="execution",
+            event_type=event_type,
+            basket_execution_id=basket_execution_id,
+        )
 
     def has_active_basket_execution(self, strategy_run_id: str) -> bool:
         db = self.session_factory()

@@ -198,6 +198,10 @@ class DurableOptionRunStore:
         finally:
             session.close()
 
+    def get_run_in_session(self, session: Any, strategy_run_id: str) -> OptionRunState:
+        self._require_id(strategy_run_id)
+        return self._get_run_in_session(session, strategy_run_id)
+
     def _get_run_in_session(self, session: Any, strategy_run_id: str, *, for_update: bool = False) -> OptionRunState:
         lock_clause = "FOR UPDATE" if for_update else ""
         row = (

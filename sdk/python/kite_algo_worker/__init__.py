@@ -37,6 +37,8 @@ from .models import (
     WorkerRunPnlLeg,
     WorkerRunPnlSnapshot,
     WorkerRunPnlTotals,
+    WorkerTimelineEvent,
+    WorkerTimelineResponse,
     WorkerTradeSnapshot,
     WorkerTradesResponse,
 )
@@ -162,6 +164,8 @@ __all__ = [
     "WorkerRunPnlLeg",
     "WorkerRunPnlSnapshot",
     "WorkerRunPnlTotals",
+    "WorkerTimelineEvent",
+    "WorkerTimelineResponse",
     "WorkerTradeSnapshot",
     "WorkerRunPnlWebSocketClient",
     "WorkerTickWebSocketClient",

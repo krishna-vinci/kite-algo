@@ -105,6 +105,15 @@ class ManagedRun:
             session_nonce=self.session_nonce,
         )
 
+    def log_decision_event(self, **payload: Any) -> JsonDict:
+        return self.client.log_decision_event(self.run_id, **payload)
+
+    def list_timeline(self, **params: Any) -> JsonDict:
+        return self.client.list_timeline(self.run_id, **params)
+
+    def stream_timeline(self, **params: Any):
+        return self.client.stream_timeline(self.run_id, **params)
+
     def exit_run(
         self,
         *,

@@ -17,6 +17,7 @@ from .models import (
     WorkerOrderSnapshot,
     WorkerOrdersResponse,
     WorkerRunPnlSnapshot,
+    WorkerTimelineResponse,
     WorkerTradesResponse,
 )
 from .options.client import OptionWorkerClient
@@ -266,6 +267,18 @@ class KiteAlgoWorkerClient:
             f"/worker/runs/{strategy_run_id}/pnl/stream",
             params={"interval_seconds": interval_seconds},
         )
+
+    def log_decision_event(self, strategy_run_id: str, **payload: Any) -> JsonDict:
+        return self._request("POST", f"/worker/runs/{strategy_run_id}/decision-events", json=dict(payload))
+
+    def list_timeline(self, strategy_run_id: str, **params: Any) -> JsonDict:
+        return self._request("GET", f"/worker/runs/{strategy_run_id}/timeline", params=dict(params or {}))
+
+    def list_timeline_snapshot(self, strategy_run_id: str, **params: Any) -> WorkerTimelineResponse:
+        return WorkerTimelineResponse.model_validate(self.list_timeline(strategy_run_id, **params))
+
+    def stream_timeline(self, strategy_run_id: str, **params: Any) -> Iterator[JsonDict]:
+        return self._stream_sse("GET", f"/worker/runs/{strategy_run_id}/timeline/stream", params=dict(params or {}))
 
     def resolve_ticker(self, symbol: str) -> JsonDict:
         return self._request("GET", "/worker/market/instruments/resolve", params={"symbol": symbol})

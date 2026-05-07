@@ -81,6 +81,26 @@ def _sqlite_store() -> tuple[BracketRuntimeStore, sessionmaker]:
                 """
             )
         )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.worker_execution_events (
+                    cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_run_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    basket_execution_id TEXT,
+                    event_kind TEXT NOT NULL DEFAULT 'execution',
+                    event_source TEXT NOT NULL DEFAULT 'legacy_execution',
+                    event_type TEXT NOT NULL,
+                    related_resource_type TEXT,
+                    related_resource_id TEXT,
+                    summary TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
     factory = sessionmaker(bind=engine)
     return BracketRuntimeStore(session_factory=factory), factory
 
@@ -167,3 +187,6 @@ def test_canonical_entry_full_fill_enqueues_place_stoploss_and_target():
     assert intent["status"] == "arming_exits"
     assert {a["action_type"] for a in actions} == {"place_stoploss", "place_target"}
     assert events[0]["event_type"] == "bracket.state_changed"
+    assert events[0]["event_kind"] == "execution"
+    assert events[0]["event_source"] == "bracket_runtime"
+    assert events[0]["related_resource_type"] == "bracket_intent"

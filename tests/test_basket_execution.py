@@ -31,7 +31,22 @@ class _FakeStoreDB:
         params = params or {}
         if "INSERT INTO public.worker_execution_events" in sql:
             self.cursor += 1
-            return _FakeResult(one=SimpleNamespace(cursor=self.cursor))
+            return _FakeResult(
+                one=SimpleNamespace(
+                    cursor=self.cursor,
+                    strategy_run_id=params.get("strategy_run_id"),
+                    account_id=params.get("account_id"),
+                    basket_execution_id=params.get("basket_execution_id"),
+                    event_kind=params.get("event_kind"),
+                    event_source=params.get("event_source"),
+                    event_type=params.get("event_type"),
+                    related_resource_type=params.get("related_resource_type"),
+                    related_resource_id=params.get("related_resource_id"),
+                    summary=params.get("summary"),
+                    payload_json=params.get("payload_json"),
+                    created_at=None,
+                )
+            )
         return _FakeResult()
 
 
@@ -74,8 +89,26 @@ class BasketExecutionTests(unittest.TestCase):
             event_type="basket.status_changed",
             payload={"status": "completed"},
         )
-        self.assertGreater(first, 0)
-        self.assertGreater(second, first)
+        self.assertGreater(first["cursor"], 0)
+        self.assertGreater(second["cursor"], first["cursor"])
+        self.assertEqual(first["event_kind"], "execution")
+        self.assertEqual(first["event_source"], "basket_runtime")
+
+    def test_non_basket_order_event_uses_broker_order_related_ref(self):
+        store = BasketExecutionStore()
+        db = _FakeStoreDB()
+        row = store.append_worker_execution_event(
+            db,  # type: ignore[arg-type]
+            strategy_run_id="run-2",
+            account_id="kite:acct",
+            basket_execution_id=None,
+            event_type="order.updated",
+            related_resource_type="broker_order",
+            related_resource_id="OID-2",
+            payload={"order_id": "OID-2", "status": "COMPLETE"},
+        )
+        self.assertEqual(row["related_resource_type"], "broker_order")
+        self.assertEqual(row["related_resource_id"], "OID-2")
 
 
 if __name__ == "__main__":

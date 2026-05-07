@@ -484,6 +484,53 @@ class SafetyCheckResult(ModelMixin):
         object.__setattr__(self, "evaluated_at", str(self.evaluated_at))
 
 
+@dataclass(frozen=True)
+class WorkerTimelineEvent(ModelMixin):
+    cursor: int
+    strategy_run_id: str
+    account_id: str
+    basket_execution_id: Optional[str] = None
+    event_kind: str = "execution"
+    event_source: str = "legacy_execution"
+    event_type: str = ""
+    related_resource_type: Optional[str] = None
+    related_resource_id: Optional[str] = None
+    summary: Optional[str] = None
+    payload: Dict[str, Any] = field(default_factory=dict)
+    created_at: Any = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cursor", _coerce_int(self.cursor))
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "account_id", str(self.account_id))
+        object.__setattr__(self, "basket_execution_id", None if self.basket_execution_id is None else str(self.basket_execution_id))
+        object.__setattr__(self, "event_kind", str(self.event_kind))
+        object.__setattr__(self, "event_source", str(self.event_source))
+        object.__setattr__(self, "event_type", str(self.event_type))
+        object.__setattr__(self, "related_resource_type", None if self.related_resource_type is None else str(self.related_resource_type))
+        object.__setattr__(self, "related_resource_id", None if self.related_resource_id is None else str(self.related_resource_id))
+        object.__setattr__(self, "summary", None if self.summary is None else str(self.summary))
+        object.__setattr__(self, "payload", dict(self.payload or {}))
+
+
+@dataclass(frozen=True)
+class WorkerTimelineResponse(ModelMixin):
+    strategy_run_id: str
+    after_cursor: int
+    last_cursor: int
+    events: List[WorkerTimelineEvent] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "after_cursor", _coerce_int(self.after_cursor))
+        object.__setattr__(self, "last_cursor", _coerce_int(self.last_cursor))
+        normalized_events = [
+            event if isinstance(event, WorkerTimelineEvent) else WorkerTimelineEvent.model_validate(event)
+            for event in list(self.events or [])
+        ]
+        object.__setattr__(self, "events", normalized_events)
+
+
 __all__ = [
     "CostContract",
     "WorkerCandle",
@@ -499,6 +546,8 @@ __all__ = [
     "WorkerRunPnlTotals",
     "RunProtectionState",
     "SafetyCheckResult",
+    "WorkerTimelineEvent",
+    "WorkerTimelineResponse",
     "WorkerOrderResult",
     "WorkerOrdersResponse",
     "WorkerTradesResponse",

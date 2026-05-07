@@ -9,7 +9,7 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
@@ -38,7 +38,8 @@ from database import SessionLocal
 from journaling.service import JournalService
 from broker_api.basket_execution import basket_execution_store
 from broker_api.bracket_runtime import bracket_runtime_store
-from broker_api.redis_events import get_redis
+from broker_api.redis_events import get_redis, publish_event
+from broker_api.worker_timeline import worker_timeline_store
 
 
 router = APIRouter(prefix="/algo-workers", tags=["Algo Workers"])
@@ -47,6 +48,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_WORKER_ACTIONS = {
     "runs:create",
     "runs:read",
+    "runs:log",
     "intents:submit",
     "risk:update",
     "runs:exit",
@@ -67,6 +69,17 @@ VALID_WORKER_STRATEGY_FAMILIES = {
 }
 WORKER_SESSION_FRESHNESS_SECONDS = int(os.getenv("WORKER_SESSION_FRESHNESS_SECONDS", "60"))
 WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS = int(os.getenv("WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS", "120"))
+
+
+def _query_int_param(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        default_value = getattr(value, "default", default)
+        try:
+            return int(default_value)
+        except Exception:
+            return int(default)
 WORKER_RUN_STALE_ACTION_SECONDS = int(os.getenv("WORKER_RUN_STALE_ACTION_SECONDS", "180"))
 
 
@@ -272,6 +285,48 @@ class WorkerBracketCreateRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class WorkerDecisionEventRequest(BaseModel):
+    decision_type: Literal[
+        "signal",
+        "entry",
+        "exit",
+        "risk_update",
+        "management",
+        "protection_ack",
+        "note",
+    ]
+    action: Literal[
+        "enter",
+        "exit",
+        "hold",
+        "skip",
+        "modify",
+        "cancel",
+        "update_protection",
+        "arm_bracket",
+        "rebalance",
+        "observe",
+    ]
+    summary: str = Field(min_length=1, max_length=500)
+    related_resource_type: Optional[Literal["basket_execution", "bracket_intent", "worker_live_execution_link"]] = None
+    related_resource_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    basket_execution_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("related_resource_id", "basket_execution_id")
+    @classmethod
+    def _trim_optional_ids(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    @field_validator("summary")
+    @classmethod
+    def _trim_summary(cls, value: str) -> str:
+        return str(value).strip()
+
+
 class WorkerRunPnlTotals(BaseModel):
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
@@ -406,6 +461,28 @@ class SqlAlchemyAlgoWorkerRepository:
             expected_exit_claim_id,
         )
 
+    async def update_run_backend_protection_with_events(
+        self,
+        strategy_run_id: str,
+        protection: Dict[str, Any],
+        protection_state: Dict[str, Any],
+        *,
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+        timeline_events: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._update_run_backend_protection_with_events_sync,
+            strategy_run_id,
+            protection,
+            protection_state,
+            expected_generation,
+            expected_triggered_rule,
+            expected_exit_claim_id,
+            timeline_events,
+        )
+
     async def update_run_backend_protection_state(
         self,
         strategy_run_id: str,
@@ -422,6 +499,26 @@ class SqlAlchemyAlgoWorkerRepository:
             expected_generation,
             expected_triggered_rule,
             expected_exit_claim_id,
+        )
+
+    async def update_run_backend_protection_state_with_events(
+        self,
+        strategy_run_id: str,
+        protection_state: Dict[str, Any],
+        *,
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+        timeline_events: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._update_run_backend_protection_state_with_events_sync,
+            strategy_run_id,
+            protection_state,
+            expected_generation,
+            expected_triggered_rule,
+            expected_exit_claim_id,
+            timeline_events,
         )
 
     async def update_run_status(self, strategy_run_id: str, status: str, *, state_patch: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -1017,6 +1114,139 @@ class SqlAlchemyAlgoWorkerRepository:
             raise
         finally:
             db.close()
+
+    def _persist_backend_protection_change_sync(
+        self,
+        *,
+        strategy_run_id: str,
+        protection: Optional[Dict[str, Any]],
+        protection_state: Dict[str, Any],
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+        timeline_events: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    SELECT *
+                    FROM public.algo_worker_runs
+                    WHERE strategy_run_id = :strategy_run_id
+                    FOR UPDATE
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id},
+            ).fetchone()
+            if row is None:
+                db.rollback()
+                return None
+
+            run_payload = self._run_view(row)
+            runtime_state = dict(run_payload.get("runtime_state") or {})
+            current_state = dict(runtime_state.get("backend_protection_state") or {})
+
+            if expected_generation is not None and _to_int(current_state.get("generation"), default=0) != _to_int(expected_generation, default=0):
+                db.rollback()
+                return None
+            if expected_triggered_rule is not None and str(current_state.get("triggered_rule") or "") != str(expected_triggered_rule):
+                db.rollback()
+                return None
+            if expected_exit_claim_id is not None and str(current_state.get("exit_claim_id") or "") != str(expected_exit_claim_id):
+                db.rollback()
+                return None
+
+            if protection is not None:
+                runtime_state["backend_protection"] = dict(protection)
+            runtime_state["backend_protection_state"] = dict(protection_state)
+
+            updated = db.execute(
+                text(
+                    """
+                    UPDATE public.algo_worker_runs
+                    SET runtime_state_json = CAST(:runtime_state_json AS JSONB),
+                        updated_at = NOW()
+                    WHERE strategy_run_id = :strategy_run_id
+                    RETURNING *
+                    """
+                ),
+                {
+                    "strategy_run_id": strategy_run_id,
+                    "runtime_state_json": _json_dumps(runtime_state),
+                },
+            ).fetchone()
+            if updated is None:
+                db.rollback()
+                return None
+
+            committed_events: List[Dict[str, Any]] = []
+            for timeline_event in list(timeline_events or []):
+                payload = dict(timeline_event)
+                committed = worker_timeline_store.append_event(
+                    db=db,
+                    strategy_run_id=strategy_run_id,
+                    account_id=str(run_payload.get("account_scope") or ""),
+                    basket_execution_id=payload.get("basket_execution_id"),
+                    event_kind=str(payload.get("event_kind") or "protection"),
+                    event_source=str(payload.get("event_source") or "backend_protection"),
+                    event_type=str(payload.get("event_type") or "protection.state_changed"),
+                    related_resource_type=payload.get("related_resource_type"),
+                    related_resource_id=payload.get("related_resource_id"),
+                    summary=payload.get("summary"),
+                    payload=dict(payload.get("payload") or {}),
+                )
+                committed_events.append(committed)
+
+            db.commit()
+            return {
+                "run": self._run_view(updated),
+                "timeline_events": committed_events,
+            }
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _update_run_backend_protection_with_events_sync(
+        self,
+        strategy_run_id: str,
+        protection: Dict[str, Any],
+        protection_state: Dict[str, Any],
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+        timeline_events: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return self._persist_backend_protection_change_sync(
+            strategy_run_id=strategy_run_id,
+            protection=protection,
+            protection_state=protection_state,
+            expected_generation=expected_generation,
+            expected_triggered_rule=expected_triggered_rule,
+            expected_exit_claim_id=expected_exit_claim_id,
+            timeline_events=timeline_events,
+        )
+
+    def _update_run_backend_protection_state_with_events_sync(
+        self,
+        strategy_run_id: str,
+        protection_state: Dict[str, Any],
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+        timeline_events: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return self._persist_backend_protection_change_sync(
+            strategy_run_id=strategy_run_id,
+            protection=None,
+            protection_state=protection_state,
+            expected_generation=expected_generation,
+            expected_triggered_rule=expected_triggered_rule,
+            expected_exit_claim_id=expected_exit_claim_id,
+            timeline_events=timeline_events,
+        )
 
     def _update_run_backend_protection_sync(
         self,
@@ -1884,6 +2114,121 @@ def _journal_service(request: Any) -> JournalService:
     return service
 
 
+def _load_worker_timeline_events(
+    *,
+    strategy_run_id: str,
+    after_cursor: int,
+    limit: int,
+    event_kind: Optional[str] = None,
+    event_source: Optional[str] = None,
+    event_type: Optional[str] = None,
+    related_resource_type: Optional[str] = None,
+    related_resource_id: Optional[str] = None,
+    basket_execution_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    db = SessionLocal()
+    try:
+        return worker_timeline_store.list_events(
+            db=db,
+            strategy_run_id=strategy_run_id,
+            after_cursor=after_cursor,
+            limit=limit,
+            event_kind=event_kind,
+            event_source=event_source,
+            event_type=event_type,
+            related_resource_type=related_resource_type,
+            related_resource_id=related_resource_id,
+            basket_execution_id=basket_execution_id,
+        )
+    finally:
+        db.close()
+
+
+def _normalize_execution_event_compat_payload(event: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "cursor": _to_int(event.get("cursor")),
+        "strategy_run_id": event.get("strategy_run_id"),
+        "account_id": event.get("account_id"),
+        "basket_execution_id": event.get("basket_execution_id"),
+        "event_type": event.get("event_type"),
+        "payload": dict(event.get("payload") or {}),
+        "created_at": event.get("created_at"),
+    }
+
+
+def _validate_decision_related_ref(
+    *,
+    db: Session,
+    strategy_run_id: str,
+    account_id: str,
+    related_resource_type: str,
+    related_resource_id: str,
+) -> None:
+    if related_resource_type == "basket_execution":
+        row = db.execute(
+            text(
+                """
+                SELECT 1
+                FROM public.basket_executions
+                WHERE strategy_run_id = :strategy_run_id
+                  AND basket_execution_id = :resource_id
+                LIMIT 1
+                """
+            ),
+            {"strategy_run_id": strategy_run_id, "resource_id": related_resource_id},
+        ).fetchone()
+        if row:
+            return
+    elif related_resource_type == "bracket_intent":
+        row = db.execute(
+            text(
+                """
+                SELECT 1
+                FROM public.bracket_intents
+                WHERE strategy_run_id = :strategy_run_id
+                  AND bracket_intent_id = :resource_id
+                LIMIT 1
+                """
+            ),
+            {"strategy_run_id": strategy_run_id, "resource_id": related_resource_id},
+        ).fetchone()
+        if row:
+            return
+    elif related_resource_type == "worker_live_execution_link":
+        row = db.execute(
+            text(
+                """
+                SELECT 1
+                FROM public.worker_live_execution_links
+                WHERE strategy_run_id = :strategy_run_id
+                  AND account_id = :account_id
+                  AND (
+                    broker_order_id = :resource_id
+                    OR COALESCE(trade_id, '') = :resource_id
+                    OR COALESCE(client_order_ref, '') = :resource_id
+                  )
+                LIMIT 1
+                """
+            ),
+            {
+                "strategy_run_id": strategy_run_id,
+                "account_id": account_id,
+                "resource_id": related_resource_id,
+            },
+        ).fetchone()
+        if row:
+            return
+
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "rejection_reason": "UNKNOWN_RELATED_REF",
+            "related_resource_type": related_resource_type,
+            "related_resource_id": related_resource_id,
+        },
+    )
+
+
 def _parse_csv_values(value: Optional[str]) -> List[str]:
     if not value:
         return []
@@ -2180,6 +2525,36 @@ def _preserve_backend_trailing_state(next_state: Dict[str, Any], previous_state:
     if isinstance(previous_positions, dict):
         preserved["position_states"] = dict(previous_positions)
     return preserved
+
+
+def _protection_reset_timeline_event(
+    *,
+    strategy_run_id: str,
+    previous_state: Dict[str, Any],
+    next_state: Dict[str, Any],
+    reason: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    previous_status = str(previous_state.get("status") or "")
+    if previous_status not in {"triggered", "error"}:
+        return None
+    if str(next_state.get("status") or "") != "active":
+        return None
+    return {
+        "event_kind": "protection",
+        "event_source": "backend_protection",
+        "event_type": "protection.reset",
+        "related_resource_type": "strategy_run",
+        "related_resource_id": strategy_run_id,
+        "summary": "Backend protection reset to active generation",
+        "payload": {
+            "emission_mode": "mutation_driven",
+            "previous_status": previous_status,
+            "status": str(next_state.get("status") or "active"),
+            "previous_generation": _to_int(previous_state.get("generation"), default=0),
+            "generation": _to_int(next_state.get("generation"), default=0),
+            "reason": reason,
+        },
+    }
 
 
 def _load_live_kite_for_account(account_scope: str):
@@ -3271,59 +3646,18 @@ async def _option_run_status_for_worker(request: Request, strategy_run_id: str) 
         return _OPTION_PROTECTION_STATE_UNAVAILABLE
 
 
-async def _option_run_protection_snapshot_for_worker(request: Request, strategy_run_id: str) -> dict[str, Any]:
-    try:
-        from options.execution.store import get_option_run_store
-        from options.protection.runtime import evaluate_option_protection_state
-
-        store = get_option_run_store()
-        run = await asyncio.to_thread(store.get_run, strategy_run_id)
-        run_status = str(run.status or "")
-        verdict = await asyncio.to_thread(evaluate_option_protection_state, run=run)
-        triggered = bool(verdict.get("triggered"))
-        status_blocks = bool(run_status and option_run_status_blocks_trading(run_status))
-        if triggered:
-            blocking_reason = "OPTIONS_PROTECTION_TRIGGERED"
-        elif status_blocks:
-            blocking_reason = "OPTIONS_RUN_NOT_ACTIVE"
-        else:
-            blocking_reason = None
-        recommended_exit_orders = list(verdict.get("recommended_exit_orders") or [])
-        return {
-            "applicable": True,
-            "run_status": run_status,
-            "evaluation_mode": "run_state",
-            "triggered": triggered,
-            "blocking": bool(triggered or status_blocks),
-            "blocking_reason": blocking_reason,
-            "matched_rule": verdict.get("matched_rule"),
-            "metrics": dict(verdict.get("metrics") or {}),
-            "recommended_exit_orders_count": len(recommended_exit_orders),
-        }
-    except KeyError:
-        return {
-            "applicable": False,
-            "run_status": None,
-            "evaluation_mode": "run_state",
-            "triggered": False,
-            "blocking": False,
-            "blocking_reason": None,
-            "matched_rule": None,
-            "metrics": {},
-            "recommended_exit_orders_count": 0,
-        }
-    except Exception:
-        return {
-            "applicable": True,
-            "run_status": None,
-            "evaluation_mode": "run_state",
-            "triggered": False,
-            "blocking": True,
-            "blocking_reason": "OPTIONS_PROTECTION_STATE_UNAVAILABLE",
-            "matched_rule": None,
-            "metrics": {},
-            "recommended_exit_orders_count": 0,
-        }
+async def _option_run_protection_snapshot_for_worker(
+    request: Request,
+    strategy_run_id: str,
+    *,
+    worker_run: Optional[Dict[str, Any]] = None,
+) -> dict[str, Any]:
+    snapshot, _events = await observe_worker_option_protection_timeline_state(
+        request,
+        strategy_run_id,
+        worker_run=worker_run,
+    )
+    return snapshot
 
 
 def _worker_safety_secret(request: Request) -> str:
@@ -3355,6 +3689,191 @@ def _safety_blocking_reasons(
     elif option_status and option_run_status_blocks_trading(option_status):
         blocking_reasons.append("OPTIONS_RUN_NOT_ACTIVE")
     return blocking_reasons
+
+
+def _compute_option_observation_fingerprint(snapshot: Dict[str, Any]) -> str:
+    canonical = {
+        "applicable": bool(snapshot.get("applicable")),
+        "run_status": snapshot.get("run_status"),
+        "triggered": bool(snapshot.get("triggered")),
+        "blocking": bool(snapshot.get("blocking")),
+        "blocking_reason": snapshot.get("blocking_reason"),
+        "matched_rule": dict(snapshot.get("matched_rule") or {}) if isinstance(snapshot.get("matched_rule"), dict) else snapshot.get("matched_rule"),
+        "metrics": dict(snapshot.get("metrics") or {}),
+        "recommended_exit_orders_count": _to_int(snapshot.get("recommended_exit_orders_count"), default=0),
+    }
+    return hashlib.sha1(json.dumps(canonical, sort_keys=True, default=_json_default, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _build_option_observation_snapshot(run: Any) -> Dict[str, Any]:
+    from options.protection.runtime import evaluate_option_protection_state
+
+    run_status = str(getattr(run, "status", "") or "")
+    verdict = evaluate_option_protection_state(run=run)
+    triggered = bool(verdict.get("triggered"))
+    status_blocks = bool(run_status and option_run_status_blocks_trading(run_status))
+    if triggered:
+        blocking_reason = "OPTIONS_PROTECTION_TRIGGERED"
+    elif status_blocks:
+        blocking_reason = "OPTIONS_RUN_NOT_ACTIVE"
+    else:
+        blocking_reason = None
+    recommended_exit_orders = list(verdict.get("recommended_exit_orders") or [])
+    return {
+        "applicable": True,
+        "run_status": run_status,
+        "evaluation_mode": "run_state",
+        "triggered": triggered,
+        "blocking": bool(triggered or status_blocks),
+        "blocking_reason": blocking_reason,
+        "matched_rule": verdict.get("matched_rule"),
+        "metrics": dict(verdict.get("metrics") or {}),
+        "recommended_exit_orders_count": len(recommended_exit_orders),
+    }
+
+
+def _observe_worker_option_protection_timeline_state_sync(
+    *,
+    strategy_run_id: str,
+    worker_run: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    from options.execution.store import get_option_run_store
+
+    store = get_option_run_store()
+    session_factory = getattr(store, "_session_factory", SessionLocal)
+
+    session = session_factory()
+    try:
+        option_run = store.get_run_in_session(session, strategy_run_id)
+    except KeyError:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        session.close()
+        return (
+            {
+                "applicable": False,
+                "run_status": None,
+                "evaluation_mode": "run_state",
+                "triggered": False,
+                "blocking": False,
+                "blocking_reason": None,
+                "matched_rule": None,
+                "metrics": {},
+                "recommended_exit_orders_count": 0,
+            },
+            [],
+        )
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        session.close()
+        unavailable = {
+            "applicable": True,
+            "run_status": None,
+            "evaluation_mode": "run_state",
+            "triggered": False,
+            "blocking": True,
+            "blocking_reason": "OPTIONS_PROTECTION_STATE_UNAVAILABLE",
+            "matched_rule": None,
+            "metrics": {},
+            "recommended_exit_orders_count": 0,
+        }
+        return unavailable, []
+
+    try:
+        snapshot = _build_option_observation_snapshot(option_run)
+    except Exception:
+        snapshot = {
+            "applicable": True,
+            "run_status": None,
+            "evaluation_mode": "run_state",
+            "triggered": False,
+            "blocking": True,
+            "blocking_reason": "OPTIONS_PROTECTION_STATE_UNAVAILABLE",
+            "matched_rule": None,
+            "metrics": {},
+            "recommended_exit_orders_count": 0,
+        }
+
+    fingerprint = _compute_option_observation_fingerprint(snapshot)
+
+    timeline_events: List[Dict[str, Any]] = []
+    try:
+        account_id = str((worker_run or {}).get("account_scope") or "")
+        if worker_run is not None:
+            session.execute(
+                text(
+                    """
+                    SELECT strategy_run_id
+                    FROM public.algo_worker_runs
+                    WHERE strategy_run_id = :strategy_run_id
+                    FOR UPDATE
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id},
+            ).fetchone()
+
+        latest = worker_timeline_store.get_latest_event_for_source(
+            db=session,
+            strategy_run_id=strategy_run_id,
+            event_kind="protection",
+            event_source="options_protection",
+        )
+        latest_fingerprint = None
+        if latest:
+            latest_payload = dict(latest.get("payload") or {})
+            latest_fingerprint = str(latest_payload.get("observation_fingerprint") or "") or None
+        if latest_fingerprint != fingerprint and worker_run is not None:
+            event_type = "protection.triggered" if snapshot.get("triggered") else "protection.blocking_changed"
+            emitted = worker_timeline_store.append_event(
+                db=session,
+                strategy_run_id=strategy_run_id,
+                account_id=account_id,
+                basket_execution_id=None,
+                event_kind="protection",
+                event_source="options_protection",
+                event_type=event_type,
+                related_resource_type="strategy_run",
+                related_resource_id=strategy_run_id,
+                summary="Options protection observation state changed",
+                payload={
+                    "emission_mode": "observation_driven",
+                    "observation_fingerprint": fingerprint,
+                    "snapshot": snapshot,
+                },
+            )
+            timeline_events.append(emitted)
+
+        if timeline_events:
+            session.commit()
+        else:
+            session.rollback()
+    except Exception:
+        session.rollback()
+    finally:
+        session.close()
+
+    return snapshot, timeline_events
+
+
+async def observe_worker_option_protection_timeline_state(
+    request: Request,
+    strategy_run_id: str,
+    *,
+    worker_run: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    snapshot, timeline_events = await asyncio.to_thread(
+        _observe_worker_option_protection_timeline_state_sync,
+        strategy_run_id=strategy_run_id,
+        worker_run=worker_run,
+    )
+    for event in timeline_events:
+        await publish_event(f"worker.execution.events:{strategy_run_id}", event)
+    return snapshot, timeline_events
 
 
 async def validate_worker_run_safety_token(
@@ -3673,7 +4192,11 @@ async def get_worker_run_safety_check(request: Request, strategy_run_id: str):
 
     runtime_state = dict(run.get("runtime_state") or {})
     generic = dict(runtime_state.get("backend_protection_state") or {})
-    option_snapshot = await _option_run_protection_snapshot_for_worker(request, strategy_run_id)
+    option_snapshot = await _option_run_protection_snapshot_for_worker(
+        request,
+        strategy_run_id,
+        worker_run=run,
+    )
     option_status = (
         _OPTION_PROTECTION_STATE_UNAVAILABLE
         if option_snapshot.get("blocking_reason") == "OPTIONS_PROTECTION_STATE_UNAVAILABLE"
@@ -3951,6 +4474,9 @@ async def patch_worker_run_protection(request: Request, strategy_run_id: str, pa
         raise HTTPException(status_code=409, detail="Backend protection cannot be reset after a terminal protection exit")
     if previous_state.get("exit_claim_id"):
         raise HTTPException(status_code=409, detail="Backend protection exit is already in progress")
+    previous_status = str(previous_state.get("status") or "")
+    if previous_status not in {"", "active", "disabled", "triggered", "error"}:
+        raise HTTPException(status_code=409, detail="Backend protection cannot be reset from current status")
 
     try:
         protection = _normalized_backend_protection_runtime_state(
@@ -3970,7 +4496,29 @@ async def patch_worker_run_protection(request: Request, strategy_run_id: str, pa
     if not payload.reset_trailing:
         next_state = _preserve_backend_trailing_state(next_state, previous_state)
     next_state["reset_trailing"] = payload.reset_trailing
+    reset_event = _protection_reset_timeline_event(
+        strategy_run_id=strategy_run_id,
+        previous_state=previous_state,
+        next_state=next_state,
+        reason=payload.reason,
+    )
     previous_generation = _to_int(previous_state.get("generation"), default=0)
+    if hasattr(_repo(request), "update_run_backend_protection_with_events"):
+        result = await _repo(request).update_run_backend_protection_with_events(
+            strategy_run_id,
+            protection,
+            next_state,
+            expected_generation=previous_generation,
+            expected_triggered_rule=previous_state.get("triggered_rule") or "",
+            expected_exit_claim_id=previous_state.get("exit_claim_id") or "",
+            timeline_events=[reset_event] if reset_event else [],
+        )
+        if result is None:
+            raise HTTPException(status_code=409, detail="Backend protection changed concurrently; reload and retry")
+        for event in list(result.get("timeline_events") or []):
+            await publish_event(f"worker.execution.events:{strategy_run_id}", event)
+        return result.get("run")
+
     updated = await _repo(request).update_run_backend_protection(
         strategy_run_id,
         protection,
@@ -4519,25 +5067,23 @@ async def list_worker_execution_events(
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
 
-    def _load() -> List[Dict[str, Any]]:
-        db = SessionLocal()
-        try:
-            return basket_execution_store.list_worker_execution_events(
-                db,
-                strategy_run_id=strategy_run_id,
-                after_cursor=after_cursor,
-                limit=limit,
-                basket_execution_id=basket_execution_id,
-                event_type=event_type,
-            )
-        finally:
-            db.close()
+    after_cursor_value = _query_int_param(after_cursor, default=0)
+    limit_value = _query_int_param(limit, default=200)
 
-    events = await asyncio.to_thread(_load)
-    last_cursor = max([after_cursor] + [int(item.get("cursor") or 0) for item in events])
+    events = await asyncio.to_thread(
+        _load_worker_timeline_events,
+        strategy_run_id=strategy_run_id,
+        after_cursor=after_cursor_value,
+        limit=limit_value,
+        event_kind="execution",
+        event_type=event_type,
+        basket_execution_id=basket_execution_id,
+    )
+    events = [_normalize_execution_event_compat_payload(item) for item in events]
+    last_cursor = max([after_cursor_value] + [int(item.get("cursor") or 0) for item in events])
     return {
         "strategy_run_id": strategy_run_id,
-        "after_cursor": after_cursor,
+        "after_cursor": after_cursor_value,
         "last_cursor": last_cursor,
         "events": events,
     }
@@ -4559,29 +5105,157 @@ async def stream_worker_execution_events(
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
 
+    after_cursor_value = _query_int_param(after_cursor, default=0)
+    limit_value = _query_int_param(limit, default=500)
+
     channel = f"worker.execution.events:{strategy_run_id}"
 
     async def _event_stream() -> AsyncGenerator[str, None]:
         redis = get_redis()
         pubsub = redis.pubsub()
         await pubsub.subscribe(channel)
-        last_sent = max(0, int(after_cursor))
+        last_sent = max(0, after_cursor_value)
         try:
-            def _initial_load() -> List[Dict[str, Any]]:
-                db = SessionLocal()
-                try:
-                    return basket_execution_store.list_worker_execution_events(
-                        db,
-                        strategy_run_id=strategy_run_id,
-                        after_cursor=last_sent,
-                        limit=limit,
-                        basket_execution_id=basket_execution_id,
-                        event_type=event_type,
-                    )
-                finally:
-                    db.close()
+            rows = await asyncio.to_thread(
+                _load_worker_timeline_events,
+                strategy_run_id=strategy_run_id,
+                after_cursor=last_sent,
+                limit=limit_value,
+                event_kind="execution",
+                event_type=event_type,
+                basket_execution_id=basket_execution_id,
+            )
+            for row in rows:
+                cursor = int(row.get("cursor") or 0)
+                if cursor <= last_sent:
+                    continue
+                compat_row = _normalize_execution_event_compat_payload(row)
+                yield f"data: {json.dumps(compat_row, default=_json_default)}\n\n"
+                last_sent = cursor
 
-            rows = await asyncio.to_thread(_initial_load)
+            while True:
+                if await request.is_disconnected():
+                    break
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=15)
+                if not message or message.get("type") != "message":
+                    yield ": heartbeat\n\n"
+                    continue
+                data = message.get("data")
+                if isinstance(data, str):
+                    payload = json.loads(data)
+                elif isinstance(data, dict):
+                    payload = data
+                else:
+                    continue
+                live_event_kind = str(payload.get("event_kind") or "execution")
+                if live_event_kind != "execution":
+                    continue
+                cursor = int(payload.get("cursor") or 0)
+                if cursor <= last_sent:
+                    continue
+                if basket_execution_id and str(payload.get("basket_execution_id") or "") != str(basket_execution_id):
+                    continue
+                if event_type and str(payload.get("event_type") or "") != str(event_type):
+                    continue
+                compat_payload = _normalize_execution_event_compat_payload(payload)
+                yield f"data: {json.dumps(compat_payload, default=_json_default)}\n\n"
+                last_sent = cursor
+        finally:
+            try:
+                await pubsub.unsubscribe(channel)
+            finally:
+                await pubsub.aclose()
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+
+@router.get("/worker/runs/{strategy_run_id}/timeline")
+async def list_worker_timeline(
+    request: Request,
+    strategy_run_id: str,
+    after_cursor: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=1000),
+    event_kind: Optional[str] = None,
+    event_source: Optional[str] = None,
+    event_type: Optional[str] = None,
+    related_resource_type: Optional[str] = None,
+    related_resource_id: Optional[str] = None,
+    basket_execution_id: Optional[str] = None,
+):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+
+    after_cursor_value = _query_int_param(after_cursor, default=0)
+    limit_value = _query_int_param(limit, default=200)
+
+    events = await asyncio.to_thread(
+        _load_worker_timeline_events,
+        strategy_run_id=strategy_run_id,
+        after_cursor=after_cursor_value,
+        limit=limit_value,
+        event_kind=event_kind,
+        event_source=event_source,
+        event_type=event_type,
+        related_resource_type=related_resource_type,
+        related_resource_id=related_resource_id,
+        basket_execution_id=basket_execution_id,
+    )
+    last_cursor = max([after_cursor_value] + [int(item.get("cursor") or 0) for item in events])
+    return {
+        "strategy_run_id": strategy_run_id,
+        "after_cursor": after_cursor_value,
+        "last_cursor": last_cursor,
+        "events": events,
+    }
+
+
+@router.get("/worker/runs/{strategy_run_id}/timeline/stream")
+async def stream_worker_timeline(
+    request: Request,
+    strategy_run_id: str,
+    after_cursor: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=2000),
+    event_kind: Optional[str] = None,
+    event_source: Optional[str] = None,
+    event_type: Optional[str] = None,
+    related_resource_type: Optional[str] = None,
+    related_resource_id: Optional[str] = None,
+    basket_execution_id: Optional[str] = None,
+):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+
+    after_cursor_value = _query_int_param(after_cursor, default=0)
+    limit_value = _query_int_param(limit, default=500)
+
+    channel = f"worker.execution.events:{strategy_run_id}"
+
+    async def _event_stream() -> AsyncGenerator[str, None]:
+        redis = get_redis()
+        pubsub = redis.pubsub()
+        await pubsub.subscribe(channel)
+        last_sent = max(0, after_cursor_value)
+        try:
+            rows = await asyncio.to_thread(
+                _load_worker_timeline_events,
+                strategy_run_id=strategy_run_id,
+                after_cursor=last_sent,
+                limit=limit_value,
+                event_kind=event_kind,
+                event_source=event_source,
+                event_type=event_type,
+                related_resource_type=related_resource_type,
+                related_resource_id=related_resource_id,
+                basket_execution_id=basket_execution_id,
+            )
             for row in rows:
                 cursor = int(row.get("cursor") or 0)
                 if cursor <= last_sent:
@@ -4606,9 +5280,17 @@ async def stream_worker_execution_events(
                 cursor = int(payload.get("cursor") or 0)
                 if cursor <= last_sent:
                     continue
-                if basket_execution_id and str(payload.get("basket_execution_id") or "") != str(basket_execution_id):
+                if event_kind and str(payload.get("event_kind") or "") != str(event_kind):
+                    continue
+                if event_source and str(payload.get("event_source") or "") != str(event_source):
                     continue
                 if event_type and str(payload.get("event_type") or "") != str(event_type):
+                    continue
+                if related_resource_type and str(payload.get("related_resource_type") or "") != str(related_resource_type):
+                    continue
+                if related_resource_id and str(payload.get("related_resource_id") or "") != str(related_resource_id):
+                    continue
+                if basket_execution_id and str(payload.get("basket_execution_id") or "") != str(basket_execution_id):
                     continue
                 yield f"data: {json.dumps(payload, default=_json_default)}\n\n"
                 last_sent = cursor
@@ -4619,6 +5301,67 @@ async def stream_worker_execution_events(
                 await pubsub.aclose()
 
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+
+@router.post("/worker/runs/{strategy_run_id}/decision-events")
+async def create_worker_decision_event(
+    request: Request,
+    strategy_run_id: str,
+    payload: WorkerDecisionEventRequest,
+):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:log")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    await require_active_worker_run_session(request, run)
+
+    account_id = str(run.get("account_scope") or "")
+
+    def _persist() -> Dict[str, Any]:
+        db = SessionLocal()
+        try:
+            if payload.related_resource_type and payload.related_resource_id:
+                _validate_decision_related_ref(
+                    db=db,
+                    strategy_run_id=strategy_run_id,
+                    account_id=account_id,
+                    related_resource_type=str(payload.related_resource_type),
+                    related_resource_id=str(payload.related_resource_id),
+                )
+            event = worker_timeline_store.append_event(
+                db=db,
+                strategy_run_id=strategy_run_id,
+                account_id=account_id,
+                basket_execution_id=payload.basket_execution_id,
+                event_kind="decision",
+                event_source="worker",
+                event_type=f"decision.{payload.decision_type}",
+                related_resource_type=payload.related_resource_type,
+                related_resource_id=payload.related_resource_id,
+                summary=payload.summary,
+                payload={
+                    "decision_type": payload.decision_type,
+                    "action": payload.action,
+                    "summary": payload.summary,
+                    "metadata": dict(payload.metadata or {}),
+                    "related_resource_type": payload.related_resource_type,
+                    "related_resource_id": payload.related_resource_id,
+                    "basket_execution_id": payload.basket_execution_id,
+                },
+            )
+            db.commit()
+            return event
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    event = await asyncio.to_thread(_persist)
+    await publish_event(f"worker.execution.events:{strategy_run_id}", event)
+    return event
 
 
 @router.post("/worker/runs/{strategy_run_id}/exit")

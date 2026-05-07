@@ -25,6 +25,31 @@ Do not use this file for frontend work.
 
 ## Newly implemented in current branch
 
+- Implemented Spec 9 worker decision logging and protection observability:
+  - widened `worker_execution_events` into a canonical worker timeline surface (`event_kind`, `event_source`, related refs, summary) while preserving compatibility defaults for legacy execution rows
+  - added shared `WorkerTimelineStore` ownership for timeline inserts/reads and migrated execution writers/reads onto the store
+  - added worker decision logging endpoint + SDK helpers:
+    - `POST /api/algo-workers/worker/runs/{strategy_run_id}/decision-events`
+    - SDK sync/async/managed-run helpers for `log_decision_event`, `list_timeline`, and `stream_timeline`
+  - added mutation-driven generic backend protection timeline emission with post-commit publish:
+    - runtime emits `protection.triggered`, `protection.exit_submitted`, and `protection.blocking_changed` when state transitions qualify
+    - patch route emits `protection.reset` only when prior status was `triggered` or `error`
+  - options protection timeline visibility remains observation-driven in Spec 9:
+    - canonical observation fingerprint shared between worker safety-check and worker options protection-state endpoints
+    - deduped emission with lock held only for latest-event lookup + conditional insert
+    - payloads include `emission_mode='observation_driven'`
+  - preserved read-only safety semantics for generic protection:
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/safety-check` does not emit generic backend protection mutation events
+  - focused verification in this environment:
+    - `rtk pytest tests/test_schema_live_order_attribution.py -k "worker_execution_events" -v` → `1 passed`
+    - `rtk pytest tests/test_worker_timeline.py -v` → `3 passed`
+    - `rtk pytest tests/test_basket_execution.py -v` → `4 passed`
+    - `rtk pytest tests/test_bracket_runtime.py -v` → `3 passed`
+    - `rtk pytest tests/test_order_runtime.py -k "basket or bracket or execution_events" -v` → `5 passed`
+    - `rtk pytest tests/test_algo_worker_api.py -k "timeline or decision_event or protection or execution_events" -v` → `51 passed`
+    - `rtk pytest tests/test_worker_protection_runtime.py -v` → `10 passed`
+    - `rtk pytest tests/test_worker_sdk.py -k "timeline or decision_event" -v` → `3 passed`
+
 - Implemented critic-approved combined Spec 7 + Spec 8 worker attribution hardening and bracket intents:
   - added exact worker-owned execution bridge schema + store:
     - `worker_live_execution_links`

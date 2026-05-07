@@ -45,6 +45,10 @@ class OptionRunStore:
             raise KeyError(f"Option run not found: {strategy_run_id}") from exc
         return deepcopy(run)
 
+    def get_run_in_session(self, session: Any, strategy_run_id: str) -> OptionRunState:
+        _ = session
+        return self.get_run(strategy_run_id)
+
     def save_run(self, run: OptionRunState) -> OptionRunState:
         if not run.strategy_run_id:
             raise ValueError("strategy_run_id is required")

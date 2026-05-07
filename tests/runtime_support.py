@@ -25,6 +25,36 @@ def apply_schema() -> None:
     with psycopg2.connect(TEST_DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute((REPO_ROOT / "schema.sql").read_text())
+            cur.execute(
+                """
+                ALTER TABLE public.worker_execution_events
+                  ADD COLUMN IF NOT EXISTS event_kind TEXT NOT NULL DEFAULT 'execution'
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE public.worker_execution_events
+                  ADD COLUMN IF NOT EXISTS event_source TEXT NOT NULL DEFAULT 'legacy_execution'
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE public.worker_execution_events
+                  ADD COLUMN IF NOT EXISTS related_resource_type TEXT
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE public.worker_execution_events
+                  ADD COLUMN IF NOT EXISTS related_resource_id TEXT
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE public.worker_execution_events
+                  ADD COLUMN IF NOT EXISTS summary TEXT
+                """
+            )
         conn.commit()
 
 

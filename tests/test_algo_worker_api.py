@@ -1,4 +1,5 @@
 # pyright: reportArgumentType=false
+import json
 import os
 import asyncio
 import sys
@@ -63,7 +64,12 @@ from api.routers.algo_workers import (  # noqa: E402
     stream_worker_run_pnl,
     list_worker_baskets,
     get_worker_basket,
+    list_worker_timeline,
+    stream_worker_timeline,
     list_worker_execution_events,
+    stream_worker_execution_events,
+    create_worker_decision_event,
+    WorkerDecisionEventRequest,
     create_worker_bracket,
     list_worker_brackets,
     get_worker_bracket,
@@ -100,6 +106,8 @@ def _sqlite_algo_worker_repo() -> SqlAlchemyAlgoWorkerRepository:
 
     @event.listens_for(engine, "connect")
     def _attach_public_schema(dbapi_connection, connection_record):
+        _ = connection_record
+        dbapi_connection.create_function("NOW", 0, lambda: datetime.now(timezone.utc).isoformat())
         cursor = dbapi_connection.cursor()
         cursor.execute("ATTACH DATABASE ':memory:' AS public")
         cursor.close()
@@ -118,8 +126,12 @@ def _sqlite_algo_worker_repo() -> SqlAlchemyAlgoWorkerRepository:
                     allowed_templates TEXT,
                     expires_at TEXT,
                     account_scope TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     heartbeat_json TEXT,
-                    last_heartbeat_at TEXT
+                    last_heartbeat_at TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TEXT
                 )
                 """
             )
@@ -286,7 +298,12 @@ def _sqlite_algo_worker_repo() -> SqlAlchemyAlgoWorkerRepository:
                     strategy_run_id TEXT NOT NULL,
                     account_id TEXT NOT NULL,
                     basket_execution_id TEXT,
+                    event_kind TEXT NOT NULL DEFAULT 'execution',
+                    event_source TEXT NOT NULL DEFAULT 'legacy_execution',
                     event_type TEXT NOT NULL,
+                    related_resource_type TEXT,
+                    related_resource_id TEXT,
+                    summary TEXT,
                     payload_json TEXT NOT NULL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
@@ -2195,14 +2212,19 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
 
         with patch(
-            "api.routers.algo_workers.basket_execution_store.list_worker_execution_events",
+            "api.routers.algo_workers.worker_timeline_store.list_events",
             return_value=[
                 {
                     "cursor": 11,
                     "strategy_run_id": "run-live-1",
                     "account_id": "kite:AB1234",
                     "basket_execution_id": "basket-1",
+                    "event_kind": "execution",
+                    "event_source": "basket_runtime",
                     "event_type": "basket.status_changed",
+                    "related_resource_type": "basket_execution",
+                    "related_resource_id": "basket-1",
+                    "summary": None,
                     "payload": {},
                 }
             ],
@@ -2218,6 +2240,358 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(all(item["cursor"] > 10 for item in response["events"]))
         self.assertTrue(all(item.get("basket_execution_id") == "basket-1" for item in response["events"]))
+
+    async def test_list_worker_timeline_filters_by_kind_and_related_ref(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-1"] = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-1",
+            "template_id": "tmpl",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {},
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        with patch(
+            "api.routers.algo_workers.worker_timeline_store.list_events",
+            return_value=[
+                {
+                    "cursor": 31,
+                    "strategy_run_id": "run-live-1",
+                    "account_id": "kite:AB1234",
+                    "basket_execution_id": None,
+                    "event_kind": "decision",
+                    "event_source": "worker",
+                    "event_type": "decision.entry",
+                    "related_resource_type": "basket_execution",
+                    "related_resource_id": "basket-1",
+                    "summary": "Entered after breakout",
+                    "payload": {"decision_type": "entry", "action": "enter"},
+                }
+            ],
+        ):
+            response = await list_worker_timeline(
+                request,
+                "run-live-1",
+                event_kind="decision",
+                related_resource_type="basket_execution",
+                related_resource_id="basket-1",
+            )
+
+        self.assertEqual(response["events"][0]["event_kind"], "decision")
+        self.assertEqual(response["events"][0]["related_resource_id"], "basket-1")
+
+    async def test_execution_events_stream_drops_non_execution_rows(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-1"] = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-1",
+            "template_id": "tmpl",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {},
+            "metadata": {},
+        }
+
+        class _FakePubSub:
+            def __init__(self, request_obj):
+                self.request = request_obj
+                self.messages = [
+                    {
+                        "type": "message",
+                        "data": json.dumps(
+                            {
+                                "cursor": 32,
+                                "event_kind": "decision",
+                                "event_type": "decision.note",
+                                "strategy_run_id": "run-live-1",
+                            }
+                        ),
+                    },
+                    {
+                        "type": "message",
+                        "data": json.dumps(
+                            {
+                                "cursor": 33,
+                                "event_kind": "execution",
+                                "event_type": "order.updated",
+                                "strategy_run_id": "run-live-1",
+                                "account_id": "kite:AB1234",
+                                "basket_execution_id": None,
+                                "payload": {"order_id": "OID-1"},
+                            }
+                        ),
+                    },
+                ]
+
+            async def subscribe(self, *_args, **_kwargs):
+                return None
+
+            async def get_message(self, **_kwargs):
+                if self.messages:
+                    return self.messages.pop(0)
+                self.request.is_disconnected = AsyncMock(return_value=True)
+                return None
+
+            async def unsubscribe(self, *_args, **_kwargs):
+                return None
+
+            async def aclose(self):
+                return None
+
+        request = self._request(repo)
+        fake_redis = SimpleNamespace(pubsub=lambda: _FakePubSub(request))
+
+        with patch("api.routers.algo_workers.get_redis", return_value=fake_redis), patch(
+            "api.routers.algo_workers.worker_timeline_store.list_events",
+            return_value=[],
+        ):
+            response = await stream_worker_execution_events(request, "run-live-1")
+            chunk = await response.body_iterator.__anext__()  # pyright: ignore[reportAttributeAccessIssue]
+
+        self.assertIn('"event_type": "order.updated"', chunk)
+        self.assertNotIn("decision.note", chunk)
+
+    async def test_execution_events_stream_treats_missing_event_kind_as_legacy_execution(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-1"] = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-1",
+            "template_id": "tmpl",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {},
+            "metadata": {},
+        }
+
+        class _FakePubSub:
+            def __init__(self, request_obj):
+                self.request = request_obj
+                self.messages = [
+                    {
+                        "type": "message",
+                        "data": json.dumps(
+                            {
+                                "cursor": 40,
+                                "event_type": "order.updated",
+                                "strategy_run_id": "run-live-1",
+                                "account_id": "kite:AB1234",
+                                "basket_execution_id": None,
+                                "payload": {"order_id": "OID-legacy"},
+                            }
+                        ),
+                    }
+                ]
+
+            async def subscribe(self, *_args, **_kwargs):
+                return None
+
+            async def get_message(self, **_kwargs):
+                if self.messages:
+                    return self.messages.pop(0)
+                self.request.is_disconnected = AsyncMock(return_value=True)
+                return None
+
+            async def unsubscribe(self, *_args, **_kwargs):
+                return None
+
+            async def aclose(self):
+                return None
+
+        request = self._request(repo)
+        fake_redis = SimpleNamespace(pubsub=lambda: _FakePubSub(request))
+
+        with patch("api.routers.algo_workers.get_redis", return_value=fake_redis), patch(
+            "api.routers.algo_workers.worker_timeline_store.list_events",
+            return_value=[],
+        ):
+            response = await stream_worker_execution_events(request, "run-live-1")
+            chunk = await response.body_iterator.__anext__()  # pyright: ignore[reportAttributeAccessIssue]
+
+        self.assertIn('"event_type": "order.updated"', chunk)
+
+    async def test_decision_events_require_runs_log_action(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=["runs:read"],
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-1"] = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-1",
+            "template_id": "tmpl",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {},
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await create_worker_decision_event(
+                request,
+                "run-live-1",
+                WorkerDecisionEventRequest(
+                    decision_type="entry",
+                    action="enter",
+                    summary="Entered on breakout",
+                ),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    async def test_decision_events_require_session_nonce_when_run_claimed(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-1"] = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-1",
+            "template_id": "tmpl",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {},
+            "metadata": {},
+            "worker_session_nonce": "nonce-live",
+        }
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await create_worker_decision_event(
+                request,
+                "run-live-1",
+                WorkerDecisionEventRequest(
+                    decision_type="entry",
+                    action="enter",
+                    summary="Entered on breakout",
+                ),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    async def test_decision_event_rejects_unknown_related_ref(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live-1"] = {
+            "strategy_run_id": "run-live-1",
+            "token_id": "worker-1",
+            "template_id": "tmpl",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {},
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+
+        @event.listens_for(engine, "connect")
+        def _attach_public_schema(dbapi_connection, connection_record):
+            _ = connection_record
+            cursor = dbapi_connection.cursor()
+            cursor.execute("ATTACH DATABASE ':memory:' AS public")
+            cursor.close()
+
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE public.basket_executions (
+                        basket_execution_id TEXT PRIMARY KEY,
+                        strategy_run_id TEXT NOT NULL
+                    )
+                    """
+                )
+            )
+
+        session_factory = sessionmaker(bind=engine)
+
+        with patch("api.routers.algo_workers.SessionLocal", session_factory):
+            with self.assertRaises(HTTPException) as ctx:
+                await create_worker_decision_event(
+                    request,
+                    "run-live-1",
+                    WorkerDecisionEventRequest(
+                        decision_type="entry",
+                        action="enter",
+                        summary="Entered on breakout",
+                        related_resource_type="basket_execution",
+                        related_resource_id="missing-basket",
+                    ),
+                )
+
+        self.assertEqual(ctx.exception.status_code, 422)
 
     async def test_worker_can_list_live_orders_for_grouped_run(self):
         token = WorkerToken(

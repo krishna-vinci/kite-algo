@@ -869,16 +869,46 @@ CREATE TABLE IF NOT EXISTS public.worker_execution_events (
   strategy_run_id TEXT NOT NULL,
   account_id TEXT NOT NULL,
   basket_execution_id TEXT,
+  event_kind TEXT NOT NULL DEFAULT 'execution',
+  event_source TEXT NOT NULL DEFAULT 'legacy_execution',
   event_type TEXT NOT NULL,
+  related_resource_type TEXT,
+  related_resource_id TEXT,
+  summary TEXT,
   payload_json JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE public.worker_execution_events
+  ADD COLUMN IF NOT EXISTS event_kind TEXT NOT NULL DEFAULT 'execution';
+
+ALTER TABLE public.worker_execution_events
+  ADD COLUMN IF NOT EXISTS event_source TEXT NOT NULL DEFAULT 'legacy_execution';
+
+ALTER TABLE public.worker_execution_events
+  ADD COLUMN IF NOT EXISTS related_resource_type TEXT;
+
+ALTER TABLE public.worker_execution_events
+  ADD COLUMN IF NOT EXISTS related_resource_id TEXT;
+
+ALTER TABLE public.worker_execution_events
+  ADD COLUMN IF NOT EXISTS summary TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_basket_executions_run_status
   ON public.basket_executions (strategy_run_id, status, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_worker_execution_events_run_cursor
   ON public.worker_execution_events (strategy_run_id, cursor);
+
+CREATE INDEX IF NOT EXISTS idx_worker_execution_events_run_kind_cursor
+  ON public.worker_execution_events (strategy_run_id, event_kind, cursor);
+
+CREATE INDEX IF NOT EXISTS idx_worker_execution_events_run_source_cursor
+  ON public.worker_execution_events (strategy_run_id, event_source, cursor);
+
+CREATE INDEX IF NOT EXISTS idx_worker_execution_events_related_ref_cursor
+  ON public.worker_execution_events (strategy_run_id, related_resource_type, related_resource_id, cursor)
+  WHERE related_resource_type IS NOT NULL AND related_resource_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_worker_execution_events_basket_cursor
   ON public.worker_execution_events (basket_execution_id, cursor)
