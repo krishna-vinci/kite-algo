@@ -69,10 +69,15 @@ from api.routers.algo_workers import (  # noqa: E402
     list_worker_execution_events,
     stream_worker_execution_events,
     create_worker_decision_event,
+    create_worker_gtt_trigger,
     WorkerDecisionEventRequest,
+    delete_worker_gtt_trigger,
     create_worker_bracket,
+    get_worker_gtt,
     list_worker_brackets,
+    list_worker_gtts,
     get_worker_bracket,
+    modify_worker_gtt_trigger,
     cancel_worker_bracket,
     submit_worker_intent,
     WorkerBracketCreateRequest,
@@ -600,6 +605,8 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("market:read", DEFAULT_WORKER_ACTIONS)
         self.assertIn("market:stream", DEFAULT_WORKER_ACTIONS)
         self.assertIn("funds:read", DEFAULT_WORKER_ACTIONS)
+        self.assertIn("gtt:read", DEFAULT_WORKER_ACTIONS)
+        self.assertIn("gtt:write", DEFAULT_WORKER_ACTIONS)
 
     async def test_worker_funds_returns_paper_account_summary(self):
         repo = _FakeWorkerRepository()
@@ -4358,6 +4365,151 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
         self.assertEqual(run["session_status"], "stale")
         self.assertEqual(run["recovery_status"], "action_required")
         self.assertTrue(run["recovery_action_required"])
+
+    async def test_worker_gtt_routes_reject_non_live_account_scope(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="paper-worker",
+            account_scope="kite:paper-a",
+            allowed_modes=["paper"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer secret-token"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+        with self.assertRaises(HTTPException) as exc:
+            await list_worker_gtts(request)
+
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertEqual(exc.exception.detail["rejection_reason"], "WORKER_ACCOUNT_SCOPE_UNSUPPORTED")
+
+    async def test_worker_gtt_routes_accept_legacy_actions_and_place_trigger(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=["runs:read", "intents:submit"],
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer secret-token"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+        payload = {
+            "type": "single",
+            "condition": {
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "trigger_values": [1500.0],
+                "last_price": 1495.0,
+            },
+            "orders": [
+                {
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "transaction_type": "BUY",
+                    "quantity": 1,
+                    "product": "CNC",
+                    "price": 1501.0,
+                }
+            ],
+        }
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ), patch(
+            "broker_api.kite_orders.gtt_service.place_gtt",
+            AsyncMock(return_value=SimpleNamespace(model_dump=lambda mode="json": {"trigger_id": 321})),
+        ):
+            response = await create_worker_gtt_trigger(request, payload)
+
+        self.assertEqual(response["trigger_id"] if isinstance(response, dict) else response.trigger_id, 321)
+
+    async def test_worker_gtt_not_found_is_normalized(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=["runs:read"],
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer secret-token"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ), patch(
+            "broker_api.kite_orders.gtt_service.get_gtt",
+            side_effect=HTTPException(status_code=404, detail="GTT trigger 999 not found"),
+        ):
+            with self.assertRaises(HTTPException) as exc:
+                await get_worker_gtt(request, 999)
+
+        self.assertEqual(exc.exception.status_code, 404)
+        self.assertEqual(exc.exception.detail["rejection_reason"], "GTT_TRIGGER_NOT_FOUND")
+
+    async def test_worker_gtt_provider_unavailable_is_normalized(self):
+        token = WorkerToken(
+            token_id="worker-1",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=["intents:submit"],
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        request = SimpleNamespace(
+            headers={"authorization": "Bearer secret-token"},
+            app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+        payload = {
+            "type": "single",
+            "condition": {
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "trigger_values": [1500.0],
+                "last_price": 1495.0,
+            },
+            "orders": [
+                {
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "transaction_type": "BUY",
+                    "quantity": 1,
+                    "product": "CNC",
+                    "price": 1501.0,
+                }
+            ],
+        }
+
+        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ), patch(
+            "broker_api.kite_orders.gtt_service.modify_gtt",
+            AsyncMock(side_effect=HTTPException(status_code=503, detail="Provider timeout or downtime.")),
+        ):
+            with self.assertRaises(HTTPException) as exc:
+                await modify_worker_gtt_trigger(request, 77, payload)
+
+        self.assertEqual(exc.exception.status_code, 503)
+        self.assertEqual(exc.exception.detail["rejection_reason"], "GTT_PROVIDER_UNAVAILABLE")
 
     async def test_worker_mutations_reject_conflicting_session_nonce(self):
         repo = _FakeWorkerRepository()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, TYPE_CHECKING
 
-from .models import SafetyCheckResult
+from .models import SafetyCheckResult, WorkerRunHealthSnapshot
 from .protection import BackendProtection
 from .run_config import RunConfig
 
@@ -28,6 +28,9 @@ class ManagedRun:
     def refresh(self) -> dict[str, Any]:
         self.run = self.client.get_run(self.run_id)
         return self.run
+
+    def get_health_snapshot(self) -> WorkerRunHealthSnapshot:
+        return self.client.get_run_health_snapshot(self.run_id)
 
     def heartbeat(
         self,

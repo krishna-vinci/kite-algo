@@ -6,7 +6,7 @@ from typing import Any, Mapping, Optional
 from .client import KiteAlgoWorkerClient
 from .exceptions import KiteAlgoWorkerError
 from .models import WorkerCandle, WorkerHistoricalCandles, WorkerOrderSnapshot
-from .orders import equity_market_order, limit_order
+from .orders import equity_market_order, limit_order, market_order
 
 
 TERMINAL_ORDER_STATES = {"COMPLETE", "CANCELLED", "REJECTED"}
@@ -43,6 +43,17 @@ def amo_limit_order(
     **kwargs: Any,
 ):
     return limit_order(exchange, tradingsymbol, transaction_type, product, quantity, price, variety="amo", **kwargs)
+
+
+def amo_market_order(
+    exchange: str,
+    tradingsymbol: str,
+    transaction_type: str,
+    product: str,
+    quantity: int,
+    **kwargs: Any,
+):
+    return market_order(exchange, tradingsymbol, transaction_type, product, quantity, variety="amo", **kwargs)
 
 
 def wait_for_history(
@@ -184,6 +195,7 @@ def preview_then_place_order(
 
 
 __all__ = [
+    "amo_market_order",
     "amo_limit_order",
     "ensure_run",
     "live_equity_market_order",

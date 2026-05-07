@@ -11,6 +11,9 @@ from .models import (
     SpreadSpec,
 )
 from .resolvers import resolve_option_contracts as _resolve_option_contracts
+from .resolvers import resolve_option_leg as _resolve_option_leg
+from .resolvers import resolve_offset_leg as _resolve_offset_leg
+from .resolvers import resolve_delta_leg as _resolve_delta_leg
 from .resolvers import resolve_spread as _resolve_spread
 
 
@@ -61,6 +64,94 @@ class OptionWorkerClient:
 
     def resolve_option_contracts(self, *, underlying: str, selection_payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         return _resolve_option_contracts(self, underlying=underlying, selection_payload=selection_payload)
+
+    def resolve_option_leg(
+        self,
+        *,
+        underlying: str,
+        product: str,
+        expiry: str,
+        selection: Mapping[str, Any],
+        transaction_type: str,
+        lots: int = 1,
+        order_type: str = "MARKET",
+        price: float | None = None,
+        trigger_price: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> OptionExecutionLeg:
+        return _resolve_option_leg(
+            self,
+            underlying=underlying,
+            product=product,
+            expiry=expiry,
+            selection=selection,
+            transaction_type=transaction_type,
+            lots=lots,
+            order_type=order_type,
+            price=price,
+            trigger_price=trigger_price,
+            metadata=metadata,
+        )
+
+    def resolve_offset_leg(
+        self,
+        *,
+        underlying: str,
+        product: str,
+        expiry: str,
+        option_type: str,
+        offset: str,
+        transaction_type: str,
+        lots: int = 1,
+        order_type: str = "MARKET",
+        price: float | None = None,
+        trigger_price: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> OptionExecutionLeg:
+        return _resolve_offset_leg(
+            self,
+            underlying=underlying,
+            product=product,
+            expiry=expiry,
+            option_type=option_type,
+            offset=offset,
+            transaction_type=transaction_type,
+            lots=lots,
+            order_type=order_type,
+            price=price,
+            trigger_price=trigger_price,
+            metadata=metadata,
+        )
+
+    def resolve_delta_leg(
+        self,
+        *,
+        underlying: str,
+        product: str,
+        expiry: str,
+        option_type: str,
+        delta_target: float,
+        transaction_type: str,
+        lots: int = 1,
+        order_type: str = "MARKET",
+        price: float | None = None,
+        trigger_price: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> OptionExecutionLeg:
+        return _resolve_delta_leg(
+            self,
+            underlying=underlying,
+            product=product,
+            expiry=expiry,
+            option_type=option_type,
+            delta_target=delta_target,
+            transaction_type=transaction_type,
+            lots=lots,
+            order_type=order_type,
+            price=price,
+            trigger_price=trigger_price,
+            metadata=metadata,
+        )
 
     def resolve_spread(self, *, underlying: str, product: str, spec: SpreadSpec) -> list[OptionExecutionLeg]:
         return _resolve_spread(self, underlying=underlying, product=product, spec=spec)

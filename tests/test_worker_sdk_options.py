@@ -12,7 +12,7 @@ if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 
 from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, KiteAlgoWorkerError, option_leg  # noqa: E402
-from kite_algo_worker.options import SpreadSpec, resolve_option_contracts, resolve_spread  # noqa: E402
+from kite_algo_worker.options import SpreadSpec, resolve_delta_leg, resolve_offset_leg, resolve_option_contracts, resolve_option_leg, resolve_spread  # noqa: E402
 from kite_algo_worker.options.models import OptionExecutionLeg, OptionRunCreateRequest  # noqa: E402
 
 
@@ -351,6 +351,119 @@ def test_resolve_option_contracts_returns_normalized_contract_rows():
 
     assert resolved[0]["tradingsymbol"] == "NIFTY26MAY25000CE"
     assert resolved[0]["lot_size"] == 75
+
+
+def test_resolve_option_contracts_accepts_worker_route_resolved_key():
+    fake_options = type(
+        "FakeOptions",
+        (),
+        {
+            "resolve_contracts": staticmethod(
+                lambda underlying, payload: {
+                    "underlying": underlying,
+                    "resolved": [
+                        {
+                            "tradingsymbol": "NIFTY26MAY25000CE",
+                            "instrument_token": 123,
+                            "strike": 25000,
+                            "option_type": "CE",
+                            "expiry_key": "2026-05-28",
+                            "lot_size": 75,
+                            "ltp": 110.5,
+                        }
+                    ],
+                }
+            )
+        },
+    )()
+
+    resolved = resolve_option_contracts(fake_options, underlying="NIFTY", selection_payload={"legs": [{"option_type": "CE", "offset": "ATM"}]})
+
+    assert resolved[0]["tradingsymbol"] == "NIFTY26MAY25000CE"
+
+
+def test_resolve_option_leg_builds_single_typed_leg_with_resolution_metadata():
+    class FakeOptions:
+        @staticmethod
+        def resolve_contracts(underlying, payload):
+            assert underlying == "NIFTY"
+            assert payload == {"expiry": "current_week", "legs": [{"option_type": "CE", "offset": "OTM1"}]}
+            return {
+                "resolved": [
+                    {
+                        "tradingsymbol": "NIFTY26MAY25100CE",
+                        "instrument_token": 2,
+                        "strike": 25100,
+                        "option_type": "CE",
+                        "expiry_key": "2026-05-28",
+                        "lot_size": 75,
+                        "ltp": 60.0,
+                        "resolver": "offset",
+                        "resolution_meta": {"offset": "OTM1"},
+                    }
+                ]
+            }
+
+    leg = resolve_option_leg(
+        FakeOptions(),
+        underlying="NIFTY",
+        product="MIS",
+        expiry="current_week",
+        selection={"option_type": "CE", "offset": "OTM1"},
+        transaction_type="BUY",
+        lots=2,
+        metadata={"tag": "entry"},
+    )
+
+    assert isinstance(leg, OptionExecutionLeg)
+    assert leg.quantity == 150
+    assert leg.metadata["tag"] == "entry"
+    assert leg.metadata["resolver"] == "offset"
+    assert leg.metadata["resolution_meta"]["offset"] == "OTM1"
+
+
+def test_resolve_offset_and_delta_leg_helpers_build_selection_requests():
+    calls = []
+
+    class FakeOptions:
+        @staticmethod
+        def resolve_contracts(underlying, payload):
+            calls.append({"underlying": underlying, "payload": payload})
+            return {
+                "resolved": [
+                    {
+                        "tradingsymbol": "NIFTY26MAY25000CE",
+                        "instrument_token": 1,
+                        "strike": 25000,
+                        "option_type": "CE",
+                        "expiry_key": "2026-05-28",
+                        "lot_size": 75,
+                        "ltp": 100.0,
+                    }
+                ]
+            }
+
+    resolve_offset_leg(
+        FakeOptions(),
+        underlying="NIFTY",
+        product="MIS",
+        expiry="current_week",
+        option_type="CE",
+        offset="ATM",
+        transaction_type="BUY",
+    )
+    resolve_delta_leg(
+        FakeOptions(),
+        underlying="NIFTY",
+        product="MIS",
+        expiry="current_week",
+        option_type="PE",
+        delta_target=0.3,
+        transaction_type="SELL",
+    )
+
+    assert calls[0]["payload"] == {"expiry": "current_week", "legs": [{"option_type": "CE", "offset": "ATM"}]}
+    assert calls[1]["payload"] == {"expiry": "current_week", "legs": [{"option_type": "PE", "delta_target": 0.3}]}
 
 
 def test_resolve_spread_builds_option_execution_legs_with_explicit_product():

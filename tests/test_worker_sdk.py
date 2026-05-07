@@ -25,6 +25,8 @@ from kite_algo_worker import (  # noqa: E402
     WorkerHistoricalCandles,
     WorkerFundsSegment,
     WorkerFundsSnapshot,
+    WorkerGttTrigger,
+    WorkerGttWriteResult,
     OrderPreview,
     KiteAlgoWorkerClient,
     KiteAlgoWorkerError,
@@ -37,11 +39,13 @@ from kite_algo_worker import (  # noqa: E402
     WorkerOrderSnapshot,
     RunProtectionState,
     WorkerOrderResult,
+    WorkerRunHealthSnapshot,
     WorkerRunPnlLeg,
     WorkerRunPnlSnapshot,
     WorkerTimelineResponse,
     WorkerTradeSnapshot,
     amo_limit_order,
+    amo_market_order,
     equity_market_order,
     ensure_run,
     limit_order,
@@ -1416,13 +1420,71 @@ def test_get_run_protection_state_returns_runtime_state_fragment(monkeypatch):
     assert client().get_run_protection_state("run-1") == {"status": "active", "generation": 2}
 
 
+def test_get_run_health_snapshot_is_typed(monkeypatch):
+    monkeypatch.setattr(
+        KiteAlgoWorkerClient,
+        "get_run",
+        lambda self, run_id: {
+            "strategy_run_id": run_id,
+            "status": "open",
+            "execution_mode": "paper",
+            "account_scope": "kite:paper-a",
+            "heartbeat_age_sec": 42,
+            "health_status": "healthy",
+            "session_status": "claimed",
+            "recovery_status": "idle",
+            "recovery_action_required": False,
+            "worker_session_claimed_at": "2026-05-07T09:15:00Z",
+            "last_heartbeat_at": "2026-05-07T09:16:00Z",
+        },
+    )
+
+    snapshot = client().get_run_health_snapshot("run-1")
+
+    assert isinstance(snapshot, WorkerRunHealthSnapshot)
+    assert snapshot.heartbeat_age_sec == 42
+    assert snapshot.health_status == "healthy"
+
+
+def test_gtt_helpers_use_worker_routes(monkeypatch):
+    responses = [
+        {"trigger_id": 91},
+        [{"id": 91, "type": "single", "status": "active", "condition": {"tradingsymbol": "INFY"}, "orders": []}],
+        {"id": 91, "type": "single", "status": "active", "condition": {"tradingsymbol": "INFY"}, "orders": []},
+        {"trigger_id": 91},
+        {"trigger_id": 91},
+    ]
+
+    def fake_request(self, method, url, **kwargs):
+        payload = responses.pop(0)
+        return FakeResponse(payload=payload, text=json.dumps(payload))
+
+    monkeypatch.setattr("requests.Session.request", fake_request)
+    sdk = client()
+
+    placed = sdk.place_gtt_snapshot({"type": "single"})
+    listed = sdk.list_gtts_snapshot()
+    current = sdk.get_gtt_snapshot(91)
+    modified = sdk.modify_gtt_snapshot(91, {"type": "single"})
+    deleted = sdk.delete_gtt_snapshot(91)
+
+    assert isinstance(placed, WorkerGttWriteResult)
+    assert isinstance(listed[0], WorkerGttTrigger)
+    assert isinstance(current, WorkerGttTrigger)
+    assert modified.trigger_id == 91
+    assert deleted.trigger_id == 91
+
+
 def test_helper_layer_builds_safe_orders_and_recovers_runs(monkeypatch):
     order = live_equity_market_order("IDEA", "BUY", 1, product="MIS")
     amo = amo_limit_order("NSE", "IDEA", "BUY", "MIS", 1, price=9.8)
+    amo_market = amo_market_order("NSE", "IDEA", "BUY", "MIS", 1)
     assert order["market_protection"] == -1
     assert order["exchange"] == "NSE"
     assert amo["variety"] == "amo"
     assert amo["price"] == 9.8
+    assert amo_market["variety"] == "amo"
+    assert amo_market["order_type"] == "MARKET"
 
     responses = [
         {"candles": []},

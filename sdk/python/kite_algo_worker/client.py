@@ -13,9 +13,12 @@ from .models import (
     RunProtectionState,
     SafetyCheckResult,
     WorkerFundsSnapshot,
+    WorkerGttTrigger,
+    WorkerGttWriteResult,
     WorkerHistoricalCandles,
     WorkerOrderSnapshot,
     WorkerOrdersResponse,
+    WorkerRunHealthSnapshot,
     WorkerRunPnlSnapshot,
     WorkerTimelineResponse,
     WorkerTradesResponse,
@@ -150,6 +153,9 @@ class KiteAlgoWorkerClient:
     def get_run(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}")
 
+    def get_run_health_snapshot(self, strategy_run_id: str) -> WorkerRunHealthSnapshot:
+        return WorkerRunHealthSnapshot.model_validate(self.get_run(strategy_run_id))
+
     def claim_session(self, strategy_run_id: str) -> JsonDict:
         return self._request("POST", f"/worker/runs/{strategy_run_id}/claim-session")
 
@@ -248,6 +254,39 @@ class KiteAlgoWorkerClient:
         runtime_state = dict(run.get("runtime_state") or {})
         state = dict(runtime_state.get("backend_protection_state") or {})
         return RunProtectionState.model_validate(state).model_dump()
+
+    def place_gtt(self, payload: Mapping[str, Any]) -> JsonDict:
+        return self._request("POST", "/worker/gtt/triggers", json=dict(payload))
+
+    def place_gtt_snapshot(self, payload: Mapping[str, Any]) -> WorkerGttWriteResult:
+        return WorkerGttWriteResult.model_validate(self.place_gtt(payload))
+
+    def list_gtts(self) -> List[JsonDict]:
+        response = self._request("GET", "/worker/gtt/triggers")
+        if not isinstance(response, list):
+            return []
+        return [dict(item) for item in response if isinstance(item, Mapping)]
+
+    def list_gtts_snapshot(self) -> List[WorkerGttTrigger]:
+        return [WorkerGttTrigger.model_validate(item) for item in self.list_gtts()]
+
+    def get_gtt(self, trigger_id: int) -> JsonDict:
+        return self._request("GET", f"/worker/gtt/triggers/{int(trigger_id)}")
+
+    def get_gtt_snapshot(self, trigger_id: int) -> WorkerGttTrigger:
+        return WorkerGttTrigger.model_validate(self.get_gtt(trigger_id))
+
+    def modify_gtt(self, trigger_id: int, payload: Mapping[str, Any]) -> JsonDict:
+        return self._request("PUT", f"/worker/gtt/triggers/{int(trigger_id)}", json=dict(payload))
+
+    def modify_gtt_snapshot(self, trigger_id: int, payload: Mapping[str, Any]) -> WorkerGttWriteResult:
+        return WorkerGttWriteResult.model_validate(self.modify_gtt(trigger_id, payload))
+
+    def delete_gtt(self, trigger_id: int) -> JsonDict:
+        return self._request("DELETE", f"/worker/gtt/triggers/{int(trigger_id)}")
+
+    def delete_gtt_snapshot(self, trigger_id: int) -> WorkerGttWriteResult:
+        return WorkerGttWriteResult.model_validate(self.delete_gtt(trigger_id))
 
     def get_funds(self, *, mode: str = "paper", account_scope: Optional[str] = None) -> JsonDict:
         params: JsonDict = {"mode": mode}

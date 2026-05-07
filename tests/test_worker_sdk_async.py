@@ -38,9 +38,12 @@ if str(SDK_ROOT) not in sys.path:
 from kite_algo_worker import AlgoWorkerConfig  # noqa: E402
 from kite_algo_worker.async_client import AsyncKiteAlgoWorkerClient  # noqa: E402
 from kite_algo_worker.models import (  # noqa: E402
+    WorkerGttTrigger,
+    WorkerGttWriteResult,
     WorkerHistoricalCandles,
     WorkerOrderSnapshot,
     WorkerOrdersResponse,
+    WorkerRunHealthSnapshot,
     WorkerRunPnlSnapshot,
     WorkerTradeSnapshot,
     WorkerTradesResponse,
@@ -141,6 +144,42 @@ def test_async_client_core_parity_methods_use_worker_endpoints():
         "all_or_none": False,
     }
     assert httpx.closed == 1
+
+
+def test_async_client_gtt_and_health_helpers_return_models():
+    httpx = _install_httpx_stub(
+        [
+            types.SimpleNamespace(
+                status_code=200,
+                content=b'{"strategy_run_id": "run-1", "status": "open", "execution_mode": "paper", "health_status": "healthy", "session_status": "claimed", "recovery_status": "idle", "recovery_action_required": false}',
+                text='{"strategy_run_id": "run-1", "status": "open", "execution_mode": "paper", "health_status": "healthy", "session_status": "claimed", "recovery_status": "idle", "recovery_action_required": false}',
+                json=lambda: {"strategy_run_id": "run-1", "status": "open", "execution_mode": "paper", "health_status": "healthy", "session_status": "claimed", "recovery_status": "idle", "recovery_action_required": False},
+            ),
+            types.SimpleNamespace(status_code=200, content=b'{"trigger_id": 55}', text='{"trigger_id": 55}', json=lambda: {"trigger_id": 55}),
+            types.SimpleNamespace(
+                status_code=200,
+                content=b'[{"id": 55, "type": "single", "status": "active", "condition": {"tradingsymbol": "INFY"}, "orders": []}]',
+                text='[{"id": 55, "type": "single", "status": "active", "condition": {"tradingsymbol": "INFY"}, "orders": []}]',
+                json=lambda: [{"id": 55, "type": "single", "status": "active", "condition": {"tradingsymbol": "INFY"}, "orders": []}],
+            ),
+        ]
+    )
+
+    async def main():
+        async with AsyncKiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test")) as sdk:
+            health = await sdk.get_run_health_snapshot("run-1")
+            placed = await sdk.place_gtt_snapshot({"type": "single"})
+            listed = await sdk.list_gtts_snapshot()
+            return health, placed, listed
+
+    health, placed, listed = asyncio.run(main())
+
+    assert isinstance(health, WorkerRunHealthSnapshot)
+    assert isinstance(placed, WorkerGttWriteResult)
+    assert isinstance(listed[0], WorkerGttTrigger)
+    assert httpx.calls[0]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1"
+    assert httpx.calls[1]["url"] == "http://localhost:8000/api/algo-workers/worker/gtt/triggers"
+    assert httpx.calls[2]["url"] == "http://localhost:8000/api/algo-workers/worker/gtt/triggers"
 
 
 def test_async_client_typed_snapshot_helpers_return_models():

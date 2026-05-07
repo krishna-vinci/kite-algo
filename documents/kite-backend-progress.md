@@ -25,6 +25,26 @@ Do not use this file for frontend work.
 
 ## Newly implemented in current branch
 
+- Implemented Spec 10 worker product completion and helper polish:
+  - added worker-token-authenticated, account-scoped GTT passthrough routes:
+    - `POST /api/algo-workers/worker/gtt/triggers`
+    - `GET /api/algo-workers/worker/gtt/triggers`
+    - `GET /api/algo-workers/worker/gtt/triggers/{trigger_id}`
+    - `PUT /api/algo-workers/worker/gtt/triggers/{trigger_id}`
+    - `DELETE /api/algo-workers/worker/gtt/triggers/{trigger_id}`
+  - GTT routes reuse existing live Kite session resolution from worker `account_scope`, add worker-facing structured rejection codes, and intentionally remain thin broker passthroughs with no local state/idempotency/timeline ownership
+  - expanded default worker token actions with `gtt:read` / `gtt:write` while preserving compatibility for legacy tokens through nearby existing actions
+  - added SDK typed run-health snapshots plus sync/async/managed-run helpers
+  - added SDK worker GTT CRUD wrappers and typed GTT models
+  - added backend-backed SDK option resolver helpers for single-leg generic/offset/delta resolution into `OptionExecutionLeg`
+  - added `amo_market_order(...)` helper symmetry
+  - explicitly deferred worker metrics/export and kept position sizing out of scope
+  - focused verification in this environment:
+    - `rtk pytest tests/test_algo_worker_api.py -k "worker_gtt or worker_run_read_surface_includes_health_fields" -v` → `5 passed`
+    - `rtk pytest tests/test_worker_sdk.py -k "gtt or amo or health_snapshot" -v` → `2 passed`
+    - `rtk pytest tests/test_worker_sdk_async.py -k "gtt or health_snapshot" -v` → `1 passed`
+    - `rtk pytest tests/test_worker_sdk_options.py -k "resolve_option_leg or resolve_offset_leg or resolve_delta_leg or resolved_key" -v` → `2 passed`
+
 - Implemented Spec 9 worker decision logging and protection observability:
   - widened `worker_execution_events` into a canonical worker timeline surface (`event_kind`, `event_source`, related refs, summary) while preserving compatibility defaults for legacy execution rows
   - added shared `WorkerTimelineStore` ownership for timeline inserts/reads and migrated execution writers/reads onto the store

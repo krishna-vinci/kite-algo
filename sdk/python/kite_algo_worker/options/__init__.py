@@ -8,7 +8,7 @@ from .models import (
     SpreadLegSelection,
     SpreadSpec,
 )
-from .resolvers import resolve_option_contracts, resolve_spread
+from .resolvers import resolve_delta_leg, resolve_offset_leg, resolve_option_contracts, resolve_option_leg, resolve_spread
 from .structures import option_leg
 
 __all__ = [
@@ -21,6 +21,9 @@ __all__ = [
     "SpreadLegSelection",
     "SpreadSpec",
     "option_leg",
+    "resolve_delta_leg",
+    "resolve_offset_leg",
     "resolve_option_contracts",
+    "resolve_option_leg",
     "resolve_spread",
 ]

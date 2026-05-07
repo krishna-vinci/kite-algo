@@ -46,6 +46,8 @@ router = APIRouter(prefix="/algo-workers", tags=["Algo Workers"])
 logger = logging.getLogger(__name__)
 
 DEFAULT_WORKER_ACTIONS = {
+    "gtt:read",
+    "gtt:write",
     "runs:create",
     "runs:read",
     "runs:log",
@@ -2458,6 +2460,23 @@ def _require_action(token: WorkerToken, action: str) -> None:
         raise HTTPException(status_code=403, detail=f"Worker token is not allowed to perform '{action}'")
 
 
+def _require_worker_gtt_action(token: WorkerToken, action: str) -> None:
+    allowed = set(token.allowed_actions)
+    accepted = {
+        "gtt:read": {"gtt:read", "runs:read"},
+        "gtt:write": {"gtt:write", "intents:submit"},
+    }.get(action, {action})
+    if allowed.intersection(accepted):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "rejection_reason": "WORKER_ACTION_NOT_ALLOWED",
+            "required_action": action,
+        },
+    )
+
+
 def _require_v1_mode(mode: str) -> None:
     normalized = str(mode or "").strip().lower()
     if normalized not in ALLOWED_V1_MODES:
@@ -2472,6 +2491,82 @@ def _broker_user_id_from_account_scope(account_scope: str) -> str:
     if parsed.mode != "live" or not parsed.broker_user_id:
         raise HTTPException(status_code=400, detail="Live worker execution requires a real broker account_scope, not a paper account scope")
     return parsed.broker_user_id
+
+
+def _require_worker_live_account_scope(token: WorkerToken) -> str:
+    account_scope = str(token.account_scope or "").strip()
+    if not account_scope:
+        raise HTTPException(status_code=403, detail={"rejection_reason": "WORKER_ACCOUNT_SCOPE_REQUIRED"})
+    try:
+        parsed = parse_account_scope(account_scope)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "rejection_reason": "WORKER_ACCOUNT_SCOPE_UNSUPPORTED",
+                "account_scope": account_scope,
+            },
+        ) from exc
+    if parsed.mode != "live" or not parsed.broker_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "rejection_reason": "WORKER_ACCOUNT_SCOPE_UNSUPPORTED",
+                "account_scope": account_scope,
+            },
+        )
+    return account_scope
+
+
+async def _load_live_kite_for_worker_account_scope(account_scope: str):
+    try:
+        return await asyncio.to_thread(_load_live_kite_for_account, account_scope)
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "rejection_reason": "WORKER_KITE_SESSION_UNAVAILABLE",
+                    "provider_detail": exc.detail,
+                },
+            ) from exc
+        raise
+
+
+def _worker_request_correlation_id(request: Request, prefix: str) -> str:
+    return request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"{prefix}-{uuid.uuid4()}"
+
+
+def _normalize_worker_gtt_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        if isinstance(exc.detail, dict) and exc.detail.get("rejection_reason"):
+            return exc
+        provider_status = int(exc.status_code)
+        if provider_status == 404:
+            reason = "GTT_TRIGGER_NOT_FOUND"
+        elif provider_status == 400:
+            reason = "GTT_REQUEST_INVALID"
+        elif provider_status == 409:
+            reason = "GTT_PROVIDER_REJECTED"
+        elif provider_status in {502, 503, 504}:
+            reason = "GTT_PROVIDER_UNAVAILABLE"
+        else:
+            reason = "GTT_PROVIDER_ERROR"
+        return HTTPException(
+            status_code=provider_status,
+            detail={
+                "rejection_reason": reason,
+                "provider_status_code": provider_status,
+                "provider_detail": exc.detail,
+            },
+        )
+    return HTTPException(
+        status_code=502,
+        detail={
+            "rejection_reason": "GTT_PROVIDER_ERROR",
+            "provider_detail": str(exc),
+        },
+    )
 
 
 def _validate_live_run_contract(*, account_scope: str, metadata: Dict[str, Any]) -> None:
@@ -3987,6 +4082,85 @@ async def worker_heartbeat(request: Request, payload: WorkerHeartbeatRequest):
     token = await require_worker_token(request)
     _require_action(token, "heartbeat")
     return await _repo(request).record_heartbeat(token.token_id, payload)
+
+
+@router.post("/worker/gtt/triggers")
+async def create_worker_gtt_trigger(request: Request, payload: Dict[str, Any]):
+    token = await require_worker_token(request)
+    _require_worker_gtt_action(token, "gtt:write")
+    account_scope = _require_worker_live_account_scope(token)
+    from broker_api.kite_orders import PlaceGTTRequest, gtt_service
+
+    request_payload = payload if isinstance(payload, PlaceGTTRequest) else PlaceGTTRequest.model_validate(payload)
+
+    try:
+        kite = await _load_live_kite_for_worker_account_scope(account_scope)
+        result = await gtt_service.place_gtt(kite, request_payload, _worker_request_correlation_id(request, "algo-worker-gtt-place"))
+        return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+    except Exception as exc:
+        raise _normalize_worker_gtt_error(exc) from exc
+
+
+@router.get("/worker/gtt/triggers")
+async def list_worker_gtts(request: Request):
+    token = await require_worker_token(request)
+    _require_worker_gtt_action(token, "gtt:read")
+    account_scope = _require_worker_live_account_scope(token)
+    from broker_api.kite_orders import gtt_service
+
+    try:
+        kite = await _load_live_kite_for_worker_account_scope(account_scope)
+        result = await asyncio.to_thread(gtt_service.get_gtts, kite, _worker_request_correlation_id(request, "algo-worker-gtt-list"))
+        return [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in list(result or [])]
+    except Exception as exc:
+        raise _normalize_worker_gtt_error(exc) from exc
+
+
+@router.get("/worker/gtt/triggers/{trigger_id}")
+async def get_worker_gtt(request: Request, trigger_id: int):
+    token = await require_worker_token(request)
+    _require_worker_gtt_action(token, "gtt:read")
+    account_scope = _require_worker_live_account_scope(token)
+    from broker_api.kite_orders import gtt_service
+
+    try:
+        kite = await _load_live_kite_for_worker_account_scope(account_scope)
+        result = await asyncio.to_thread(gtt_service.get_gtt, kite, int(trigger_id), _worker_request_correlation_id(request, "algo-worker-gtt-get"))
+        return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+    except Exception as exc:
+        raise _normalize_worker_gtt_error(exc) from exc
+
+
+@router.put("/worker/gtt/triggers/{trigger_id}")
+async def modify_worker_gtt_trigger(request: Request, trigger_id: int, payload: Dict[str, Any]):
+    token = await require_worker_token(request)
+    _require_worker_gtt_action(token, "gtt:write")
+    account_scope = _require_worker_live_account_scope(token)
+    from broker_api.kite_orders import ModifyGTTRequest, gtt_service
+
+    request_payload = payload if isinstance(payload, ModifyGTTRequest) else ModifyGTTRequest.model_validate(payload)
+
+    try:
+        kite = await _load_live_kite_for_worker_account_scope(account_scope)
+        result = await gtt_service.modify_gtt(kite, int(trigger_id), request_payload, _worker_request_correlation_id(request, "algo-worker-gtt-modify"))
+        return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+    except Exception as exc:
+        raise _normalize_worker_gtt_error(exc) from exc
+
+
+@router.delete("/worker/gtt/triggers/{trigger_id}")
+async def delete_worker_gtt_trigger(request: Request, trigger_id: int):
+    token = await require_worker_token(request)
+    _require_worker_gtt_action(token, "gtt:write")
+    account_scope = _require_worker_live_account_scope(token)
+    from broker_api.kite_orders import gtt_service
+
+    try:
+        kite = await _load_live_kite_for_worker_account_scope(account_scope)
+        result = await gtt_service.delete_gtt(kite, int(trigger_id), _worker_request_correlation_id(request, "algo-worker-gtt-delete"))
+        return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+    except Exception as exc:
+        raise _normalize_worker_gtt_error(exc) from exc
 
 
 @router.post("/worker/runs/{strategy_run_id}/claim-session")
