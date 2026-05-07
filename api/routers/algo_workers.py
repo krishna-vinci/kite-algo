@@ -40,6 +40,17 @@ from broker_api.basket_execution import basket_execution_store
 from broker_api.bracket_runtime import bracket_runtime_store
 from broker_api.redis_events import get_redis, publish_event
 from broker_api.worker_timeline import worker_timeline_store
+from shared.serialization import (
+    _hash_token,
+    _json_default,
+    _json_dumps,
+    _json_loads,
+    _query_int_param,
+    _row_mapping,
+    _to_float,
+    _to_int,
+    _utcnow,
+)
 
 
 router = APIRouter(prefix="/algo-workers", tags=["Algo Workers"])
@@ -71,82 +82,7 @@ VALID_WORKER_STRATEGY_FAMILIES = {
 }
 WORKER_SESSION_FRESHNESS_SECONDS = int(os.getenv("WORKER_SESSION_FRESHNESS_SECONDS", "60"))
 WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS = int(os.getenv("WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS", "120"))
-
-
-def _query_int_param(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        default_value = getattr(value, "default", default)
-        try:
-            return int(default_value)
-        except Exception:
-            return int(default)
 WORKER_RUN_STALE_ACTION_SECONDS = int(os.getenv("WORKER_RUN_STALE_ACTION_SECONDS", "180"))
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def _json_default(value: Any) -> Any:
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
-    return str(value)
-
-
-def _json_dumps(value: Any) -> str:
-    import json
-
-    return json.dumps(value, default=_json_default)
-
-
-def _json_loads(value: Any, fallback: Any) -> Any:
-    import json
-
-    if value in (None, ""):
-        return fallback
-    if isinstance(value, str):
-        return json.loads(value)
-    return value
-
-
-def _row_mapping(row: Any) -> Dict[str, Any]:
-    if row is None:
-        return {}
-    if hasattr(row, "_mapping"):
-        return dict(row._mapping)
-    if isinstance(row, dict):
-        return dict(row)
-    return {
-        key: getattr(row, key)
-        for key in dir(row)
-        if not key.startswith("_") and not callable(getattr(row, key))
-    }
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
-def _to_int(value: Any, default: int = 0) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except Exception:
-        return default
 
 
 class WorkerTokenCreateRequest(BaseModel):
