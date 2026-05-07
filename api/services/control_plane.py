@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
-from api.control_plane_protection import ControlPlaneProtectionService, InvestingProtectionRepository
+from api.services.control_plane_protection import ControlPlaneProtectionService, InvestingProtectionRepository
 
 
 HEALTHY_HEARTBEAT_SECONDS = 45

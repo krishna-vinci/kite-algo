@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from database import SessionLocal, get_user_settings, update_user_settings
+from app.database import SessionLocal, get_user_settings, update_user_settings
 
 
 router = APIRouter(tags=["User Settings"])

@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 import psycopg2.extras
 import requests
 
-from database import SessionLocal, get_db_connection
+from app.database import SessionLocal, get_db_connection
 from broker_api.session.kite_session import build_kite_client, get_system_access_token
 
 

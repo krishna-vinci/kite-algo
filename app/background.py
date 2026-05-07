@@ -13,9 +13,9 @@ from api.repositories.algo_worker_repo import (
     WORKER_RUN_STALE_ACTION_SECONDS,
     WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
 )
-from api.worker_runtime_recovery import build_worker_runtime_recovery_service
+from api.services.runtime_recovery import build_worker_runtime_recovery_service
 from broker_api.orders import bracket_runtime_store, get_bracket_executor_wakeup_event, run_bracket_executor_once
-from runtime_monitor import heartbeat, set_component_status
+from app.monitor import heartbeat, set_component_status
 
 def _worker_protection_squareoff_schedule() -> dict[str, str]:
     defaults = {
@@ -41,7 +41,7 @@ async def _worker_protection_loop(app: FastAPI):
     from types import SimpleNamespace
 
     from api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository
-    from api.worker_protection_runtime import (
+    from api.services.protection_runtime import (
         WorkerProtectionRuntime,
         load_worker_run_pnl_for_protection,
         submit_worker_protection_exit,

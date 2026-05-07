@@ -13,7 +13,7 @@ from broker_api.broker_api import (
     get_ohlc as _get_ohlc,
 )
 from broker_api.session.kite_session import get_kite
-from database import get_db
+from app.database import get_db
 
 router = APIRouter(tags=["Core"] )
 

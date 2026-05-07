@@ -9,7 +9,7 @@ from kiteconnect import KiteConnect
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database import get_db
+from app.database import get_db
 from broker_api.orders.models import *
 from broker_api.orders.service import *
 from broker_api.session.kite_session import get_kite, get_kite_session_id, get_session_account_id

@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database import SessionLocal
+from app.database import SessionLocal
 from broker_api.timeline.worker_timeline import worker_timeline_store
 from shared.serialization import _json_dumps, _json_loads, _row_mapping, _to_int, _utcnow
 

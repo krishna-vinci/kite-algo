@@ -2,7 +2,7 @@ import logging
 import sys
 from datetime import datetime, timedelta
 from broker_api.session.kite_auth import login_headless
-from database import get_db_connection
+from app.database import get_db_connection
 from broker_api.performance.performance_logic import calculate_performance, get_instrument_token
 
 # Configure logging to stdout

@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
-from database import SessionLocal
+from app.database import SessionLocal
 from .models import (
     PaperAccount,
     PaperFundLedgerEntry,

@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from database import SessionLocal
+from app.database import SessionLocal
 from broker_api.broker_api import run_headless_login_and_persist_system_token
 from broker_api.instruments.index_ingestion import (
     get_index_refresh_state,
@@ -14,7 +14,7 @@ from broker_api.instruments.index_ingestion import (
     refresh_live_metrics_for_indices,
     refresh_supported_indices,
 )
-from runtime_monitor import heartbeat, set_component_status, set_meta
+from app.monitor import heartbeat, set_component_status, set_meta
 
 daily_token_ready: asyncio.Event = asyncio.Event()
 

@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database import SessionLocal
+from app.database import SessionLocal
 from shared.serialization import _json_dumps, _json_loads, _row_mapping, _to_int
 
 

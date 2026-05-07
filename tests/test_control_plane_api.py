@@ -12,7 +12,7 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.control_plane import (  # noqa: E402
+from api.services.control_plane import (  # noqa: E402
     build_empty_snapshot,
     build_strategy_positions_snapshot,
     cancel_control_strategy_orders,

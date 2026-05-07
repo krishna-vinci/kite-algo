@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import pandas as pd
-from database import get_db_connection
+from app.database import get_db_connection
 import logging
 from kiteconnect import KiteConnect
 from sqlalchemy import text

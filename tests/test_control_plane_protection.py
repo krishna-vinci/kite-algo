@@ -4,7 +4,7 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.control_plane_protection import ControlPlaneProtectionService, _json_loads
+from api.services.control_plane_protection import ControlPlaneProtectionService, _json_loads
 
 
 class _FakeOptionStrategyStore:

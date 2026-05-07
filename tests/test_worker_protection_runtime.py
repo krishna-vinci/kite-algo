@@ -7,7 +7,7 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.worker_protection_runtime import WorkerProtectionRuntime, submit_worker_protection_exit
+from api.services.protection_runtime import WorkerProtectionRuntime, submit_worker_protection_exit
 
 
 class _Repo:

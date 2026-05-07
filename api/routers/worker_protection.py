@@ -10,11 +10,11 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
-from api.worker_protection import validate_backend_protection_payload
-from api.worker_safety import build_safety_fingerprint, build_signed_safety_token, option_run_status_blocks_trading, verify_signed_safety_token
+from api.services.protection import validate_backend_protection_payload
+from api.services.safety import build_safety_fingerprint, build_signed_safety_token, option_run_status_blocks_trading, verify_signed_safety_token
 from broker_api.core.redis_events import get_redis, publish_event
 from broker_api.timeline.worker_timeline import worker_timeline_store
-from database import SessionLocal
+from app.database import SessionLocal
 from api.schemas.worker import WorkerDecisionEventRequest, WorkerProtectionPatchRequest, WorkerRiskPatchRequest, WorkerRunPnlLeg, WorkerRunPnlSnapshot, WorkerRunPnlTotals, WorkerFundsSegment, WorkerFundsSnapshot, WorkerExitRequest
 from api.routers.worker_shared import *
 

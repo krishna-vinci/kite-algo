@@ -7,7 +7,7 @@ from broker_api.broker_api import (
     sync_and_reindex_instruments as _sync_and_reindex_instruments,
     fuzzy_search_instruments as _fuzzy_search_instruments,
 )
-from database import get_db
+from app.database import get_db
 from fastapi import Depends, Query
 from sqlalchemy.orm import Session
 

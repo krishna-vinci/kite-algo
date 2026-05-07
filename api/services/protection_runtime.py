@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
 
-from api.worker_protection import evaluate_backend_protection, validate_backend_protection_payload
+from api.services.protection import evaluate_backend_protection, validate_backend_protection_payload
 from broker_api.core.redis_events import publish_event
 
 
@@ -348,7 +348,7 @@ async def load_worker_run_pnl_for_protection(request: Any, run: Dict[str, Any]) 
 
 
 async def submit_worker_protection_exit(request: Any, run: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
-    from api.control_plane import exit_control_strategy
+    from api.services.control_plane import exit_control_strategy
 
     return await exit_control_strategy(
         request,

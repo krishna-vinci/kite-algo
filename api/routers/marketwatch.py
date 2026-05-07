@@ -17,7 +17,7 @@ from broker_api.instruments.index_ingestion import (
     refresh_live_metrics,
 )
 from broker_api.core.redis_events import get_redis
-from database import get_db_connection
+from app.database import get_db_connection
 
 
 router = APIRouter(tags=["Marketwatch"])

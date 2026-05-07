@@ -589,7 +589,7 @@ class WorkerMarketDataService:
 
     async def _get_system_kite_client(self) -> Any:
         from broker_api.market.candles_api import get_kite_db
-        from database import SessionLocal
+        from app.database import SessionLocal
 
         db = SessionLocal()
         try:

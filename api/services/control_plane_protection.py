@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database import SessionLocal
+from app.database import SessionLocal
 
 
 def _json_loads(value: Any, fallback: Any) -> Any:

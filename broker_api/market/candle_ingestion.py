@@ -403,7 +403,7 @@ class IngestionScheduler:
     async def _get_watchlist_tokens(self) -> List[int]:
         """Get instrument tokens from watchlist."""
         try:
-            from database import get_db
+            from app.database import get_db
             from sqlalchemy import text
             
             db_session = next(get_db())

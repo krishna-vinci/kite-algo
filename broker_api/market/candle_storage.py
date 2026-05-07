@@ -10,7 +10,7 @@ import psycopg2
 from psycopg2.extras import execute_values, DictCursor
 import pytz
 
-from database import get_db_connection
+from app.database import get_db_connection
 
 logger = logging.getLogger(__name__)
 

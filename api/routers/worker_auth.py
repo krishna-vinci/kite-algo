@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from fastapi import APIRouter, HTTPException, Request
-from auth_service import require_app_user
+from app.auth import require_app_user
 from api.schemas.worker import WorkerTokenCreateRequest, WorkerTokenCreateResponse, WorkerTokenView, WorkerHeartbeatRequest, WorkerRunCreateRequest
 from api.routers.worker_shared import *
 

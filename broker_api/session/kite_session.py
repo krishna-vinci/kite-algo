@@ -8,7 +8,7 @@ from kiteconnect import KiteConnect
 from sqlalchemy import Column, DateTime, String, or_
 from sqlalchemy.orm import Session
 
-from database import Base, get_db
+from app.database import Base, get_db
 from .kite_auth import API_KEY
 
 

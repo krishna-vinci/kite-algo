@@ -13,11 +13,11 @@ from sqlalchemy.orm import Session
 
 from api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository, WorkerToken, WORKER_RUN_STALE_ACTION_SECONDS, WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS
 from api.schemas.worker import WorkerIntentRequest
-from api.worker_market_data import WorkerMarketDataService
-from api.worker_safety import build_safety_fingerprint, build_signed_safety_token, option_run_status_blocks_trading, verify_signed_safety_token
+from api.services.market_data import WorkerMarketDataService
+from api.services.safety import build_safety_fingerprint, build_signed_safety_token, option_run_status_blocks_trading, verify_signed_safety_token
 from algo_runtime.account_scope import parse_account_scope
-from auth_service import require_app_user
-from database import SessionLocal
+from app.auth import require_app_user
+from app.database import SessionLocal
 from journaling.service import JournalService
 from shared.serialization import _json_dumps, _json_loads, _row_mapping, _to_float, _to_int, _utcnow, _hash_token, _query_int_param
 
@@ -141,7 +141,7 @@ def _session_status_for_run(run: Dict[str, Any], health: Dict[str, Any]) -> str:
     return "takeover_required"
 
 def _enrich_run_health_fields(run: Dict[str, Any]) -> Dict[str, Any]:
-    from api.control_plane import compute_worker_health
+    from api.services.control_plane import compute_worker_health
 
     payload = dict(run)
     now = _utcnow()

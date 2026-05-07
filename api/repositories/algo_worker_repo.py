@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from broker_api.core.redis_events import publish_event
 from broker_api.timeline.worker_timeline import worker_timeline_store
-from database import SessionLocal
+from app.database import SessionLocal
 from shared.serialization import _hash_token, _json_dumps, _json_loads, _row_mapping, _to_float, _to_int, _utcnow
 
 if TYPE_CHECKING:  # pragma: no cover

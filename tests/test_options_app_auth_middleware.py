@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from shared.serialization import _hash_token
-from auth_service import ACCESS_COOKIE_NAME, AppUser, auth_exempt_path, create_access_token, get_optional_app_user
+from app.auth import ACCESS_COOKIE_NAME, AppUser, auth_exempt_path, create_access_token, get_optional_app_user
 from options.api.execution_router import router as execution_router
 from options.api.market_router import get_options_session_manager, router as market_router
 from options.api.protection_router import router as protection_router

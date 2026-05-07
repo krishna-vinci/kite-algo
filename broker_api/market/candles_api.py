@@ -25,7 +25,7 @@ from .candle_ingestion import CandleIngestion, IngestionScheduler
 from .kite_auth import API_KEY
 from broker_api.session.kite_session import KiteSession, build_kite_client
 from broker_api.instruments.instruments_repository import InstrumentsRepository
-from database import get_db, get_db_connection
+from app.database import get_db, get_db_connection
 
 logger = logging.getLogger(__name__)
 
@@ -740,7 +740,7 @@ async def run_ingestion_now(
         
         # Get tokens from watchlist if not specified
         if not tokens:
-            from database import get_db
+            from app.database import get_db
             from sqlalchemy import text
             
             db_session = next(get_db())

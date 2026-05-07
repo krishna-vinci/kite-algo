@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from api.worker_market_data import WorkerInstrumentResolveRequest, WorkerMarketSnapshotRequest, WorkerQuoteRequest
+from api.services.market_data import WorkerInstrumentResolveRequest, WorkerMarketSnapshotRequest, WorkerQuoteRequest
 from api.routers.worker_shared import *
 
 router = APIRouter(prefix='/algo-workers', tags=['Algo Workers'])

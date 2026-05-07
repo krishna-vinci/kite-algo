@@ -6,7 +6,7 @@ from algo_runtime.account_scope import parse_account_scope
 from algo_runtime.execution_attribution import build_execution_attribution
 from broker_api.orders import OrdersService
 from broker_api.session.kite_session import build_kite_client, get_system_access_token
-from database import SessionLocal
+from app.database import SessionLocal
 from execution_accounting.contracts import ChargesStatus, ExecutionCostContract
 from execution_accounting.kite_costs import build_live_basket_cost_contract
 

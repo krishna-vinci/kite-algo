@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException
 from sqlalchemy import text
 
-from database import SessionLocal
+from app.database import SessionLocal
 from execution_accounting.contracts import OrderAttribution
 from shared.serialization import _json_dumps
 

@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database import SessionLocal, engine
+from app.database import SessionLocal, engine
 from journaling.live_projector import LiveJournalProjector
 from shared.serialization import _to_float, _to_int
 from broker_api.core.redis_events import get_redis, publish_event, pubsub_iter

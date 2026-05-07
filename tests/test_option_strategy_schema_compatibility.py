@@ -1,6 +1,6 @@
 import unittest
 
-from database import _ensure_option_strategy_runs_compatibility
+from app.database import _ensure_option_strategy_runs_compatibility
 
 
 class _FakeCursor:

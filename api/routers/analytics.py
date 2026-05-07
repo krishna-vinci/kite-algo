@@ -4,7 +4,7 @@ from datetime import date
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from auth_service import require_app_user
+from app.auth import require_app_user
 from journaling.analytics_service import AnalyticsService
 from journaling.models import (
     AnalyticsSummaryResponse,

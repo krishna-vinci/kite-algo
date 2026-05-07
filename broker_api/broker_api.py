@@ -35,8 +35,8 @@ from sqlalchemy import (
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
-from auth_service import require_app_user
-from database import database
+from app.auth import require_app_user
+from app.database import database
 
 from .kite_auth import login_headless
 from broker_api.session.kite_session import (
@@ -52,7 +52,7 @@ from broker_api.session.kite_session import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-from runtime_public_config import get_scheduler_ntfy_url
+from app.config import get_scheduler_ntfy_url
 
 
 SCHEDULER_NTFY_URL = get_scheduler_ntfy_url()
@@ -1901,7 +1901,7 @@ def parse_fo_query(query: str) -> Dict[str, Any]:
 
 ####KITE
 from .historical_data import fetch_and_store_historical_data, fetch_and_store_indices_historical_data
-from database import get_db_connection
+from app.database import get_db_connection
 
 @router.post("/clear_historical_data")
 def clear_historical_data(conn = Depends(get_psql_conn)):

@@ -5,7 +5,7 @@ import uuid
 from typing import Any, Callable
 
 from sqlalchemy import text
-from database import SessionLocal
+from app.database import SessionLocal
 
 from .models import OptionRunCreateRequest, OptionRunState
 

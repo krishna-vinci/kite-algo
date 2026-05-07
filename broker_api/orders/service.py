@@ -15,7 +15,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database import get_db
+from app.database import get_db
 from broker_api.core.redis_events import get_redis, publish_event, pubsub_iter
 from broker_api.instruments.instruments_repository import InstrumentsRepository
 from broker_api.orders.models import *
@@ -701,7 +701,7 @@ class OrdersService:
         basket_snapshot: Optional[Dict[str, Any]] = None
 
         if session_id:
-            from database import SessionLocal
+            from app.database import SessionLocal
             from broker_api.orders.basket_execution import basket_execution_store
             from broker_api.orders.live_order_intents import validate_live_order_attribution
 
@@ -741,7 +741,7 @@ class OrdersService:
                 )
 
                 if basket_execution_id:
-                    from database import SessionLocal
+                    from app.database import SessionLocal
                     from broker_api.orders.basket_execution import basket_execution_store
 
                     db = SessionLocal()
@@ -793,7 +793,7 @@ class OrdersService:
                 )
 
                 if basket_execution_id:
-                    from database import SessionLocal
+                    from app.database import SessionLocal
                     from broker_api.orders.basket_execution import basket_execution_store
 
                     db = SessionLocal()
@@ -828,7 +828,7 @@ class OrdersService:
                             )
 
                     if basket_execution_id:
-                        from database import SessionLocal
+                        from app.database import SessionLocal
                         from broker_api.orders.basket_execution import basket_execution_store
 
                         db = SessionLocal()
@@ -861,7 +861,7 @@ class OrdersService:
         final_status = "success" if not errors else "partial"
         logger.info(f"Basket order completed with status: {final_status}", extra={**log_ctx, "success_count": len(placed), "error_count": len(errors)})
         if basket_execution_id:
-            from database import SessionLocal
+            from app.database import SessionLocal
             from broker_api.orders.basket_execution import basket_execution_store
 
             db = SessionLocal()

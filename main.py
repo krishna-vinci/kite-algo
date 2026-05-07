@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
-from api.openapi import OPENAPI_TAGS
+from api.config.openapi import OPENAPI_TAGS
 from app.bootstrap import combined_lifespan
 from app.middleware import setup_middleware
 
@@ -40,7 +40,7 @@ from options.api.market_router import router as options_market_router
 from options.api.protection_router import router as options_protection_router
 from options.api.strategy_router import router as options_strategy_router
 from options.api.worker_options_router import router as worker_options_router
-from runtime_monitor import install_log_buffer
+from app.monitor import install_log_buffer
 from strategies.indexstoploss.router import router as indexstoploss_router
 
 load_dotenv()  # Load environment variables from .env file

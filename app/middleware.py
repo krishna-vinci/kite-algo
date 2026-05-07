@@ -4,8 +4,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from auth_service import auth_exempt_path, get_optional_app_user
-from runtime_public_config import get_allowed_cors_origins
+from app.auth import auth_exempt_path, get_optional_app_user
+from app.config import get_allowed_cors_origins
 
 async def _auth_middleware(request: Request, call_next):
     path = request.url.path

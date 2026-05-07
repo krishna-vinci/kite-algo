@@ -12,7 +12,7 @@ from uuid import UUID
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from database import SessionLocal
+from app.database import SessionLocal
 
 from journaling.models import (
     BenchmarkDailyPrice,

@@ -9,7 +9,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database import SessionLocal
+from app.database import SessionLocal
 
 
 class InstrumentsRepository:
