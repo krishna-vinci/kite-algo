@@ -21,9 +21,16 @@ from app.background import (
     _worker_runtime_recovery_runs_loop,
 )
 from app.schedulers import daily_token_ready, _schedule_daily_token_refresh, _schedule_monthly_index_refresh
-from broker_api.broker_api import run_headless_login_and_persist_system_token, schedule_daily_instruments_update
+from broker_api.broker_api import (
+    ensure_instruments_index,
+    get_meili_client,
+    meili_reindex_instruments,
+    run_headless_login_and_persist_system_token,
+    schedule_daily_instruments_update,
+)
 from broker_api.instruments.index_ingestion import refresh_live_metrics_for_indices
 from broker_api.orders import order_event_runtime, realtime_positions_service, refresh_processing_stuck_rows
+from broker_api.session.kite_auth import API_KEY, login_headless
 from broker_api.session.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
 from broker_api.orders.market_runtime_client import MarketDataRuntime, market_runtime_enabled
 from broker_api.options.options_greeks import prewarm_options_engine

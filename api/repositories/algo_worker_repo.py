@@ -591,12 +591,12 @@ class SqlAlchemyAlgoWorkerRepository:
                         worker_session_nonce IS NULL
                         OR (
                           last_heartbeat_at IS NOT NULL
-                          AND last_heartbeat_at < NOW() - (:freshness_seconds::TEXT || ' seconds')::INTERVAL
+                          AND last_heartbeat_at < NOW() - (CAST(:freshness_seconds AS TEXT) || ' seconds')::INTERVAL
                         )
                         OR (
                           last_heartbeat_at IS NULL
                           AND worker_session_claimed_at IS NOT NULL
-                          AND worker_session_claimed_at < NOW() - (:claimed_without_heartbeat_seconds::TEXT || ' seconds')::INTERVAL
+                          AND worker_session_claimed_at < NOW() - (CAST(:claimed_without_heartbeat_seconds AS TEXT) || ' seconds')::INTERVAL
                         )
                       )
                     RETURNING *
@@ -692,12 +692,12 @@ class SqlAlchemyAlgoWorkerRepository:
                       AND (
                         (
                           r.last_heartbeat_at IS NOT NULL
-                          AND r.last_heartbeat_at < NOW() - (:stale_seconds::TEXT || ' seconds')::INTERVAL
+                          AND r.last_heartbeat_at < NOW() - (CAST(:stale_seconds AS TEXT) || ' seconds')::INTERVAL
                         )
                         OR (
                           r.last_heartbeat_at IS NULL
                           AND r.worker_session_claimed_at IS NOT NULL
-                          AND r.worker_session_claimed_at < NOW() - (:claimed_without_heartbeat_seconds::TEXT || ' seconds')::INTERVAL
+                          AND r.worker_session_claimed_at < NOW() - (CAST(:claimed_without_heartbeat_seconds AS TEXT) || ' seconds')::INTERVAL
                         )
                       )
                     ORDER BY COALESCE(r.updated_at, r.created_at) ASC
