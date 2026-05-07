@@ -14,8 +14,8 @@ import logging
 from datetime import date
 from typing import Dict, List, Optional, Tuple, Any
 
-from broker_api.instruments_repository import InstrumentsRepository
-from broker_api.options_sessions import OptionsSessionManager
+from broker_api.instruments.instruments_repository import InstrumentsRepository
+from broker_api.options.options_sessions import OptionsSessionManager
 
 logger = logging.getLogger(__name__)
 

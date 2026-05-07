@@ -20,7 +20,7 @@ from auth_service import (
     verify_app_credentials,
 )
 from broker_api import broker_api
-from broker_api.kite_session import KiteSession
+from broker_api.session.kite_session import KiteSession
 from database import get_db
 from strategies.option_strategy.store import OptionStrategyStore
 from runtime_monitor import get_components, get_logs, get_meta

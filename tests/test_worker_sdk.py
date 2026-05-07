@@ -9,7 +9,7 @@ import pytest
 from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs(stub_kite_orders=False)
-sys.modules.pop("broker_api.kite_orders", None)
+sys.modules.pop("broker_api.orders", None)
 
 SDK_ROOT = Path(__file__).resolve().parents[1] / "sdk" / "python"
 if str(SDK_ROOT) not in sys.path:
@@ -62,7 +62,7 @@ from kite_algo_worker import (  # noqa: E402
     warmup_history,
 )
 import kite_algo_worker as kite_algo_worker_pkg  # noqa: E402
-from broker_api.kite_orders import PlaceOrderRequest  # noqa: E402
+from broker_api.orders import PlaceOrderRequest  # noqa: E402
 from scripts.sdk_worker_certification import main as sdk_worker_certification_main  # noqa: E402
 
 

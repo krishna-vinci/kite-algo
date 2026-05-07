@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
@@ -9,45 +8,11 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
-from broker_api.worker_timeline import worker_timeline_store
+from broker_api.timeline.worker_timeline import worker_timeline_store
+from shared.serialization import _json_dumps, _json_loads, _row_mapping, _to_int
 
 
 TERMINAL_LEG_STATES = {"submit_failed", "filled", "cancelled", "rejected", "partial_terminal"}
-
-
-def _json_dumps(value: Any) -> str:
-    return json.dumps(value, default=str)
-
-
-def _json_loads(value: Any, fallback: Any) -> Any:
-    if value in (None, ""):
-        return fallback
-    if isinstance(value, str):
-        return json.loads(value)
-    return value
-
-
-def _row_mapping(row: Any) -> Dict[str, Any]:
-    if row is None:
-        return {}
-    if hasattr(row, "_mapping"):
-        return dict(row._mapping)
-    if isinstance(row, dict):
-        return dict(row)
-    return {
-        key: getattr(row, key)
-        for key in dir(row)
-        if not key.startswith("_") and not callable(getattr(row, key))
-    }
-
-
-def _to_int(value: Any, default: int = 0) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except Exception:
-        return default
 
 
 def normalize_leg_state(*, broker_status: str, filled_quantity: int, requested_quantity: int) -> str:

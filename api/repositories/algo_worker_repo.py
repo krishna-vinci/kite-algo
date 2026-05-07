@@ -5,18 +5,18 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from broker_api.redis_events import publish_event
-from broker_api.worker_timeline import worker_timeline_store
+from broker_api.core.redis_events import publish_event
+from broker_api.timeline.worker_timeline import worker_timeline_store
 from database import SessionLocal
 from shared.serialization import _hash_token, _json_dumps, _json_loads, _row_mapping, _to_float, _to_int, _utcnow
 
-if False:  # pragma: no cover
-    from api.routers.algo_workers import WorkerHeartbeatRequest, WorkerIntentRequest, WorkerRunCreateRequest, WorkerTokenCreateRequest
+if TYPE_CHECKING:  # pragma: no cover
+    from api.schemas.worker import WorkerHeartbeatRequest, WorkerIntentRequest, WorkerRunCreateRequest, WorkerTokenCreateRequest
 
 WORKER_SESSION_FRESHNESS_SECONDS = int(os.getenv("WORKER_SESSION_FRESHNESS_SECONDS", "60"))
 WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS = int(

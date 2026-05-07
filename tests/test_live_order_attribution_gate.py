@@ -6,10 +6,10 @@ from fastapi import HTTPException
 from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs(stub_kite_orders=False)
-sys.modules.pop("broker_api.kite_orders", None)
+sys.modules.pop("broker_api.orders", None)
 
-from broker_api.kite_orders import Exchange, OrderType, PlaceOrderRequest, Product, TransactionType, Validity, Variety
-from broker_api.live_order_intents import validate_live_order_attribution
+from broker_api.orders import Exchange, OrderType, PlaceOrderRequest, Product, TransactionType, Validity, Variety
+from broker_api.orders.live_order_intents import validate_live_order_attribution
 
 
 class LiveOrderAttributionGateTests(unittest.TestCase):

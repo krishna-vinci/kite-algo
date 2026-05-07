@@ -464,7 +464,7 @@ class ControlPlaneRouterTests(unittest.TestCase):
         }
 
         with patch("api.routers.control.require_app_user", new=_require_user), patch(
-            "broker_api.kite_orders.reconcile_realtime_positions", new=AsyncMock(side_effect=_fake_reconcile), create=True
+            "broker_api.orders.reconcile_realtime_positions", new=AsyncMock(side_effect=_fake_reconcile), create=True
         ) as reconcile_mock:
             client = TestClient(app)
             response = client.post("/control/reconcile")

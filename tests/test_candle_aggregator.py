@@ -5,7 +5,7 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs(stub_kite_orders=False)
 
-from broker_api.candle_aggregator import CandleAggregator
+from broker_api.market.candle_aggregator import CandleAggregator
 
 
 class _FakeRedis:

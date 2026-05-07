@@ -9,7 +9,7 @@ from kiteconnect import KiteConnect
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .kite_orders import get_correlation_id, run_kite_write_action
-from .kite_session import get_kite
+from broker_api.session.kite_session import get_kite
 
 
 logger = logging.getLogger(__name__)

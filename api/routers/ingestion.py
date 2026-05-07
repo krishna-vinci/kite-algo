@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from broker_api.index_ingestion import (
+from broker_api.instruments.index_ingestion import (
     NIFTY50_MANUAL_BASELINES,
     NIFTYBANK_MANUAL_BASELINES,
     SOURCE_LIST_NIFTY50,

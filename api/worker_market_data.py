@@ -11,8 +11,8 @@ from fastapi import HTTPException, Request, WebSocket
 from pydantic import BaseModel, Field, field_validator
 
 from algo_runtime.models import CandleSeriesSpec
-from broker_api.instruments_repository import InstrumentsRepository
-from broker_api.market_runtime_client import RUNTIME_TICKS_CHANNEL
+from broker_api.instruments.instruments_repository import InstrumentsRepository
+from broker_api.orders.market_runtime_client import RUNTIME_TICKS_CHANNEL
 
 
 VALID_MARKET_MODES = {"ltp", "quote", "full"}
@@ -277,8 +277,8 @@ class WorkerMarketDataService:
         of letting external workers call broker APIs or database internals directly.
         """
 
-        from broker_api.candle_ingestion import CandleIngestion
-        from broker_api.candle_storage import CandleStorage, IST
+        from broker_api.market.candle_ingestion import CandleIngestion
+        from broker_api.market.candle_storage import CandleStorage, IST
 
         instrument = await self._resolve_one(symbol=symbol, instrument_token=instrument_token)
         interval = normalize_timeframe(timeframe)
@@ -588,7 +588,7 @@ class WorkerMarketDataService:
         return value
 
     async def _get_system_kite_client(self) -> Any:
-        from broker_api.candles_api import get_kite_db
+        from broker_api.market.candles_api import get_kite_db
         from database import SessionLocal
 
         db = SessionLocal()

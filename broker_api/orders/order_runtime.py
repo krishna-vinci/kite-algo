@@ -4,7 +4,6 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from kiteconnect import KiteConnect
@@ -14,11 +13,12 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal, engine
 from journaling.live_projector import LiveJournalProjector
-from .redis_events import get_redis, publish_event, pubsub_iter
-from .kite_session import KiteSession, get_session_account_id, make_account_id
+from shared.serialization import _to_float, _to_int
+from broker_api.core.redis_events import get_redis, publish_event, pubsub_iter
+from broker_api.session.kite_session import KiteSession, get_session_account_id, make_account_id
 from .basket_execution import BasketExecutionStore, basket_execution_store
 from .bracket_runtime import BracketRuntimeStore, bracket_runtime_store
-from .worker_execution_links import WorkerExecutionLinksStore, worker_execution_links_store
+from broker_api.orders.worker_execution_links import WorkerExecutionLinksStore, worker_execution_links_store
 
 
 logger = logging.getLogger(__name__)
@@ -35,26 +35,6 @@ TERMINAL_ORDER_STATUSES = {
 EVENT_PROCESSOR_LOCK_ID = 87234101
 POSITION_RECONCILE_LOCK_ID = 87234102
 _ORDER_RUNTIME_SCHEMA_COMPAT_READY = False
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    if isinstance(value, Decimal):
-        return float(value)
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
-def _to_int(value: Any, default: int = 0) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except Exception:
-        return default
 
 
 def _parse_timestamp(value: Any) -> datetime:

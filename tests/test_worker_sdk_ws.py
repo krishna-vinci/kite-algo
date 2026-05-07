@@ -6,7 +6,7 @@ from pathlib import Path
 from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs(stub_kite_orders=False)
-sys.modules.pop("broker_api.kite_orders", None)
+sys.modules.pop("broker_api.orders", None)
 
 
 def _install_websockets_stub(routes):

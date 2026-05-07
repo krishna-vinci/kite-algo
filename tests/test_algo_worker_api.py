@@ -18,75 +18,14 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.routers.algo_workers import (  # noqa: E402
-    DEFAULT_WORKER_ACTIONS,
-    WorkerIntentRequest,
-    WorkerInstrumentResolveRequest,
-    WorkerMarketSnapshotRequest,
-    WorkerQuoteRequest,
-    get_worker_order,
-    get_worker_order_history,
-    get_worker_market_candles,
-    get_worker_run,
-    get_worker_run_safety_check,
-    get_worker_market_history,
-    get_worker_run_pnl,
-    get_worker_funds,
-    get_worker_run_funds,
-    get_worker_market_snapshot,
-    get_worker_market_quotes,
-    list_worker_orders,
-    list_worker_trades,
-    cancel_worker_order,
-    claim_worker_run_session,
-    preview_worker_order,
-    WorkerOrderActionRequest,
-    WorkerOrderPreviewRequest,
-    WorkerBasketPreviewRequest,
-    preview_worker_basket,
-    WorkerRiskPatchRequest,
-    WorkerProtectionPatchRequest,
-    WorkerRunCreateRequest,
-    WorkerTokenCreateRequest,
-    create_worker_run,
-    create_worker_token,
-    patch_worker_run_risk,
-    patch_worker_run_protection,
-    release_worker_run_session,
-    heartbeat_worker_run_session,
-    exit_worker_run,
-    resolve_worker_market_ticker,
-    resolve_worker_market_tickers,
-    stream_worker_market_candles,
-    stream_worker_market_ticks,
-    stream_worker_run_pnl,
-    list_worker_baskets,
-    get_worker_basket,
-    list_worker_timeline,
-    stream_worker_timeline,
-    list_worker_execution_events,
-    stream_worker_execution_events,
-    create_worker_decision_event,
-    create_worker_gtt_trigger,
-    WorkerDecisionEventRequest,
-    delete_worker_gtt_trigger,
-    create_worker_bracket,
-    get_worker_gtt,
-    list_worker_brackets,
-    list_worker_gtts,
-    get_worker_bracket,
-    modify_worker_gtt_trigger,
-    cancel_worker_bracket,
-    submit_worker_intent,
-    WorkerBracketCreateRequest,
-    WorkerExitRequest,
-    worker_ticks_ws,
-    worker_candles_ws,
-    worker_run_pnl_ws,
-    router,
-)
+from api.routers.worker_auth import *  # noqa: E402,F403
+from api.routers.worker_market import *  # noqa: E402,F403
+from api.routers.worker_execution import *  # noqa: E402,F403
+from api.routers.worker_protection import *  # noqa: E402,F403
+from api.routers.worker_shared import DEFAULT_WORKER_ACTIONS  # noqa: E402
+from api.worker_market_data import WorkerInstrumentResolveRequest, WorkerMarketSnapshotRequest, WorkerQuoteRequest  # noqa: E402
 from api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository, WorkerToken  # noqa: E402
-from api.routers.algo_workers import _hash_token  # noqa: E402
+from shared.serialization import _hash_token  # noqa: E402
 from api.worker_market_data import WorkerMarketDataService  # noqa: E402
 from sqlalchemy import create_engine, event, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
@@ -1874,7 +1813,7 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.status_code, 409)
 
     async def test_live_worker_intent_routes_through_live_order_service_with_attribution(self):
-        sys.modules.pop("broker_api.kite_orders", None)
+        sys.modules.pop("broker_api.orders", None)
         token = WorkerToken(
             token_id="worker-live",
             name="live-worker",
@@ -4426,7 +4365,7 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
             "api.routers.algo_workers.asyncio.to_thread",
             _run_to_thread_inline,
         ), patch(
-            "broker_api.kite_orders.gtt_service.place_gtt",
+            "broker_api.orders.gtt_service.place_gtt",
             AsyncMock(return_value=SimpleNamespace(model_dump=lambda mode="json": {"trigger_id": 321})),
         ):
             response = await create_worker_gtt_trigger(request, payload)
@@ -4453,7 +4392,7 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
             "api.routers.algo_workers.asyncio.to_thread",
             _run_to_thread_inline,
         ), patch(
-            "broker_api.kite_orders.gtt_service.get_gtt",
+            "broker_api.orders.gtt_service.get_gtt",
             side_effect=HTTPException(status_code=404, detail="GTT trigger 999 not found"),
         ):
             with self.assertRaises(HTTPException) as exc:
@@ -4501,7 +4440,7 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
             "api.routers.algo_workers.asyncio.to_thread",
             _run_to_thread_inline,
         ), patch(
-            "broker_api.kite_orders.gtt_service.modify_gtt",
+            "broker_api.orders.gtt_service.modify_gtt",
             AsyncMock(side_effect=HTTPException(status_code=503, detail="Provider timeout or downtime.")),
         ):
             with self.assertRaises(HTTPException) as exc:

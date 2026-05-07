@@ -10,7 +10,7 @@ import psycopg2.extras
 import requests
 
 from database import SessionLocal, get_db_connection
-from broker_api.kite_session import build_kite_client, get_system_access_token
+from broker_api.session.kite_session import build_kite_client, get_system_access_token
 
 
 logger = logging.getLogger(__name__)

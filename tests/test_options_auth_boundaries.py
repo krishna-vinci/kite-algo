@@ -7,7 +7,8 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
-from api.routers.algo_workers import _hash_token, require_worker_token
+from shared.serialization import _hash_token
+from api.routers.worker_shared import require_worker_token
 from options.api.execution_router import router as execution_router
 from options.api.market_router import get_options_session_manager, router as market_router
 from options.api.protection_router import router as protection_router

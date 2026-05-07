@@ -10,7 +10,8 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.routers.algo_workers import require_worker_token, router as algo_workers_router
+from api.routers.worker_shared import require_worker_token
+from api.routers.worker_auth import router as algo_workers_router
 from options.api.execution_router import get_option_execution_runtime_instance
 from options.api.execution_router import router as options_execution_router
 from options.api.market_router import router as options_market_router
@@ -269,7 +270,7 @@ def test_worker_option_enter_rejects_stale_safety_token(monkeypatch):
     }
     monkeypatch.setenv("WORKER_SAFETY_TOKEN_SECRET", "secret-key")
 
-    from api.routers import algo_workers as algo_workers_module
+    from api.routers import worker_protection as algo_workers_module
 
     async def _fresh_snapshot(_request, _run_id):
         return {
@@ -330,7 +331,7 @@ def test_worker_option_exit_rejects_stale_safety_token_before_state_mutation(mon
     }
     monkeypatch.setenv("WORKER_SAFETY_TOKEN_SECRET", "secret-key")
 
-    from api.routers import algo_workers as algo_workers_module
+    from api.routers import worker_protection as algo_workers_module
 
     async def _fresh_snapshot(_request, _run_id):
         return {

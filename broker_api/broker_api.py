@@ -39,7 +39,7 @@ from auth_service import require_app_user
 from database import database
 
 from .kite_auth import login_headless
-from .kite_session import (
+from broker_api.session.kite_session import (
     KiteSession,
     build_kite_client,
     get_kite,
@@ -89,7 +89,7 @@ historical_data_update_progress = {
     "error": None,
 }
 
-from broker_api.kite_auth import API_KEY
+from broker_api.session.kite_auth import API_KEY
 
 
 

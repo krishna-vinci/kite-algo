@@ -13,8 +13,8 @@ from api.control_plane import (
     exit_control_strategy,
 )
 from auth_service import require_app_user
-from broker_api.kite_orders import get_correlation_id
-from broker_api.kite_session import get_kite, get_kite_session_id, get_session_account_id
+from broker_api.orders import get_correlation_id
+from broker_api.session.kite_session import get_kite, get_kite_session_id, get_session_account_id
 from database import get_db
 
 
@@ -73,6 +73,6 @@ async def reconcile_control_plane(
     corr_id: str = Depends(get_correlation_id),
 ):
     require_app_user(request)
-    from broker_api.kite_orders import reconcile_realtime_positions
+    from broker_api.orders import reconcile_realtime_positions
 
     return await reconcile_realtime_positions(request, kite=kite, db=db, corr_id=corr_id)

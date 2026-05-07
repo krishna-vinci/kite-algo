@@ -23,8 +23,8 @@ from .candle_storage import CandleStorage, IST
 from .candle_aggregator import get_aggregator, SUPPORTED_INTERVALS
 from .candle_ingestion import CandleIngestion, IngestionScheduler
 from .kite_auth import API_KEY
-from .kite_session import KiteSession, build_kite_client
-from .instruments_repository import InstrumentsRepository
+from broker_api.session.kite_session import KiteSession, build_kite_client
+from broker_api.instruments.instruments_repository import InstrumentsRepository
 from database import get_db, get_db_connection
 
 logger = logging.getLogger(__name__)
@@ -360,7 +360,7 @@ async def stream_candles(
     Client can reconnect using Last-Event-ID for seamless recovery.
     """
     from fastapi.responses import StreamingResponse
-    from .redis_events import get_redis, pubsub_iter
+    from broker_api.core.redis_events import get_redis, pubsub_iter
     
     instrument_token = await resolve_identifier(identifier, db)
     interval = normalize_timeframe(timeframe)

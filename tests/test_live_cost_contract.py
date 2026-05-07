@@ -6,9 +6,9 @@ from unittest.mock import Mock
 from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs(stub_kite_orders=False)
-sys.modules.pop("broker_api.kite_orders", None)
+sys.modules.pop("broker_api.orders", None)
 
-from broker_api.kite_orders import Exchange, OrderType, Product, Trade, TransactionType, Variety
+from broker_api.orders import Exchange, OrderType, Product, Trade, TransactionType, Variety
 from execution_accounting.kite_costs import build_live_basket_cost_contract, build_live_order_cost_contract
 
 

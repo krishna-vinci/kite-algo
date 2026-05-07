@@ -13,8 +13,8 @@ if "broker_api.broker_api" not in sys.modules:
     broker_api.get_kite = lambda: None
     sys.modules["broker_api.broker_api"] = broker_api
 
-if "broker_api.kite_orders" in sys.modules:
-    sys.modules["broker_api.kite_orders"].realtime_positions_service = types.SimpleNamespace(
+if "broker_api.orders" in sys.modules:
+    sys.modules["broker_api.orders"].realtime_positions_service = types.SimpleNamespace(
         get_positions=AsyncMock(return_value={}),
         initialize_positions=AsyncMock(return_value={}),
     )

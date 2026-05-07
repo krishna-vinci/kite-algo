@@ -5,7 +5,7 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs(stub_kite_orders=False)
 
-from broker_api.kite_orders import (
+from broker_api.orders import (
     ConvertPositionRequest,
     Exchange,
     OrdersService,
@@ -42,7 +42,7 @@ class ConvertPositionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "broker_api.kite_orders.run_kite_write_action",
+            "broker_api.orders.run_kite_write_action",
             AsyncMock(return_value=True),
         ) as run_action:
             response = await service.convert_position(kite, req, corr_id="corr-1")

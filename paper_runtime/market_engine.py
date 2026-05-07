@@ -7,7 +7,7 @@ from time import monotonic
 from typing import Any, Dict
 from uuid import uuid4
 
-from broker_api.redis_events import get_redis
+from broker_api.core.redis_events import get_redis
 from runtime_monitor import heartbeat, set_component_status
 
 

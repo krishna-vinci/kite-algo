@@ -9,8 +9,8 @@ from urllib.parse import quote
 import httpx
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from broker_api.order_runtime import order_event_runtime
-from broker_api.redis_events import get_redis, publish_event
+from broker_api.orders.order_runtime import order_event_runtime
+from broker_api.core.redis_events import get_redis, publish_event
 
 
 logger = logging.getLogger(__name__)

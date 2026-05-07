@@ -8,8 +8,8 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from broker_api.instruments_repository import InstrumentsRepository
-from broker_api.order_runtime import (
+from broker_api.instruments.instruments_repository import InstrumentsRepository
+from broker_api.orders.order_runtime import (
     CanonicalOrderEventRuntime,
     RealTimePositionsService,
     _acquire_advisory_lock_session,

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from api.worker_protection import evaluate_backend_protection, validate_backend_protection_payload
-from broker_api.redis_events import publish_event
+from broker_api.core.redis_events import publish_event
 
 
 def _utcnow() -> datetime:
@@ -342,7 +342,7 @@ class WorkerProtectionRuntime:
 
 
 async def load_worker_run_pnl_for_protection(request: Any, run: Dict[str, Any]) -> Dict[str, Any]:
-    from api.routers.algo_workers import _build_worker_run_pnl_snapshot
+    from api.routers.worker_protection import _build_worker_run_pnl_snapshot
 
     return await _build_worker_run_pnl_snapshot(request, run)
 

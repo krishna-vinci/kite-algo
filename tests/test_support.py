@@ -103,8 +103,8 @@ def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
         sys.modules["redis.asyncio"] = redis_asyncio
         sys.modules["redis.exceptions"] = redis_exceptions
 
-    if stub_kite_orders and "broker_api.kite_orders" not in sys.modules:
-        kite_orders = types.ModuleType("broker_api.kite_orders")
+    if stub_kite_orders and "broker_api.orders" not in sys.modules:
+        kite_orders = types.ModuleType("broker_api.orders")
 
         try:
             from pydantic import BaseModel
@@ -153,7 +153,7 @@ def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
         kite_orders.ChargesOrderInput = ChargesOrderInput
         kite_orders.OrderMarginInput = OrderMarginInput
         kite_orders.OrdersService = OrdersService
-        sys.modules["broker_api.kite_orders"] = kite_orders
+        sys.modules["broker_api.orders"] = kite_orders
 
     if "broker_api.kite_session" not in sys.modules:
         kite_session = types.ModuleType("broker_api.kite_session")

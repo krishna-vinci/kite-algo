@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
@@ -13,6 +12,7 @@ from sqlalchemy import text
 
 from database import SessionLocal
 from execution_accounting.contracts import OrderAttribution
+from shared.serialization import _json_dumps
 
 
 def _json_default(value: Any) -> Any:
@@ -25,10 +25,6 @@ def _json_default(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
-
-
-def _json_dumps(value: Any) -> str:
-    return json.dumps(value, default=_json_default)
 
 
 def make_client_order_ref(strategy_run_id: str) -> str:

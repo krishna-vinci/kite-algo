@@ -8,7 +8,7 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from broker_api.worker_timeline import WorkerTimelineStore
+from broker_api.timeline.worker_timeline import WorkerTimelineStore
 
 
 def _sqlite_timeline_store() -> tuple[WorkerTimelineStore, sessionmaker]:

@@ -6,7 +6,8 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.routers.algo_workers import DEFAULT_WORKER_ACTIONS, WorkerToken, _assert_run_access  # noqa: E402
+from api.repositories.algo_worker_repo import WorkerToken  # noqa: E402
+from api.routers.worker_shared import DEFAULT_WORKER_ACTIONS, _assert_run_access  # noqa: E402
 
 
 class WorkerRunAccessTests(unittest.TestCase):

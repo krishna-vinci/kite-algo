@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from api.routers.algo_workers import (
+from api.routers.worker_protection import (
     observe_worker_option_protection_timeline_state,
+    validate_worker_run_safety_token,
+)
+from api.routers.worker_shared import (
     _repo,
     require_active_worker_run_session,
     require_worker_token,
-    validate_worker_run_safety_token,
 )
 from options.api.execution_router import (
     create_option_run,

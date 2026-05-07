@@ -4,7 +4,7 @@ from decimal import Decimal
 from decimal import InvalidOperation
 from typing import Any, Iterable, Mapping
 
-from broker_api.kite_orders import ChargesOrderInput, OrderMarginInput
+from broker_api.orders import ChargesOrderInput, OrderMarginInput
 
 from .contracts import ChargesStatus, ExecutionCostContract
 

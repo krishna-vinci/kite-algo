@@ -6,7 +6,7 @@ try:
     from redis.asyncio import from_url as redis_from_url
     from sqlalchemy import text
 
-    from broker_api.order_runtime import CanonicalOrderEventRuntime, RealTimePositionsService
+    from broker_api.orders.order_runtime import CanonicalOrderEventRuntime, RealTimePositionsService
     from tests.runtime_support import (
         TEST_REDIS_URL,
         apply_schema,

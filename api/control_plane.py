@@ -273,7 +273,7 @@ async def _worker_strategy_rows(request: Any, *, broker_account_id: Optional[str
 
 async def _worker_pnl_or_empty(request: Any, run: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        from api.routers.algo_workers import _build_worker_run_pnl_snapshot
+        from api.routers.worker_protection import _build_worker_run_pnl_snapshot
 
         return await _build_worker_run_pnl_snapshot(request, run)
     except Exception:
@@ -457,7 +457,9 @@ async def _paper_strategy_exists(service: Any, *, account_scope: str, strategy_r
 
 
 async def _exit_worker_control_strategy(request: Any, run: Dict[str, Any], *, reason: Optional[str], dry_run: bool, idempotency_key: Optional[str] = None) -> Dict[str, Any]:
-    from api.routers.algo_workers import WorkerExitRequest, WorkerToken, _exit_live_worker_run
+    from api.schemas.worker import WorkerExitRequest
+    from api.repositories.algo_worker_repo import WorkerToken
+    from api.routers.worker_execution import _exit_live_worker_run
 
     mode = str(run.get("execution_mode") or "paper").lower()
     strategy_run_id = str(run.get("strategy_run_id"))

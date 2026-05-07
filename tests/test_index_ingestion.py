@@ -4,7 +4,7 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from broker_api.index_ingestion import (
+from broker_api.instruments.index_ingestion import (
     NIFTY50_MANUAL_BASELINES,
     NIFTYBANK_MANUAL_BASELINES,
     SOURCE_LIST_NIFTY50,
