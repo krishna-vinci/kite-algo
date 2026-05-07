@@ -17,3 +17,11 @@ def test_schema_has_basket_execution_tables_and_links():
     assert "CREATE TABLE IF NOT EXISTS public.worker_execution_events" in schema
     assert "ADD COLUMN IF NOT EXISTS basket_execution_id TEXT" in schema
     assert "ADD COLUMN IF NOT EXISTS basket_leg_index INTEGER" in schema
+
+
+def test_schema_has_worker_execution_links_and_bracket_tables():
+    schema = Path("schema.sql").read_text()
+    assert "CREATE TABLE IF NOT EXISTS public.worker_live_execution_links" in schema
+    assert "CREATE TABLE IF NOT EXISTS public.bracket_intents" in schema
+    assert "CREATE TABLE IF NOT EXISTS public.bracket_actions" in schema
+    assert "ADD COLUMN IF NOT EXISTS bracket_intent_id TEXT" in schema

@@ -44,6 +44,22 @@ class FakeRecoveryRepo:
         self.run["runtime_state"] = dict(runtime_state)
         return dict(self.run)
 
+    async def has_worker_execution_links(self, *, strategy_run_id, account_id):
+        _ = (strategy_run_id, account_id)
+        return bool(self.run.get("has_worker_execution_links"))
+
+    async def has_unresolved_worker_execution(self, *, strategy_run_id, account_id):
+        _ = (strategy_run_id, account_id)
+        return bool(self.run.get("has_unresolved_worker_execution"))
+
+    async def has_active_bracket_intent(self, *, strategy_run_id):
+        _ = strategy_run_id
+        return bool(self.run.get("has_active_bracket_intent"))
+
+    async def has_pending_bracket_actions(self, *, strategy_run_id):
+        _ = strategy_run_id
+        return bool(self.run.get("has_pending_bracket_actions"))
+
 
 def test_stale_paper_run_without_backend_protection_is_exited():
     repo = FakeRecoveryRepo(
@@ -133,6 +149,7 @@ def test_exiting_live_run_defers_when_active_basket_exists():
     repo = FakeRecoveryRepo(
         run={
             "strategy_run_id": "run-live",
+            "account_scope": "kite:AB1234",
             "execution_mode": "live",
             "status": "exiting",
             "runtime_state": {},
@@ -153,3 +170,60 @@ def test_exiting_live_run_defers_when_active_basket_exists():
     assert result["stalled"] == 1
     assert repo.updated_statuses[-1] == ("run-live", "exiting")
     assert repo.run["runtime_state"]["runtime_recovery"]["reason"] == "active_basket_execution"
+
+
+def test_settlement_status_defers_before_broker_refresh_when_active_bracket_exists():
+    repo = FakeRecoveryRepo(
+        run={
+            "strategy_run_id": "run-live",
+            "execution_mode": "live",
+            "status": "exiting",
+            "account_scope": "kite:AB1234",
+            "runtime_state": {},
+            "has_active_bracket_intent": True,
+        }
+    )
+    loader = AsyncMock(return_value={"is_flat": True})
+    service = WorkerRuntimeRecoveryService(
+        repo=repo,
+        now_fn=lambda: dt("2026-05-06T09:10:00Z"),
+        stale_action_seconds=180,
+        claimed_without_heartbeat_seconds=120,
+        paper_exit_submitter=AsyncMock(),
+        live_flatness_loader=loader,
+    )
+
+    result = asyncio.run(service.recover_exiting_runs_once())
+
+    assert result["stalled"] == 1
+    assert repo.run["runtime_state"]["runtime_recovery"]["reason"] == "active_bracket_intent"
+    loader.assert_not_called()
+
+
+def test_settlement_status_defers_when_unresolved_execution_links_exist():
+    repo = FakeRecoveryRepo(
+        run={
+            "strategy_run_id": "run-live",
+            "execution_mode": "live",
+            "status": "exiting",
+            "account_scope": "kite:AB1234",
+            "runtime_state": {},
+            "has_worker_execution_links": True,
+            "has_unresolved_worker_execution": True,
+        }
+    )
+    loader = AsyncMock(return_value={"is_flat": True})
+    service = WorkerRuntimeRecoveryService(
+        repo=repo,
+        now_fn=lambda: dt("2026-05-06T09:10:00Z"),
+        stale_action_seconds=180,
+        claimed_without_heartbeat_seconds=120,
+        paper_exit_submitter=AsyncMock(),
+        live_flatness_loader=loader,
+    )
+
+    result = asyncio.run(service.recover_exiting_runs_once())
+
+    assert result["stalled"] == 1
+    assert repo.run["runtime_state"]["runtime_recovery"]["reason"] == "unresolved_execution_links"
+    loader.assert_not_called()

@@ -1159,6 +1159,9 @@ ALTER TABLE public.live_order_intents
   ADD COLUMN IF NOT EXISTS basket_execution_id TEXT,
   ADD COLUMN IF NOT EXISTS basket_leg_index INTEGER;
 
+ALTER TABLE public.live_order_intents
+  ADD COLUMN IF NOT EXISTS bracket_intent_id TEXT;
+
 CREATE UNIQUE INDEX IF NOT EXISTS ux_live_order_intents_client_order_ref
   ON public.live_order_intents (client_order_ref);
 
@@ -1170,6 +1173,67 @@ CREATE INDEX IF NOT EXISTS idx_live_order_intents_strategy
 
 CREATE INDEX IF NOT EXISTS idx_live_order_intents_account_order_basket
   ON public.live_order_intents (account_id, broker_order_id, basket_execution_id);
+
+CREATE TABLE IF NOT EXISTS public.worker_live_execution_links (
+  link_id BIGSERIAL PRIMARY KEY,
+  strategy_run_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  broker_order_id TEXT NOT NULL,
+  trade_id TEXT,
+  client_order_ref TEXT,
+  basket_execution_id TEXT,
+  basket_leg_index INTEGER,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_exec_links_order
+  ON public.worker_live_execution_links (account_id, broker_order_id)
+  WHERE trade_id IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_exec_links_trade
+  ON public.worker_live_execution_links (account_id, trade_id)
+  WHERE trade_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_worker_exec_links_run
+  ON public.worker_live_execution_links (strategy_run_id, account_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.bracket_intents (
+  bracket_intent_id TEXT PRIMARY KEY,
+  strategy_run_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  entry_basket_execution_id TEXT,
+  status TEXT NOT NULL,
+  action_required BOOLEAN NOT NULL DEFAULT FALSE,
+  action_reason TEXT,
+  config_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  closed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_bracket_intents_run_status
+  ON public.bracket_intents (strategy_run_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.bracket_actions (
+  action_id TEXT PRIMARY KEY,
+  bracket_intent_id TEXT NOT NULL REFERENCES public.bracket_intents(bracket_intent_id) ON DELETE CASCADE,
+  strategy_run_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  action_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TIMESTAMPTZ,
+  claimed_at TIMESTAMPTZ,
+  payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  error_json JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_bracket_actions_pending
+  ON public.bracket_actions (status, next_attempt_at, created_at);
 
 CREATE TABLE IF NOT EXISTS public.journal_source_links (
     id BIGSERIAL PRIMARY KEY,

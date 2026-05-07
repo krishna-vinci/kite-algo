@@ -77,6 +77,73 @@ async def load_live_run_flatness(request: Any, run: Dict[str, Any]) -> Dict[str,
     }
 
 
+async def evaluate_worker_run_settlement_status(
+    *,
+    run: Dict[str, Any],
+    repo: Any,
+    broker_flatness_loader: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]],
+    active_basket_loader: Optional[Callable[[str], bool]] = None,
+) -> Dict[str, Any]:
+    strategy_run_id = str(run.get("strategy_run_id") or "")
+    account_id = str(run.get("account_scope") or "")
+
+    # Phase 1 DB guards are additive safety for modern worker runs.
+    # If identity fields are missing (legacy run), skip guards and
+    # fall through to broker flatness so existing recovery behavior
+    # does not regress.
+    have_identity = bool(strategy_run_id and account_id)
+
+    if have_identity and (active_basket_loader and active_basket_loader(strategy_run_id)):
+        return {
+            "closable": False,
+            "reason": "active_basket_execution",
+            "details": {"active_basket_execution": True},
+        }
+
+    if have_identity:
+        has_active_bracket_intent = getattr(repo, "has_active_bracket_intent", None)
+        if has_active_bracket_intent and await has_active_bracket_intent(strategy_run_id=strategy_run_id):
+            return {
+                "closable": False,
+                "reason": "active_bracket_intent",
+                "details": {"active_bracket_intent": True},
+            }
+
+        has_pending_bracket_actions = getattr(repo, "has_pending_bracket_actions", None)
+        if has_pending_bracket_actions and await has_pending_bracket_actions(strategy_run_id=strategy_run_id):
+            return {
+                "closable": False,
+                "reason": "pending_bracket_action",
+                "details": {"pending_bracket_action": True},
+            }
+
+    has_links = False
+    if have_identity:
+        has_worker_execution_links = getattr(repo, "has_worker_execution_links", None)
+        has_unresolved_worker_execution = getattr(repo, "has_unresolved_worker_execution", None)
+        has_links = (
+            await has_worker_execution_links(strategy_run_id=strategy_run_id, account_id=account_id)
+            if has_worker_execution_links
+            else False
+        )
+        if has_links and has_unresolved_worker_execution and await has_unresolved_worker_execution(strategy_run_id=strategy_run_id, account_id=account_id):
+            return {
+                "closable": False,
+                "reason": "unresolved_execution_links",
+                "details": {"unresolved_execution_links": True, "exact_mode": True},
+            }
+
+    # Phase 2: broker/account flatness check once DB guards clear
+    flatness = await broker_flatness_loader(run)
+    is_flat = bool((flatness or {}).get("is_flat"))
+    return {
+        "closable": is_flat,
+        "reason": "flat" if is_flat else str((flatness or {}).get("reason") or "live_exposure_not_flat"),
+        "details": dict(flatness or {}),
+        "exact_mode": has_links,
+    }
+
+
 class WorkerRuntimeRecoveryService:
     def __init__(
         self,
@@ -217,24 +284,13 @@ class WorkerRuntimeRecoveryService:
                     result["closed"] += 1
                     continue
 
-                if self.active_basket_loader and self.active_basket_loader(strategy_run_id):
-                    await self.repo.update_run_status(
-                        strategy_run_id,
-                        "exiting",
-                        state_patch=_runtime_recovery_patch(
-                            run,
-                            recovery_status="stalled",
-                            action_required=True,
-                            reason="active_basket_execution",
-                            details={"active_basket_execution": True},
-                        ),
-                    )
-                    result["stalled"] += 1
-                    continue
-
-                flatness = await self.live_flatness_loader(run)
-                is_flat = bool((flatness or {}).get("is_flat"))
-                if is_flat:
+                settlement = await evaluate_worker_run_settlement_status(
+                    run=run,
+                    repo=self.repo,
+                    broker_flatness_loader=self.live_flatness_loader,
+                    active_basket_loader=self.active_basket_loader,
+                )
+                if bool(settlement.get("closable")):
                     await self.repo.update_run_status(
                         strategy_run_id,
                         "closed",
@@ -242,7 +298,7 @@ class WorkerRuntimeRecoveryService:
                             run,
                             recovery_status="closed",
                             reason="exiting_live_flat_confirmed",
-                            details=flatness,
+                            details=dict(settlement.get("details") or {}),
                         ),
                     )
                     result["closed"] += 1
@@ -254,8 +310,8 @@ class WorkerRuntimeRecoveryService:
                             run,
                             recovery_status="stalled",
                             action_required=True,
-                            reason=str((flatness or {}).get("reason") or "live_exposure_not_flat"),
-                            details=flatness,
+                            reason=str(settlement.get("reason") or "live_exposure_not_flat"),
+                            details=dict(settlement.get("details") or {}),
                         ),
                     )
                     result["stalled"] += 1

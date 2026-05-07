@@ -37,6 +37,7 @@ from auth_service import require_app_user
 from database import SessionLocal
 from journaling.service import JournalService
 from broker_api.basket_execution import basket_execution_store
+from broker_api.bracket_runtime import bracket_runtime_store
 from broker_api.redis_events import get_redis
 
 
@@ -263,6 +264,14 @@ class WorkerBasketPreviewRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class WorkerBracketCreateRequest(BaseModel):
+    entry_order: Dict[str, Any] = Field(default_factory=dict)
+    stoploss: Dict[str, Any] = Field(default_factory=dict)
+    target: Optional[Dict[str, Any]] = None
+    idempotency_key: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 class WorkerRunPnlTotals(BaseModel):
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
@@ -452,6 +461,18 @@ class SqlAlchemyAlgoWorkerRepository:
 
     async def list_live_strategy_broker_positions(self, *, strategy_run_id: str, account_id: str) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(self._list_live_strategy_broker_positions_sync, strategy_run_id, account_id)
+
+    async def has_worker_execution_links(self, *, strategy_run_id: str, account_id: str) -> bool:
+        return await asyncio.to_thread(self._has_worker_execution_links_sync, strategy_run_id, account_id)
+
+    async def has_unresolved_worker_execution(self, *, strategy_run_id: str, account_id: str) -> bool:
+        return await asyncio.to_thread(self._has_unresolved_worker_execution_sync, strategy_run_id, account_id)
+
+    async def has_active_bracket_intent(self, *, strategy_run_id: str) -> bool:
+        return await asyncio.to_thread(self._has_active_bracket_intent_sync, strategy_run_id)
+
+    async def has_pending_bracket_actions(self, *, strategy_run_id: str) -> bool:
+        return await asyncio.to_thread(self._has_pending_bracket_actions_sync, strategy_run_id)
 
     async def get_intent_result(self, strategy_run_id: str, idempotency_key: str) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._get_intent_result_sync, strategy_run_id, idempotency_key)
@@ -1117,6 +1138,70 @@ class SqlAlchemyAlgoWorkerRepository:
     def _list_live_strategy_open_legs_sync(self, strategy_run_id: str, account_id: str) -> List[Dict[str, Any]]:
         db = self.session_factory()
         try:
+            has_exact_links = self._has_worker_execution_links_sync(strategy_run_id, account_id, db=db)
+            if has_exact_links:
+                rows = db.execute(
+                    text(
+                        """
+                        WITH attributed_orders AS (
+                            SELECT DISTINCT
+                                wl.account_id,
+                                wl.broker_order_id
+                            FROM public.worker_live_execution_links wl
+                            WHERE wl.strategy_run_id = :strategy_run_id
+                              AND wl.account_id = :account_id
+                              AND COALESCE(NULLIF(wl.broker_order_id, ''), '') <> ''
+                        ),
+                        leg_facts AS (
+                            SELECT
+                                CAST(NULL AS UUID) AS journal_run_id,
+                                otf.account_id,
+                                otf.instrument_token,
+                                COALESCE(NULLIF(otf.exchange, ''), COALESCE(otf.payload_json ->> 'exchange', '')) AS exchange,
+                                COALESCE(NULLIF(otf.tradingsymbol, ''), COALESCE(otf.payload_json ->> 'tradingsymbol', '')) AS tradingsymbol,
+                                COALESCE(NULLIF(otf.product, ''), COALESCE(otf.payload_json ->> 'product', '')) AS product,
+                                SUM(
+                                    CASE
+                                        WHEN UPPER(COALESCE(NULLIF(otf.transaction_type, ''), COALESCE(otf.payload_json ->> 'transaction_type', ''))) = 'BUY'
+                                            THEN otf.quantity
+                                        ELSE -otf.quantity
+                                    END
+                                ) AS net_quantity
+                            FROM public.order_trade_fills otf
+                            INNER JOIN attributed_orders ao
+                              ON ao.account_id = otf.account_id
+                             AND ao.broker_order_id = otf.order_id
+                            GROUP BY
+                                otf.account_id,
+                                otf.instrument_token,
+                                COALESCE(NULLIF(otf.exchange, ''), COALESCE(otf.payload_json ->> 'exchange', '')),
+                                COALESCE(NULLIF(otf.tradingsymbol, ''), COALESCE(otf.payload_json ->> 'tradingsymbol', '')),
+                                COALESCE(NULLIF(otf.product, ''), COALESCE(otf.payload_json ->> 'product', ''))
+                        )
+                        SELECT
+                            lf.journal_run_id,
+                            lf.account_id,
+                            lf.instrument_token,
+                            lf.exchange,
+                            lf.tradingsymbol,
+                            lf.product,
+                            lf.net_quantity,
+                            ap.net_quantity AS broker_net_quantity
+                        FROM leg_facts lf
+                        LEFT JOIN public.account_positions ap
+                          ON ap.account_id = lf.account_id
+                          AND ap.instrument_token = lf.instrument_token
+                          AND ap.product = lf.product
+                          AND ap.exchange = lf.exchange
+                          AND ap.tradingsymbol = lf.tradingsymbol
+                        WHERE lf.net_quantity <> 0
+                        ORDER BY lf.exchange, lf.tradingsymbol, lf.product
+                        """
+                    ),
+                    {"strategy_run_id": strategy_run_id, "account_id": account_id},
+                ).mappings().all()
+                return [dict(row) for row in rows]
+
             rows = db.execute(
                 text(
                     """
@@ -1202,6 +1287,38 @@ class SqlAlchemyAlgoWorkerRepository:
     def _get_live_order_attribution_refs_sync(self, strategy_run_id: str, account_id: str) -> Dict[str, List[str]]:
         db = self.session_factory()
         try:
+            has_exact_links = self._has_worker_execution_links_sync(strategy_run_id, account_id, db=db)
+            if has_exact_links:
+                rows = db.execute(
+                    text(
+                        """
+                        SELECT broker_order_id, client_order_ref
+                        FROM public.worker_live_execution_links
+                        WHERE strategy_run_id = :strategy_run_id
+                          AND account_id = :account_id
+                        """
+                    ),
+                    {"strategy_run_id": strategy_run_id, "account_id": account_id},
+                ).mappings().all()
+                broker_order_ids = sorted(
+                    {
+                        str(row.get("broker_order_id") or "").strip()
+                        for row in rows
+                        if str(row.get("broker_order_id") or "").strip()
+                    }
+                )
+                client_order_refs = sorted(
+                    {
+                        str(row.get("client_order_ref") or "").strip()
+                        for row in rows
+                        if str(row.get("client_order_ref") or "").strip()
+                    }
+                )
+                return {
+                    "broker_order_ids": broker_order_ids,
+                    "client_order_refs": client_order_refs,
+                }
+
             rows = db.execute(
                 text(
                     """
@@ -1257,6 +1374,62 @@ class SqlAlchemyAlgoWorkerRepository:
     def _list_live_strategy_broker_positions_sync(self, strategy_run_id: str, account_id: str) -> List[Dict[str, Any]]:
         db = self.session_factory()
         try:
+            has_exact_links = self._has_worker_execution_links_sync(strategy_run_id, account_id, db=db)
+            if has_exact_links:
+                rows = db.execute(
+                    text(
+                        """
+                        WITH attributed_orders AS (
+                            SELECT DISTINCT
+                                wl.account_id,
+                                wl.broker_order_id
+                            FROM public.worker_live_execution_links wl
+                            WHERE wl.strategy_run_id = :strategy_run_id
+                              AND wl.account_id = :account_id
+                              AND COALESCE(NULLIF(wl.broker_order_id, ''), '') <> ''
+                        ),
+                        attributed_instruments AS (
+                            SELECT DISTINCT
+                                osp.account_id,
+                                osp.instrument_token,
+                                osp.exchange,
+                                osp.tradingsymbol,
+                                osp.product
+                            FROM public.order_state_projection osp
+                            INNER JOIN attributed_orders ao
+                              ON ao.account_id = osp.account_id
+                             AND ao.broker_order_id = osp.order_id
+                            WHERE COALESCE(osp.instrument_token, 0) <> 0
+                              AND COALESCE(NULLIF(osp.exchange, ''), '') <> ''
+                              AND COALESCE(NULLIF(osp.tradingsymbol, ''), '') <> ''
+                              AND COALESCE(NULLIF(osp.product, ''), '') <> ''
+                        )
+                        SELECT
+                            ap.account_id,
+                            ap.instrument_token,
+                            ap.exchange,
+                            ap.tradingsymbol,
+                            ap.product,
+                            ap.net_quantity,
+                            ap.average_price,
+                            ap.last_price,
+                            ap.updated_at,
+                            ap.last_reconciled_at
+                        FROM public.account_positions ap
+                        INNER JOIN attributed_instruments ai
+                          ON ai.account_id = ap.account_id
+                         AND ai.instrument_token = ap.instrument_token
+                         AND ai.exchange = ap.exchange
+                         AND ai.tradingsymbol = ap.tradingsymbol
+                         AND ai.product = ap.product
+                        WHERE ap.net_quantity <> 0
+                        ORDER BY ap.exchange, ap.tradingsymbol, ap.product
+                        """
+                    ),
+                    {"strategy_run_id": strategy_run_id, "account_id": account_id},
+                ).mappings().all()
+                return [dict(row) for row in rows]
+
             rows = db.execute(
                 text(
                     """
@@ -1328,6 +1501,116 @@ class SqlAlchemyAlgoWorkerRepository:
                 {"strategy_run_id": strategy_run_id, "account_id": account_id},
             ).mappings().all()
             return [dict(row) for row in rows]
+        finally:
+            db.close()
+
+    def _has_worker_execution_links_sync(self, strategy_run_id: str, account_id: str, db: Optional[Session] = None) -> bool:
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            row = session.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM public.worker_live_execution_links
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND account_id = :account_id
+                    LIMIT 1
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id, "account_id": account_id},
+            ).fetchone()
+            return bool(row)
+        finally:
+            if owns_db:
+                session.close()
+
+    def _has_unresolved_worker_execution_sync(self, strategy_run_id: str, account_id: str) -> bool:
+        db = self.session_factory()
+        try:
+            net_row = db.execute(
+                text(
+                    """
+                    SELECT COALESCE(SUM(
+                        CASE
+                            WHEN UPPER(COALESCE(otf.transaction_type, '')) = 'BUY' THEN otf.quantity
+                            WHEN UPPER(COALESCE(otf.transaction_type, '')) = 'SELL' THEN -otf.quantity
+                            ELSE 0
+                        END
+                    ), 0) AS net_quantity
+                    FROM public.worker_live_execution_links wl
+                    INNER JOIN public.order_trade_fills otf
+                      ON otf.account_id = wl.account_id
+                     AND otf.trade_id = wl.trade_id
+                    WHERE wl.strategy_run_id = :strategy_run_id
+                      AND wl.account_id = :account_id
+                      AND wl.trade_id IS NOT NULL
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id, "account_id": account_id},
+            ).fetchone()
+            if _to_int((net_row[0] if net_row else 0)) != 0:
+                return True
+
+            pending_row = db.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM public.worker_live_execution_links wl
+                    LEFT JOIN public.order_state_projection osp
+                      ON osp.account_id = wl.account_id
+                     AND osp.order_id = wl.broker_order_id
+                    WHERE wl.strategy_run_id = :strategy_run_id
+                      AND wl.account_id = :account_id
+                      AND wl.trade_id IS NULL
+                      AND (
+                        osp.order_id IS NULL
+                        OR UPPER(COALESCE(osp.latest_status, '')) NOT IN ('COMPLETE', 'CANCELLED', 'REJECTED', 'LAPSED')
+                      )
+                    LIMIT 1
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id, "account_id": account_id},
+            ).fetchone()
+            return bool(pending_row)
+        finally:
+            db.close()
+
+    def _has_active_bracket_intent_sync(self, strategy_run_id: str) -> bool:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM public.bracket_intents
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND status IN ('entry_submitting', 'entry_working', 'arming_exits', 'armed', 'cancelling')
+                    LIMIT 1
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id},
+            ).fetchone()
+            return bool(row)
+        finally:
+            db.close()
+
+    def _has_pending_bracket_actions_sync(self, strategy_run_id: str) -> bool:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM public.bracket_actions
+                    WHERE strategy_run_id = :strategy_run_id
+                      AND status IN ('pending', 'claimed')
+                    LIMIT 1
+                    """
+                ),
+                {"strategy_run_id": strategy_run_id},
+            ).fetchone()
+            return bool(row)
         finally:
             db.close()
 
@@ -2898,6 +3181,54 @@ async def _exit_live_worker_run(*, request: Request, token: WorkerToken, run: Di
     }
 
 
+async def _place_bracket_entry(
+    *,
+    request: Request,
+    token: WorkerToken,
+    run: Dict[str, Any],
+    bracket_intent_id: str,
+    entry_order: Dict[str, Any],
+    idempotency_key: str,
+) -> Dict[str, Any]:
+    from broker_api.kite_orders import OrdersService, PlaceOrderRequest
+
+    metadata = dict(run.get("metadata") or {})
+    attribution = build_execution_attribution(
+        execution_mode="live",
+        strategy_run_id=str(run["strategy_run_id"]),
+        strategy_family=str(metadata.get("strategy_family") or "indicator_strategy"),
+        strategy_name=str(metadata.get("strategy_name") or run.get("template_id") or run["strategy_run_id"]),
+        account_ref=str(run["account_scope"]),
+        entry_surface="worker_bracket",
+        source="algo_worker_bracket",
+        idempotency_key=idempotency_key,
+        metadata={
+            "token_id": token.token_id,
+            "template_id": run.get("template_id"),
+            "bracket_intent_id": bracket_intent_id,
+        },
+        extras={"bracket_intent_id": bracket_intent_id},
+    )
+    attribution["bracket_intent_id"] = bracket_intent_id
+    order_payload = _inject_live_attribution(dict(entry_order or {}), attribution)
+    req = PlaceOrderRequest.model_validate(order_payload)
+    kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
+    corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-bracket-entry-{uuid.uuid4()}"
+    orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+    result = await orders_service.place_order(
+        kite,
+        req,
+        corr_id,
+        idempotency_key=idempotency_key,
+        session_id=f"backend:bracket:{bracket_intent_id}",
+        response=Response(),
+    )
+    return {
+        "order_id": str(result.order_id),
+        "idempotency_key": idempotency_key,
+    }
+
+
 def _assert_run_access(token: WorkerToken, run: Dict[str, Any]) -> None:
     if str(run.get("token_id") or "") != token.token_id:
         raise HTTPException(status_code=403, detail="Worker token cannot access this run")
@@ -3855,6 +4186,181 @@ async def preview_worker_basket(request: Request, strategy_run_id: str, payload:
         ),
     )
     return {"strategy_run_id": strategy_run_id, "mode": "live", "preview": preview}
+
+
+@router.post("/worker/runs/{strategy_run_id}/brackets")
+async def create_worker_bracket(request: Request, strategy_run_id: str, payload: WorkerBracketCreateRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "intents:submit")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    _require_live_run(run, feature="Bracket intents")
+    await require_active_worker_run_session(request, run)
+
+    bracket_intent_id = f"brk_{uuid.uuid4().hex}"
+    idempotency_key = str(payload.idempotency_key or f"bracket:{bracket_intent_id}:entry:1")
+    if not idempotency_key.startswith("bracket:"):
+        idempotency_key = f"bracket:{bracket_intent_id}:entry:1"
+
+    db = SessionLocal()
+    try:
+        intent = bracket_runtime_store.create_bracket_intent(
+            db,
+            strategy_run_id=strategy_run_id,
+            account_id=str(run.get("account_scope") or ""),
+            config={
+                "entry": dict(payload.entry_order or {}),
+                "stoploss": dict(payload.stoploss or {}),
+                "target": dict(payload.target or {}),
+            },
+            metadata={"created_by": "worker", **dict(payload.metadata or {})},
+            bracket_intent_id=bracket_intent_id,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    try:
+        entry_result = await _place_bracket_entry(
+            request=request,
+            token=token,
+            run=run,
+            bracket_intent_id=bracket_intent_id,
+            entry_order=dict(payload.entry_order or {}),
+            idempotency_key=idempotency_key,
+        )
+    except Exception as exc:
+        db = SessionLocal()
+        try:
+            bracket_runtime_store.update_bracket_status(
+                db,
+                bracket_intent_id=bracket_intent_id,
+                status="failed",
+                action_required=False,
+                action_reason="entry_submit_failed",
+                metadata_patch={"entry_error": str(exc)},
+            )
+            db.commit()
+        finally:
+            db.close()
+        raise
+
+    db = SessionLocal()
+    try:
+        bracket_runtime_store.update_bracket_status(
+            db,
+            bracket_intent_id=bracket_intent_id,
+            status="entry_working",
+            action_required=False,
+            action_reason=None,
+            metadata_patch={"entry_result": dict(entry_result)},
+        )
+        latest = bracket_runtime_store.get_bracket_intent(db, strategy_run_id=strategy_run_id, bracket_intent_id=bracket_intent_id)
+        if latest:
+            cfg = dict(latest.get("config") or {})
+            cfg.setdefault("entry", {})["broker_order_id"] = entry_result.get("order_id")
+            db.execute(
+                text(
+                    """
+                    UPDATE public.bracket_intents
+                    SET config_json = :config_json,
+                        updated_at = NOW()
+                    WHERE bracket_intent_id = :bracket_intent_id
+                    """
+                ),
+                {"bracket_intent_id": bracket_intent_id, "config_json": _json_dumps(cfg)},
+            )
+        db.commit()
+    finally:
+        db.close()
+
+    db = SessionLocal()
+    try:
+        current = bracket_runtime_store.get_bracket_intent(db, strategy_run_id=strategy_run_id, bracket_intent_id=bracket_intent_id)
+    finally:
+        db.close()
+    return {
+        "strategy_run_id": strategy_run_id,
+        "bracket_intent_id": bracket_intent_id,
+        "status": str((current or {}).get("status") or "entry_working"),
+        "action_required": bool((current or {}).get("action_required")),
+        "action_reason": (current or {}).get("action_reason"),
+        "entry_result": entry_result,
+    }
+
+
+@router.get("/worker/runs/{strategy_run_id}/brackets")
+async def list_worker_brackets(request: Request, strategy_run_id: str, limit: int = Query(50, ge=1, le=200)):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    _require_live_run(run, feature="Bracket intents")
+    db = SessionLocal()
+    try:
+        rows = bracket_runtime_store.list_bracket_intents_for_run(db, strategy_run_id=strategy_run_id, limit=limit)
+    finally:
+        db.close()
+    return {"strategy_run_id": strategy_run_id, "brackets": rows}
+
+
+@router.get("/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}")
+async def get_worker_bracket(request: Request, strategy_run_id: str, bracket_intent_id: str):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    _require_live_run(run, feature="Bracket intents")
+    db = SessionLocal()
+    try:
+        row = bracket_runtime_store.get_bracket_intent(db, strategy_run_id=strategy_run_id, bracket_intent_id=bracket_intent_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Bracket intent not found")
+    finally:
+        db.close()
+    return row
+
+
+@router.post("/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}/cancel")
+async def cancel_worker_bracket(request: Request, strategy_run_id: str, bracket_intent_id: str):
+    token = await require_worker_token(request)
+    _require_action(token, "intents:submit")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    _require_live_run(run, feature="Bracket intents")
+    await require_active_worker_run_session(request, run)
+
+    db = SessionLocal()
+    try:
+        updated = bracket_runtime_store.request_cancel_bracket(
+            db,
+            strategy_run_id=strategy_run_id,
+            bracket_intent_id=bracket_intent_id,
+        )
+        db.commit()
+    except KeyError:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Bracket intent not found")
+    finally:
+        db.close()
+    return {
+        "strategy_run_id": strategy_run_id,
+        "bracket_intent_id": bracket_intent_id,
+        "status": str(updated.get("status") or "cancelling"),
+        "action_required": bool(updated.get("action_required")),
+        "action_reason": updated.get("action_reason"),
+    }
 
 
 @router.post("/worker/runs/{strategy_run_id}/intents")

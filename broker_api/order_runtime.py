@@ -17,6 +17,8 @@ from journaling.live_projector import LiveJournalProjector
 from .redis_events import get_redis, publish_event, pubsub_iter
 from .kite_session import KiteSession, get_session_account_id, make_account_id
 from .basket_execution import BasketExecutionStore, basket_execution_store
+from .bracket_runtime import BracketRuntimeStore, bracket_runtime_store
+from .worker_execution_links import WorkerExecutionLinksStore, worker_execution_links_store
 
 
 logger = logging.getLogger(__name__)
@@ -109,8 +111,16 @@ class PositionPnL(BaseModel):
 
 
 class CanonicalOrderEventRuntime:
-    def __init__(self, *, basket_store: BasketExecutionStore = basket_execution_store) -> None:
+    def __init__(
+        self,
+        *,
+        basket_store: BasketExecutionStore = basket_execution_store,
+        bracket_store: BracketRuntimeStore = bracket_runtime_store,
+        execution_links_store: WorkerExecutionLinksStore = worker_execution_links_store,
+    ) -> None:
         self.basket_store = basket_store
+        self.bracket_store = bracket_store
+        self.execution_links_store = execution_links_store
 
     def _event_fingerprint(self, source: str, payload: Dict[str, Any]) -> str:
         stable = {
@@ -472,12 +482,18 @@ class CanonicalOrderEventRuntime:
             for row in claimed:
                 try:
                     basket_events: List[Dict[str, Any]] = []
+                    bracket_events: List[Dict[str, Any]] = []
                     self._upsert_projection_from_event(db, row)
                     try:
                         with db.begin_nested():
                             basket_events = self.basket_store.apply_order_event(db, canonical_event=row)
                     except Exception:
                         self.basket_store.mark_projection_inconsistent_if_linked(db, canonical_event=row)
+                    try:
+                        with db.begin_nested():
+                            bracket_events = self.bracket_store.apply_order_event_observation(db, canonical_event=row)
+                    except Exception:
+                        self.bracket_store.mark_projection_inconsistent_if_linked(db, canonical_event=row)
                     db.execute(
                         text(
                             "UPDATE canonical_order_events SET processing_state = 'processed', processed_at = NOW(), last_error = NULL WHERE id = :id"
@@ -486,6 +502,8 @@ class CanonicalOrderEventRuntime:
                     )
                     db.commit()
                     for event in basket_events:
+                        await publish_event(f"worker.execution.events:{event['strategy_run_id']}", event)
+                    for event in bracket_events:
                         await publish_event(f"worker.execution.events:{event['strategy_run_id']}", event)
                     processed += 1
                 except Exception as exc:
@@ -630,6 +648,12 @@ class CanonicalOrderEventRuntime:
             )
             if result.fetchone():
                 inserted += 1
+                self.execution_links_store.upsert_trade_links_for_order(
+                    account_id=account_id,
+                    broker_order_id=effective_order_id,
+                    trades=[trade],
+                    db=db,
+                )
         return inserted
 
     def _apply_pending_trade_fills(self, db: Session, account_id: str, order_id: str) -> int:

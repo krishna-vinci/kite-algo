@@ -4,7 +4,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -56,6 +56,11 @@ from broker_api.order_runtime import (
     order_event_runtime,
     realtime_positions_service,
     refresh_processing_stuck_rows,
+)
+from broker_api.bracket_runtime import (
+    bracket_runtime_store,
+    get_bracket_executor_wakeup_event,
+    run_bracket_executor_once,
 )
 from broker_api.performance_router import router as performance_router
 from broker_api.redis_events import get_redis
@@ -265,6 +270,87 @@ async def _worker_runtime_recovery_exiting_loop(app: FastAPI):
             set_component_status("worker_runtime_exiting_recovery", "degraded", detail=str(exc))
         await asyncio.sleep(interval)
 
+
+async def _bracket_executor_loop(app: FastAPI):
+    poll_seconds = max(0.5, float(os.getenv("BRACKET_EXECUTOR_POLL_SECONDS", "1.0")))
+    claim_limit = max(1, int(os.getenv("BRACKET_EXECUTOR_CLAIM_LIMIT", "10")))
+    wake_event = get_bracket_executor_wakeup_event()
+    set_component_status("bracket_executor", "healthy", detail="Bracket executor runtime started")
+
+    async def _place_order_fn(*, strategy_run_id: str, account_id: str, bracket_intent_id: str, action_type: str, payload: Dict[str, Any], idempotency_key: str):
+        from broker_api.kite_orders import OrdersService, PlaceOrderRequest
+        from api.routers.algo_workers import _load_live_kite_for_account
+
+        kite = await asyncio.to_thread(_load_live_kite_for_account, account_id)
+        orders_service = getattr(app.state, "algo_worker_orders_service", None) or OrdersService()
+        order_payload = dict(payload or {})
+        order_payload.setdefault("variety", "regular")
+        order_payload.setdefault("validity", "DAY")
+        order_payload.setdefault("market_protection", -1)
+        if action_type == "place_stoploss":
+            order_payload.setdefault("order_type", "SL")
+        else:
+            order_payload.setdefault("order_type", "LIMIT")
+        order_payload["attribution"] = {
+            "strategy_run_id": strategy_run_id,
+            "strategy_family": "indicator_strategy",
+            "strategy_name": "worker_bracket",
+            "execution_mode": "live",
+            "account_ref": account_id,
+            "entry_surface": "backend_bracket_executor",
+            "source": "backend_bracket_executor",
+            "idempotency_key": idempotency_key,
+            "bracket_intent_id": bracket_intent_id,
+            "metadata": {"bracket_intent_id": bracket_intent_id},
+        }
+        req = PlaceOrderRequest.model_validate(order_payload)
+        result = await orders_service.place_order(
+            kite,
+            req,
+            corr_id=f"bracket-executor-{bracket_intent_id}",
+            idempotency_key=idempotency_key,
+            session_id=f"backend:bracket:{bracket_intent_id}",
+        )
+        return {"order_id": str(result.order_id)}
+
+    async def _cancel_order_fn(*, account_id: str, order_id: str):
+        from broker_api.kite_orders import OrdersService
+        from api.routers.algo_workers import _load_live_kite_for_account
+
+        kite = await asyncio.to_thread(_load_live_kite_for_account, account_id)
+        orders_service = getattr(app.state, "algo_worker_orders_service", None) or OrdersService()
+        await orders_service.cancel_order(
+            kite,
+            "regular",
+            order_id,
+            corr_id=f"bracket-executor-cancel-{order_id}",
+        )
+
+    while True:
+        try:
+            claimed = await run_bracket_executor_once(
+                store=bracket_runtime_store,
+                place_order_fn=_place_order_fn,
+                cancel_order_fn=_cancel_order_fn,
+                claim_limit=claim_limit,
+            )
+            heartbeat(
+                "bracket_executor",
+                detail="Processed bracket actions",
+                meta={"claimed_actions": claimed, "poll_seconds": poll_seconds, "claim_limit": claim_limit},
+            )
+        except asyncio.CancelledError:
+            set_component_status("bracket_executor", "stopped", detail="Bracket executor runtime cancelled")
+            break
+        except Exception as exc:
+            logging.warning("Bracket executor loop failed: %s", exc, exc_info=True)
+            set_component_status("bracket_executor", "degraded", detail=str(exc))
+        try:
+            await asyncio.wait_for(wake_event.wait(), timeout=poll_seconds)
+            wake_event.clear()
+        except asyncio.TimeoutError:
+            pass
+
 # 2. Combine the lifespans
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
@@ -279,6 +365,7 @@ async def combined_lifespan(app: FastAPI):
     worker_protection_task = None
     worker_runtime_stale_recovery_task = None
     worker_runtime_exiting_recovery_task = None
+    bracket_executor_task = None
     journal_runtime_worker = None
     set_component_status("app", "starting", detail="Application startup in progress")
     try:
@@ -724,6 +811,7 @@ async def combined_lifespan(app: FastAPI):
 
         worker_runtime_stale_recovery_task = asyncio.create_task(_worker_runtime_recovery_stale_loop(app))
         worker_runtime_exiting_recovery_task = asyncio.create_task(_worker_runtime_recovery_exiting_loop(app))
+        bracket_executor_task = asyncio.create_task(_bracket_executor_loop(app))
     except Exception as e:
         logging.error(f"Failed to initialize broker bootstrap or market runtime: {e}", exc_info=True)
         startup_status = "degraded"
@@ -829,6 +917,16 @@ async def combined_lifespan(app: FastAPI):
             worker_runtime_exiting_recovery_task.cancel()
             try:
                 await worker_runtime_exiting_recovery_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel bracket executor runtime
+    try:
+        if 'bracket_executor_task' in locals() and bracket_executor_task:
+            bracket_executor_task.cancel()
+            try:
+                await bracket_executor_task
             except Exception:
                 pass
     except Exception:

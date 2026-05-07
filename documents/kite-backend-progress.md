@@ -25,6 +25,51 @@ Do not use this file for frontend work.
 
 ## Newly implemented in current branch
 
+- Implemented critic-approved combined Spec 7 + Spec 8 worker attribution hardening and bracket intents:
+  - added exact worker-owned execution bridge schema + store:
+    - `worker_live_execution_links`
+    - new store module `broker_api/worker_execution_links.py`
+    - bridge remains narrow ownership mapping (run/account/order/trade/client_ref/basket refs only) and intentionally does **not** duplicate fill facts from `order_trade_fills`
+  - order-link population now happens in the live placement success path (same moment `live_order_intents` is marked placed)
+  - trade-link population now happens at fill materialization boundary in `order_runtime._store_trade_fills(...)` immediately after each inserted `order_trade_fills` row
+  - primary worker run attribution queries are exact-bridge-first for adopted runs:
+    - `_list_live_strategy_open_legs_sync(...)`
+    - `_get_live_order_attribution_refs_sync(...)`
+    - `_list_live_strategy_broker_positions_sync(...)`
+    - explicit compatibility fallback remains only when no bridge rows exist for legacy pre-adoption runs
+  - added bracket persistence/runtime primitives:
+    - `bracket_intents`, `bracket_actions`, and `live_order_intents.bracket_intent_id`
+    - new `broker_api/bracket_runtime.py` with bracket state machine, durable action queue, SKIP LOCKED action claiming, canonical-event observation helpers, sibling cleanup actions, and executor helpers
+  - added worker bracket route surface:
+    - `POST /api/algo-workers/worker/runs/{strategy_run_id}/brackets`
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/brackets`
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}`
+    - `POST /api/algo-workers/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}/cancel`
+    - create/cancel mutation routes enforce active `X-Worker-Session-Nonce` once run is claimed
+  - bracket creation now owns entry placement (no post-hoc attach model):
+    - create bracket intent first (`entry_submitting`)
+    - place entry via backend-owned path with idempotency namespace `bracket:{bracket_intent_id}:entry:...`
+    - entry-side `live_order_intents` rows carry exact `bracket_intent_id`
+  - canonical event processing now includes bracket observation under nested savepoint isolation:
+    - bracket observation failures mark linked bracket projection inconsistent without poisoning order projection
+    - full entry fill transitions bracket to `arming_exits` and enqueues `place_stoploss` / optional `place_target`
+    - sibling cleanup is backend-managed (`stoploss fill -> cancel_target`, `target fill -> cancel_stoploss`)
+  - recovery closability unified with one boundary helper:
+    - added `evaluate_worker_run_settlement_status(...)`
+    - replaced direct `live_flatness_loader(...)` gate ordering in exiting-run recovery
+    - phase order now: active basket guard -> active/pending bracket guard -> unresolved exact execution guard -> broker flatness refresh
+  - added dedicated startup bracket executor loop in `main.py`:
+    - backend-owned action execution namespace `bracket:{bracket_intent_id}:...`
+    - `SELECT ... FOR UPDATE SKIP LOCKED` claim semantics for action rows
+    - event-hinted wakeup + 1s fallback polling cadence
+  - verification in this environment:
+    - `rtk pytest tests/test_schema_live_order_attribution.py -k "worker_execution_links_and_bracket_tables" -v` → `1 passed`
+    - `rtk pytest tests/test_worker_execution_links.py -v` → `2 passed`
+    - `rtk pytest tests/test_bracket_runtime.py -v` → `3 passed`
+    - `rtk pytest tests/test_order_runtime.py -k "worker_execution_links or bracket" -v` → `2 passed`
+    - `rtk pytest tests/test_algo_worker_api.py -k "bracket or worker_execution_links" -v` → `2 passed`
+    - `rtk pytest tests/test_worker_runtime_recovery.py -k "active_bracket_intent or settlement_status" -v` → `2 passed`
+
 - Implemented combined Spec 5 + Spec 6 live execution observability and basket state slice:
   - added durable schema primitives for basket execution + worker execution outbox:
     - `basket_executions`

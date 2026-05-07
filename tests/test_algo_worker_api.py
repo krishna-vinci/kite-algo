@@ -64,7 +64,12 @@ from api.routers.algo_workers import (  # noqa: E402
     list_worker_baskets,
     get_worker_basket,
     list_worker_execution_events,
+    create_worker_bracket,
+    list_worker_brackets,
+    get_worker_bracket,
+    cancel_worker_bracket,
     submit_worker_intent,
+    WorkerBracketCreateRequest,
     WorkerExitRequest,
     worker_ticks_ws,
     worker_candles_ws,
@@ -155,7 +160,67 @@ def _sqlite_algo_worker_repo() -> SqlAlchemyAlgoWorkerRepository:
                     broker_order_id TEXT,
                     basket_execution_id TEXT,
                     basket_leg_index INTEGER,
+                    bracket_intent_id TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.worker_live_execution_links (
+                    link_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_run_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    broker_order_id TEXT NOT NULL,
+                    trade_id TEXT,
+                    client_order_ref TEXT,
+                    basket_execution_id TEXT,
+                    basket_leg_index INTEGER,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.bracket_intents (
+                    bracket_intent_id TEXT PRIMARY KEY,
+                    strategy_run_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    entry_basket_execution_id TEXT,
+                    status TEXT NOT NULL,
+                    action_required INTEGER NOT NULL DEFAULT 0,
+                    action_reason TEXT,
+                    config_json TEXT NOT NULL DEFAULT '{}',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    closed_at TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.bracket_actions (
+                    action_id TEXT PRIMARY KEY,
+                    bracket_intent_id TEXT NOT NULL,
+                    strategy_run_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    claimed_at TEXT,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    error_json TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -2355,6 +2420,246 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refs["client_order_refs"], ["KATAGRECOVER"])
         self.assertEqual(len(legs), 1)
         self.assertEqual(legs[0]["instrument_token"], 408065)
+
+    async def test_worker_open_legs_use_exact_bridge_without_fuzzy_union(self):
+        repo = _sqlite_algo_worker_repo()
+        session = repo.session_factory()
+        try:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO worker_live_execution_links (
+                        strategy_run_id, account_id, broker_order_id, trade_id, client_order_ref
+                    ) VALUES (
+                        :strategy_run_id, :account_id, :broker_order_id, NULL, :client_order_ref
+                    )
+                    """
+                ),
+                {
+                    "strategy_run_id": "run-live-exact",
+                    "account_id": "kite:AB1234",
+                    "broker_order_id": "OID-EXACT-1",
+                    "client_order_ref": "KAEXACT1",
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO order_trade_fills (
+                        account_id, trade_id, order_id, instrument_token, exchange, tradingsymbol,
+                        product, transaction_type, quantity, price, fill_timestamp, payload_json
+                    ) VALUES (
+                        :account_id, :trade_id, :order_id, :instrument_token, :exchange, :tradingsymbol,
+                        :product, :transaction_type, :quantity, :price, :fill_timestamp, :payload_json
+                    )
+                    """
+                ),
+                {
+                    "account_id": "kite:AB1234",
+                    "trade_id": "T-EXACT-1",
+                    "order_id": "OID-EXACT-1",
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "product": "MIS",
+                    "transaction_type": "BUY",
+                    "quantity": 2,
+                    "price": 1500,
+                    "fill_timestamp": "2026-04-29T09:15:00Z",
+                    "payload_json": "{}",
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO account_positions (account_id, instrument_token, product, exchange, tradingsymbol, net_quantity)
+                    VALUES (:account_id, :instrument_token, :product, :exchange, :tradingsymbol, :net_quantity)
+                    """
+                ),
+                {
+                    "account_id": "kite:AB1234",
+                    "instrument_token": 408065,
+                    "product": "MIS",
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "net_quantity": 2,
+                },
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        refs = await repo.get_live_order_attribution_refs(strategy_run_id="run-live-exact", account_id="kite:AB1234")
+        legs = await repo.list_live_strategy_open_legs(strategy_run_id="run-live-exact", account_id="kite:AB1234")
+        assert refs["broker_order_ids"] == ["OID-EXACT-1"]
+        assert refs["client_order_refs"] == ["KAEXACT1"]
+        assert len(legs) == 1
+        assert legs[0]["net_quantity"] == 2
+
+    async def test_create_worker_bracket_places_entry_under_bracket_idempotency_domain(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+            "worker_session_nonce": "nonce-run-live",
+        }
+        request = self._request(repo)
+        request.headers["X-Worker-Session-Nonce"] = "nonce-run-live"
+        live_orders = SimpleNamespace(
+            place_order=AsyncMock(return_value=SimpleNamespace(order_id="OID-BRK-1"))
+        )
+        request.app.state.algo_worker_orders_service = live_orders
+
+        intents = {}
+
+        class _FakeDB:
+            def execute(self, *args, **kwargs):
+                return None
+
+            def commit(self):
+                return None
+
+            def rollback(self):
+                return None
+
+            def close(self):
+                return None
+
+        def _create_bracket_intent(db, *, strategy_run_id, account_id, config, metadata=None, bracket_intent_id=None):
+            intents[bracket_intent_id] = {
+                "bracket_intent_id": bracket_intent_id,
+                "strategy_run_id": strategy_run_id,
+                "account_id": account_id,
+                "status": "entry_submitting",
+                "action_required": False,
+                "action_reason": None,
+                "config": dict(config or {}),
+                "metadata": dict(metadata or {}),
+            }
+            return dict(intents[bracket_intent_id])
+
+        def _update_bracket_status(db, *, bracket_intent_id, status, action_required=None, action_reason=None, metadata_patch=None, entry_basket_execution_id=None):
+            _ = entry_basket_execution_id
+            intent = intents[bracket_intent_id]
+            intent["status"] = status
+            if action_required is not None:
+                intent["action_required"] = bool(action_required)
+            intent["action_reason"] = action_reason
+            if metadata_patch:
+                intent.setdefault("metadata", {}).update(dict(metadata_patch))
+
+        def _get_bracket_intent(db, *, strategy_run_id, bracket_intent_id):
+            _ = strategy_run_id
+            return dict(intents.get(bracket_intent_id) or {})
+
+        def _request_cancel_bracket(db, *, strategy_run_id, bracket_intent_id):
+            _ = strategy_run_id
+            if bracket_intent_id not in intents:
+                raise KeyError(bracket_intent_id)
+            intents[bracket_intent_id]["status"] = "cancelling"
+            return dict(intents[bracket_intent_id])
+
+        with patch("api.routers.algo_workers.SessionLocal", return_value=_FakeDB()), patch(
+            "api.routers.algo_workers.bracket_runtime_store.create_bracket_intent",
+            side_effect=_create_bracket_intent,
+        ), patch(
+            "api.routers.algo_workers.bracket_runtime_store.update_bracket_status",
+            side_effect=_update_bracket_status,
+        ), patch(
+            "api.routers.algo_workers.bracket_runtime_store.get_bracket_intent",
+            side_effect=_get_bracket_intent,
+        ), patch(
+            "api.routers.algo_workers.bracket_runtime_store.request_cancel_bracket",
+            side_effect=_request_cancel_bracket,
+        ), patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "api.routers.algo_workers.asyncio.to_thread",
+            _run_to_thread_inline,
+        ):
+            response = await create_worker_bracket(
+                request,
+                "run-live",
+                WorkerBracketCreateRequest(
+                    entry_order={
+                        "exchange": "NSE",
+                        "tradingsymbol": "INFY",
+                        "transaction_type": "BUY",
+                        "variety": "regular",
+                        "product": "MIS",
+                        "order_type": "MARKET",
+                        "quantity": 1,
+                        "validity": "DAY",
+                        "market_protection": -1,
+                    },
+                    stoploss={
+                        "exchange": "NSE",
+                        "tradingsymbol": "INFY",
+                        "transaction_type": "SELL",
+                        "variety": "regular",
+                        "product": "MIS",
+                        "order_type": "SL",
+                        "quantity": 1,
+                        "trigger_price": 100.0,
+                        "price": 99.5,
+                        "validity": "DAY",
+                    },
+                ),
+            )
+
+        self.assertTrue(response["bracket_intent_id"])
+        self.assertEqual(response["status"], "entry_working")
+        self.assertEqual(response["entry_result"]["order_id"], "OID-BRK-1")
+        live_orders.place_order.assert_awaited_once()
+        self.assertTrue(live_orders.place_order.await_args.kwargs["idempotency_key"].startswith("bracket:"))
+
+    async def test_cancel_worker_bracket_requires_session_nonce_when_claimed(self):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope="kite:AB1234",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-live"] = {
+            "strategy_run_id": "run-live",
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+            "worker_session_nonce": "nonce-run-live",
+        }
+        request = self._request(repo)
+
+        class _FakeDB:
+            def commit(self):
+                return None
+
+            def rollback(self):
+                return None
+
+            def close(self):
+                return None
+
+        with patch("api.routers.algo_workers.SessionLocal", return_value=_FakeDB()):
+            with self.assertRaises(HTTPException) as ctx:
+                await cancel_worker_bracket(request, "run-live", "brk-session")
+        self.assertEqual(ctx.exception.status_code, 409)
 
     async def test_worker_order_list_matches_by_broker_order_id_or_tag(self):
         token = WorkerToken(

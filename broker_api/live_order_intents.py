@@ -56,6 +56,7 @@ def _intent_params(
     idempotency_key: Optional[str],
     basket_execution_id: Optional[str] = None,
     basket_leg_index: Optional[int] = None,
+    bracket_intent_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     attribution_json = attribution.model_dump(mode="json")
     return {
@@ -71,6 +72,7 @@ def _intent_params(
         "idempotency_key": idempotency_key or attribution.idempotency_key,
         "basket_execution_id": basket_execution_id,
         "basket_leg_index": basket_leg_index,
+        "bracket_intent_id": bracket_intent_id,
         "attribution_json": _json_dumps(attribution_json),
         "cost_contract_json": _json_dumps(cost_contract),
     }
@@ -83,6 +85,7 @@ def create_live_order_intent(
     idempotency_key: Optional[str],
     basket_execution_id: Optional[str] = None,
     basket_leg_index: Optional[int] = None,
+    bracket_intent_id: Optional[str] = None,
     db: Any = None,
 ) -> str:
     intent_id = f"lint_{uuid.uuid4().hex}"
@@ -105,6 +108,7 @@ def create_live_order_intent(
                     idempotency_key,
                     basket_execution_id,
                     basket_leg_index,
+                    bracket_intent_id,
                     attribution_json,
                     cost_contract_json
                 ) VALUES (
@@ -120,6 +124,7 @@ def create_live_order_intent(
                     :idempotency_key,
                     :basket_execution_id,
                     :basket_leg_index,
+                    :bracket_intent_id,
                     CAST(:attribution_json AS jsonb),
                     CAST(:cost_contract_json AS jsonb)
                 )
@@ -132,6 +137,7 @@ def create_live_order_intent(
                 idempotency_key=idempotency_key,
                 basket_execution_id=basket_execution_id,
                 basket_leg_index=basket_leg_index,
+                bracket_intent_id=bracket_intent_id,
             ),
         )
         if owns_db:

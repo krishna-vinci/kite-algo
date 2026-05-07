@@ -546,6 +546,91 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(processed, 1)
         publish_event.assert_awaited_once_with("worker.execution.events:run-2", basket_store.apply_order_event.return_value[0])
 
+    async def test_process_pending_events_observes_bracket_and_publishes_event(self):
+        basket_store = MagicMock()
+        basket_store.apply_order_event.return_value = []
+        bracket_store = MagicMock()
+        bracket_store.apply_order_event_observation.return_value = [
+            {
+                "cursor": 21,
+                "strategy_run_id": "run-1",
+                "account_id": "kite:AB1234",
+                "basket_execution_id": None,
+                "event_type": "bracket.state_changed",
+                "payload": {"bracket_intent_id": "brk-1", "status": "arming_exits"},
+            }
+        ]
+        runtime = CanonicalOrderEventRuntime(basket_store=basket_store, bracket_store=bracket_store)
+        row = SimpleNamespace(
+            id=3,
+            account_id="kite:AB1234",
+            order_id="OID-BRACKET-1",
+            status="COMPLETE",
+            event_timestamp="2026-05-07T10:00:00+00:00",
+            filled_quantity=1,
+            quantity=1,
+            exchange="NSE",
+            tradingsymbol="INFY",
+            instrument_token=408065,
+            product="MIS",
+            transaction_type="BUY",
+            average_price=100.0,
+        )
+        db = MagicMock()
+        db.begin_nested.return_value = nullcontext()
+
+        with patch("broker_api.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
+            "broker_api.order_runtime._acquire_advisory_lock_session",
+            AsyncMock(return_value=db),
+        ), patch("broker_api.order_runtime._release_advisory_lock"), patch(
+            "broker_api.order_runtime._close_locked_session"
+        ), patch.object(runtime, "_claim_pending_events", return_value=[row]), patch.object(
+            runtime, "_upsert_projection_from_event"
+        ), patch("broker_api.order_runtime.publish_event", AsyncMock()) as publish_event:
+            processed = await runtime.process_pending_events(batch_size=10)
+
+        self.assertEqual(processed, 1)
+        bracket_store.apply_order_event_observation.assert_called_once()
+        publish_event.assert_awaited_once_with("worker.execution.events:run-1", bracket_store.apply_order_event_observation.return_value[0])
+
+    async def test_process_pending_events_bracket_observation_failure_does_not_poison_projection(self):
+        basket_store = MagicMock()
+        basket_store.apply_order_event.return_value = []
+        bracket_store = MagicMock()
+        bracket_store.apply_order_event_observation.side_effect = RuntimeError("boom")
+        runtime = CanonicalOrderEventRuntime(basket_store=basket_store, bracket_store=bracket_store)
+        row = SimpleNamespace(
+            id=4,
+            account_id="kite:AB1234",
+            order_id="OID-BRACKET-2",
+            status="COMPLETE",
+            event_timestamp="2026-05-07T10:00:00+00:00",
+            filled_quantity=1,
+            quantity=1,
+            exchange="NSE",
+            tradingsymbol="INFY",
+            instrument_token=408065,
+            product="MIS",
+            transaction_type="BUY",
+            average_price=100.0,
+        )
+        db = MagicMock()
+        db.begin_nested.return_value = nullcontext()
+
+        with patch("broker_api.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
+            "broker_api.order_runtime._acquire_advisory_lock_session",
+            AsyncMock(return_value=db),
+        ), patch("broker_api.order_runtime._release_advisory_lock"), patch(
+            "broker_api.order_runtime._close_locked_session"
+        ), patch.object(runtime, "_claim_pending_events", return_value=[row]), patch.object(
+            runtime, "_upsert_projection_from_event"
+        ), patch("broker_api.order_runtime.publish_event", AsyncMock()) as publish_event:
+            processed = await runtime.process_pending_events(batch_size=10)
+
+        self.assertEqual(processed, 1)
+        bracket_store.mark_projection_inconsistent_if_linked.assert_called_once()
+        publish_event.assert_not_awaited()
+
 
 class InstrumentsRepositoryTests(unittest.TestCase):
     def test_session_factory_is_closed_after_each_query(self):

@@ -23,6 +23,7 @@ from .redis_events import get_redis, publish_event, pubsub_iter
 from .instruments_repository import InstrumentsRepository
 from .kite_session import KiteSession, get_kite, get_kite_session_id, get_session_account_id
 from .order_runtime import PositionPnL, order_event_runtime, realtime_positions_service
+from .worker_execution_links import worker_execution_links_store
 from database import get_db
 
 # Module-level logger
@@ -640,12 +641,19 @@ class OrdersService:
                     order=quote_payload,
                     corr_id=corr_id,
                 )
+                bracket_intent_id = None
+                if isinstance(attribution_payload, dict):
+                    bracket_intent_id = (
+                        attribution_payload.get("bracket_intent_id")
+                        or (attribution_payload.get("metadata") or {}).get("bracket_intent_id")
+                    )
                 create_live_order_intent(
                     attribution=attribution,
                     cost_contract=cost_contract.journal_payload(),
                     idempotency_key=idempotency_key,
                     basket_execution_id=basket_execution_id,
                     basket_leg_index=basket_leg_index,
+                    bracket_intent_id=str(bracket_intent_id or "").strip() or None,
                 )
             variety = params.pop('variety')
             variety_value = variety.value if isinstance(variety, Variety) else str(variety)
@@ -666,6 +674,14 @@ class OrdersService:
                         broker_order_id=str(order_id),
                         status="PLACED",
                         order_payload=params,
+                    )
+                    worker_execution_links_store.upsert_order_link(
+                        strategy_run_id=str(attribution.strategy_run_id),
+                        account_id=str(attribution.account_ref),
+                        broker_order_id=str(order_id),
+                        client_order_ref=str(attribution.client_order_ref),
+                        basket_execution_id=basket_execution_id,
+                        basket_leg_index=basket_leg_index,
                     )
                 except Exception as mark_error:
                     logger.error(
