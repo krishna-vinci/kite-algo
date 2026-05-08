@@ -43,6 +43,15 @@ type NormalizedTick struct {
 	ShardID            int              `json:"shard_id"`
 	IsTradable         bool             `json:"is_tradable"`
 	IsIndex            bool             `json:"is_index"`
+	// Instrument metadata enriched by the instrument store (omitempty when unavailable).
+	Tradingsymbol  string  `json:"tradingsymbol,omitempty"`
+	Exchange       string  `json:"exchange,omitempty"`
+	InstrumentType string  `json:"instrument_type,omitempty"`
+	LotSize        int32   `json:"lot_size,omitempty"`
+	TickSize       float64 `json:"tick_size,omitempty"`
+	Strike         float64 `json:"strike,omitempty"`
+	Expiry         string  `json:"expiry,omitempty"`
+	Underlying     string  `json:"underlying,omitempty"`
 }
 
 type NormalizedOHLC struct {

@@ -2,9 +2,13 @@ package service
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
+	"runtime/debug"
 	"strings"
+
+	"kitealgo/market-runtime/internal/instruments"
 )
 
 func NewHTTPHandler(svc *Service) http.Handler {
@@ -60,6 +64,39 @@ func NewHTTPHandler(svc *Service) http.Handler {
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
+	})
+	mux.HandleFunc("/internal/market-runtime/instruments/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		newStore, err := instruments.Reload(r.Context(), svc.config.PostgresDSN, svc.instruments)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "instrument reload failed: "+err.Error())
+			return
+		}
+		svc.instrumentsMu.Lock()
+		svc.instruments = newStore
+		svc.instrumentsMu.Unlock()
+
+		// Publish updated blob to Redis.
+		if blob, err := newStore.SerializeBlob(); err != nil {
+			log.Printf("instrument blob serialization on refresh failed: %v", err)
+		} else {
+			ctx := r.Context()
+			if err := svc.publisher.client.Set(ctx, "instrument:blob", blob, 0).Err(); err != nil {
+				log.Printf("publishing instrument blob to Redis on refresh failed: %v", err)
+			} else {
+				_ = svc.publisher.client.Publish(ctx, "instrument:refresh", "1").Err()
+				log.Printf("instruments: refreshed blob (%d bytes) published to Redis", len(blob))
+				debug.FreeOSMemory()  // reclaim old store + temporary buffers
+			}
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "ok",
+			"count":  newStore.Len(),
+		})
 	})
 	return mux
 }

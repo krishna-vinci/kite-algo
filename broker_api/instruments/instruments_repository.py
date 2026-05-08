@@ -1,7 +1,10 @@
 """
 Provides a repository for querying instrument data from the database.
 """
+import asyncio
 import calendar
+import gzip
+import json
 from contextlib import contextmanager
 from datetime import date, timedelta
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
@@ -15,10 +18,90 @@ from app.database import SessionLocal
 class InstrumentsRepository:
     """
     A schema-aware repository for efficient options lookups.
+
+    Maintains an in-memory cache hydrated from the Go market-runtime's
+    Redis instrument blob.  Lookups hit the cache first and fall back to
+    PostgreSQL when the cache is cold.
     """
+
+    # ── in-memory cache (shared across all instances) ──────────────────────
+    _by_token: Dict[int, Dict[str, object]] = {}
+    _by_symbol: Dict[str, Dict[str, object]] = {}
+
+    # ── public constructors / cache loaders ────────────────────────────────
 
     def __init__(self, db: Optional[Session | Callable[[], Session]] = None):
         self.db = db
+
+    @classmethod
+    async def load_from_blob(cls) -> int:
+        """
+        Load instrument data from the Redis *instrument:blob* key (set by
+        the Go market-runtime) and rebuild the class-level caches.
+
+        Returns the number of instruments loaded, or 0 if the blob is
+        unavailable / empty.
+        """
+        try:
+            from broker_api.core.redis_events import get_redis
+            import base64
+
+            redis = get_redis()
+            blob_b64 = await redis.get("instrument:blob")
+            blob = base64.b64decode(blob_b64) if blob_b64 else None
+            if not blob:
+                return 0
+
+            decompressed = gzip.decompress(blob)
+            rows = json.loads(decompressed)
+        except Exception:
+            import logging
+            logging.getLogger("instruments").exception("Failed to load instrument blob from Redis")
+            return 0
+
+        by_token: Dict[int, Dict[str, object]] = {}
+        by_symbol: Dict[str, Dict[str, object]] = {}
+
+        for r in rows:
+            token = int(r["instrument_token"])
+            by_token[token] = r
+
+            # Populate symbol lookups: both "EXCHANGE:SYMBOL" and bare "SYMBOL".
+            exchange = str(r.get("exchange", "") or "")
+            symbol = str(r.get("tradingsymbol", "") or "")
+            if exchange and symbol:
+                by_symbol[f"{exchange}:{symbol}"] = r
+            if symbol:
+                # Allow bare-symbol lookups (last write wins for duplicates).
+                by_symbol[symbol] = r
+
+        # Atomically swap in the new caches (CPython assignment is thread-safe
+        # under the GIL, and our readers are all synchronous).
+        cls._by_token = by_token
+        cls._by_symbol = by_symbol
+
+        return len(by_token)
+
+    @classmethod
+    async def _on_instrument_refresh(cls) -> None:
+        """Background task: listen for *instrument:refresh* and reload."""
+        import logging
+        logger = logging.getLogger("instruments")
+
+        try:
+            from broker_api.core.redis_events import pubsub_iter
+
+            async for message in pubsub_iter("instrument:refresh"):
+                if message.get("event") == "heartbeat":
+                    continue
+                count = await cls.load_from_blob()
+                logger.info("Instrument cache refreshed from Redis blob (%d instruments)", count)
+        except asyncio.CancelledError:
+            logger.info("Instrument refresh subscriber cancelled")
+        except Exception:
+            logger.exception("Instrument refresh subscriber failed")
+
+    # ── session helpers ────────────────────────────────────────────────────
 
     @contextmanager
     def _session_scope(self) -> Iterator[Session]:
@@ -39,6 +122,8 @@ class InstrumentsRepository:
             yield session
         finally:
             session.close()
+
+    # ── symbol normalisation ───────────────────────────────────────────────
 
     def normalize_underlying_symbol(self, input_symbol: str) -> tuple[str, str]:
         """
@@ -69,6 +154,8 @@ class InstrumentsRepository:
         with self._session_scope() as db:
             result = db.execute(query, {"ts": spot_tradingsymbol}).scalar_one_or_none()
             return result
+
+    # ── expiry helpers ─────────────────────────────────────────────────────
 
     def get_expiries(self, underlying: str, today: date) -> List[date]:
         """
@@ -187,6 +274,8 @@ class InstrumentsRepository:
         target_expiries = sorted(list(set(target_weeklies + target_monthlies)))
         return target_expiries
 
+    # ── strike helpers ─────────────────────────────────────────────────────
+
     def get_distinct_strikes(self, underlying: str, expiry: date) -> List[float]:
         """
         Retrieves all distinct strikes for a given underlying and expiry.
@@ -270,14 +359,6 @@ class InstrumentsRepository:
     def get_atm_strike(self, underlying: str, current_spot: float, expiry: date) -> Optional[float]:
         """
         Calculate ATM strike closest to spot price.
-        
-        Args:
-            underlying: Index symbol (e.g., 'NIFTY')
-            current_spot: Current spot/index price
-            expiry: Target expiry date
-        
-        Returns:
-            ATM strike price, or None if no strikes available
         """
         strikes = self.get_distinct_strikes(underlying, expiry)
         if not strikes:
@@ -292,14 +373,6 @@ class InstrumentsRepository:
     ) -> List[float]:
         """
         Get N strikes centered around ATM.
-        
-        Args:
-            atm_strike: The ATM strike
-            all_strikes: All available strikes (sorted)
-            count: Total number of strikes to return (default: 5)
-        
-        Returns:
-            List of strikes centered around ATM
         """
         if not all_strikes or atm_strike not in all_strikes:
             return []
@@ -313,69 +386,37 @@ class InstrumentsRepository:
         except ValueError:
             return []
     
-    def get_lot_size(self, instrument_token: int) -> Optional[int]:
-        """
-        Get lot size for an instrument token.
-        
-        Args:
-            instrument_token: Instrument token
-        
-        Returns:
-            Lot size, or None if not found
-        """
-        query = text(
-            """
-            SELECT lot_size FROM kite_instruments
-            WHERE instrument_token = :token LIMIT 1
-            """
-        )
-        with self._session_scope() as db:
-            result = db.execute(query, {"token": instrument_token}).scalar_one_or_none()
-            return result
-
-    def get_instrument_by_exchange_symbol(self, exchange: str, tradingsymbol: str) -> Optional[Dict[str, object]]:
-        """
-        Look up a single instrument by exchange and tradingsymbol.
-
-        Returns a minimal normalized mapping used by execution paths.
-        """
-        query = text(
-            """
-            SELECT instrument_token, exchange, tradingsymbol, lot_size, instrument_type, last_price, tick_size
-            FROM kite_instruments
-            WHERE exchange = :exchange AND tradingsymbol = :tradingsymbol
-            LIMIT 1
-            """
-        )
-        with self._session_scope() as db:
-            row = db.execute(
-                query,
-                {
-                    "exchange": str(exchange or "").strip().upper(),
-                    "tradingsymbol": str(tradingsymbol or "").strip().upper(),
-                },
-            ).mappings().first()
-            return dict(row) if row else None
+    # ── cache-aware lookups (public API) ───────────────────────────────────
 
     def get_instrument_by_token(self, instrument_token: int) -> Optional[Dict[str, object]]:
+        """Return instrument metadata for *instrument_token* (cache-first)."""
         try:
-            normalized_token = int(instrument_token)
+            token = int(instrument_token)
         except (TypeError, ValueError):
             return None
-        if normalized_token <= 0 or normalized_token > 9_999_999_999:
-            return None
-        query = text(
-            """
-            SELECT instrument_token, exchange, tradingsymbol, name, instrument_type,
-                   segment, tick_size, lot_size, expiry, strike
-            FROM kite_instruments
-            WHERE instrument_token = :instrument_token
-            LIMIT 1
-            """
-        )
-        with self._session_scope() as db:
-            row = db.execute(query, {"instrument_token": normalized_token}).mappings().first()
-            return dict(row) if row else None
+
+        # Check class-level in-memory cache.
+        cached = self._by_token.get(token)
+        if cached is not None:
+            return cached
+
+        return self._get_instrument_by_token_sql(token)
+
+    def get_instrument_by_exchange_symbol(self, exchange: str, tradingsymbol: str) -> Optional[Dict[str, object]]:
+        """Return instrument metadata for *exchange* + *tradingsymbol* (cache-first)."""
+        ex = str(exchange or "").strip().upper()
+        sym = str(tradingsymbol or "").strip().upper()
+
+        # Check class-level in-memory cache (both formats).
+        if ex and sym:
+            cached = self._by_symbol.get(f"{ex}:{sym}")
+            if cached is not None:
+                return cached
+        cached = self._by_symbol.get(sym)
+        if cached is not None:
+            return cached
+
+        return self._get_instrument_by_exchange_symbol_sql(ex, sym)
 
     def resolve_market_symbol(self, symbol: str) -> Optional[Dict[str, object]]:
         raw = str(symbol or "").strip().upper()
@@ -394,7 +435,20 @@ class InstrumentsRepository:
             return None
         return self.get_instrument_by_exchange_symbol(exchange, tradingsymbol)
 
+    def get_lot_size(self, instrument_token: int) -> Optional[int]:
+        """
+        Get lot size for an instrument token (cache-first).
+        """
+        instrument = self.get_instrument_by_token(instrument_token)
+        if instrument is not None:
+            ls = instrument.get("lot_size")
+            if ls is not None:
+                return int(ls)
+        # Fallback to SQL for minimal round-trip.
+        return self._get_lot_size_sql(instrument_token)
+
     def search_market_instruments(self, query: str, *, exchange: Optional[str] = None, limit: int = 20) -> List[Dict[str, object]]:
+        """Full-text ILIKE search — always hits PostgreSQL (no cache)."""
         normalized_text = str(query or "").strip().upper()
         if not normalized_text:
             return []
@@ -427,3 +481,55 @@ class InstrumentsRepository:
                 },
             ).mappings().all()
             return [dict(row) for row in rows]
+
+    # ── private SQL fallbacks ──────────────────────────────────────────────
+
+    def _get_instrument_by_token_sql(self, instrument_token: int) -> Optional[Dict[str, object]]:
+        try:
+            normalized_token = int(instrument_token)
+        except (TypeError, ValueError):
+            return None
+        if normalized_token <= 0 or normalized_token > 9_999_999_999:
+            return None
+        query = text(
+            """
+            SELECT instrument_token, exchange, tradingsymbol, name, instrument_type,
+                   segment, tick_size, lot_size, expiry, strike
+            FROM kite_instruments
+            WHERE instrument_token = :instrument_token
+            LIMIT 1
+            """
+        )
+        with self._session_scope() as db:
+            row = db.execute(query, {"instrument_token": normalized_token}).mappings().first()
+            return dict(row) if row else None
+
+    def _get_instrument_by_exchange_symbol_sql(self, exchange: str, tradingsymbol: str) -> Optional[Dict[str, object]]:
+        query = text(
+            """
+            SELECT instrument_token, exchange, tradingsymbol, lot_size, instrument_type, last_price, tick_size
+            FROM kite_instruments
+            WHERE exchange = :exchange AND tradingsymbol = :tradingsymbol
+            LIMIT 1
+            """
+        )
+        with self._session_scope() as db:
+            row = db.execute(
+                query,
+                {
+                    "exchange": exchange,
+                    "tradingsymbol": tradingsymbol,
+                },
+            ).mappings().first()
+            return dict(row) if row else None
+
+    def _get_lot_size_sql(self, instrument_token: int) -> Optional[int]:
+        query = text(
+            """
+            SELECT lot_size FROM kite_instruments
+            WHERE instrument_token = :token LIMIT 1
+            """
+        )
+        with self._session_scope() as db:
+            result = db.execute(query, {"token": instrument_token}).scalar_one_or_none()
+            return result

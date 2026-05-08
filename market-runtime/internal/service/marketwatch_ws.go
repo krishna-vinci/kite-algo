@@ -277,6 +277,12 @@ func downcastMarketwatchTick(tick map[string]any, mode string) map[string]any {
 		"last_price":       tick["last_price"],
 		"change":           tick["change"],
 	}
+	if ts, ok := tick["tradingsymbol"]; ok && ts != "" {
+		base["tradingsymbol"] = ts
+	}
+	if ex, ok := tick["exchange"]; ok && ex != "" {
+		base["exchange"] = ex
+	}
 	if ts, ok := tick["exchange_timestamp"]; ok {
 		base["exchange_timestamp"] = ts
 	}
