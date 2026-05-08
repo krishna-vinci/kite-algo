@@ -3,7 +3,7 @@ from decimal import Decimal
 import unittest
 from unittest.mock import Mock
 
-from tests.test_support import install_dependency_stubs
+from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 

@@ -25,7 +25,6 @@ from options.api.market_router import router as options_market_router
 from options.api.protection_router import router as options_protection_router
 from options.api.strategy_router import router as options_strategy_router
 from app.monitor import install_log_buffer
-from strategies.indexstoploss.router import router as indexstoploss_router
 
 load_dotenv()  # Load environment variables from .env file
 
@@ -102,7 +101,6 @@ app.include_router(candles_api_router, prefix="/api")  # Unified candles API wit
 app.include_router(broker_historical_routes_router, prefix="/api")
 app.include_router(broker_instruments_router, prefix="/api")
 app.include_router(performance_router, prefix="/api")
-app.include_router(indexstoploss_router, prefix="/api/strategies")
 app.include_router(options_market_router)
 app.include_router(options_strategy_router)
 app.include_router(options_execution_router)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.test_support import install_dependency_stubs
+from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 

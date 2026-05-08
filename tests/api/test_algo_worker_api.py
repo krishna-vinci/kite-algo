@@ -14,7 +14,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from tests.test_support import install_dependency_stubs
+from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 

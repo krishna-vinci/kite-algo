@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from tests.test_support import install_dependency_stubs
+from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
