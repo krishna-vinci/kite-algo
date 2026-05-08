@@ -1,487 +1,213 @@
 # Algo Worker Development Guide
 
-This is the practical coding guide for building external algo strategies that use Kite Algo for execution, grouping, risk edits, exits, accounting, and journaling.
+This is the practical coding guide for building external algo strategies that use Kite Algo for execution, grouping, protection, exits, accounting, and journaling.
 
 The rule is simple:
 
 ```text
 strategy worker owns decisions
-Kite Algo backend owns execution, grouping, attribution, accounting, and exits
+Kite Algo backend owns execution, grouping, attribution, accounting, protection state, and exits
 ```
 
-Workers should only call the public worker API, preferably through the Python SDK in `sdk/python/kite_algo_worker`. Workers must not call broker internals, database tables, paper-runtime internals, or manually craft broker attribution.
+Workers must only call the public worker API through the Python SDK. Never call broker internals, database tables, or paper-runtime internals.
 
-## Install/use the SDK
-
-### Recommended: install from PyPI on remote strategy servers
-
-Once the SDK changes are published, remote servers should install the exact SDK version from PyPI:
+## Install
 
 ```bash
-python3 -m pip install kite-algo-worker==0.6.2
-```
-
-Fallback exact-tag install from the monorepo:
-
-```bash
-python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
-```
-
-Pin live strategy servers to an immutable version such as `0.6.2`. Avoid installing from `main` for live workers because a moving branch can change behavior unexpectedly.
-
-Release conventions:
-
-- app/product tags: `vX.Y.Z`
-- SDK package tags: `kite-algo-worker-vX.Y.Z`
-
-Create the SDK tag from the repository root after bumping `sdk/python/pyproject.toml`:
-
-```bash
-git tag -a kite-algo-worker-v0.6.2 -m "kite-algo-worker v0.6.2"
-git push origin kite-algo-worker-v0.6.2
-```
-
-Pushing a `kite-algo-worker-v*` tag triggers GitHub Actions to build, validate, and publish the SDK to PyPI.
-
-### Local development install
-
-From a strategy project or virtualenv:
-
-```bash
-python3 -m pip install -e /path/to/kite-algo/sdk/python
-```
-
-During local development from this repository:
-
-```bash
-export PYTHONPATH="$PWD/sdk/python:$PYTHONPATH"
-```
-
-Minimal worker:
-
-```python
-from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, equity_market_order
-
-client = KiteAlgoWorkerClient(AlgoWorkerConfig(
-    base_url="http://localhost:8000",
-    token="kwa_...",
-))
-
-run = client.create_run(
-    strategy_run_id="run_mean_reversion_20260425_001",
-    template_id="mean-reversion",
-    account_scope="kite:paper-a",
-    execution_mode="paper",
-    runtime_state={"risk": {"stop_loss_pct": 1.2}},
-    metadata={"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
-)
-
-order = equity_market_order("INFY", "BUY", 1)
-client.place_order(run["strategy_run_id"], order, "run_mean_reversion_20260425_001:entry:001")
+python3 -m pip install kite-algo-worker==0.7.0
 ```
 
 ## Environment variables
 
-Recommended variables for examples and production workers:
-
 | Variable | Purpose | Safe default |
 | --- | --- | --- |
-| `KITE_ALGO_API_BASE` | Backend base URL, for example `http://localhost:8000` | `http://localhost:8000` |
-| `KITE_ALGO_WORKER_TOKEN` | Raw worker token. Sent as `Authorization: Bearer <token>` | required |
-| `KITE_ALGO_ACCOUNT_SCOPE` | Account scope such as `kite:paper-a` or live `kite:<broker_user_id>` | `kite:paper-a` |
-| `KITE_ALGO_EXECUTION_MODE` | `dry_run`, `paper`, or `live` | `dry_run` in examples |
+| `KITE_ALGO_API_BASE` | Backend base URL | `http://localhost:18777` |
+| `KITE_ALGO_WORKER_TOKEN` | Worker token (sent as `Authorization: Bearer <token>`) | required |
+| `KITE_ALGO_ACCOUNT_SCOPE` | Account scope, e.g. `kite:paper-a` or `kite:<broker_id>` | `kite:paper-a` |
+| `KITE_ALGO_EXECUTION_MODE` | `dry_run`, `paper`, or `live` | `dry_run` |
 | `KITE_ALGO_RUN_ID` | Stable strategy run id for restart recovery | strategy-specific |
-| `KITE_ALGO_ENABLE_LIVE` | Explicit live acknowledgement in examples | unset / false |
+| `KITE_ALGO_ENABLE_LIVE` | Explicit live acknowledgement | unset (refuses live without it) |
 | `KITE_ALGO_TIMEOUT` | HTTP timeout seconds | `10` |
 
 Store tokens in environment or a secret manager. Never commit raw worker tokens.
 
-## Worker API and SDK lifecycle
+## Run lifecycle
 
-All strategy activity should happen under one stable `strategy_run_id` per strategy lifecycle.
+Every worker strategy operates under one stable `strategy_run_id` per lifecycle.
 
-1. `health()` at startup to verify the token.
-2. `create_run(...)` once per strategy lifecycle. Reuse the same `strategy_run_id` after restarts.
-3. `place_order(...)` or `place_basket(...)` with explicit idempotency keys for every intent.
-4. `patch_risk(...)` whenever stops, targets, model thresholds, or exposure controls change.
-5. `heartbeat(...)` from long-running workers.
-6. `resolve_ticker(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `get_historical_candles(...)`, or `stream_candles(...)` for backend-owned market data.
-7. `get_run(...)` after restarts, mutations, and exits.
-8. `get_funds(...)` or `get_run_funds(...)` before sizing entries.
-9. `get_run_pnl(...)` or `stream_run_pnl(...)` for grouped realtime run P&L.
-10. `exit_run(...)` to close the grouped strategy run.
-
-## Hardened core surface
-
-Keep new worker code on the production-safe core surface:
-
-- lifecycle/accounting: `health()`, `heartbeat(...)`, `create_run(...)`, `get_run(...)`, `get_funds(...)`, `get_run_funds(...)`, `get_run_pnl(...)`, `stream_run_pnl(...)`
-- execution control: `list_orders(...)`, `list_trades(...)`, `preview_order(...)`, `preview_basket(...)`, `place_order(...)`, `place_basket(...)`, `exit_run(...)`
-- market data: `resolve_ticker(...)`, `search_tickers(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `stream_candles(...)`, `get_historical_candles(...)`, `get_market_snapshot(...)`
-- recovery helpers: `wait_for_history(...)` and the websocket client for reconnectable streams
-
-The certification script at `scripts/sdk_worker_certification.py` exercises this core surface and now reports preview output plus capability flags.
-
-## Options namespace (canonical worker-safe surface)
-
-Worker options SDK calls must use worker-auth-safe routes under:
-
-`/api/algo-workers/worker/options/*`
-
-Use `client.options` for options market + run/protection lifecycle flows. Canonical
-option market snapshots (including Greeks/IV) are exposed by backend option sessions.
-Those session Greeks are computed from synthetic-forward + Black-76 in backend option
-session computation and surfaced through canonical routes/SDK.
-
-Key points:
-
-- Run-level `product` is required for option run creation (`MIS` or `NRML`).
-- Market calls should use `client.options.ensure_session/list_expiries/get_chain/get_mini_chain/get_greeks/...`.
-- Selection resolution supports exact strike, ATM/ITM/OTM offset, and snapshot-safe
-  `delta_target` selection. Delta targeting only uses already-computed session
-  Greek fields; it does not recompute Greeks from raw spot in the worker or route.
-- Run/protection SDK methods exist: create/list/get run, preview/enter/exit,
-  protection get/update/state/replay.
-- Production option runs persist through the durable backend run-state store;
-  tests may still override routes with the in-memory store for deterministic cases.
-- `kite_algo_worker.option_leg(...)` remains only a payload helper and does not
-  imply hidden run-level product defaults.
-
-Example:
+### Minimal raw-client worker
 
 ```python
-from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, option_leg
+import os
+from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, equity_market_order
 
-client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_..."))
+client = KiteAlgoWorkerClient(AlgoWorkerConfig(
+    base_url=os.environ.get("KITE_ALGO_API_BASE", "http://localhost:18777"),
+    token=os.environ["KITE_ALGO_WORKER_TOKEN"],
+))
 
-client.options.ensure_session("NIFTY")
-expiries = client.options.list_expiries("NIFTY")
-greeks = client.options.get_greeks("NIFTY", expiry="nearest")
+strategy_run_id = os.environ.get("KITE_ALGO_RUN_ID", "run_demo_001")
+client.health()
 
-run = client.options.create_run(
-    strategy_name="bull_call_spread",
-    product="MIS",  # required at run level
-    legs=[
-        option_leg("NIFTY26MAY25000CE", "BUY", 75),
-        option_leg("NIFTY26MAY25100CE", "SELL", 75),
-    ],
+run = client.create_run(
+    strategy_run_id=strategy_run_id,
+    template_id="demo-strategy",
+    account_scope=os.environ.get("KITE_ALGO_ACCOUNT_SCOPE", "kite:paper-a"),
+    execution_mode=os.environ.get("KITE_ALGO_EXECUTION_MODE", "dry_run"),
+    metadata={
+        "strategy_family": "indicator_strategy",
+        "strategy_name": "Demo Worker",
+        "entry_surface": "external_algo_worker",
+    },
 )
 
-preview = client.options.preview_entry(run["strategy_run_id"])
-enter_result = client.options.enter(run["strategy_run_id"])
-protection_state = client.options.get_protection_state(run["strategy_run_id"])
+order = equity_market_order("INFY", "BUY", 1)
+client.place_order(run["strategy_run_id"], order, f"{strategy_run_id}:entry:001")
 ```
 
-For compatibility, generic SDK primitives still exist, but new option strategy
-work should prefer the options namespace above.
+### Recommended managed-lifecycle worker
 
-The SDK maps to public endpoints only:
+For longer-lived workers, prefer `RunConfig` + `client.run(...)` + `ManagedRun`:
 
-| SDK method | Worker endpoint |
+```python
+from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, RunConfig, equity_market_order
+
+client = KiteAlgoWorkerClient(AlgoWorkerConfig(
+    base_url="http://localhost:18777", token="kwa_...",
+))
+
+config = RunConfig(
+    strategy_run_id="run_managed_001",
+    template_id="managed-demo",
+    account_scope="kite:paper-a",
+    execution_mode="paper",
+)
+
+with client.run(config) as run:
+    safety = run.safety_check()
+    if not safety.can_trade:
+        raise SystemExit(f"Blocked: {', '.join(safety.blocking_reasons) or safety.run_status}")
+
+    run.place_order(
+        equity_market_order("INFY", "BUY", 1),
+        idempotency_key=f"{run.run_id}:entry:001",
+        safety_token=safety.safety_token,
+    )
+```
+
+**What `client.run(...)` does:** manages session claim/heartbeat/release plumbing.
+
+**What it does NOT do:** auto-trade, auto-exit, or make decisions for you.
+
+## Safety rules
+
+- Always call `safety_check()` before guarded trade actions
+- If `can_trade` is false, stop. Read `blocking_reasons` to understand why
+- If a `safety_token` is present, pass it to the guarded action
+- If the token is rejected (expired), reacquire safety state — don't blindly retry
+- Use deterministic idempotency keys for every order intent
+- Start in `dry_run`, then `paper`, then `live` only after explicit validation
+- Never send broker `tag`, `tags`, or `attribution`
+- Close grouped strategies through `client.exit_run(...)`, not ad-hoc exit orders
+
+## Core action payload guidance
+
+### create_run(...)
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `template_id` | yes | Strategy template identifier |
+| `account_scope` | yes | e.g. `kite:paper-a` |
+| `execution_mode` | yes | `dry_run`, `paper`, or `live` |
+| `strategy_run_id` | no | Stable run ID (generated if omitted) |
+| `metadata` | no | Must include `strategy_family`, `strategy_name`, `entry_surface` for live runs |
+
+**Response:** `strategy_run_id`, `status`, `execution_mode`, `runtime_state`, `metadata`.
+
+### safety_check(strategy_run_id)
+
+**Response:** `can_trade` (bool), `safety_token` (str|null), `blocking_reasons` (list[str]), `run_status` (str).
+
+### place_order(...)
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `strategy_run_id` | yes | Run identifier |
+| order payload | yes | Dict with exchange, tradingsymbol, transaction_type, product, order_type, quantity |
+| `idempotency_key` | yes | Deterministic key to prevent duplicates |
+| `safety_token` | no | From `safety_check()` |
+| `session_nonce` | no | From `claim_session()` |
+
+### get_run_pnl(strategy_run_id)
+
+**Response:** `totals` (net_pnl, gross_pnl, charges), `legs` (per-leg breakdown), `is_stale` (bool).
+
+### exit_run(strategy_run_id)
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `reason` | no | Human-readable reason |
+| `idempotency_key` | no | Deterministic exit key |
+| `dry_run` | no | Preview exit without placing orders (safe for live) |
+
+## Order builder summary
+
+| Helper | Use for |
 | --- | --- |
-| `health()` | `GET /api/algo-workers/worker/health` |
-| `heartbeat(...)` | `POST /api/algo-workers/worker/heartbeat` |
-| `create_run(...)` | `POST /api/algo-workers/worker/runs` |
-| `get_run(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}` |
-| `list_orders(strategy_run_id)` / `list_trades(strategy_run_id)` | `GET /api/algo-workers/worker/orders`, `GET /api/algo-workers/worker/trades` |
-| `preview_order(...)` / `preview_basket(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/preview/*` |
-| `get_funds(...)` | `GET /api/algo-workers/worker/funds` |
-| `get_run_funds(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/funds` |
-| `get_run_pnl(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/pnl` |
-| `stream_run_pnl(strategy_run_id)` | `GET /api/algo-workers/worker/runs/{strategy_run_id}/pnl/stream` |
-| `resolve_ticker(...)` / `search_tickers(...)` | `/api/algo-workers/worker/market/instruments/*` |
-| `get_quotes(...)` / `stream_ticks(...)` | `POST /api/algo-workers/worker/market/quotes`, `GET /api/algo-workers/worker/market/ticks/stream` |
-| `get_candles(...)` / `stream_candles(...)` | `/api/algo-workers/worker/market/candles*` |
-| `get_historical_candles(...)` | `GET /api/algo-workers/worker/market/history` |
-| `get_market_snapshot(...)` | `POST /api/algo-workers/worker/market/snapshot` |
-| `place_order(...)` / `place_basket(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/intents` |
-| `patch_risk(...)` | `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/risk` |
-| `update_backend_protection(...)` | `PATCH /api/algo-workers/worker/runs/{strategy_run_id}/protection` |
-| `exit_run(...)` | `POST /api/algo-workers/worker/runs/{strategy_run_id}/exit` |
+| `equity_market_order(symbol, side, qty)` | Simple equity entry/exit |
+| `limit_order(exchange, symbol, side, product, qty, price)` | Limit orders |
+| `sl_order(exchange, symbol, side, product, qty, price, trigger)` | Stop-loss orders |
+| `sl_m_order(exchange, symbol, side, product, qty, trigger)` | Stop-loss market orders |
+| `option_market_order(symbol, side, qty)` | Option market orders |
+| `amo_market_order(exchange, symbol, side, product, qty)` | After-market market orders |
+| `amo_limit_order(exchange, symbol, side, product, qty, price)` | After-market limit orders |
 
-## Realtime run P&L
+All helpers accept optional fields: `variety`, `validity`, `disclosed_quantity`, `market_protection`, and variety-specific fields (CO: `squareoff`/`stoploss`; iceberg: `iceberg_legs`/`iceberg_quantity`).
 
-The worker API supports grouped run-level P&L snapshots and an SSE stream.
+## Protection essentials
 
-Use:
+Backend protection objects declare thresholds the backend enforces automatically.
+
+**Products:** `CNC`, `MIS`, `NRML`. **Sides:** `BUY`, `SELL`. Quantities and prices must be positive. Stale-worker limits: `30..86400` seconds.
+
+Use `update_backend_protection(...)` and `patch_risk(...)` to adjust thresholds at runtime.
+
+## Options flow summary
+
+Prefer `client.options.*` and resolver helpers over manual option payload construction.
 
 ```python
-snapshot = client.get_run_pnl(run_id)
+leg = resolve_offset_leg(client.options, underlying="NIFTY", product="MIS",
+    expiry="current_week", option_type="CE", offset="ATM", transaction_type="BUY")
 
-for update in client.stream_run_pnl(run_id, interval_seconds=1.0):
-    print(update["totals"]["net_pnl"])
+option_run = client.options.create_run(strategy_name="Call Entry", product="MIS",
+    legs=[leg.model_dump(exclude_none=True)])
+
+client.options.enter(option_run["strategy_run_id"], safety_token=safety.safety_token)
 ```
 
-Important notes:
-
-- `dry_run` returns zero totals and no legs.
-- `paper` returns grouped paper run P&L and grouped paper legs.
-- `live` returns grouped attributed live run P&L with charges and live-leg breakdown.
-- `is_stale=true` means the backend could not fully confirm one or more live leg marks/coverage.
-
-## Execution modes: dry_run vs paper vs live
-
-### `dry_run`
-
-- Does not place broker orders.
-- Accepts and stores worker intent payloads so you can verify strategy decisions and request shapes.
-- Good for first local development and CI-style smoke runs.
-
-### `paper`
-
-- Does not place broker orders.
-- Sends orders to the paper runtime and proves strategy behavior, grouping, risk patching, exits, and grouped P&L.
-- Use paper before enabling any live worker token.
-
-### `live`
-
-- Places real broker orders only when the worker token explicitly allows `live`, the run uses a real broker account scope such as `kite:AB1234`, and live metadata is present.
-- Proves broker order placement, fills, margin/charges, and live journaling only after real validation.
-- Keep live enablement environment-gated in worker code. The repository also includes `scripts/live_worker_e2e_validation.py` for explicit live validation.
-
-## Strategy run metadata
-
-For live runs, metadata must include:
-
-```json
-{
-  "strategy_family": "indicator_strategy",
-  "strategy_name": "Mean Reversion",
-  "entry_surface": "external_algo_worker"
-}
-```
-
-Valid `strategy_family` values:
-
-- `options_strategy`
-- `indicator_strategy`
-- `investment_strategy`
-- `discretionary_strategy`
-
-`entry_surface` is optional but recommended for auditability.
-
-## Full supported order catalog
-
-Worker live orders must match `broker_api.kite_orders.PlaceOrderRequest`. The SDK order builders produce that shape.
-
-### Supported values
-
-| Field | Supported values / notes |
-| --- | --- |
-| `exchange` | `NSE`, `BSE`, `NFO`, `CDS`, `MCX` |
-| `tradingsymbol` | Broker trading symbol, for example `INFY` or `NIFTY24APR22500CE` |
-| `transaction_type` | `BUY`, `SELL` |
-| `variety` | `regular`, `amo`, `co`, `iceberg`, `auction` |
-| `product` | `CNC`, `MIS`, `NRML`, `MTF` |
-| `order_type` | `MARKET`, `LIMIT`, `SL`, `SL-M` |
-| `quantity` | Positive integer |
-| `price` | Required for `LIMIT` and `SL`; omit for `MARKET`; omit or `0` for `SL-M` |
-| `trigger_price` | Required for `SL` and `SL-M` |
-| `validity` | `DAY`, `IOC`, `TTL` |
-| `validity_ttl` | Required when `validity=TTL`; backend validates `1..365` |
-| `disclosed_quantity` | Optional; cannot exceed `quantity` |
-| `market_protection` | Optional; allowed for `MARKET` and `SL-M`; `-1` or `0..100` |
-| `autoslice` | Optional boolean |
-| `iceberg_legs` | Optional integer `2..10` |
-| `iceberg_quantity` | Optional positive integer |
-| `auction_number` | Optional string for auction orders |
-| `squareoff` | Optional cover-order squareoff value |
-| `stoploss` | Optional cover-order stoploss value |
-| `trailing_stoploss` | Optional cover-order trailing stoploss value |
-
-Do **not** send `tag`, `tags`, or `attribution`. The backend injects compact broker tags and durable live attribution for the strategy run.
-
-### SDK order helpers
-
-```python
-from kite_algo_worker import (
-    market_order,
-    limit_order,
-    sl_order,
-    sl_m_order,
-    option_market_order,
-    equity_market_order,
-    OrderBuilder,
-)
-```
-
-Helpers:
-
-- `market_order(exchange, tradingsymbol, transaction_type, product, quantity, variety="regular", ...)`
-- `limit_order(exchange, tradingsymbol, transaction_type, product, quantity, price, variety="regular", ...)`
-- `sl_order(exchange, tradingsymbol, transaction_type, product, quantity, price, trigger_price, variety="regular", ...)`
-- `sl_m_order(exchange, tradingsymbol, transaction_type, product, quantity, trigger_price, variety="regular", ...)`
-- `option_market_order(tradingsymbol, transaction_type, quantity, product="NRML", exchange="NFO", variety="regular", ...)`
-- `equity_market_order(tradingsymbol, transaction_type, quantity, product="CNC", exchange="NSE", variety="regular", ...)`
-
-All helpers accept the optional fields listed above except `price` / `trigger_price` where the order type controls them.
-
-## Equity examples
-
-```python
-from kite_algo_worker import equity_market_order, limit_order
-
-entry = equity_market_order("INFY", "BUY", 1, product="CNC")
-client.place_order(run_id, entry, f"{run_id}:entry:INFY:20260425T091500")
-
-limit_exit = limit_order("NSE", "INFY", "SELL", "CNC", 1, price=1510.50)
-client.place_order(run_id, limit_exit, f"{run_id}:target:INFY:20260425T100000")
-```
-
-## Option examples
-
-```python
-from kite_algo_worker import option_market_order
-
-buy_call = option_market_order("NIFTY24APR22500CE", "BUY", 50)
-client.place_order(run_id, buy_call, f"{run_id}:long-call:001")
-```
-
-## Basket examples
-
-Use baskets for spreads, hedges, and multi-leg strategies. Every leg remains grouped under the same `strategy_run_id`.
-
-```python
-orders = [
-    option_market_order("NIFTY24APR22500CE", "SELL", 50),
-    option_market_order("NIFTY24APR22600CE", "BUY", 50),
-]
-
-client.place_basket(
-    run_id,
-    orders,
-    idempotency_key=f"{run_id}:entry-basket:credit-spread:001",
-    metadata={"signal": "credit-spread-entry"},
-    all_or_none=False,
-    dry_run=False,
-)
-```
-
-For live basket previews, pass `dry_run=True` to preview broker margin/charges without placing broker orders.
-
-## Stop loss / SL-M / LIMIT examples
-
-```python
-from kite_algo_worker import limit_order, sl_order, sl_m_order
-
-target = limit_order("NSE", "INFY", "SELL", "CNC", 1, price=1510.50)
-stop_limit = sl_order("NSE", "INFY", "SELL", "CNC", 1, price=1489.50, trigger_price=1490.00)
-stop_market = sl_m_order("NSE", "INFY", "SELL", "CNC", 1, trigger_price=1490.00, market_protection=-1)
-
-client.place_order(run_id, target, f"{run_id}:target:001")
-client.place_order(run_id, stop_limit, f"{run_id}:stop-limit:001")
-client.place_order(run_id, stop_market, f"{run_id}:stop-market:001")
-```
-
-## Grouped live exit behavior
-
-Always exit with `exit_run(...)`; do not place ad-hoc manual exit orders from the worker.
-
-For live runs, grouped `/exit` is broker-aware:
-
-1. Reconciles live broker positions first.
-2. Reads attributed open live legs for that `strategy_run_id`.
-3. Builds reducing market exit orders for the grouped live legs.
-4. Validates broker net position can cover the attributed strategy quantity.
-5. Places the exit basket through the same attributed live order path unless `dry_run=True`.
-6. Closes the run only after projected live fills prove the strategy is flat.
-
-If exit orders are submitted but fills are still pending, the run status becomes `exiting`. Keep monitoring, allow order/trade sync to project fills, and call `exit_run(...)` again to confirm flat closure.
-
-Preview without broker placement:
-
-```python
-preview = client.exit_run(run_id, reason="operator preview", idempotency_key=f"{run_id}:exit-preview:001", dry_run=True)
-```
-
-## Risk patching for dynamic stops/ML models
-
-Use `patch_risk(...)` for dynamic stops, targets, trailing distances, model confidence thresholds, volatility regimes, and max exposure changes.
-
-```python
-client.patch_risk(
-    run_id,
-    {"trailing_stop_pct": 0.75, "model_confidence_min": 0.68},
-    reason="model regime changed",
-)
-```
-
-The backend updates `runtime_state.risk` and matching `risk_schema` values, so operator views and runtime state stay aligned. The worker does not need database access.
-
-## Idempotency key rules
-
-Every order intent must have an explicit idempotency key. Keys must be 8 to 160 characters. The SDK raises `ValueError` if `place_order` or `place_basket` is called without one or with a key outside that length range.
-
-Good keys are deterministic and include the run, action, instrument or basket, and signal/time bucket:
-
-```text
-{strategy_run_id}:entry:{symbol}:{bar_timestamp}
-{strategy_run_id}:entry-basket:{structure}:{signal_id}
-{strategy_run_id}:scaleout:{leg}:{signal_id}
-{strategy_run_id}:exit:{reason}:{signal_id}
-```
-
-If the same key is retried, the backend returns the stored result instead of placing a duplicate order. Do not generate random keys for retryable signals.
-
-## Recovery after worker restart
-
-Persist locally:
-
-- `strategy_run_id`
-- last processed signal/bar id
-- idempotency keys already emitted
-- strategy-local model/risk state needed to continue decisions
-
-On restart:
-
-1. Create the SDK client and call `health()`.
-2. Call `get_run(strategy_run_id)`.
-3. If the run is `open`, resume from the last persisted signal id.
-4. If the run is `exiting`, call `exit_run(..., dry_run=True)` or `exit_run(...)` after broker sync to confirm flat closure.
-5. If the run is `closed` or `failed`, do not submit more intents; create a new lifecycle run if the strategy should start again.
-
-## What backend owns vs what worker owns
-
-Backend owns:
-
-- worker token authentication and scoping
-- dry_run/paper/live mode enforcement
-- live order validation and broker placement
-- compact broker tags and live attribution
-- paper runtime execution
-- grouped live and paper exits
-- live/paper journal separation
-- margin/charges contracts
-- order/fill projection into journal facts
-- keeping broker/manual activity separate as `broker_import` unless safely attributed by reconciliation
-
-Worker owns:
-
-- signals and strategy decisions
-- stable `strategy_run_id` selection
-- deterministic idempotency keys
-- run metadata, summary fields, and initial risk schema
-- risk patches when strategy controls change
-- heartbeat and restart recovery
-
-## What not to do
-
-- Do not call broker APIs directly from external workers.
-- Do not call backend database tables or paper-runtime internals.
-- Do not send `tag`, `tags`, or `attribution`; the backend injects attribution.
-- Do not mix multiple unrelated strategy lifecycles into one `strategy_run_id`.
-- Do not use random idempotency keys for retryable order intents.
-- Do not enable live before dry_run and paper behavior are proven.
-- Do not assume live `/exit` is closed until the backend confirms flat projected fills.
-- Do not manually merge live and paper P&L; the backend keeps them separated.
-
-## Runnable SDK examples
-
-Examples live in `sdk/python/examples/`:
-
-- `mean_reversion_worker.py` — create run, place an equity order, patch risk, heartbeat, optional exit.
-- `option_basket_worker.py` — create run, submit an option basket, patch risk.
-- `live_exit_preview.py` — preview grouped live exit with `dry_run=True`.
-
-All examples default to safe behavior (`dry_run` or preview). Live order placement requires explicit environment acknowledgement.
+## Timeline, health, and GTT at a glance
+
+- `log_decision_event(...)` — record worker decisions to the run timeline
+- `list_timeline(...)` — read execution/decision/protection event history
+- `get_run_health_snapshot(...)` — operational health (heartbeat age, session status, recovery status)
+- `place_gtt(...)` / `list_gtts()` / `get_gtt(...)` / `modify_gtt(...)` / `delete_gtt(...)` — account-scoped GTT management
+
+## Live-safety rules
+
+- start in `dry_run`, then `paper`, then `live` only after explicit validation
+- require `KITE_ALGO_ENABLE_LIVE=1` as an intentional live-mode gate
+- for live exits: use `dry_run=True` first to preview, then commit
+- never send broker `tag`, `tags`, or `attribution`
+- close grouped strategies through `client.exit_run(...)`
+
+## Examples in this pack
+
+- `examples/basic_equity_worker.py` — raw-client baseline
+- `examples/managed_run_worker.py` — managed lifecycle example
+- `examples/mean_reversion_worker.py` — indicator-driven strategy
+- `examples/signal_driven_worker.py` — external decision integration
+- `examples/option_basket_worker.py` — options spread example
+- `examples/live_exit_preview.py` — safe live exit preview
+
+These files are copied from the canonical SDK examples.

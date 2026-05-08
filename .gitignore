@@ -51,6 +51,9 @@ kite-go/
 kite-python/
 market-runtime/README.md
 scripts/
+!scripts/
+scripts/*
+!scripts/check_worker_sdk_version_refs.py
 
 # Agent Skills
 .agents/
@@ -60,5 +63,3 @@ scripts/
 openalgo/
 openalgo/openalgo/
 quant-ml-india/
-
-

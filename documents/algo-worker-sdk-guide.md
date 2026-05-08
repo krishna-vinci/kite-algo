@@ -1,248 +1,260 @@
 # Algo Worker and Python SDK Guide
 
-This is the best starting document for contributors who want to understand why the worker model exists and why it is a major strength of Kite Algo.
+This guide explains the worker model behind Kite Algo: why it exists, how it works, and how to think about building strategies on it.
 
-## Worker philosophy
+For exact method signatures, request/response shapes, and reference examples, use [`../sdk/python/README.md`](../sdk/python/README.md).
 
-The core rule is:
+## 1. Platform philosophy
 
-> strategy code owns decisions; Kite Algo owns execution, attribution, grouped accounting, protection updates, and journal-visible truth.
+Kite Algo is a trading platform, not a thin broker wrapper.
+
+The core rule:
+
+> Strategy code owns decisions. Kite Algo owns execution, attribution, grouped accounting, protection state, and journal-visible truth.
 
 That rule keeps strategy workers small and replaceable while letting the platform keep the dangerous and stateful parts centralized.
 
-## Why workers exist
+### What the platform owns
 
-Workers make it possible to:
+- broker login, session lifecycle, and token management
+- order attribution — every order is tagged to the correct run
+- grouped accounting — run-level funds, P&L, exits
+- execution routing — paper vs live, idempotency, error recovery
+- protection — stoploss, target, basket-level, and worker-stale rules
+- journaling — reviewable run history
 
-- run strategy logic outside the main backend process
-- use local or remote machines for compute-heavy or isolated strategies
-- reuse backend-owned market data and execution contracts
-- stay inside the same grouped accounting and journaling model as the rest of the platform
+### What your strategy owns
 
-## Worker/backend contract
+- market analysis, indicators, signal logic
+- entry and exit decisions
+- sizing and risk thresholds
+- the sequence of intents you submit
 
-Workers should use only the public worker API, ideally through the Python SDK in `sdk/python/`.
+### Why this separation matters
 
-Workers should not:
-
-- call broker internals directly
-- write to database tables directly
-- invent their own broker attribution tags
-- bypass grouped run identity
-
-## Run lifecycle
-
-Every worker strategy should operate under one stable `strategy_run_id` per lifecycle.
-
-Typical flow:
-
-1. `health()` to verify the worker token
-2. `create_run(...)` once for the strategy lifecycle (or use `RunConfig` + `client.run(...)`)
-3. read quotes, history, ticks, or candles
-4. preview/place explicit intents with idempotency keys
-5. read grouped run funds and grouped P&L
-6. send heartbeats for long-running workers
-7. patch backend protection state if the strategy updates thresholds
-8. `exit_run(...)` to close the grouped run
-
-## Execution modes
-
-| Mode | What happens |
-| --- | --- |
-| `dry_run` | Validate logic and payloads without creating paper or live execution |
-| `paper` | Use durable backend-owned simulated orders, trades, positions, funds, and grouped P&L |
-| `live` | Route through backend-owned broker sessions and live attribution paths |
-
-## Why grouped funds and grouped P&L exist
-
-Brokers expose account-level truth, not strategy-level truth.
-
-Kite Algo adds grouped run accounting so a strategy can answer practical questions such as:
-
-- how much capital is this run using?
-- what is this run's current P&L?
-- which orders and trades belong to this run?
-- is this run flat yet?
-
-That grouped model is what makes remote workers manageable instead of chaotic.
-
-## Worker-safe execution and attribution rules
-
-- workers emit explicit order intents
-- the backend injects or derives attribution metadata
-- the backend owns grouped order/trade/run truth
-- paper mode never writes to the broker
-- live mode requires a real broker-backed account scope
-
-## Python SDK role
-
-The SDK is intentionally thin.
-
-It calls public worker endpoints under `/api/algo-workers/worker/*` and does not import backend internals, database logic, or market-runtime internals.
-
-That makes it safer to version, easier to install remotely, and easier for strategy authors to adopt.
-
-### Explicit helper layer (Spec 4)
-
-The SDK now includes an explicit ergonomics layer with no hidden trading behavior:
-
-- `RunConfig`: immutable typed run builder for `create_run(...)` payload parity.
-- `client.create_run_from_config(config)`: thin call-through.
-- `client.run(config, ...)`: context manager for run/session lifecycle.
-- `ManagedRun`: run-bound helper object for explicit calls (`safety_check`, `place_order`, `place_basket`, `patch_risk`, `update_backend_protection`, `exit_run`, `heartbeat`).
-
-Important boundaries:
-
-- `client.run()` owns session claim/heartbeat-on-enter/release lifecycle only.
-- It does **not** auto-exit your strategy.
-- `ManagedRun` does **not** auto-call `safety_check()`.
-- Trading decisions and call ordering stay explicit in worker code.
-
-Use the raw client directly when you want full manual control. Use `RunConfig` + `client.run()` when you want cleaner lifecycle wiring while keeping all safety and mutation calls visible.
-
-Install from PyPI:
-
-```bash
-python3 -m pip install kite-algo-worker==0.6.2
-```
-
-Pin to an immutable version in production.
-
-Fallback for an exact monorepo tag before or instead of a PyPI release:
-
-```bash
-python3 -m pip install \
-  "kite-algo-worker @ git+https://github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
-```
-
-Release conventions:
-
-- app/product tags: `vX.Y.Z`
-- SDK package tags: `kite-algo-worker-vX.Y.Z`
-
-Pushing an SDK tag automatically builds and publishes the package to PyPI through GitHub Actions.
-
-## Core worker endpoint families
-
-| Family | Example methods |
-| --- | --- |
-| Health + liveness | `health()`, `heartbeat(...)` |
-| Run lifecycle | `create_run(...)`, `get_run(...)`, `exit_run(...)` |
-| Market data | `get_quotes(...)`, `get_candles(...)`, `get_historical_candles(...)`, `stream_ticks(...)` |
-| Execution | `preview_order(...)`, `preview_basket(...)`, `place_order(...)`, `place_basket(...)` |
-| Grouped accounting | `get_funds(...)`, `get_run_funds(...)`, `get_run_pnl(...)`, `stream_run_pnl(...)` |
-| Risk / protection | `patch_risk(...)`, `update_backend_protection(...)` |
-| Options workflows | `client.options.*` |
-
-## Minimal worker shape
+If every strategy had to own broker sessions, websocket reconnects, order tagging, and exit reconciliation, you would spend more time on plumbing than on alpha. Kite Algo absorbs that complexity so strategy code can stay focused.
 
 ```python
-from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, ensure_run, equity_market_order
-
-client = KiteAlgoWorkerClient(AlgoWorkerConfig(
-    base_url="http://localhost:18777",
-    token="kwa_...",
-))
-
-run = ensure_run(
-    client,
-    strategy_run_id="run_demo_001",
-    template_id="demo-strategy",
-    account_scope="kite:paper-a",
-    execution_mode="paper",
-    metadata={"strategy_family": "demo", "strategy_name": "Demo Worker"},
-)
-
+# Your strategy only needs to think about this
+client.health()
+run = client.create_run(strategy_run_id="run_001", template_id="my-strategy", ...)
 order = equity_market_order("INFY", "BUY", 1)
-client.place_order(run["strategy_run_id"], order, "run_demo_001:entry:001")
+client.place_order(run["strategy_run_id"], order, "run_001:entry:001")
 ```
 
-## Managed run shape (explicit safety + session lifecycle)
+## 2. Execution modes
+
+Kite Algo supports three execution modes with a deliberate progression.
+
+| Mode | What happens | When to use |
+| --- | --- | --- |
+| `dry_run` | Validates logic and payloads without any execution | First local development, CI smoke runs |
+| `paper` | Durable backend-owned simulated orders, trades, P&L | Proving strategy behavior before live |
+| `live` | Real broker orders through the backend's Kite session | After paper validation and explicit live acknowledgement |
+
+### The progression rule
+
+```text
+dry_run  →  paper  →  explicit live validation  →  live
+```
+
+Never skip from `dry_run` to `live`. Use paper to prove grouping, risk patching, exits, and grouped P&L before any real capital is at risk.
+
+### Live-mode gating
+
+Live execution requires two things:
+1. The worker token must explicitly allow `live`
+2. The worker code must set `KITE_ALGO_ENABLE_LIVE=1`
+
+This is an intentional double-gate. No worker accidentally places live orders.
+
+## 3. The grouped accounting model
+
+Brokers provide account-level truth — your total balance, total positions, total margin.
+
+They do not tell you which strategy is using how much capital, or which P&L belongs to which run.
+
+Kite Algo adds a grouped run model on top so every strategy becomes a first-class unit:
+
+- its own `strategy_run_id`
+- its own grouped orders and trades
+- its own run-level funds usage
+- its own run-level P&L
+- its own exit and review path
+
+### Why this matters in practice
+
+Without grouped accounting, a trader running two strategies on the same broker account has no way to answer "is strategy A profitable?" without manual reconciliation.
+
+With grouped accounting:
 
 ```python
-from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient, RunConfig, equity_market_order
+# How much capital is Strategy A using?
+run_funds = client.get_run_funds("strategy_a_v1")
 
-client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:18777", token="kwa_..."))
+# What is Strategy A's current P&L?
+pnl = client.get_run_pnl("strategy_a_v1")
+print(pnl["totals"]["net_pnl"])
 
-config = RunConfig(
-    strategy_run_id="run_demo_002",
-    template_id="demo-strategy",
-    account_scope="kite:paper-a",
-    execution_mode="paper",
-)
+# Is Strategy A flat?
+# The backend tracks this through grouped orders/trades
+```
 
+This is what makes remote workers manageable instead of chaotic.
+
+## 4. Lifecycle choices
+
+Every strategy operates under one stable `strategy_run_id` per lifecycle.
+
+Kite Algo supports two lifecycle styles — both valid, choose based on your needs.
+
+### Raw-client style
+
+Use this when you want full manual control: simple scripts, one-shot tasks, or when you prefer to wire every call yourself.
+
+```python
+client.health()
+run = client.create_run(...)
+client.place_order(run["strategy_run_id"], order, idempotency_key)
+pnl = client.get_run_pnl(run["strategy_run_id"])
+client.exit_run(run["strategy_run_id"])
+```
+
+You manage session, heartbeat, and safety calls explicitly.
+
+### Managed-lifecycle style
+
+Use this for longer-lived workers. `RunConfig` + `client.run(...)` + `ManagedRun` handle session plumbing while keeping trading decisions explicit.
+
+```python
 with client.run(config) as run:
     safety = run.safety_check()
-    if not safety.can_trade:
-        return
-    run.place_order(
-        equity_market_order("INFY", "BUY", 1),
-        idempotency_key=f"{run.run_id}:entry:001",
-        safety_token=safety.safety_token,
-    )
+    if safety.can_trade:
+        run.place_order(order, idempotency_key=key, safety_token=safety.safety_token)
 ```
 
-## Option resolver helpers (non-deploying)
+The managed lifecycle manages claim/heartbeat/release. It does not auto-trade or auto-exit.
 
-`resolve_option_contracts(...)` and `resolve_spread(...)` are pure SDK helpers layered on existing worker-safe options routes. They only resolve contracts and construct `OptionExecutionLeg` payloads. They do not create runs, place orders, or enter/exit option runs.
+### Which to choose
 
-## Grouped funds and run allocation
-
-Workers can read account-level funds and run-level usage before sizing entries:
-
-```python
-account_funds = client.get_funds(mode="paper")
-run_funds = client.get_run_funds(run_id)
-
-remaining = run_funds["strategy"]["allocation"]["remaining"]
-if remaining is not None and remaining < required_notional:
-    return  # skip or reduce size
-```
-
-`get_funds(...)` returns a worker-safe account funds snapshot for the token account scope. For paper runs this comes from the paper runtime account. For live runs this comes from broker margins through the backend's live Kite session.
-
-`get_run_funds(strategy_run_id)` adds strategy/run usage derived from backend-owned grouped P&L legs. If run metadata includes `allocation_cap` or `allocation_cap_inr`, the response includes remaining allocation using current gross exposure as the usage basis.
-
-## Realtime grouped run P&L
-
-The SDK exposes grouped run-level P&L snapshots and an SSE stream:
-
-```python
-snapshot = client.get_run_pnl(run_id)
-
-for update in client.stream_run_pnl(run_id, interval_seconds=1.0):
-    print(update["totals"]["net_pnl"])
-```
-
-The payload is grouped by `strategy_run_id` and keeps paper and live P&L separated. The backend is the source of truth for grouped P&L. Live broker/manual activity stays separate unless safely attributed.
-
-## Where worker features live in the codebase
-
-| Path | Purpose |
+| If you want... | Use |
 | --- | --- |
-| `api/routers/algo_workers.py` | Worker-safe route surface |
-| `algo_runtime/` | Grouped run lifecycle, attribution, execution wiring |
-| `options/` | Options sessions, strategy flows, protection, and execution helpers |
-| `paper_runtime/` | Durable paper execution path |
-| `execution_accounting/` | Shared accounting and attribution semantics |
-| `sdk/python/kite_algo_worker/` | SDK client and helper surface |
-| `sdk/python/examples/` | Example workers |
+| Simplest mental model | Raw client |
+| Session-aware long-running workers | Managed lifecycle |
+| Full control over every HTTP call | Raw client |
+| Less session plumbing | Managed lifecycle |
 
-## Contribution opportunities
+## 5. Safety and protection model
 
-High-value improvements include:
+Safety checks are the gatekeeper for guarded trade actions. They are part of the modern worker story and should be used by any serious long-running worker.
 
-- SDK helper ergonomics and typed models
-- better examples and recovery patterns
-- stronger worker-safe validation on the backend
-- grouped funds/P&L clarity and run-allocation helpers
-- live-worker guardrails and per-token risk limits
-- options namespace polish and canonical options workflows
-- non-option systematic strategy examples on the grouped run contract
+### Safety check flow
 
-## Read next
+1. Claim or manage the worker session
+2. Call `safety_check()`
+3. If `can_trade` is `false`, stop and inspect `blocking_reasons`
+4. If a `safety_token` is returned, pass it into the next guarded action
+5. If the token is rejected (expired), reacquire safety state — don't blindly retry
 
-- [`platform-overview.md`](platform-overview.md)
-- [`codebase-map.md`](codebase-map.md)
-- [`../sdk/python/README.md`](../sdk/python/README.md)
-- [`live-paper-accounting-and-worker-live-execution.md`](live-paper-accounting-and-worker-live-execution.md)
+### Backend protection
+
+Workers can register backend-owned exposure protection. When a declared rule triggers (stoploss, target, worker-stale), the backend executes a conservative attributed exit — without the worker needing to be running.
+
+This means protection is not "worker implements stoploss logic." It is "worker declares thresholds, backend enforces them."
+
+### Risk patching
+
+Use `patch_risk(...)` to update thresholds at runtime without recreating the run. This is how strategies adjust stops, targets, and exposure controls as conditions change.
+
+## 6. Options philosophy
+
+Options workflows have their own namespace because option selection is inherently different from equity execution: you need session management, expiry chains, Greeks, strike resolution, and spread construction.
+
+### Why the options namespace exists
+
+Instead of every worker hand-coding option contract selection:
+
+```python
+# Before: manual option construction
+order = {"exchange": "NFO", "tradingsymbol": "NIFTY26MAY25000CE", ...}
+```
+
+Use backend-backed resolution:
+
+```python
+# Now: platform-owned resolution
+leg = resolve_offset_leg(client.options, underlying="NIFTY", product="MIS",
+    expiry="current_week", option_type="CE", offset="ATM", transaction_type="BUY")
+```
+
+The resolver helpers construct `OptionExecutionLeg` payloads from backend option sessions. They do not create runs or place trades — you still own those decisions explicitly.
+
+## 7. Observability model
+
+Beyond orders and P&L, the platform provides worker-visible observability through timelines and health snapshots.
+
+### Run timelines
+
+Every strategy run has a timeline: a durable sequence of execution events, worker decisions, and protection state changes. This is backend-owned truth — you can read it, append decisions to it, and stream it, but you cannot alter non-decision events.
+
+### Decision logging
+
+Workers can explicitly log their decisions to the timeline:
+
+```python
+client.log_decision_event("run_001",
+    event_type="signal.generated",
+    summary="EMA crossover confirmed on INFY 5min",
+    details={"symbol": "INFY", "fast_ema": 1450.1},
+)
+```
+
+This strengthens the audit trail: the timeline shows both what the backend executed AND what the worker decided.
+
+### Health snapshots
+
+`get_run_health_snapshot(...)` gives operational health at a glance: heartbeat age, session status, recovery status, whether operator action is needed.
+
+### P&L streams
+
+`stream_run_pnl(...)` provides real-time SSE updates so workers can react to changing P&L without polling.
+
+## 8. Exit and recovery
+
+### Exiting a run
+
+Use `exit_run(...)` to close a grouped strategy. Always use this — never place ad-hoc exit orders manually.
+
+```python
+client.exit_run("run_001", reason="target reached", idempotency_key="run_001:exit:001")
+```
+
+For live runs, prefer `dry_run=True` first to preview the exit, then commit the real exit.
+
+### Recovery after restart
+
+If a worker process restarts:
+
+1. `get_run(strategy_run_id)` — the backend still knows your run state
+2. warm up historical candles and rebuild local indicator state
+3. reconnect `stream_ticks(...)`, `stream_candles(...)`, or `stream_run_pnl(...)`
+4. resume your decision loop
+
+The backend owns run identity and state. Worker restarts are a normal operational event, not a disaster.
+
+### Session lifecycle
+
+The managed lifecycle handles session plumbing for you. For raw-client flows, session management is explicit: `claim_session(...)` → work → `release_session(...)`.
+
+A claimed session signals to the backend that a worker is actively operating on the run. Stale sessions trigger backend protection if configured.
+
+## 9. Where to go for exact reference
+
+This guide explains the model. For exact method signatures, field tables, request/response shapes, and runnable examples, see:
+
+- [`../sdk/python/README.md`](../sdk/python/README.md) — the full SDK reference
+- [`../sdk/python/examples/`](../sdk/python/examples/) — canonical scenario examples
+- [`codebase-map.md`](codebase-map.md) — where worker features live in the codebase
+- [`platform-overview.md`](platform-overview.md) — architecture and ownership boundaries
+
+The SDK README is the single source of truth for install, methods, and release information.

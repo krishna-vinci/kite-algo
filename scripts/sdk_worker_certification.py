@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pyright: reportMissingImports=false
 from __future__ import annotations
 
 import argparse
@@ -150,6 +151,22 @@ def collect_indicator_capability() -> dict[str, Any]:
     return report
 
 
+def collect_sdk_surface_capability(client: KiteAlgoWorkerClient) -> dict[str, Any]:
+    options_client = getattr(client, "options", None)
+    return {
+        "managed_lifecycle": all(hasattr(client, name) for name in ("run", "claim_session", "release_session", "run_heartbeat")),
+        "safety_check": hasattr(client, "safety_check"),
+        "run_health_snapshot": hasattr(client, "get_run_health_snapshot"),
+        "timeline": all(hasattr(client, name) for name in ("log_decision_event", "list_timeline", "stream_timeline")),
+        "gtt_helpers": all(hasattr(client, name) for name in ("place_gtt", "list_gtts", "get_gtt", "modify_gtt", "delete_gtt")),
+        "option_resolvers": bool(
+            options_client
+            and all(hasattr(options_client, name) for name in ("resolve_option_leg", "resolve_offset_leg", "resolve_delta_leg", "resolve_spread"))
+        ),
+        "amo_market_order_helper": hasattr(__import__("kite_algo_worker"), "amo_market_order"),
+    }
+
+
 def collect_certification_report(
     client: KiteAlgoWorkerClient,
     *,
@@ -185,6 +202,7 @@ def collect_certification_report(
             "preview_order": True,
             "list_orders": True,
             "wait_for_history": True,
+            "sdk_surface": collect_sdk_surface_capability(client),
             "typed_marketdata": collect_typed_marketdata_capability(client, symbol),
             "recovery_helpers": collect_recovery_helper_capability(client, symbol),
             "websocket_health": collect_websocket_health_capability(),
@@ -200,7 +218,7 @@ def main() -> int:
 
     client = KiteAlgoWorkerClient(
         AlgoWorkerConfig(
-            base_url=os.environ.get("KITE_ALGO_API_BASE", "http://localhost:8000"),
+            base_url=os.environ.get("KITE_ALGO_API_BASE", "http://localhost:18777"),
             token=os.environ["KITE_ALGO_WORKER_TOKEN"],
             timeout=float(os.environ.get("KITE_ALGO_TIMEOUT", "10")),
         )

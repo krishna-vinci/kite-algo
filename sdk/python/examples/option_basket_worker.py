@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pyright: reportMissingImports=false
 """Safe option basket worker example.
 
 The default mode is `dry_run`. Live mode requires KITE_ALGO_ENABLE_LIVE=1.
@@ -7,10 +8,6 @@ The default mode is `dry_run`. Live mode requires KITE_ALGO_ENABLE_LIVE=1.
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from kite_algo_worker import (
     AlgoWorkerConfig,
@@ -30,7 +27,7 @@ def main() -> None:
     strategy_run_id = os.getenv("KITE_ALGO_RUN_ID", "run_option_basket_demo_v1")
     client = KiteAlgoWorkerClient(
         AlgoWorkerConfig(
-            base_url=os.environ.get("KITE_ALGO_API_BASE", "http://localhost:8000"),
+            base_url=os.environ.get("KITE_ALGO_API_BASE", "http://localhost:18777"),
             token=os.environ["KITE_ALGO_WORKER_TOKEN"],
         )
     )

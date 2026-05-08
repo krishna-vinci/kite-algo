@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-05-07
+Last updated: 2026-05-08
 
 ## Scope
 
@@ -19,7 +19,7 @@ Do not use this file for frontend work.
 - Added Redis-backed order idempotency for direct order placement
 - Routed strategy order placement through the same throttled write path
 - Added broker login health endpoint in `api/routers/auth.py`
-- Added runtime status/log metadata support via `runtime_monitor.py`
+- Added runtime status/log metadata support via `app/monitor.py`
 - Added project-local OpenCode skill at `.opencode/skills/kite-backend-progress/SKILL.md`
 - Added backend mutual fund router in `broker_api/kite_mutual_funds.py`
 
@@ -341,7 +341,7 @@ Do not use this file for frontend work.
 - Added the first real external worker SDK slice:
   - `sdk/python/kite_algo_worker` exposes `KiteAlgoWorkerClient`, `AlgoWorkerConfig`, a custom API exception, and broker-shape order builders
   - SDK examples now cover mean-reversion, option baskets, and grouped live exit preview with safe defaults
-  - `docs/algo-worker-development-guide.md` is now a full coding guide for dry_run/paper/live worker strategy development and documents all live order fields supported by `PlaceOrderRequest`
+  - `documents/algo-worker-sdk-guide.md` is now the canonical worker-model guide for dry_run/paper/live worker strategy development
   - focused SDK tests validate auth headers, run/intent payloads, idempotency enforcement, exit preview payloads, non-2xx handling, and order-builder compatibility with broker order validation
 - Added grouped algo-worker run P&L snapshot/stream support:
   - `/api/algo-workers/worker/runs/{strategy_run_id}/pnl` now returns backend-owned grouped run totals plus per-leg breakdown for `dry_run`, `paper`, and `live`
@@ -351,7 +351,7 @@ Do not use this file for frontend work.
 - Added generic runtime-backed algo-worker market-data primitives:
   - worker endpoints now expose ticker resolution/search, quote snapshots, tick SSE streams, candle snapshots, candle SSE streams, and combined market snapshot bundles under `/api/algo-workers/worker/market/*`
   - SDK methods now wrap those endpoints so external workers can build non-option realtime strategies without broker websockets, Redis access, database access, or backend internals
-  - option-chain discovery, strike/expiry selection, Greeks/IV, and spread builders are explicitly deferred to a later namespaced option worker layer inside the same SDK package
+  - option-chain discovery, strike/expiry selection, Greeks/IV, and spread builders were originally deferred, but the worker-safe options namespace is now implemented under `options/api/worker_options_router.py` and `sdk/python/kite_algo_worker/options/`
 - Added worker-safe funds and run-allocation snapshots:
   - `/api/algo-workers/worker/funds` returns account funds from paper runtime or broker margins through the backend-controlled live Kite session
   - `/api/algo-workers/worker/runs/{strategy_run_id}/funds` adds derived run exposure/P&L and optional allocation-cap remaining calculations for worker position sizing
@@ -368,7 +368,7 @@ Do not use this file for frontend work.
   - updated the worker development guide and added `scripts/sdk_worker_certification.py` for lightweight worker SDK certification checks
 - Completed the generic live protection 100% gate for algo workers:
   - added `sdk/python/kite_algo_worker/live_protection_certification.py` with pure threshold/verdict helpers and `scripts/live_worker_protection_certification.py` for strict ultra-small live protection drills
-  - updated `docs/algo-worker-development-guide.md` with live protection certification usage and safety gates
+  - updated the worker-model docs with live protection certification usage and safety gates
   - fixed a live-db compatibility gap where some running environments were missing `canonical_order_events.processing_started_at`, which prevented canonical event processing/trade-fill projection and made live worker P&L stay empty even for filled attributed orders
   - added runtime self-heal for that schema compatibility in `broker_api/order_runtime.py` and moved startup stuck-row refresh into the guarded worker loop in `main.py` so the order runtime worker cannot die silently before entering its retry loop
   - re-validated the full generic live protection surface with real tiny broker drills for worker-stale exit, position stoploss, basket stoploss, position target, basket target, and live protection patch mutability
@@ -525,23 +525,23 @@ Authoritative docs:
 ---
 
 ### 5) Instrument search + backend startup efficiency
-Status: **Meilisearch remains active; alternate search engine evaluation is deferred**
+Status: **Meilisearch removed; current work is aligned around direct SQL/backend-owned search plus the Go runtime's growing instrument responsibilities**
 
 Current behavior:
 
-- instrument suggestions still run through Meilisearch while search-engine replacement is evaluated
-- PostgreSQL should remain focused on canonical backend data (orders, positions, runtime state, etc.) and should not host a duplicated search index for instruments
+- instrument suggestions no longer depend on a Meilisearch sidecar
+- PostgreSQL remains focused on canonical backend data while instrument-search ownership is being tightened inside backend/Go-owned paths rather than a separate search service
 - FastAPI startup no longer eagerly imports several heavy data/chart packages that are not needed for most requests
 
 Remaining work:
 
 - verify top broker-style query ordering against real expected results (`nifty`, `bank nifty`, strike + CE/PE flows, common typos)
-- if search-engine evaluation resumes later, require a measured RAM win and acceptable broker-style ranking before replacing Meilisearch
+- continue validating broker-style query ordering (`nifty`, `bank nifty`, strike + CE/PE flows, common typos`) against the newer direct SQL / runtime-backed search path
 
 Expected operational effect:
 
 - reduces FastAPI baseline RSS by avoiding unnecessary scientific/chart imports at startup
-- keeps Postgres isolated from instrument-search experiments so order/runtime workloads stay unaffected
+- keeps order/runtime workloads isolated while instrument search is consolidated into owned backend/runtime paths
 
 ---
 
