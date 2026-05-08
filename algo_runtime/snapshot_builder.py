@@ -137,27 +137,135 @@ class RedisCandleDataReader:
 
 
 class OptionsSnapshotReader:
-    def __init__(self, options_session_manager: Any, strike_selector: Any | None = None) -> None:
+    def __init__(self, options_session_manager: Any) -> None:
         self.options_session_manager = options_session_manager
-        self.strike_selector = strike_selector
 
     async def read(self, spec: OptionReadSpec) -> Dict[str, Any]:
         snapshot = self.options_session_manager.get_snapshot(spec.underlying)
         if not snapshot:
             return {}
-        if spec.view == OptionView.SNAPSHOT or self.strike_selector is None:
+        if spec.view == OptionView.SNAPSHOT:
             return snapshot
 
         expiry = self._resolve_expiry(snapshot, spec)
         if expiry is None:
             return snapshot
         if spec.view == OptionView.MINI_CHAIN:
-            return await self.strike_selector.get_mini_chain(
-                spec.underlying,
-                expiry,
+            return await self._build_mini_chain(
+                underlying=spec.underlying,
+                expiry=expiry,
+                snapshot=snapshot,
                 count=(spec.strikes_around_atm * 2) + 1,
             )
         return snapshot
+
+    async def _build_mini_chain(
+        self,
+        *,
+        underlying: str,
+        expiry,
+        snapshot: Dict[str, Any],
+        center_strike: float | None = None,
+        count: int = 11,
+    ) -> Dict[str, Any]:
+        from datetime import date
+
+        expiry_str = expiry.isoformat() if isinstance(expiry, date) else str(expiry)
+        spot_ltp = snapshot.get("spot_ltp")
+        if not spot_ltp:
+            return {
+                "error": "No spot LTP available",
+                "underlying": underlying,
+                "expiry": expiry_str,
+            }
+
+        expiry_data = snapshot.get("per_expiry", {}).get(expiry_str)
+        if not expiry_data:
+            return {
+                "error": f"No data available for expiry {expiry_str}",
+                "underlying": underlying,
+                "expiry": expiry_str,
+                "available_expiries": snapshot.get("expiries", []),
+            }
+
+        if center_strike is None:
+            center_strike = expiry_data.get("atm_strike")
+        if not center_strike:
+            return {
+                "error": "Could not determine ATM strike",
+                "underlying": underlying,
+                "expiry": expiry_str,
+            }
+
+        repo = self.options_session_manager.instrument_repo
+        all_strikes = repo.get_distinct_strikes(underlying, expiry)
+        window_strikes = repo.get_strikes_around_atm(center_strike, all_strikes, count)
+
+        rows = expiry_data.get("rows", [])
+        formatted_strikes = []
+        for row in rows:
+            if row["strike"] not in window_strikes:
+                continue
+
+            ce_data = None
+            if row.get("CE"):
+                ce = row["CE"]
+                lot_size = repo.get_lot_size(ce.get("token"))
+                if not lot_size:
+                    lot_size = 50 if underlying == "NIFTY" else 15
+                ce_data = {
+                    "instrument_token": ce.get("token"),
+                    "tradingsymbol": ce.get("tsym"),
+                    "ltp": ce.get("ltp") or 0,
+                    "lot_size": lot_size,
+                    "oi": ce.get("oi"),
+                    "greeks": {
+                        "delta": ce.get("delta") or 0,
+                        "gamma": ce.get("gamma") or 0,
+                        "theta": ce.get("theta") or 0,
+                        "vega": ce.get("vega") or 0,
+                        "iv": ce.get("iv") or 0,
+                    },
+                }
+
+            pe_data = None
+            if row.get("PE"):
+                pe = row["PE"]
+                lot_size = repo.get_lot_size(pe.get("token"))
+                if not lot_size:
+                    lot_size = 50 if underlying == "NIFTY" else 15
+                pe_data = {
+                    "instrument_token": pe.get("token"),
+                    "tradingsymbol": pe.get("tsym"),
+                    "ltp": pe.get("ltp") or 0,
+                    "lot_size": lot_size,
+                    "oi": pe.get("oi"),
+                    "greeks": {
+                        "delta": pe.get("delta") or 0,
+                        "gamma": pe.get("gamma") or 0,
+                        "theta": pe.get("theta") or 0,
+                        "vega": pe.get("vega") or 0,
+                        "iv": pe.get("iv") or 0,
+                    },
+                }
+
+            formatted_strikes.append(
+                {
+                    "strike": row["strike"],
+                    "ce": ce_data,
+                    "pe": pe_data,
+                    "is_atm": row["strike"] == center_strike,
+                }
+            )
+
+        return {
+            "underlying": underlying,
+            "expiry": expiry_str,
+            "spot_price": spot_ltp,
+            "atm_strike": center_strike,
+            "strikes": formatted_strikes,
+            "timestamp": snapshot.get("updated_at"),
+        }
 
     def _resolve_expiry(self, snapshot: Dict[str, Any], spec: OptionReadSpec):
         from datetime import date

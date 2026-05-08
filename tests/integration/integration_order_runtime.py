@@ -7,7 +7,7 @@ try:
     from sqlalchemy import text
 
     from broker_api.orders.order_runtime import CanonicalOrderEventRuntime, RealTimePositionsService
-    from tests.runtime_support import (
+    from tests.support.runtime_support import (
         TEST_REDIS_URL,
         apply_schema,
         create_test_session_factory,

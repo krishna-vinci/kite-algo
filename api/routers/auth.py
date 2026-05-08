@@ -22,9 +22,9 @@ from app.auth import (
 from broker_api import broker_api
 from broker_api.session.kite_session import KiteSession
 from app.database import get_db
-from strategies.option_strategy.store import OptionStrategyStore
+from options.execution.option_strategy_store import OptionStrategyStore
 from app.monitor import get_components, get_logs, get_meta
-from strategies.option_strategy.runtime_updates import apply_protection_patch, build_option_run_capabilities, build_option_run_summary_fields
+from options.execution.runtime_updates import apply_protection_patch, build_option_run_capabilities, build_option_run_summary_fields
 
 
 router = APIRouter()

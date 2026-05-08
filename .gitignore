@@ -54,9 +54,12 @@ scripts/
 !scripts/
 scripts/*
 !scripts/check_worker_sdk_version_refs.py
+!scripts/sdk_worker_certification.py
+!scripts/live_worker_e2e_validation.py
 
 # Agent Skills
 .agents/
+skills-lock.json
 
 
 # External reference projects

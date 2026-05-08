@@ -328,26 +328,6 @@ async def combined_lifespan(app: FastAPI):
             logging.error("Failed startup index runtime refresh: %s", e, exc_info=True)
             set_component_status("index_runtime_refresh", "degraded", detail=str(e))
 
-        # Initialize Phase 3: StrikeSelector and PositionBuilder
-        try:
-            from strategies.strike_selector import StrikeSelector, PositionBuilder
-            
-            # Get OptionsSessionManager from app state
-            osm = getattr(app.state, "options_session_manager", None)
-            if osm:
-                instruments_repo = InstrumentsRepository(db=SessionLocal)
-                
-                strike_selector = StrikeSelector(osm, instruments_repo)
-                position_builder = PositionBuilder(strike_selector, instruments_repo)
-                
-                app.state.strike_selector = strike_selector
-                app.state.position_builder = position_builder
-                logging.info("Phase 3: StrikeSelector and PositionBuilder initialized")
-            else:
-                logging.warning("OptionsSessionManager not available, Phase 3 components not initialized")
-        except Exception as e:
-            logging.error("Failed to initialize Phase 3 components: %s", e, exc_info=True)
-
         # Auto-start Candle Aggregator with all supported intervals
         try:
             from broker_api.market.candle_aggregator import get_aggregator
@@ -395,12 +375,9 @@ async def combined_lifespan(app: FastAPI):
             from broker_api.market.candle_storage import CandleStorage
             from broker_api.core.redis_events import get_redis
             from paper_runtime import DryRunIntentHandler, PaperIntentHandler, PaperMarketEngine, PaperTradingService
-            from strategies.modular import register_builtin_algos
 
             options_session_manager = getattr(app.state, "options_session_manager", None)
-            strike_selector = getattr(app.state, "strike_selector", None)
             algo_registry = AlgoRegistry()
-            register_builtin_algos(algo_registry)
 
             snapshot_builder = DependencyFilteredSnapshotBuilder(
                 market_reader=RuntimeMarketDataReader(market_data_runtime),
@@ -410,7 +387,7 @@ async def combined_lifespan(app: FastAPI):
                     interval_seconds=INTERVAL_SECONDS,
                 ),
                 indicator_reader=BuiltInIndicatorReader(),
-                options_reader=OptionsSnapshotReader(options_session_manager, strike_selector) if options_session_manager else None,
+                options_reader=OptionsSnapshotReader(options_session_manager) if options_session_manager else None,
                 positions_reader=PositionsSnapshotReader(realtime_positions_service),
                 orders_reader=OrderProjectionReader(),
             )

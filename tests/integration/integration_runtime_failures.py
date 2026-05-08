@@ -8,7 +8,7 @@ try:
 
     from broker_api.orders.order_runtime import CanonicalOrderEventRuntime, RealTimePositionsService
     from broker_api.websocket_manager import write_ticks_to_redis_overlay
-    from tests.runtime_support import (
+    from tests.support.runtime_support import (
         apply_schema,
         create_test_session_factory,
         flush_test_redis,
