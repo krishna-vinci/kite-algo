@@ -126,7 +126,7 @@ func (s *Store) SerializeBlob() ([]byte, error) {
 	gw := gzip.NewWriter(&gzipBuf)
 	enc := json.NewEncoder(gw)
 	// Write opening bracket
-	if _, err := gzipBuf.Write([]byte{'['}); err != nil {
+	if _, err := io.WriteString(gw, "["); err != nil {
 		gw.Close()
 		return nil, err
 	}
