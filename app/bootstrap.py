@@ -22,13 +22,11 @@ from app.background import (
 )
 from app.schedulers import daily_token_ready, _schedule_daily_token_refresh, _schedule_monthly_index_refresh
 from broker_api.broker_api import (
-    ensure_instruments_index,
-    get_meili_client,
-    meili_reindex_instruments,
     run_headless_login_and_persist_system_token,
     schedule_daily_instruments_update,
 )
 from broker_api.instruments.index_ingestion import refresh_live_metrics_for_indices
+from broker_api.instruments.instruments_repository import InstrumentsRepository
 from broker_api.orders import order_event_runtime, realtime_positions_service, refresh_processing_stuck_rows
 from broker_api.session.kite_auth import API_KEY, login_headless
 from broker_api.session.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
@@ -57,23 +55,12 @@ def run_schema_migrations() -> None:
             except Exception:
                 pass
 
-def reset_meili_settings():
-    """
-    Force-applies the latest index settings from the Python codebase to Meilisearch.
-    This is a quick fix for ensuring settings are synchronized on startup.
-    """
-    try:
-        logger.info("Attempting to reset Meilisearch index settings...")
-        ensure_instruments_index()
-        logger.info("Meilisearch index settings reset successfully.")
-    except Exception as e:
-        logger.error(f"Failed to reset Meilisearch settings: {e}", exc_info=True)
-
 async def combined_lifespan(app: FastAPI):
     global market_data_runtime
     # Perform headless login at startup and store the KiteConnect instance
     token_watcher_task = None
     scheduler_task = None
+    daily_instruments_refresh_task = None
     instruments_refresh_task = None
     index_refresh_task = None
     order_runtime_task = None
@@ -332,7 +319,7 @@ async def combined_lifespan(app: FastAPI):
         logging.info("[GATE] Initialized and open at startup (will close at next 08:00 IST)")
         set_meta("daily_token_gate", {"ready": True, "last_changed_at": datetime.utcnow().isoformat()})
         scheduler_task = asyncio.create_task(_schedule_daily_token_refresh())
-        instruments_refresh_task = asyncio.create_task(schedule_daily_instruments_update())
+        daily_instruments_refresh_task = asyncio.create_task(schedule_daily_instruments_update())
         index_refresh_task = asyncio.create_task(_schedule_monthly_index_refresh())
         try:
             startup_index_result = await asyncio.to_thread(refresh_live_metrics_for_indices, ["Nifty50", "NiftyBank"])
@@ -345,7 +332,6 @@ async def combined_lifespan(app: FastAPI):
         # Initialize Phase 3: StrikeSelector and PositionBuilder
         try:
             from strategies.strike_selector import StrikeSelector, PositionBuilder
-            from broker_api.instruments.instruments_repository import InstrumentsRepository
             
             # Get OptionsSessionManager from app state
             osm = getattr(app.state, "options_session_manager", None)
@@ -363,29 +349,22 @@ async def combined_lifespan(app: FastAPI):
         except Exception as e:
             logging.error("Failed to initialize Phase 3 components: %s", e, exc_info=True)
 
-        # Ensure Meilisearch index exists on startup (and bootstrap reindex if empty)
+        # Load instrument cache from Go market-runtime Redis blob.
         try:
-            # Quick fix: force-reset settings on every startup
-            reset_meili_settings()
-            logger.info("Meilisearch index 'instruments' ensured on startup")
-            try:
-                client = get_meili_client(admin=True)
-                index = client.index("instruments")
-                stats = index.get_stats() if hasattr(index, "get_stats") else index.stats()
-                # Handle both dict (older versions) and IndexStats object (newer versions)
-                if isinstance(stats, dict):
-                    num_docs = (stats.get("numberOfDocuments") or stats.get("number_of_documents") or 0)
-                else:
-                    # Try camelCase first then snake_case attributes
-                    num_docs = getattr(stats, "numberOfDocuments", getattr(stats, "number_of_documents", 0))
-
-                if int(num_docs) == 0:
-                    logger.info("Meilisearch 'instruments' index is empty; triggering bootstrap reindex...")
-                    await meili_reindex_instruments()
-            except Exception as ie:
-                logger.exception("Startup Meilisearch reindex-if-empty check failed: %s", ie)
+            count = await InstrumentsRepository.load_from_blob()
+            if count > 0:
+                logger.info("Instrument cache loaded from Redis blob (%d instruments)", count)
+            else:
+                logger.info("Instrument cache empty (will fall back to SQL) — ensure market-runtime is running")
         except Exception as e:
-            logger.exception("Failed to ensure Meilisearch index on startup: %s", e)
+            logger.warning("Failed to load instrument cache from Redis blob: %s", e)
+
+        # Start background subscriber for instrument cache refresh.
+        try:
+            instruments_refresh_task = asyncio.create_task(InstrumentsRepository._on_instrument_refresh())
+            logger.info("Instrument cache refresh subscriber started")
+        except Exception as e:
+            logger.warning("Failed to start instrument cache refresh subscriber: %s", e)
 
         # Auto-start Candle Aggregator with all supported intervals
         try:
@@ -569,11 +548,21 @@ async def combined_lifespan(app: FastAPI):
         pass
     # Cancel daily instruments refresh scheduler
     try:
+        if 'daily_instruments_refresh_task' in locals() and daily_instruments_refresh_task:
+            daily_instruments_refresh_task.cancel()
+            try:
+                await daily_instruments_refresh_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel instrument cache refresh subscriber
+    try:
         if 'instruments_refresh_task' in locals() and instruments_refresh_task:
             instruments_refresh_task.cancel()
             try:
                 await instruments_refresh_task
-            except Exception:
+            except asyncio.CancelledError:
                 pass
     except Exception:
         pass

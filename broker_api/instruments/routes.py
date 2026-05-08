@@ -3,7 +3,6 @@ from typing import Optional
 
 from broker_api.broker_api import (
     SyncAndReindexRequest,
-    get_meilisearch_health as _get_meilisearch_health,
     sync_and_reindex_instruments as _sync_and_reindex_instruments,
     fuzzy_search_instruments as _fuzzy_search_instruments,
 )
@@ -12,10 +11,6 @@ from fastapi import Depends, Query
 from sqlalchemy.orm import Session
 
 router = APIRouter(tags=["Instruments"])
-
-@router.get("/instruments/meili/health")
-async def get_meilisearch_health():
-    return await _get_meilisearch_health()
 
 @router.post("/instruments/sync-and-reindex")
 async def sync_and_reindex_instruments(background_tasks: BackgroundTasks, request: Optional[SyncAndReindexRequest] = Body(default=None), db: Session = Depends(get_db)):

@@ -108,8 +108,6 @@ app.include_router(options_strategy_router)
 app.include_router(options_execution_router)
 app.include_router(options_protection_router)
 
-from broker_api.broker_api import ensure_instruments_index, get_meili_client, meili_reindex_instruments
-
 logger = logging.getLogger(__name__)
 @app.get("/", tags=["System"])
 async def root():
