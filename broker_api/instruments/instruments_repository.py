@@ -1,107 +1,110 @@
 """
-Provides a repository for querying instrument data from the database.
+Provides a repository for querying instrument data.
+
+Instrument lookups go to the Go market-runtime via HTTP (same Docker bridge,
+~0.76 ms) and fall back to PostgreSQL when Go is unreachable.
 """
 import asyncio
 import calendar
-import gzip
-import json
+import logging
+import time
 from contextlib import contextmanager
 from datetime import date, timedelta
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import urlencode
 
+import httpx
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 
+logger = logging.getLogger("instruments")
+
+# ── Go HTTP client singletons ────────────────────────────────────────────────
+_GO_BASE_URL = "http://market-runtime:8780"
+_sync_client: Optional[httpx.Client] = None
+_async_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_sync() -> httpx.Client:
+    global _sync_client
+    if _sync_client is None:
+        _sync_client = httpx.Client(
+            base_url=_GO_BASE_URL,
+            timeout=httpx.Timeout(0.5, connect=0.3),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
+    return _sync_client
+
+
+def _get_async() -> httpx.AsyncClient:
+    global _async_client
+    if _async_client is None:
+        _async_client = httpx.AsyncClient(
+            base_url=_GO_BASE_URL,
+            timeout=httpx.Timeout(0.5, connect=0.3),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
+    return _async_client
+
+
+# ── Circuit breaker ──────────────────────────────────────────────────────────
+
+class _CircuitBreaker:
+    """State machine protecting Go HTTP calls.
+
+    404 (instrument not found) is NOT a failure — Go is healthy, just
+    doesn't have the data.  Only 5xx and connection errors count.
+    """
+
+    def __init__(self):
+        self._failures = 0
+        self._opened_at = 0.0
+        self._state = "closed"  # closed | open | half_open
+        self._threshold = 3
+        self._recovery = 10  # seconds
+
+    def _should_try(self) -> bool:
+        if self._state == "closed":
+            return True
+        if self._state == "open":
+            if time.monotonic() - self._opened_at > self._recovery:
+                self._state = "half_open"
+                return True
+            return False
+        return True  # half_open
+
+    def success(self) -> None:
+        self._failures = 0
+        self._state = "closed"
+
+    def not_found(self) -> None:
+        """404 — Go is healthy, just doesn't have the instrument."""
+        self._failures = 0
+        self._state = "closed"
+
+    def failure(self) -> None:
+        self._failures += 1
+        if self._state in ("half_open", "closed") and self._failures >= self._threshold:
+            self._state = "open"
+            self._opened_at = time.monotonic()
+            logger.warning("Go instrument HTTP circuit breaker OPEN (3 consecutive failures)")
+
+
+_sync_breaker = _CircuitBreaker()
+_async_breaker = _CircuitBreaker()
+
+
+# ── Repository ───────────────────────────────────────────────────────────────
 
 class InstrumentsRepository:
-    """
-    A schema-aware repository for efficient options lookups.
-
-    Maintains an in-memory cache hydrated from the Go market-runtime's
-    Redis instrument blob.  Lookups hit the cache first and fall back to
-    PostgreSQL when the cache is cold.
-    """
-
-    # ── in-memory cache (shared across all instances) ──────────────────────
-    _by_token: Dict[int, Dict[str, object]] = {}
-    _by_symbol: Dict[str, Dict[str, object]] = {}
-
-    # ── public constructors / cache loaders ────────────────────────────────
+    """Instrument lookups via Go HTTP, with PostgreSQL fallback."""
 
     def __init__(self, db: Optional[Session | Callable[[], Session]] = None):
         self.db = db
 
-    @classmethod
-    async def load_from_blob(cls) -> int:
-        """
-        Load instrument data from the Redis *instrument:blob* key (set by
-        the Go market-runtime) and rebuild the class-level caches.
-
-        Returns the number of instruments loaded, or 0 if the blob is
-        unavailable / empty.
-        """
-        try:
-            from broker_api.core.redis_events import get_redis
-            import base64
-
-            redis = get_redis()
-            blob_b64 = await redis.get("instrument:blob")
-            blob = base64.b64decode(blob_b64) if blob_b64 else None
-            if not blob:
-                return 0
-
-            decompressed = gzip.decompress(blob)
-            rows = json.loads(decompressed)
-        except Exception:
-            import logging
-            logging.getLogger("instruments").exception("Failed to load instrument blob from Redis")
-            return 0
-
-        by_token: Dict[int, Dict[str, object]] = {}
-        by_symbol: Dict[str, Dict[str, object]] = {}
-
-        for r in rows:
-            token = int(r["instrument_token"])
-            by_token[token] = r
-
-            # Populate symbol lookups: both "EXCHANGE:SYMBOL" and bare "SYMBOL".
-            exchange = str(r.get("exchange", "") or "")
-            symbol = str(r.get("tradingsymbol", "") or "")
-            if exchange and symbol:
-                by_symbol[f"{exchange}:{symbol}"] = r
-            if symbol:
-                # Allow bare-symbol lookups (last write wins for duplicates).
-                by_symbol[symbol] = r
-
-        # Atomically swap in the new caches (CPython assignment is thread-safe
-        # under the GIL, and our readers are all synchronous).
-        cls._by_token = by_token
-        cls._by_symbol = by_symbol
-
-        return len(by_token)
-
-    @classmethod
-    async def _on_instrument_refresh(cls) -> None:
-        """Background task: listen for *instrument:refresh* and reload."""
-        import logging
-        logger = logging.getLogger("instruments")
-
-        try:
-            from broker_api.core.redis_events import pubsub_iter
-
-            async for message in pubsub_iter("instrument:refresh"):
-                if message.get("event") == "heartbeat":
-                    continue
-                count = await cls.load_from_blob()
-                logger.info("Instrument cache refreshed from Redis blob (%d instruments)", count)
-        except asyncio.CancelledError:
-            logger.info("Instrument refresh subscriber cancelled")
-        except Exception:
-            logger.exception("Instrument refresh subscriber failed")
-
-    # ── session helpers ────────────────────────────────────────────────────
+    # ── session helpers ──────────────────────────────────────────────────
 
     @contextmanager
     def _session_scope(self) -> Iterator[Session]:
@@ -112,24 +115,18 @@ class InstrumentsRepository:
             finally:
                 session.close()
             return
-
         if self.db is not None:
             yield self.db
             return
-
         session = SessionLocal()
         try:
             yield session
         finally:
             session.close()
 
-    # ── symbol normalisation ───────────────────────────────────────────────
+    # ── symbol normalisation ─────────────────────────────────────────────
 
     def normalize_underlying_symbol(self, input_symbol: str) -> tuple[str, str]:
-        """
-        Normalizes common index symbols to their database representations.
-        Returns (options_underlying_key, spot_tradingsymbol).
-        """
         symbol_map = {
             "NIFTY": ("NIFTY", "NIFTY 50"),
             "BANKNIFTY": ("BANKNIFTY", "NIFTY BANK"),
@@ -137,11 +134,7 @@ class InstrumentsRepository:
         return symbol_map.get(input_symbol.upper(), (input_symbol, input_symbol))
 
     def get_spot_token(self, underlying_symbol: str) -> Optional[int]:
-        """
-        Retrieves the instrument token for a given spot or index symbol.
-        """
         _, spot_tradingsymbol = self.normalize_underlying_symbol(underlying_symbol)
-
         if "NIFTY" in spot_tradingsymbol:
             query = text(
                 "SELECT instrument_token FROM kite_instruments WHERE segment='INDICES' AND tradingsymbol=:ts LIMIT 1"
@@ -150,17 +143,13 @@ class InstrumentsRepository:
             query = text(
                 "SELECT instrument_token FROM kite_instruments WHERE exchange='NSE' AND instrument_type='EQ' AND tradingsymbol=:ts LIMIT 1"
             )
-
         with self._session_scope() as db:
             result = db.execute(query, {"ts": spot_tradingsymbol}).scalar_one_or_none()
             return result
 
-    # ── expiry helpers ─────────────────────────────────────────────────────
+    # ── expiry helpers ───────────────────────────────────────────────────
 
     def get_expiries(self, underlying: str, today: date) -> List[date]:
-        """
-        Fetches all available option expiries for an underlying on or after a given date.
-        """
         query = text(
             """
             SELECT DISTINCT expiry FROM kite_instruments
@@ -177,10 +166,6 @@ class InstrumentsRepository:
     def classify_weekly_monthly(
         self, expiries: List[date]
     ) -> tuple[List[date], List[date]]:
-        """
-        Classifies a list of expiry dates into weekly and monthly options.
-        Monthly expiries are the last Thursday of the month.
-        """
         weeklies, monthlies = [], []
         for expiry in expiries:
             last_day = calendar.monthrange(expiry.year, expiry.month)[1]
@@ -198,11 +183,6 @@ class InstrumentsRepository:
         return sorted(weeklies), sorted(monthlies)
 
     def select_target_expiries(self, expiries: List[date]) -> List[date]:
-        """
-        Selects target expiries based on an aggressive profile.
-        - Weeklies: Next 4 weekly + next 2 monthly.
-        - No weeklies: Next 3 monthly.
-        """
         weeklies, monthlies = self.classify_weekly_monthly(expiries)
         if weeklies:
             target = sorted(list(set(weeklies[:4] + monthlies[:2])))
@@ -213,10 +193,6 @@ class InstrumentsRepository:
     def get_expiries_grouped(
         self, underlying: str, today: date
     ) -> Dict[date, List[date]]:
-        """
-        Returns a dict keyed by the first day of each month with a sorted list
-        of distinct expiries for that month, for expiries >= today.
-        """
         query = text(
             """
             SELECT date_trunc('month', expiry)::date AS ym,
@@ -236,33 +212,21 @@ class InstrumentsRepository:
     def pick_monthly_per_month(
         self, grouped: Dict[date, List[date]]
     ) -> Dict[date, date]:
-        """
-        Identifies the monthly expiry (max date) for each month in the grouped dict.
-        """
         return {ym: max(expiries) for ym, expiries in grouped.items()}
 
     def select_current_weeklies_plus_three_monthlies(
         self, underlying: str, today: date
     ) -> List[date]:
-        """
-        Selects the frontend expiry window for an underlying.
-
-        - NIFTY: 3 weekly + 2 monthly expiries
-        - others: 4 weekly + 3 monthly expiries
-        """
         all_expiries = self.get_expiries(underlying, today)
         if not all_expiries:
             return []
-
         grouped = self.get_expiries_grouped(underlying, today)
         monthly_expiries_map = self.pick_monthly_per_month(grouped)
         all_monthly_expiries = set(monthly_expiries_map.values())
-
         weeklies = sorted(
             [exp for exp in all_expiries if exp not in all_monthly_expiries]
         )
         monthlies = sorted(list(all_monthly_expiries))
-
         normalized_underlying = (underlying or "").strip().upper()
         if normalized_underlying == "NIFTY":
             target_weeklies = weeklies[:3]
@@ -270,16 +234,12 @@ class InstrumentsRepository:
         else:
             target_weeklies = weeklies[:4]
             target_monthlies = monthlies[:3]
-
         target_expiries = sorted(list(set(target_weeklies + target_monthlies)))
         return target_expiries
 
-    # ── strike helpers ─────────────────────────────────────────────────────
+    # ── strike helpers ───────────────────────────────────────────────────
 
     def get_distinct_strikes(self, underlying: str, expiry: date) -> List[float]:
-        """
-        Retrieves all distinct strikes for a given underlying and expiry.
-        """
         query = text(
             """
             SELECT DISTINCT strike FROM kite_instruments
@@ -296,9 +256,6 @@ class InstrumentsRepository:
     def get_option_instruments_for_strikes(
         self, underlying: str, expiry: date, strikes: List[float]
     ) -> List[Dict]:
-        """
-        Fetches option instrument details for a list of strikes.
-        """
         if not strikes:
             return []
         query = text(
@@ -317,9 +274,6 @@ class InstrumentsRepository:
             return [dict(row) for row in result]
 
     def derive_strike_step(self, strikes: List[float]) -> Optional[float]:
-        """
-        Computes the modal difference between neighboring strikes.
-        """
         if len(strikes) < 2:
             return None
         diffs = [strikes[i] - strikes[i - 1] for i in range(1, len(strikes))]
@@ -328,17 +282,11 @@ class InstrumentsRepository:
         return max(set(diffs), key=diffs.count)
 
     def nearest_strike(self, strikes: List[float], ref: float) -> Optional[float]:
-        """
-        Finds the nearest strike to a reference price.
-        """
         if not strikes:
             return None
         return min(strikes, key=lambda k: abs(k - ref))
 
     def window_strikes(self, strikes: List[float], atm: float, k: int) -> List[float]:
-        """
-        Returns a window of 2k+1 strikes centered around the ATM strike.
-        """
         if not strikes:
             return []
         atm_strike = self.nearest_strike(strikes, atm)
@@ -351,32 +299,25 @@ class InstrumentsRepository:
             return strikes[start:end]
         except ValueError:
             return []
-    
-    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ═══════════════════════════════════════════════════════════════════════
     # PHASE 3: DELTA-BASED STRIKE SELECTION
-    # ═══════════════════════════════════════════════════════════════════════════
-    
+    # ═══════════════════════════════════════════════════════════════════════
+
     def get_atm_strike(self, underlying: str, current_spot: float, expiry: date) -> Optional[float]:
-        """
-        Calculate ATM strike closest to spot price.
-        """
         strikes = self.get_distinct_strikes(underlying, expiry)
         if not strikes:
             return None
         return self.nearest_strike(strikes, current_spot)
-    
+
     def get_strikes_around_atm(
-        self, 
-        atm_strike: float, 
-        all_strikes: List[float], 
+        self,
+        atm_strike: float,
+        all_strikes: List[float],
         count: int = 5
     ) -> List[float]:
-        """
-        Get N strikes centered around ATM.
-        """
         if not all_strikes or atm_strike not in all_strikes:
             return []
-        
         try:
             atm_index = all_strikes.index(atm_strike)
             half = count // 2
@@ -385,37 +326,94 @@ class InstrumentsRepository:
             return all_strikes[start:end]
         except ValueError:
             return []
-    
-    # ── cache-aware lookups (public API) ───────────────────────────────────
+
+    # ── HTTP lookups (with circuit breaker + SQL fallback) ───────────────
+
+    def _lookup_token_via_http(self, token: int) -> Optional[Dict[str, Any]]:
+        """Synchronous HTTP lookup via Go.  Returns None if not found."""
+        if not _sync_breaker._should_try():
+            return None  # circuit open → let caller use SQL
+        try:
+            resp = _get_sync().get(f"/instruments/{token}")
+        except Exception:
+            _sync_breaker.failure()
+            return None
+
+        if resp.status_code == 200:
+            _sync_breaker.success()
+            return resp.json()
+        elif resp.status_code == 404:
+            _sync_breaker.not_found()
+            return None
+        else:
+            _sync_breaker.failure()
+            return None
+
+    async def _lookup_token_via_http_async(self, token: int) -> Optional[Dict[str, Any]]:
+        """Async HTTP lookup via Go."""
+        if not _async_breaker._should_try():
+            return None
+        try:
+            resp = await _get_async().get(f"/instruments/{token}")
+        except Exception:
+            _async_breaker.failure()
+            return None
+
+        if resp.status_code == 200:
+            _async_breaker.success()
+            return resp.json()
+        elif resp.status_code == 404:
+            _async_breaker.not_found()
+            return None
+        else:
+            _async_breaker.failure()
+            return None
+
+    def _lookup_symbol_via_http(self, exchange: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """Synchronous symbol lookup via Go."""
+        if not _sync_breaker._should_try():
+            return None
+        try:
+            params = urlencode({"exchange": exchange, "symbol": symbol})
+            resp = _get_sync().get(f"/instruments/by-symbol?{params}")
+        except Exception:
+            _sync_breaker.failure()
+            return None
+
+        if resp.status_code == 200:
+            _sync_breaker.success()
+            return resp.json()
+        elif resp.status_code == 404:
+            _sync_breaker.not_found()
+            return None
+        else:
+            _sync_breaker.failure()
+            return None
+
+    # ── public lookup API ────────────────────────────────────────────────
 
     def get_instrument_by_token(self, instrument_token: int) -> Optional[Dict[str, object]]:
-        """Return instrument metadata for *instrument_token* (cache-first)."""
+        """HTTP-first (Go), SQL fallback."""
         try:
             token = int(instrument_token)
         except (TypeError, ValueError):
             return None
 
-        # Check class-level in-memory cache.
-        cached = self._by_token.get(token)
-        if cached is not None:
-            return cached
-
+        result = self._lookup_token_via_http(token)
+        if result is not None:
+            return result  # type: ignore[return-value]
         return self._get_instrument_by_token_sql(token)
 
     def get_instrument_by_exchange_symbol(self, exchange: str, tradingsymbol: str) -> Optional[Dict[str, object]]:
-        """Return instrument metadata for *exchange* + *tradingsymbol* (cache-first)."""
+        """HTTP-first (Go), SQL fallback."""
         ex = str(exchange or "").strip().upper()
         sym = str(tradingsymbol or "").strip().upper()
+        if not ex or not sym:
+            return None
 
-        # Check class-level in-memory cache (both formats).
-        if ex and sym:
-            cached = self._by_symbol.get(f"{ex}:{sym}")
-            if cached is not None:
-                return cached
-        cached = self._by_symbol.get(sym)
-        if cached is not None:
-            return cached
-
+        result = self._lookup_symbol_via_http(ex, sym)
+        if result is not None:
+            return result  # type: ignore[return-value]
         return self._get_instrument_by_exchange_symbol_sql(ex, sym)
 
     def resolve_market_symbol(self, symbol: str) -> Optional[Dict[str, object]]:
@@ -436,19 +434,15 @@ class InstrumentsRepository:
         return self.get_instrument_by_exchange_symbol(exchange, tradingsymbol)
 
     def get_lot_size(self, instrument_token: int) -> Optional[int]:
-        """
-        Get lot size for an instrument token (cache-first).
-        """
         instrument = self.get_instrument_by_token(instrument_token)
         if instrument is not None:
             ls = instrument.get("lot_size")
             if ls is not None:
                 return int(ls)
-        # Fallback to SQL for minimal round-trip.
         return self._get_lot_size_sql(instrument_token)
 
     def search_market_instruments(self, query: str, *, exchange: Optional[str] = None, limit: int = 20) -> List[Dict[str, object]]:
-        """Full-text ILIKE search — always hits PostgreSQL (no cache)."""
+        """Full-text ILIKE search — always hits PostgreSQL."""
         normalized_text = str(query or "").strip().upper()
         if not normalized_text:
             return []
@@ -482,7 +476,7 @@ class InstrumentsRepository:
             ).mappings().all()
             return [dict(row) for row in rows]
 
-    # ── private SQL fallbacks ──────────────────────────────────────────────
+    # ── private SQL fallbacks ────────────────────────────────────────────
 
     def _get_instrument_by_token_sql(self, instrument_token: int) -> Optional[Dict[str, object]]:
         try:
@@ -494,7 +488,7 @@ class InstrumentsRepository:
         query = text(
             """
             SELECT instrument_token, exchange, tradingsymbol, name, instrument_type,
-                   segment, tick_size, lot_size, expiry, strike
+                   segment, tick_size, lot_size, expiry, strike, COALESCE(underlying, '') AS underlying
             FROM kite_instruments
             WHERE instrument_token = :instrument_token
             LIMIT 1
@@ -507,7 +501,9 @@ class InstrumentsRepository:
     def _get_instrument_by_exchange_symbol_sql(self, exchange: str, tradingsymbol: str) -> Optional[Dict[str, object]]:
         query = text(
             """
-            SELECT instrument_token, exchange, tradingsymbol, lot_size, instrument_type, last_price, tick_size
+            SELECT instrument_token, exchange, tradingsymbol, lot_size, instrument_type,
+                   COALESCE(tick_size, 0) AS tick_size, COALESCE(name, '') AS name,
+                   COALESCE(strike, 0) AS strike, COALESCE(underlying, '') AS underlying
             FROM kite_instruments
             WHERE exchange = :exchange AND tradingsymbol = :tradingsymbol
             LIMIT 1

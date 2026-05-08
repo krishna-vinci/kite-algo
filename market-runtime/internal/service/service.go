@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"runtime/debug"
 	"time"
 
 	"kitealgo/market-runtime/internal/config"
@@ -67,21 +66,6 @@ func New(ctx context.Context, cfg config.Config) (*Service, error) {
 		log.Printf("instrument store load failed (tick enrichment disabled): %v", err)
 	} else {
 		instrumentsStore = instStore
-	}
-
-	// Publish instrument blob to Redis for Python consumers (best-effort).
-	if instrumentsStore != nil {
-		if blob, err := instrumentsStore.SerializeBlob(); err != nil {
-			log.Printf("instrument blob serialization failed: %v", err)
-		} else {
-			if err := publisher.client.Set(ctx, "instrument:blob", blob, 0).Err(); err != nil {
-				log.Printf("publishing instrument blob to Redis failed: %v", err)
-			} else {
-				_ = publisher.client.Publish(ctx, "instrument:refresh", "1").Err()
-				log.Printf("instruments: published blob (%d bytes) to Redis", len(blob))
-				debug.FreeOSMemory()  // reclaim temporary JSON/gzip/base64 buffers
-			}
-		}
 	}
 
 	s := &Service{

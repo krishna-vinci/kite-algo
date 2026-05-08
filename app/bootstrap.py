@@ -61,7 +61,6 @@ async def combined_lifespan(app: FastAPI):
     token_watcher_task = None
     scheduler_task = None
     daily_instruments_refresh_task = None
-    instruments_refresh_task = None
     index_refresh_task = None
     order_runtime_task = None
     positions_runtime_task = None
@@ -349,23 +348,6 @@ async def combined_lifespan(app: FastAPI):
         except Exception as e:
             logging.error("Failed to initialize Phase 3 components: %s", e, exc_info=True)
 
-        # Load instrument cache from Go market-runtime Redis blob.
-        try:
-            count = await InstrumentsRepository.load_from_blob()
-            if count > 0:
-                logger.info("Instrument cache loaded from Redis blob (%d instruments)", count)
-            else:
-                logger.info("Instrument cache empty (will fall back to SQL) — ensure market-runtime is running")
-        except Exception as e:
-            logger.warning("Failed to load instrument cache from Redis blob: %s", e)
-
-        # Start background subscriber for instrument cache refresh.
-        try:
-            instruments_refresh_task = asyncio.create_task(InstrumentsRepository._on_instrument_refresh())
-            logger.info("Instrument cache refresh subscriber started")
-        except Exception as e:
-            logger.warning("Failed to start instrument cache refresh subscriber: %s", e)
-
         # Auto-start Candle Aggregator with all supported intervals
         try:
             from broker_api.market.candle_aggregator import get_aggregator
@@ -553,16 +535,6 @@ async def combined_lifespan(app: FastAPI):
             try:
                 await daily_instruments_refresh_task
             except Exception:
-                pass
-    except Exception:
-        pass
-    # Cancel instrument cache refresh subscriber
-    try:
-        if 'instruments_refresh_task' in locals() and instruments_refresh_task:
-            instruments_refresh_task.cancel()
-            try:
-                await instruments_refresh_task
-            except asyncio.CancelledError:
                 pass
     except Exception:
         pass

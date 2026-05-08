@@ -1,15 +1,11 @@
 package instruments
 
 import (
-	"bytes"
-	"encoding/base64"
-	"compress/gzip"
 	"context"
-	"io"
 	"database/sql"
-	"encoding/json"
-	"sync"
 	"log"
+	"strings"
+	"sync"
 
 	_ "github.com/lib/pq"
 )
@@ -50,8 +46,9 @@ type InstrumentMeta struct {
 // It must be treated as immutable after construction; to refresh,
 // use Reload to obtain a new Store and atomically swap it on the consumer.
 type Store struct {
-	byToken map[uint32]*InstrumentMeta
-	db      *sql.DB
+	byToken  map[uint32]*InstrumentMeta
+	bySymbol map[string]*InstrumentMeta // "EXCHANGE:SYMBOL" → meta
+	db       *sql.DB
 }
 
 // LoadFromPostgres connects to the given DSN, queries kite_instruments
@@ -82,6 +79,7 @@ func LoadFromPostgres(ctx context.Context, dsn string) (*Store, error) {
 	defer rows.Close()
 
 	byToken := make(map[uint32]*InstrumentMeta)
+	bySymbol := make(map[string]*InstrumentMeta)
 	for rows.Next() {
 		var m InstrumentMeta
 		if err := rows.Scan(&m.Token, &m.Tradingsymbol, &m.Name, &m.Exchange,
@@ -89,7 +87,13 @@ func LoadFromPostgres(ctx context.Context, dsn string) (*Store, error) {
 			log.Printf("instruments: scan row: %v", err)
 			continue
 		}
+		m.Exchange = intern(strings.ToUpper(m.Exchange))
+		m.Tradingsymbol = intern(m.Tradingsymbol)
 		byToken[m.Token] = &m
+		key := m.Exchange + ":" + m.Tradingsymbol
+		bySymbol[key] = &m
+		// Also index by bare symbol (last-write-wins for duplicates across exchanges)
+		bySymbol[m.Tradingsymbol] = &m
 	}
 	if err := rows.Err(); err != nil {
 		db.Close()
@@ -97,13 +101,18 @@ func LoadFromPostgres(ctx context.Context, dsn string) (*Store, error) {
 	}
 
 	log.Printf("instruments: loaded %d active instruments from PostgreSQL", len(byToken))
-	return &Store{byToken: byToken, db: db}, nil
+	return &Store{byToken: byToken, bySymbol: bySymbol, db: db}, nil
 }
 
 // ByToken returns the metadata for the given instrument_token, or nil if unknown.
 // This is safe for concurrent reads — the Store is immutable.
 func (s *Store) ByToken(token uint32) *InstrumentMeta {
 	return s.byToken[token]
+}
+
+// BySymbol returns the metadata for the given "EXCHANGE:SYMBOL" key, or nil if unknown.
+func (s *Store) BySymbol(key string) *InstrumentMeta {
+	return s.bySymbol[key]
 }
 
 // Len returns the number of instruments in the store.
@@ -116,40 +125,6 @@ func (s *Store) Close() {
 	if s.db != nil {
 		s.db.Close()
 	}
-}
-
-// SerializeBlob streams instruments directly JSON → gzip → base64,
-// avoiding intermediate copies.  The caller should call runtime.GC() after
-// publishing to reclaim the returned buffer.
-func (s *Store) SerializeBlob() ([]byte, error) {
-	var gzipBuf bytes.Buffer
-	gw := gzip.NewWriter(&gzipBuf)
-	enc := json.NewEncoder(gw)
-	// Write opening bracket
-	if _, err := io.WriteString(gw, "["); err != nil {
-		gw.Close()
-		return nil, err
-	}
-	first := true
-	for _, m := range s.byToken {
-		if first {
-			first = false
-		} else {
-			io.WriteString(gw, ",")
-		}
-		if err := enc.Encode(m); err != nil {
-			gw.Close()
-			return nil, err
-		}
-	}
-	// Write closing bracket directly into the gzip writer
-	io.WriteString(gw, "]")
-	if err := gw.Close(); err != nil {
-		return nil, err
-	}
-	encoded := make([]byte, base64.StdEncoding.EncodedLen(gzipBuf.Len()))
-	base64.StdEncoding.Encode(encoded, gzipBuf.Bytes())
-	return encoded, nil
 }
 
 // Reload creates a fresh Store by re-querying PostgreSQL, then closes the old Store.
