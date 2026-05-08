@@ -41,7 +41,6 @@ COPY execution_accounting ./execution_accounting
 COPY journaling ./journaling
 COPY options ./options
 COPY paper_runtime ./paper_runtime
-COPY strategies ./strategies
 COPY sdk ./sdk
 COPY shared ./shared
 COPY alembic.ini main.py schema.sql ./

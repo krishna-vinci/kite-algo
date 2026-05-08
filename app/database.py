@@ -267,7 +267,7 @@ DATABASE_URL = os.getenv(
 )
 
 # synchronous SQLAlchemy
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=5, pool_recycle=3600)
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
