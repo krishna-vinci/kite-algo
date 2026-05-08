@@ -9,7 +9,7 @@ from algo_runtime.admin import refresh_runtime as refresh_algo_runtime_impl
 from algo_runtime.admin import update_instance_status as update_algo_runtime_instance_status_impl
 from algo_runtime.admin import upsert_instance as upsert_algo_runtime_instance_impl
 from algo_runtime.models import AlgoInstance, AlgoLifecycleState, DependencySpec, ExecutionMode
-from auth_service import (
+from app.auth import (
     AppUser,
     clear_auth_cookies,
     get_configured_app_username,
@@ -20,10 +20,10 @@ from auth_service import (
     verify_app_credentials,
 )
 from broker_api import broker_api
-from broker_api.kite_session import KiteSession
-from database import get_db
+from broker_api.session.kite_session import KiteSession
+from app.database import get_db
 from strategies.option_strategy.store import OptionStrategyStore
-from runtime_monitor import get_components, get_logs, get_meta
+from app.monitor import get_components, get_logs, get_meta
 from strategies.option_strategy.runtime_updates import apply_protection_patch, build_option_run_capabilities, build_option_run_summary_fields
 
 

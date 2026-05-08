@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from broker_api.instruments_repository import InstrumentsRepository
-from broker_api.redis_events import publish_event
+from broker_api.instruments.instruments_repository import InstrumentsRepository
+from broker_api.core.redis_events import publish_event
 from execution_accounting.contracts import signed_cash_flow
 
 from algo_runtime.execution_attribution import build_execution_attribution

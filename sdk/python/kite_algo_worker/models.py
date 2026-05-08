@@ -284,6 +284,72 @@ class RunProtectionState(RawModelMixin):
     backend_protection: Optional[Dict[str, Any]] = None
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
 
+
+@dataclass(frozen=True)
+class WorkerRunHealthSnapshot(ModelMixin):
+    strategy_run_id: str
+    status: str
+    execution_mode: str
+    account_scope: Optional[str] = None
+    heartbeat_age_sec: Optional[int] = None
+    health_status: Optional[str] = None
+    session_status: Optional[str] = None
+    recovery_status: Optional[str] = None
+    recovery_action_required: bool = False
+    worker_session_claimed_at: Optional[str] = None
+    last_heartbeat_at: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "status", str(self.status))
+        object.__setattr__(self, "execution_mode", str(self.execution_mode))
+        object.__setattr__(self, "account_scope", None if self.account_scope is None else str(self.account_scope))
+        object.__setattr__(self, "heartbeat_age_sec", _coerce_optional_int(self.heartbeat_age_sec))
+        object.__setattr__(self, "health_status", None if self.health_status is None else str(self.health_status))
+        object.__setattr__(self, "session_status", None if self.session_status is None else str(self.session_status))
+        object.__setattr__(self, "recovery_status", None if self.recovery_status is None else str(self.recovery_status))
+        object.__setattr__(self, "recovery_action_required", _coerce_bool(self.recovery_action_required))
+        object.__setattr__(self, "worker_session_claimed_at", None if self.worker_session_claimed_at is None else str(self.worker_session_claimed_at))
+        object.__setattr__(self, "last_heartbeat_at", None if self.last_heartbeat_at is None else str(self.last_heartbeat_at))
+
+
+@dataclass(frozen=True)
+class WorkerGttWriteResult(ModelMixin):
+    trigger_id: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "trigger_id", _coerce_int(self.trigger_id))
+
+
+@dataclass(frozen=True)
+class WorkerGttTrigger(RawModelMixin):
+    id: int
+    user_id: Optional[str] = None
+    parent_trigger: Optional[int] = None
+    type: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    status: Optional[str] = None
+    condition: Dict[str, Any] = field(default_factory=dict)
+    orders: List[Dict[str, Any]] = field(default_factory=list)
+    meta: Optional[Dict[str, Any]] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", _coerce_int(self.id))
+        object.__setattr__(self, "user_id", None if self.user_id is None else str(self.user_id))
+        object.__setattr__(self, "parent_trigger", _coerce_optional_int(self.parent_trigger))
+        object.__setattr__(self, "type", None if self.type is None else str(self.type))
+        object.__setattr__(self, "created_at", None if self.created_at is None else str(self.created_at))
+        object.__setattr__(self, "updated_at", None if self.updated_at is None else str(self.updated_at))
+        object.__setattr__(self, "expires_at", None if self.expires_at is None else str(self.expires_at))
+        object.__setattr__(self, "status", None if self.status is None else str(self.status))
+        object.__setattr__(self, "condition", dict(self.condition or {}))
+        object.__setattr__(self, "orders", [dict(item) for item in list(self.orders or [])])
+        object.__setattr__(self, "meta", dict(self.meta or {}) if self.meta is not None else None)
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
 @dataclass(frozen=True)
 class WorkerCandle(RawModelMixin):
     ts: str
@@ -460,6 +526,77 @@ class WorkerTradesResponse(ModelMixin):
         object.__setattr__(self, "trades", trades)
 
 
+@dataclass(frozen=True)
+class SafetyCheckResult(ModelMixin):
+    strategy_run_id: str
+    can_trade: bool
+    run_status: str
+    safety_token: str | None = None
+    token_expires_at: str | None = None
+    blocking_reasons: list[str] = field(default_factory=list)
+    generic_protection: dict[str, Any] = field(default_factory=dict)
+    options_protection: dict[str, Any] = field(default_factory=dict)
+    evaluated_at: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "can_trade", bool(self.can_trade))
+        object.__setattr__(self, "run_status", str(self.run_status))
+        object.__setattr__(self, "safety_token", None if self.safety_token is None else str(self.safety_token))
+        object.__setattr__(self, "token_expires_at", None if self.token_expires_at is None else str(self.token_expires_at))
+        object.__setattr__(self, "blocking_reasons", [str(item) for item in list(self.blocking_reasons or [])])
+        object.__setattr__(self, "generic_protection", dict(self.generic_protection or {}))
+        object.__setattr__(self, "options_protection", dict(self.options_protection or {}))
+        object.__setattr__(self, "evaluated_at", str(self.evaluated_at))
+
+
+@dataclass(frozen=True)
+class WorkerTimelineEvent(ModelMixin):
+    cursor: int
+    strategy_run_id: str
+    account_id: str
+    basket_execution_id: Optional[str] = None
+    event_kind: str = "execution"
+    event_source: str = "legacy_execution"
+    event_type: str = ""
+    related_resource_type: Optional[str] = None
+    related_resource_id: Optional[str] = None
+    summary: Optional[str] = None
+    payload: Dict[str, Any] = field(default_factory=dict)
+    created_at: Any = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cursor", _coerce_int(self.cursor))
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "account_id", str(self.account_id))
+        object.__setattr__(self, "basket_execution_id", None if self.basket_execution_id is None else str(self.basket_execution_id))
+        object.__setattr__(self, "event_kind", str(self.event_kind))
+        object.__setattr__(self, "event_source", str(self.event_source))
+        object.__setattr__(self, "event_type", str(self.event_type))
+        object.__setattr__(self, "related_resource_type", None if self.related_resource_type is None else str(self.related_resource_type))
+        object.__setattr__(self, "related_resource_id", None if self.related_resource_id is None else str(self.related_resource_id))
+        object.__setattr__(self, "summary", None if self.summary is None else str(self.summary))
+        object.__setattr__(self, "payload", dict(self.payload or {}))
+
+
+@dataclass(frozen=True)
+class WorkerTimelineResponse(ModelMixin):
+    strategy_run_id: str
+    after_cursor: int
+    last_cursor: int
+    events: List[WorkerTimelineEvent] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "after_cursor", _coerce_int(self.after_cursor))
+        object.__setattr__(self, "last_cursor", _coerce_int(self.last_cursor))
+        normalized_events = [
+            event if isinstance(event, WorkerTimelineEvent) else WorkerTimelineEvent.model_validate(event)
+            for event in list(self.events or [])
+        ]
+        object.__setattr__(self, "events", normalized_events)
+
+
 __all__ = [
     "CostContract",
     "WorkerCandle",
@@ -474,6 +611,9 @@ __all__ = [
     "WorkerRunPnlSnapshot",
     "WorkerRunPnlTotals",
     "RunProtectionState",
+    "SafetyCheckResult",
+    "WorkerTimelineEvent",
+    "WorkerTimelineResponse",
     "WorkerOrderResult",
     "WorkerOrdersResponse",
     "WorkerTradesResponse",

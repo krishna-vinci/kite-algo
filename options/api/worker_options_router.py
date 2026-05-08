@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from api.routers.algo_workers import require_worker_token
+from api.routers.worker_protection import (
+    observe_worker_option_protection_timeline_state,
+    validate_worker_run_safety_token,
+)
+from api.routers.worker_shared import (
+    _repo,
+    require_active_worker_run_session,
+    require_worker_token,
+)
 from options.api.execution_router import (
     create_option_run,
     enter_option_run,
@@ -19,6 +27,7 @@ from options.api.protection_router import (
 )
 from options.api.strategy_router import preview_option_strategy
 from options.execution import OptionRunCreateRequest
+from options.execution.models import OptionRunActionRequest
 from options.execution.runtime_instance import (
     OptionExecutionRuntimeInstance,
     get_option_execution_runtime_instance,
@@ -141,12 +150,24 @@ async def preview_worker_option_run_entry(
 async def enter_worker_option_run(
     strategy_run_id: str,
     request: Request,
-    payload: dict | None = None,
+    payload: OptionRunActionRequest | None = None,
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
     runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
 ):
-    return await enter_option_run(strategy_run_id, request, payload, store, runtime)
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is not None:
+        await require_active_worker_run_session(request, run)
+    action_payload = payload or OptionRunActionRequest()
+    if action_payload.safety_token:
+        await validate_worker_run_safety_token(request, strategy_run_id, action_payload.safety_token)
+    return await enter_option_run(
+        strategy_run_id,
+        request,
+        action_payload.model_dump(exclude_none=True),
+        store,
+        runtime,
+    )
 
 
 @router.post("/runs/{strategy_run_id}/preview-exit")
@@ -163,12 +184,24 @@ async def preview_worker_option_run_exit(
 @router.post("/runs/{strategy_run_id}/exit")
 async def exit_worker_option_run(
     strategy_run_id: str,
-    payload: dict | None = None,
+    request: Request,
+    payload: OptionRunActionRequest | None = None,
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
     runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
 ):
-    return await exit_option_run(strategy_run_id, payload, store, runtime)
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is not None:
+        await require_active_worker_run_session(request, run)
+    action_payload = payload or OptionRunActionRequest()
+    if action_payload.safety_token:
+        await validate_worker_run_safety_token(request, strategy_run_id, action_payload.safety_token)
+    return await exit_option_run(
+        strategy_run_id,
+        action_payload.model_dump(exclude_none=True),
+        store,
+        runtime,
+    )
 
 
 @router.get("/runs/{strategy_run_id}/state")
@@ -183,20 +216,33 @@ async def get_worker_option_run_state(
 @router.put("/runs/{strategy_run_id}/protection")
 async def update_worker_option_run_protection(
     strategy_run_id: str,
+    request: Request,
     payload: OptionProtectionConfigUpdateRequest,
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
 ):
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is not None:
+        await require_active_worker_run_session(request, run)
     return await update_option_run_protection(strategy_run_id, payload, store)
 
 
 @router.get("/runs/{strategy_run_id}/protection/state")
 async def get_worker_option_run_protection_state(
     strategy_run_id: str,
+    request: Request,
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
 ):
-    return await get_option_run_protection_state(strategy_run_id, store)
+    state = await get_option_run_protection_state(strategy_run_id, store)
+    worker_run = await _repo(request).get_run(strategy_run_id)
+    if worker_run is not None:
+        _snapshot, _events = await observe_worker_option_protection_timeline_state(
+            request,
+            strategy_run_id,
+            worker_run=worker_run,
+        )
+    return state
 
 
 @router.post("/runs/{strategy_run_id}/protection/replay")

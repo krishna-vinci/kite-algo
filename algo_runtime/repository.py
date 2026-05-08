@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from database import SessionLocal
+from app.database import SessionLocal
 from .models import AlgoCheckpoint, AlgoInstance, AlgoLifecycleState, ExecutionMode
 
 

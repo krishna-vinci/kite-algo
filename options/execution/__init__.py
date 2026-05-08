@@ -12,12 +12,14 @@ from .lifecycle import (
     transition_to,
 )
 from .durable_store import DurableOptionRunStore
-from .models import OptionRunCreateRequest, OptionRunState, OptionRunStatus
+from .models import OptionExecutionLeg, OptionRunActionRequest, OptionRunCreateRequest, OptionRunState, OptionRunStatus
 from .planner import sort_entry_orders_buy_first, sort_orders_buy_first
 from .store import OptionRunStore, get_option_run_store, reset_option_run_store
 
 __all__ = [
     "OptionRunState",
+    "OptionExecutionLeg",
+    "OptionRunActionRequest",
     "OptionRunCreateRequest",
     "OptionRunStatus",
     "sort_orders_buy_first",

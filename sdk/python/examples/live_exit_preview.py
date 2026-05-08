@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
+# pyright: reportMissingImports=false
 """Preview a grouped live exit without placing broker orders."""
 
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient
 
@@ -16,7 +13,7 @@ def main() -> None:
     strategy_run_id = os.environ["KITE_ALGO_RUN_ID"]
     client = KiteAlgoWorkerClient(
         AlgoWorkerConfig(
-            base_url=os.environ.get("KITE_ALGO_API_BASE", "http://localhost:8000"),
+            base_url=os.environ.get("KITE_ALGO_API_BASE", "http://localhost:18777"),
             token=os.environ["KITE_ALGO_WORKER_TOKEN"],
         )
     )

@@ -68,7 +68,7 @@ This file summarizes the accounting and worker-API changes made to keep paper, l
 - Required environment:
 
 ```bash
-export KITE_ALGO_API_BASE="http://localhost:8000"
+export KITE_ALGO_API_BASE="http://localhost:18777"
 export KITE_ALGO_WORKER_TOKEN="kwa_..."
 export KITE_ALGO_ACCOUNT_SCOPE="kite:AB1234"
 ```

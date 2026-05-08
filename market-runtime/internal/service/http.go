@@ -2,9 +2,13 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"kitealgo/market-runtime/internal/instruments"
 )
 
 func NewHTTPHandler(svc *Service) http.Handler {
@@ -61,6 +65,64 @@ func NewHTTPHandler(svc *Service) http.Handler {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	})
+	mux.HandleFunc("/internal/market-runtime/instruments/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		newStore, err := instruments.Reload(r.Context(), svc.config.PostgresDSN, svc.instruments)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "instrument reload failed: "+err.Error())
+			return
+		}
+		svc.instrumentsMu.Lock()
+		svc.instruments = newStore
+		svc.instrumentsMu.Unlock()
+
+		log.Printf("instruments: reloaded %d instruments", newStore.Len())
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "ok",
+			"count":  newStore.Len(),
+		})
+	})
+
+	// Instrument lookup by token: GET /instruments/{token}
+	mux.HandleFunc("/instruments/", func(w http.ResponseWriter, r *http.Request) {
+		svc.instrumentsMu.RLock()
+		store := svc.instruments
+		svc.instrumentsMu.RUnlock()
+
+		path := strings.TrimPrefix(r.URL.Path, "/instruments/")
+		if r.Method == http.MethodGet && path == "by-symbol" {
+			// GET /instruments/by-symbol?exchange=NFO&symbol=BANKNIFTY25MAY51000CE
+			exchange := strings.ToUpper(r.URL.Query().Get("exchange"))
+			symbol := r.URL.Query().Get("symbol")
+			if exchange == "" || symbol == "" {
+				writeError(w, http.StatusBadRequest, "exchange and symbol query params required")
+				return
+			}
+			key := exchange + ":" + symbol
+			if meta := store.BySymbol(key); meta != nil {
+				writeJSON(w, http.StatusOK, meta)
+			} else {
+				writeError(w, http.StatusNotFound, fmt.Sprintf("instrument not found: %s", key))
+			}
+			return
+		}
+
+		// GET /instruments/{token}
+		token, err := strconv.ParseUint(strings.TrimSpace(path), 10, 32)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid instrument token")
+			return
+		}
+		if meta := store.ByToken(uint32(token)); meta != nil {
+			writeJSON(w, http.StatusOK, meta)
+		} else {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("instrument not found: %d", token))
+		}
+	})
+
 	return mux
 }
 

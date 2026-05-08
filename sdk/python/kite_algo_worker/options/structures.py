@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from typing import Any, Dict
 
 
@@ -17,6 +18,7 @@ def option_leg(
     exit_order_type: str | None = None,
     exit_price: float | None = None,
     variety: str = "regular",
+    leg_id: str | None = None,
     **extra: Any,
 ) -> Dict[str, Any]:
     """Build a simple option leg payload for preview/entry/exit baskets.
@@ -28,10 +30,11 @@ def option_leg(
     """
 
     payload: Dict[str, Any] = {
+        "leg_id": str(leg_id or f"leg_{uuid.uuid4().hex[:8]}"),
         "exchange": exchange,
-        "tradingsymbol": tradingsymbol,
-        "transaction_type": transaction_type,
-        "order_type": order_type,
+        "tradingsymbol": str(tradingsymbol).strip().upper(),
+        "transaction_type": str(transaction_type).strip().upper(),
+        "order_type": str(order_type).strip().upper(),
         "quantity": int(quantity),
         "variety": variety,
     }

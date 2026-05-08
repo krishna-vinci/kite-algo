@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, Optional, Protocol
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
-from database import SessionLocal
+from app.database import SessionLocal
 
 from .models import (
     AlgoInstance,

@@ -2,11 +2,11 @@
 
 Thanks for contributing.
 
-Kite Algo is a full-stack trading platform with real execution, paper execution, runtime services, grouped accounting, journaling, and an external worker model. Good contributions respect those boundaries instead of cutting around them.
+Kite Algo is a full-stack trading platform with real execution, paper execution, grouped accounting, a separate Go market runtime, and an external worker model. Good contributions respect those boundaries instead of cutting around them.
 
 ## Before you start
 
-Please read these first:
+Read these first:
 
 - [README.md](README.md)
 - [documents/README.md](documents/README.md)
@@ -16,15 +16,16 @@ Please read these first:
 
 ## Prerequisites
 
-- Python 3
+- Python 3.11+ recommended for local work
 - Docker + Docker Compose
 - Node.js for `frontend-next/`
 - Go for `market-runtime/`
 - Git
+- `pre-commit` if you want local hook parity with the repo defaults
 
 ## Local development setup
 
-This file covers the contributor workflow. Unlike the root `README.md`, it uses the local development stack.
+This file covers the contributor workflow. Unlike the root `README.md`, it assumes the local development stack.
 
 ### 1. Prepare environment variables
 
@@ -49,22 +50,22 @@ Use `compose.dev.yml` for contributor workflows. The production-oriented stack i
 | Surface | URL |
 | --- | --- |
 | Frontend | `http://localhost:13000` |
-| Backend | `http://localhost:18777` |
+| Backend API | `http://localhost:18777` |
 | Market runtime | `http://localhost:18780/healthz` |
-| Meilisearch | `http://localhost:17700` |
 
 ## Repository map
 
 | Path | Responsibility |
 | --- | --- |
-| `api/` | Public backend routes and API helpers |
-| `broker_api/` | Broker-facing services and session handling |
-| `algo_runtime/` | Strategy lifecycle, attribution, and execution wiring |
-| `options/` | Options sessions, strategy flows, protection, and execution helpers |
+| `main.py`, `app/` | App bootstrap, middleware, startup validation, monitoring |
+| `api/` | Public backend routes plus grouped support modules under `config/`, `repositories/`, `schemas/`, and `services/` |
+| `broker_api/` | Broker-facing services organized by subpackages such as `core/`, `orders/`, `instruments/`, `market/`, `session/`, and `timeline/` |
+| `algo_runtime/` | Strategy lifecycle, attribution, run truth, and execution orchestration |
+| `options/` | Options sessions, strategy flows, protection, worker-safe options APIs |
 | `paper_runtime/` | Durable paper execution state |
-| `execution_accounting/` | Shared attribution and cost contracts |
-| `journaling/` | Run history, journal views, summaries, review flows |
-| `market-runtime/` | Go websocket runtime |
+| `execution_accounting/` | Shared attribution, cost, and grouped-accounting contracts |
+| `journaling/` | Run history, journal views, summaries, analytics, review flows |
+| `market-runtime/` | Go websocket runtime and instrument-serving internals |
 | `sdk/python/` | Python SDK for external algo workers |
 | `frontend-next/` | Next.js frontend |
 | `strategies/` | Strategy implementations and strategy-oriented modules |
@@ -73,6 +74,8 @@ Use `compose.dev.yml` for contributor workflows. The production-oriented stack i
 
 ## Contribution lanes
 
+Prefer the newer grouped structure when adding code. Worker routes are split across `api/routers/worker_*.py`, backend support code lives under `api/services/` and `api/repositories/`, and broker behavior is organized under `broker_api/` subpackages.
+
 | Area | Good contribution examples | Start here |
 | --- | --- | --- |
 | Backend/API | Typed route cleanup, validation, contract improvements, auth-safe flows | `api/`, `broker_api/`, `main.py` |
@@ -80,10 +83,10 @@ Use `compose.dev.yml` for contributor workflows. The production-oriented stack i
 | Options | Options sessions, strategy flows, protection, and execution helpers | `options/`, worker options endpoints, frontend options pages |
 | Paper execution | Simulation accuracy, funds/P&L correctness, isolation fixes | `paper_runtime/`, `execution_accounting/` |
 | Journaling | Run summaries, review flows, metrics, note handling | `journaling/` |
-| Market runtime | Subscription ownership, runtime status, tick fanout | `market-runtime/` |
+| Market runtime | Subscription ownership, runtime status, tick fanout, instrument serving | `market-runtime/` |
 | Worker SDK | Typed models, helper ergonomics, examples, worker-safe flows | `sdk/python/` |
 | Frontend | Operator UX, typed pages, tests, data presentation | `frontend-next/` |
-| Docs | Architecture, codebase guides, onboarding improvements | `README.md`, `documents/`, `CONTRIBUTING.md` |
+| Docs | Architecture, codebase guides, onboarding improvements | `README.md`, `documents/`, `CONTRIBUTING.md`, `agent-context/` |
 
 ## Workflow expectations
 
@@ -92,13 +95,13 @@ Use `compose.dev.yml` for contributor workflows. The production-oriented stack i
 - do not bypass backend-owned execution or accounting rules
 - do not commit secrets or real credentials
 - add or update tests when behavior changes
-- update docs when public behavior or developer workflows change
+- update docs when public behavior, repo structure, or developer workflows change
 
 ## High-risk areas
 
 Take extra care in these parts of the codebase:
 
-- `auth_service.py` and auth/session routes
+- `app/auth.py`, auth/session routes, and startup auth validation
 - live execution paths
 - grouped funds and grouped P&L logic
 - execution attribution and reconciliation
@@ -106,6 +109,13 @@ Take extra care in these parts of the codebase:
 - worker-token authorization and worker-safe route boundaries
 
 ## Running checks
+
+### Pre-commit hooks
+
+```bash
+pre-commit install
+pre-commit run --all-files
+```
 
 ### Backend
 

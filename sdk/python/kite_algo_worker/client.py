@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
 import requests
 
 from .exceptions import KiteAlgoWorkerError, error_for_status
+from .run_config import RunConfig
 from .models import (
     RunProtectionState,
+    SafetyCheckResult,
     WorkerFundsSnapshot,
+    WorkerGttTrigger,
+    WorkerGttWriteResult,
     WorkerHistoricalCandles,
     WorkerOrderSnapshot,
     WorkerOrdersResponse,
+    WorkerRunHealthSnapshot,
     WorkerRunPnlSnapshot,
+    WorkerTimelineResponse,
     WorkerTradesResponse,
 )
 from .options.client import OptionWorkerClient
@@ -101,8 +108,85 @@ class KiteAlgoWorkerClient:
             payload["strategy_run_id"] = strategy_run_id
         return self._request("POST", "/worker/runs", json=payload)
 
+    def create_run_from_config(self, config: RunConfig) -> JsonDict:
+        return self._request("POST", "/worker/runs", json=config.to_create_run_payload())
+
+    @contextmanager
+    def run(
+        self,
+        config: RunConfig,
+        *,
+        claim_session: bool = True,
+        heartbeat_on_enter: bool = True,
+        release_on_exit: bool = True,
+    ):
+        if heartbeat_on_enter and not claim_session:
+            raise ValueError("heartbeat_on_enter requires claim_session=True")
+
+        run_payload = _get_or_create_run_with_validation(self, config)
+        run_id = str(run_payload["strategy_run_id"])
+        session_nonce: str | None = None
+
+        if claim_session:
+            claim = self.claim_session(run_id)
+            session_nonce = str(claim["worker_session_nonce"])
+            if heartbeat_on_enter:
+                self.run_heartbeat(run_id, session_nonce=session_nonce)
+
+        from .managed_run import ManagedRun
+
+        managed = ManagedRun(client=self, config=config, run=run_payload, session_nonce=session_nonce)
+        body_error: Exception | None = None
+        try:
+            yield managed
+        except Exception as exc:
+            body_error = exc
+            raise
+        finally:
+            if release_on_exit and session_nonce:
+                try:
+                    self.release_session(run_id, session_nonce=session_nonce)
+                except Exception:
+                    if body_error is None:
+                        raise
+
     def get_run(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}")
+
+    def get_run_health_snapshot(self, strategy_run_id: str) -> WorkerRunHealthSnapshot:
+        return WorkerRunHealthSnapshot.model_validate(self.get_run(strategy_run_id))
+
+    def claim_session(self, strategy_run_id: str) -> JsonDict:
+        return self._request("POST", f"/worker/runs/{strategy_run_id}/claim-session")
+
+    def release_session(self, strategy_run_id: str, *, session_nonce: str) -> JsonDict:
+        return self._request(
+            "DELETE",
+            f"/worker/runs/{strategy_run_id}/claim-session",
+            headers={"X-Worker-Session-Nonce": str(session_nonce)},
+        )
+
+    def run_heartbeat(
+        self,
+        strategy_run_id: str,
+        *,
+        session_nonce: str,
+        worker_id: Optional[str] = None,
+        status: str = "healthy",
+        metrics: Optional[Mapping[str, Any]] = None,
+    ) -> JsonDict:
+        payload: JsonDict = {"status": status, "metrics": dict(metrics or {})}
+        if worker_id is not None:
+            payload["worker_id"] = worker_id
+        return self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/heartbeat",
+            headers={"X-Worker-Session-Nonce": str(session_nonce)},
+            json=payload,
+        )
+
+    def safety_check(self, strategy_run_id: str) -> SafetyCheckResult:
+        return SafetyCheckResult.model_validate(self._request("GET", f"/worker/runs/{strategy_run_id}/safety-check"))
 
     def get_run_pnl(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}/pnl")
@@ -171,6 +255,39 @@ class KiteAlgoWorkerClient:
         state = dict(runtime_state.get("backend_protection_state") or {})
         return RunProtectionState.model_validate(state).model_dump()
 
+    def place_gtt(self, payload: Mapping[str, Any]) -> JsonDict:
+        return self._request("POST", "/worker/gtt/triggers", json=dict(payload))
+
+    def place_gtt_snapshot(self, payload: Mapping[str, Any]) -> WorkerGttWriteResult:
+        return WorkerGttWriteResult.model_validate(self.place_gtt(payload))
+
+    def list_gtts(self) -> List[JsonDict]:
+        response = self._request("GET", "/worker/gtt/triggers")
+        if not isinstance(response, list):
+            return []
+        return [dict(item) for item in response if isinstance(item, Mapping)]
+
+    def list_gtts_snapshot(self) -> List[WorkerGttTrigger]:
+        return [WorkerGttTrigger.model_validate(item) for item in self.list_gtts()]
+
+    def get_gtt(self, trigger_id: int) -> JsonDict:
+        return self._request("GET", f"/worker/gtt/triggers/{int(trigger_id)}")
+
+    def get_gtt_snapshot(self, trigger_id: int) -> WorkerGttTrigger:
+        return WorkerGttTrigger.model_validate(self.get_gtt(trigger_id))
+
+    def modify_gtt(self, trigger_id: int, payload: Mapping[str, Any]) -> JsonDict:
+        return self._request("PUT", f"/worker/gtt/triggers/{int(trigger_id)}", json=dict(payload))
+
+    def modify_gtt_snapshot(self, trigger_id: int, payload: Mapping[str, Any]) -> WorkerGttWriteResult:
+        return WorkerGttWriteResult.model_validate(self.modify_gtt(trigger_id, payload))
+
+    def delete_gtt(self, trigger_id: int) -> JsonDict:
+        return self._request("DELETE", f"/worker/gtt/triggers/{int(trigger_id)}")
+
+    def delete_gtt_snapshot(self, trigger_id: int) -> WorkerGttWriteResult:
+        return WorkerGttWriteResult.model_validate(self.delete_gtt(trigger_id))
+
     def get_funds(self, *, mode: str = "paper", account_scope: Optional[str] = None) -> JsonDict:
         params: JsonDict = {"mode": mode}
         if account_scope is not None:
@@ -189,6 +306,18 @@ class KiteAlgoWorkerClient:
             f"/worker/runs/{strategy_run_id}/pnl/stream",
             params={"interval_seconds": interval_seconds},
         )
+
+    def log_decision_event(self, strategy_run_id: str, **payload: Any) -> JsonDict:
+        return self._request("POST", f"/worker/runs/{strategy_run_id}/decision-events", json=dict(payload))
+
+    def list_timeline(self, strategy_run_id: str, **params: Any) -> JsonDict:
+        return self._request("GET", f"/worker/runs/{strategy_run_id}/timeline", params=dict(params or {}))
+
+    def list_timeline_snapshot(self, strategy_run_id: str, **params: Any) -> WorkerTimelineResponse:
+        return WorkerTimelineResponse.model_validate(self.list_timeline(strategy_run_id, **params))
+
+    def stream_timeline(self, strategy_run_id: str, **params: Any) -> Iterator[JsonDict]:
+        return self._stream_sse("GET", f"/worker/runs/{strategy_run_id}/timeline/stream", params=dict(params or {}))
 
     def resolve_ticker(self, symbol: str) -> JsonDict:
         return self._request("GET", "/worker/market/instruments/resolve", params={"symbol": symbol})
@@ -379,18 +508,20 @@ class KiteAlgoWorkerClient:
         order: Mapping[str, Any],
         idempotency_key: str,
         metadata: Optional[Mapping[str, Any]] = None,
+        safety_token: Optional[str] = None,
+        session_nonce: Optional[str] = None,
     ) -> JsonDict:
         key = self._require_idempotency_key(idempotency_key)
-        return self._request(
-            "POST",
-            f"/worker/runs/{strategy_run_id}/intents",
-            json={
-                "intent_type": "place_order",
-                "payload": {"order": dict(order)},
-                "idempotency_key": key,
-                "metadata": dict(metadata or {}),
-            },
-        )
+        payload: JsonDict = {
+            "intent_type": "place_order",
+            "payload": {"order": dict(order)},
+            "idempotency_key": key,
+            "metadata": dict(metadata or {}),
+        }
+        if safety_token is not None:
+            payload["safety_token"] = str(safety_token)
+        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
+        return self._request("POST", f"/worker/runs/{strategy_run_id}/intents", json=payload, headers=headers)
 
     def place_basket(
         self,
@@ -401,30 +532,35 @@ class KiteAlgoWorkerClient:
         *,
         all_or_none: bool = False,
         dry_run: bool = False,
+        safety_token: Optional[str] = None,
+        session_nonce: Optional[str] = None,
     ) -> JsonDict:
         key = self._require_idempotency_key(idempotency_key)
         order_list: List[JsonDict] = [dict(order) for order in orders]
-        return self._request(
-            "POST",
-            f"/worker/runs/{strategy_run_id}/intents",
-            json={
-                "intent_type": "place_basket",
-                "payload": {"basket": {"orders": order_list, "all_or_none": all_or_none, "dry_run": dry_run}},
-                "idempotency_key": key,
-                "metadata": dict(metadata or {}),
-            },
-        )
+        payload: JsonDict = {
+            "intent_type": "place_basket",
+            "payload": {"basket": {"orders": order_list, "all_or_none": all_or_none, "dry_run": dry_run}},
+            "idempotency_key": key,
+            "metadata": dict(metadata or {}),
+        }
+        if safety_token is not None:
+            payload["safety_token"] = str(safety_token)
+        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
+        return self._request("POST", f"/worker/runs/{strategy_run_id}/intents", json=payload, headers=headers)
 
     def patch_risk(
         self,
         strategy_run_id: str,
         patch: Mapping[str, Any],
         reason: Optional[str] = None,
+        session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
         return self._request(
             "PATCH",
             f"/worker/runs/{strategy_run_id}/risk",
             json={"patch": dict(patch), "reason": reason},
+            headers=headers,
         )
 
     def update_backend_protection(
@@ -434,7 +570,9 @@ class KiteAlgoWorkerClient:
         *,
         reason: Optional[str] = None,
         reset_trailing: bool = True,
+        session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
         return self._request(
             "PATCH",
             f"/worker/runs/{strategy_run_id}/protection",
@@ -443,6 +581,7 @@ class KiteAlgoWorkerClient:
                 "reason": reason,
                 "reset_trailing": reset_trailing,
             },
+            headers=headers,
         )
 
     def exit_run(
@@ -451,11 +590,14 @@ class KiteAlgoWorkerClient:
         reason: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         dry_run: bool = False,
+        session_nonce: Optional[str] = None,
     ) -> JsonDict:
+        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
         return self._request(
             "POST",
             f"/worker/runs/{strategy_run_id}/exit",
             json={"reason": reason, "idempotency_key": idempotency_key, "dry_run": dry_run},
+            headers=headers,
         )
 
     @staticmethod
@@ -494,3 +636,26 @@ class KiteAlgoWorkerClient:
         except ValueError:
             body = {"raw": response.text}
         raise error_for_status(response.status_code, body, fallback=f"Worker API returned {response.status_code} for {method} {path}")
+
+
+def _get_or_create_run_with_validation(client: KiteAlgoWorkerClient, config: RunConfig) -> dict[str, Any]:
+    if config.strategy_run_id:
+        try:
+            existing = client.get_run(config.strategy_run_id)
+        except KiteAlgoWorkerError as exc:
+            if exc.status_code != 404:
+                raise
+        else:
+            mismatches = {
+                "template_id": (existing.get("template_id"), config.template_id),
+                "account_scope": (existing.get("account_scope"), config.account_scope),
+                "execution_mode": (existing.get("execution_mode"), config.execution_mode),
+            }
+            wrong = {key: value for key, value in mismatches.items() if str(value[0]) != str(value[1])}
+            if wrong:
+                raise KiteAlgoWorkerError(
+                    f"RunConfig mismatch for {config.strategy_run_id}: {wrong}",
+                    status_code=409,
+                )
+            return existing
+    return client.create_run_from_config(config)

@@ -24,21 +24,21 @@ Market-data ownership, execution ownership, and post-trade ownership are intenti
 
 ### 4. External workers should still live inside platform truth
 
-Remote or isolated strategy workers should be able to use backend-owned execution, grouped funds, grouped P&L, and journaling without becoming their own parallel trading system.
+Remote or isolated strategy workers should be able to use backend-owned execution, grouped funds, grouped P&L, protection state, and journaling without becoming their own parallel trading system.
 
 ## Layer map
 
 | Layer | Why it exists | Main code |
 | --- | --- | --- |
-| App auth | Protect operator access before any broker-backed action | `auth_service.py`, `api/routers/auth.py` |
-| Broker session ownership | Centralize Kite login and session truth | `broker_api/` |
-| Typed API layer | Stable contracts for frontend and workers | `api/routers/` |
+| App bootstrap and auth | Startup, auth validation, middleware, monitoring, and app lifecycle | `main.py`, `app/`, `api/routers/auth.py` |
+| Broker session ownership | Centralize Kite login and session truth | `broker_api/session/`, `broker_api/core/`, `broker_api/` |
+| Typed API layer | Stable contracts for frontend and workers | `api/routers/`, `api/services/`, `api/repositories/` |
 | Algo runtime | Run lifecycle, attribution, intent handling | `algo_runtime/` |
 | Options core | Options sessions, strategy flows, protection, and execution helpers | `options/` |
 | Paper runtime | Durable simulated execution | `paper_runtime/` |
 | Execution accounting | Shared attribution and cost semantics | `execution_accounting/` |
 | Journaling | Reviewable run and trade history | `journaling/` |
-| Go market runtime | Websocket ownership and normalized tick fanout | `market-runtime/` |
+| Go market runtime | Websocket ownership, instrument serving, and normalized tick fanout | `market-runtime/` |
 | Worker SDK | Typed external worker interface | `sdk/python/` |
 | Frontend | Operator UI and user workflows | `frontend-next/` |
 
@@ -50,7 +50,7 @@ Frontend / API client
         v
 FastAPI backend
         |
-        +--> app auth
+        +--> app bootstrap / middleware / auth
         +--> broker session ownership
         +--> typed route handlers
         +--> algo runtime / paper runtime
@@ -58,16 +58,16 @@ FastAPI backend
         +--> journaling / grouped reporting
         |
         v
-Backend consumers read status + ticks from Redis
+Redis-backed status + tick consumers
         ^
         |
-Redis tick bus
+Redis tick/status bus
         ^
         |
 Go market runtime
 ```
 
-The frontend and external workers both enter through the same FastAPI control plane. The Go market runtime owns the broker websocket connection and publishes normalized ticks through Redis. Backend consumers read ticks and status from Redis rather than opening their own broker websocket connections.
+The frontend and external workers both enter through the same FastAPI control plane. The Go market runtime owns broker websocket connectivity, normalized tick fanout, and the newer instrument-serving/search responsibilities so the rest of the stack does not duplicate those concerns.
 
 ## Strategy lifecycle flow
 
@@ -76,6 +76,9 @@ Create or recover strategy_run_id
         |
         v
 Read market data and history
+        |
+        v
+Optionally claim worker session + run safety check
         |
         v
 Build explicit order intent(s)
@@ -88,7 +91,7 @@ Backend validates + attributes the run
         +--> live broker path
         |
         v
-Grouped orders / trades / positions / P&L
+Grouped orders / trades / positions / P&L / timeline
         |
         v
 Journal, review, summaries, and exits
@@ -103,6 +106,7 @@ Every strategy run carries a stable `strategy_run_id`. The backend attaches attr
 | Strategy decisions | Worker or strategy logic |
 | Broker login/session | Backend |
 | Websocket subscriptions and tick fanout | Go market runtime |
+| Instrument search/serving | Backend + Go market runtime |
 | Order attribution and grouped run identity | Backend |
 | Paper execution truth | `paper_runtime/` |
 | Live execution truth and recovery | Backend + broker session layer |
@@ -133,16 +137,23 @@ It allows strategy code to run outside the backend while still using platform-ow
 - grouped funds and grouped P&L
 - execution attribution
 - live/paper boundaries
+- safety checks, timelines, and other worker observability helpers on the current development branch
 - exits and journaling
 
 For more, read [`algo-worker-sdk-guide.md`](algo-worker-sdk-guide.md).
+
+## Current architecture notes
+
+- Worker-safe APIs are split across `api/routers/worker_auth.py`, `worker_market.py`, `worker_execution.py`, `worker_protection.py`, and `options/api/worker_options_router.py` rather than a single large worker router.
+- Backend support code is increasingly grouped under `api/services/`, `api/repositories/`, and `broker_api/` subpackages.
+- Instrument search no longer depends on a Meilisearch sidecar; current work is aligned around direct SQL / backend-owned search paths and the Go runtime's growing instrument responsibilities.
 
 ## Maturity notes
 
 | Area | Current state |
 | --- | --- |
 | Worker-safe API surface | Strong and actively expanding |
-| Python SDK | Strong core surface with room for more helpers |
+| Python SDK | Strong core surface with newer helpers still awaiting a release after `0.6.2` |
 | Go market runtime | Built and still being hardened operationally |
 | Journaling / review model | Built with ongoing UI and workflow refinement |
 | Frontend coverage | Active and evolving |

@@ -22,9 +22,9 @@ It gives traders and strategy developers one backend-owned control plane for bro
 | Surface | What you use it for | Best fit for |
 | --- | --- | --- |
 | **Operator frontend** | Run the day-to-day platform: auth, runtime views, journal surfaces, strategy workflows, and platform tools. | Traders and operators who want one control plane. |
-| **Algo workers + Python SDK** | Run local or remote strategy code against worker-safe APIs for lifecycle, market data, execution, grouped funds/P&L, and protection. | Systematic traders and developers who want strategy isolation without losing central execution/accounting. |
+| **Algo workers + Python SDK** | Run local or remote strategy code against worker-safe APIs for lifecycle, market data, execution, grouped funds/P&L, protection, and observability. | Systematic traders and developers who want strategy isolation without losing central execution/accounting. |
 | **Backend API** | Build typed integrations around auth-safe and worker-safe platform flows. | Developers extending the platform or building supporting tooling. |
-| **Go market runtime** | Own websocket subscriptions, reconnects, and normalized tick fanout for the whole stack. | Users who care about a clean market-data ownership boundary. |
+| **Go market runtime** | Own websocket subscriptions, reconnects, tick fanout, and the newer instrument/search serving path. | Users who care about a clean market-data ownership boundary. |
 
 ## Why traders use it
 
@@ -42,7 +42,7 @@ Kite Algo is for traders who want more than a thin broker wrapper. It is especia
 | --- | --- |
 | **Execution modes** | Dry-run, paper, and live execution paths with explicit attribution and accounting boundaries. |
 | **Run-level visibility** | Grouped strategy runs with tracked orders, trades, funds usage, P&L, exits, and journaling. |
-| **Market runtime** | Separate Go service for websocket ownership, reconnect handling, and tick fanout. |
+| **Market runtime** | Separate Go service for websocket ownership, reconnect handling, tick fanout, and instrument-serving duties. |
 | **Options/runtime flows** | Options sessions, strategy flows, protection helpers, and execution-oriented modules. |
 | **Operator UI** | Next.js frontend for runtime views, journal/review surfaces, and strategy workflows. |
 | **Review and journaling** | Post-run summaries, comparisons, notes, and review-oriented workflows. |
@@ -57,9 +57,10 @@ Worker strategies can:
 
 - run locally or on remote machines
 - use typed lifecycle and market-data calls
-- preview/place intents without owning broker internals
+- preview and place intents without owning broker internals
 - read grouped run funds and grouped P&L
 - patch backend protection state
+- inspect worker timelines, safety checks, and run health through newer SDK helpers on the `development` branch
 - stay inside the same accounting and journaling model as platform-native flows
 
 Start here:
@@ -67,15 +68,17 @@ Start here:
 - [Algo worker + SDK guide](documents/algo-worker-sdk-guide.md)
 - [Python SDK README](sdk/python/README.md)
 
-Public package install:
+Current public package install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.6.2
+python3 -m pip install kite-algo-worker==0.7.0
 ```
+
+> The `development` branch already contains newer worker SDK helpers that are not yet on PyPI. Use the docs in this branch for architecture and workflow guidance, but treat the PyPI package as `0.6.2` until the next SDK release is published.
 
 ## Quick start
 
-This README shows the simplest **production-style** startup path.
+This README shows the simplest production-style startup path.
 
 For local development workflow, use [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
@@ -99,7 +102,7 @@ Fill in at least:
 ### 2. Generate the admin password hash
 
 ```bash
-python3 -c 'from auth_service import hash_password; import base64, getpass; pw=getpass.getpass("Admin password: "); print(base64.b64encode(hash_password(pw).encode()).decode())'
+python3 -c 'from app.auth import hash_password; import base64, getpass; pw=getpass.getpass("Admin password: "); print(base64.b64encode(hash_password(pw).encode()).decode())'
 ```
 
 Paste the output into `.env` like this:
@@ -122,7 +125,6 @@ docker compose -f compose.yml up --build -d
 | Frontend | `http://localhost:13000` |
 | Backend API | `http://localhost:18777` |
 | Market runtime | `http://localhost:18780/healthz` |
-| Meilisearch | `http://localhost:17700` |
 
 For development setup, tests, and local iteration, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
@@ -143,10 +145,10 @@ Why `APP_ADMIN_PASSWORD_HASH_B64` matters: the hash format contains `$`, and `.e
 Run this from the repository root:
 
 ```bash
-python -c 'from auth_service import hash_password; import base64, getpass; pw = getpass.getpass("Admin password: "); hashed = hash_password(pw); print("APP_ADMIN_PASSWORD_HASH=" + hashed); print("APP_ADMIN_PASSWORD_HASH_B64=" + base64.b64encode(hashed.encode()).decode())'
+python -c 'from app.auth import hash_password; import base64, getpass; pw = getpass.getpass("Admin password: "); hashed = hash_password(pw); print("APP_ADMIN_PASSWORD_HASH=" + hashed); print("APP_ADMIN_PASSWORD_HASH_B64=" + base64.b64encode(hashed.encode()).decode())'
 ```
 
-That uses the repo's own `auth_service.hash_password()` function and prints both the raw hash and the Compose-safe base64 form.
+That uses the repo's own `app.auth.hash_password()` function and prints both the raw hash and the Compose-safe base64 form.
 
 ### Recommended `.env` pattern for production compose
 
@@ -175,16 +177,15 @@ At startup, the app accepts `APP_ADMIN_PASSWORD`, `APP_ADMIN_PASSWORD_HASH`, `AP
 
 | Layer | Responsibility | Main code |
 | --- | --- | --- |
-| App auth | Protect operator access to the platform | `auth_service.py`, `api/routers/auth.py`, `main.py` |
-| Broker session layer | Own Kite login/session lifecycle | `broker_api/` |
-| Typed API layer | Expose stable backend contracts | `api/routers/`, `api/openapi.py` |
+| App bootstrap and auth | Startup, middleware, auth config validation, request protection | `main.py`, `app/`, `api/routers/auth.py` |
+| Broker session layer | Own Kite login/session lifecycle and broker-facing services | `broker_api/` |
+| Typed API layer | Stable contracts for frontend and workers | `api/routers/`, `api/services/`, `api/repositories/` |
 | Algo runtime | Strategy lifecycle, attribution, execution wiring | `algo_runtime/` |
 | Options core | Options sessions, strategy flows, protection, and execution helpers | `options/` |
 | Paper runtime | Durable simulated execution state | `paper_runtime/` |
 | Execution accounting | Shared attribution and cost contracts | `execution_accounting/` |
 | Journaling | Run history, review, summaries, analytics | `journaling/` |
-| Market runtime | Websocket ownership and tick fanout | `market-runtime/` |
-| Runtime monitoring | Component status, heartbeats, and in-memory runtime logs | `runtime_monitor.py` |
+| Market runtime | Websocket ownership, instrument serving, and tick fanout | `market-runtime/` |
 | Worker SDK | Typed remote strategy interface | `sdk/python/` |
 | Frontend | Operator-facing product surface | `frontend-next/` |
 
@@ -197,25 +198,26 @@ Trader / Developer
   Next.js frontend  <---------------------------+
         |                                        |
         v                                        |
-  FastAPI control plane
-        |
-        +--> broker_api/ session ownership
-        +--> api/routers/ typed contracts
-        +--> algo_runtime/ strategy flows
-        +--> options/ market + protection flows
-        +--> paper_runtime/ simulated execution
-        +--> execution_accounting/ attribution
-        +--> journaling/ review + analytics
-        |
-        v
-  Backend consumers read status + ticks from Redis
-        ^
-        |
-  Redis tick/status bus
-        ^
-        |
-  market-runtime (Go)
+  FastAPI control plane                         |
+        |                                        |
+        +--> app bootstrap + middleware          |
+        +--> broker session ownership            |
+        +--> typed route handlers                |
+        +--> algo runtime / paper runtime        |
+        +--> options flows + protection          |
+        +--> journaling / grouped reporting      |
+        |                                        |
+        v                                        |
+  Redis-backed status/tick consumers             |
+        ^                                        |
+        |                                        |
+  Redis tick/status bus                          |
+        ^                                        |
+        |                                        |
+  market-runtime (Go) ---------------------------+
 ```
+
+The frontend and external workers both enter through the same FastAPI control plane. The Go market runtime owns broker websocket connectivity and related market-data serving responsibilities so backend consumers do not each open their own broker websocket connections.
 
 ## Strategy and algo-worker flow
 
@@ -228,11 +230,13 @@ Kite Algo Worker Python SDK
         v
 /api/algo-workers/worker/*
         |
-        +--> create/get run
-        +--> get market data
+        +--> create/recover run
+        +--> claim session when needed
+        +--> safety check + market data
         +--> preview/place intents
-        +--> get grouped funds + P&L
-        +--> patch backend protection
+        +--> grouped funds + grouped P&L
+        +--> timeline / decision observability
+        +--> backend protection / GTT helpers
         +--> exit grouped run
         |
         v
@@ -249,10 +253,11 @@ Journal / review / control-plane visibility
 
 | Area | Purpose |
 | --- | --- |
-| `api/`, `broker_api/`, `main.py` | Backend API, auth, broker/session ownership |
+| `main.py`, `app/`, `api/` | App wiring, middleware, auth, typed API surfaces, support services/repositories |
+| `broker_api/` | Broker sessions, orders, instruments, timeline, and market-facing helpers |
 | `algo_runtime/`, `options/`, `paper_runtime/`, `execution_accounting/` | Strategy lifecycle, execution modes, protection, attribution, and accounting |
 | `journaling/` | Review, summaries, notes, and run history |
-| `market-runtime/` | Go websocket runtime and tick distribution |
+| `market-runtime/` | Go websocket runtime and related market-data serving concerns |
 | `sdk/python/` | External algo-worker SDK |
 | `frontend-next/` | Operator-facing Next.js app |
 | `documents/` | Public docs and onboarding |

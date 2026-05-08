@@ -7,6 +7,14 @@ services:
       POSTGRES_DB: ${DB_NAME:-postgres}
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    command: >
+      postgres
+      -c shared_buffers=48MB
+      -c max_connections=10
+      -c work_mem=4MB
+      -c maintenance_work_mem=16MB
+      -c wal_buffers=1MB
+      -c effective_cache_size=512MB
     ports:
       - "15432:5432"
     volumes:
@@ -35,31 +43,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-
-  meilisearch:
-    image: getmeili/meilisearch:v1.12
-    container_name: kite-meilisearch
-    restart: unless-stopped
-    environment:
-      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-aMasterKey}
-      MEILI_NO_ANALYTICS: "true"
-    ports:
-      - "17700:7700"
-    volumes:
-      - meili_data:/meili_data
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "wget",
-          "--no-verbose",
-          "--tries=1",
-          "--spider",
-          "http://127.0.0.1:7700/health",
-        ]
-      interval: 30s
-      timeout: 10s
-      retries: 5
 
   market-runtime:
     build:
@@ -119,7 +102,6 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_URL: redis://redis:6379/0
-      MEILI_URL: http://meilisearch:7700
       MARKET_RUNTIME_ENABLED: "true"
       MARKET_RUNTIME_HTTP_URL: http://market-runtime:8780
       PYTHONUNBUFFERED: "1"
@@ -133,8 +115,6 @@ services:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      meilisearch:
         condition: service_healthy
       market-runtime:
         condition: service_healthy
@@ -189,4 +169,3 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  meili_data:

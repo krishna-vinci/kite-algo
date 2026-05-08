@@ -2,7 +2,19 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Optional
 
-from .models import OptionEntryPreviewRequest, OptionExpirySnapshot, OptionRunCreateRequest
+from .models import (
+    OptionEntryPreviewRequest,
+    OptionExecutionLeg,
+    OptionExpirySnapshot,
+    OptionRunActionRequest,
+    OptionRunCreateRequest,
+    SpreadSpec,
+)
+from .resolvers import resolve_option_contracts as _resolve_option_contracts
+from .resolvers import resolve_option_leg as _resolve_option_leg
+from .resolvers import resolve_offset_leg as _resolve_offset_leg
+from .resolvers import resolve_delta_leg as _resolve_delta_leg
+from .resolvers import resolve_spread as _resolve_spread
 
 
 class OptionWorkerClient:
@@ -49,6 +61,100 @@ class OptionWorkerClient:
             self._options_path(underlying, "selection/resolve"),
             json=payload,
         )
+
+    def resolve_option_contracts(self, *, underlying: str, selection_payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+        return _resolve_option_contracts(self, underlying=underlying, selection_payload=selection_payload)
+
+    def resolve_option_leg(
+        self,
+        *,
+        underlying: str,
+        product: str,
+        expiry: str,
+        selection: Mapping[str, Any],
+        transaction_type: str,
+        lots: int = 1,
+        order_type: str = "MARKET",
+        price: float | None = None,
+        trigger_price: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> OptionExecutionLeg:
+        return _resolve_option_leg(
+            self,
+            underlying=underlying,
+            product=product,
+            expiry=expiry,
+            selection=selection,
+            transaction_type=transaction_type,
+            lots=lots,
+            order_type=order_type,
+            price=price,
+            trigger_price=trigger_price,
+            metadata=metadata,
+        )
+
+    def resolve_offset_leg(
+        self,
+        *,
+        underlying: str,
+        product: str,
+        expiry: str,
+        option_type: str,
+        offset: str,
+        transaction_type: str,
+        lots: int = 1,
+        order_type: str = "MARKET",
+        price: float | None = None,
+        trigger_price: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> OptionExecutionLeg:
+        return _resolve_offset_leg(
+            self,
+            underlying=underlying,
+            product=product,
+            expiry=expiry,
+            option_type=option_type,
+            offset=offset,
+            transaction_type=transaction_type,
+            lots=lots,
+            order_type=order_type,
+            price=price,
+            trigger_price=trigger_price,
+            metadata=metadata,
+        )
+
+    def resolve_delta_leg(
+        self,
+        *,
+        underlying: str,
+        product: str,
+        expiry: str,
+        option_type: str,
+        delta_target: float,
+        transaction_type: str,
+        lots: int = 1,
+        order_type: str = "MARKET",
+        price: float | None = None,
+        trigger_price: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> OptionExecutionLeg:
+        return _resolve_delta_leg(
+            self,
+            underlying=underlying,
+            product=product,
+            expiry=expiry,
+            option_type=option_type,
+            delta_target=delta_target,
+            transaction_type=transaction_type,
+            lots=lots,
+            order_type=order_type,
+            price=price,
+            trigger_price=trigger_price,
+            metadata=metadata,
+        )
+
+    def resolve_spread(self, *, underlying: str, product: str, spec: SpreadSpec) -> list[OptionExecutionLeg]:
+        return _resolve_spread(self, underlying=underlying, product=product, spec=spec)
 
     def get_pcr(self, underlying: str, *, expiry: str | None = None) -> dict[str, Any]:
         return self._client._request(
@@ -106,11 +212,14 @@ class OptionWorkerClient:
         request_payload = OptionRunCreateRequest(
             strategy_name=strategy_name,
             product=product,
-            legs=[dict(leg) for leg in legs],
+            legs=[
+                leg if isinstance(leg, OptionExecutionLeg) else OptionExecutionLeg.model_validate(dict(leg))
+                for leg in legs
+            ],
             protection=dict(protection) if protection is not None else None,
             metadata=dict(metadata or {}),
         )
-        payload = request_payload.model_dump()
+        payload = request_payload.model_dump(exclude_none=True)
         if request_payload.protection is None:
             payload.pop("protection", None)
         return self._client._request("POST", "/worker/options/runs", json=payload)
@@ -118,23 +227,66 @@ class OptionWorkerClient:
     def preview_run_entry(self, strategy_run_id: str, payload: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         return self._client._request("POST", f"/worker/options/runs/{strategy_run_id}/preview-entry", json=dict(payload or {}))
 
-    def enter(self, strategy_run_id: str, payload: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
-        return self._client._request("POST", f"/worker/options/runs/{strategy_run_id}/enter", json=dict(payload or {}))
+    def enter(
+        self,
+        strategy_run_id: str,
+        payload: Optional[Mapping[str, Any]] = None,
+        *,
+        safety_token: str | None = None,
+        session_nonce: str | None = None,
+    ) -> dict[str, Any]:
+        request_payload = OptionRunActionRequest.model_validate(
+            {
+                **dict(payload or {}),
+                **({"safety_token": safety_token} if safety_token is not None else {}),
+            }
+        )
+        return self._client._request(
+            "POST",
+            f"/worker/options/runs/{strategy_run_id}/enter",
+            json=request_payload.model_dump(exclude_none=True),
+            headers={"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None,
+        )
 
     def preview_exit(self, strategy_run_id: str, payload: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         return self._client._request("POST", f"/worker/options/runs/{strategy_run_id}/preview-exit", json=dict(payload or {}))
 
-    def exit(self, strategy_run_id: str, payload: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
-        return self._client._request("POST", f"/worker/options/runs/{strategy_run_id}/exit", json=dict(payload or {}))
+    def exit(
+        self,
+        strategy_run_id: str,
+        payload: Optional[Mapping[str, Any]] = None,
+        *,
+        safety_token: str | None = None,
+        session_nonce: str | None = None,
+    ) -> dict[str, Any]:
+        request_payload = OptionRunActionRequest.model_validate(
+            {
+                **dict(payload or {}),
+                **({"safety_token": safety_token} if safety_token is not None else {}),
+            }
+        )
+        return self._client._request(
+            "POST",
+            f"/worker/options/runs/{strategy_run_id}/exit",
+            json=request_payload.model_dump(exclude_none=True),
+            headers={"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None,
+        )
 
     def get_run_state(self, strategy_run_id: str) -> dict[str, Any]:
         return self._client._request("GET", f"/worker/options/runs/{strategy_run_id}/state")
 
-    def update_protection(self, strategy_run_id: str, protection: Mapping[str, Any]) -> dict[str, Any]:
+    def update_protection(
+        self,
+        strategy_run_id: str,
+        protection: Mapping[str, Any],
+        *,
+        session_nonce: str | None = None,
+    ) -> dict[str, Any]:
         return self._client._request(
             "PUT",
             f"/worker/options/runs/{strategy_run_id}/protection",
             json=dict(protection),
+            headers={"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None,
         )
 
     def get_protection_state(self, strategy_run_id: str) -> dict[str, Any]:

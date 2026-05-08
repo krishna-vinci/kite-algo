@@ -10,6 +10,7 @@ from .client import AlgoWorkerConfig, KiteAlgoWorkerClient, KiteAlgoWorkerError
 from .exceptions import AuthError, BrokerValidationError, PermissionDeniedError, StreamDisconnectedError
 from .helpers import (
     amo_limit_order,
+    amo_market_order,
     ensure_run,
     live_equity_market_order,
     preview_then_place_order,
@@ -19,6 +20,7 @@ from .helpers import (
     wait_for_terminal_order_state,
     warmup_history,
 )
+from .managed_run import ManagedRun
 from .indicators import BaseIndicator, IndicatorInput, IndicatorValue, LiveIndicatorEngine, NUMBA_AVAILABLE, TechnicalAnalysis, crossover, format_output, njit, normalize_input, sma, ta
 from .models import (
     CostContract,
@@ -27,20 +29,39 @@ from .models import (
     OrderPreview,
     PreviewPayload,
     RunProtectionState,
+    SafetyCheckResult,
+    WorkerGttTrigger,
+    WorkerGttWriteResult,
     WorkerOrderSnapshot,
     WorkerFundsSegment,
     WorkerFundsSnapshot,
     WorkerOrderResult,
     WorkerOrdersResponse,
+    WorkerRunHealthSnapshot,
     WorkerRunPnlLeg,
     WorkerRunPnlSnapshot,
     WorkerRunPnlTotals,
+    WorkerTimelineEvent,
+    WorkerTimelineResponse,
     WorkerTradeSnapshot,
     WorkerTradesResponse,
 )
 from .orders import OrderBuilder, equity_market_order, limit_order, market_order, option_market_order, sl_m_order, sl_order
-from .options import OptionEntryPreviewRequest, OptionExpirySnapshot, OptionWorkerClient, option_leg
+from .options import (
+    OptionEntryPreviewRequest,
+    OptionExpirySnapshot,
+    OptionWorkerClient,
+    SpreadLegSelection,
+    SpreadSpec,
+    option_leg,
+    resolve_delta_leg,
+    resolve_offset_leg,
+    resolve_option_contracts,
+    resolve_option_leg,
+    resolve_spread,
+)
 from .protection import BackendProtection, BasketProtection, OperationalProtection, ProtectedPosition
+from .run_config import RunConfig
 from .ws import StreamHealth, WorkerCandleWebSocketClient, WorkerRunPnlWebSocketClient, WorkerTickWebSocketClient, WorkerWebSocketClient
 
 _MARKETDATA_AVAILABLE = False
@@ -86,6 +107,7 @@ __all__ = [
     "AsyncKiteAlgoWorkerClient",
     "AuthError",
     "amo_limit_order",
+    "amo_market_order",
     "BackendProtection",
     "BasketProtection",
     "BrokerValidationError",
@@ -101,6 +123,7 @@ __all__ = [
     "equity_market_order",
     "KiteAlgoWorkerClient",
     "KiteAlgoWorkerError",
+    "ManagedRun",
     "live_equity_market_order",
     "limit_order",
     "market_order",
@@ -116,7 +139,11 @@ __all__ = [
     "preview_then_place_order",
     "ProtectedPosition",
     "OperationalProtection",
+    "RunConfig",
     "RunProtectionState",
+    "SafetyCheckResult",
+    "SpreadLegSelection",
+    "SpreadSpec",
     "WorkerOrderSnapshot",
     "sl_order",
     "sl_m_order",
@@ -128,6 +155,11 @@ __all__ = [
     "normalize_input",
     "option_leg",
     "options",
+    "resolve_option_contracts",
+    "resolve_option_leg",
+    "resolve_offset_leg",
+    "resolve_delta_leg",
+    "resolve_spread",
     "sma",
     "ta",
     "wait_for_history",
@@ -138,11 +170,16 @@ __all__ = [
     "WorkerCandleWebSocketClient",
     "WorkerFundsSegment",
     "WorkerFundsSnapshot",
+    "WorkerGttTrigger",
+    "WorkerGttWriteResult",
     "WorkerOrderResult",
     "WorkerOrdersResponse",
+    "WorkerRunHealthSnapshot",
     "WorkerRunPnlLeg",
     "WorkerRunPnlSnapshot",
     "WorkerRunPnlTotals",
+    "WorkerTimelineEvent",
+    "WorkerTimelineResponse",
     "WorkerTradeSnapshot",
     "WorkerRunPnlWebSocketClient",
     "WorkerTickWebSocketClient",

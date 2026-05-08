@@ -14,13 +14,15 @@ If you are new to the project, start with the curated files below before reading
 | Understand the architecture and philosophy | [`platform-overview.md`](platform-overview.md) |
 | Understand the folder layout and ownership boundaries | [`codebase-map.md`](codebase-map.md) |
 | Build or review external strategy workers | [`algo-worker-sdk-guide.md`](algo-worker-sdk-guide.md) |
+| Follow contributor workflow instead of production startup | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
 
 ## Recommended reading path for developers
 
 1. [`platform-overview.md`](platform-overview.md) — architecture, philosophy, and system flow
 2. [`codebase-map.md`](codebase-map.md) — where to find code and how to change it safely
-3. [`algo-worker-sdk-guide.md`](algo-worker-sdk-guide.md) — worker model, lifecycle, and SDK surface
-4. Deeper subsystem references below
+3. [`algo-worker-sdk-guide.md`](algo-worker-sdk-guide.md) — worker model, lifecycle choices, and SDK story
+4. [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — local setup, checks, contribution lanes
+5. Deeper subsystem references below
 
 ## Recommended reading path for traders and power users
 
@@ -32,7 +34,7 @@ If you are new to the project, start with the curated files below before reading
 
 | Document | What it covers |
 | --- | --- |
-| [`kite-websocket.md`](kite-websocket.md) | Websocket market-runtime overview and re-architecture notes |
+| [`kite-websocket.md`](kite-websocket.md) | Market-runtime overview and websocket ownership notes |
 | [`live-paper-accounting-and-worker-live-execution.md`](live-paper-accounting-and-worker-live-execution.md) | Live/paper accounting and worker execution notes |
 | [`kite-backend-progress.md`](kite-backend-progress.md) | Current backend progress tracker |
 | [`unified-design-core.md`](unified-design-core.md) | Deep position-protection architecture |

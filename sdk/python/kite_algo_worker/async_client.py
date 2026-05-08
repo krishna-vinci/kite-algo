@@ -8,10 +8,14 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 from .client import AlgoWorkerConfig, JsonDict
 from .exceptions import error_for_status
 from .models import (
+    WorkerGttTrigger,
+    WorkerGttWriteResult,
     WorkerHistoricalCandles,
     WorkerOrderSnapshot,
     WorkerOrdersResponse,
+    WorkerRunHealthSnapshot,
     WorkerRunPnlSnapshot,
+    WorkerTimelineResponse,
     WorkerTradesResponse,
 )
 
@@ -51,6 +55,9 @@ class AsyncKiteAlgoWorkerClient:
     async def get_run(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", f"/worker/runs/{strategy_run_id}")
 
+    async def get_run_health_snapshot(self, strategy_run_id: str) -> WorkerRunHealthSnapshot:
+        return WorkerRunHealthSnapshot.model_validate(await self.get_run(strategy_run_id))
+
     async def get_run_pnl(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", f"/worker/runs/{strategy_run_id}/pnl")
 
@@ -65,6 +72,48 @@ class AsyncKiteAlgoWorkerClient:
 
     async def get_run_funds(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", f"/worker/runs/{strategy_run_id}/funds")
+
+    async def place_gtt(self, payload: Mapping[str, Any]) -> JsonDict:
+        return await self._request("POST", "/worker/gtt/triggers", json=dict(payload))
+
+    async def place_gtt_snapshot(self, payload: Mapping[str, Any]) -> WorkerGttWriteResult:
+        return WorkerGttWriteResult.model_validate(await self.place_gtt(payload))
+
+    async def list_gtts(self) -> list[JsonDict]:
+        response = await self._request("GET", "/worker/gtt/triggers")
+        if not isinstance(response, list):
+            return []
+        return [dict(item) for item in response if isinstance(item, Mapping)]
+
+    async def list_gtts_snapshot(self) -> list[WorkerGttTrigger]:
+        return [WorkerGttTrigger.model_validate(item) for item in await self.list_gtts()]
+
+    async def get_gtt(self, trigger_id: int) -> JsonDict:
+        return await self._request("GET", f"/worker/gtt/triggers/{int(trigger_id)}")
+
+    async def get_gtt_snapshot(self, trigger_id: int) -> WorkerGttTrigger:
+        return WorkerGttTrigger.model_validate(await self.get_gtt(trigger_id))
+
+    async def modify_gtt(self, trigger_id: int, payload: Mapping[str, Any]) -> JsonDict:
+        return await self._request("PUT", f"/worker/gtt/triggers/{int(trigger_id)}", json=dict(payload))
+
+    async def modify_gtt_snapshot(self, trigger_id: int, payload: Mapping[str, Any]) -> WorkerGttWriteResult:
+        return WorkerGttWriteResult.model_validate(await self.modify_gtt(trigger_id, payload))
+
+    async def delete_gtt(self, trigger_id: int) -> JsonDict:
+        return await self._request("DELETE", f"/worker/gtt/triggers/{int(trigger_id)}")
+
+    async def delete_gtt_snapshot(self, trigger_id: int) -> WorkerGttWriteResult:
+        return WorkerGttWriteResult.model_validate(await self.delete_gtt(trigger_id))
+
+    async def log_decision_event(self, strategy_run_id: str, **payload: Any) -> JsonDict:
+        return await self._request("POST", f"/worker/runs/{strategy_run_id}/decision-events", json=dict(payload))
+
+    async def list_timeline(self, strategy_run_id: str, **params: Any) -> JsonDict:
+        return await self._request("GET", f"/worker/runs/{strategy_run_id}/timeline", params=dict(params or {}))
+
+    async def list_timeline_snapshot(self, strategy_run_id: str, **params: Any) -> WorkerTimelineResponse:
+        return WorkerTimelineResponse.model_validate(await self.list_timeline(strategy_run_id, **params))
 
     async def list_orders(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", "/worker/orders", params={"strategy_run_id": strategy_run_id})

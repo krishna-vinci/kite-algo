@@ -7,15 +7,15 @@ from kiteconnect import KiteConnect
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.control_plane import (
+from api.services.control_plane import (
     build_strategy_positions_snapshot,
     cancel_control_strategy_orders,
     exit_control_strategy,
 )
-from auth_service import require_app_user
-from broker_api.kite_orders import get_correlation_id
-from broker_api.kite_session import get_kite, get_kite_session_id, get_session_account_id
-from database import get_db
+from app.auth import require_app_user
+from broker_api.orders import get_correlation_id
+from broker_api.session.kite_session import get_kite, get_kite_session_id, get_session_account_id
+from app.database import get_db
 
 
 router = APIRouter(prefix="/control", tags=["Control Plane"])
@@ -73,6 +73,6 @@ async def reconcile_control_plane(
     corr_id: str = Depends(get_correlation_id),
 ):
     require_app_user(request)
-    from broker_api.kite_orders import reconcile_realtime_positions
+    from broker_api.orders import reconcile_realtime_positions
 
     return await reconcile_realtime_positions(request, kite=kite, db=db, corr_id=corr_id)

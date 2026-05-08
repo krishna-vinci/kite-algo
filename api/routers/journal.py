@@ -6,7 +6,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from auth_service import require_app_user
+from app.auth import require_app_user
 from journaling.models import (
     JournalV2DailyResponse,
     JournalV2EpisodeDetailResponse,

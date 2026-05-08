@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-05-04
+Last updated: 2026-05-08
 
 ## Scope
 
@@ -19,11 +19,163 @@ Do not use this file for frontend work.
 - Added Redis-backed order idempotency for direct order placement
 - Routed strategy order placement through the same throttled write path
 - Added broker login health endpoint in `api/routers/auth.py`
-- Added runtime status/log metadata support via `runtime_monitor.py`
+- Added runtime status/log metadata support via `app/monitor.py`
 - Added project-local OpenCode skill at `.opencode/skills/kite-backend-progress/SKILL.md`
 - Added backend mutual fund router in `broker_api/kite_mutual_funds.py`
 
 ## Newly implemented in current branch
+
+- Implemented Spec 10 worker product completion and helper polish:
+  - added worker-token-authenticated, account-scoped GTT passthrough routes:
+    - `POST /api/algo-workers/worker/gtt/triggers`
+    - `GET /api/algo-workers/worker/gtt/triggers`
+    - `GET /api/algo-workers/worker/gtt/triggers/{trigger_id}`
+    - `PUT /api/algo-workers/worker/gtt/triggers/{trigger_id}`
+    - `DELETE /api/algo-workers/worker/gtt/triggers/{trigger_id}`
+  - GTT routes reuse existing live Kite session resolution from worker `account_scope`, add worker-facing structured rejection codes, and intentionally remain thin broker passthroughs with no local state/idempotency/timeline ownership
+  - expanded default worker token actions with `gtt:read` / `gtt:write` while preserving compatibility for legacy tokens through nearby existing actions
+  - added SDK typed run-health snapshots plus sync/async/managed-run helpers
+  - added SDK worker GTT CRUD wrappers and typed GTT models
+  - added backend-backed SDK option resolver helpers for single-leg generic/offset/delta resolution into `OptionExecutionLeg`
+  - added `amo_market_order(...)` helper symmetry
+  - explicitly deferred worker metrics/export and kept position sizing out of scope
+  - focused verification in this environment:
+    - `rtk pytest tests/test_algo_worker_api.py -k "worker_gtt or worker_run_read_surface_includes_health_fields" -v` → `5 passed`
+    - `rtk pytest tests/test_worker_sdk.py -k "gtt or amo or health_snapshot" -v` → `2 passed`
+    - `rtk pytest tests/test_worker_sdk_async.py -k "gtt or health_snapshot" -v` → `1 passed`
+    - `rtk pytest tests/test_worker_sdk_options.py -k "resolve_option_leg or resolve_offset_leg or resolve_delta_leg or resolved_key" -v` → `2 passed`
+
+- Implemented Spec 9 worker decision logging and protection observability:
+  - widened `worker_execution_events` into a canonical worker timeline surface (`event_kind`, `event_source`, related refs, summary) while preserving compatibility defaults for legacy execution rows
+  - added shared `WorkerTimelineStore` ownership for timeline inserts/reads and migrated execution writers/reads onto the store
+  - added worker decision logging endpoint + SDK helpers:
+    - `POST /api/algo-workers/worker/runs/{strategy_run_id}/decision-events`
+    - SDK sync/async/managed-run helpers for `log_decision_event`, `list_timeline`, and `stream_timeline`
+  - added mutation-driven generic backend protection timeline emission with post-commit publish:
+    - runtime emits `protection.triggered`, `protection.exit_submitted`, and `protection.blocking_changed` when state transitions qualify
+    - patch route emits `protection.reset` only when prior status was `triggered` or `error`
+  - options protection timeline visibility remains observation-driven in Spec 9:
+    - canonical observation fingerprint shared between worker safety-check and worker options protection-state endpoints
+    - deduped emission with lock held only for latest-event lookup + conditional insert
+    - payloads include `emission_mode='observation_driven'`
+  - preserved read-only safety semantics for generic protection:
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/safety-check` does not emit generic backend protection mutation events
+  - focused verification in this environment:
+    - `rtk pytest tests/test_schema_live_order_attribution.py -k "worker_execution_events" -v` → `1 passed`
+    - `rtk pytest tests/test_worker_timeline.py -v` → `3 passed`
+    - `rtk pytest tests/test_basket_execution.py -v` → `4 passed`
+    - `rtk pytest tests/test_bracket_runtime.py -v` → `3 passed`
+    - `rtk pytest tests/test_order_runtime.py -k "basket or bracket or execution_events" -v` → `5 passed`
+    - `rtk pytest tests/test_algo_worker_api.py -k "timeline or decision_event or protection or execution_events" -v` → `51 passed`
+    - `rtk pytest tests/test_worker_protection_runtime.py -v` → `10 passed`
+    - `rtk pytest tests/test_worker_sdk.py -k "timeline or decision_event" -v` → `3 passed`
+
+- Implemented critic-approved combined Spec 7 + Spec 8 worker attribution hardening and bracket intents:
+  - added exact worker-owned execution bridge schema + store:
+    - `worker_live_execution_links`
+    - new store module `broker_api/worker_execution_links.py`
+    - bridge remains narrow ownership mapping (run/account/order/trade/client_ref/basket refs only) and intentionally does **not** duplicate fill facts from `order_trade_fills`
+  - order-link population now happens in the live placement success path (same moment `live_order_intents` is marked placed)
+  - trade-link population now happens at fill materialization boundary in `order_runtime._store_trade_fills(...)` immediately after each inserted `order_trade_fills` row
+  - primary worker run attribution queries are exact-bridge-first for adopted runs:
+    - `_list_live_strategy_open_legs_sync(...)`
+    - `_get_live_order_attribution_refs_sync(...)`
+    - `_list_live_strategy_broker_positions_sync(...)`
+    - explicit compatibility fallback remains only when no bridge rows exist for legacy pre-adoption runs
+  - added bracket persistence/runtime primitives:
+    - `bracket_intents`, `bracket_actions`, and `live_order_intents.bracket_intent_id`
+    - new `broker_api/bracket_runtime.py` with bracket state machine, durable action queue, SKIP LOCKED action claiming, canonical-event observation helpers, sibling cleanup actions, and executor helpers
+  - added worker bracket route surface:
+    - `POST /api/algo-workers/worker/runs/{strategy_run_id}/brackets`
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/brackets`
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}`
+    - `POST /api/algo-workers/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}/cancel`
+    - create/cancel mutation routes enforce active `X-Worker-Session-Nonce` once run is claimed
+  - bracket creation now owns entry placement (no post-hoc attach model):
+    - create bracket intent first (`entry_submitting`)
+    - place entry via backend-owned path with idempotency namespace `bracket:{bracket_intent_id}:entry:...`
+    - entry-side `live_order_intents` rows carry exact `bracket_intent_id`
+  - canonical event processing now includes bracket observation under nested savepoint isolation:
+    - bracket observation failures mark linked bracket projection inconsistent without poisoning order projection
+    - full entry fill transitions bracket to `arming_exits` and enqueues `place_stoploss` / optional `place_target`
+    - sibling cleanup is backend-managed (`stoploss fill -> cancel_target`, `target fill -> cancel_stoploss`)
+  - recovery closability unified with one boundary helper:
+    - added `evaluate_worker_run_settlement_status(...)`
+    - replaced direct `live_flatness_loader(...)` gate ordering in exiting-run recovery
+    - phase order now: active basket guard -> active/pending bracket guard -> unresolved exact execution guard -> broker flatness refresh
+  - added dedicated startup bracket executor loop in `main.py`:
+    - backend-owned action execution namespace `bracket:{bracket_intent_id}:...`
+    - `SELECT ... FOR UPDATE SKIP LOCKED` claim semantics for action rows
+    - event-hinted wakeup + 1s fallback polling cadence
+  - verification in this environment:
+    - `rtk pytest tests/test_schema_live_order_attribution.py -k "worker_execution_links_and_bracket_tables" -v` → `1 passed`
+    - `rtk pytest tests/test_worker_execution_links.py -v` → `2 passed`
+    - `rtk pytest tests/test_bracket_runtime.py -v` → `3 passed`
+    - `rtk pytest tests/test_order_runtime.py -k "worker_execution_links or bracket" -v` → `2 passed`
+    - `rtk pytest tests/test_algo_worker_api.py -k "bracket or worker_execution_links" -v` → `2 passed`
+    - `rtk pytest tests/test_worker_runtime_recovery.py -k "active_bracket_intent or settlement_status" -v` → `2 passed`
+
+- Implemented combined Spec 5 + Spec 6 live execution observability and basket state slice:
+  - added durable schema primitives for basket execution + worker execution outbox:
+    - `basket_executions`
+    - `basket_execution_legs`
+    - `worker_execution_events`
+    - `live_order_intents.basket_execution_id` / `basket_leg_index`
+  - added `broker_api/basket_execution.py` store with deterministic basket recompute + leg normalization helpers, exact linked projection updates, and run-scoped execution-event reads
+  - preserved `algo_worker_intents` compatibility envelope while adding live basket pending-intent reservation + basket skeleton creation before broker child submits
+  - live basket deduped replay now returns the same durable `basket_execution_id` (no duplicate basket execution creation)
+  - extended live order intent creation to carry exact basket linkage for child orders
+  - integrated inline basket projection under existing canonical event processing lock (`EVENT_PROCESSOR_LOCK_ID`) and publish-after-commit run-scoped events (`worker.execution.events:{strategy_run_id}`)
+  - basket projection runs under nested savepoint semantics; projection failures mark linked basket as `action_required=true` / `action_reason='projection_inconsistent'` without poisoning valid order projection
+  - added worker-safe basket and execution observability routes:
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/baskets`
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/baskets/{basket_execution_id}`
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/execution-events`
+    - `GET /api/algo-workers/worker/runs/{strategy_run_id}/execution-events/stream` (SSE subscribe-first / drain-second / dedupe-by-cursor)
+  - integrated recovery guard using `active_basket_loader` in recovery decision layer so exiting live runs with active baskets defer safe-close with `active_basket_execution`
+  - verification in this environment:
+    - `rtk pytest tests/test_schema_live_order_attribution.py -k "basket_execution_tables_and_links" -v` → `1 passed`
+    - `rtk pytest tests/test_basket_execution.py -v` → `3 passed`
+    - `rtk pytest tests/test_order_runtime.py -k "linked_basket_leg or non_basket_order_updated_event or basket_projection_failure" -v` → `2 passed`
+    - `rtk pytest tests/integration_order_runtime.py -k "linked_basket_leg or updates_linked_basket_leg_and_aggregate" -v` → `1 skipped` (integration env not configured)
+    - `rtk pytest tests/test_algo_worker_api.py -k "basket_execution_id or basket_deduped_replay or worker_basket_returns_persisted_snapshot or execution_events_filters_by_basket" -v` → `4 passed`
+    - `rtk pytest tests/test_worker_runtime_recovery.py -k "active_basket_execution or exiting_live_run_defers_when_active_basket_exists" -v` → `1 passed`
+    - `rtk pytest tests/test_order_runtime.py tests/test_basket_execution.py tests/test_schema_live_order_attribution.py tests/test_worker_runtime_recovery.py tests/test_algo_worker_api.py -k "basket or execution_events or active_basket_execution or linked_basket_leg" -v` → `14 passed`
+
+- Implemented Spec 3 worker runtime reliability & recovery slice end-to-end:
+  - extended `algo_worker_runs` persistence with run-scoped lease/heartbeat fields (`worker_session_nonce`, `worker_session_claimed_at`, `last_heartbeat_at`) and exposed those fields in repository run views
+  - added worker session lifecycle routes for run ownership and heartbeat:
+    - `POST /api/algo-workers/worker/runs/{strategy_run_id}/claim-session`
+    - `DELETE /api/algo-workers/worker/runs/{strategy_run_id}/claim-session`
+    - `POST /api/algo-workers/worker/runs/{strategy_run_id}/heartbeat`
+  - enforced active session nonce (`X-Worker-Session-Nonce`) on covered worker mutation paths (generic intents/risk/protection/exit and worker-option enter/exit/protection update) while preserving legacy compatibility for unclaimed runs
+  - added dedicated runtime recovery module `api/worker_runtime_recovery.py` with stale-run sweep + exiting-run closure checks, and wired separate startup loops/components in `main.py`
+  - stale-run recovery follows conservative exclusion/ownership boundaries:
+    - excludes protection-owned stale-worker runs (`backend_protection.enabled && operations.exit_on_worker_stale`) to avoid races with `WorkerProtectionRuntime`
+    - stale live unprotected runs are marked action-required, not auto-exited
+    - no live exit re-submission logic added
+  - added run-health projection fields (`heartbeat_age_sec`, `health_status`, `session_status`, `recovery_status`, `recovery_action_required`) on worker run reads and control-plane strategy rows
+  - verification in this environment:
+    - `rtk pytest tests/test_worker_runtime_recovery.py -v` → `3 passed`
+    - `rtk pytest tests/test_algo_worker_api.py -v` → `91 passed`
+    - `rtk pytest tests/test_options_api_routes.py -v` → `9 passed`
+    - `rtk pytest tests/test_control_plane_api.py -v` → `14 passed`
+    - `rtk pytest tests/test_worker_sdk.py -v` → `55 passed`
+    - `rtk pytest tests/test_worker_sdk_options.py -v` → `13 passed`
+
+- Implemented unified worker run safety-check v1 end-to-end:
+  - preserved caller-supplied option `strategy_run_id` during run creation (while retaining existing auto-generated IDs when omitted)
+  - added `api/worker_safety.py` fingerprint/sign/verify helpers and conservative option-run status blocking projection
+  - added `GET /api/algo-workers/worker/runs/{strategy_run_id}/safety-check` plus optional `safety_token` enforcement on generic worker intents to reject stale safety state
+  - hardened the safety gate so option-run status lookup errors fail closed with `OPTIONS_PROTECTION_STATE_UNAVAILABLE` and production token signing requires `WORKER_SAFETY_TOKEN_SECRET` or `APP_JWT_SECRET`
+  - added SDK `SafetyCheckResult`, `KiteAlgoWorkerClient.safety_check(...)`, and optional `safety_token` plumbing on generic order/basket intent helpers
+
+- Implemented Spec 4 SDK explicit-helper ergonomics (SDK-only scope, no backend behavior changes):
+  - added immutable `RunConfig` builder plus `create_run_from_config(...)` payload-parity helper
+  - added explicit run/session lifecycle context manager `client.run(...)` with bound `ManagedRun` helpers
+  - mutation helper methods forward claimed session nonce when present; no implicit safety checks, no implicit exits
+  - added pure option resolver helpers `resolve_option_contracts(...)` and `resolve_spread(...)` with explicit `OptionExecutionLeg` construction (`quantity = lot_size * lots`)
+  - refreshed SDK examples and guide for explicit safety-check + managed-run posture
 
 - Added Journal V2 Phase B6 analytics separation:
   - created `journaling/analytics_service.py` with period-aware analytics summary, strategy deep-dive, dense equity curve, cost analysis, and paper-vs-live comparison computation on top of V2 episodes/facts
@@ -189,7 +341,7 @@ Do not use this file for frontend work.
 - Added the first real external worker SDK slice:
   - `sdk/python/kite_algo_worker` exposes `KiteAlgoWorkerClient`, `AlgoWorkerConfig`, a custom API exception, and broker-shape order builders
   - SDK examples now cover mean-reversion, option baskets, and grouped live exit preview with safe defaults
-  - `docs/algo-worker-development-guide.md` is now a full coding guide for dry_run/paper/live worker strategy development and documents all live order fields supported by `PlaceOrderRequest`
+  - `documents/algo-worker-sdk-guide.md` is now the canonical worker-model guide for dry_run/paper/live worker strategy development
   - focused SDK tests validate auth headers, run/intent payloads, idempotency enforcement, exit preview payloads, non-2xx handling, and order-builder compatibility with broker order validation
 - Added grouped algo-worker run P&L snapshot/stream support:
   - `/api/algo-workers/worker/runs/{strategy_run_id}/pnl` now returns backend-owned grouped run totals plus per-leg breakdown for `dry_run`, `paper`, and `live`
@@ -199,7 +351,7 @@ Do not use this file for frontend work.
 - Added generic runtime-backed algo-worker market-data primitives:
   - worker endpoints now expose ticker resolution/search, quote snapshots, tick SSE streams, candle snapshots, candle SSE streams, and combined market snapshot bundles under `/api/algo-workers/worker/market/*`
   - SDK methods now wrap those endpoints so external workers can build non-option realtime strategies without broker websockets, Redis access, database access, or backend internals
-  - option-chain discovery, strike/expiry selection, Greeks/IV, and spread builders are explicitly deferred to a later namespaced option worker layer inside the same SDK package
+  - option-chain discovery, strike/expiry selection, Greeks/IV, and spread builders were originally deferred, but the worker-safe options namespace is now implemented under `options/api/worker_options_router.py` and `sdk/python/kite_algo_worker/options/`
 - Added worker-safe funds and run-allocation snapshots:
   - `/api/algo-workers/worker/funds` returns account funds from paper runtime or broker margins through the backend-controlled live Kite session
   - `/api/algo-workers/worker/runs/{strategy_run_id}/funds` adds derived run exposure/P&L and optional allocation-cap remaining calculations for worker position sizing
@@ -216,7 +368,7 @@ Do not use this file for frontend work.
   - updated the worker development guide and added `scripts/sdk_worker_certification.py` for lightweight worker SDK certification checks
 - Completed the generic live protection 100% gate for algo workers:
   - added `sdk/python/kite_algo_worker/live_protection_certification.py` with pure threshold/verdict helpers and `scripts/live_worker_protection_certification.py` for strict ultra-small live protection drills
-  - updated `docs/algo-worker-development-guide.md` with live protection certification usage and safety gates
+  - updated the worker-model docs with live protection certification usage and safety gates
   - fixed a live-db compatibility gap where some running environments were missing `canonical_order_events.processing_started_at`, which prevented canonical event processing/trade-fill projection and made live worker P&L stay empty even for filled attributed orders
   - added runtime self-heal for that schema compatibility in `broker_api/order_runtime.py` and moved startup stuck-row refresh into the guarded worker loop in `main.py` so the order runtime worker cannot die silently before entering its retry loop
   - re-validated the full generic live protection surface with real tiny broker drills for worker-stale exit, position stoploss, basket stoploss, position target, basket target, and live protection patch mutability
@@ -373,23 +525,23 @@ Authoritative docs:
 ---
 
 ### 5) Instrument search + backend startup efficiency
-Status: **Meilisearch remains active; alternate search engine evaluation is deferred**
+Status: **Meilisearch removed; current work is aligned around direct SQL/backend-owned search plus the Go runtime's growing instrument responsibilities**
 
 Current behavior:
 
-- instrument suggestions still run through Meilisearch while search-engine replacement is evaluated
-- PostgreSQL should remain focused on canonical backend data (orders, positions, runtime state, etc.) and should not host a duplicated search index for instruments
+- instrument suggestions no longer depend on a Meilisearch sidecar
+- PostgreSQL remains focused on canonical backend data while instrument-search ownership is being tightened inside backend/Go-owned paths rather than a separate search service
 - FastAPI startup no longer eagerly imports several heavy data/chart packages that are not needed for most requests
 
 Remaining work:
 
 - verify top broker-style query ordering against real expected results (`nifty`, `bank nifty`, strike + CE/PE flows, common typos)
-- if search-engine evaluation resumes later, require a measured RAM win and acceptable broker-style ranking before replacing Meilisearch
+- continue validating broker-style query ordering (`nifty`, `bank nifty`, strike + CE/PE flows, common typos`) against the newer direct SQL / runtime-backed search path
 
 Expected operational effect:
 
 - reduces FastAPI baseline RSS by avoiding unnecessary scientific/chart imports at startup
-- keeps Postgres isolated from instrument-search experiments so order/runtime workloads stay unaffected
+- keeps order/runtime workloads isolated while instrument search is consolidated into owned backend/runtime paths
 
 ---
 

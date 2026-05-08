@@ -10,7 +10,6 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-import meilisearch
 import psycopg2
 import pytz
 import requests
@@ -35,11 +34,11 @@ from sqlalchemy import (
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship, sessionmaker
 
-from auth_service import require_app_user
-from database import database
+from app.auth import require_app_user
+from app.database import database
 
-from .kite_auth import login_headless
-from .kite_session import (
+from broker_api.session.kite_auth import login_headless
+from broker_api.session.kite_session import (
     KiteSession,
     build_kite_client,
     get_kite,
@@ -52,7 +51,7 @@ from .kite_session import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-from runtime_public_config import get_scheduler_ntfy_url
+from app.config import get_scheduler_ntfy_url
 
 
 SCHEDULER_NTFY_URL = get_scheduler_ntfy_url()
@@ -89,7 +88,7 @@ historical_data_update_progress = {
     "error": None,
 }
 
-from broker_api.kite_auth import API_KEY
+from broker_api.session.kite_auth import API_KEY
 
 
 
@@ -298,12 +297,6 @@ async def _startup():
 
     await database.connect()
     
-    # Ensure Meilisearch index is set up
-    try:
-        ensure_instruments_index()
-    except Exception as e:
-        logger.error(f"Failed to ensure Meilisearch index on startup: {e}", exc_info=True)
-    
     # Daily instruments update scheduling is managed by main; no internal scheduler here
 
 @router.on_event("shutdown")
@@ -325,429 +318,9 @@ def get_psql_conn():
     Fallback raw psycopg2 connection for ad-hoc queries.
     """
     return psycopg2.connect(DATABASE_URL)
-# ─────────── Meilisearch client and index helpers ───────────
-_meili_client = None  # preserved (unused) to keep imports/refs stable
-_meili_client_cache: Dict[str, meilisearch.Client] = {}
-
-MEILI_INSTRUMENT_RESULT_ATTRIBUTES = [
-    "instrument_token",
-    "exchange_token",
-    "tradingsymbol",
-    "name",
-    "last_price",
-    "expiry",
-    "strike",
-    "tick_size",
-    "lot_size",
-    "instrument_type",
-    "segment",
-    "exchange",
-    "underlying",
-    "option_type",
-]
-
 MEILI_INSTRUMENT_MARKET_DATE_SQL = "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date"
 
 KITE_INSTRUMENT_IMPORT_EXCHANGES = ["NSE", "NFO", "BSE", "BFO", "CDS", "BCD", "MCX"]
-
-def _meili_health_ok(client: "meilisearch.Client") -> bool:
-    """
-    Small helper to check Meilisearch health using available method names.
-    Returns True when healthy, False otherwise.
-    """
-    try:
-        if hasattr(client, "health"):
-            h = client.health()
-        else:
-            h = client.get_health()
-        if isinstance(h, dict):
-            status = h.get("status")
-            # newer SDKs: {"status": "available"}
-            return str(status).lower() == "available"
-        # older SDKs might return truthy
-        return bool(h)
-    except Exception:
-        return False
-
-def get_meili_client(admin: bool = False) -> meilisearch.Client:
-    """
-    Returns a Meilisearch client based on role, with robust URL/key fallback and caching.
-    - Builds ordered URL list:
-        1) MEILI_URL (if set)
-        2) http://meilisearch:7700
-        3) http://localhost:7700
-        4) http://127.0.0.1:7700
-    - Builds ordered key list:
-        admin=True  -> [MEILI_MASTER_KEY, MEILI_SEARCH_API_KEY, MEILI_API_KEY, None]
-        admin=False -> [MEILI_SEARCH_API_KEY, MEILI_API_KEY, MEILI_MASTER_KEY, None]
-    - Tries URLs × keys; on first healthy client, caches per role and returns.
-    - Raises RuntimeError if no combination works.
-    """
-    role = "admin" if admin else "search"
-    # Return cached client if available and healthy
-    cached = _meili_client_cache.get(role)
-    if cached and _meili_health_ok(cached):
-        return cached
-
-    # URL candidates (dedup preserving order)
-    urls_ordered: List[str] = []
-    env_url = os.getenv("MEILI_URL")
-    if env_url:
-        urls_ordered.append(env_url)
-    urls_ordered.extend([
-        "http://meilisearch:7700",
-        "http://localhost:7700",
-        "http://127.0.0.1:7700",
-    ])
-    seen = set()
-    urls: List[str] = []
-    for u in urls_ordered:
-        if u not in seen:
-            urls.append(u)
-            seen.add(u)
-
-    # Key candidates as per role
-    def _env(name: str) -> Optional[str]:
-        v = os.getenv(name)
-        return v if (v is not None and str(v).strip() != "") else None
-
-    if admin:
-        keys: List[Optional[str]] = [
-            _env("MEILI_MASTER_KEY"),
-            _env("MEILI_SEARCH_API_KEY"),
-            _env("MEILI_API_KEY"),
-            None,
-        ]
-    else:
-        keys = [
-            _env("MEILI_SEARCH_API_KEY"),
-            _env("MEILI_API_KEY"),
-            _env("MEILI_MASTER_KEY"),
-            None,
-        ]
-
-    tried_urls: List[str] = []
-
-    for url in urls:
-        tried_urls.append(url)
-        for key in keys:
-            try:
-                client = meilisearch.Client(url) if key is None else meilisearch.Client(url, key)
-                if _meili_health_ok(client):
-                    _meili_client_cache[role] = client
-                    return client
-            except Exception:
-                # continue trying other combinations
-                continue
-
-    # If all attempts failed, raise with summary of tried URLs
-    summary = ", ".join(tried_urls)
-    raise RuntimeError(f"Unable to connect to Meilisearch. Tried URLs (in order): {summary}")
-
-def ensure_instruments_index():
-    """Ensures the 'instruments' index exists and has the correct settings."""
-    client = get_meili_client(admin=True)
-    try:
-        logger.info("Ensuring Meilisearch 'instruments' index exists and settings are applied...")
-        index = client.index("instruments")
-        index.fetch_info() # Check if index exists
-    except meilisearch.errors.MeilisearchApiError as e:
-        if e.code == 'index_not_found':
-            logger.info("Meilisearch 'instruments' index not found, creating it.")
-            task = client.create_index("instruments", {'primaryKey': 'id'})
-            client.wait_for_task(task.task_uid)
-            index = client.index("instruments")
-        else:
-            logger.error(f"Meilisearch API error when checking index: {e}", exc_info=True)
-            return
-    except Exception as e:
-        logger.error(f"Unexpected error when checking Meilisearch index: {e}", exc_info=True)
-        return
-
-    settings = {
-        "displayedAttributes": MEILI_INSTRUMENT_RESULT_ATTRIBUTES,
-        "searchableAttributes": ["tradingsymbol", "name", "underlying", "aliases"],
-        "rankingRules": [
-            "typo",
-            "words",
-            "proximity",
-            "attribute",
-            "exactness",
-            "sort",
-            "boost_score:desc",
-            "type_rank:asc",
-            "expiry_ts:asc"
-        ],
-        "filterableAttributes": [
-            "underlying", "option_type", "exchange", "instrument_type", "segment",
-            "expiry", "strike", "derivative_kind", "expiry_year", "expiry_month"
-        ],
-        "sortableAttributes": ["expiry", "expiry_ts", "strike", "type_rank", "boost_score"],
-        "synonyms": {
-            "nifty": ["NIFTY", "NIFTY 50", "NIFTY50"],
-            "nifty50": ["NIFTY", "NIFTY 50", "NIFTY50"],
-            "banknifty": ["BANKNIFTY", "NIFTY BANK", "BANK NIFTY"],
-            "finnifty": ["FINNIFTY"],
-            "sensex": ["SENSEX"],
-            "midcap100": ["NIFTY MIDCAP 100"],
-            "nifty bank": ["BANKNIFTY", "NIFTY BANK", "BANK NIFTY"],
-            "crude": ["CRUDEOIL"],
-            "crude oil": ["CRUDEOIL"]
-        }
-    }
-    try:
-        update_task = index.update_settings(settings)
-        client.wait_for_task(update_task.task_uid)
-        logger.info("Meilisearch 'instruments' index settings applied successfully.")
-        try:
-            effective_settings = index.get_settings()
-            effective_sortables = effective_settings.get("sortableAttributes")
-            logger.info(f"effective_sortables={effective_sortables}")
-        except Exception as e:
-            logger.warning(f"Could not fetch effective settings after update: {e}")
-    except Exception as e:
-        logger.error(f"Error applying Meilisearch index settings: {e}", exc_info=True)
-
-
-async def fetch_instrument_search_records() -> List[Dict[str, Any]]:
-    sql_query = f"""
-        SELECT
-            instrument_token, exchange_token, tradingsymbol, name, last_price,
-            expiry, strike, tick_size, lot_size, instrument_type, segment,
-            exchange, underlying, option_type
-        FROM kite_instruments
-        WHERE expiry IS NULL OR expiry >= {MEILI_INSTRUMENT_MARKET_DATE_SQL}
-        UNION ALL
-        SELECT
-            instrument_token, exchange_token, tradingsymbol, name, last_price,
-            expiry, strike, tick_size, lot_size, instrument_type, segment,
-            exchange,
-            NULL AS underlying, NULL AS option_type
-        FROM kite_indices
-        WHERE expiry IS NULL OR expiry >= {MEILI_INSTRUMENT_MARKET_DATE_SQL};
-    """
-    logger.info("Fetching instruments from PostgreSQL for search indexing...")
-    db_records = await database.fetch_all(sql_query)
-    return [dict(record) for record in db_records]
-
-
-async def fetch_expired_instrument_search_ids() -> List[str]:
-    sql_query = f"""
-        WITH source_rows AS (
-            SELECT instrument_token, expiry
-            FROM kite_instruments
-            UNION ALL
-            SELECT instrument_token, expiry
-            FROM kite_indices
-        ),
-        active_tokens AS (
-            SELECT DISTINCT instrument_token
-            FROM source_rows
-            WHERE expiry IS NULL OR expiry >= {MEILI_INSTRUMENT_MARKET_DATE_SQL}
-        ),
-        expired_tokens AS (
-            SELECT DISTINCT instrument_token
-            FROM source_rows
-            WHERE expiry < {MEILI_INSTRUMENT_MARKET_DATE_SQL}
-        )
-        SELECT expired_tokens.instrument_token
-        FROM expired_tokens
-        LEFT JOIN active_tokens USING (instrument_token)
-        WHERE active_tokens.instrument_token IS NULL;
-    """
-    rows = await database.fetch_all(sql_query)
-    return [str(row["instrument_token"]) for row in rows]
-
-
-def build_instrument_search_documents(db_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    documents = []
-
-    def _type_rank(doc: Dict[str, Any]) -> int:
-        segment = str(doc.get("segment", "")).upper()
-        instrument_type = str(doc.get("instrument_type", "")).upper()
-        option_type = str(doc.get("option_type", "")).upper()
-
-        if segment == "INDICES" or instrument_type == "INDEX":
-            return 1
-        if instrument_type == "FUT":
-            return 2
-        if instrument_type == "EQ" and not option_type:
-            return 3
-        if option_type in ("CE", "PE"):
-            return 4
-        return 9
-
-    def _boost_and_aliases(underlying: str, tradingsymbol: str, name: Optional[str]) -> Tuple[int, List[str]]:
-        u = (underlying or "").upper()
-        base_aliases = []
-        boost = 0
-
-        if "BANKNIFTY" in u or "BANK" in u:
-            boost = 100
-            base_aliases.extend(["BANKNIFTY", "NIFTY BANK", "BANK NIFTY"])
-        elif "FINNIFTY" in u:
-            boost = 100
-            base_aliases.extend(["FINNIFTY", "FIN NIFTY"])
-        elif "SENSEX" in u:
-            boost = 100
-            base_aliases.extend(["SENSEX"])
-        elif "NIFTY" in u:
-            boost = 100
-            base_aliases.extend(["NIFTY", "NIFTY50", "NIFTY 50"])
-
-        searchable_reference = {
-            value.upper()
-            for value in (underlying, tradingsymbol, name)
-            if value
-        }
-        all_aliases = {
-            alias.upper()
-            for alias in base_aliases
-            if alias and alias.upper() not in searchable_reference
-        }
-
-        return boost, sorted(all_aliases)
-
-    for record in db_records:
-        doc = {
-            "id": str(record["instrument_token"]),
-            "instrument_token": record["instrument_token"],
-            "exchange_token": record["exchange_token"],
-            "tradingsymbol": record["tradingsymbol"],
-            "name": record["name"],
-            "last_price": float(record["last_price"]) if record["last_price"] is not None else None,
-            "expiry": record["expiry"].isoformat() if record["expiry"] else None,
-            "strike": float(record["strike"]) if record["strike"] is not None else None,
-            "tick_size": float(record["tick_size"]) if record["tick_size"] is not None else None,
-            "lot_size": int(record["lot_size"]) if record["lot_size"] is not None else None,
-            "instrument_type": record["instrument_type"],
-            "segment": record["segment"],
-            "exchange": record["exchange"],
-            "underlying": record["underlying"],
-            "option_type": record["option_type"],
-            "derivative_kind": "NONE",
-            "expiry_ts": None,
-            "expiry_year": None,
-            "expiry_month": None,
-            "type_rank": 9,
-            "boost_score": 0,
-        }
-
-        instrument_type = record["instrument_type"]
-        segment = record["segment"]
-        tradingsymbol = record["tradingsymbol"]
-        expiry_date = record["expiry"]
-
-        seg_up = (segment or "").upper() if segment else None
-        if seg_up == "INDICES":
-            doc["instrument_type"] = "INDEX"
-            doc["segment"] = "INDICES"
-            doc["option_type"] = None
-            doc["expiry"] = None
-            doc["strike"] = None
-            up_ts = (tradingsymbol or "").upper()
-            if "BANK" in up_ts:
-                derived_underlying = "BANKNIFTY"
-            elif "NIFTY" in up_ts:
-                derived_underlying = "NIFTY"
-            elif "SENSEX" in up_ts:
-                derived_underlying = "SENSEX"
-            elif "FINNIFTY" in up_ts:
-                derived_underlying = "FINNIFTY"
-            else:
-                first_word = up_ts.split()[0] if up_ts.split() else up_ts
-                cleaned = re.sub(r'[^A-Z0-9]', '', first_word)
-                derived_underlying = cleaned if cleaned else up_ts
-            doc["underlying"] = derived_underlying
-            instrument_type = doc["instrument_type"]
-
-        if instrument_type in {"CE", "PE"}:
-            doc["derivative_kind"] = "OPT"
-        elif instrument_type == "FUT":
-            doc["derivative_kind"] = "FUT"
-
-        if expiry_date:
-            expiry_utc = datetime.combine(expiry_date, datetime.min.time(), tzinfo=pytz.utc)
-            doc["expiry_ts"] = int(expiry_utc.timestamp())
-            doc["expiry_year"] = expiry_date.year
-            doc["expiry_month"] = expiry_date.month
-
-        doc["type_rank"] = _type_rank(doc)
-        underlying_for_aliases = doc.get("underlying") or tradingsymbol
-        boost, alias_list = _boost_and_aliases(underlying_for_aliases, tradingsymbol, doc.get("name"))
-        doc["boost_score"] = boost
-        if alias_list:
-            doc["aliases"] = alias_list
-
-        documents.append(doc)
-
-    return documents
-
-# ─────────── Meilisearch reindex pipeline ───────────
-async def meili_reindex_instruments():
-    """
-    Queries both kite_instruments and kite_indices tables, builds documents,
-    and upserts them into the Meilisearch 'instruments' index.
-    """
-    # Ensure index settings are up-to-date before reindexing
-    ensure_instruments_index()
-
-    client = get_meili_client(admin=True)
-    index = client.index("instruments")
-
-    db_records = await fetch_instrument_search_records()
-    documents = build_instrument_search_documents(db_records)
-    expired_document_ids = await fetch_expired_instrument_search_ids()
-
-    total_documents = len(documents)
-    if not total_documents:
-        logger.info("No instruments to reindex in Meilisearch.")
-        return {"total": 0, "batches": 0, "expired_removed": 0}
-
-    batch_size = 5000 # Sensible default batch size
-    batches = 0
-    last_task_uid = None
-
-    logger.info(f"Starting Meilisearch reindexing for {total_documents} active instruments in batches of {batch_size}...")
-    for i in range(0, total_documents, batch_size):
-        batch = documents[i:i + batch_size]
-        try:
-            task = index.add_documents(batch, primary_key="id")
-            last_task_uid = task.task_uid
-            batches += 1
-            logger.info(f"Sent batch {batches} to Meilisearch (task_uid: {last_task_uid}).")
-        except Exception as e:
-            logger.error(f"Error sending batch {batches} to Meilisearch: {e}", exc_info=True)
-            # Continue with next batch or re-raise, depending on desired error handling
-            # For now, we log and continue.
-
-    if last_task_uid is not None:
-        logger.info(f"Waiting for last Meilisearch indexing task ({last_task_uid}) to complete...")
-        client.wait_for_task(last_task_uid)
-        logger.info("Meilisearch reindexing completed.")
-    else:
-        logger.info("No documents were sent to Meilisearch for reindexing.")
-
-    expired_removed = 0
-    last_delete_task_uid = None
-    for i in range(0, len(expired_document_ids), batch_size):
-        batch = expired_document_ids[i:i + batch_size]
-        try:
-            task = index.delete_documents(batch)
-            last_delete_task_uid = task.task_uid
-            expired_removed += len(batch)
-        except Exception as e:
-            logger.error(f"Error deleting expired Meilisearch instruments batch starting at {i}: {e}", exc_info=True)
-            raise
-
-    if last_delete_task_uid is not None:
-        logger.info(f"Waiting for last expired Meilisearch delete task ({last_delete_task_uid}) to complete...")
-        client.wait_for_task(last_delete_task_uid)
-        logger.info(f"Expired Meilisearch instruments removed: {expired_removed}.")
-
-    return {"total": total_documents, "batches": batches, "expired_removed": expired_removed}
-
-
 
 
 
@@ -759,11 +332,10 @@ async def sync_and_reindex_orchestrator(
     background_tasks: Optional[BackgroundTasks] = None
 ) -> Dict[str, Optional[int]]:
     """
-    Orchestrates optional instrument refresh, backfill of underlying/option_type, and Meilisearch reindex.
+    Orchestrates optional instrument refresh and backfill of underlying/option_type.
     """
     refreshed_count: Optional[int] = None
     backfilled_counts: Dict[str, int] = {"processed": 0, "updated": 0, "skipped": 0}
-    indexed_count: Optional[int] = None
 
     try:
         # 1. Refresh instruments from broker
@@ -805,21 +377,24 @@ async def sync_and_reindex_orchestrator(
         backfilled_counts = await _parse_and_backfill_underlying(session, only_nulls=backfill_only_nulls)
         logger.info(f"Backfill completed: Processed {backfilled_counts['processed']}, Updated {backfilled_counts['updated']}, Skipped {backfilled_counts['skipped']}.")
 
-        # 3. Reindex Meilisearch
-        if reindex:
-            logger.info("Initiating Meilisearch reindex (orchestrator)...")
-            reindex_stats = await meili_reindex_instruments()
-            indexed_count = reindex_stats.get("total")
-            logger.info(f"Meilisearch reindex completed. Total indexed: {indexed_count}.")
-        else:
-            logger.info("Meilisearch reindex skipped as per orchestrator request.")
+        # 3. Notify Go market-runtime to refresh instrument cache
+        try:
+            import httpx
+            runtime_url = os.getenv("MARKET_RUNTIME_HTTP_URL", "http://market-runtime:8780")
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(f"{runtime_url}/internal/market-runtime/instruments/refresh")
+                if resp.status_code == 200:
+                    logger.info("Go instrument store refreshed successfully")
+                else:
+                    logger.warning(f"Go instrument store refresh returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to notify Go market-runtime of instrument refresh: {e}")
 
         return {
             "refreshed": refreshed_count,
             "backfilled": backfilled_counts["processed"],
             "updated": backfilled_counts["updated"],
-            "skipped": backfilled_counts["skipped"],
-            "indexed": indexed_count
+            "skipped": backfilled_counts["skipped"]
         }
 
     except Exception as e:
@@ -1085,23 +660,6 @@ async def import_all_instruments(kite: KiteConnect = Depends(get_kite)):
             results.append({"exchange": exchange, "error": str(e)})
     
     return {"message": "Imported all instruments", "results": results}
-
-@router.get("/instruments/meili/health")
-async def get_meilisearch_health():
-    """
-    Returns the health status of the Meilisearch service.
-    """
-    try:
-        client = get_meili_client(admin=False)
-        health = client.health()
-        if health.get("status") == "available":
-            return {"status": "ok"}
-        else:
-            return {"status": "error", "detail": health}
-    except Exception as e:
-        logger.error(f"Error checking Meilisearch health: {e}", exc_info=True)
-        return {"status": "error", "detail": str(e)}
-
 
 async def _parse_and_backfill_underlying(session: Session, only_nulls: bool = True) -> Dict[str, int]:
     """
@@ -1402,7 +960,7 @@ async def get_anchor_price_for_underlying(underlying_symbol: str) -> Optional[fl
 class SyncAndReindexRequest(BaseModel):
     refresh_from_broker: bool = True
     backfill_only_nulls: bool = True
-    reindex: bool = True
+    reindex: bool = True  # DEPRECATED: Meilisearch removed
 
     # refresh_from_broker=True calls an internal import/refresh function (e.g., import_all_instruments) directly if present;
     # it does not call any HTTP endpoint. If no internal refresh function exists, this endpoint still backfills
@@ -1440,237 +998,9 @@ async def fuzzy_search_instruments(
     query: Optional[str] = Query(None, alias="query"),
     limit: int = 50
 ):
-    def _sanitize_sort(index, sort_list: list[str]) -> list[str]:
-        try:
-            settings = index.get_settings()
-            allowed = set(settings.get("sortableAttributes") or [])
-            sanitized = [s for s in (sort_list or []) if (s.split(":")[0] in allowed)]
-            if len(sanitized) != len(sort_list or []):
-                logger.info(f"sanitized_sort={sanitized} allowed={allowed}")
-            return sanitized
-        except Exception as e:
-            logger.exception("Failed to sanitize sort, returning empty list.")
-            return []  # fallback: no sort
-    """
-    Fuzzy search endpoint with Meilisearch-first and robust SQL fallback.
-    Changes:
-    - Accepts both 'q' and 'query'.
-    - Short query guard (<=3): skip parsing; plain Meili search with no filter.
-    - Always fallback to SQL when Meili returns zero hits.
-    - Always return 200 with a list (possibly empty).
-    """
-    q_text = (q or query or "").strip()
-    if not q_text:
-        return []
-
-    try:
-        client = get_meili_client(admin=False)
-        index = client.index("instruments")
-    except Exception:
-        logger.exception(f"Failed to init Meili client for q='{q_text}'. Falling back to SQL (plain). mode=sql_fallback_plain")
-        rows = await sql_fallback_plain(q_text, limit)
-        logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
-        return rows
-
-    # Short query guard: <= 3 characters -> skip structured parsing entirely
-    if len(q_text) <= 3:
-        try:
-            options = {
-                "limit": limit,
-                "sort": ["boost_score:desc","type_rank:asc","expiry_ts:asc"],
-                "attributesToRetrieve": MEILI_INSTRUMENT_RESULT_ATTRIBUTES,
-            }
-            # Pre-sanitize sort against current index settings to avoid invalid_search_sort
-            try:
-                sanitized = _sanitize_sort(index, options.get("sort"))
-                if not sanitized:
-                    options.pop("sort", None)
-                else:
-                    options["sort"] = sanitized
-            except Exception:
-                # On any settings error, drop sort to avoid invalid_search_sort
-                options.pop("sort", None)
-            try:
-                result = index.search(q_text, options)
-            except meilisearch.errors.MeilisearchApiError as e:
-                msg = str(e)
-                if "invalid_search_sort" in msg or "not sortable" in msg:
-                    logger.warning(f"Meili search failed with invalid sort for q='{q_text}'. Sanitizing and retrying.")
-                    options["sort"] = _sanitize_sort(index, options.get("sort"))
-                    try:
-                        result = index.search(q_text, options)
-                    except Exception:
-                        logger.error(f"Meili retry failed for q='{q_text}' after sanitizing. Retrying without sort.")
-                        options.pop("sort", None)
-                        result = index.search(q_text, options)
-                elif "invalid_search_filter" in msg or "not filterable" in msg:
-                    logger.warning(f"Meili search failed with invalid filter settings for q='{q_text}'. Resetting index settings and retrying.")
-                    try:
-                        # Attempt self-heal: re-apply index settings
-                        ensure_instruments_index()
-                        # Reacquire index handle and retry with same options
-                        index = client.index("instruments")
-                        result = index.search(q_text, options)
-                    except Exception:
-                        # Final attempt: drop any filters/sorts and try plain search
-                        logger.error(f"Meili retry failed for q='{q_text}' after resetting settings. Retrying without filter/sort.")
-                        options.pop("filter", None)
-                        options.pop("sort", None)
-                        result = index.search(q_text, options)
-                else:
-                    raise
-            hits = result.get("hits", [])
-            logger.info(f"q='{q_text}' mode=meili_q_only meili_hits={len(hits)}")
-            if not hits:
-                rows = await sql_fallback_plain(q_text, limit)
-                logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
-                return rows
-            return hits
-        except Exception:
-            logger.exception(f"Meili error for short query q='{q_text}'. Falling back to SQL (plain). mode=sql_fallback_plain")
-            rows = await sql_fallback_plain(q_text, limit)
-            logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
-            return rows
-
-    # Longer queries: try to parse for structured filters
-    parsed = {}
-    try:
-        parsed = parse_fo_query(q_text)
-        logger.info(f"q='{q_text}' parsed={json.dumps(parsed, default=str)}")
-    except Exception:
-        logger.exception(f"Parser error for q='{q_text}'. Proceeding without filters.")
-
-    options = {
-        "limit": limit,
-        "attributesToRetrieve": MEILI_INSTRUMENT_RESULT_ATTRIBUTES,
-    }
-    
-    filter_clauses = []
-
-    # Determine if the user explicitly asked for derivatives
-    explicit_derivative = bool(
-        parsed.get("option_type")
-        or parsed.get("derivative_kind")
-        or parsed.get("expiry_date")
-        or (parsed.get("expiry_year") and parsed.get("expiry_month"))
-        or (parsed.get("strike") is not None)
-        or ("FUT" in (parsed.get("instrument_type") or ""))
-    )
-
-    # For base queries (no explicit derivatives), exclude options so index/equity/futures surface
-    if not explicit_derivative:
-        filter_clauses.append("option_type IS NULL")
-        # Prefer major indices and futures first for base queries
-        options["sort"] = ["boost_score:desc","type_rank:asc","expiry_ts:asc"]
-
-    # Numeric strike without CE/PE => both legs in a band, sorted by expiry then strike
-    strike = parsed.get("strike")
-    if (strike is not None) and not parsed.get("option_type"):
-        # If a strike is provided without CE/PE, we should look for options, not exclude them.
-        # So, we remove the "option_type IS NULL" filter if it was added.
-        if "option_type IS NULL" in filter_clauses:
-            filter_clauses.remove("option_type IS NULL")
-        filter_clauses.append('(option_type = "CE" OR option_type = "PE")')
-        tol = 50
-        filter_clauses.append(f"(strike >= {int(strike - tol)} AND strike <= {int(strike + tol)})")
-        # Prefer expiry_ts for sorting if available
-        options["sort"] = ["expiry_ts:asc", "strike:asc"]
-
-    # Add other parsed filters
-    # This reuses the existing build_meili_filter logic but integrates it into the new clause system
-    if parsed:
-        # We handle strike and option_type manually above, so we can create a temporary parsed dict without them
-        # to avoid double-filtering.
-        temp_parsed = parsed.copy()
-        temp_parsed.pop("strike", None)
-        # We don't pop option_type because if it's present, it should be used.
-        # The logic above for strike handling only applies when option_type is NOT specified.
-        
-        # The original build_meili_filter is fine to reuse for other attributes
-        additional_filters = build_meili_filter(temp_parsed)
-        if additional_filters:
-            filter_clauses.extend(additional_filters)
-
-    filter_str = " AND ".join(filter_clauses) if filter_clauses else None
-    resid = parsed.get("residual") if parsed else None
-    search_q = resid or q_text
-
-    try:
-        if filter_str:
-            options["filter"] = filter_str
-
-        # Pre-sanitize sort against index settings to avoid invalid_search_sort
-        if "sort" in options:
-            try:
-                sanitized = _sanitize_sort(index, options.get("sort"))
-                if not sanitized:
-                    options.pop("sort", None)
-                else:
-                    options["sort"] = sanitized
-            except Exception:
-                options.pop("sort", None)
-        
-        try:
-            result = index.search(search_q, options)
-        except meilisearch.errors.MeilisearchApiError as e:
-            msg = str(e)
-            if "invalid_search_sort" in msg or "not sortable" in msg:
-                logger.warning(f"Meili search failed with invalid sort for q='{q_text}'. Sanitizing and retrying.")
-                options["sort"] = _sanitize_sort(index, options.get("sort"))
-                try:
-                    result = index.search(search_q, options)
-                except Exception:
-                    logger.error(f"Meili retry failed for q='{q_text}' after sanitizing. Retrying without sort.")
-                    options.pop("sort", None)
-                    result = index.search(search_q, options)
-            elif "invalid_search_filter" in msg or "not filterable" in msg:
-                logger.warning(f"Meili search failed with invalid filter for q='{q_text}' filter='{filter_str}'. Attempting index settings reset.")
-                try:
-                    # Self-heal: ensure index has correct filterableAttributes, wait for task, then retry
-                    ensure_instruments_index()
-                    index = client.index("instruments")
-                    result = index.search(search_q, options)
-                except Exception:
-                    logger.error(f"Meili retry failed for q='{q_text}' after resetting settings. Retrying without filter.")
-                    # Drop the filter and retry as plain query
-                    options.pop("filter", None)
-                    try:
-                        result = index.search(search_q, options)
-                    except Exception:
-                        # Give up on Meili path; let caller fallback to SQL
-                        raise
-            else:
-                raise
-        hits = result.get("hits", [])
-        mode = "meili_filtered" if filter_str else "meili_q_only"
-        logger.info(f"q='{q_text}' mode={mode} meili_hits={len(hits)}")
-
-        if not hits:
-            # Always fallback to SQL whenever Meili hits are zero
-            if filter_str:
-                rows = await sql_fallback_fuzzy_search(q_text, limit, parsed)
-                logger.info(f"q='{q_text}' mode=sql_fallback_structured sql_rows={len(rows)}")
-                return rows
-            else:
-                rows = await sql_fallback_plain(q_text, limit)
-                logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
-                return rows
-
-        return hits
-    except (meilisearch.errors.MeilisearchCommunicationError, requests.exceptions.ConnectionError, httpx.ConnectError):
-        logger.exception(f"Meili connection error for q='{q_text}'. Falling back to SQL (prefer structured if available).")
-        if filter_str:
-            rows = await sql_fallback_fuzzy_search(q_text, limit, parsed)
-            logger.info(f"q='{q_text}' mode=sql_fallback_structured sql_rows={len(rows)}")
-        else:
-            rows = await sql_fallback_plain(q_text, limit)
-            logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
-        return rows
-    except Exception:
-        logger.exception(f"Unexpected Meili error for q='{q_text}'. Falling back to SQL (plain).")
-        rows = await sql_fallback_plain(q_text, limit)
-        logger.info(f"q='{q_text}' mode=sql_fallback_plain sql_rows={len(rows)}")
-        return rows
+    search_term = (q or query or "").strip()
+    rows = await sql_fallback_plain(search_term, limit)
+    return {"results": rows, "total": len(rows), "source": "sql"}
 
 # ─────────── Daily update functionality ───────────
 async def schedule_daily_instruments_update():
@@ -1717,7 +1047,6 @@ async def update_all_instruments_daily():
             session=db,
             refresh_from_broker=True,
             backfill_only_nulls=True,
-            reindex=True,
             background_tasks=None
         )
         logger.info(f"Daily instruments maintenance completed successfully. Counts: {counts}")
@@ -1745,48 +1074,6 @@ def month_window(year: int, month: int) -> tuple[date, date]:
     else:
         end_date = date(year, month + 1, 1)
     return start_date, end_date
-
-def build_meili_filter(parsed: dict) -> list[str]:
-    """
-    Safe Meilisearch filter builder:
-    - Only string equality with double quotes for: underlying, option_type, instrument_type, exchange.
-    - Only numeric equality for strike.
-    - Expiry: equality only (ISO date string) or skip.
-    - No ranges, no IN clauses.
-    """
-    preds: list[str] = []
-
-    # String fields: equality only, double quotes
-    if parsed.get("underlying"):
-        preds.append(f'underlying = "{parsed["underlying"]}"')
-
-    if parsed.get("instrument_type"):
-        preds.append(f'instrument_type = "{parsed["instrument_type"]}"')
-
-    if parsed.get("option_type"):
-        preds.append(f'option_type = "{parsed["option_type"]}"')
-
-    if parsed.get("exchange"):
-        preds.append(f'exchange = "{parsed["exchange"]}"')
-
-    # Expiry equality only (ISO format) or skip on error
-    if parsed.get("expiry_date"):
-        try:
-            preds.append(f'expiry = "{parsed["expiry_date"].isoformat()}"')
-        except Exception:
-            # Skip malformed expiry to avoid breaking the filter
-            pass
-
-    # Numeric strike: equality only
-    if parsed.get("strike") is not None:
-        try:
-            sval = float(parsed["strike"])
-            preds.append(f'strike = {int(sval) if sval.is_integer() else sval}')
-        except Exception:
-            # Ignore invalid strike
-            pass
-
-    return preds
 
 def parse_fo_query(query: str) -> Dict[str, Any]:
     """
@@ -1900,8 +1187,8 @@ def parse_fo_query(query: str) -> Dict[str, Any]:
     return result
 
 ####KITE
-from .historical_data import fetch_and_store_historical_data, fetch_and_store_indices_historical_data
-from database import get_db_connection
+from broker_api.market.historical_data import fetch_and_store_historical_data, fetch_and_store_indices_historical_data
+from app.database import get_db_connection
 
 @router.post("/clear_historical_data")
 def clear_historical_data(conn = Depends(get_psql_conn)):

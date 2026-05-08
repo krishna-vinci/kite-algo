@@ -7,9 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from broker_api.instruments_repository import InstrumentsRepository
-from broker_api.options_sessions import OptionsSessionManager
-from database import SessionLocal
+from broker_api.instruments.instruments_repository import InstrumentsRepository
+from broker_api.options.options_sessions import OptionsSessionManager
+from app.database import SessionLocal
 from options.market.service import OptionsMarketService
 
 router = APIRouter(prefix="/api/options", tags=["Options"])

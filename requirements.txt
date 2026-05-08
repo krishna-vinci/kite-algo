@@ -22,7 +22,6 @@ asyncpg
 alembic
 kiteconnect
 indexed-gzip
-meilisearch>=0.31.0
 redis
 mibian
 numba

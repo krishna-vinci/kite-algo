@@ -10,14 +10,14 @@ from fastapi import APIRouter, HTTPException, Query, WebSocket
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from broker_api.index_ingestion import (
+from broker_api.instruments.index_ingestion import (
     ensure_fresh_live_metrics,
     get_index_refresh_state,
     normalize_source_list,
     refresh_live_metrics,
 )
-from broker_api.redis_events import get_redis
-from database import get_db_connection
+from broker_api.core.redis_events import get_redis
+from app.database import get_db_connection
 
 
 router = APIRouter(tags=["Marketwatch"])

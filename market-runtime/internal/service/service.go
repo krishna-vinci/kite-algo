@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"kitealgo/market-runtime/internal/config"
+	"kitealgo/market-runtime/internal/instruments"
 
 	kiteconnect "github.com/zerodha/gokiteconnect/v4"
 	kitemodels "github.com/zerodha/gokiteconnect/v4/models"
@@ -32,6 +33,8 @@ type Service struct {
 	closeOnce           sync.Once
 	cancel              context.CancelFunc
 	statusSignals       chan struct{}
+	instruments         *instruments.Store
+	instrumentsMu       sync.RWMutex
 }
 
 func New(ctx context.Context, cfg config.Config) (*Service, error) {
@@ -56,6 +59,15 @@ func New(ctx context.Context, cfg config.Config) (*Service, error) {
 	if err != nil {
 		log.Printf("market-runtime initial token read failed: %v", err)
 	}
+
+	// Load instrument metadata for tick enrichment (best-effort; graceful degradation).
+	var instrumentsStore *instruments.Store
+	if instStore, err := instruments.LoadFromPostgres(ctx, cfg.PostgresDSN); err != nil {
+		log.Printf("instrument store load failed (tick enrichment disabled): %v", err)
+	} else {
+		instrumentsStore = instStore
+	}
+
 	s := &Service{
 		config:              cfg,
 		registry:            NewSubscriptionRegistry(),
@@ -67,7 +79,8 @@ func New(ctx context.Context, cfg config.Config) (*Service, error) {
 		tokenStoreHealthy:   err == nil,
 		lastTokenStoreError: errorString(err),
 		cancel:              cancel,
-		statusSignals:       make(chan struct{}, 1),
+		statusSignals:       make(chan struct{}, 10),
+		instruments:         instrumentsStore,
 	}
 	if s.currentToken != "" {
 		s.ensureShardLocked(1)
@@ -90,6 +103,9 @@ func (s *Service) Close() {
 			shard.Stop()
 		}
 		s.mu.Unlock()
+		if s.instruments != nil {
+			s.instruments.Close()
+		}
 		s.tokenStore.Close()
 		_ = s.publisher.Close()
 	})
@@ -224,6 +240,24 @@ func (s *Service) ensureShardLocked(shardID int) *KiteShard {
 
 func (s *Service) handleTick(tick kitemodels.Tick, shardID int) {
 	normalized := normalizeTick(tick, shardID)
+
+	// Enrich with instrument metadata (best-effort, no allocation on miss).
+	s.instrumentsMu.RLock()
+	store := s.instruments
+	s.instrumentsMu.RUnlock()
+	if store != nil {
+		if meta := store.ByToken(normalized.InstrumentToken); meta != nil {
+			normalized.Tradingsymbol = meta.Tradingsymbol
+			normalized.Exchange = meta.Exchange
+			normalized.InstrumentType = meta.InstrumentType
+			normalized.LotSize = meta.LotSize
+			normalized.TickSize = meta.TickSize
+			normalized.Strike = meta.Strike
+			normalized.Expiry = meta.Expiry
+			normalized.Underlying = meta.Underlying
+		}
+	}
+
 	if err := s.publisher.PublishTick(context.Background(), normalized); err != nil {
 		log.Printf("publish tick shard=%d token=%d: %v", shardID, normalized.InstrumentToken, err)
 	}

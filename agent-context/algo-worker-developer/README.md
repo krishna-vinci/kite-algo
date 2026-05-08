@@ -1,71 +1,50 @@
 # Algo Worker Developer Agent Context
 
-This folder is a copyable context pack for agents that build external Kite Algo strategies.
+This folder is a copyable context pack for agents and developers building external Kite Algo strategies.
 
-Give the whole folder to an algo developer agent when you want it to write workers on another machine or in another repo. The agent does **not** need backend source access for normal strategy work; it should install the SDK from PyPI and follow the contracts in this folder.
+Give this pack to an external coding agent when you want worker code written in another machine or another repo. The pack is designed to be self-contained enough for safe worker development without handing over the full backend source tree.
 
-## Start here
+## What this pack is for
 
-1. `AGENT_PROMPT.md` — paste this into the agent as the operating instruction.
-2. `ALGO_WORKER_DEVELOPMENT_GUIDE.md` — full copy of the main algo worker development guide.
-3. `SDK_INSTALL.md` — how to install the SDK on remote servers.
-4. `STRATEGY_LIFECYCLE.md` — how every worker should create runs, submit orders, patch risk, and exit.
-5. `MARKET_DATA.md` — runtime-backed ticker, quote, tick-stream, and candle usage.
-6. `REALTIME_PNL.md` — grouped realtime run-level P&L snapshot and stream usage.
-7. `ORDER_CATALOG.md` — supported order fields, including AMO.
-8. `LIVE_SAFETY.md` — live trading gates and what not to do.
-9. `PROTECTION.md` — backend-owned protection contract usage.
-10. `examples/` — runnable strategy examples.
+- external strategy workers
+- AI agents generating worker code
+- developers who need the worker contract without reading the entire backend
 
-## Canonical source files in this repo
-
-These files remain the source of truth in the main repo:
-
-- `docs/algo-worker-development-guide.md`
-- `sdk/python/README.md`
-- `sdk/python/kite_algo_worker/client.py`
-- `sdk/python/kite_algo_worker/orders.py`
-- `sdk/python/examples/`
-- `tests/test_worker_sdk.py`
-- `api/routers/algo_workers.py`
-- `broker_api/kite_orders.py`
-- `scripts/live_worker_e2e_validation.py`
-
-If this context pack and the canonical files disagree, trust the canonical files.
-
-## Current SDK release
+## Current package status
 
 - Package name: `kite-algo-worker`
-- Version: `0.6.2`
+- Current public PyPI release: `0.7.0`
 - SDK tag convention: `kite-algo-worker-vX.Y.Z`
-- App tag convention: `vX.Y.Z`
 
-Current hardened core surface:
-
-- lifecycle and recovery: `health()`, `heartbeat(...)`, `create_run(...)`, `get_run(...)`
-- accounting: `get_funds(...)`, `get_run_funds(...)`, `get_run_pnl(...)`, `stream_run_pnl(...)`
-- execution control: `list_orders(...)`, `list_trades(...)`, `preview_order(...)`, `preview_basket(...)`, `place_order(...)`, `place_basket(...)`, `exit_run(...)`
-- market data: `resolve_ticker(...)`, `search_tickers(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `stream_candles(...)`, `get_historical_candles(...)`, `get_market_snapshot(...)`
-- recovery helpers: `wait_for_history(...)` and the websocket client for reconnectable streams
-
-The certification script now prints preview output and capability flags for this surface.
-
-Remote install:
+Canonical public install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.6.2
+python3 -m pip install kite-algo-worker==0.7.0
 ```
 
-Fallback exact-tag install:
+This pack describes the current released SDK surface. If this pack and the repo disagree, trust the repo files.
 
-```bash
-python3 -m pip install \
-  "kite-algo-worker @ git+ssh://git@github.com/krishna-vinci/kite-algo.git@kite-algo-worker-v0.6.2#subdirectory=sdk/python"
-```
+## Read in this order
 
-This release adds:
+1. `AGENT_PROMPT.md` — pasteable operating instruction for an external coding agent
+2. `ALGO_WORKER_DEVELOPMENT_GUIDE.md` — safe-worker playbook and current workflow guidance
+3. `examples/` — canonical example subset copied from `sdk/python/examples/`
 
-- grouped order/trade inspection and order lifecycle helpers
-- live order/basket preview APIs for sizing and charges checks
-- async SDK support plus websocket clients for ticks, candles, and grouped run P&L
-- safer worker ergonomics such as `ensure_run(...)`, `wait_for_history(...)`, and `live_equity_market_order(...)`
+## Pack contents
+
+- `README.md`
+- `AGENT_PROMPT.md`
+- `ALGO_WORKER_DEVELOPMENT_GUIDE.md`
+- `examples/`
+
+## If you also have repo access
+
+For deeper source-of-truth reading in the main repo, start with:
+
+- `sdk/python/README.md`
+- `documents/algo-worker-sdk-guide.md`
+- `sdk/python/kite_algo_worker/`
+- `api/routers/worker_auth.py`, `worker_market.py`, `worker_execution.py`, and `worker_protection.py`
+- `options/api/worker_options_router.py`
+
+If this pack and the repo disagree, trust the repo files.

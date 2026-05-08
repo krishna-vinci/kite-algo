@@ -5,7 +5,7 @@ import uuid
 from typing import Any, Callable
 
 from sqlalchemy import text
-from database import SessionLocal
+from app.database import SessionLocal
 
 from .models import OptionRunCreateRequest, OptionRunState
 
@@ -96,8 +96,8 @@ class DurableOptionRunStore:
             raise ValueError("strategy_run_id is required")
 
     def create_run(self, request: OptionRunCreateRequest) -> OptionRunState:
-        strategy_run_id = self._id_factory()
-        if not strategy_run_id.startswith("opt_run_"):
+        strategy_run_id = str(request.strategy_run_id or self._id_factory())
+        if not strategy_run_id.startswith("opt_run_") and not request.strategy_run_id:
             strategy_run_id = f"opt_run_{strategy_run_id}"
 
         run = OptionRunState.from_create_request(request, strategy_run_id=strategy_run_id)
@@ -197,6 +197,10 @@ class DurableOptionRunStore:
             return self._get_run_in_session(session, strategy_run_id)
         finally:
             session.close()
+
+    def get_run_in_session(self, session: Any, strategy_run_id: str) -> OptionRunState:
+        self._require_id(strategy_run_id)
+        return self._get_run_in_session(session, strategy_run_id)
 
     def _get_run_in_session(self, session: Any, strategy_run_id: str, *, for_update: bool = False) -> OptionRunState:
         lock_clause = "FOR UPDATE" if for_update else ""

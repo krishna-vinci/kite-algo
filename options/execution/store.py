@@ -23,8 +23,8 @@ class OptionRunStore:
         self._counter = count(1)
 
     def create_run(self, request: OptionRunCreateRequest) -> OptionRunState:
-        strategy_run_id = self._id_factory()
-        if not strategy_run_id.startswith("opt_run_"):
+        strategy_run_id = str(request.strategy_run_id or self._id_factory())
+        if not strategy_run_id.startswith("opt_run_") and not request.strategy_run_id:
             strategy_run_id = f"opt_run_{strategy_run_id}"
         if strategy_run_id in self._runs:
             raise ValueError(f"Run already exists: {strategy_run_id}")
@@ -44,6 +44,10 @@ class OptionRunStore:
         except KeyError as exc:
             raise KeyError(f"Option run not found: {strategy_run_id}") from exc
         return deepcopy(run)
+
+    def get_run_in_session(self, session: Any, strategy_run_id: str) -> OptionRunState:
+        _ = session
+        return self.get_run(strategy_run_id)
 
     def save_run(self, run: OptionRunState) -> OptionRunState:
         if not run.strategy_run_id:
