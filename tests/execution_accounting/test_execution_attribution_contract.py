@@ -4,7 +4,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from algo_runtime.execution_attribution import build_paper_execution_attribution  # noqa: E402
+from backend.algo_runtime.execution_attribution import build_paper_execution_attribution  # noqa: E402
 
 
 class ExecutionAttributionContractTests(unittest.TestCase):

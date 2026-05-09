@@ -4,7 +4,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from algo_runtime.models import (  # noqa: E402
+from backend.algo_runtime.models import (  # noqa: E402
     CandleSeriesSpec,
     DependencySpec,
     IndicatorSpec,
@@ -12,7 +12,7 @@ from algo_runtime.models import (  # noqa: E402
     TriggerEvent,
     TriggerType,
 )
-from algo_runtime.triggers import trigger_matches  # noqa: E402
+from backend.algo_runtime.triggers import trigger_matches  # noqa: E402
 
 
 class TriggerMatchTests(unittest.TestCase):

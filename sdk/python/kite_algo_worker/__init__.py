@@ -4,7 +4,7 @@ from importlib.metadata import PackageNotFoundError, version as _package_version
 from pathlib import Path
 import re
 
-from . import options
+from . import backend.options
 from .async_client import AsyncKiteAlgoWorkerClient
 from .client import AlgoWorkerConfig, KiteAlgoWorkerClient, KiteAlgoWorkerError
 from .exceptions import AuthError, BrokerValidationError, PermissionDeniedError, StreamDisconnectedError

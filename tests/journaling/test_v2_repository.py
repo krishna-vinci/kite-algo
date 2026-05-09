@@ -5,8 +5,8 @@ from decimal import Decimal
 from typing import Any, cast
 from uuid import uuid4
 
-from journaling.models import JournalMetricSnapshot
-from journaling.repository import JournalRepository
+from backend.journaling.models import JournalMetricSnapshot
+from backend.journaling.repository import JournalRepository
 
 
 class _FakeResult:

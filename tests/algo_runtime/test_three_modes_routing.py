@@ -4,9 +4,9 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from algo_runtime.intent_bridge import IntentBridge  # noqa: E402
-from algo_runtime.models import ExecutionMode, OrderIntent  # noqa: E402
-from paper_runtime.executor import DryRunIntentHandler  # noqa: E402
+from backend.algo_runtime.intent_bridge import IntentBridge  # noqa: E402
+from backend.algo_runtime.models import ExecutionMode, OrderIntent  # noqa: E402
+from backend.paper_runtime.executor import DryRunIntentHandler  # noqa: E402
 
 
 class FakeModeHandler:

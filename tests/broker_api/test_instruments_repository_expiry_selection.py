@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from broker_api.instruments.instruments_repository import InstrumentsRepository
+from backend.broker_api.instruments.instruments_repository import InstrumentsRepository
 
 
 class _RepoStub(InstrumentsRepository):

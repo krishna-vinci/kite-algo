@@ -1,7 +1,7 @@
 from decimal import Decimal
 import unittest
 
-from execution_accounting.contracts import (
+from backend.execution_accounting.contracts import (
     ChargesStatus,
     ExecutionCostContract,
     OrderAttribution,

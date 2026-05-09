@@ -7,7 +7,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from broker_api.orders.basket_execution import BasketExecutionStore, recompute_basket_status
+from backend.broker_api.orders.basket_execution import BasketExecutionStore, recompute_basket_status
 
 
 class _FakeResult:

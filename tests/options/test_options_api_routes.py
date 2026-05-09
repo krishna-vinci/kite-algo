@@ -10,16 +10,16 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.routers.worker_shared import require_worker_token
-from api.routers.worker_auth import router as algo_workers_router
-from options.api.execution_router import get_option_execution_runtime_instance
-from options.api.execution_router import router as options_execution_router
-from options.api.market_router import router as options_market_router
-from options.api.protection_router import router as options_protection_router
-from options.api.strategy_router import router as options_strategy_router
-from options.api.worker_options_router import router as worker_options_router
-from options.execution.models import OptionRunCreateRequest
-from options.execution.store import OptionRunStore, get_option_run_store
+from backend.api.routers.worker_shared import require_worker_token
+from backend.api.routers.worker_auth import router as algo_workers_router
+from backend.options.api.execution_router import get_option_execution_runtime_instance
+from backend.options.api.execution_router import router as options_execution_router
+from backend.options.api.market_router import router as options_market_router
+from backend.options.api.protection_router import router as options_protection_router
+from backend.options.api.strategy_router import router as options_strategy_router
+from backend.options.api.worker_options_router import router as worker_options_router
+from backend.options.execution.models import OptionRunCreateRequest
+from backend.options.execution.store import OptionRunStore, get_option_run_store
 
 app = FastAPI()
 app.include_router(options_market_router)
@@ -270,7 +270,7 @@ def test_worker_option_enter_rejects_stale_safety_token(monkeypatch):
     }
     monkeypatch.setenv("WORKER_SAFETY_TOKEN_SECRET", "secret-key")
 
-    from api.routers import worker_protection as algo_workers_module
+    from backend.api.routers import worker_protection as algo_workers_module
 
     async def _fresh_snapshot(_request, _run_id):
         return {
@@ -331,7 +331,7 @@ def test_worker_option_exit_rejects_stale_safety_token_before_state_mutation(mon
     }
     monkeypatch.setenv("WORKER_SAFETY_TOKEN_SECRET", "secret-key")
 
-    from api.routers import worker_protection as algo_workers_module
+    from backend.api.routers import worker_protection as algo_workers_module
 
     async def _fresh_snapshot(_request, _run_id):
         return {

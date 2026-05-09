@@ -5,8 +5,8 @@ from typing import Literal
 
 import pytest
 
-from options.execution.durable_store import DurableOptionRunStore
-from options.execution.models import OptionRunCreateRequest, OptionRunState
+from backend.options.execution.durable_store import DurableOptionRunStore
+from backend.options.execution.models import OptionRunCreateRequest, OptionRunState
 
 
 def _create_request(product: Literal["MIS", "NRML"] = "MIS") -> OptionRunCreateRequest:

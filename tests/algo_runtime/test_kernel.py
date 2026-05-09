@@ -4,8 +4,8 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from algo_runtime.kernel import AlgoKernel  # noqa: E402
-from algo_runtime.models import (  # noqa: E402
+from backend.algo_runtime.kernel import AlgoKernel  # noqa: E402
+from backend.algo_runtime.models import (  # noqa: E402
     AlgoInstance,
     AlgoLifecycleState,
     DependencySpec,
@@ -15,10 +15,10 @@ from algo_runtime.models import (  # noqa: E402
     TriggerEvent,
     TriggerType,
 )
-from algo_runtime.registry import AlgoRegistry  # noqa: E402
-from algo_runtime.repository import InMemoryAlgoRepository  # noqa: E402
-from algo_runtime.service import AlgoRuntimeService  # noqa: E402
-from algo_runtime.state_store import InMemoryAlgoStateStore  # noqa: E402
+from backend.algo_runtime.registry import AlgoRegistry  # noqa: E402
+from backend.algo_runtime.repository import InMemoryAlgoRepository  # noqa: E402
+from backend.algo_runtime.service import AlgoRuntimeService  # noqa: E402
+from backend.algo_runtime.state_store import InMemoryAlgoStateStore  # noqa: E402
 
 
 class FakeSnapshotBuilder:

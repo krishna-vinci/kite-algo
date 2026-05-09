@@ -1,8 +1,8 @@
 import pytest
 from typing import Literal
 
-from options.execution.models import OptionRunCreateRequest
-from options.execution.store import OptionRunStore
+from backend.options.execution.models import OptionRunCreateRequest
+from backend.options.execution.store import OptionRunStore
 
 
 def _create_request(product: Literal["MIS", "NRML"] = "MIS") -> OptionRunCreateRequest:

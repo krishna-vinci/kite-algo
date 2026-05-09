@@ -6,7 +6,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from journaling.models import (  # noqa: E402
+from backend.journaling.models import (  # noqa: E402
     JournalExecutionContext,
     JournalExecutionEnvironment,
     JournalExecutionFact,
@@ -14,7 +14,7 @@ from journaling.models import (  # noqa: E402
     JournalTimelineEvent,
     JournalEpisode,
 )
-from journaling.service import JournalService  # noqa: E402
+from backend.journaling.service import JournalService  # noqa: E402
 
 
 def _dt(value: str) -> datetime:

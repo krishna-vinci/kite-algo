@@ -2,8 +2,8 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs(stub_kite_orders=False)
 
-from options.strategy.compiler import compile_option_strategy_preview
-from options.strategy.models import SelectedOptionLeg
+from backend.options.strategy.compiler import compile_option_strategy_preview
+from backend.options.strategy.models import SelectedOptionLeg
 
 
 def test_compile_short_straddle_uses_combined_premium_primary_metric():

@@ -1,8 +1,8 @@
 import pytest
 
-from journaling.models import JournalEnvironmentMode, JournalExecutionEnvironment
-from journaling.service import JournalService
-from journaling.v2 import environment_identity_tuple, resolve_environment_key
+from backend.journaling.models import JournalEnvironmentMode, JournalExecutionEnvironment
+from backend.journaling.service import JournalService
+from backend.journaling.v2 import environment_identity_tuple, resolve_environment_key
 
 
 class _EnvironmentRepository:

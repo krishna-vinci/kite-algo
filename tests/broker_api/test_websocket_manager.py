@@ -6,7 +6,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from broker_api.websocket_manager import WebSocketManager
+from backend.broker_api.websocket_manager import WebSocketManager
 
 
 class FakeKiteTicker:

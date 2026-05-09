@@ -5,8 +5,8 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from algo_runtime.intent_bridge import IntentBridge, KiteOrdersIntentHandler  # noqa: E402
-from algo_runtime.models import NoopAction, NotifyAction, OrderIntent, StatePatchAction  # noqa: E402
+from backend.algo_runtime.intent_bridge import IntentBridge, KiteOrdersIntentHandler  # noqa: E402
+from backend.algo_runtime.models import NoopAction, NotifyAction, OrderIntent, StatePatchAction  # noqa: E402
 
 
 class FakeOrderHandler:

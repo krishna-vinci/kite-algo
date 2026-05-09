@@ -6,15 +6,15 @@ from datetime import datetime, timezone
 
 from pydantic import ValidationError
 
-from journaling.service import JournalService
-from journaling.models import (
+from backend.journaling.service import JournalService
+from backend.journaling.models import (
     JournalAttachment,
     JournalNote,
     JournalNoteRevision,
     JournalNoteType,
     JournalTimelineEvent,
 )
-from journaling.v2.notes import (
+from backend.journaling.v2.notes import (
     NOTE_TEMPLATE_ADJUSTMENT,
     NOTE_TEMPLATE_EXIT_REVIEW,
     NOTE_TEMPLATE_EXPERIMENT,
@@ -32,7 +32,7 @@ EPISODE_ID = "00000000-0000-4000-8000-000000000101"
 NOTE_ID = "00000000-0000-4000-8000-000000000201"
 
 
-SCHEMA_SQL = Path("schema.sql").read_text()
+SCHEMA_SQL = Path("backend/schema.sql").read_text()
 
 
 def _assert_has(pattern: str) -> None:

@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 TEST_REDIS_URL = os.getenv("TEST_REDIS_URL")
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def integration_env_ready() -> bool:
@@ -24,7 +24,7 @@ def create_test_session_factory():
 def apply_schema() -> None:
     with psycopg2.connect(TEST_DATABASE_URL) as conn:
         with conn.cursor() as cur:
-            cur.execute((REPO_ROOT / "schema.sql").read_text())
+            cur.execute((REPO_ROOT / "backend/schema.sql").read_text())
             cur.execute(
                 """
                 ALTER TABLE public.worker_execution_events

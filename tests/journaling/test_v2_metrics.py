@@ -5,7 +5,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from journaling.v2.metrics import (
+from backend.journaling.v2.metrics import (
     build_environment_episode_metrics,
     build_episode_outcome,
     build_paper_live_comparison,

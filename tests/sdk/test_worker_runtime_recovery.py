@@ -10,7 +10,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.services.runtime_recovery import WorkerRuntimeRecoveryService
+from backend.api.services.runtime_recovery import WorkerRuntimeRecoveryService
 
 
 def dt(value: str) -> datetime:

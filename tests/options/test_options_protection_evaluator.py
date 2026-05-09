@@ -1,5 +1,5 @@
-from options.protection.evaluator import evaluate_option_rules
-from options.protection.exit_builder import build_grouped_exit_orders
+from backend.options.protection.evaluator import evaluate_option_rules
+from backend.options.protection.exit_builder import build_grouped_exit_orders
 
 
 def test_evaluate_option_rules_returns_first_matching_rule_by_precedence():

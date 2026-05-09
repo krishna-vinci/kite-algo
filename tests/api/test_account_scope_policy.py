@@ -4,7 +4,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from algo_runtime.account_scope import ParsedAccountScope, parse_account_scope  # noqa: E402
+from backend.algo_runtime.account_scope import ParsedAccountScope, parse_account_scope  # noqa: E402
 
 
 class AccountScopePolicyTests(unittest.TestCase):

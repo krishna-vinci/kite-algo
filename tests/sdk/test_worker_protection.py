@@ -5,7 +5,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.services.protection import BackendProtectionConfig, evaluate_backend_protection, validate_backend_protection_payload
+from backend.api.services.protection import BackendProtectionConfig, evaluate_backend_protection, validate_backend_protection_payload
 
 
 class WorkerProtectionContractTests(unittest.TestCase):

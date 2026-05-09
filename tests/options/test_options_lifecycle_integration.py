@@ -3,11 +3,11 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from options.api.execution_router import router as execution_router
-from options.api.market_router import get_options_session_manager, router as market_router
-from options.api.protection_router import router as protection_router
-from options.api.strategy_router import router as strategy_router
-from options.execution.store import OptionRunStore, get_option_run_store
+from backend.options.api.execution_router import router as execution_router
+from backend.options.api.market_router import get_options_session_manager, router as market_router
+from backend.options.api.protection_router import router as protection_router
+from backend.options.api.strategy_router import router as strategy_router
+from backend.options.execution.store import OptionRunStore, get_option_run_store
 
 
 class _FakeInstrumentRepo:

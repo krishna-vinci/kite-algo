@@ -5,7 +5,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.routers import journal as journal_router  # noqa: E402
+from backend.api.routers import journal as journal_router  # noqa: E402
 
 
 def _request_with_service(service):

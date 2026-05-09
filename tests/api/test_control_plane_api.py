@@ -12,14 +12,14 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.services.control_plane import (  # noqa: E402
+from backend.api.services.control_plane import (  # noqa: E402
     build_empty_snapshot,
     build_strategy_positions_snapshot,
     cancel_control_strategy_orders,
     compute_worker_health,
     exit_control_strategy,
 )
-from api.routers.control import router as control_router  # noqa: E402
+from backend.api.routers.control import router as control_router  # noqa: E402
 
 
 class _FakeWorkerRepository:
@@ -455,7 +455,7 @@ class ControlPlaneRouterTests(unittest.TestCase):
             self.assertEqual(corr_id, "corr-123")
             return {"status": "ok", "corr_id": corr_id}
 
-        from api.routers import control as control_module
+        from backend.api.routers import control as control_module
 
         app.dependency_overrides = {
             control_module.get_db: lambda: fake_db,
@@ -488,7 +488,7 @@ class ControlPlaneRouterTests(unittest.TestCase):
             self.assertEqual(broker_account_id, "kite:AB1234")
             return {"generated_at": "x", "totals": {}, "strategies": [], "unattributed": {}}
 
-        from api.routers import control as control_module
+        from backend.api.routers import control as control_module
 
         app.dependency_overrides = {control_module.get_db: lambda: fake_db}
 

@@ -1,8 +1,8 @@
 from datetime import date
 
-from options.market.models import ResolvedOptionContract
-from options.market.repository import OffsetResolutionRequest, resolve_offset_from_repository
-from options.market.selection import resolve_delta_contract, resolve_offset_contract, resolve_offset_strike
+from backend.options.market.models import ResolvedOptionContract
+from backend.options.market.repository import OffsetResolutionRequest, resolve_offset_from_repository
+from backend.options.market.selection import resolve_delta_contract, resolve_offset_contract, resolve_offset_strike
 
 
 def test_resolve_offset_contract_for_call_otm_uses_canonical_atm_direction():

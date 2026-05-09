@@ -20,8 +20,8 @@ if "numba" not in sys.modules:
     numba_stub.njit = _njit
     sys.modules["numba"] = numba_stub
 
-from broker_api.options.options_sessions import OptionsSessionManager
-from options.market.redis_cache import (
+from backend.broker_api.options.options_sessions import OptionsSessionManager
+from backend.options.market.redis_cache import (
     OPTION_SNAPSHOT_SCHEMA_VERSION,
     OPTION_SNAPSHOT_TTL_SECONDS,
     option_snapshot_v1_key,

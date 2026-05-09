@@ -8,7 +8,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from broker_api.orders.worker_execution_links import WorkerExecutionLinksStore
+from backend.broker_api.orders.worker_execution_links import WorkerExecutionLinksStore
 
 
 def _sqlite_store() -> WorkerExecutionLinksStore:

@@ -6,9 +6,9 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
-from execution_accounting.contracts import ExecutionCostContract
-from journaling.models import DecisionActorType, DecisionType, JournalDecisionEvent, JournalSourceLink, SourceType
-from journaling.service import JournalService
+from backend.execution_accounting.contracts import ExecutionCostContract
+from backend.journaling.models import DecisionActorType, DecisionType, JournalDecisionEvent, JournalSourceLink, SourceType
+from backend.journaling.service import JournalService
 from scripts.backfill_journal_v2 import run_backfill
 
 

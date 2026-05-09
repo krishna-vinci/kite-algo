@@ -6,8 +6,8 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from paper_runtime.run_state import PaperRunStateService  # noqa: E402
-from paper_runtime.service import PaperTradingService  # noqa: E402
+from backend.paper_runtime.run_state import PaperRunStateService  # noqa: E402
+from backend.paper_runtime.service import PaperTradingService  # noqa: E402
 from tests.algo_runtime.test_paper_executor import (  # noqa: E402
     FakeInstrumentsRepository,
     FakeMarketRuntime,

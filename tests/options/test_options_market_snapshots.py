@@ -1,6 +1,6 @@
-from options.market.analytics.max_pain import compute_bounded_max_pain
-from options.market.analytics.pcr import compute_put_call_ratio
-from options.market.snapshots import build_bounded_strike_window, build_mini_chain_view
+from backend.options.market.analytics.max_pain import compute_bounded_max_pain
+from backend.options.market.analytics.pcr import compute_put_call_ratio
+from backend.options.market.snapshots import build_bounded_strike_window, build_mini_chain_view
 
 
 def test_build_bounded_strike_window_returns_centered_window_around_atm():

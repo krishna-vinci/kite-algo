@@ -6,8 +6,8 @@ try:
     from redis.asyncio import from_url as redis_from_url
     from sqlalchemy import text
 
-    from broker_api.orders.order_runtime import CanonicalOrderEventRuntime, RealTimePositionsService
-    from broker_api.websocket_manager import write_ticks_to_redis_overlay
+    from backend.broker_api.orders.order_runtime import CanonicalOrderEventRuntime, RealTimePositionsService
+    from backend.broker_api.websocket_manager import write_ticks_to_redis_overlay
     from tests.support.runtime_support import (
         apply_schema,
         create_test_session_factory,
