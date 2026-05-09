@@ -4,8 +4,8 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from algo_runtime.dependencies import DependencyAggregator  # noqa: E402
-from algo_runtime.models import CandleSeriesSpec, DependencySpec, IndicatorSpec, TriggerType  # noqa: E402
+from backend.algo_runtime.dependencies import DependencyAggregator  # noqa: E402
+from backend.algo_runtime.models import CandleSeriesSpec, DependencySpec, IndicatorSpec, TriggerType  # noqa: E402
 
 
 class DependencyAggregatorTests(unittest.TestCase):

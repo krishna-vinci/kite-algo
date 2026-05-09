@@ -18,8 +18,8 @@ def _reload_auth_service(monkeypatch, **env):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    sys.modules.pop("auth_service", None)
-    return importlib.import_module("auth_service")
+    sys.modules.pop("backend.app.auth_service", None)
+    return importlib.import_module("backend.app.auth_service")
 
 
 def test_missing_jwt_secret_raises_outside_explicit_dev_mode(monkeypatch):

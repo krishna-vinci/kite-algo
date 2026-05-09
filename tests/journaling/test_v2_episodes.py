@@ -1,6 +1,6 @@
 import pytest
 
-from journaling.v2.episodes import (
+from backend.journaling.v2.episodes import (
     PositionEffect,
     classify_position_effect,
     next_episode_sequence,

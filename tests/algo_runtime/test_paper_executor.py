@@ -8,8 +8,8 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from paper_runtime.models import PaperOrderStatus  # noqa: E402
-from paper_runtime.service import PaperTradingService  # noqa: E402
+from backend.paper_runtime.models import PaperOrderStatus  # noqa: E402
+from backend.paper_runtime.service import PaperTradingService  # noqa: E402
 
 
 async def _inline_to_thread(func, /, *args, **kwargs):

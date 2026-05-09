@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, Query, Request
+
+from backend.api.routers.worker_protection import (
+    observe_worker_option_protection_timeline_state,
+    validate_worker_run_safety_token,
+)
+from backend.api.routers.worker_shared import (
+    _repo,
+    require_active_worker_run_session,
+    require_worker_token,
+)
+from backend.options.api.execution_router import (
+    create_option_run,
+    enter_option_run,
+    exit_option_run,
+    get_option_run_state,
+    preview_option_run_entry,
+    preview_option_run_exit,
+)
+from backend.options.api.market_router import get_options_session_manager
+from backend.options.api.protection_router import (
+    get_option_run_protection_state,
+    replay_option_run_protection,
+    update_option_run_protection,
+)
+from backend.options.api.strategy_router import preview_option_strategy
+from backend.options.execution import OptionRunCreateRequest
+from backend.options.execution.models import OptionRunActionRequest
+from backend.options.execution.runtime_instance import (
+    OptionExecutionRuntimeInstance,
+    get_option_execution_runtime_instance,
+)
+from backend.options.execution.store import OptionRunStore, get_option_run_store
+from backend.options.market.service import OptionsMarketService
+from backend.options.protection.models import OptionProtectionConfigUpdateRequest, OptionProtectionReplayRequest
+
+router = APIRouter(prefix="/api/algo-workers/worker/options", tags=["Algo Workers"])
+
+
+@router.get("/underlyings/{underlying}/session")
+async def get_worker_option_session(
+    underlying: str,
+    _token=Depends(require_worker_token),
+    manager=Depends(get_options_session_manager),
+):
+    return OptionsMarketService(manager).get_session(underlying)
+
+
+@router.get("/underlyings/{underlying}/expiries")
+async def list_worker_option_expiries(
+    underlying: str,
+    _token=Depends(require_worker_token),
+    manager=Depends(get_options_session_manager),
+):
+    return OptionsMarketService(manager).list_expiries(underlying)
+
+
+@router.get("/underlyings/{underlying}/chain")
+async def get_worker_option_chain(
+    underlying: str,
+    expiry: str | None = None,
+    _token=Depends(require_worker_token),
+    manager=Depends(get_options_session_manager),
+):
+    return OptionsMarketService(manager).get_chain(underlying, expiry)
+
+
+@router.get("/underlyings/{underlying}/mini-chain")
+async def get_worker_option_mini_chain(
+    underlying: str,
+    expiry: str | None = None,
+    window: int = Query(default=5, ge=1, le=20),
+    _token=Depends(require_worker_token),
+    manager=Depends(get_options_session_manager),
+):
+    return OptionsMarketService(manager).get_mini_chain(underlying, expiry, window)
+
+
+@router.get("/underlyings/{underlying}/greeks")
+async def get_worker_option_greeks(
+    underlying: str,
+    expiry: str | None = None,
+    _token=Depends(require_worker_token),
+    manager=Depends(get_options_session_manager),
+):
+    return OptionsMarketService(manager).get_greeks(underlying, expiry)
+
+
+@router.post("/underlyings/{underlying}/selection/resolve")
+async def resolve_worker_option_selection(
+    underlying: str,
+    payload: dict,
+    _token=Depends(require_worker_token),
+    manager=Depends(get_options_session_manager),
+):
+    return OptionsMarketService(manager).resolve_selection(underlying, payload)
+
+
+@router.get("/underlyings/{underlying}/analytics/pcr")
+async def get_worker_option_pcr(
+    underlying: str,
+    expiry: str | None = None,
+    _token=Depends(require_worker_token),
+    manager=Depends(get_options_session_manager),
+):
+    return OptionsMarketService(manager).get_pcr(underlying, expiry)
+
+
+@router.get("/underlyings/{underlying}/analytics/max-pain")
+async def get_worker_option_max_pain(
+    underlying: str,
+    expiry: str | None = None,
+    _token=Depends(require_worker_token),
+    manager=Depends(get_options_session_manager),
+):
+    return OptionsMarketService(manager).get_max_pain(underlying, expiry)
+
+
+@router.post("/strategies/preview")
+async def preview_worker_option_strategy(
+    payload: dict,
+    _token=Depends(require_worker_token),
+):
+    return await preview_option_strategy(payload)
+
+
+@router.post("/runs")
+async def create_worker_option_run(
+    payload: OptionRunCreateRequest,
+    _token=Depends(require_worker_token),
+    store: OptionRunStore = Depends(get_option_run_store),
+):
+    return await create_option_run(payload, store)
+
+
+@router.post("/runs/{strategy_run_id}/preview-entry")
+async def preview_worker_option_run_entry(
+    strategy_run_id: str,
+    request: Request,
+    payload: dict | None = None,
+    _token=Depends(require_worker_token),
+    store: OptionRunStore = Depends(get_option_run_store),
+):
+    return await preview_option_run_entry(strategy_run_id, request, payload, store)
+
+
+@router.post("/runs/{strategy_run_id}/enter")
+async def enter_worker_option_run(
+    strategy_run_id: str,
+    request: Request,
+    payload: OptionRunActionRequest | None = None,
+    _token=Depends(require_worker_token),
+    store: OptionRunStore = Depends(get_option_run_store),
+    runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
+):
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is not None:
+        await require_active_worker_run_session(request, run)
+    action_payload = payload or OptionRunActionRequest()
+    if action_payload.safety_token:
+        await validate_worker_run_safety_token(request, strategy_run_id, action_payload.safety_token)
+    return await enter_option_run(
+        strategy_run_id,
+        request,
+        action_payload.model_dump(exclude_none=True),
+        store,
+        runtime,
+    )
+
+
+@router.post("/runs/{strategy_run_id}/preview-exit")
+async def preview_worker_option_run_exit(
+    strategy_run_id: str,
+    request: Request,
+    payload: dict | None = None,
+    _token=Depends(require_worker_token),
+    store: OptionRunStore = Depends(get_option_run_store),
+):
+    return await preview_option_run_exit(strategy_run_id, request, payload, store)
+
+
+@router.post("/runs/{strategy_run_id}/exit")
+async def exit_worker_option_run(
+    strategy_run_id: str,
+    request: Request,
+    payload: OptionRunActionRequest | None = None,
+    _token=Depends(require_worker_token),
+    store: OptionRunStore = Depends(get_option_run_store),
+    runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
+):
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is not None:
+        await require_active_worker_run_session(request, run)
+    action_payload = payload or OptionRunActionRequest()
+    if action_payload.safety_token:
+        await validate_worker_run_safety_token(request, strategy_run_id, action_payload.safety_token)
+    return await exit_option_run(
+        strategy_run_id,
+        action_payload.model_dump(exclude_none=True),
+        store,
+        runtime,
+    )
+
+
+@router.get("/runs/{strategy_run_id}/state")
+async def get_worker_option_run_state(
+    strategy_run_id: str,
+    _token=Depends(require_worker_token),
+    store: OptionRunStore = Depends(get_option_run_store),
+):
+    return await get_option_run_state(strategy_run_id, store)
+
+
+@router.put("/runs/{strategy_run_id}/protection")
+async def update_worker_option_run_protection(
+    strategy_run_id: str,
+    request: Request,
+    payload: OptionProtectionConfigUpdateRequest,
+    _token=Depends(require_worker_token),
+    store: OptionRunStore = Depends(get_option_run_store),
+):
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is not None:
+        await require_active_worker_run_session(request, run)
+    return await update_option_run_protection(strategy_run_id, payload, store)
+
+
+@router.get("/runs/{strategy_run_id}/protection/state")
+async def get_worker_option_run_protection_state(
+    strategy_run_id: str,
+    request: Request,
+    _token=Depends(require_worker_token),
+    store: OptionRunStore = Depends(get_option_run_store),
+):
+    state = await get_option_run_protection_state(strategy_run_id, store)
+    worker_run = await _repo(request).get_run(strategy_run_id)
+    if worker_run is not None:
+        _snapshot, _events = await observe_worker_option_protection_timeline_state(
+            request,
+            strategy_run_id,
+            worker_run=worker_run,
+        )
+    return state
+
+
+@router.post("/runs/{strategy_run_id}/protection/replay")
+async def replay_worker_option_run_protection(
+    strategy_run_id: str,
+    payload: OptionProtectionReplayRequest,
+    _token=Depends(require_worker_token),
+    store: OptionRunStore = Depends(get_option_run_store),
+):
+    return await replay_option_run_protection(strategy_run_id, payload, store)

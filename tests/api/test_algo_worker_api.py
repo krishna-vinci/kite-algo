@@ -18,15 +18,15 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.routers.worker_auth import *  # noqa: E402,F403
-from api.routers.worker_market import *  # noqa: E402,F403
-from api.routers.worker_execution import *  # noqa: E402,F403
-from api.routers.worker_protection import *  # noqa: E402,F403
-from api.routers.worker_shared import DEFAULT_WORKER_ACTIONS  # noqa: E402
-from api.services.market_data import WorkerInstrumentResolveRequest, WorkerMarketSnapshotRequest, WorkerQuoteRequest  # noqa: E402
-from api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository, WorkerToken  # noqa: E402
-from shared.serialization import _hash_token  # noqa: E402
-from api.services.market_data import WorkerMarketDataService  # noqa: E402
+from backend.api.routers.worker_auth import *  # noqa: E402,F403
+from backend.api.routers.worker_market import *  # noqa: E402,F403
+from backend.api.routers.worker_execution import *  # noqa: E402,F403
+from backend.api.routers.worker_protection import *  # noqa: E402,F403
+from backend.api.routers.worker_shared import DEFAULT_WORKER_ACTIONS  # noqa: E402
+from backend.api.services.market_data import WorkerInstrumentResolveRequest, WorkerMarketSnapshotRequest, WorkerQuoteRequest  # noqa: E402
+from backend.api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository, WorkerToken  # noqa: E402
+from backend.shared.serialization import _hash_token  # noqa: E402
+from backend.api.services.market_data import WorkerMarketDataService  # noqa: E402
 from sqlalchemy import create_engine, event, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402

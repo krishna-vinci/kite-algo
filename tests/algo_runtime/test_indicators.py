@@ -4,8 +4,8 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from algo_runtime.indicators import BuiltInIndicatorReader, compute_ema_series  # noqa: E402
-from algo_runtime.models import IndicatorSpec  # noqa: E402
+from backend.algo_runtime.indicators import BuiltInIndicatorReader, compute_ema_series  # noqa: E402
+from backend.algo_runtime.models import IndicatorSpec  # noqa: E402
 
 
 class IndicatorReaderTests(unittest.IsolatedAsyncioTestCase):

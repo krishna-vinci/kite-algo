@@ -6,8 +6,8 @@ from typing import cast
 
 import pytest
 
-from journaling.analytics_service import AnalyticsService
-from journaling.models import (
+from backend.journaling.analytics_service import AnalyticsService
+from backend.journaling.models import (
     CapitalBasisType,
     ExecutionMode,
     JournalEnvironmentMode,
@@ -24,7 +24,7 @@ from journaling.models import (
     SourceType,
     StrategyFamily,
 )
-from journaling.repository import JournalRepository
+from backend.journaling.repository import JournalRepository
 
 
 def _dt(value: str) -> datetime:

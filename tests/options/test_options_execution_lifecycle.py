@@ -1,6 +1,6 @@
 import pytest
 
-from options.execution.lifecycle import (
+from backend.options.execution.lifecycle import (
     mark_closed,
     mark_entered,
     mark_entering,
@@ -11,7 +11,7 @@ from options.execution.lifecycle import (
     mark_partial_exit,
     transition_to,
 )
-from options.execution.models import OptionRunState, OptionRunStatus
+from backend.options.execution.models import OptionRunState, OptionRunStatus
 
 
 def test_mark_partial_entry_sets_cleanup_required_when_some_legs_fail():

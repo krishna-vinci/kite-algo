@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
+COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Stage 2: Runtime ──────────────────────────────────────────
@@ -32,19 +32,8 @@ COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code
-COPY algo_runtime ./algo_runtime
-COPY api ./api
-COPY app ./app
-COPY alembic ./alembic
-COPY broker_api ./broker_api
-COPY execution_accounting ./execution_accounting
-COPY journaling ./journaling
-COPY options ./options
-COPY paper_runtime ./paper_runtime
-COPY sdk ./sdk
-COPY shared ./shared
-COPY alembic.ini main.py schema.sql ./
+COPY backend/ /app/backend/
 
 EXPOSE 8777
 
-CMD ["sh", "-c", "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8777"]
+CMD ["sh", "-c", "alembic -c /app/backend/alembic.ini upgrade head && uvicorn backend.main:app --host 0.0.0.0 --port 8777"]

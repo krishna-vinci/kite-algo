@@ -24,10 +24,10 @@ jobs:
         run: python -m pip install --upgrade pip build twine pytest
 
       - name: Install SDK test dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r backend/requirements.txt
 
       - name: Run focused SDK tests
-        run: python -m pytest tests/test_worker_sdk.py tests/test_worker_sdk_async.py tests/test_worker_sdk_ws.py tests/test_worker_sdk_options.py tests/test_worker_sdk_options_market.py -q
+        run: python -m pytest tests/sdk/test_worker_sdk.py tests/sdk/test_worker_sdk_async.py tests/sdk/test_worker_sdk_ws.py tests/sdk/test_worker_sdk_options.py tests/sdk/test_worker_sdk_options_market.py -q
 
       - name: Verify tag matches SDK version
         if: startsWith(github.ref, 'refs/tags/')

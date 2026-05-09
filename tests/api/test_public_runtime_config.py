@@ -7,8 +7,8 @@ def _reload_runtime_public_config(monkeypatch, **env):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    sys.modules.pop("runtime_public_config", None)
-    return importlib.import_module("runtime_public_config")
+    sys.modules.pop("backend.app.runtime_public_config", None)
+    return importlib.import_module("backend.app.runtime_public_config")
 
 
 def test_default_allowed_origins_are_generic_local_hosts(monkeypatch):

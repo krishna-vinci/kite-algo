@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from journaling.v2.identity import (
+from backend.journaling.v2.identity import (
     is_low_confidence_resolution,
     normalize_identity_key,
     resolve_strategy_identity,

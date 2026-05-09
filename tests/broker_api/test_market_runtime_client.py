@@ -4,7 +4,7 @@ from importlib.util import find_spec
 
 
 if find_spec("redis") is not None:
-    from broker_api.orders.market_runtime_client import MarketDataRuntime
+    from backend.broker_api.orders.market_runtime_client import MarketDataRuntime
 else:
     MarketDataRuntime = None
 

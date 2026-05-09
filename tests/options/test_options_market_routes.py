@@ -5,7 +5,7 @@ from datetime import date
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from options.api.market_router import get_options_session_manager, router as market_router
+from backend.options.api.market_router import get_options_session_manager, router as market_router
 
 
 class _FakeInstrumentRepo:

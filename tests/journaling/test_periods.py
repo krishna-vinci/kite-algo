@@ -2,7 +2,7 @@ from datetime import date
 
 import pytest
 
-from journaling.periods import day_bounds_utc, period_bounds_utc
+from backend.journaling.periods import day_bounds_utc, period_bounds_utc
 
 
 def test_day_bounds_use_ist_calendar_and_return_utc() -> None:

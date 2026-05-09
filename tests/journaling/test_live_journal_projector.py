@@ -6,7 +6,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from journaling.live_projector import LiveJournalProjector
+from backend.journaling.live_projector import LiveJournalProjector
 
 
 class LiveJournalProjectorTests(unittest.TestCase):

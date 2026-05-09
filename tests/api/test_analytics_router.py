@@ -7,7 +7,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from api.routers import analytics as analytics_router  # noqa: E402
+from backend.api.routers import analytics as analytics_router  # noqa: E402
 
 
 class _FakeAnalyticsService:

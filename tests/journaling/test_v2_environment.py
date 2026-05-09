@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 
 
-SCHEMA_SQL = Path("schema.sql").read_text()
+SCHEMA_SQL = Path("backend/schema.sql").read_text()
 
 
 def _assert_has(pattern: str) -> None:

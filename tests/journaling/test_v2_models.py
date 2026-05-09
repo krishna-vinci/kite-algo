@@ -3,7 +3,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from journaling.models import (
+from backend.journaling.models import (
     CostBreakdown,
     JournalEpisode,
     JournalEpisodeStatus,

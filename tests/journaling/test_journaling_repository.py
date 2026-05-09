@@ -1,7 +1,7 @@
 import unittest
 
-from journaling.models import ProjectionState
-from journaling.repository import JournalRepository
+from backend.journaling.models import ProjectionState
+from backend.journaling.repository import JournalRepository
 
 
 class _FakeResult:

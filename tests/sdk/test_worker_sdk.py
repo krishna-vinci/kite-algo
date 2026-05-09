@@ -62,7 +62,7 @@ from kite_algo_worker import (  # noqa: E402
     warmup_history,
 )
 import kite_algo_worker as kite_algo_worker_pkg  # noqa: E402
-from broker_api.orders import PlaceOrderRequest  # noqa: E402
+from backend.broker_api.orders import PlaceOrderRequest  # noqa: E402
 from scripts.sdk_worker_certification import main as sdk_worker_certification_main  # noqa: E402
 
 

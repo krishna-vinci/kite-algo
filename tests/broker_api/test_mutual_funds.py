@@ -7,7 +7,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from broker_api.mutual_funds.kite_mutual_funds import PlaceMFOrderRequest, mf_service
+from backend.broker_api.mutual_funds.kite_mutual_funds import PlaceMFOrderRequest, mf_service
 
 
 class FakeMutualFundKite:

@@ -5,7 +5,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs(stub_kite_orders=False)
 
-from broker_api.orders import (
+from backend.broker_api.orders import (
     ConvertPositionRequest,
     Exchange,
     OrdersService,

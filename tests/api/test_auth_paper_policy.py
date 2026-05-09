@@ -19,8 +19,8 @@ if "broker_api.broker_api" not in sys.modules:
     broker_api_stub.get_margins = lambda *args, **kwargs: {"ok": True}
     sys.modules["broker_api.broker_api"] = broker_api_stub
 
-from algo_runtime.models import AlgoInstance, AlgoLifecycleState, DependencySpec, ExecutionMode  # noqa: E402
-from api.routers.auth import (  # noqa: E402
+from backend.algo_runtime.models import AlgoInstance, AlgoLifecycleState, DependencySpec, ExecutionMode  # noqa: E402
+from backend.api.routers.auth import (  # noqa: E402
     PaperAccountResetRequest,
     PaperAccountUpsertRequest,
     PaperStrategyExitRequest,

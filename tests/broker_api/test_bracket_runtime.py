@@ -8,7 +8,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from broker_api.orders.bracket_runtime import BracketRuntimeStore
+from backend.broker_api.orders.bracket_runtime import BracketRuntimeStore
 
 
 def _sqlite_store() -> tuple[BracketRuntimeStore, sessionmaker]:

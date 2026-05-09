@@ -8,11 +8,11 @@ from unittest.mock import AsyncMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from options.api.execution_router import router as execution_router
-from options.execution.store import OptionRunStore, get_option_run_store
-from execution_accounting.contracts import ChargesStatus, ExecutionCostContract
+from backend.options.api.execution_router import router as execution_router
+from backend.options.execution.store import OptionRunStore, get_option_run_store
+from backend.execution_accounting.contracts import ChargesStatus, ExecutionCostContract
 
-execution_router_module = importlib.import_module("options.api.execution_router")
+execution_router_module = importlib.import_module("backend.options.api.execution_router")
 
 
 def _client() -> tuple[TestClient, OptionRunStore]:

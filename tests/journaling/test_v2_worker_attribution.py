@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from algo_runtime.execution_attribution import build_execution_attribution
-from journaling.service import JournalService
+from backend.algo_runtime.execution_attribution import build_execution_attribution
+from backend.journaling.service import JournalService
 
 
 class _FakeJournalV2Repository:

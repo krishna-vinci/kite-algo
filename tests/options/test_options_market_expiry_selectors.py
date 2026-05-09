@@ -2,7 +2,7 @@ from datetime import date
 
 import pytest
 
-from options.market.expiry_selectors import ExpirySelectorError, resolve_expiry_selector
+from backend.options.market.expiry_selectors import ExpirySelectorError, resolve_expiry_selector
 
 
 def test_resolve_explicit_expiry_from_string():

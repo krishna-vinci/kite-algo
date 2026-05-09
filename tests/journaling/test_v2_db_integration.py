@@ -10,9 +10,9 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
-from journaling.models import CapitalBasisType, ExecutionMode, JournalExecutionFact, JournalRun, SourceType, StrategyFamily
-from journaling.repository import JournalRepository
-from journaling.service import JournalService
+from backend.journaling.models import CapitalBasisType, ExecutionMode, JournalExecutionFact, JournalRun, SourceType, StrategyFamily
+from backend.journaling.repository import JournalRepository
+from backend.journaling.service import JournalService
 
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
@@ -32,7 +32,7 @@ def _db_ready() -> bool:
 
 
 def _apply_schema_twice() -> None:
-    schema_sql = (REPO_ROOT / "schema.sql").read_text()
+    schema_sql = (REPO_ROOT / "backend/schema.sql").read_text()
     for _ in range(2):
         with psycopg2.connect(TEST_DATABASE_URL) as conn:
             with conn.cursor() as cur:

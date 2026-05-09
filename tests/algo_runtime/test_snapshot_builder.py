@@ -4,7 +4,7 @@ from tests.support.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from algo_runtime.models import (  # noqa: E402
+from backend.algo_runtime.models import (  # noqa: E402
     AlgoInstance,
     CandleSeriesSpec,
     DependencySpec,
@@ -15,7 +15,7 @@ from algo_runtime.models import (  # noqa: E402
     PositionFilter,
     TriggerEvent,
 )
-from algo_runtime.snapshot_builder import DependencyFilteredSnapshotBuilder, OptionsSnapshotReader, OrderProjectionReader  # noqa: E402
+from backend.algo_runtime.snapshot_builder import DependencyFilteredSnapshotBuilder, OptionsSnapshotReader, OrderProjectionReader  # noqa: E402
 
 
 class FakeMarketReader:

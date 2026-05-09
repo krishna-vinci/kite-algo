@@ -7,13 +7,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-from shared.serialization import _hash_token
-from app.auth import ACCESS_COOKIE_NAME, AppUser, auth_exempt_path, create_access_token, get_optional_app_user
-from options.api.execution_router import router as execution_router
-from options.api.market_router import get_options_session_manager, router as market_router
-from options.api.protection_router import router as protection_router
-from options.api.worker_options_router import router as worker_options_router
-from options.execution.store import OptionRunStore, get_option_run_store
+from backend.shared.serialization import _hash_token
+from backend.app.auth import ACCESS_COOKIE_NAME, AppUser, auth_exempt_path, create_access_token, get_optional_app_user
+from backend.options.api.execution_router import router as execution_router
+from backend.options.api.market_router import get_options_session_manager, router as market_router
+from backend.options.api.protection_router import router as protection_router
+from backend.options.api.worker_options_router import router as worker_options_router
+from backend.options.execution.store import OptionRunStore, get_option_run_store
 
 
 class _FakeInstrumentRepo:
