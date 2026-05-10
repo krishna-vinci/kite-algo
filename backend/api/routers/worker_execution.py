@@ -956,3 +956,21 @@ async def exit_worker_run(request: Request, strategy_run_id: str, payload: Worke
         return {"mode": "paper", "status": "closed", "result": result, "run": updated}
     updated = await _repo(request).update_run_status(strategy_run_id, str(run.get("status") or "open"), state_patch={"exit_result": result, "exit_reason": payload.reason})
     return {"mode": "paper", "status": result_status, "result": result, "run": updated}
+
+
+router.add_api_route("/worker/orders", list_worker_orders, methods=["GET"])
+router.add_api_route("/worker/trades", list_worker_trades, methods=["GET"])
+router.add_api_route("/worker/orders/{order_id}", get_worker_order, methods=["GET"])
+router.add_api_route("/worker/orders/{order_id}/history", get_worker_order_history, methods=["GET"])
+router.add_api_route("/worker/orders/{order_id}/cancel", cancel_worker_order, methods=["POST"])
+router.add_api_route("/worker/orders/{order_id}/modify", modify_worker_order, methods=["POST"])
+router.add_api_route("/worker/runs/{strategy_run_id}/preview/order", preview_worker_order, methods=["POST"])
+router.add_api_route("/worker/runs/{strategy_run_id}/preview/basket", preview_worker_basket, methods=["POST"])
+router.add_api_route("/worker/runs/{strategy_run_id}/brackets", create_worker_bracket, methods=["POST"])
+router.add_api_route("/worker/runs/{strategy_run_id}/brackets", list_worker_brackets, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}", get_worker_bracket, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}/cancel", cancel_worker_bracket, methods=["POST"])
+router.add_api_route("/worker/runs/{strategy_run_id}/intents", submit_worker_intent, methods=["POST"])
+router.add_api_route("/worker/runs/{strategy_run_id}/baskets", list_worker_baskets, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/baskets/{basket_execution_id}", get_worker_basket, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/exit", exit_worker_run, methods=["POST"])
