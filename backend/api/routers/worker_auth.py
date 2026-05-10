@@ -232,3 +232,15 @@ async def get_worker_run(request: Request, strategy_run_id: str):
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     return _enrich_run_health_fields(run)
+
+
+router.add_api_route("/tokens", create_worker_token, methods=["POST"], response_model=WorkerTokenCreateResponse)
+router.add_api_route("/tokens", list_worker_tokens, methods=["GET"], response_model=list[WorkerTokenView])
+router.add_api_route("/tokens/{token_id}/revoke", revoke_worker_token, methods=["POST"], response_model=WorkerTokenView)
+router.add_api_route("/worker/health", worker_health, methods=["GET"])
+router.add_api_route("/worker/heartbeat", worker_heartbeat, methods=["POST"])
+router.add_api_route("/worker/runs/{strategy_run_id}/claim-session", claim_worker_run_session, methods=["POST"])
+router.add_api_route("/worker/runs/{strategy_run_id}/claim-session", release_worker_run_session, methods=["DELETE"])
+router.add_api_route("/worker/runs/{strategy_run_id}/heartbeat", heartbeat_worker_run_session, methods=["POST"])
+router.add_api_route("/worker/runs", create_worker_run, methods=["POST"])
+router.add_api_route("/worker/runs/{strategy_run_id}", get_worker_run, methods=["GET"])

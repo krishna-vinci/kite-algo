@@ -213,3 +213,21 @@ async def delete_worker_gtt_trigger(request: Request, trigger_id: int):
         return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
     except Exception as exc:
         raise _normalize_worker_gtt_error(exc) from exc
+
+
+router.add_api_route("/worker/market/instruments/resolve", resolve_worker_market_ticker, methods=["GET"])
+router.add_api_route("/worker/market/instruments/search", search_worker_market_tickers, methods=["GET"])
+router.add_api_route("/worker/market/instruments/resolve", resolve_worker_market_tickers, methods=["POST"])
+router.add_api_route("/worker/market/quotes", get_worker_market_quotes, methods=["POST"])
+router.add_api_route("/worker/market/ticks/stream", stream_worker_market_ticks, methods=["GET"])
+router.add_api_route("/worker/market/candles", get_worker_market_candles, methods=["GET"])
+router.add_api_route("/worker/market/history", get_worker_market_history, methods=["GET"])
+router.add_api_route("/worker/market/candles/stream", stream_worker_market_candles, methods=["GET"])
+router.add_api_route("/worker/market/snapshot", get_worker_market_snapshot, methods=["POST"])
+router.add_api_route("/worker/funds", get_worker_funds, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/funds", get_worker_run_funds, methods=["GET"])
+router.add_api_route("/worker/gtt/triggers", create_worker_gtt_trigger, methods=["POST"])
+router.add_api_route("/worker/gtt/triggers", list_worker_gtts, methods=["GET"])
+router.add_api_route("/worker/gtt/triggers/{trigger_id}", get_worker_gtt, methods=["GET"])
+router.add_api_route("/worker/gtt/triggers/{trigger_id}", modify_worker_gtt_trigger, methods=["PUT"])
+router.add_api_route("/worker/gtt/triggers/{trigger_id}", delete_worker_gtt_trigger, methods=["DELETE"])

@@ -1472,3 +1472,19 @@ async def worker_run_pnl_ws(websocket: WebSocket, strategy_run_id: str):
     await websocket.accept()
     async for event, payload in _worker_run_pnl_stream_ws(websocket, run, interval_seconds=interval_seconds):
         await websocket.send_json({"event": event, "data": payload})
+
+
+router.add_api_route("/worker/runs/{strategy_run_id}/safety-check", get_worker_run_safety_check, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/pnl", get_worker_run_pnl, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/pnl/stream", stream_worker_run_pnl, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/risk", patch_worker_run_risk, methods=["PATCH"])
+router.add_api_route("/worker/runs/{strategy_run_id}/protection", patch_worker_run_protection, methods=["PATCH"])
+router.add_api_route("/worker/runs/{strategy_run_id}/execution-events", list_worker_execution_events, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/execution-events/stream", stream_worker_execution_events, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/timeline", list_worker_timeline, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/timeline/stream", stream_worker_timeline, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/decision-events", create_worker_decision_event, methods=["POST"])
+
+router.add_api_websocket_route("/worker/ws/market/ticks", worker_ticks_ws)
+router.add_api_websocket_route("/worker/ws/market/candles", worker_candles_ws)
+router.add_api_websocket_route("/worker/ws/runs/{strategy_run_id}/pnl", worker_run_pnl_ws)
