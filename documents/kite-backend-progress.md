@@ -42,7 +42,7 @@ Do not use this file for frontend work.
   - paper runs load strategy-scoped positions from `paper_runtime_service.get_strategy_run_pnl(...)`; dry-run returns an explicit empty list; live runs return persisted live attribution positions
   - focused verification: `.venv/bin/python -m pytest tests/api/test_algo_worker_api.py -k "get_run_includes and positions or create_run_database_failure or worker_can_create_paper_run" -v` → `4 passed`; `py_compile` for `backend/api/routers/worker_auth.py` passed
 
-- Bumped the Python worker SDK package/docs version from `0.7.0` to `0.7.3` for PyPI publishing of the historical-candle helper and worker-run reconciliation fixes; `scripts/check_worker_sdk_version_refs.py` passes with `0.7.3`. The `0.7.1`/`0.7.2` tags exposed CI packaging/env issues before PyPI publish, so `0.7.3` carries the release plus workflow fixes that install `sdk/python` before focused SDK tests and set a Postgres-style `DATABASE_URL` during CI collection.
+- Bumped the Python worker SDK package/docs version from `0.7.0` to `0.7.4` for PyPI publishing of the historical-candle helper and worker-run reconciliation fixes; `scripts/check_worker_sdk_version_refs.py` passes with `0.7.4`. The `0.7.1`/`0.7.2`/`0.7.3` tags exposed CI packaging/env/test-root issues before PyPI publish, so `0.7.4` carries the release plus workflow fixes that install `sdk/python` before focused SDK tests, set a Postgres-style `DATABASE_URL` during CI collection, and correct SDK test root discovery.
 
 - Implemented Spec 10 worker product completion and helper polish:
   - added worker-token-authenticated, account-scoped GTT passthrough routes:
