@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
 import requests
@@ -28,6 +29,40 @@ from .protection import BackendProtection
 
 
 JsonDict = Dict[str, Any]
+
+
+def _coerce_datetime(value: str | datetime) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _build_historical_date_params(
+    *,
+    from_date: Optional[str | datetime] = None,
+    to_date: Optional[str | datetime] = None,
+    lookback_days: Optional[int] = None,
+) -> JsonDict:
+    if lookback_days is not None and lookback_days <= 0:
+        raise ValueError("lookback_days must be positive")
+    if from_date is not None and lookback_days is not None:
+        raise ValueError("from_date and lookback_days are mutually exclusive")
+
+    params: JsonDict = {}
+    if to_date is not None:
+        params["to"] = to_date.isoformat() if isinstance(to_date, datetime) else to_date
+    elif lookback_days is not None:
+        params["to"] = datetime.now(timezone.utc).isoformat()
+
+    if from_date is not None:
+        params["from"] = from_date.isoformat() if isinstance(from_date, datetime) else from_date
+    elif lookback_days is not None:
+        to_dt = _coerce_datetime(params["to"])
+        if to_dt.tzinfo is None:
+            raise ValueError("to_date must include timezone information when lookback_days is used")
+        params["from"] = (to_dt - timedelta(days=int(lookback_days))).isoformat()
+
+    return params
 
 
 @dataclass(frozen=True)
@@ -357,6 +392,12 @@ class KiteAlgoWorkerClient:
         )
 
     def get_candles(self, instrument: str | int, interval: str = "5minute", lookback: int = 50) -> JsonDict:
+        """Return recent live/cache candles.
+
+        This reads the worker live candle cache (`/worker/market/candles`). For
+        full historical ranges, daily warmups, or broker passthrough history use
+        :meth:`get_historical_candles` instead.
+        """
         params: JsonDict = {"interval": interval, "lookback": lookback}
         instrument_value = str(instrument).strip()
         if isinstance(instrument, int) or instrument_value.isdigit():
@@ -375,8 +416,9 @@ class KiteAlgoWorkerClient:
         self,
         instrument: str | int,
         timeframe: str = "day",
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
+        from_date: Optional[str | datetime] = None,
+        to_date: Optional[str | datetime] = None,
+        lookback_days: Optional[int] = None,
         ingest: bool = True,
         passthrough: bool = False,
     ) -> WorkerHistoricalCandles:
@@ -386,6 +428,7 @@ class KiteAlgoWorkerClient:
                 timeframe=timeframe,
                 from_date=from_date,
                 to_date=to_date,
+                lookback_days=lookback_days,
                 ingest=ingest,
                 passthrough=passthrough,
             )
@@ -395,21 +438,25 @@ class KiteAlgoWorkerClient:
         self,
         instrument: str | int,
         timeframe: str = "day",
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
+        from_date: Optional[str | datetime] = None,
+        to_date: Optional[str | datetime] = None,
+        lookback_days: Optional[int] = None,
         ingest: bool = True,
         passthrough: bool = False,
     ) -> JsonDict:
+        """Return historical candles via `/worker/market/history`.
+
+        Use this for daily history and warmup/backtest windows. `get_candles()`
+        intentionally remains a recent live/cache surface and may be empty for
+        `interval="day"` when no live daily candle cache is present.
+        """
         params: JsonDict = {"timeframe": timeframe, "ingest": ingest, "passthrough": passthrough}
         instrument_value = str(instrument).strip()
         if isinstance(instrument, int) or instrument_value.isdigit():
             params["instrument_token"] = int(instrument_value)
         else:
             params["symbol"] = instrument_value
-        if from_date is not None:
-            params["from"] = from_date
-        if to_date is not None:
-            params["to"] = to_date
+        params.update(_build_historical_date_params(from_date=from_date, to_date=to_date, lookback_days=lookback_days))
         return self._request("GET", "/worker/market/history", params=params)
 
     def stream_candles(self, instrument: str | int, interval: str = "5minute") -> Iterator[JsonDict]:

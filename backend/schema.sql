@@ -791,6 +791,21 @@ CREATE TABLE IF NOT EXISTS public.algo_worker_runs (
 );
 
 ALTER TABLE public.algo_worker_runs
+  ADD COLUMN IF NOT EXISTS summary_fields_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+ALTER TABLE public.algo_worker_runs
+  ADD COLUMN IF NOT EXISTS risk_schema_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+ALTER TABLE public.algo_worker_runs
+  ADD COLUMN IF NOT EXISTS allowed_actions_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+ALTER TABLE public.algo_worker_runs
+  ADD COLUMN IF NOT EXISTS runtime_state_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE public.algo_worker_runs
+  ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE public.algo_worker_runs
   ADD COLUMN IF NOT EXISTS worker_session_nonce TEXT;
 
 ALTER TABLE public.algo_worker_runs

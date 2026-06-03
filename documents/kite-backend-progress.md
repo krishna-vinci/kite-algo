@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-05-08
+Last updated: 2026-06-03
 
 ## Scope
 
@@ -24,6 +24,25 @@ Do not use this file for frontend work.
 - Added backend mutual fund router in `broker_api/kite_mutual_funds.py`
 
 ## Newly implemented in current branch
+
+- Clarified and hardened worker historical candle access in the SDK/API:
+  - kept `get_candles(...)` as the recent live/cache candle surface and documented that daily historical warmups should use `get_historical_candles(...)`
+  - added SDK `lookback_days` convenience for sync/async `get_historical_candles(...)` / typed snapshot helpers so workers can request daily history without manual date math
+  - accepted both `from`/`to` and `from_date`/`to_date` query aliases on `/api/algo-workers/worker/market/history`
+  - added focused SDK/API regression coverage and verified with `.venv/bin/python -m pytest` focused sync SDK, async SDK, and API history tests
+
+- Fixed worker run creation regression uncovered by end-to-end SDK dry-run setup:
+  - `create_worker_run(...)` now explicitly imports `parse_account_scope` and owns its logger instead of relying on `worker_shared.__all__`; this prevents `POST /api/algo-workers/worker/runs` from crashing before persistence
+  - repository `IntegrityError` on duplicate `strategy_run_id` is mapped to worker-safe 409, and SQLAlchemy persistence failures are mapped to worker-safe 503 with structured logging instead of raw 500 / disconnect
+  - `schema.sql` now backfills existing `algo_worker_runs` JSON columns (`summary_fields_json`, `risk_schema_json`, `allowed_actions_json`, `runtime_state_json`, `metadata_json`) for older databases where `CREATE TABLE IF NOT EXISTS` skipped newer columns
+  - focused verification: `.venv/bin/python -m pytest tests/api/test_algo_worker_api.py -k "create_run_database_failure or worker_can_create_paper_run or paper_run_rejects_live_account_scope or worker_market_history" -v` → `9 passed`; `.venv/bin/python -m pytest tests/sdk/test_worker_sdk.py -k "historical_candles or create_run" -v` → `9 passed`; `py_compile` for `backend/api/routers/worker_auth.py` passed
+
+- Added worker run backend-position payload for SDK reconciliation:
+  - `GET /api/algo-workers/worker/runs/{strategy_run_id}` now always includes `positions`, `backend_positions`, `backend_positions_status`, and `backend_positions_source`
+  - paper runs load strategy-scoped positions from `paper_runtime_service.get_strategy_run_pnl(...)`; dry-run returns an explicit empty list; live runs return persisted live attribution positions
+  - focused verification: `.venv/bin/python -m pytest tests/api/test_algo_worker_api.py -k "get_run_includes and positions or create_run_database_failure or worker_can_create_paper_run" -v` → `4 passed`; `py_compile` for `backend/api/routers/worker_auth.py` passed
+
+- Bumped the Python worker SDK package/docs version from `0.7.0` to `0.7.1` for PyPI publishing of the historical-candle helper and worker-run reconciliation fixes; `scripts/check_worker_sdk_version_refs.py` passes with `0.7.1`.
 
 - Implemented Spec 10 worker product completion and helper polish:
   - added worker-token-authenticated, account-scoped GTT passthrough routes:

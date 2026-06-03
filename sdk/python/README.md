@@ -7,14 +7,14 @@ Kite Algo is a self-hosted algorithmic trading platform for Zerodha/Kite workflo
 ## Package status and install
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.0
+python3 -m pip install kite-algo-worker==0.7.1
 ```
 
 Extras:
 
 ```bash
-python3 -m pip install "kite-algo-worker[dataframe]==0.7.0"
-python3 -m pip install "kite-algo-worker[indicators]==0.7.0"
+python3 -m pip install "kite-algo-worker[dataframe]==0.7.1"
+python3 -m pip install "kite-algo-worker[indicators]==0.7.1"
 ```
 
 - base SDK: HTTP/WebSocket clients, typed models, order helpers
@@ -323,6 +323,11 @@ print(quotes["quotes"]["NSE:INFY"]["last_price"])
 
 ### get_candles(...)
 
+Reads the worker's recent live/cache candle surface. It is not the full
+historical-data API; daily warmups such as `interval="day", lookback=366` may be
+empty/stale when no live daily cache exists. Use `get_historical_candles(...)`
+for historical daily/intraday ranges.
+
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `symbol_or_token` | `str\|int` | yes | Instrument symbol or token |
@@ -345,6 +350,7 @@ for c in candles["candles"]:
 | `timeframe` | `str` | no | `"day"`, `"5minute"`, etc. |
 | `from_date` | `str` | no | ISO 8601 start |
 | `to_date` | `str` | no | ISO 8601 end |
+| `lookback_days` | `int` | no | Convenience range in days when `from_date` is omitted |
 | `ingest` | `bool` | no | Trigger background ingestion for missing DB ranges |
 | `passthrough` | `bool` | no | Fetch directly from Kite via the controlled system session |
 
@@ -353,9 +359,8 @@ for c in candles["candles"]:
 ```python
 history = client.get_historical_candles(
     "NSE:INFY", timeframe="day",
-    from_date="2026-01-01T00:00:00+05:30",
-    to_date="2026-05-01T00:00:00+05:30",
-    ingest=True,
+    lookback_days=366,
+    passthrough=True,
 )
 ```
 

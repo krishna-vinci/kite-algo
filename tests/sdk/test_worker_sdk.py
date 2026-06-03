@@ -661,6 +661,35 @@ def test_get_historical_candles_accepts_token(captured_requests):
     }
 
 
+def test_get_historical_candles_supports_lookback_days(captured_requests):
+    client().get_historical_candles(
+        "NSE:INFY",
+        timeframe="day",
+        to_date="2024-12-31T00:00:00+00:00",
+        lookback_days=366,
+        passthrough=True,
+    )
+
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/market/history"
+    assert captured_requests[0]["kwargs"]["params"] == {
+        "timeframe": "day",
+        "ingest": True,
+        "passthrough": True,
+        "symbol": "NSE:INFY",
+        "to": "2024-12-31T00:00:00+00:00",
+        "from": "2023-12-31T00:00:00+00:00",
+    }
+
+
+def test_get_historical_candles_rejects_ambiguous_from_and_lookback():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        client().get_historical_candles(
+            "NSE:INFY",
+            from_date="2024-01-01T00:00:00+00:00",
+            lookback_days=10,
+        )
+
+
 def test_get_market_snapshot_uses_expected_endpoint(captured_requests):
     client().get_market_snapshot(
         symbols=["NSE:INFY"],

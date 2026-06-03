@@ -71,10 +71,10 @@ Start here:
 Current public package install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.0
+python3 -m pip install kite-algo-worker==0.7.1
 ```
 
-> The `development` branch already contains newer worker SDK helpers that are not yet on PyPI. Use the docs in this branch for architecture and workflow guidance, but treat the PyPI package as `0.6.2` until the next SDK release is published.
+> The `development` branch is prepared for the `0.7.1` worker SDK PyPI release. Publish/tag `kite-algo-worker-v0.7.1` before treating the pinned install as globally available.
 
 ## Quick start
 

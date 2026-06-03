@@ -347,6 +347,41 @@ def test_async_client_typed_snapshot_helpers_return_models():
     assert httpx.calls[5]["url"] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/pnl"
 
 
+def test_async_get_historical_candles_supports_lookback_days():
+    httpx = _install_httpx_stub(
+        [
+            types.SimpleNamespace(
+                status_code=200,
+                content=b'{"candles": []}',
+                text='{"candles": []}',
+                json=lambda: {"candles": []},
+            )
+        ]
+    )
+
+    async def main():
+        async with AsyncKiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test")) as client:
+            return await client.get_historical_candles(
+                "NSE:INFY",
+                timeframe="day",
+                to_date="2024-12-31T00:00:00+00:00",
+                lookback_days=366,
+                passthrough=True,
+            )
+
+    asyncio.run(main())
+
+    assert httpx.calls[0]["url"] == "http://localhost:8000/api/algo-workers/worker/market/history"
+    assert httpx.calls[0]["kwargs"]["params"] == {
+        "timeframe": "day",
+        "ingest": True,
+        "passthrough": True,
+        "symbol": "NSE:INFY",
+        "to": "2024-12-31T00:00:00+00:00",
+        "from": "2023-12-31T00:00:00+00:00",
+    }
+
+
 def test_async_wait_for_terminal_order_state_polls_until_complete():
     httpx = _install_httpx_stub(
         [
