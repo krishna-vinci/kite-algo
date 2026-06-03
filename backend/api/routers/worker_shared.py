@@ -23,6 +23,48 @@ from backend.shared.serialization import _json_dumps, _json_loads, _row_mapping,
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    # Public non-underscored symbols
+    "ALLOWED_V1_MODES",
+    "DEFAULT_WORKER_ACTIONS",
+    "LIVE_REQUIRED_RUN_METADATA",
+    "VALID_WORKER_STRATEGY_FAMILIES",
+    "WORKER_SESSION_FRESHNESS_SECONDS",
+    "require_active_worker_run_session",
+    "require_worker_token",
+    "require_worker_ws_token",
+    # Underscored symbols re-used by other worker routers
+    "_assert_run_access",
+    "_broker_user_id_from_account_scope",
+    "_enrich_run_health_fields",
+    "_extract_bearer_token",
+    "_extract_ws_token",
+    "_journal_service",
+    "_live_broker_positions_for_attribution",
+    "_load_live_kite_for_account",
+    "_load_live_kite_for_worker_account_scope",
+    "_market_data_service",
+    "_normalize_worker_gtt_error",
+    "_payload_matches_live_attribution",
+    "_payload_matches_strategy_run",
+    "_payload_matches_worker_run",
+    "_refresh_live_account_state",
+    "_repo",
+    "_require_action",
+    "_require_live_run",
+    "_require_v1_mode",
+    "_require_worker_gtt_action",
+    "_require_worker_live_account_scope",
+    "_serialize_model",
+    "_session_status_for_run",
+    "_token_allows_account_scope",
+    "_validate_decision_related_ref",
+    "_validate_live_run_contract",
+    "_worker_request_correlation_id",
+    "_worker_run_live_attribution_refs",
+    "_worker_session_nonce_from_request",
+]
+
 DEFAULT_WORKER_ACTIONS = {
     "gtt:read",
     "gtt:write",

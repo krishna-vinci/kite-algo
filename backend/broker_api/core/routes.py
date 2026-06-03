@@ -26,8 +26,8 @@ def logout(response: Response, request: Request, db=Depends(get_db)):
     return _logout(response, request, db)
 
 @router.get("/profile_kite")
-def profile(kite: KiteConnect = Depends(get_kite)):
-    return _profile(kite)
+def profile(request: Request, db=Depends(get_db)):
+    return _profile(request, db)
 
 @router.get("/holdings_kite")
 def holdings(kite: KiteConnect = Depends(get_kite)):
