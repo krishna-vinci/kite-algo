@@ -114,6 +114,17 @@ function splitTemplateList(value: string): string[] {
     .filter(Boolean);
 }
 
+function normalizeLiveAccountScopeInput(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (/^kite:/i.test(trimmed)) {
+    const brokerUserId = trimmed.slice(5).trim();
+    return brokerUserId ? `kite:${brokerUserId}` : "";
+  }
+  if (trimmed.includes(":")) return "";
+  return `kite:${trimmed}`;
+}
+
 function toggleSelection(values: string[], value: string, checked: boolean): string[] {
   if (checked) {
     return values.includes(value) ? values : [...values, value];
@@ -324,6 +335,7 @@ export function AlgoWorkerAccessPanel() {
   const queryClient = useQueryClient();
   const [name, setName] = useState("paper-worker");
   const [accountScope, setAccountScope] = useState(DEFAULT_ACCOUNT_SCOPE);
+  const [manualLiveAccountScope, setManualLiveAccountScope] = useState("");
   const [templatesText, setTemplatesText] = useState("");
   const [selectedModes, setSelectedModes] = useState<string[]>(["paper", "dry_run"]);
   const [selectedActions, setSelectedActions] = useState<string[]>(ACTION_OPTIONS.map((item) => item.value));
@@ -341,10 +353,12 @@ export function AlgoWorkerAccessPanel() {
   });
 
   const brokerUserId = kiteProfileQuery.data?.userId ?? null;
-  const liveAccountScope = brokerUserId ? `kite:${brokerUserId}` : "";
   const liveModeEnabled = selectedModes.includes("live");
-  const effectiveAccountScope = liveModeEnabled ? liveAccountScope : accountScope.trim() || null;
-  const liveTokenBlocked = liveModeEnabled && (!brokerUserId || !liveAcknowledged);
+  const resolvedLiveAccountScope = brokerUserId
+    ? `kite:${brokerUserId}`
+    : normalizeLiveAccountScopeInput(manualLiveAccountScope);
+  const effectiveAccountScope = liveModeEnabled ? resolvedLiveAccountScope || null : accountScope.trim() || null;
+  const liveTokenBlocked = liveModeEnabled && (!resolvedLiveAccountScope || !liveAcknowledged);
   const invalidSelection = selectedModes.length === 0 || selectedActions.length === 0;
 
   const createMutation = useMutation({
@@ -361,7 +375,15 @@ export function AlgoWorkerAccessPanel() {
       queryClient.invalidateQueries({ queryKey: TOKEN_QUERY_KEY });
       toast.success("Worker token created");
     },
-    onError: () => toast.error("Could not create worker token"),
+    onError: (error: unknown) => {
+      const detail =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Could not create worker token";
+      toast.error(detail);
+    },
   });
 
   const revokeMutation = useMutation({
@@ -370,7 +392,15 @@ export function AlgoWorkerAccessPanel() {
       queryClient.invalidateQueries({ queryKey: TOKEN_QUERY_KEY });
       toast.success("Worker token revoked");
     },
-    onError: () => toast.error("Could not revoke worker token"),
+    onError: (error: unknown) => {
+      const detail =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Could not revoke worker token";
+      toast.error(detail);
+    },
   });
 
   const sortedTokens = useMemo(() => tokensQuery.data ?? [], [tokensQuery.data]);
@@ -401,14 +431,21 @@ export function AlgoWorkerAccessPanel() {
             <label className="grid gap-1.5 text-xs text-foreground/55">
               Account scope
               <input
-                value={liveModeEnabled ? liveAccountScope || "Login to Kite to resolve account" : accountScope}
-                onChange={(event) => setAccountScope(event.target.value)}
-                disabled={liveModeEnabled}
+                value={liveModeEnabled ? (brokerUserId ? resolvedLiveAccountScope : manualLiveAccountScope) : accountScope}
+                onChange={(event) => {
+                  if (liveModeEnabled) {
+                    setManualLiveAccountScope(event.target.value);
+                    return;
+                  }
+                  setAccountScope(event.target.value);
+                }}
+                disabled={liveModeEnabled && Boolean(brokerUserId)}
+                placeholder={liveModeEnabled ? "AB1234 or kite:AB1234" : undefined}
                 className="rounded-xl border border-border/70 bg-background/70 px-3 py-2 font-mono text-sm text-foreground outline-none transition-colors focus:border-primary/45"
               />
               {liveModeEnabled ? (
                 <span className="text-[11px] leading-4 text-foreground/45">
-                  Live worker tokens are bound to your Kite profile user id for live runs. Current profile: {brokerUserId ? <span className="font-mono text-primary">{brokerUserId}</span> : "not available"}. The same token can still create paper or dry-run runs on scopes like <span className="font-mono text-primary">{DEFAULT_ACCOUNT_SCOPE}</span> when those modes are enabled.
+                  Live worker tokens are bound to a Kite broker user id for live runs. Current profile: {brokerUserId ? <span className="font-mono text-primary">{brokerUserId}</span> : "not available"}. When auto-resolve is unavailable, enter the broker user id manually. The same token can still create paper or dry-run runs on scopes like <span className="font-mono text-primary">{DEFAULT_ACCOUNT_SCOPE}</span> when those modes are enabled.
                 </span>
               ) : null}
             </label>
@@ -496,12 +533,20 @@ export function AlgoWorkerAccessPanel() {
                     type="checkbox"
                     checked={liveAcknowledged}
                     onChange={(event) => setLiveAcknowledged(event.target.checked)}
-                    disabled={!brokerUserId}
+                    disabled={!resolvedLiveAccountScope}
                     className="mt-1 h-4 w-4 rounded border-amber-200/60"
                   />
-                  <span>I understand this token can place live orders for {liveAccountScope || "the resolved Kite account"}.</span>
+                  <span>I understand this token can place live orders for {resolvedLiveAccountScope || "the resolved Kite account"}.</span>
                 </label>
-                {kiteProfileQuery.isError ? <p className="mt-2 text-amber-100/80">Could not load Kite profile. Login to Kite, then refresh this page before enabling live mode.</p> : null}
+                {kiteProfileQuery.isPending ? (
+                  <p className="mt-2 text-amber-100/80">Loading Kite profile. If it does not resolve, you can enter the broker user id manually.</p>
+                ) : null}
+                {kiteProfileQuery.isError ? (
+                  <p className="mt-2 text-amber-100/80">Could not load Kite profile. Login to Kite and refresh, or enter the Kite broker user id manually.</p>
+                ) : null}
+                {!brokerUserId && !kiteProfileQuery.isPending ? (
+                  <p className="mt-2 text-amber-100/80">Enter a Kite broker user id such as <span className="font-mono">AB1234</span>. We will bind the token to <span className="font-mono">{resolvedLiveAccountScope || "kite:YOUR_BROKER_USER_ID"}</span>.</p>
+                ) : null}
               </div>
             ) : null}
 
@@ -516,6 +561,10 @@ export function AlgoWorkerAccessPanel() {
               onClick={() => {
                 if (invalidSelection) {
                   toast.error("Select at least one execution mode and worker capability");
+                  return;
+                }
+                if (liveModeEnabled && !resolvedLiveAccountScope) {
+                  toast.error("Login to Kite or enter a Kite broker user id before creating a live token");
                   return;
                 }
                 createMutation.mutate();
