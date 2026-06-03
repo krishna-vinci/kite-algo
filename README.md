@@ -71,10 +71,10 @@ Start here:
 Current public package install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.1
+python3 -m pip install kite-algo-worker==0.7.2
 ```
 
-> The `development` branch is prepared for the `0.7.1` worker SDK PyPI release. Publish/tag `kite-algo-worker-v0.7.1` before treating the pinned install as globally available.
+> The `development` branch is prepared for the `0.7.2` worker SDK PyPI release. Publish/tag `kite-algo-worker-v0.7.2` before treating the pinned install as globally available.
 
 ## Quick start
 

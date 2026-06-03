@@ -7,14 +7,14 @@ Kite Algo is a self-hosted algorithmic trading platform for Zerodha/Kite workflo
 ## Package status and install
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.1
+python3 -m pip install kite-algo-worker==0.7.2
 ```
 
 Extras:
 
 ```bash
-python3 -m pip install "kite-algo-worker[dataframe]==0.7.1"
-python3 -m pip install "kite-algo-worker[indicators]==0.7.1"
+python3 -m pip install "kite-algo-worker[dataframe]==0.7.2"
+python3 -m pip install "kite-algo-worker[indicators]==0.7.2"
 ```
 
 - base SDK: HTTP/WebSocket clients, typed models, order helpers
