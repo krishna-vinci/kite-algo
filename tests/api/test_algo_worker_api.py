@@ -964,6 +964,41 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["current"]["close"], 1525.5)
         self.assertFalse(response["is_stale"])
 
+    async def test_worker_market_day_current_uses_runtime_tick_without_candle_reader(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            ),
+            market_data_runtime=SimpleNamespace(
+                get_tick=AsyncMock(
+                    return_value={
+                        "instrument_token": 408065,
+                        "last_price": 1531.0,
+                        "received_at": "2026-04-25T08:00:00+00:00",
+                        "ohlc": {"open": 1500, "high": 1535, "low": 1495, "close": 1510},
+                    }
+                )
+            ),
+            candle_reader=None,
+        )
+
+        response = await service.get_candles(symbol="NSE:INFY", interval="day", lookback=1)
+
+        self.assertEqual(response["current"]["source"], "broker_quote_ohlc")
+        self.assertEqual(response["current"]["close"], 1531.0)
+        self.assertFalse(response["is_stale"])
+
     async def test_worker_market_history_forwards_passthrough_request(self):
         repo = _FakeWorkerRepository()
         request = self._request(repo)

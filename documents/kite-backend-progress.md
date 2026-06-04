@@ -59,6 +59,12 @@ Do not use this file for frontend work.
   - bumped SDK package/docs references to `0.7.5`; `scripts/check_worker_sdk_version_refs.py` passes
   - focused verification: `DATABASE_URL="postgresql://user:pass@localhost:5432/kite_test" .venv/bin/python -m pytest tests/sdk/test_worker_sdk.py -k "safety_check or health_snapshot" -q` → `2 passed`; API candle/funds regressions → `5 passed`; `py_compile` for changed backend/SDK modules passed
 
+- Tightened remaining worker backend-only `0.7.5` retest issues without requiring another SDK publish:
+  - worker session claim now computes stale cutoffs in Python and binds timestamp values directly, avoiding provider-specific interval expression failures in the `claim_session` UPDATE path
+  - daily current-candle fallback now runs even when no candle reader is installed and can derive the daily current candle from an existing market-runtime tick before trying broker quote OHLC, with historical day storage as a final local fallback
+  - first `stream_candles(..., interval="day")` snapshot uses the same `get_candles(..., interval="day")` fallback path, so it can return current/latest daily data when ticks/quote/history are available
+  - focused verification: `DATABASE_URL="postgresql://user:pass@localhost:5432/kite_test" .venv/bin/python -m pytest tests/api/test_algo_worker_api.py -k "day_current_uses or current_falls_back or claim_session_returns_nonce_for_owned_run" -q` → `4 passed`; `py_compile` for changed claim/market modules passed
+
 - Implemented Spec 10 worker product completion and helper polish:
   - added worker-token-authenticated, account-scoped GTT passthrough routes:
     - `POST /api/algo-workers/worker/gtt/triggers`

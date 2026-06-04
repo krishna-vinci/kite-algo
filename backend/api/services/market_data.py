@@ -243,16 +243,9 @@ class WorkerMarketDataService:
         instrument = await self._resolve_one(symbol=symbol, instrument_token=instrument_token)
         reader = self.candle_reader
         if reader is None:
-            return {
-                "symbol": instrument["symbol"],
-                "instrument_token": instrument["instrument_token"],
-                "interval": interval,
-                "candles": [],
-                "current": None,
-                "is_stale": True,
-            }
-
-        history_raw, current_raw = await self._read_candles(reader, int(instrument["instrument_token"]), interval, int(lookback))
+            history_raw, current_raw = [], None
+        else:
+            history_raw, current_raw = await self._read_candles(reader, int(instrument["instrument_token"]), interval, int(lookback))
         candles = [
             normalized
             for item in history_raw
@@ -263,6 +256,8 @@ class WorkerMarketDataService:
             current = {**candles[-1], "is_complete": True, "source": "latest_cached_candle"}
         if current is None and normalize_timeframe(interval) == "day":
             current = await self._latest_daily_quote_candle(instrument)
+        if current is None and normalize_timeframe(interval) == "day":
+            current = await self._latest_historical_day_candle(int(instrument["instrument_token"]))
         return {
             "symbol": instrument["symbol"],
             "instrument_token": instrument["instrument_token"],
@@ -566,10 +561,14 @@ class WorkerMarketDataService:
         return quotes
 
     async def _latest_daily_quote_candle(self, instrument: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        quotes = await self._get_broker_quotes([instrument], mode="quote")
-        if not quotes:
-            return None
-        quote = quotes[0]
+        tick = await self._get_tick(int(instrument["instrument_token"]))
+        if tick:
+            quote = self._quote_payload(instrument, tick, mode="quote")
+        else:
+            quotes = await self._get_broker_quotes([instrument], mode="quote")
+            if not quotes:
+                return None
+            quote = quotes[0]
         ohlc = dict(quote.get("ohlc") or {}) if isinstance(quote.get("ohlc"), dict) else {}
         open_ = ohlc.get("open")
         high = ohlc.get("high")
@@ -589,6 +588,29 @@ class WorkerMarketDataService:
             "is_complete": False,
             "source": "broker_quote_ohlc",
         }
+
+    async def _latest_historical_day_candle(self, instrument_token: int) -> Optional[Dict[str, Any]]:
+        try:
+            from backend.broker_api.market.candle_storage import CandleStorage
+
+            to_date = utcnow()
+            from_date = to_date - timedelta(days=14)
+            raw_candles = await asyncio.to_thread(
+                CandleStorage.query_candles,
+                int(instrument_token),
+                "day",
+                from_date,
+                to_date,
+                True,
+                False,
+            )
+        except Exception:
+            return None
+        for item in reversed(list(raw_candles or [])):
+            candle = self._normalize_candle(item, is_complete=True)
+            if candle is not None:
+                return {**candle, "source": "latest_historical_day"}
+        return None
 
     def _quote_payload(self, instrument: Dict[str, Any], tick: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
         received_at_raw = tick.get("received_at")
