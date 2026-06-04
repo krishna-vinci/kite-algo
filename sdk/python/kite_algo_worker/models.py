@@ -286,7 +286,7 @@ class RunProtectionState(RawModelMixin):
 
 
 @dataclass(frozen=True)
-class WorkerRunHealthSnapshot(ModelMixin):
+class WorkerRunHealthSnapshot(RawModelMixin):
     strategy_run_id: str
     status: str
     execution_mode: str
@@ -298,6 +298,7 @@ class WorkerRunHealthSnapshot(ModelMixin):
     recovery_action_required: bool = False
     worker_session_claimed_at: Optional[str] = None
     last_heartbeat_at: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
@@ -311,6 +312,7 @@ class WorkerRunHealthSnapshot(ModelMixin):
         object.__setattr__(self, "recovery_action_required", _coerce_bool(self.recovery_action_required))
         object.__setattr__(self, "worker_session_claimed_at", None if self.worker_session_claimed_at is None else str(self.worker_session_claimed_at))
         object.__setattr__(self, "last_heartbeat_at", None if self.last_heartbeat_at is None else str(self.last_heartbeat_at))
+        object.__setattr__(self, "raw", dict(self.raw or {}))
 
 
 @dataclass(frozen=True)
@@ -527,7 +529,7 @@ class WorkerTradesResponse(ModelMixin):
 
 
 @dataclass(frozen=True)
-class SafetyCheckResult(ModelMixin):
+class SafetyCheckResult(RawModelMixin):
     strategy_run_id: str
     can_trade: bool
     run_status: str
@@ -537,6 +539,7 @@ class SafetyCheckResult(ModelMixin):
     generic_protection: dict[str, Any] = field(default_factory=dict)
     options_protection: dict[str, Any] = field(default_factory=dict)
     evaluated_at: str = ""
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
@@ -548,6 +551,7 @@ class SafetyCheckResult(ModelMixin):
         object.__setattr__(self, "generic_protection", dict(self.generic_protection or {}))
         object.__setattr__(self, "options_protection", dict(self.options_protection or {}))
         object.__setattr__(self, "evaluated_at", str(self.evaluated_at))
+        object.__setattr__(self, "raw", dict(self.raw or {}))
 
 
 @dataclass(frozen=True)

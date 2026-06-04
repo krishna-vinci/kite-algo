@@ -462,6 +462,7 @@ def test_safety_check_uses_new_endpoint(monkeypatch):
                 "strategy_run_id": "run-1",
                 "can_trade": True,
                 "run_status": "open",
+                "execution_mode": "paper",
                 "safety_token": "abc",
                 "token_expires_at": "2026-05-06T10:00:10Z",
                 "blocking_reasons": [],
@@ -477,6 +478,7 @@ def test_safety_check_uses_new_endpoint(monkeypatch):
 
     assert isinstance(result, SafetyCheckResult)
     assert result.can_trade is True
+    assert result.raw["execution_mode"] == "paper"
     assert calls[0][0] == "GET"
     assert calls[0][1] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/safety-check"
 
@@ -1456,6 +1458,8 @@ def test_get_run_health_snapshot_is_typed(monkeypatch):
         lambda self, run_id: {
             "strategy_run_id": run_id,
             "status": "open",
+            "token_id": "worker-1",
+            "template_id": "mean-reversion",
             "execution_mode": "paper",
             "account_scope": "kite:paper-a",
             "heartbeat_age_sec": 42,
@@ -1473,6 +1477,7 @@ def test_get_run_health_snapshot_is_typed(monkeypatch):
     assert isinstance(snapshot, WorkerRunHealthSnapshot)
     assert snapshot.heartbeat_age_sec == 42
     assert snapshot.health_status == "healthy"
+    assert snapshot.raw["token_id"] == "worker-1"
 
 
 def test_gtt_helpers_use_worker_routes(monkeypatch):
