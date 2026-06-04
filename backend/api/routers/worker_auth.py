@@ -63,11 +63,15 @@ async def claim_worker_run_session(request: Request, strategy_run_id: str):
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
-    claimed = await _repo(request).claim_run_session(
-        strategy_run_id,
-        freshness_seconds=WORKER_SESSION_FRESHNESS_SECONDS,
-        claimed_without_heartbeat_seconds=WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
-    )
+    try:
+        claimed = await _repo(request).claim_run_session(
+            strategy_run_id,
+            freshness_seconds=WORKER_SESSION_FRESHNESS_SECONDS,
+            claimed_without_heartbeat_seconds=WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
+        )
+    except SQLAlchemyError as exc:
+        logger.exception("algo_worker_claim_session_database_failed", extra={"strategy_run_id": strategy_run_id})
+        raise HTTPException(status_code=503, detail="Worker session persistence unavailable") from exc
     if claimed is None:
         raise HTTPException(
             status_code=409,
@@ -162,6 +166,8 @@ async def create_worker_run(request: Request, payload: WorkerRunCreateRequest):
 
     runtime_state = dict(payload.runtime_state or {})
     if "backend_protection" in runtime_state:
+        from backend.api.routers.worker_protection import _initial_backend_protection_state, _normalized_backend_protection_runtime_state
+
         try:
             runtime_state["backend_protection"] = _normalized_backend_protection_runtime_state(
                 runtime_state.get("backend_protection"),

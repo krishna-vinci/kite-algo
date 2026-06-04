@@ -148,6 +148,8 @@ async def get_worker_funds(request: Request, mode: str = Query("paper"), account
         raise HTTPException(status_code=400, detail="account_scope is required for worker funds")
     if not _token_allows_account_scope(token, scope):
         raise HTTPException(status_code=403, detail="Worker token cannot read this account scope")
+    from backend.api.routers.worker_protection import _build_worker_funds_snapshot
+
     return await _build_worker_funds_snapshot(request, account_scope=scope, mode=normalized_mode)
 
 async def get_worker_run_funds(request: Request, strategy_run_id: str):
@@ -160,6 +162,8 @@ async def get_worker_run_funds(request: Request, strategy_run_id: str):
     mode = str(run.get("execution_mode") or "paper").lower()
     if mode not in token.allowed_modes:
         raise HTTPException(status_code=403, detail="Worker token cannot read funds for this execution mode")
+    from backend.api.routers.worker_protection import _build_worker_run_funds_snapshot
+
     return await _build_worker_run_funds_snapshot(request, run)
 
 async def create_worker_gtt_trigger(request: Request, payload: Dict[str, Any]):

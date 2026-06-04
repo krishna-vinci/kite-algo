@@ -853,6 +853,117 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response["is_stale"])
 
+    async def test_worker_market_candles_current_falls_back_to_latest_cached_candle(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            ),
+            candle_reader=SimpleNamespace(
+                get_candles=AsyncMock(
+                    return_value={
+                        "candles": [
+                            {
+                                "ts": "2026-04-25T09:15:00+05:30",
+                                "open": 1500,
+                                "high": 1510,
+                                "low": 1490,
+                                "close": 1505,
+                                "volume": 1000,
+                            }
+                        ],
+                        "current": None,
+                    }
+                )
+            ),
+        )
+
+        response = await service.get_candles(symbol="NSE:INFY", interval="day", lookback=1)
+
+        self.assertEqual(response["current"]["close"], 1505.0)
+        self.assertEqual(response["current"]["source"], "latest_cached_candle")
+
+    async def test_worker_market_quotes_fall_back_to_broker_quote_when_runtime_tick_missing(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            )
+        )
+
+        class FakeKite:
+            def quote(self, instruments):
+                return {
+                    instruments[0]: {
+                        "instrument_token": 408065,
+                        "last_price": 1525.5,
+                        "ohlc": {"open": 1500, "high": 1530, "low": 1495, "close": 1510},
+                    }
+                }
+
+        with patch.object(service, "_get_system_kite_client", AsyncMock(return_value=FakeKite())):
+            response = await service.get_quotes(WorkerQuoteRequest(symbols=["NSE:INFY"], mode="quote"))
+
+        self.assertEqual(response["quotes"][0]["last_price"], 1525.5)
+        self.assertEqual(response["missing"], [])
+
+    async def test_worker_market_day_current_uses_broker_quote_ohlc_when_cache_empty(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            ),
+            candle_reader=SimpleNamespace(get_candles=AsyncMock(return_value={"candles": [], "current": None})),
+        )
+
+        class FakeKite:
+            def quote(self, instruments):
+                return {
+                    instruments[0]: {
+                        "instrument_token": 408065,
+                        "last_price": 1525.5,
+                        "volume": 12345,
+                        "ohlc": {"open": 1500, "high": 1530, "low": 1495, "close": 1510},
+                    }
+                }
+
+        with patch.object(service, "_get_system_kite_client", AsyncMock(return_value=FakeKite())):
+            response = await service.get_candles(symbol="NSE:INFY", interval="day", lookback=1)
+
+        self.assertEqual(response["current"]["source"], "broker_quote_ohlc")
+        self.assertEqual(response["current"]["close"], 1525.5)
+        self.assertFalse(response["is_stale"])
+
     async def test_worker_market_history_forwards_passthrough_request(self):
         repo = _FakeWorkerRepository()
         request = self._request(repo)

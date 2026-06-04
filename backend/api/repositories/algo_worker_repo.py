@@ -591,12 +591,12 @@ class SqlAlchemyAlgoWorkerRepository:
                         worker_session_nonce IS NULL
                         OR (
                           last_heartbeat_at IS NOT NULL
-                          AND last_heartbeat_at < NOW() - (CAST(:freshness_seconds AS TEXT) || ' seconds')::INTERVAL
+                          AND last_heartbeat_at < NOW() - make_interval(secs => CAST(:freshness_seconds AS INTEGER))
                         )
                         OR (
                           last_heartbeat_at IS NULL
                           AND worker_session_claimed_at IS NOT NULL
-                          AND worker_session_claimed_at < NOW() - (CAST(:claimed_without_heartbeat_seconds AS TEXT) || ' seconds')::INTERVAL
+                          AND worker_session_claimed_at < NOW() - make_interval(secs => CAST(:claimed_without_heartbeat_seconds AS INTEGER))
                         )
                       )
                     RETURNING *
