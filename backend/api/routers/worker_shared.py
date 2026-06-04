@@ -31,6 +31,7 @@ __all__ = [
     "_OPTION_PROTECTION_STATE_UNAVAILABLE",
     "parse_account_scope",
     "VALID_WORKER_STRATEGY_FAMILIES",
+    "WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS",
     "WORKER_SESSION_FRESHNESS_SECONDS",
     "require_active_worker_run_session",
     "require_worker_token",

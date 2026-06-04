@@ -65,6 +65,11 @@ Do not use this file for frontend work.
   - first `stream_candles(..., interval="day")` snapshot uses the same `get_candles(..., interval="day")` fallback path, so it can return current/latest daily data when ticks/quote/history are available
   - focused verification: `DATABASE_URL="postgresql://user:pass@localhost:5432/kite_test" .venv/bin/python -m pytest tests/api/test_algo_worker_api.py -k "day_current_uses or current_falls_back or claim_session_returns_nonce_for_owned_run" -q` → `4 passed`; `py_compile` for changed claim/market modules passed
 
+- Fixed the isolated remaining worker lifecycle `claim_session(...)` 500 root cause:
+  - `worker_auth.py` imported `WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS` via `worker_shared.*`, but `worker_shared.__all__` omitted that underscored lifecycle constant after wildcard export hardening, causing `NameError` only when the claim route executed
+  - exported `WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS` from `worker_shared.__all__` and added an endpoint-level SQLAlchemy-backed regression test so the route exercises the real token lookup + repository claim path instead of only a fake repository call
+  - focused verification: `DATABASE_URL="postgresql://user:pass@localhost:5432/kite_test" .venv/bin/python -m pytest tests/api/test_algo_worker_api.py -k "claim_session_endpoint_returns_nonce or claim_session_returns_nonce_for_owned_run" -q` → `2 passed`; `py_compile` for `worker_shared.py` and `worker_auth.py` passed
+
 - Implemented Spec 10 worker product completion and helper polish:
   - added worker-token-authenticated, account-scoped GTT passthrough routes:
     - `POST /api/algo-workers/worker/gtt/triggers`

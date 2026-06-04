@@ -4357,7 +4357,7 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["strategy_run_id"], "run-claimed-no-heartbeat")
 
-    async def test_claim_session_returns_nonce_for_owned_run(self):
+    def test_claim_session_returns_nonce_for_owned_run(self):
         repo = _FakeWorkerRepository()
         repo.runs["run-claim-route"] = {
             "strategy_run_id": "run-claim-route",
@@ -4375,9 +4375,63 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
             is_disconnected=AsyncMock(return_value=False),
         )
 
-        response = await claim_worker_run_session(request, "run-claim-route")
+        response = asyncio.run(claim_worker_run_session(request, "run-claim-route"))
         self.assertEqual(response["strategy_run_id"], "run-claim-route")
         self.assertTrue(response["worker_session_nonce"])
+
+    def test_claim_session_endpoint_returns_nonce_for_owned_sqlalchemy_run(self):
+        from backend.api.routers import worker_auth as worker_auth_module
+
+        repo = _sqlite_algo_worker_repo()
+        with repo.session_factory() as db:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.algo_worker_tokens (
+                        token_id, name, token_hash, status, allowed_modes, allowed_actions,
+                        allowed_templates, account_scope
+                    ) VALUES (
+                        'worker-claim-endpoint', 'Worker', :token_hash, 'active',
+                        :allowed_modes, :allowed_actions, :allowed_templates, 'kite:paper-a'
+                    )
+                    """
+                ),
+                {
+                    "token_hash": _hash_token("secret-token"),
+                    "allowed_modes": json.dumps(["paper", "dry_run"]),
+                    "allowed_actions": json.dumps(["runs:create", "runs:read", "heartbeat"]),
+                    "allowed_templates": json.dumps([]),
+                },
+            )
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.algo_worker_runs (
+                        strategy_run_id, token_id, template_id, account_scope, execution_mode,
+                        status, runtime_state_json, metadata_json
+                    ) VALUES (
+                        'run-claim-endpoint', 'worker-claim-endpoint', 'sdk-mean-reversion',
+                        'kite:paper-a', 'dry_run', 'open', '{}', '{}'
+                    )
+                    """
+                )
+            )
+            db.commit()
+
+        app = FastAPI()
+        app.state.algo_worker_repository = repo
+        app.include_router(worker_auth_module.router, prefix="/api")
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/algo-workers/worker/runs/run-claim-endpoint/claim-session",
+            headers={"Authorization": "Bearer secret-token"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["strategy_run_id"], "run-claim-endpoint")
+        self.assertTrue(payload["worker_session_nonce"])
 
     async def test_submit_worker_intent_rejects_missing_session_nonce(self):
         repo = _FakeWorkerRepository()
