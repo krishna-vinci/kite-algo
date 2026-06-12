@@ -215,12 +215,21 @@ class WorkerMarketDataService:
         quotes: List[Dict[str, Any]] = []
         missing = list(resolved["missing"])
         mode = normalize_mode(request.mode)
+        missing_instruments: List[Dict[str, Any]] = []
         for instrument in resolved["instruments"]:
             tick = await self._get_tick(int(instrument["instrument_token"]))
             if not tick:
-                missing.append(instrument["symbol"])
+                missing_instruments.append(instrument)
                 continue
             quotes.append(self._quote_payload(instrument, tick, mode=mode))
+
+        if missing_instruments:
+            fallback_quotes = await self._get_broker_quotes(missing_instruments, mode=mode)
+            quoted_tokens = {int(item.get("instrument_token") or 0) for item in fallback_quotes}
+            quotes.extend(fallback_quotes)
+            for instrument in missing_instruments:
+                if int(instrument["instrument_token"]) not in quoted_tokens:
+                    missing.append(instrument["symbol"])
         return {"quotes": quotes, "missing": missing}
 
     async def get_candles(
@@ -234,22 +243,21 @@ class WorkerMarketDataService:
         instrument = await self._resolve_one(symbol=symbol, instrument_token=instrument_token)
         reader = self.candle_reader
         if reader is None:
-            return {
-                "symbol": instrument["symbol"],
-                "instrument_token": instrument["instrument_token"],
-                "interval": interval,
-                "candles": [],
-                "current": None,
-                "is_stale": True,
-            }
-
-        history_raw, current_raw = await self._read_candles(reader, int(instrument["instrument_token"]), interval, int(lookback))
+            history_raw, current_raw = [], None
+        else:
+            history_raw, current_raw = await self._read_candles(reader, int(instrument["instrument_token"]), interval, int(lookback))
         candles = [
             normalized
             for item in history_raw
             if (normalized := self._normalize_candle(item, is_complete=True)) is not None
         ]
         current = self._normalize_candle(current_raw, is_complete=False) if current_raw is not None else None
+        if current is None and candles:
+            current = {**candles[-1], "is_complete": True, "source": "latest_cached_candle"}
+        if current is None and normalize_timeframe(interval) == "day":
+            current = await self._latest_daily_quote_candle(instrument)
+        if current is None and normalize_timeframe(interval) == "day":
+            current = await self._latest_historical_day_candle(int(instrument["instrument_token"]))
         return {
             "symbol": instrument["symbol"],
             "instrument_token": instrument["instrument_token"],
@@ -529,6 +537,80 @@ class WorkerMarketDataService:
         if self.market_data_runtime is None:
             return None
         return await self.market_data_runtime.get_tick(int(instrument_token))
+
+    async def _get_broker_quotes(self, instruments: List[Dict[str, Any]], *, mode: str) -> List[Dict[str, Any]]:
+        if not instruments:
+            return []
+        keys = [str(item["symbol"]) for item in instruments]
+        by_symbol = {str(item["symbol"]): item for item in instruments}
+        try:
+            kite = await self._get_system_kite_client()
+            raw_quotes = await asyncio.to_thread(kite.quote, keys)
+        except Exception:
+            return []
+
+        quotes: List[Dict[str, Any]] = []
+        for key, raw_tick in dict(raw_quotes or {}).items():
+            instrument = by_symbol.get(str(key))
+            if instrument is None or not isinstance(raw_tick, dict):
+                continue
+            tick = dict(raw_tick)
+            tick.setdefault("mode", mode)
+            tick.setdefault("received_at", utcnow().isoformat())
+            quotes.append(self._quote_payload(instrument, tick, mode=mode))
+        return quotes
+
+    async def _latest_daily_quote_candle(self, instrument: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        tick = await self._get_tick(int(instrument["instrument_token"]))
+        if tick:
+            quote = self._quote_payload(instrument, tick, mode="quote")
+        else:
+            quotes = await self._get_broker_quotes([instrument], mode="quote")
+            if not quotes:
+                return None
+            quote = quotes[0]
+        ohlc = dict(quote.get("ohlc") or {}) if isinstance(quote.get("ohlc"), dict) else {}
+        open_ = ohlc.get("open")
+        high = ohlc.get("high")
+        low = ohlc.get("low")
+        close = quote.get("last_price")
+        if open_ is None or high is None or low is None or close is None:
+            return None
+        ts = quote.get("exchange_timestamp") or quote.get("received_at") or utcnow().isoformat()
+        return {
+            "ts": str(ts),
+            "open": float(open_),
+            "high": float(high),
+            "low": float(low),
+            "close": float(close),
+            "volume": float(quote.get("volume") or 0),
+            "oi": None,
+            "is_complete": False,
+            "source": "broker_quote_ohlc",
+        }
+
+    async def _latest_historical_day_candle(self, instrument_token: int) -> Optional[Dict[str, Any]]:
+        try:
+            from backend.broker_api.market.candle_storage import CandleStorage
+
+            to_date = utcnow()
+            from_date = to_date - timedelta(days=14)
+            raw_candles = await asyncio.to_thread(
+                CandleStorage.query_candles,
+                int(instrument_token),
+                "day",
+                from_date,
+                to_date,
+                True,
+                False,
+            )
+        except Exception:
+            return None
+        for item in reversed(list(raw_candles or [])):
+            candle = self._normalize_candle(item, is_complete=True)
+            if candle is not None:
+                return {**candle, "source": "latest_historical_day"}
+        return None
 
     def _quote_payload(self, instrument: Dict[str, Any], tick: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
         received_at_raw = tick.get("received_at")

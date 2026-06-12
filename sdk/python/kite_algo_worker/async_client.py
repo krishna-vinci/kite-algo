@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime
 from importlib import import_module
 from typing import Any, Dict, Iterable, Mapping, Optional
 
-from .client import AlgoWorkerConfig, JsonDict
+from .client import AlgoWorkerConfig, JsonDict, _build_historical_date_params
 from .exceptions import error_for_status
 from .models import (
     WorkerGttTrigger,
@@ -132,6 +133,10 @@ class AsyncKiteAlgoWorkerClient:
         return WorkerOrderSnapshot.model_validate(response.get("order") or response)
 
     async def get_candles(self, instrument: str | int, interval: str = "5minute", lookback: int = 50) -> JsonDict:
+        """Return recent live/cache candles.
+
+        Use get_historical_candles() for daily history and broader historical ranges.
+        """
         params: JsonDict = {"interval": interval, "lookback": lookback}
         instrument_value = str(instrument).strip()
         if isinstance(instrument, int) or instrument_value.isdigit():
@@ -147,8 +152,9 @@ class AsyncKiteAlgoWorkerClient:
         self,
         instrument: str | int,
         timeframe: str = "day",
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
+        from_date: Optional[str | datetime] = None,
+        to_date: Optional[str | datetime] = None,
+        lookback_days: Optional[int] = None,
         ingest: bool = True,
         passthrough: bool = False,
     ) -> JsonDict:
@@ -158,18 +164,16 @@ class AsyncKiteAlgoWorkerClient:
             params["instrument_token"] = int(instrument_value)
         else:
             params["symbol"] = instrument_value
-        if from_date is not None:
-            params["from"] = from_date
-        if to_date is not None:
-            params["to"] = to_date
+        params.update(_build_historical_date_params(from_date=from_date, to_date=to_date, lookback_days=lookback_days))
         return await self._request("GET", "/worker/market/history", params=params)
 
     async def get_historical_candles_snapshot(
         self,
         instrument: str | int,
         timeframe: str = "day",
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
+        from_date: Optional[str | datetime] = None,
+        to_date: Optional[str | datetime] = None,
+        lookback_days: Optional[int] = None,
         ingest: bool = True,
         passthrough: bool = False,
     ) -> WorkerHistoricalCandles:
@@ -179,6 +183,7 @@ class AsyncKiteAlgoWorkerClient:
                 timeframe=timeframe,
                 from_date=from_date,
                 to_date=to_date,
+                lookback_days=lookback_days,
                 ingest=ingest,
                 passthrough=passthrough,
             )

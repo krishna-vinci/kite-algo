@@ -6,11 +6,26 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+_DEFAULT_WORKER_ACTIONS = [
+    "gtt:read",
+    "gtt:write",
+    "runs:create",
+    "runs:read",
+    "runs:log",
+    "intents:submit",
+    "risk:update",
+    "runs:exit",
+    "heartbeat",
+    "market:read",
+    "market:stream",
+    "funds:read",
+]
+
 class WorkerTokenCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     account_scope: Optional[str] = None
     allowed_modes: List[str] = Field(default_factory=lambda: ["paper", "dry_run"])
-    allowed_actions: List[str] = Field(default_factory=lambda: sorted(DEFAULT_WORKER_ACTIONS))
+    allowed_actions: List[str] = Field(default_factory=lambda: sorted(_DEFAULT_WORKER_ACTIONS))
     allowed_templates: List[str] = Field(default_factory=list)
     expires_at: Optional[datetime] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)

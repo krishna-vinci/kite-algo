@@ -28,6 +28,7 @@ from backend.api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerReposi
 from backend.shared.serialization import _hash_token  # noqa: E402
 from backend.api.services.market_data import WorkerMarketDataService  # noqa: E402
 from sqlalchemy import create_engine, event, text  # noqa: E402
+from sqlalchemy.exc import SQLAlchemyError  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402
 
@@ -412,7 +413,6 @@ class _FakeWorkerRepository:
         }
         self.runs[strategy_run_id] = run
         return dict(run)
-
     async def get_run(self, strategy_run_id):
         run = self.runs.get(strategy_run_id)
         return dict(run) if run else None
@@ -509,6 +509,11 @@ class _FakeWorkerRepository:
         self.intent_results[key] = dict(result)
         self.intent_results[(strategy_run_id, f"__status__:{idempotency_key}")] = status
         return {"status": status, "result": dict(result)}
+
+
+class _FailingCreateRunRepository(_FakeWorkerRepository):
+    async def create_run(self, token, payload, *, strategy_run_id):
+        raise SQLAlchemyError("db unavailable")
 
 
 def _test_client(*, repo, market_data_service=None):
@@ -848,6 +853,152 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response["is_stale"])
 
+    async def test_worker_market_candles_current_falls_back_to_latest_cached_candle(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            ),
+            candle_reader=SimpleNamespace(
+                get_candles=AsyncMock(
+                    return_value={
+                        "candles": [
+                            {
+                                "ts": "2026-04-25T09:15:00+05:30",
+                                "open": 1500,
+                                "high": 1510,
+                                "low": 1490,
+                                "close": 1505,
+                                "volume": 1000,
+                            }
+                        ],
+                        "current": None,
+                    }
+                )
+            ),
+        )
+
+        response = await service.get_candles(symbol="NSE:INFY", interval="day", lookback=1)
+
+        self.assertEqual(response["current"]["close"], 1505.0)
+        self.assertEqual(response["current"]["source"], "latest_cached_candle")
+
+    async def test_worker_market_quotes_fall_back_to_broker_quote_when_runtime_tick_missing(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            )
+        )
+
+        class FakeKite:
+            def quote(self, instruments):
+                return {
+                    instruments[0]: {
+                        "instrument_token": 408065,
+                        "last_price": 1525.5,
+                        "ohlc": {"open": 1500, "high": 1530, "low": 1495, "close": 1510},
+                    }
+                }
+
+        with patch.object(service, "_get_system_kite_client", AsyncMock(return_value=FakeKite())):
+            response = await service.get_quotes(WorkerQuoteRequest(symbols=["NSE:INFY"], mode="quote"))
+
+        self.assertEqual(response["quotes"][0]["last_price"], 1525.5)
+        self.assertEqual(response["missing"], [])
+
+    async def test_worker_market_day_current_uses_broker_quote_ohlc_when_cache_empty(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            ),
+            candle_reader=SimpleNamespace(get_candles=AsyncMock(return_value={"candles": [], "current": None})),
+        )
+
+        class FakeKite:
+            def quote(self, instruments):
+                return {
+                    instruments[0]: {
+                        "instrument_token": 408065,
+                        "last_price": 1525.5,
+                        "volume": 12345,
+                        "ohlc": {"open": 1500, "high": 1530, "low": 1495, "close": 1510},
+                    }
+                }
+
+        with patch.object(service, "_get_system_kite_client", AsyncMock(return_value=FakeKite())):
+            response = await service.get_candles(symbol="NSE:INFY", interval="day", lookback=1)
+
+        self.assertEqual(response["current"]["source"], "broker_quote_ohlc")
+        self.assertEqual(response["current"]["close"], 1525.5)
+        self.assertFalse(response["is_stale"])
+
+    async def test_worker_market_day_current_uses_runtime_tick_without_candle_reader(self):
+        service = WorkerMarketDataService(
+            instruments_repository=SimpleNamespace(
+                resolve_market_symbol=lambda symbol: {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "name": "INFOSYS",
+                    "instrument_type": "EQ",
+                    "segment": "NSE",
+                    "tick_size": 0.05,
+                    "lot_size": 1,
+                    "expiry": None,
+                    "strike": None,
+                }
+            ),
+            market_data_runtime=SimpleNamespace(
+                get_tick=AsyncMock(
+                    return_value={
+                        "instrument_token": 408065,
+                        "last_price": 1531.0,
+                        "received_at": "2026-04-25T08:00:00+00:00",
+                        "ohlc": {"open": 1500, "high": 1535, "low": 1495, "close": 1510},
+                    }
+                )
+            ),
+            candle_reader=None,
+        )
+
+        response = await service.get_candles(symbol="NSE:INFY", interval="day", lookback=1)
+
+        self.assertEqual(response["current"]["source"], "broker_quote_ohlc")
+        self.assertEqual(response["current"]["close"], 1531.0)
+        self.assertFalse(response["is_stale"])
+
     async def test_worker_market_history_forwards_passthrough_request(self):
         repo = _FakeWorkerRepository()
         request = self._request(repo)
@@ -884,6 +1035,29 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(captured["ingest"])
         self.assertTrue(captured["passthrough"])
 
+    async def test_worker_market_history_accepts_from_date_aliases(self):
+        repo = _FakeWorkerRepository()
+        request = self._request(repo)
+        captured = {}
+        request.app.state.worker_market_data_service = SimpleNamespace(
+            get_historical_candles=AsyncMock(
+                side_effect=lambda **kwargs: captured.update(kwargs)
+                or {"symbol": "NSE:INFY", "instrument_token": 408065, "timeframe": "day", "candles": []}
+            )
+        )
+
+        await get_worker_market_history(
+            request,
+            SimpleNamespace(add_task=lambda *args, **kwargs: None),
+            symbol="NSE:INFY",
+            timeframe="day",
+            from_date=datetime.fromisoformat("2024-01-01T00:00:00+00:00"),
+            to_date=datetime.fromisoformat("2024-12-31T00:00:00+00:00"),
+        )
+
+        self.assertEqual(captured["from_date"], datetime.fromisoformat("2024-01-01T00:00:00+00:00"))
+        self.assertEqual(captured["to_date"], datetime.fromisoformat("2024-12-31T00:00:00+00:00"))
+
     async def test_worker_market_history_passthrough_treats_naive_kite_dates_as_ist(self):
         service = WorkerMarketDataService(
             instruments_repository=SimpleNamespace(
@@ -918,8 +1092,8 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ]
 
-        with patch("api.worker_market_data.WorkerMarketDataService._get_system_kite_client", AsyncMock(return_value=object())):
-            with patch("broker_api.candle_ingestion.CandleIngestion", FakeIngestion):
+        with patch("backend.api.services.market_data.WorkerMarketDataService._get_system_kite_client", AsyncMock(return_value=object())):
+            with patch("backend.broker_api.market.candle_ingestion.CandleIngestion", FakeIngestion):
                 response = await service.get_historical_candles(
                     symbol="NSE:INFY",
                     timeframe="day",
@@ -1009,7 +1183,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with patch("broker_api.candle_storage.CandleStorage.query_candles", side_effect=RuntimeError("db down")):
+        with patch("backend.broker_api.market.candle_storage.CandleStorage.query_candles", side_effect=RuntimeError("db down")):
             with self.assertRaises(HTTPException) as ctx:
                 await service.get_historical_candles(
                     symbol="NSE:INFY",
@@ -1142,6 +1316,88 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["attribution"]["source"], "algo_worker")
         self.assertEqual(call["attribution"]["metadata"]["strategy_run_id"], "run-worker-1")
         self.assertNotEqual(call["attribution"]["metadata"]["strategy_run_id"], "evil-run")
+
+    async def test_create_run_database_failure_returns_worker_safe_503(self):
+        repo = _FailingCreateRunRepository()
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await create_worker_run(
+                request,
+                WorkerRunCreateRequest(
+                    strategy_run_id="run-create-db-fail",
+                    template_id="demo-strategy",
+                    account_scope="kite:paper-a",
+                    execution_mode="dry_run",
+                ),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail, "Worker run persistence unavailable")
+
+    async def test_get_run_includes_backend_positions_field_for_paper_reconciliation(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-paper-positions"] = {
+            "strategy_run_id": "run-paper-positions",
+            "token_id": "worker-1",
+            "template_id": "demo-strategy",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {},
+            "metadata": {},
+        }
+        paper_runtime = SimpleNamespace(
+            get_strategy_run_pnl=AsyncMock(
+                return_value={
+                    "positions": [
+                        {
+                            "instrument_token": 408065,
+                            "exchange": "NSE",
+                            "tradingsymbol": "INFY",
+                            "product": "MIS",
+                            "net_quantity": 1,
+                        }
+                    ]
+                }
+            )
+        )
+        request = self._request(repo, paper_runtime=paper_runtime)
+
+        response = await get_worker_run(request, "run-paper-positions")
+
+        self.assertIn("positions", response)
+        self.assertEqual(response["positions"][0]["tradingsymbol"], "INFY")
+        self.assertEqual(response["backend_positions"], response["positions"])
+        self.assertEqual(response["backend_positions_status"], "available")
+        self.assertEqual(response["backend_positions_source"], "paper_runtime")
+
+    async def test_get_run_includes_empty_positions_for_dry_run_reconciliation(self):
+        repo = _FakeWorkerRepository()
+        repo.runs["run-dry-positions"] = {
+            "strategy_run_id": "run-dry-positions",
+            "token_id": "worker-1",
+            "template_id": "demo-strategy",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "dry_run",
+            "status": "open",
+            "summary_fields": [],
+            "risk_schema": [],
+            "allowed_actions": [],
+            "runtime_state": {},
+            "metadata": {},
+        }
+        request = self._request(repo)
+
+        response = await get_worker_run(request, "run-dry-positions")
+
+        self.assertEqual(response["positions"], [])
+        self.assertEqual(response["backend_positions"], [])
+        self.assertEqual(response["backend_positions_status"], "available")
+        self.assertEqual(response["backend_positions_source"], "dry_run")
 
     async def test_paper_run_rejects_live_account_scope(self):
         repo = _FakeWorkerRepository()
@@ -4101,7 +4357,7 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["strategy_run_id"], "run-claimed-no-heartbeat")
 
-    async def test_claim_session_returns_nonce_for_owned_run(self):
+    def test_claim_session_returns_nonce_for_owned_run(self):
         repo = _FakeWorkerRepository()
         repo.runs["run-claim-route"] = {
             "strategy_run_id": "run-claim-route",
@@ -4119,9 +4375,63 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
             is_disconnected=AsyncMock(return_value=False),
         )
 
-        response = await claim_worker_run_session(request, "run-claim-route")
+        response = asyncio.run(claim_worker_run_session(request, "run-claim-route"))
         self.assertEqual(response["strategy_run_id"], "run-claim-route")
         self.assertTrue(response["worker_session_nonce"])
+
+    def test_claim_session_endpoint_returns_nonce_for_owned_sqlalchemy_run(self):
+        from backend.api.routers import worker_auth as worker_auth_module
+
+        repo = _sqlite_algo_worker_repo()
+        with repo.session_factory() as db:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.algo_worker_tokens (
+                        token_id, name, token_hash, status, allowed_modes, allowed_actions,
+                        allowed_templates, account_scope
+                    ) VALUES (
+                        'worker-claim-endpoint', 'Worker', :token_hash, 'active',
+                        :allowed_modes, :allowed_actions, :allowed_templates, 'kite:paper-a'
+                    )
+                    """
+                ),
+                {
+                    "token_hash": _hash_token("secret-token"),
+                    "allowed_modes": json.dumps(["paper", "dry_run"]),
+                    "allowed_actions": json.dumps(["runs:create", "runs:read", "heartbeat"]),
+                    "allowed_templates": json.dumps([]),
+                },
+            )
+            db.execute(
+                text(
+                    """
+                    INSERT INTO public.algo_worker_runs (
+                        strategy_run_id, token_id, template_id, account_scope, execution_mode,
+                        status, runtime_state_json, metadata_json
+                    ) VALUES (
+                        'run-claim-endpoint', 'worker-claim-endpoint', 'sdk-mean-reversion',
+                        'kite:paper-a', 'dry_run', 'open', '{}', '{}'
+                    )
+                    """
+                )
+            )
+            db.commit()
+
+        app = FastAPI()
+        app.state.algo_worker_repository = repo
+        app.include_router(worker_auth_module.router, prefix="/api")
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/algo-workers/worker/runs/run-claim-endpoint/claim-session",
+            headers={"Authorization": "Bearer secret-token"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["strategy_run_id"], "run-claim-endpoint")
+        self.assertTrue(payload["worker_session_nonce"])
 
     async def test_submit_worker_intent_rejects_missing_session_nonce(self):
         repo = _FakeWorkerRepository()

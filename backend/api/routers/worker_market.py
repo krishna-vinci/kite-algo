@@ -10,6 +10,11 @@ from backend.api.routers.worker_shared import *
 
 router = APIRouter(prefix='/algo-workers', tags=['Algo Workers'])
 
+def _optional_query_datetime(value: Any) -> Optional[datetime]:
+    # FastAPI injects real datetimes during requests, but direct unit calls that
+    # omit Query(...) parameters receive the Query object default.
+    return value if isinstance(value, datetime) else None
+
 async def resolve_worker_market_ticker(request: Request, symbol: str):
     token = await require_worker_token(request)
     _require_action(token, "market:read")
@@ -75,17 +80,29 @@ async def get_worker_market_history(
     timeframe: str = "day",
     from_ts: Optional[datetime] = Query(None, alias="from"),
     to_ts: Optional[datetime] = Query(None, alias="to"),
+    from_date: Optional[datetime] = Query(None, alias="from_date"),
+    to_date: Optional[datetime] = Query(None, alias="to_date"),
     ingest: bool = True,
     passthrough: bool = False,
 ):
     token = await require_worker_token(request)
     _require_action(token, "market:read")
+    from_ts_value = _optional_query_datetime(from_ts)
+    to_ts_value = _optional_query_datetime(to_ts)
+    from_date_value = _optional_query_datetime(from_date)
+    to_date_value = _optional_query_datetime(to_date)
+    resolved_from = from_ts_value or from_date_value
+    resolved_to = to_ts_value or to_date_value
+    if from_ts_value is not None and from_date_value is not None and from_ts_value != from_date_value:
+        raise HTTPException(status_code=422, detail="Use only one of from or from_date")
+    if to_ts_value is not None and to_date_value is not None and to_ts_value != to_date_value:
+        raise HTTPException(status_code=422, detail="Use only one of to or to_date")
     return await _market_data_service(request).get_historical_candles(
         symbol=symbol,
         instrument_token=instrument_token,
         timeframe=timeframe,
-        from_date=from_ts,
-        to_date=to_ts,
+        from_date=resolved_from,
+        to_date=resolved_to,
         ingest=ingest,
         passthrough=passthrough,
         background_tasks=background_tasks,
@@ -131,6 +148,8 @@ async def get_worker_funds(request: Request, mode: str = Query("paper"), account
         raise HTTPException(status_code=400, detail="account_scope is required for worker funds")
     if not _token_allows_account_scope(token, scope):
         raise HTTPException(status_code=403, detail="Worker token cannot read this account scope")
+    from backend.api.routers.worker_protection import _build_worker_funds_snapshot
+
     return await _build_worker_funds_snapshot(request, account_scope=scope, mode=normalized_mode)
 
 async def get_worker_run_funds(request: Request, strategy_run_id: str):
@@ -143,6 +162,8 @@ async def get_worker_run_funds(request: Request, strategy_run_id: str):
     mode = str(run.get("execution_mode") or "paper").lower()
     if mode not in token.allowed_modes:
         raise HTTPException(status_code=403, detail="Worker token cannot read funds for this execution mode")
+    from backend.api.routers.worker_protection import _build_worker_run_funds_snapshot
+
     return await _build_worker_run_funds_snapshot(request, run)
 
 async def create_worker_gtt_trigger(request: Request, payload: Dict[str, Any]):

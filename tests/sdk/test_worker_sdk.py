@@ -11,7 +11,7 @@ from tests.support.test_support import install_dependency_stubs
 install_dependency_stubs(stub_kite_orders=False)
 sys.modules.pop("broker_api.orders", None)
 
-SDK_ROOT = Path(__file__).resolve().parents[1] / "sdk" / "python"
+SDK_ROOT = Path(__file__).resolve().parents[2] / "sdk" / "python"
 if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 
@@ -462,6 +462,7 @@ def test_safety_check_uses_new_endpoint(monkeypatch):
                 "strategy_run_id": "run-1",
                 "can_trade": True,
                 "run_status": "open",
+                "execution_mode": "paper",
                 "safety_token": "abc",
                 "token_expires_at": "2026-05-06T10:00:10Z",
                 "blocking_reasons": [],
@@ -477,6 +478,7 @@ def test_safety_check_uses_new_endpoint(monkeypatch):
 
     assert isinstance(result, SafetyCheckResult)
     assert result.can_trade is True
+    assert result.raw["execution_mode"] == "paper"
     assert calls[0][0] == "GET"
     assert calls[0][1] == "http://localhost:8000/api/algo-workers/worker/runs/run-1/safety-check"
 
@@ -659,6 +661,35 @@ def test_get_historical_candles_accepts_token(captured_requests):
         "passthrough": False,
         "instrument_token": 408065,
     }
+
+
+def test_get_historical_candles_supports_lookback_days(captured_requests):
+    client().get_historical_candles(
+        "NSE:INFY",
+        timeframe="day",
+        to_date="2024-12-31T00:00:00+00:00",
+        lookback_days=366,
+        passthrough=True,
+    )
+
+    assert captured_requests[0]["url"] == "http://localhost:8000/api/algo-workers/worker/market/history"
+    assert captured_requests[0]["kwargs"]["params"] == {
+        "timeframe": "day",
+        "ingest": True,
+        "passthrough": True,
+        "symbol": "NSE:INFY",
+        "to": "2024-12-31T00:00:00+00:00",
+        "from": "2023-12-31T00:00:00+00:00",
+    }
+
+
+def test_get_historical_candles_rejects_ambiguous_from_and_lookback():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        client().get_historical_candles(
+            "NSE:INFY",
+            from_date="2024-01-01T00:00:00+00:00",
+            lookback_days=10,
+        )
 
 
 def test_get_market_snapshot_uses_expected_endpoint(captured_requests):
@@ -1427,6 +1458,8 @@ def test_get_run_health_snapshot_is_typed(monkeypatch):
         lambda self, run_id: {
             "strategy_run_id": run_id,
             "status": "open",
+            "token_id": "worker-1",
+            "template_id": "mean-reversion",
             "execution_mode": "paper",
             "account_scope": "kite:paper-a",
             "heartbeat_age_sec": 42,
@@ -1444,6 +1477,7 @@ def test_get_run_health_snapshot_is_typed(monkeypatch):
     assert isinstance(snapshot, WorkerRunHealthSnapshot)
     assert snapshot.heartbeat_age_sec == 42
     assert snapshot.health_status == "healthy"
+    assert snapshot.raw["token_id"] == "worker-1"
 
 
 def test_gtt_helpers_use_worker_routes(monkeypatch):

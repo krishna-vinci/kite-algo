@@ -14,7 +14,7 @@ Workers must only call the public worker API through the Python SDK. Never call 
 ## Install
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.0
+python3 -m pip install kite-algo-worker==0.7.5
 ```
 
 ## Environment variables

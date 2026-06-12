@@ -470,7 +470,17 @@ def logout(response: Response, request: Request, db: Session = Depends(get_db)):
 
 
 @router.get("/profile_kite")
-def profile(kite: KiteConnect = Depends(get_kite)):
+def profile(request: Request, db: Session = Depends(get_db)):
+    require_app_user(request)
+    try:
+        kite = get_kite(request, db)
+    except HTTPException as exc:
+        if exc.status_code != 401:
+            raise
+        access_token = get_system_access_token(db)
+        if not access_token:
+            raise
+        kite = build_kite_client(access_token, session_id="system")
     return kite.profile()
 
 

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import logging
+import secrets
 import uuid
 from fastapi import APIRouter, HTTPException, Request
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from backend.algo_runtime.account_scope import parse_account_scope
 from backend.app.auth import require_app_user
 from backend.api.schemas.worker import WorkerTokenCreateRequest, WorkerTokenCreateResponse, WorkerTokenView, WorkerHeartbeatRequest, WorkerRunCreateRequest
 from backend.api.routers.worker_shared import *
 
 router = APIRouter(prefix='/algo-workers', tags=['Algo Workers'])
+logger = logging.getLogger(__name__)
 
 async def create_worker_token(request: Request, payload: WorkerTokenCreateRequest):
     require_app_user(request)
@@ -58,11 +63,15 @@ async def claim_worker_run_session(request: Request, strategy_run_id: str):
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
-    claimed = await _repo(request).claim_run_session(
-        strategy_run_id,
-        freshness_seconds=WORKER_SESSION_FRESHNESS_SECONDS,
-        claimed_without_heartbeat_seconds=WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
-    )
+    try:
+        claimed = await _repo(request).claim_run_session(
+            strategy_run_id,
+            freshness_seconds=WORKER_SESSION_FRESHNESS_SECONDS,
+            claimed_without_heartbeat_seconds=WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
+        )
+    except SQLAlchemyError as exc:
+        logger.exception("algo_worker_claim_session_database_failed", extra={"strategy_run_id": strategy_run_id})
+        raise HTTPException(status_code=503, detail="Worker session persistence unavailable") from exc
     if claimed is None:
         raise HTTPException(
             status_code=409,
@@ -157,6 +166,8 @@ async def create_worker_run(request: Request, payload: WorkerRunCreateRequest):
 
     runtime_state = dict(payload.runtime_state or {})
     if "backend_protection" in runtime_state:
+        from backend.api.routers.worker_protection import _initial_backend_protection_state, _normalized_backend_protection_runtime_state
+
         try:
             runtime_state["backend_protection"] = _normalized_backend_protection_runtime_state(
                 runtime_state.get("backend_protection"),
@@ -222,7 +233,74 @@ async def create_worker_run(request: Request, payload: WorkerRunCreateRequest):
             },
         )
 
-    return await _repo(request).create_run(token, payload, strategy_run_id=strategy_run_id)
+    try:
+        return await _repo(request).create_run(token, payload, strategy_run_id=strategy_run_id)
+    except IntegrityError as exc:
+        logger.warning(
+            "algo_worker_run_create_conflict",
+            extra={
+                "strategy_run_id": strategy_run_id,
+                "account_scope": payload.account_scope,
+                "execution_mode": payload.execution_mode,
+                "template_id": payload.template_id,
+            },
+        )
+        raise HTTPException(status_code=409, detail="Strategy run already exists") from exc
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "algo_worker_run_create_database_failed",
+            extra={
+                "strategy_run_id": strategy_run_id,
+                "account_scope": payload.account_scope,
+                "execution_mode": payload.execution_mode,
+                "template_id": payload.template_id,
+            },
+        )
+        raise HTTPException(status_code=503, detail="Worker run persistence unavailable") from exc
+
+
+async def _attach_worker_run_positions(request: Request, run: dict) -> dict:
+    enriched = dict(run)
+    strategy_run_id = str(enriched.get("strategy_run_id") or "")
+    execution_mode = str(enriched.get("execution_mode") or "").strip().lower()
+    account_scope = str(enriched.get("account_scope") or "")
+    positions = []
+    source = "none"
+    status = "available"
+
+    try:
+        if execution_mode == "paper":
+            paper_runtime = getattr(request.app.state, "paper_runtime_service", None)
+            if paper_runtime is not None and hasattr(paper_runtime, "get_strategy_run_pnl"):
+                pnl = await paper_runtime.get_strategy_run_pnl(account_scope, strategy_run_id)
+                if isinstance(pnl, dict):
+                    positions = list(pnl.get("positions") or pnl.get("legs") or [])
+                    source = "paper_runtime"
+            else:
+                source = "paper_runtime_unavailable"
+        elif execution_mode == "live":
+            positions = await _repo(request).list_live_strategy_broker_positions(
+                strategy_run_id=strategy_run_id,
+                account_id=account_scope,
+            )
+            source = "live_order_attribution"
+        else:
+            source = "dry_run"
+    except Exception as exc:
+        logger.warning(
+            "algo_worker_run_positions_unavailable",
+            extra={"strategy_run_id": strategy_run_id, "account_scope": account_scope, "execution_mode": execution_mode, "error": str(exc)},
+        )
+        positions = []
+        status = "unavailable"
+
+    serialized_positions = [_serialize_model(position) for position in positions]
+    enriched["positions"] = serialized_positions
+    enriched["backend_positions"] = serialized_positions
+    enriched["backend_positions_status"] = status
+    enriched["backend_positions_source"] = source
+    return enriched
+
 
 async def get_worker_run(request: Request, strategy_run_id: str):
     token = await require_worker_token(request)
@@ -231,7 +309,7 @@ async def get_worker_run(request: Request, strategy_run_id: str):
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
-    return _enrich_run_health_fields(run)
+    return await _attach_worker_run_positions(request, _enrich_run_health_fields(run))
 
 
 router.add_api_route("/tokens", create_worker_token, methods=["POST"], response_model=WorkerTokenCreateResponse)

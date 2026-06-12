@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-05-08
+Last updated: 2026-06-03
 
 ## Scope
 
@@ -24,6 +24,51 @@ Do not use this file for frontend work.
 - Added backend mutual fund router in `broker_api/kite_mutual_funds.py`
 
 ## Newly implemented in current branch
+
+- Clarified and hardened worker historical candle access in the SDK/API:
+  - kept `get_candles(...)` as the recent live/cache candle surface and documented that daily historical warmups should use `get_historical_candles(...)`
+  - added SDK `lookback_days` convenience for sync/async `get_historical_candles(...)` / typed snapshot helpers so workers can request daily history without manual date math
+  - accepted both `from`/`to` and `from_date`/`to_date` query aliases on `/api/algo-workers/worker/market/history`
+  - added focused SDK/API regression coverage and verified with `.venv/bin/python -m pytest` focused sync SDK, async SDK, and API history tests
+
+- Fixed worker run creation regression uncovered by end-to-end SDK dry-run setup:
+  - `create_worker_run(...)` now explicitly imports `parse_account_scope` and owns its logger instead of relying on `worker_shared.__all__`; this prevents `POST /api/algo-workers/worker/runs` from crashing before persistence
+  - repository `IntegrityError` on duplicate `strategy_run_id` is mapped to worker-safe 409, and SQLAlchemy persistence failures are mapped to worker-safe 503 with structured logging instead of raw 500 / disconnect
+  - `schema.sql` now backfills existing `algo_worker_runs` JSON columns (`summary_fields_json`, `risk_schema_json`, `allowed_actions_json`, `runtime_state_json`, `metadata_json`) for older databases where `CREATE TABLE IF NOT EXISTS` skipped newer columns
+  - focused verification: `.venv/bin/python -m pytest tests/api/test_algo_worker_api.py -k "create_run_database_failure or worker_can_create_paper_run or paper_run_rejects_live_account_scope or worker_market_history" -v` → `9 passed`; `.venv/bin/python -m pytest tests/sdk/test_worker_sdk.py -k "historical_candles or create_run" -v` → `9 passed`; `py_compile` for `backend/api/routers/worker_auth.py` passed
+
+- Added worker run backend-position payload for SDK reconciliation:
+  - `GET /api/algo-workers/worker/runs/{strategy_run_id}` now always includes `positions`, `backend_positions`, `backend_positions_status`, and `backend_positions_source`
+  - paper runs load strategy-scoped positions from `paper_runtime_service.get_strategy_run_pnl(...)`; dry-run returns an explicit empty list; live runs return persisted live attribution positions
+  - focused verification: `.venv/bin/python -m pytest tests/api/test_algo_worker_api.py -k "get_run_includes and positions or create_run_database_failure or worker_can_create_paper_run" -v` → `4 passed`; `py_compile` for `backend/api/routers/worker_auth.py` passed
+
+- Bumped the Python worker SDK package/docs version from `0.7.0` to `0.7.4` for PyPI publishing of the historical-candle helper and worker-run reconciliation fixes; `scripts/check_worker_sdk_version_refs.py` passes with `0.7.4`. The `0.7.1`/`0.7.2`/`0.7.3` tags exposed CI packaging/env/test-root issues before PyPI publish, so `0.7.4` carries the release plus workflow fixes that install `sdk/python` before focused SDK tests, set a Postgres-style `DATABASE_URL` during CI collection, and correct SDK test root discovery.
+
+- Investigated external worker SDK/API regression report against `kite-algo-worker==0.7.4` and fixed worker-facing crashes/empty market surfaces:
+  - restored worker router wildcard dependencies hidden by explicit `worker_shared.__all__` so stream CSV parsing, timeline serialization/query helpers, safety sentinel values, and worker protection helpers are available to mounted worker routers
+  - fixed `/worker/funds` and `/worker/runs/{strategy_run_id}/funds` `NameError` crashes by resolving the funds snapshot builders from the protection router at call time
+  - fixed `create_run(... runtime_state.backend_protection ...)` latent crash by resolving backend protection normalization helpers at call time
+  - added broker quote fallback for `/worker/market/quotes` when live runtime ticks are unavailable, so valid symbols can return Kite quote data instead of an empty quote map
+  - made `/worker/market/candles` expose the latest cached candle as `current` when no forming candle exists, preserving `is_stale=true` only for fully empty cache reads
+  - focused verification: `DATABASE_URL="postgresql://user:pass@localhost:5432/kite_test" .venv/bin/python -m pytest tests/api/test_algo_worker_api.py -k "worker_funds_returns_paper_account_summary or worker_run_funds_includes_allocation_remaining or current_falls_back or quotes_fall_back or tick_stream_parses_symbols" -q` → `5 passed`; `claim_session_returns_nonce_for_owned_run` focused test → `1 passed`; direct smoke tests for `safety_check` and `list_timeline` returned structured payloads; `py_compile` for changed worker modules passed
+
+- Prepared worker SDK/API follow-up fix release `0.7.5` for typed model and daily candle lifecycle regressions:
+  - SDK `SafetyCheckResult` and `WorkerRunHealthSnapshot` now tolerate backend-added fields via raw passthrough parsing, fixing `execution_mode` / `token_id` model parse failures
+  - worker session claim SQL now avoids PostgreSQL `::INTERVAL` bind parsing ambiguity by using `make_interval(...)`, and `claim_session` maps persistence failures to structured 503 instead of raw 500
+  - daily `/worker/market/candles` now derives a current day candle from broker quote OHLC when the live candle cache has no forming/current daily candle, making `get_current_candle(..., interval="day")` and the first `stream_candles(..., interval="day")` snapshot useful when quote access is available
+  - bumped SDK package/docs references to `0.7.5`; `scripts/check_worker_sdk_version_refs.py` passes
+  - focused verification: `DATABASE_URL="postgresql://user:pass@localhost:5432/kite_test" .venv/bin/python -m pytest tests/sdk/test_worker_sdk.py -k "safety_check or health_snapshot" -q` → `2 passed`; API candle/funds regressions → `5 passed`; `py_compile` for changed backend/SDK modules passed
+
+- Tightened remaining worker backend-only `0.7.5` retest issues without requiring another SDK publish:
+  - worker session claim now computes stale cutoffs in Python and binds timestamp values directly, avoiding provider-specific interval expression failures in the `claim_session` UPDATE path
+  - daily current-candle fallback now runs even when no candle reader is installed and can derive the daily current candle from an existing market-runtime tick before trying broker quote OHLC, with historical day storage as a final local fallback
+  - first `stream_candles(..., interval="day")` snapshot uses the same `get_candles(..., interval="day")` fallback path, so it can return current/latest daily data when ticks/quote/history are available
+  - focused verification: `DATABASE_URL="postgresql://user:pass@localhost:5432/kite_test" .venv/bin/python -m pytest tests/api/test_algo_worker_api.py -k "day_current_uses or current_falls_back or claim_session_returns_nonce_for_owned_run" -q` → `4 passed`; `py_compile` for changed claim/market modules passed
+
+- Fixed the isolated remaining worker lifecycle `claim_session(...)` 500 root cause:
+  - `worker_auth.py` imported `WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS` via `worker_shared.*`, but `worker_shared.__all__` omitted that underscored lifecycle constant after wildcard export hardening, causing `NameError` only when the claim route executed
+  - exported `WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS` from `worker_shared.__all__` and added an endpoint-level SQLAlchemy-backed regression test so the route exercises the real token lookup + repository claim path instead of only a fake repository call
+  - focused verification: `DATABASE_URL="postgresql://user:pass@localhost:5432/kite_test" .venv/bin/python -m pytest tests/api/test_algo_worker_api.py -k "claim_session_endpoint_returns_nonce or claim_session_returns_nonce_for_owned_run" -q` → `2 passed`; `py_compile` for `worker_shared.py` and `worker_auth.py` passed
 
 - Implemented Spec 10 worker product completion and helper polish:
   - added worker-token-authenticated, account-scoped GTT passthrough routes:

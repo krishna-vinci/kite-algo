@@ -579,6 +579,9 @@ class SqlAlchemyAlgoWorkerRepository:
     ) -> Optional[Dict[str, Any]]:
         db = self.session_factory()
         try:
+            now = _utcnow()
+            heartbeat_stale_before = now - timedelta(seconds=max(1, int(freshness_seconds)))
+            claim_stale_before = now - timedelta(seconds=max(1, int(claimed_without_heartbeat_seconds)))
             row = db.execute(
                 text(
                     """
@@ -591,12 +594,12 @@ class SqlAlchemyAlgoWorkerRepository:
                         worker_session_nonce IS NULL
                         OR (
                           last_heartbeat_at IS NOT NULL
-                          AND last_heartbeat_at < NOW() - (CAST(:freshness_seconds AS TEXT) || ' seconds')::INTERVAL
+                          AND last_heartbeat_at < :heartbeat_stale_before
                         )
                         OR (
                           last_heartbeat_at IS NULL
                           AND worker_session_claimed_at IS NOT NULL
-                          AND worker_session_claimed_at < NOW() - (CAST(:claimed_without_heartbeat_seconds AS TEXT) || ' seconds')::INTERVAL
+                          AND worker_session_claimed_at < :claim_stale_before
                         )
                       )
                     RETURNING *
@@ -605,8 +608,8 @@ class SqlAlchemyAlgoWorkerRepository:
                 {
                     "strategy_run_id": strategy_run_id,
                     "nonce": f"wsn_{uuid.uuid4().hex}",
-                    "freshness_seconds": max(1, int(freshness_seconds)),
-                    "claimed_without_heartbeat_seconds": max(1, int(claimed_without_heartbeat_seconds)),
+                    "heartbeat_stale_before": heartbeat_stale_before,
+                    "claim_stale_before": claim_stale_before,
                 },
             ).fetchone()
             db.commit()
