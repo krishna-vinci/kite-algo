@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import Mock, patch
 
 from tests.support.test_support import install_dependency_stubs
 
@@ -14,6 +15,7 @@ from backend.broker_api.instruments.index_ingestion import (
     compute_live_weight,
     compute_points_contribution,
     index_refresh_is_due,
+    get_index_refresh_state,
     normalize_source_list,
     parse_constituent_csv,
     parse_top_holdings_csv,
@@ -66,6 +68,22 @@ class IndexIngestionHelpersTests(unittest.TestCase):
         nifty500 = {"last_success_at": None, "complete": False, "last_error": "download failed"}
         self.assertFalse(index_refresh_is_due(nifty50, month_key=now_month))
         self.assertTrue(index_refresh_is_due(nifty500, month_key=now_month))
+
+    def test_status_lookup_never_runs_runtime_schema_ddl(self):
+        connection = Mock()
+        expected = {"source_list": "Nifty500", "complete": False}
+        with (
+            patch(
+                "backend.broker_api.instruments.index_ingestion.get_db_connection",
+                return_value=connection,
+            ),
+            patch(
+                "backend.broker_api.instruments.index_ingestion._load_refresh_state_row",
+                return_value=expected,
+            ),
+        ):
+            self.assertEqual(get_index_refresh_state("Nifty500"), expected)
+        connection.close.assert_called_once()
 
 
 if __name__ == "__main__":

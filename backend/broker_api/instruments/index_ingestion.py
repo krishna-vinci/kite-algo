@@ -252,46 +252,6 @@ class NseDataClient:
         return dict(payload or {})
 
 
-def ensure_index_ingestion_schema(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS isin_code VARCHAR(32)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS series VARCHAR(32)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS source_url TEXT")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS weight_source VARCHAR(128)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS points_contribution NUMERIC(18, 4)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS last_refreshed_at TIMESTAMP WITH TIME ZONE")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_close NUMERIC(18, 6)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_index_weight NUMERIC(10, 4)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_freefloat_marketcap NUMERIC(20, 2)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_ff_factor NUMERIC(24, 10)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_as_of_date DATE")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS needs_weight_review BOOLEAN NOT NULL DEFAULT FALSE")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS public.index_refresh_state (
-                source_list VARCHAR(255) PRIMARY KEY,
-                last_constituent_refresh_at TIMESTAMP WITH TIME ZONE,
-                last_live_refresh_at TIMESTAMP WITH TIME ZONE,
-                added_symbols_json TEXT,
-                removed_symbols_json TEXT,
-                needs_review BOOLEAN NOT NULL DEFAULT FALSE,
-                last_error TEXT,
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            )
-            """
-        )
-        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS official_source_url TEXT")
-        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS source_checksum CHAR(64)")
-        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS expected_member_count INTEGER")
-        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS actual_member_count INTEGER")
-        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS complete BOOLEAN NOT NULL DEFAULT FALSE")
-        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP WITH TIME ZONE")
-        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMP WITH TIME ZONE")
-        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS last_failure_at TIMESTAMP WITH TIME ZONE")
-        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMP WITH TIME ZONE")
-    conn.commit()
-
-
 def _load_instrument_map(conn, symbols: Sequence[str]) -> Dict[str, Dict[str, Any]]:
     if not symbols:
         return {}
@@ -389,7 +349,6 @@ def get_index_refresh_state(source_list: str) -> Dict[str, Any]:
     normalized = normalize_source_list(source_list)
     conn = get_db_connection()
     try:
-        ensure_index_ingestion_schema(conn)
         return _load_refresh_state_row(conn, normalized)
     finally:
         conn.close()
@@ -402,7 +361,6 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
     client = client or NseDataClient()
     conn = get_db_connection()
     try:
-        ensure_index_ingestion_schema(conn)
         constituent_csv = client.fetch_text(config.constituent_csv_url, referer="https://www.nseindia.com/all-reports/", use_nse=True)
         constituents = parse_constituent_csv(constituent_csv)
         source_checksum = hashlib.sha256(constituent_csv.encode("utf-8")).hexdigest()
@@ -563,7 +521,6 @@ def apply_manual_baseline_seed(
     client = client or NseDataClient()
     conn = get_db_connection()
     try:
-        ensure_index_ingestion_schema(conn)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 "SELECT instrument_token, tradingsymbol, close, baseline_close, baseline_ff_factor FROM public.kite_ticker_tickers WHERE source_list = %s",
@@ -798,7 +755,6 @@ def refresh_live_metrics(source_list: str, *, client: Optional[NseDataClient] = 
     client = client or NseDataClient()
     conn = get_db_connection()
     try:
-        ensure_index_ingestion_schema(conn)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
@@ -902,7 +858,6 @@ def ensure_fresh_live_metrics(source_list: str, *, max_age_seconds: int = 900) -
     normalized = normalize_source_list(source_list)
     conn = get_db_connection()
     try:
-        ensure_index_ingestion_schema(conn)
         with conn.cursor() as cur:
             cur.execute("SELECT MAX(last_updated) FROM public.kite_ticker_tickers WHERE source_list = %s", (normalized,))
             row = cur.fetchone()
@@ -1004,7 +959,6 @@ def get_worker_index_snapshot(source_list: str) -> Dict[str, Any]:
     status = get_worker_index_status(normalized)
     conn = get_db_connection()
     try:
-        ensure_index_ingestion_schema(conn)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""SELECT instrument_token,tradingsymbol,exchange,company_name,series,source_url,last_refreshed_at
                 FROM public.kite_ticker_tickers WHERE source_list=%s ORDER BY exchange,tradingsymbol,instrument_token""", (normalized,))
