@@ -97,7 +97,7 @@ async def get_worker_market_history(
         raise HTTPException(status_code=422, detail="Use only one of from or from_date")
     if to_ts_value is not None and to_date_value is not None and to_ts_value != to_date_value:
         raise HTTPException(status_code=422, detail="Use only one of to or to_date")
-    return await _market_data_service(request).get_historical_candles(
+    response = await _market_data_service(request).get_historical_candles(
         symbol=symbol,
         instrument_token=instrument_token,
         timeframe=timeframe,
@@ -107,6 +107,22 @@ async def get_worker_market_history(
         passthrough=passthrough,
         background_tasks=background_tasks,
     )
+    if str(response.get("timeframe") or "").lower() != "day":
+        return response
+    from backend.app.database import get_db_connection
+    from backend.broker_api.market.exchange_calendar import CalendarUnavailable, assess_daily_completeness, get_calendar_sessions
+    start_day = resolved_from.date() if resolved_from else datetime.fromisoformat(str(response["from"])).date()
+    end_day = resolved_to.date() if resolved_to else datetime.fromisoformat(str(response["to"])).date()
+    conn = get_db_connection()
+    try:
+        calendar = await asyncio.to_thread(get_calendar_sessions, conn, exchange="NSE", segment="CM", from_date=start_day, to_date=end_day)
+    except CalendarUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"rejection_reason": str(exc)}) from exc
+    finally:
+        conn.close()
+    ingestion = response.get("ingestion") or {}
+    response.update(assess_daily_completeness(response.get("candles") or [], calendar, ingestion_status=str(ingestion.get("status") or "unknown")))
+    return response
 
 async def stream_worker_market_candles(
     request: Request,
