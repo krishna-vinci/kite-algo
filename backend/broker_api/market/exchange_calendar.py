@@ -4,7 +4,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List
 
 CSV_SCHEMA_VERSION = "nse_cm_sessions_v1"
@@ -109,3 +109,33 @@ def get_calendar_sessions(conn: Any, *, exchange: str, segment: str, from_date: 
     if len(rows) != (to_date - from_date).days + 1 or not all(row[4] for row in rows):
         raise CalendarUnavailable("CALENDAR_RANGE_UNCOVERED")
     return {"schema_version": 1, "source": "operator_imported_official_nse_document", "source_as_of": rows[-1][6].astimezone(timezone.utc).isoformat(), "retrieved_at": datetime.now(timezone.utc).isoformat(), "exchange": exchange, "segment": segment, "calendar_version": int(version), "sessions": [{"session_date": row[0].isoformat(), "session_type": row[1], "opens_at": row[2].isoformat() if row[2] else None, "closes_at": row[3].isoformat() if row[3] else None, "verified": row[4], "source_reference": row[5]} for row in rows]}
+
+
+def assess_daily_completeness(candles: List[Dict[str, Any]], calendar: Dict[str, Any], *, now: datetime | None = None, finality_delay_seconds: int = 900, ingestion_status: str = "completed") -> Dict[str, Any]:
+    """Assess daily candles exclusively against imported verified sessions."""
+    now = now or datetime.now(timezone.utc)
+    expected = [item for item in calendar["sessions"] if item["session_type"] in {"REGULAR", "SPECIAL"}]
+    dates = []
+    for candle in candles:
+        raw = candle.get("timestamp") or candle.get("ts")
+        if not raw:
+            continue
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        dates.append(parsed.date().isoformat())
+    actual_dates = set(dates)
+    expected_dates = [item["session_date"] for item in expected]
+    missing = sorted(set(expected_dates) - actual_dates)
+    duplicate = sorted({item for item in dates if dates.count(item) > 1})
+    last_final = False
+    if expected:
+        last = expected[-1]
+        close = time.fromisoformat(str(last["closes_at"]))
+        close_at = datetime.combine(date.fromisoformat(last["session_date"]), close, tzinfo=timezone(timedelta(hours=5, minutes=30))).astimezone(timezone.utc)
+        last_final = now >= close_at + timedelta(seconds=finality_delay_seconds) and ingestion_status in {"completed", "up_to_date"}
+    complete = not missing and not duplicate and last_final and ingestion_status in {"completed", "up_to_date"}
+    reasons = []
+    if missing: reasons.append("MISSING_SESSIONS")
+    if duplicate: reasons.append("DUPLICATE_SESSIONS")
+    if not last_final: reasons.append("LAST_CANDLE_NOT_FINAL")
+    if ingestion_status not in {"completed", "up_to_date"}: reasons.append("INGESTION_INCOMPLETE")
+    return {"calendar_version": calendar["calendar_version"], "expected_sessions": len(expected_dates), "actual_sessions": len(actual_dates), "missing_sessions": missing, "duplicate_sessions": duplicate, "last_candle_final": last_final, "ingestion_status": ingestion_status, "complete": complete, "completeness_reasons": reasons}
