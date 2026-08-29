@@ -975,10 +975,12 @@ def get_worker_index_snapshot(source_list: str) -> Dict[str, Any]:
     complete = bool(status["complete"])
     if not complete:
         raise RuntimeError("INDEX_UNIVERSE_INCOMPLETE")
+    effective_date = str(status["source_as_of"])[:10]
     return {
         "schema_version": 1,
         "source": status["source"],
         "source_as_of": status["source_as_of"],
+        "effective_date": effective_date,
         "retrieved_at": datetime.now(timezone.utc).isoformat(),
         "source_list": normalized,
         "complete": True,
