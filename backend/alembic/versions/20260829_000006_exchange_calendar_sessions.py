@@ -15,10 +15,14 @@ depends_on = None
 def upgrade() -> None:
     op.execute("""CREATE TABLE public.exchange_calendar_source_documents (
         source_document_id BIGSERIAL PRIMARY KEY, exchange TEXT NOT NULL, segment TEXT NOT NULL,
-        official_source_reference TEXT NOT NULL, content_sha256 CHAR(64) NOT NULL, parser_version TEXT NOT NULL,
+        official_source_reference TEXT NOT NULL,
+        official_source_document_sha256 CHAR(64) NOT NULL,
+        canonical_csv_sha256 CHAR(64) NOT NULL,
+        parser_version TEXT NOT NULL,
         calendar_version BIGINT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL,
         imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), supersedes_calendar_version BIGINT,
-        UNIQUE(exchange, segment, calendar_version), UNIQUE(exchange, segment, content_sha256))""")
+        UNIQUE(exchange, segment, calendar_version),
+        UNIQUE(exchange, segment, official_source_document_sha256, canonical_csv_sha256))""")
     op.execute("""CREATE TABLE public.exchange_calendar_sessions (
         exchange TEXT NOT NULL, segment TEXT NOT NULL, session_date DATE NOT NULL, calendar_version BIGINT NOT NULL,
         session_type TEXT NOT NULL CHECK (session_type IN ('REGULAR','HOLIDAY','SPECIAL')), opens_at TIME, closes_at TIME,

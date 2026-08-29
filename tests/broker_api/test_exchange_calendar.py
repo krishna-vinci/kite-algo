@@ -1,6 +1,8 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from backend.broker_api.market.exchange_calendar import CSV_SCHEMA_VERSION, assess_daily_completeness, dry_run_import, parse_canonical_csv, sha256_text
+import pytest
+
+from backend.broker_api.market.exchange_calendar import CSV_SCHEMA_VERSION, CalendarSchemaMigrationRequired, assess_daily_completeness, dry_run_import, get_calendar_sessions, import_calendar_csv, parse_canonical_csv, sha256_text
 
 
 CSV = """session_date,session_type,opens_at,closes_at,verified
@@ -11,10 +13,41 @@ CSV = """session_date,session_type,opens_at,closes_at,verified
 
 
 def test_canonical_import_requires_audited_source_metadata_and_dry_run():
-    preview = dry_run_import(CSV, source_reference="https://www.nseindia.com/example-circular", sha256=sha256_text(CSV), parser_version=CSV_SCHEMA_VERSION, actor="operator@example", reason="official circular import")
+    official_source_checksum = "a" * 64
+    preview = dry_run_import(CSV, source_reference="https://www.nseindia.com/example-circular", official_source_document_sha256=official_source_checksum, parser_version=CSV_SCHEMA_VERSION, actor="operator@example", reason="official circular import")
     assert preview["dry_run"] is True
     assert preview["session_count"] == 3
     assert preview["sessions"][2]["session_type"] == "SPECIAL"
+    assert preview["official_source_document_sha256"] == official_source_checksum
+    assert preview["canonical_csv_sha256"] == sha256_text(CSV)
+    assert preview["canonical_csv_sha256"] != official_source_checksum
+
+
+class _MissingSchemaCursor:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, *_args):
+        return None
+
+    def fetchone(self):
+        return (None, None)
+
+
+class _MissingSchemaConnection:
+    def cursor(self):
+        return _MissingSchemaCursor()
+
+
+def test_apply_and_read_fail_clearly_when_alembic_schema_is_absent():
+    connection = _MissingSchemaConnection()
+    with pytest.raises(CalendarSchemaMigrationRequired, match="EXCHANGE_CALENDAR_SCHEMA_MIGRATION_REQUIRED"):
+        import_calendar_csv(connection, CSV, exchange="NSE", segment="CM", source_reference="https://www.nseindia.com/example-circular", official_source_document_sha256="b" * 64, parser_version=CSV_SCHEMA_VERSION, actor="operator@example", reason="official circular import", apply=True)
+    with pytest.raises(CalendarSchemaMigrationRequired, match="EXCHANGE_CALENDAR_SCHEMA_MIGRATION_REQUIRED"):
+        get_calendar_sessions(connection, exchange="NSE", segment="CM", from_date=date(2026, 8, 28), to_date=date(2026, 8, 28))
 
 
 def test_unverified_or_ambiguous_rows_are_rejected():
