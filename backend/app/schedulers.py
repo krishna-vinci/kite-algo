@@ -10,6 +10,7 @@ from backend.app.database import SessionLocal
 from backend.broker_api.broker_api import run_headless_login_and_persist_system_token
 from backend.broker_api.instruments.index_ingestion import (
     get_index_refresh_state,
+    index_refresh_is_due,
     list_supported_index_source_lists,
     refresh_live_metrics_for_indices,
     refresh_supported_indices,
@@ -122,14 +123,9 @@ async def _schedule_daily_token_refresh() -> None:
 async def _schedule_monthly_index_refresh() -> None:
     tz = ZoneInfo("Asia/Kolkata")
     source_lists = list_supported_index_source_lists()
-    persisted_month = None
     set_component_status("index_refresh_scheduler", "healthy", detail="Monthly index refresh scheduler started")
     while True:
         try:
-            persisted_state = await asyncio.to_thread(get_index_refresh_state, "Nifty50")
-            persisted_refresh_at = persisted_state.get("last_constituent_refresh_at")
-            if persisted_refresh_at:
-                persisted_month = persisted_refresh_at.astimezone(tz).strftime("%Y-%m")
             now = datetime.now(tz)
             next_run = now.replace(hour=6, minute=30, second=0, microsecond=0)
             if now >= next_run:
@@ -140,31 +136,34 @@ async def _schedule_monthly_index_refresh() -> None:
                 {
                     "next_run": next_run.isoformat(),
                     "sleep_seconds": sleep_sec,
-                    "last_success_month": persisted_month,
                     "source_lists": source_lists,
                 },
             )
             heartbeat(
                 "index_refresh_scheduler",
                 detail="Scheduler sleeping until next refresh window",
-                meta={"next_run": next_run.isoformat(), "last_success_month": persisted_month},
+                meta={"next_run": next_run.isoformat(), "source_lists": source_lists},
             )
             await asyncio.sleep(sleep_sec)
 
             month_key = datetime.now(tz).strftime("%Y-%m")
-            if month_key == persisted_month:
+            due_lists = []
+            for source_list in source_lists:
+                state = await asyncio.to_thread(get_index_refresh_state, source_list)
+                if index_refresh_is_due(state, month_key=month_key):
+                    due_lists.append(source_list)
+            if not due_lists:
                 continue
 
-            set_component_status("index_refresh_scheduler", "running", detail=f"Refreshing official index datasets for {month_key}")
-            result = await asyncio.to_thread(refresh_supported_indices, source_lists)
+            set_component_status("index_refresh_scheduler", "running", detail=f"Refreshing official index datasets for {due_lists}")
+            result = await asyncio.to_thread(refresh_supported_indices, due_lists)
             if result.get("status") == "error":
                 raise RuntimeError(json.dumps(result))
-            runtime_result = await asyncio.to_thread(refresh_live_metrics_for_indices, source_lists)
+            runtime_result = await asyncio.to_thread(refresh_live_metrics_for_indices, due_lists)
 
             set_meta(
                 "index_refresh_scheduler",
                 {
-                    "last_success_month": month_key,
                     "last_success_at": datetime.utcnow().isoformat(),
                     "last_result": result,
                     "last_runtime_result": runtime_result,
@@ -182,7 +181,7 @@ async def _schedule_monthly_index_refresh() -> None:
                 {
                     "last_failure_at": datetime.utcnow().isoformat(),
                     "last_error": str(e),
-                    "last_success_month": persisted_month,
+                    "last_success_month": None,
                 },
             )
             await asyncio.sleep(300)

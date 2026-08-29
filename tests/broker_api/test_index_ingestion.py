@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 
 from tests.support.test_support import install_dependency_stubs
 
@@ -12,6 +13,7 @@ from backend.broker_api.instruments.index_ingestion import (
     compute_baseline_ff_factor,
     compute_live_weight,
     compute_points_contribution,
+    index_refresh_is_due,
     normalize_source_list,
     parse_constituent_csv,
     parse_top_holdings_csv,
@@ -57,6 +59,13 @@ class IndexIngestionHelpersTests(unittest.TestCase):
 
     def test_default_niftybank_manual_baseline_contains_hdfcbank(self):
         self.assertEqual(NIFTYBANK_MANUAL_BASELINES["HDFCBANK"]["weight"], 25.77)
+
+    def test_nifty500_failure_is_due_even_when_nifty50_succeeded_this_month(self):
+        now_month = "2026-08"
+        nifty50 = {"last_success_at": datetime(2026, 8, 1, tzinfo=timezone.utc), "complete": True, "last_error": None}
+        nifty500 = {"last_success_at": None, "complete": False, "last_error": "download failed"}
+        self.assertFalse(index_refresh_is_due(nifty50, month_key=now_month))
+        self.assertTrue(index_refresh_is_due(nifty500, month_key=now_month))
 
 
 if __name__ == "__main__":
