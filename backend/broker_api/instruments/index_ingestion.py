@@ -927,6 +927,10 @@ def get_worker_index_status(source_list: str) -> Dict[str, Any]:
     normalized = normalize_source_list(source_list)
     state = get_index_refresh_state(normalized)
     refreshed = state.get("last_success_at") or state.get("last_constituent_refresh_at")
+    requires_weight_review = normalized in {SOURCE_LIST_NIFTY50, SOURCE_LIST_NIFTYBANK}
+    review_blocked = requires_weight_review and bool(
+        state.get("needs_review") or state.get("pending_review_count")
+    )
     return {
         "schema_version": 1,
         "source": state.get("official_source_url") or "nse_official_constituent_csv",
@@ -939,7 +943,7 @@ def get_worker_index_status(source_list: str) -> Dict[str, Any]:
         "expected_member_count": state.get("expected_member_count"),
         "actual_member_count": state.get("actual_member_count"),
         "checksum": state.get("source_checksum"),
-        "complete": bool(state.get("complete") and refreshed and not state.get("last_error") and not state.get("needs_review") and not state.get("pending_review_count")),
+        "complete": bool(state.get("complete") and refreshed and not state.get("last_error") and not review_blocked),
     }
 
 

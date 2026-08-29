@@ -11,11 +11,13 @@ from backend.broker_api.instruments.index_ingestion import (
     NIFTYBANK_MANUAL_BASELINES,
     SOURCE_LIST_NIFTY50,
     SOURCE_LIST_NIFTYBANK,
+    SOURCE_LIST_NIFTY500,
     compute_baseline_ff_factor,
     compute_live_weight,
     compute_points_contribution,
     index_refresh_is_due,
     get_index_refresh_state,
+    get_worker_index_status,
     normalize_source_list,
     parse_constituent_csv,
     parse_top_holdings_csv,
@@ -84,6 +86,21 @@ class IndexIngestionHelpersTests(unittest.TestCase):
         ):
             self.assertEqual(get_index_refresh_state("Nifty500"), expected)
         connection.close.assert_called_once()
+
+    def test_nifty500_readiness_does_not_require_legacy_weight_review(self):
+        base = {
+            "last_success_at": datetime(2026, 8, 29, tzinfo=timezone.utc),
+            "complete": True,
+            "last_error": None,
+            "needs_review": True,
+            "pending_review_count": 500,
+        }
+        with patch(
+            "backend.broker_api.instruments.index_ingestion.get_index_refresh_state",
+            return_value=base,
+        ):
+            self.assertTrue(get_worker_index_status(SOURCE_LIST_NIFTY500)["complete"])
+            self.assertFalse(get_worker_index_status(SOURCE_LIST_NIFTY50)["complete"])
 
 
 if __name__ == "__main__":
