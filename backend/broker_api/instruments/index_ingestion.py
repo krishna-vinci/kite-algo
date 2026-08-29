@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -279,6 +280,15 @@ def ensure_index_ingestion_schema(conn) -> None:
             )
             """
         )
+        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS official_source_url TEXT")
+        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS source_checksum CHAR(64)")
+        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS expected_member_count INTEGER")
+        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS actual_member_count INTEGER")
+        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS complete BOOLEAN NOT NULL DEFAULT FALSE")
+        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP WITH TIME ZONE")
+        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMP WITH TIME ZONE")
+        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS last_failure_at TIMESTAMP WITH TIME ZONE")
+        cur.execute("ALTER TABLE public.index_refresh_state ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMP WITH TIME ZONE")
     conn.commit()
 
 
@@ -395,6 +405,7 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
         ensure_index_ingestion_schema(conn)
         constituent_csv = client.fetch_text(config.constituent_csv_url, referer="https://www.nseindia.com/all-reports/", use_nse=True)
         constituents = parse_constituent_csv(constituent_csv)
+        source_checksum = hashlib.sha256(constituent_csv.encode("utf-8")).hexdigest()
         symbols = [row["symbol"] for row in constituents]
         instrument_map = _load_instrument_map(conn, symbols)
         existing_rows = _load_existing_rows(conn, normalized)
@@ -486,6 +497,12 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
                 needs_review=bool(added_symbols or removed_symbols or any(row["needs_weight_review"] for row in prepared_rows)),
                 constituent_refresh_at=now_utc,
             )
+            cur.execute(
+                """UPDATE public.index_refresh_state SET official_source_url=%s, source_checksum=%s,
+                    expected_member_count=%s, actual_member_count=%s, complete=%s, last_attempt_at=%s,
+                    last_success_at=%s, last_failure_at=NULL, next_attempt_at=NULL, last_error=NULL WHERE source_list=%s""",
+                (config.constituent_csv_url, source_checksum, len(constituents), len(prepared_rows), len(constituents) == len(prepared_rows), now_utc, now_utc, normalized),
+            )
         conn.commit()
 
         if normalized == SOURCE_LIST_NIFTY50:
@@ -512,6 +529,12 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
                 needs_review=True,
                 last_error=str(exc),
             )
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE public.index_refresh_state SET complete=FALSE, last_attempt_at=NOW(),
+                        last_failure_at=NOW(), next_attempt_at=NOW() + INTERVAL '5 minutes' WHERE source_list=%s""",
+                    (normalized,),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -948,21 +971,32 @@ def get_worker_index_status(source_list: str) -> Dict[str, Any]:
     """Return per-list readiness without treating another index as evidence."""
     normalized = normalize_source_list(source_list)
     state = get_index_refresh_state(normalized)
-    refreshed = state.get("last_constituent_refresh_at")
+    refreshed = state.get("last_success_at") or state.get("last_constituent_refresh_at")
     return {
         "schema_version": 1,
-        "source": "nse_official_constituent_csv",
+        "source": state.get("official_source_url") or "nse_official_constituent_csv",
         "source_as_of": refreshed.isoformat() if refreshed else None,
         "retrieved_at": datetime.now(timezone.utc).isoformat(),
         "source_list": normalized,
         "last_success_at": refreshed.isoformat() if refreshed else None,
         "last_failure": state.get("last_error"),
-        "next_attempt_at": None,
-        "expected_member_count": None,
-        "actual_member_count": None,
-        "checksum": None,
-        "complete": bool(refreshed and not state.get("last_error") and not state.get("needs_review") and not state.get("pending_review_count")),
+        "next_attempt_at": state.get("next_attempt_at").isoformat() if state.get("next_attempt_at") else None,
+        "expected_member_count": state.get("expected_member_count"),
+        "actual_member_count": state.get("actual_member_count"),
+        "checksum": state.get("source_checksum"),
+        "complete": bool(state.get("complete") and refreshed and not state.get("last_error") and not state.get("needs_review") and not state.get("pending_review_count")),
     }
+
+
+def index_refresh_is_due(state: Mapping[str, Any], *, month_key: str, timezone_name: str = "Asia/Kolkata") -> bool:
+    """A list is ready only after its own complete success in the current month."""
+    refreshed = state.get("last_success_at") or state.get("last_constituent_refresh_at")
+    if not refreshed or not bool(state.get("complete")) or state.get("last_error"):
+        return True
+    if getattr(refreshed, "tzinfo", None) is None:
+        refreshed = refreshed.replace(tzinfo=timezone.utc)
+    from zoneinfo import ZoneInfo
+    return refreshed.astimezone(ZoneInfo(timezone_name)).strftime("%Y-%m") != month_key
 
 
 def get_worker_index_snapshot(source_list: str) -> Dict[str, Any]:
