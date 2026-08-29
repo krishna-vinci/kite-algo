@@ -942,3 +942,55 @@ def refresh_live_metrics_for_indices(source_lists: Optional[Iterable[str]] = Non
         "results": results,
         "failures": failures,
     }
+
+
+def get_worker_index_status(source_list: str) -> Dict[str, Any]:
+    """Return per-list readiness without treating another index as evidence."""
+    normalized = normalize_source_list(source_list)
+    state = get_index_refresh_state(normalized)
+    refreshed = state.get("last_constituent_refresh_at")
+    return {
+        "schema_version": 1,
+        "source": "nse_official_constituent_csv",
+        "source_as_of": refreshed.isoformat() if refreshed else None,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "source_list": normalized,
+        "last_success_at": refreshed.isoformat() if refreshed else None,
+        "last_failure": state.get("last_error"),
+        "next_attempt_at": None,
+        "expected_member_count": None,
+        "actual_member_count": None,
+        "checksum": None,
+        "complete": bool(refreshed and not state.get("last_error") and not state.get("needs_review") and not state.get("pending_review_count")),
+    }
+
+
+def get_worker_index_snapshot(source_list: str) -> Dict[str, Any]:
+    normalized = normalize_source_list(source_list)
+    status = get_worker_index_status(normalized)
+    conn = get_db_connection()
+    try:
+        ensure_index_ingestion_schema(conn)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""SELECT instrument_token,tradingsymbol,exchange,company_name,series,source_url,last_refreshed_at
+                FROM public.kite_ticker_tickers WHERE source_list=%s ORDER BY exchange,tradingsymbol,instrument_token""", (normalized,))
+            members = [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+    identities = [(row.get("exchange"), row.get("tradingsymbol"), row.get("instrument_token")) for row in members]
+    if not members or len(identities) != len(set(identities)):
+        raise RuntimeError("INDEX_UNIVERSE_INCOMPLETE")
+    complete = bool(status["complete"])
+    if not complete:
+        raise RuntimeError("INDEX_UNIVERSE_INCOMPLETE")
+    return {
+        "schema_version": 1,
+        "source": status["source"],
+        "source_as_of": status["source_as_of"],
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "source_list": normalized,
+        "complete": True,
+        "member_count": len(members),
+        "checksum": status["checksum"],
+        "members": members,
+    }
