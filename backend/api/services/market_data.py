@@ -352,6 +352,10 @@ class WorkerMarketDataService:
                 for rec in records
             ]
             source = "kite_passthrough"
+            ingestion = {
+                "status": "completed",
+                "message": "Synchronous broker passthrough completed without cache ingestion",
+            }
         else:
             if ingest:
                 try:

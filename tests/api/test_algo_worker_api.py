@@ -1103,6 +1103,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(response["candles"][0]["ts"], "2024-01-01T09:15:00+05:30")
+        self.assertEqual(response["ingestion"]["status"], "completed")
 
     async def test_worker_market_history_rejects_unbounded_passthrough_range(self):
         service = WorkerMarketDataService(
