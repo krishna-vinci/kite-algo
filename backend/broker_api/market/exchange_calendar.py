@@ -130,7 +130,8 @@ def assess_daily_completeness(candles: List[Dict[str, Any]], calendar: Dict[str,
         if not raw:
             continue
         parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        dates.append(parsed.date().isoformat())
+        ist = timezone(timedelta(hours=5, minutes=30))
+        dates.append(parsed.astimezone(ist).date().isoformat())
     actual_dates = set(dates)
     expected_dates = [item["session_date"] for item in expected]
     missing = sorted(set(expected_dates) - actual_dates)
