@@ -1,7 +1,10 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi import HTTPException
 
+from backend.api.routers.worker_market import _require_schema_version
+from backend.api.schemas.investment_worker import PortfolioSnapshotResponse
 from backend.broker_api.account.portfolio_snapshot import PortfolioSnapshotUnavailable, build_portfolio_snapshot
 
 
@@ -47,3 +50,14 @@ def test_snapshot_rejects_duplicate_holdings():
 
     with pytest.raises(PortfolioSnapshotUnavailable, match="duplicate"):
         build_portfolio_snapshot(DuplicateKite(), "kite:TEST")
+
+
+def test_v1_envelope_rejects_unknown_schema_version():
+    with pytest.raises(HTTPException) as exc:
+        _require_schema_version(2)
+    assert exc.value.status_code == 422
+
+
+def test_portfolio_response_requires_the_v1_envelope_fields():
+    snapshot = build_portfolio_snapshot(FakeKite(), "kite:TEST")
+    assert PortfolioSnapshotResponse.model_validate(snapshot).schema_version == 1
