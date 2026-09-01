@@ -21,10 +21,39 @@ from backend.broker_api.instruments.index_ingestion import (
     normalize_source_list,
     parse_constituent_csv,
     parse_top_holdings_csv,
+    _resolve_nse_instrument_map,
 )
 
 
 class IndexIngestionHelpersTests(unittest.TestCase):
+    def test_nse_series_symbol_wins_over_exact_bse_symbol(self):
+        resolved = _resolve_nse_instrument_map(
+            [{"symbol": "SCHNEIDER", "series": "EQ"}],
+            [
+                ("SCHNEIDER", 136739588, "BSE"),
+                ("SCHNEIDER-BE", 7996929, "NSE"),
+            ],
+        )
+
+        self.assertEqual(
+            resolved["SCHNEIDER"],
+            {
+                "tradingsymbol": "SCHNEIDER-BE",
+                "instrument_token": 7996929,
+                "exchange": "NSE",
+            },
+        )
+
+    def test_ambiguous_nse_series_symbols_fail_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "Ambiguous NSE instrument mapping"):
+            _resolve_nse_instrument_map(
+                [{"symbol": "DEMO", "series": "EQ"}],
+                [
+                    ("DEMO-BE", 101, "NSE"),
+                    ("DEMO-SM", 202, "NSE"),
+                ],
+            )
+
     def test_parse_constituent_csv_extracts_official_fields(self):
         rows = parse_constituent_csv(
             "Company Name,Industry,Symbol,Series,ISIN Code\n"

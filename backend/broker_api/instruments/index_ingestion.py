@@ -252,7 +252,54 @@ class NseDataClient:
         return dict(payload or {})
 
 
-def _load_instrument_map(conn, symbols: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+def _resolve_nse_instrument_map(
+    constituents: Sequence[Mapping[str, Any]],
+    rows: Sequence[Sequence[Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Resolve official NSE symbols to one current NSE instrument-master row.
+
+    Kite may suffix a cash-market trading symbol when the security moves to a
+    different series (for example ``SCHNEIDER-BE``).  An NSE index must never
+    fall back to an exact BSE symbol merely because the NSE row is suffixed.
+    """
+
+    candidates: Dict[str, List[Dict[str, Any]]] = {}
+    for tradingsymbol, instrument_token, exchange in rows:
+        if str(exchange).strip().upper() != "NSE":
+            continue
+        value = {
+            "tradingsymbol": str(tradingsymbol),
+            "instrument_token": instrument_token,
+            "exchange": "NSE",
+        }
+        for item in constituents:
+            official_symbol = str(item.get("symbol") or "").strip()
+            if tradingsymbol == official_symbol or str(tradingsymbol).startswith(
+                f"{official_symbol}-"
+            ):
+                candidates.setdefault(official_symbol, []).append(value)
+
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for item in constituents:
+        official_symbol = str(item.get("symbol") or "").strip()
+        matches = candidates.get(official_symbol, [])
+        exact = [item for item in matches if item["tradingsymbol"] == official_symbol]
+        selected = exact if exact else matches
+        if len(selected) > 1:
+            symbols = ", ".join(sorted(str(item["tradingsymbol"]) for item in selected))
+            raise RuntimeError(
+                f"Ambiguous NSE instrument mapping for {official_symbol}: {symbols}"
+            )
+        if selected:
+            resolved[official_symbol] = selected[0]
+    return resolved
+
+
+def _load_instrument_map(
+    conn, constituents: Sequence[Mapping[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    symbols = [str(item.get("symbol") or "").strip() for item in constituents]
+    symbols = [symbol for symbol in symbols if symbol]
     if not symbols:
         return {}
     with conn.cursor() as cur:
@@ -261,21 +308,13 @@ def _load_instrument_map(conn, symbols: Sequence[str]) -> Dict[str, Dict[str, An
             SELECT tradingsymbol, instrument_token, exchange
             FROM kite_instruments
             WHERE instrument_type = 'EQ'
-              AND exchange IN ('NSE', 'BSE')
-              AND tradingsymbol = ANY(%s)
-            ORDER BY tradingsymbol,
-                     CASE WHEN exchange = 'NSE' THEN 0 ELSE 1 END,
-                     instrument_token
+              AND exchange = 'NSE'
+              AND (tradingsymbol = ANY(%s) OR tradingsymbol LIKE ANY(%s))
+            ORDER BY tradingsymbol, instrument_token
             """,
-            (list(symbols),),
+            (symbols, [f"{symbol}-%" for symbol in symbols]),
         )
-        instrument_map: Dict[str, Dict[str, Any]] = {}
-        for row in cur.fetchall():
-            instrument_map.setdefault(
-                row[0],
-                {"tradingsymbol": row[0], "instrument_token": row[1], "exchange": row[2]},
-            )
-        return instrument_map
+        return _resolve_nse_instrument_map(constituents, cur.fetchall())
 
 
 def _load_existing_rows(conn, source_list: str) -> Dict[str, Dict[str, Any]]:
@@ -364,11 +403,13 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
         constituent_csv = client.fetch_text(config.constituent_csv_url, referer="https://www.nseindia.com/all-reports/", use_nse=True)
         constituents = parse_constituent_csv(constituent_csv)
         source_checksum = hashlib.sha256(constituent_csv.encode("utf-8")).hexdigest()
-        symbols = [row["symbol"] for row in constituents]
-        instrument_map = _load_instrument_map(conn, symbols)
+        instrument_map = _load_instrument_map(conn, constituents)
         existing_rows = _load_existing_rows(conn, normalized)
         old_symbols = set(existing_rows.keys())
-        new_symbols = {symbol for symbol in symbols if symbol in instrument_map}
+        new_symbols = {
+            str(instrument["tradingsymbol"])
+            for instrument in instrument_map.values()
+        }
         added_symbols = sorted(new_symbols - old_symbols)
         removed_symbols = sorted(old_symbols - new_symbols)
         now_utc = datetime.now(timezone.utc)
@@ -381,16 +422,17 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
             if not instrument:
                 unmatched_symbols.append(symbol)
                 continue
-            existing = existing_rows.get(symbol, {})
+            resolved_symbol = str(instrument["tradingsymbol"])
+            existing = existing_rows.get(resolved_symbol, {})
             needs_review = bool(existing.get("needs_weight_review"))
-            if symbol in added_symbols:
+            if resolved_symbol in added_symbols:
                 needs_review = True
             if normalized in {SOURCE_LIST_NIFTY50, SOURCE_LIST_NIFTYBANK} and existing.get("baseline_ff_factor") is None:
                 needs_review = True
             prepared_rows.append(
                 {
                     "instrument_token": instrument["instrument_token"],
-                    "tradingsymbol": symbol,
+                    "tradingsymbol": resolved_symbol,
                     "company_name": item["company_name"],
                     "sector": item["industry"] or existing.get("sector"),
                     "exchange": instrument.get("exchange") or existing.get("exchange") or "NSE",
@@ -422,8 +464,14 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
                 }
             )
 
-        if not prepared_rows:
-            raise RuntimeError(f"No constituents prepared for {normalized}; keeping previous snapshot")
+        if unmatched_symbols:
+            raise RuntimeError(
+                f"Unmatched NSE constituents for {normalized}: {', '.join(sorted(unmatched_symbols))}"
+            )
+        if not prepared_rows or any(row["exchange"] != "NSE" for row in prepared_rows):
+            raise RuntimeError(
+                f"No complete NSE constituent snapshot prepared for {normalized}; keeping previous snapshot"
+            )
 
         with conn.cursor() as cur:
             cur.execute("DELETE FROM public.kite_ticker_tickers WHERE source_list = %s", (normalized,))
