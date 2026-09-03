@@ -674,14 +674,24 @@ class WorkerMarketDataService:
         return value
 
     async def _get_system_kite_client(self) -> Any:
-        from backend.broker_api.market.candles_api import get_kite_db
         from backend.app.database import SessionLocal
+        from backend.broker_api.session.kite_session import KiteSession, build_kite_client
 
         db = SessionLocal()
         try:
-            return await get_kite_db(db)
+            system_session = db.query(KiteSession).filter_by(session_id="system").first()
+            access_token = (
+                str(system_session.access_token).strip()
+                if system_session is not None and system_session.access_token
+                else ""
+            )
         finally:
+            db.rollback()
             db.close()
+
+        if not access_token:
+            raise HTTPException(status_code=401, detail="Not authenticated; login first")
+        return build_kite_client(access_token, session_id="system")
 
     def _unpack_candle_series(self, raw: Any) -> tuple[List[Any], Any]:
         if isinstance(raw, dict):

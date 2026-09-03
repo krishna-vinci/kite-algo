@@ -6,7 +6,7 @@ import sys
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -526,6 +526,71 @@ def _test_client(*, repo, market_data_service=None):
 
 
 class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_system_kite_client_releases_database_before_client_build(self):
+        events = []
+        fake_session = SimpleNamespace(access_token=" token-123 ")
+
+        class FakeQuery:
+            def filter_by(self, **kwargs):
+                self.filter_kwargs = kwargs
+                return self
+
+            def first(self):
+                events.append("read")
+                return fake_session
+
+        class FakeDb:
+            def query(self, model):
+                self.model = model
+                return FakeQuery()
+
+            def rollback(self):
+                events.append("rollback")
+
+            def close(self):
+                events.append("close")
+
+        fake_db = FakeDb()
+        expected_client = object()
+
+        def build_client(access_token, *, session_id):
+            events.append("build")
+            self.assertEqual(access_token, "token-123")
+            self.assertEqual(session_id, "system")
+            self.assertEqual(events, ["read", "rollback", "close", "build"])
+            return expected_client
+
+        service = WorkerMarketDataService()
+        with (
+            patch("backend.app.database.SessionLocal", return_value=fake_db),
+            patch(
+                "backend.broker_api.session.kite_session.build_kite_client",
+                side_effect=build_client,
+            ),
+        ):
+            client = await service._get_system_kite_client()
+
+        self.assertIs(client, expected_client)
+
+    async def test_system_kite_client_rejects_missing_token_after_releasing_database(self):
+        fake_query = SimpleNamespace(
+            filter_by=lambda **kwargs: SimpleNamespace(first=lambda: None)
+        )
+        fake_db = SimpleNamespace(
+            query=lambda model: fake_query,
+            rollback=Mock(),
+            close=Mock(),
+        )
+
+        service = WorkerMarketDataService()
+        with patch("backend.app.database.SessionLocal", return_value=fake_db):
+            with self.assertRaises(HTTPException) as raised:
+                await service._get_system_kite_client()
+
+        self.assertEqual(raised.exception.status_code, 401)
+        fake_db.rollback.assert_called_once_with()
+        fake_db.close.assert_called_once_with()
+
     def _request(self, repo, *, paper_runtime=None, raw_token="secret-token"):
         return SimpleNamespace(
             headers={"authorization": f"Bearer {raw_token}"},
