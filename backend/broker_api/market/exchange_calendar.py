@@ -141,11 +141,12 @@ def assess_daily_completeness(candles: List[Dict[str, Any]], calendar: Dict[str,
         last = expected[-1]
         close = time.fromisoformat(str(last["closes_at"]))
         close_at = datetime.combine(date.fromisoformat(last["session_date"]), close, tzinfo=timezone(timedelta(hours=5, minutes=30))).astimezone(timezone.utc)
-        last_final = now >= close_at + timedelta(seconds=finality_delay_seconds) and ingestion_status in {"completed", "up_to_date"}
-    complete = not missing and not duplicate and last_final and ingestion_status in {"completed", "up_to_date"}
+        last_final = now >= close_at + timedelta(seconds=finality_delay_seconds)
+    ingestion_settled = ingestion_status in {"completed", "up_to_date", "disabled"}
+    complete = not missing and not duplicate and last_final and ingestion_settled
     reasons = []
     if missing: reasons.append("MISSING_SESSIONS")
     if duplicate: reasons.append("DUPLICATE_SESSIONS")
     if not last_final: reasons.append("LAST_CANDLE_NOT_FINAL")
-    if ingestion_status not in {"completed", "up_to_date"}: reasons.append("INGESTION_INCOMPLETE")
+    if not ingestion_settled: reasons.append("INGESTION_INCOMPLETE")
     return {"calendar_version": calendar["calendar_version"], "expected_sessions": len(expected_dates), "actual_sessions": len(actual_dates), "missing_sessions": missing, "duplicate_sessions": duplicate, "last_candle_final": last_final, "ingestion_status": ingestion_status, "complete": complete, "completeness_reasons": reasons}

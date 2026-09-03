@@ -76,3 +76,16 @@ def test_daily_completeness_fails_on_missing_or_nonfinal_session():
     result = assess_daily_completeness([], calendar, now=datetime(2026, 8, 28, 9, 0, tzinfo=timezone.utc), ingestion_status="triggered")
     assert result["complete"] is False
     assert "MISSING_SESSIONS" in result["completeness_reasons"]
+
+
+def test_daily_completeness_accepts_complete_cached_read_with_ingestion_disabled():
+    calendar = {"calendar_version": 7, "sessions": [{"session_date": "2026-08-28", "session_type": "REGULAR", "closes_at": "15:30:00"}]}
+    result = assess_daily_completeness(
+        [{"timestamp": "2026-08-28T15:30:00+05:30"}],
+        calendar,
+        now=datetime(2026, 8, 28, 11, 0, tzinfo=timezone.utc),
+        ingestion_status="disabled",
+    )
+    assert result["complete"] is True
+    assert result["last_candle_final"] is True
+    assert result["completeness_reasons"] == []
