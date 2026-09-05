@@ -5,6 +5,7 @@ import asyncio
 import sys
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -4962,6 +4963,138 @@ def test_worker_run_pnl_websocket_rejects_invalid_interval_seconds():
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/api/algo-workers/worker/ws/runs/run-1/pnl?token=secret-token&interval_seconds=abc"):
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Investment read-route contract locks (kite-algo-worker SDK 0.7.6)
+# ---------------------------------------------------------------------------
+
+from backend.api.routers.worker_market import router as worker_market_router  # noqa: E402
+
+_WORKER_API_FIXTURES = Path(__file__).parent.parent / "fixtures" / "worker_api" / "v1"
+_INVESTMENT_AUTH = {"Authorization": "Bearer secret-token"}
+
+
+def _worker_api_fixture(name):
+    return json.loads((_WORKER_API_FIXTURES / name).read_text())
+
+
+def _investment_client(repo):
+    app = FastAPI()
+    app.include_router(worker_market_router, prefix="/api")
+    app.state.algo_worker_repository = repo
+    return TestClient(app)
+
+
+def test_worker_index_constituents_route_locks_v1_contract():
+    repo = _FakeWorkerRepository(raw_token="secret-token")
+    fixture = _worker_api_fixture("nifty500_constituents.json")
+    with _investment_client(repo) as client:
+        with patch(
+            "backend.broker_api.instruments.index_ingestion.get_worker_index_snapshot",
+            return_value=dict(fixture),
+        ):
+            response = client.get(
+                "/api/algo-workers/worker/market/indices/Nifty500",
+                headers=_INVESTMENT_AUTH,
+            )
+    assert response.status_code == 200
+    constituent_payload = response.json()
+    assert constituent_payload["schema_version"] == 1
+    assert constituent_payload["source_list"] == "Nifty500"
+    assert constituent_payload["complete"] is True
+    assert all(member["exchange"] == "NSE" for member in constituent_payload["members"])
+
+
+def test_worker_index_status_route_locks_v1_contract():
+    repo = _FakeWorkerRepository(raw_token="secret-token")
+    fixture = _worker_api_fixture("nifty500_status.json")
+    with _investment_client(repo) as client:
+        with patch(
+            "backend.broker_api.instruments.index_ingestion.get_worker_index_status",
+            return_value=dict(fixture),
+        ):
+            response = client.get(
+                "/api/algo-workers/worker/market/indices/Nifty500/status",
+                headers=_INVESTMENT_AUTH,
+            )
+    assert response.status_code == 200
+    status_payload = response.json()
+    assert status_payload["schema_version"] == 1
+    assert status_payload["source_list"] == "Nifty500"
+    assert status_payload["complete"] is True
+    assert status_payload["actual_member_count"] == 500
+
+
+def test_worker_market_calendar_route_locks_v1_contract():
+    repo = _FakeWorkerRepository(raw_token="secret-token")
+    fixture = _worker_api_fixture("calendar.json")
+    fake_conn = Mock()
+    with _investment_client(repo) as client:
+        with (
+            patch("backend.app.database.get_db_connection", return_value=fake_conn),
+            patch(
+                "backend.broker_api.market.exchange_calendar.get_calendar_sessions",
+                return_value=dict(fixture),
+            ) as sessions_mock,
+        ):
+            response = client.get(
+                "/api/algo-workers/worker/market/calendar?from=2026-09-01&to=2026-12-31&exchange=NSE&segment=CM",
+                headers=_INVESTMENT_AUTH,
+            )
+    assert response.status_code == 200
+    calendar_payload = response.json()
+    assert calendar_payload["schema_version"] == 1
+    assert calendar_payload["exchange"] == "NSE"
+    assert calendar_payload["segment"] == "CM"
+    assert calendar_payload["calendar_version"] >= 1
+    assert isinstance(calendar_payload["sessions"], list) and calendar_payload["sessions"]
+    assert calendar_payload["sessions"][0]["session_type"] == "REGULAR"
+    assert sessions_mock.call_args.kwargs["exchange"] == "NSE"
+    assert sessions_mock.call_args.kwargs["segment"] == "CM"
+
+
+def test_worker_account_portfolio_route_locks_v1_contract():
+    repo = _FakeWorkerRepository(raw_token="secret-token")
+    fixture = _worker_api_fixture("portfolio_success.json")
+    with _investment_client(repo) as client:
+        with (
+            patch(
+                "backend.api.routers.worker_market._load_live_kite_for_worker_account_scope",
+                new=AsyncMock(return_value=object()),
+            ),
+            patch(
+                "backend.broker_api.account.portfolio_snapshot.build_portfolio_snapshot",
+                return_value=dict(fixture),
+            ) as snapshot_mock,
+        ):
+            response = client.get(
+                "/api/algo-workers/worker/account/portfolio",
+                headers=_INVESTMENT_AUTH,
+            )
+    assert response.status_code == 200
+    portfolio_payload = response.json()
+    assert portfolio_payload["schema_version"] == 1
+    assert portfolio_payload["account_scope"] == "kite:SANITIZED"
+    assert portfolio_payload["coherent"] is True
+    assert portfolio_payload["coherence_skew_ms"] >= 0
+    assert portfolio_payload["funds"]["equity"]["available"]["cash"] == 50000
+    assert snapshot_mock.call_args.args[1] == "kite:paper-a"
+
+
+def test_worker_investment_read_routes_reject_unsupported_schema_version():
+    repo = _FakeWorkerRepository(raw_token="secret-token")
+    routes = [
+        "/api/algo-workers/worker/market/indices/Nifty500",
+        "/api/algo-workers/worker/market/indices/Nifty500/status",
+        "/api/algo-workers/worker/market/calendar?from=2026-09-01&to=2026-12-31",
+        "/api/algo-workers/worker/account/portfolio",
+    ]
+    with _investment_client(repo) as client:
+        for route in routes:
+            response = client.get(f"{route}&schema_version=2" if "?" in route else f"{route}?schema_version=2", headers=_INVESTMENT_AUTH)
+            assert response.status_code == 422, route
+            assert response.json()["detail"]["rejection_reason"] == "UNSUPPORTED_SCHEMA_VERSION", route
 
 
 if __name__ == "__main__":
