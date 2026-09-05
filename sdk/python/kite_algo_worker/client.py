@@ -9,6 +9,12 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 import requests
 
 from .exceptions import KiteAlgoWorkerError, error_for_status
+from .fundamentals import (
+    FundamentalFeatures,
+    FundamentalsStatements,
+    FundamentalsStatus,
+    FundamentalsSyncRun,
+)
 from .investment import (
     WorkerAccountPortfolioSnapshot,
     WorkerIndexConstituentStatus,
@@ -78,6 +84,21 @@ def _require_identity_param(value: Any, *, field_name: str) -> str:
     if not text:
         raise ValueError(f"{field_name} is required")
     return text
+
+
+def _fundamentals_scope_params(symbols: Optional[Iterable[str]], index: Optional[str]) -> JsonDict:
+    """Validate the exclusive symbols/index scope shared by fundamentals methods."""
+    if bool(symbols) == bool(index):
+        raise ValueError("provide exactly one of 'symbols' or 'index'")
+    if symbols:
+        cleaned = [str(s).strip().upper() for s in symbols if str(s).strip()]
+        if not cleaned:
+            raise ValueError("symbols must not be empty when provided")
+        return {"symbols": cleaned}
+    index_text = str(index or "").strip()
+    if not index_text:
+        raise ValueError("index must not be empty when provided")
+    return {"index": index_text}
 
 
 def _normalize_calendar_date_params(from_date: Any, to_date: Any, *, exchange: Any, segment: Any) -> JsonDict:
@@ -451,6 +472,61 @@ class KiteAlgoWorkerClient:
             self.get_account_portfolio(account_scope=account_scope, schema_version=schema_version)
         )
 
+    # -- Fundamentals (0.7.7; read-only except refresh_fundamentals) --------
+
+    def get_fundamentals_features(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None) -> FundamentalFeatures:
+        """Typed fundamentals feature snapshot for symbols or an index universe."""
+        params = _fundamentals_scope_params(symbols, index)
+        params["schema_version"] = 1
+        return FundamentalFeatures.model_validate(
+            self._request_api_root("GET", "fundamentals/features", params=params)
+        )
+
+    def get_fundamentals_status(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None) -> FundamentalsStatus:
+        """Per-symbol fundamentals freshness plus recent sync-run history."""
+        params = _fundamentals_scope_params(symbols, index)
+        params["schema_version"] = 1
+        return FundamentalsStatus.model_validate(
+            self._request_api_root("GET", "fundamentals/status", params=params)
+        )
+
+    def get_fundamentals_statements(self, symbol: str, *, dataset: str, statement_scope: str = "consolidated") -> FundamentalsStatements:
+        """Raw statement rows for one symbol and dataset (e.g. ``quarterly``)."""
+        symbol_text = _require_identity_param(symbol, field_name="symbol")
+        if not str(dataset).strip():
+            raise ValueError("dataset is required")
+        return FundamentalsStatements.model_validate(
+            self._request_api_root(
+                "GET",
+                "fundamentals/statements",
+                params={
+                    "symbol": symbol_text.upper(),
+                    "dataset": dataset,
+                    "statement_scope": statement_scope,
+                    "schema_version": 1,
+                },
+            )
+        )
+
+    def refresh_fundamentals(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None, mode: str = "incremental") -> FundamentalsSyncRun:
+        """Trigger an on-demand fundamentals sync. This is the only mutating
+        fundamentals method: the server caps symbol scopes at 50 per request
+        and single-flights syncs (409 when one is already running)."""
+        if bool(symbols) == bool(index):
+            raise ValueError("provide exactly one of 'symbols' or 'index'")
+        body: JsonDict = {"mode": mode}
+        if symbols:
+            cleaned = [str(s).strip().upper() for s in symbols if str(s).strip()]
+            if not cleaned:
+                raise ValueError("symbols must not be empty when provided")
+            body["symbols"] = cleaned
+        else:
+            index_text = str(index or "").strip()
+            if not index_text:
+                raise ValueError("index must not be empty when provided")
+            body["index"] = index_text
+        return FundamentalsSyncRun.model_validate(self._request_api_root("POST", "fundamentals/sync", json=body))
+
     def stream_run_pnl(self, strategy_run_id: str, *, interval_seconds: float = 1.0) -> Iterator[JsonDict]:
         return self._stream_sse(
             "GET",
@@ -779,7 +855,16 @@ class KiteAlgoWorkerClient:
         return f"{base}{prefix}{suffix}"
 
     def _request(self, method: str, path: str, **kwargs: Any) -> JsonDict:
-        response = self.session.request(method, self._url(path), timeout=self.config.timeout, **kwargs)
+        return self._request_url(method, self._url(path), **kwargs)
+
+    def _request_api_root(self, method: str, path: str, **kwargs: Any) -> JsonDict:
+        """Request a path relative to the server API root (outside the
+        ``/algo-workers`` worker prefix, e.g. ``fundamentals/features``)."""
+        base = self.config.base_url.rstrip("/")
+        return self._request_url(method, f"{base}/{path.lstrip('/')}", **kwargs)
+
+    def _request_url(self, method: str, url: str, **kwargs: Any) -> JsonDict:
+        response = self.session.request(method, url, timeout=self.config.timeout, **kwargs)
         if 200 <= response.status_code < 300:
             if response.status_code == 204 or not response.content:
                 return {}
@@ -788,7 +873,7 @@ class KiteAlgoWorkerClient:
             except ValueError:
                 return {"raw": response.text}
 
-        self._raise_response_error(response, method, path)
+        self._raise_response_error(response, method, url)
         raise AssertionError("unreachable")
 
     @staticmethod

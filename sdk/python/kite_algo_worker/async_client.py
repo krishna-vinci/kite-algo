@@ -6,8 +6,14 @@ from datetime import datetime
 from importlib import import_module
 from typing import Any, Dict, Iterable, Mapping, Optional
 
-from .client import AlgoWorkerConfig, JsonDict, _build_historical_date_params, _normalize_calendar_date_params, _require_identity_param
+from .client import AlgoWorkerConfig, JsonDict, _build_historical_date_params, _fundamentals_scope_params, _normalize_calendar_date_params, _require_identity_param
 from .exceptions import error_for_status
+from .fundamentals import (
+    FundamentalFeatures,
+    FundamentalsStatements,
+    FundamentalsStatus,
+    FundamentalsSyncRun,
+)
 from .investment import (
     WorkerAccountPortfolioSnapshot,
     WorkerIndexConstituentStatus,
@@ -145,6 +151,61 @@ class AsyncKiteAlgoWorkerClient:
         return WorkerAccountPortfolioSnapshot.model_validate(
             await self.get_account_portfolio(account_scope=account_scope, schema_version=schema_version)
         )
+
+    # -- Fundamentals (0.7.7; read-only except refresh_fundamentals) --------
+
+    async def get_fundamentals_features(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None) -> FundamentalFeatures:
+        """Typed fundamentals feature snapshot for symbols or an index universe."""
+        params = _fundamentals_scope_params(symbols, index)
+        params["schema_version"] = 1
+        return FundamentalFeatures.model_validate(
+            await self._request_api_root("GET", "fundamentals/features", params=params)
+        )
+
+    async def get_fundamentals_status(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None) -> FundamentalsStatus:
+        """Per-symbol fundamentals freshness plus recent sync-run history."""
+        params = _fundamentals_scope_params(symbols, index)
+        params["schema_version"] = 1
+        return FundamentalsStatus.model_validate(
+            await self._request_api_root("GET", "fundamentals/status", params=params)
+        )
+
+    async def get_fundamentals_statements(self, symbol: str, *, dataset: str, statement_scope: str = "consolidated") -> FundamentalsStatements:
+        """Raw statement rows for one symbol and dataset (e.g. ``quarterly``)."""
+        symbol_text = _require_identity_param(symbol, field_name="symbol")
+        if not str(dataset).strip():
+            raise ValueError("dataset is required")
+        return FundamentalsStatements.model_validate(
+            await self._request_api_root(
+                "GET",
+                "fundamentals/statements",
+                params={
+                    "symbol": symbol_text.upper(),
+                    "dataset": dataset,
+                    "statement_scope": statement_scope,
+                    "schema_version": 1,
+                },
+            )
+        )
+
+    async def refresh_fundamentals(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None, mode: str = "incremental") -> FundamentalsSyncRun:
+        """Trigger an on-demand fundamentals sync. This is the only mutating
+        fundamentals method: the server caps symbol scopes at 50 per request
+        and single-flights syncs (409 when one is already running)."""
+        if bool(symbols) == bool(index):
+            raise ValueError("provide exactly one of 'symbols' or 'index'")
+        body: JsonDict = {"mode": mode}
+        if symbols:
+            cleaned = [str(s).strip().upper() for s in symbols if str(s).strip()]
+            if not cleaned:
+                raise ValueError("symbols must not be empty when provided")
+            body["symbols"] = cleaned
+        else:
+            index_text = str(index or "").strip()
+            if not index_text:
+                raise ValueError("index must not be empty when provided")
+            body["index"] = index_text
+        return FundamentalsSyncRun.model_validate(await self._request_api_root("POST", "fundamentals/sync", json=body))
 
     async def place_gtt(self, payload: Mapping[str, Any]) -> JsonDict:
         return await self._request("POST", "/worker/gtt/triggers", json=dict(payload))
@@ -386,7 +447,16 @@ class AsyncKiteAlgoWorkerClient:
         return f"{base}{prefix}{suffix}"
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> JsonDict:
-        response = await self.client.request(method, self._url(path), **kwargs)
+        return await self._request_url(method, self._url(path), **kwargs)
+
+    async def _request_api_root(self, method: str, path: str, **kwargs: Any) -> JsonDict:
+        """Request a path relative to the server API root (outside the
+        ``/algo-workers`` worker prefix, e.g. ``fundamentals/features``)."""
+        base = self.config.base_url.rstrip("/")
+        return await self._request_url(method, f"{base}/{path.lstrip('/')}", **kwargs)
+
+    async def _request_url(self, method: str, url: str, **kwargs: Any) -> JsonDict:
+        response = await self.client.request(method, url, **kwargs)
         if 200 <= response.status_code < 300:
             if response.status_code == 204 or not response.content:
                 return {}
@@ -399,7 +469,7 @@ class AsyncKiteAlgoWorkerClient:
             body: Any = response.json()
         except ValueError:
             body = {"raw": response.text}
-        raise error_for_status(response.status_code, body, fallback=f"Worker API returned {response.status_code} for {method} {path}")
+        raise error_for_status(response.status_code, body, fallback=f"Worker API returned {response.status_code} for {method} {url}")
 
 
 __all__ = ["AsyncKiteAlgoWorkerClient"]

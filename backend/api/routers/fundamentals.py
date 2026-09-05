@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -29,6 +30,11 @@ from fundamentals.ingestion import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["fundamentals"])
+
+
+def _envelope() -> dict:
+    """Shared read-envelope fields, consistent with the 0.7.6 contracts."""
+    return {"schema_version": 1, "source": "screener", "retrieved_at": datetime.now(timezone.utc).isoformat()}
 
 
 class SyncRequest(BaseModel):
@@ -115,7 +121,7 @@ def sync_status(symbols: Optional[List[str]] = Query(None), index: Optional[str]
     finally:
         conn.close()
     found = {row["symbol"] for row in rows}
-    return {"schema_version": 1, "source": "screener",
+    return {**_envelope(),
             "symbols": rows,
             "missing_symbols": [s for s in wanted if s not in found],
             "recent_runs": runs}
@@ -138,7 +144,7 @@ def features(symbols: Optional[List[str]] = Query(None), index: Optional[str] = 
         if row.get("scraped_at"):
             row["scraped_at"] = row["scraped_at"].isoformat()
     found = {row["symbol"] for row in rows}
-    return {"schema_version": 1, "source": "screener", "features": rows,
+    return {**_envelope(), "features": rows,
             "missing_symbols": [s for s in wanted if s not in found]}
 
 
@@ -166,7 +172,7 @@ def statements(symbol: str, dataset: str, statement_scope: str = "consolidated")
         conn.close()
     if not rows:
         raise HTTPException(404, f"no {dataset} rows stored for {symbol} ({statement_scope})")
-    return {"schema_version": 1, "source": "screener", "symbol": symbol,
+    return {**_envelope(), "symbol": symbol,
             "statement_scope": statement_scope, "dataset": dataset, "rows": rows}
 
 

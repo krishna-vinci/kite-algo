@@ -16,6 +16,15 @@ from .exceptions import (
     UnsupportedSchemaVersionError,
     WorkerDataUnavailableError,
 )
+from .fundamentals import (
+    FundamentalFeatureRow,
+    FundamentalFeatures,
+    FundamentalsEnvelope,
+    FundamentalsStatus,
+    FundamentalsStatements,
+    FundamentalsSymbolStatus,
+    FundamentalsSyncRun,
+)
 from .helpers import (
     amo_limit_order,
     amo_market_order,
@@ -145,6 +154,13 @@ __all__ = [
     "equity_market_order",
     "KiteAlgoWorkerClient",
     "KiteAlgoWorkerError",
+    "FundamentalFeatureRow",
+    "FundamentalFeatures",
+    "FundamentalsEnvelope",
+    "FundamentalsStatus",
+    "FundamentalsStatements",
+    "FundamentalsSymbolStatus",
+    "FundamentalsSyncRun",
     "ItemizedCharges",
     "ManagedRun",
     "live_equity_market_order",

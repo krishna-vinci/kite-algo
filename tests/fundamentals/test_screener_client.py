@@ -1,9 +1,24 @@
 import asyncio
+import sys
 
-import fundamentals.screener_client as screener_client_module
-from fundamentals.screener_client import ScreenerClient, _extract_page_identity
+# tests/sdk/test_worker_sdk_async.py installs a bare httpx stub into
+# sys.modules at test runtime (sys.modules["httpx"] is never restored), which
+# breaks any later-executed module that needs the real httpx. Capture the real
+# package here at collection time, rebind the ported client to it, and use the
+# captured handles inside handlers so these tests are immune to stub
+# reinstalls that happen later in the same pytest process.
+import fundamentals.screener_client as _screener_client_module
 
+_stub = sys.modules.get("httpx")
+if _stub is not None and not hasattr(_stub, "Response"):
+    del sys.modules["httpx"]
 
+import httpx  # noqa: E402  (guaranteed real: any stub was just removed)
+
+_HTTPX = httpx
+_screener_client_module.httpx = httpx
+
+from fundamentals.screener_client import ScreenerClient, _extract_page_identity  # noqa: E402
 class FakeAsyncClient:
     """httpx.AsyncClient double that answers from a scripted handler."""
 
@@ -27,11 +42,10 @@ def test_fetch_returns_304_result_without_html(monkeypatch):
     def handler(url, headers):
         captured["url"] = url
         captured["headers"] = headers
-        import httpx
 
-        return httpx.Response(304, headers={"etag": '"v2"'}, request=httpx.Request("GET", url))
+        return _HTTPX.Response(304, headers={"etag": '"v2"'}, request=_HTTPX.Request("GET", url))
 
-    monkeypatch.setattr(screener_client_module.httpx, "AsyncClient", lambda **kwargs: FakeAsyncClient(handler, **kwargs))
+    monkeypatch.setattr(_screener_client_module.httpx, "AsyncClient", lambda **kwargs: FakeAsyncClient(handler, **kwargs))
 
     result = asyncio.run(ScreenerClient().fetch_company_page("RELIANCE", if_none_match='"v1"'))
 
@@ -49,16 +63,15 @@ def test_fetch_sends_if_modified_since_and_returns_html(monkeypatch):
     def handler(url, headers):
         captured["url"] = url
         captured["headers"] = headers
-        import httpx
 
-        return httpx.Response(
+        return _HTTPX.Response(
             200,
             text="<html><h1>Reliance Industries</h1></html>",
             headers={"etag": '"v9"', "last-modified": "Wed, 02 Sep 2026 10:00:00 GMT"},
-            request=httpx.Request("GET", url),
+            request=_HTTPX.Request("GET", url),
         )
 
-    monkeypatch.setattr(screener_client_module.httpx, "AsyncClient", lambda **kwargs: FakeAsyncClient(handler, **kwargs))
+    monkeypatch.setattr(_screener_client_module.httpx, "AsyncClient", lambda **kwargs: FakeAsyncClient(handler, **kwargs))
 
     result = asyncio.run(ScreenerClient().fetch_company_page("RELIANCE", if_modified_since="Tue, 01 Sep 2026 10:00:00 GMT"))
 
@@ -75,18 +88,17 @@ def test_fetch_falls_back_to_standalone_url_when_consolidated_is_missing(monkeyp
     seen_urls = []
 
     def handler(url, headers):
-        import httpx
 
         seen_urls.append(url)
         if url.endswith("/consolidated/"):
-            return httpx.Response(404, request=httpx.Request("GET", url))
-        return httpx.Response(
+            return _HTTPX.Response(404, request=_HTTPX.Request("GET", url))
+        return _HTTPX.Response(
             200,
             text="<html>standalone page</html>",
-            request=httpx.Request("GET", url),
+            request=_HTTPX.Request("GET", url),
         )
 
-    monkeypatch.setattr(screener_client_module.httpx, "AsyncClient", lambda **kwargs: FakeAsyncClient(handler, **kwargs))
+    monkeypatch.setattr(_screener_client_module.httpx, "AsyncClient", lambda **kwargs: FakeAsyncClient(handler, **kwargs))
 
     result = asyncio.run(ScreenerClient().fetch_company_page("RELIANCE"))
 
@@ -100,11 +112,9 @@ def test_fetch_falls_back_to_standalone_url_when_consolidated_is_missing(monkeyp
 
 def test_fetch_raises_after_all_candidates_fail(monkeypatch):
     def handler(url, headers):
-        import httpx
+                return _HTTPX.Response(500, request=_HTTPX.Request("GET", url))
 
-        return httpx.Response(500, request=httpx.Request("GET", url))
-
-    monkeypatch.setattr(screener_client_module.httpx, "AsyncClient", lambda **kwargs: FakeAsyncClient(handler, **kwargs))
+    monkeypatch.setattr(_screener_client_module.httpx, "AsyncClient", lambda **kwargs: FakeAsyncClient(handler, **kwargs))
 
     try:
         asyncio.run(ScreenerClient().fetch_company_page("BAD"))
