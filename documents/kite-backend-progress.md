@@ -1,6 +1,6 @@
 # Kite Backend Progress Tracker
 
-Last updated: 2026-06-03
+Last updated: 2026-09-05
 
 ## Scope
 
@@ -24,6 +24,14 @@ Do not use this file for frontend work.
 - Added backend mutual fund router in `broker_api/kite_mutual_funds.py`
 
 ## Newly implemented in current branch
+
+- Released worker SDK `0.7.7` with server-owned screener.in fundamentals support:
+  - added typed sync/async SDK methods for features, statements, freshness status, and deliberate refreshes
+  - added additive Alembic migrations through `20260905_000010`, including PostgreSQL `UNIQUE NULLS NOT DISTINCT` protection for nullable-period metric natural keys
+  - hardened ingestion against structurally invalid pages, preserved failed run records for parser-readiness failures, and retained degraded scheduler health after partial failures
+  - documented the resolved 50-symbol on-demand cap, worker `market:read` authorization, and content fingerprints as the normal unchanged-data path
+  - refreshed the complete external agent-context pack and expanded the trusted-publishing workflow's SDK release gate
+  - published `kite-algo-worker==0.7.7` to PyPI from tag `kite-algo-worker-v0.7.7`
 
 - Clarified and hardened worker historical candle access in the SDK/API:
   - kept `get_candles(...)` as the recent live/cache candle surface and documented that daily historical warmups should use `get_historical_candles(...)`

@@ -74,7 +74,7 @@ Current public package install:
 python3 -m pip install kite-algo-worker==0.7.7
 ```
 
-> The `development` branch is prepared for the `0.7.7` worker SDK PyPI release. Publish/tag `kite-algo-worker-v0.7.7` before treating the pinned install as globally available.
+`kite-algo-worker==0.7.7` is publicly available on PyPI and was published from the `kite-algo-worker-v0.7.7` tag.
 
 ## Quick start
 

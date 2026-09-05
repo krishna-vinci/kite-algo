@@ -14,7 +14,8 @@ Give this pack to an external coding agent when you want worker code written in 
 
 - Package name: `kite-algo-worker`
 - SDK version described by this pack: `0.7.7`
-- Last public release before the 0.7.7 publication: `0.7.6`
+- Current public PyPI release: `0.7.7`
+- Published tag: `kite-algo-worker-v0.7.7`
 - SDK tag convention: `kite-algo-worker-vX.Y.Z`
 
 Canonical public install:
@@ -23,7 +24,7 @@ Canonical public install:
 python3 -m pip install kite-algo-worker==0.7.7
 ```
 
-The 0.7.7 install becomes public when tag `kite-algo-worker-v0.7.7` completes the trusted-publishing workflow. Keep the exact pin; do not silently fall back to an unpinned package. If this pack and the repo disagree, trust the repo files.
+The pack describes the current public SDK release. Keep the exact pin; do not silently fall back to an unpinned package. If this pack and the repo disagree, trust the repo files.
 
 ## Read in this order
 
