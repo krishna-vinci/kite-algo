@@ -66,3 +66,7 @@ skills-lock.json
 openalgo/
 openalgo/openalgo/
 quant-ml-india/
+
+# Handoff packages (design/plan docs must never be committed)
+kite-algo-fundamentals-0.7.7-handoff/
+kite-algo-*-handoff/
