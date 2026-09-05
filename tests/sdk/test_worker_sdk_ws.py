@@ -65,7 +65,7 @@ def _install_websockets_stub(routes):
     sys.modules["websockets"] = module
     return module
 
-SDK_ROOT = Path(__file__).resolve().parents[1] / "sdk" / "python"
+SDK_ROOT = Path(__file__).resolve().parents[2] / "sdk" / "python"
 if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 

@@ -18,6 +18,7 @@ from .investment import (
 )
 from .run_config import RunConfig
 from .models import (
+    OrderPreview,
     RunProtectionState,
     SafetyCheckResult,
     WorkerFundsSnapshot,
@@ -316,6 +317,23 @@ class KiteAlgoWorkerClient:
                 "metadata": dict(metadata or {}),
                 "all_or_none": all_or_none,
             },
+        )
+
+    def preview_order_snapshot(self, strategy_run_id: str, order: Mapping[str, Any], *, metadata: Optional[Mapping[str, Any]] = None) -> OrderPreview:
+        """Typed order preview. Previews never submit orders."""
+        return OrderPreview.model_validate(self.preview_order(strategy_run_id, order, metadata=metadata))
+
+    def preview_basket_snapshot(
+        self,
+        strategy_run_id: str,
+        orders: Iterable[Mapping[str, Any]],
+        *,
+        metadata: Optional[Mapping[str, Any]] = None,
+        all_or_none: bool = False,
+    ) -> OrderPreview:
+        """Typed basket preview. Previews never submit orders."""
+        return OrderPreview.model_validate(
+            self.preview_basket(strategy_run_id, orders, metadata=metadata, all_or_none=all_or_none)
         )
 
     def get_run_protection_state(self, strategy_run_id: str) -> JsonDict:

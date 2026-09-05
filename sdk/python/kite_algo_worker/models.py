@@ -94,11 +94,53 @@ class RawModelMixin(ModelMixin):
 
 
 @dataclass(frozen=True)
+class ItemizedCharges(RawModelMixin):
+    """Itemized preview cost components.
+
+    Known additive charge keys are typed as optional floats; unknown future
+    charge keys are preserved in ``raw`` and round-trip through
+    ``model_dump()``. An absent component stays ``None`` and never becomes 0.
+    """
+
+    brokerage: Optional[float] = None
+    exchange_transaction_charge: Optional[float] = None
+    stt: Optional[float] = None
+    stamp_duty: Optional[float] = None
+    sebi_charge: Optional[float] = None
+    gst: Optional[float] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "brokerage", _coerce_optional_float(self.brokerage))
+        object.__setattr__(self, "exchange_transaction_charge", _coerce_optional_float(self.exchange_transaction_charge))
+        object.__setattr__(self, "stt", _coerce_optional_float(self.stt))
+        object.__setattr__(self, "stamp_duty", _coerce_optional_float(self.stamp_duty))
+        object.__setattr__(self, "sebi_charge", _coerce_optional_float(self.sebi_charge))
+        object.__setattr__(self, "gst", _coerce_optional_float(self.gst))
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+@dataclass(frozen=True)
 class CostContract(ModelMixin):
     margin_required: Any = None
     charges_estimate: Any = None
     total_charges: Any = None
     total_taxes: Any = None
+    itemized: Optional[ItemizedCharges] = None
+    dp_charge: Optional[float] = None
+    dp_charge_status: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "margin_required", _coerce_optional_float(self.margin_required))
+        object.__setattr__(self, "charges_estimate", _coerce_optional_float(self.charges_estimate))
+        object.__setattr__(self, "total_charges", _coerce_optional_float(self.total_charges))
+        object.__setattr__(self, "total_taxes", _coerce_optional_float(self.total_taxes))
+        itemized = self.itemized
+        if itemized is not None and not isinstance(itemized, ItemizedCharges):
+            itemized = ItemizedCharges.model_validate(itemized)
+        object.__setattr__(self, "itemized", itemized)
+        object.__setattr__(self, "dp_charge", _coerce_optional_float(self.dp_charge))
+        object.__setattr__(self, "dp_charge_status", None if self.dp_charge_status is None else str(self.dp_charge_status))
 
 
 @dataclass(frozen=True)
@@ -603,6 +645,7 @@ class WorkerTimelineResponse(ModelMixin):
 
 __all__ = [
     "CostContract",
+    "ItemizedCharges",
     "WorkerCandle",
     "WorkerHistoricalCandles",
     "WorkerOrderSnapshot",

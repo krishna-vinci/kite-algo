@@ -1030,8 +1030,8 @@ def test_typed_models_and_exception_hierarchy():
             },
         }
     )
-    assert preview.preview.cost_contract.margin_required == "10.00"
-    assert preview.preview.cost_contract.charges_estimate == "2.50"
+    assert preview.preview.cost_contract.margin_required == 10.0
+    assert preview.preview.cost_contract.charges_estimate == 2.5
 
     order_result = WorkerOrderResult.model_validate({"mode": "paper", "result": {"status": "filled", "order": {"order_id": "PAPER-1"}}})
     assert order_result.result["order"]["order_id"].startswith("PAPER-")

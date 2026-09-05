@@ -47,7 +47,7 @@ except ModuleNotFoundError:  # pragma: no cover - local fallback in minimal envs
     pd.to_datetime = _to_datetime
     sys.modules["pandas"] = pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sdk" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk" / "python"))
 
 from kite_algo_worker.indicators import crossunder, crossover, falling, highest, lowest, rising, ta
 

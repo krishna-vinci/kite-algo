@@ -7,7 +7,15 @@ import re
 from . import options
 from .async_client import AsyncKiteAlgoWorkerClient
 from .client import AlgoWorkerConfig, KiteAlgoWorkerClient, KiteAlgoWorkerError
-from .exceptions import AuthError, BrokerValidationError, PermissionDeniedError, StreamDisconnectedError
+from .exceptions import (
+    AuthError,
+    BrokerValidationError,
+    CalendarRangeUncoveredError,
+    PermissionDeniedError,
+    StreamDisconnectedError,
+    UnsupportedSchemaVersionError,
+    WorkerDataUnavailableError,
+)
 from .helpers import (
     amo_limit_order,
     amo_market_order,
@@ -36,6 +44,7 @@ from .managed_run import ManagedRun
 from .indicators import BaseIndicator, IndicatorInput, IndicatorValue, LiveIndicatorEngine, NUMBA_AVAILABLE, TechnicalAnalysis, crossover, format_output, njit, normalize_input, sma, ta
 from .models import (
     CostContract,
+    ItemizedCharges,
     WorkerCandle,
     WorkerHistoricalCandles,
     OrderPreview,
@@ -123,6 +132,7 @@ __all__ = [
     "BackendProtection",
     "BasketProtection",
     "BrokerValidationError",
+    "CalendarRangeUncoveredError",
     "CostContract",
     "BaseIndicator",
     "IndicatorInput",
@@ -135,6 +145,7 @@ __all__ = [
     "equity_market_order",
     "KiteAlgoWorkerClient",
     "KiteAlgoWorkerError",
+    "ItemizedCharges",
     "ManagedRun",
     "live_equity_market_order",
     "limit_order",
@@ -161,6 +172,8 @@ __all__ = [
     "sl_m_order",
     "StreamDisconnectedError",
     "StreamHealth",
+    "UnsupportedSchemaVersionError",
+    "WorkerDataUnavailableError",
     "crossover",
     "format_output",
     "njit",

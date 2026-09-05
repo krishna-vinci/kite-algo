@@ -16,6 +16,7 @@ from .investment import (
     WorkerMarketCalendarStatus,
 )
 from .models import (
+    OrderPreview,
     WorkerGttTrigger,
     WorkerGttWriteResult,
     WorkerHistoricalCandles,
@@ -341,6 +342,23 @@ class AsyncKiteAlgoWorkerClient:
                 "metadata": dict(metadata or {}),
                 "all_or_none": all_or_none,
             },
+        )
+
+    async def preview_order_snapshot(self, strategy_run_id: str, order: Mapping[str, Any], *, metadata: Optional[Mapping[str, Any]] = None) -> OrderPreview:
+        """Typed order preview. Previews never submit orders."""
+        return OrderPreview.model_validate(await self.preview_order(strategy_run_id, order, metadata=metadata))
+
+    async def preview_basket_snapshot(
+        self,
+        strategy_run_id: str,
+        orders: Iterable[Mapping[str, Any]],
+        *,
+        metadata: Optional[Mapping[str, Any]] = None,
+        all_or_none: bool = False,
+    ) -> OrderPreview:
+        """Typed basket preview. Previews never submit orders."""
+        return OrderPreview.model_validate(
+            await self.preview_basket(strategy_run_id, orders, metadata=metadata, all_or_none=all_or_none)
         )
 
     async def wait_for_terminal_order_state(
