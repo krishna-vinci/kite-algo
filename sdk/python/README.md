@@ -35,6 +35,7 @@ Pin to an immutable version in production.
 | Order placement | `preview_order(...)`, `preview_order_snapshot(...)`, `place_order(...)`, `cancel_order(...)`, `modify_order(...)`, order builders |
 | Basket execution | `preview_basket(...)`, `preview_basket_snapshot(...)`, `place_basket(...)` |
 | Investment data (read-only) | `get_market_calendar(...)`, `get_market_calendar_status(...)`, `get_index_constituents(...)`, `get_index_constituent_status(...)`, `get_account_portfolio(...)` and their `*_snapshot(...)` typed variants |
+| Fundamentals (0.7.7) | `get_fundamentals_features(...)`, `get_fundamentals_status(...)`, `get_fundamentals_statements(...)`, `refresh_fundamentals(...)` |
 | Safety + protection | `safety_check(...)`, `BackendProtection`, `update_backend_protection(...)`, `patch_risk(...)` |
 | Grouped P&L + monitoring | `get_run_pnl(...)`, `stream_run_pnl(...)`, `list_timeline(...)`, `log_decision_event(...)`, `stream_timeline(...)` |
 | Options namespace | `client.options.*`, resolver helpers, options run lifecycle |
@@ -778,6 +779,49 @@ try:
 except CalendarRangeUncoveredError as exc:
     print(exc.status_code, exc.rejection_reason)  # 503 CALENDAR_RANGE_UNCOVERED
 ```
+
+## Fundamentals (0.7.7)
+
+Screener.in-sourced company fundamentals, acquired, stored, and refreshed by the Kite Algo server. Consumers never scrape; they call the SDK. Responses are typed models carrying `schema_version`, `source: "screener"`, and `retrieved_at`.
+
+```python
+from kite_algo_worker import KiteAlgoWorkerClient, AlgoWorkerConfig
+
+client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_..."))
+
+# A single stock or an explicit list
+features = client.get_fundamentals_features(symbols=["RELIANCE", "TCS"])
+row = features.for_symbol("RELIANCE")   # case-insensitive lookup
+print(row.ttm_revenue, row.quarterly_revenue_yoy_pct, row.promoter_holding_pct)
+
+# A whole index universe (currently Nifty50 and Nifty500)
+features = client.get_fundamentals_features(index="Nifty500")
+print(len(features.features), features.missing_symbols)
+
+# Freshness and completeness inspection before use
+status = client.get_fundamentals_status(index="Nifty50")
+if not status.fresh_within("RELIANCE", hours=24.0, now=datetime.now(timezone.utc)):
+    run = client.refresh_fundamentals(symbols=["RELIANCE"], mode="incremental")
+    print(run.symbols_changed, run.symbols_failed)
+
+# Raw statement rows for one symbol
+statements = client.get_fundamentals_statements("RELIANCE", dataset="quarterly")
+for r in statements.rows:
+    print(r["period_end"], r["metric_name"], r["numeric_value"])
+
+# The async client mirrors every method:
+# features = await async_client.get_fundamentals_features(index="Nifty50")
+```
+
+**Scope rule:** every method takes exactly one scope — `symbols` (one or many; at most 50 for `refresh_fundamentals`) or `index` (one of the server-supported universes; currently `Nifty50` and `Nifty500`). Passing both or neither raises `ValueError` before any network call.
+
+**Models:** `FundamentalFeatures` (list of `FundamentalFeatureRow` plus `missing_symbols`), `FundamentalsStatus` (per-symbol `last_checked_at`/`last_success_at`/`last_error` plus `recent_runs`), `FundamentalsStatements`, and `FundamentalsSyncRun` (the only mutating response). Unknown additive server fields are preserved in `raw` and round-trip through `model_dump()`.
+
+**Freshness is your policy:** the server stores derived features per symbol and reports `last_success_at` per symbol; apply your own staleness thresholds with `status.fresh_within(...)` before trusting data in time-sensitive strategies.
+
+**Refresh economics and guardrails:** `refresh_fundamentals` is the only mutating fundamentals method. The server deduplicates fetches with HTTP conditional requests (ETag / If-Modified-Since → `304 Not Modified`), isolates per-symbol failures, enforces the 50-symbol cap for symbol scopes, and single-flights syncs — a second concurrent refresh raises `KiteAlgoWorkerError` with status `409` ("fundamentals sync already in progress"). The nightly scheduler refreshes every supported index universe at 02:00 IST.
+
+**Read-only guarantee:** all `get_fundamentals_*` methods are observation-only and never enable live execution; the live-mode gate of the platform is unaffected.
 
 ## Options workflows
 

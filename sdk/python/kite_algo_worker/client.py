@@ -479,7 +479,7 @@ class KiteAlgoWorkerClient:
         params = _fundamentals_scope_params(symbols, index)
         params["schema_version"] = 1
         return FundamentalFeatures.model_validate(
-            self._request_api_root("GET", "fundamentals/features", params=params)
+            self._request("GET", "/worker/fundamentals/features", params=params)
         )
 
     def get_fundamentals_status(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None) -> FundamentalsStatus:
@@ -487,7 +487,7 @@ class KiteAlgoWorkerClient:
         params = _fundamentals_scope_params(symbols, index)
         params["schema_version"] = 1
         return FundamentalsStatus.model_validate(
-            self._request_api_root("GET", "fundamentals/status", params=params)
+            self._request("GET", "/worker/fundamentals/status", params=params)
         )
 
     def get_fundamentals_statements(self, symbol: str, *, dataset: str, statement_scope: str = "consolidated") -> FundamentalsStatements:
@@ -496,9 +496,9 @@ class KiteAlgoWorkerClient:
         if not str(dataset).strip():
             raise ValueError("dataset is required")
         return FundamentalsStatements.model_validate(
-            self._request_api_root(
+            self._request(
                 "GET",
-                "fundamentals/statements",
+                "/worker/fundamentals/statements",
                 params={
                     "symbol": symbol_text.upper(),
                     "dataset": dataset,
@@ -525,7 +525,7 @@ class KiteAlgoWorkerClient:
             if not index_text:
                 raise ValueError("index must not be empty when provided")
             body["index"] = index_text
-        return FundamentalsSyncRun.model_validate(self._request_api_root("POST", "fundamentals/sync", json=body))
+        return FundamentalsSyncRun.model_validate(self._request("POST", "/worker/fundamentals/sync", json=body))
 
     def stream_run_pnl(self, strategy_run_id: str, *, interval_seconds: float = 1.0) -> Iterator[JsonDict]:
         return self._stream_sse(
@@ -856,12 +856,6 @@ class KiteAlgoWorkerClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> JsonDict:
         return self._request_url(method, self._url(path), **kwargs)
-
-    def _request_api_root(self, method: str, path: str, **kwargs: Any) -> JsonDict:
-        """Request a path relative to the server API root (outside the
-        ``/algo-workers`` worker prefix, e.g. ``fundamentals/features``)."""
-        base = self.config.base_url.rstrip("/")
-        return self._request_url(method, f"{base}/{path.lstrip('/')}", **kwargs)
 
     def _request_url(self, method: str, url: str, **kwargs: Any) -> JsonDict:
         response = self.session.request(method, url, timeout=self.config.timeout, **kwargs)

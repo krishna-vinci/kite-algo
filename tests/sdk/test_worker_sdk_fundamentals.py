@@ -15,7 +15,7 @@ SDK_ROOT = Path(__file__).resolve().parents[2] / "sdk" / "python"
 if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 
-FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "fundamentals"
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "fundamentals" / "v1"
 
 
 FEATURES_PAYLOAD = {
@@ -93,13 +93,13 @@ def _sync_client():
 def _capture_api_root(client, payload):
     calls = []
 
-    def fake_request_api_root(method, path, **kwargs):
+    def fake_request(method, path, **kwargs):
         calls.append({"method": method, "path": path, "params": kwargs.get("params"), "json": kwargs.get("json")})
         import copy
 
         return copy.deepcopy(payload)
 
-    client._request_api_root = fake_request_api_root
+    client._request = fake_request
     return calls
 
 
@@ -115,11 +115,11 @@ def _capture_async_api_root(client, payload):
 
     calls = []
 
-    async def fake_request_api_root(method, path, **kwargs):
+    async def fake_request(method, path, **kwargs):
         calls.append({"method": method, "path": path, "params": kwargs.get("params"), "json": kwargs.get("json")})
         return copy.deepcopy(payload)
 
-    object.__setattr__(client, "_request_api_root", fake_request_api_root)
+    object.__setattr__(client, "_request", fake_request)
     return calls
 
 
@@ -170,7 +170,7 @@ def test_get_fundamentals_features_parses_typed_response():
     assert result.missing_symbols == ["TCS"]
     # Symbol scopes travel as repeated query params (FastAPI list encoding).
     assert calls == [
-        {"method": "GET", "path": "fundamentals/features",
+        {"method": "GET", "path": "/worker/fundamentals/features",
          "params": {"symbols": ["RELIANCE", "TCS"], "schema_version": 1}, "json": None}
     ]
 
@@ -212,7 +212,7 @@ def test_get_fundamentals_status_and_freshness_helper():
     assert result.fresh_within("RELIANCE", 0.5, now=now) is False
     assert result.fresh_within("TCS", 24.0, now=now) is False  # failed, never succeeded
     assert result.fresh_within("INFY", 24.0, now=now) is False  # missing
-    assert calls[0]["path"] == "fundamentals/status"
+    assert calls[0]["path"] == "/worker/fundamentals/status"
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +232,7 @@ def test_get_fundamentals_statements_uses_query_params():
     assert result.dataset == "quarterly"
     assert result.rows[0]["numeric_value"] == 140.0
     assert calls[0] == {
-        "method": "GET", "path": "fundamentals/statements",
+        "method": "GET", "path": "/worker/fundamentals/statements",
         "params": {"symbol": "RELIANCE", "dataset": "quarterly", "statement_scope": "consolidated", "schema_version": 1},
         "json": None,
     }
@@ -250,7 +250,7 @@ def test_refresh_fundamentals_sends_exclusive_scope_body():
     assert run.symbols_changed == 1
     assert run.scope == {"scope_type": "symbols", "scope_value": "RELIANCE"}
     assert calls[0] == {
-        "method": "POST", "path": "fundamentals/sync",
+        "method": "POST", "path": "/worker/fundamentals/sync",
         "params": None, "json": {"symbols": ["RELIANCE"], "mode": "full"},
     }
 
@@ -268,7 +268,7 @@ def test_refresh_conflict_surfaces_as_worker_error():
     def conflict(method, path, **kwargs):
         raise error_for_status(409, {"detail": "fundamentals sync already in progress"}, fallback="fb")
 
-    client._request_api_root = conflict
+    client._request = conflict
     with pytest.raises(KiteAlgoWorkerError) as excinfo:
         client.refresh_fundamentals(symbols=["RELIANCE"])
     assert excinfo.value.status_code == 409
@@ -288,7 +288,7 @@ def test_async_fundamentals_methods_use_server_contract():
         calls = _capture_async_api_root(client, FEATURES_PAYLOAD)
         features = await client.get_fundamentals_features(index="Nifty500")
         assert isinstance(features, FundamentalFeatures)
-        assert calls[0] == {"method": "GET", "path": "fundamentals/features", "params": {"index": "Nifty500", "schema_version": 1}, "json": None}
+        assert calls[0] == {"method": "GET", "path": "/worker/fundamentals/features", "params": {"index": "Nifty500", "schema_version": 1}, "json": None}
 
         calls = _capture_async_api_root(client, STATUS_PAYLOAD)
         status = await client.get_fundamentals_status(symbols=["RELIANCE"])
@@ -298,7 +298,7 @@ def test_async_fundamentals_methods_use_server_contract():
         calls = _capture_async_api_root(client, STATEMENTS_PAYLOAD)
         statements = await client.get_fundamentals_statements("RELIANCE", dataset="quarterly")
         assert isinstance(statements, FundamentalsStatements)
-        assert calls[0]["path"] == "fundamentals/statements"
+        assert calls[0]["path"] == "/worker/fundamentals/statements"
 
         calls = _capture_async_api_root(client, SYNC_RUN_PAYLOAD)
         run = await client.refresh_fundamentals(symbols=["RELIANCE"], mode="full")
@@ -306,3 +306,27 @@ def test_async_fundamentals_methods_use_server_contract():
         assert calls[0]["json"] == {"symbols": ["RELIANCE"], "mode": "full"}
 
     asyncio.run(main())
+
+
+# ---------------------------------------------------------------------------
+# Contract fixture parity (mirrors the sanitized server envelope)
+# ---------------------------------------------------------------------------
+
+
+def test_contract_fixture_round_trips_through_typed_model():
+    import json
+
+    from kite_algo_worker import FundamentalFeatures
+
+    payload = json.loads((FIXTURES / "fundamentals_features.json").read_text())
+    model = FundamentalFeatures.model_validate(payload)
+    assert model.schema_version == 1
+    assert model.source == "screener"
+    row = model.for_symbol("reliance")
+    assert row.ttm_revenue == 420.0
+    assert row.as_of_date == "2026-06-30"
+    assert row.scraped_at is not None
+    assert model.missing_symbols == ["SANITIZED2"]
+    dumped = model.model_dump()
+    assert dumped["schema_version"] == 1
+    assert dumped["source"] == "screener"

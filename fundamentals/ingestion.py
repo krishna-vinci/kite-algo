@@ -254,8 +254,8 @@ def _start_run(config: SyncConfig, requested: int) -> uuid.UUID:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO public.fundamentals_sync_runs (run_id, scope_type, scope_value, mode, symbols_requested) "
-                "VALUES (%s,%s,%s,%s,%s)",
-                (run_id, config.scope.scope_type, config.scope.scope_value, config.mode, requested),
+                "VALUES (%s::uuid,%s,%s,%s,%s)",
+                (str(run_id), config.scope.scope_type, config.scope.scope_value, config.mode, requested),
             )
         conn.commit()
     except Exception:
@@ -273,8 +273,8 @@ def _finish_run(run_id: uuid.UUID, *, changed: int, unchanged: int, failed: int,
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE public.fundamentals_sync_runs SET symbols_changed=%s, symbols_unchanged=%s, "
-                "symbols_failed=%s, symbols_skipped=%s, finished_at=now(), status=%s, error=%s WHERE run_id=%s",
-                (changed, unchanged, failed, skipped, status, error, run_id),
+                "symbols_failed=%s, symbols_skipped=%s, finished_at=now(), status=%s, error=%s WHERE run_id=%s::uuid",
+                (changed, unchanged, failed, skipped, status, error, str(run_id)),
             )
         conn.commit()
     except Exception:

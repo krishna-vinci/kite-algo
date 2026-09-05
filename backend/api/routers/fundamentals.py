@@ -1,22 +1,30 @@
-"""Company fundamentals read/refresh routes (LAN-internal, no per-route auth).
+"""Company fundamentals read/refresh routes for external workers.
+
+Mounted under the authenticated worker prefix (``/algo-workers``) so the SDK
+methods authenticate with the worker bearer token exactly like every other
+worker surface; reads and the refresh require ``market:read``. The app-wide
+auth middleware otherwise 401s all non-worker ``/api`` paths, which would make
+unauthenticated LAN-internal routes unusable for SDK consumers.
 
 All read responses carry a versioned envelope: ``schema_version: 1``,
 ``source: "screener"``, and per-row ``as_of_date``/``scraped_at`` freshness.
-``POST /fundamentals/sync`` is the only mutating route and shares the single
-sync engine with the nightly scheduler.
+``POST .../fundamentals/sync`` is the only mutating route and shares the
+single sync engine with the nightly scheduler.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, model_validator
 
+from backend.api.routers.worker_shared import _require_action, require_worker_token
 from backend.app.database import get_db_connection
 from fundamentals.index_scopes import canonical_index_key, is_supported_index, supported_index_scopes
 from fundamentals.ingestion import (
@@ -29,7 +37,7 @@ from fundamentals.ingestion import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(tags=["fundamentals"])
+router = APIRouter(prefix="/algo-workers", tags=["Algo Workers"])
 
 
 def _envelope() -> dict:
@@ -61,15 +69,11 @@ def _scope_from_request(symbols: Optional[List[str]], index: Optional[str]) -> S
     return SyncScope(scope_type="index", scope_value=canonical_index_key(index))
 
 
-@router.post("/fundamentals/sync")
-async def trigger_sync(payload: SyncRequest):
-    scope = _scope_from_request(payload.symbols, payload.index)
-    try:
-        return await run_fundamentals_sync(SyncConfig(scope=scope, mode=payload.mode, on_demand=True))
-    except RuntimeError as exc:
-        raise HTTPException(409, str(exc))
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
+async def _authorize(request: Request, schema_version: int = 1) -> None:
+    if schema_version != 1:
+        raise HTTPException(422, {"rejection_reason": "UNSUPPORTED_SCHEMA_VERSION", "supported": [1]})
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
 
 
 def _resolve_scope_filter(symbols: Optional[List[str]], index: Optional[str]) -> List[str]:
@@ -88,9 +92,19 @@ def _resolve_scope_filter(symbols: Optional[List[str]], index: Optional[str]) ->
         raise HTTPException(400, str(exc))
 
 
-@router.get("/fundamentals/status")
-def sync_status(symbols: Optional[List[str]] = Query(None), index: Optional[str] = Query(None)):
-    wanted = _resolve_scope_filter(symbols, index)
+@router.post("/worker/fundamentals/sync")
+async def trigger_sync(request: Request, payload: SyncRequest):
+    await _authorize(request)
+    scope = _scope_from_request(payload.symbols, payload.index)
+    try:
+        return await run_fundamentals_sync(SyncConfig(scope=scope, mode=payload.mode, on_demand=True))
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+def _load_status_rows(wanted: List[str]) -> dict:
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -118,8 +132,17 @@ def sync_status(symbols: Optional[List[str]] = Query(None), index: Optional[str]
                  "finished_at": r[9].isoformat() if r[9] else None, "status": r[10]}
                 for r in cur.fetchall()
             ]
+            return {"rows": rows, "runs": runs}
     finally:
         conn.close()
+
+
+@router.get("/worker/fundamentals/status")
+async def sync_status(request: Request, symbols: Optional[List[str]] = Query(None), index: Optional[str] = Query(None), schema_version: int = Query(1, ge=1)):
+    await _authorize(request, schema_version)
+    wanted = _resolve_scope_filter(symbols, index)
+    result = await asyncio.to_thread(_load_status_rows, wanted)
+    rows, runs = result["rows"], result["runs"]
     found = {row["symbol"] for row in rows}
     return {**_envelope(),
             "symbols": rows,
@@ -127,17 +150,22 @@ def sync_status(symbols: Optional[List[str]] = Query(None), index: Optional[str]
             "recent_runs": runs}
 
 
-@router.get("/fundamentals/features")
-def features(symbols: Optional[List[str]] = Query(None), index: Optional[str] = Query(None)):
-    wanted = _resolve_scope_filter(symbols, index)
+def _load_feature_rows(wanted: List[str]) -> List[dict]:
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM public.fundamentals_features WHERE symbol = ANY(%s) ORDER BY symbol", (wanted,))
             columns = [desc[0] for desc in cur.description]
-            rows = [dict(zip(columns, r)) for r in cur.fetchall()]
+            return [dict(zip(columns, r)) for r in cur.fetchall()]
     finally:
         conn.close()
+
+
+@router.get("/worker/fundamentals/features")
+async def features(request: Request, symbols: Optional[List[str]] = Query(None), index: Optional[str] = Query(None), schema_version: int = Query(1, ge=1)):
+    await _authorize(request, schema_version)
+    wanted = _resolve_scope_filter(symbols, index)
+    rows = await asyncio.to_thread(_load_feature_rows, wanted)
     for row in rows:
         if row.get("as_of_date"):
             row["as_of_date"] = row["as_of_date"].isoformat()
@@ -148,11 +176,7 @@ def features(symbols: Optional[List[str]] = Query(None), index: Optional[str] = 
             "missing_symbols": [s for s in wanted if s not in found]}
 
 
-@router.get("/fundamentals/statements")
-def statements(symbol: str, dataset: str, statement_scope: str = "consolidated"):
-    symbol = symbol.strip().upper()
-    if dataset not in DATASETS:
-        raise HTTPException(400, f"dataset must be one of {DATASETS}")
+def _load_statement_rows(symbol: str, statement_scope: str, dataset: str) -> List[dict]:
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -162,7 +186,7 @@ def statements(symbol: str, dataset: str, statement_scope: str = "consolidated")
                 "ORDER BY period_end, metric_key",
                 (symbol, statement_scope, dataset),
             )
-            rows = [
+            return [
                 {"dataset": r[0], "period_end": r[1].isoformat() if r[1] else None, "metric_key": r[2],
                  "metric_name": r[3], "value_text": r[4], "numeric_value": r[5],
                  "scraped_at": r[6].isoformat() if r[6] else None}
@@ -170,16 +194,22 @@ def statements(symbol: str, dataset: str, statement_scope: str = "consolidated")
             ]
     finally:
         conn.close()
+
+
+@router.get("/worker/fundamentals/statements")
+async def statements(request: Request, symbol: str, dataset: str, statement_scope: str = "consolidated", schema_version: int = Query(1, ge=1)):
+    await _authorize(request, schema_version)
+    symbol = symbol.strip().upper()
+    if dataset not in DATASETS:
+        raise HTTPException(400, f"dataset must be one of {DATASETS}")
+    rows = await asyncio.to_thread(_load_statement_rows, symbol, statement_scope, dataset)
     if not rows:
         raise HTTPException(404, f"no {dataset} rows stored for {symbol} ({statement_scope})")
     return {**_envelope(), "symbol": symbol,
             "statement_scope": statement_scope, "dataset": dataset, "rows": rows}
 
 
-@router.get("/fundamentals/export.csv")
-def export_csv(symbols: Optional[List[str]] = Query(None), index: Optional[str] = Query(None),
-               dataset: str = "fundamentals_features"):
-    wanted = _resolve_scope_filter(symbols, index)
+def _render_export_csv(wanted: List[str], dataset: str) -> str:
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     conn = get_db_connection()
@@ -201,6 +231,14 @@ def export_csv(symbols: Optional[List[str]] = Query(None), index: Optional[str] 
                 writer.writerow([v.isoformat() if hasattr(v, "isoformat") else v for v in row])
     finally:
         conn.close()
-    buffer.seek(0)
-    return StreamingResponse(iter([buffer.getvalue()]), media_type="text/csv",
+    return buffer.getvalue()
+
+
+@router.get("/worker/fundamentals/export.csv")
+async def export_csv(request: Request, symbols: Optional[List[str]] = Query(None), index: Optional[str] = Query(None),
+                     dataset: str = "fundamentals_features", schema_version: int = Query(1, ge=1)):
+    await _authorize(request, schema_version)
+    wanted = _resolve_scope_filter(symbols, index)
+    content = await asyncio.to_thread(_render_export_csv, wanted, dataset)
+    return StreamingResponse(iter([content]), media_type="text/csv",
                              headers={"Content-Disposition": f"attachment; filename=fundamentals_{dataset}.csv"})

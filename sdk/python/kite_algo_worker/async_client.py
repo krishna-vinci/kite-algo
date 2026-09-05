@@ -159,7 +159,7 @@ class AsyncKiteAlgoWorkerClient:
         params = _fundamentals_scope_params(symbols, index)
         params["schema_version"] = 1
         return FundamentalFeatures.model_validate(
-            await self._request_api_root("GET", "fundamentals/features", params=params)
+            await self._request("GET", "/worker/fundamentals/features", params=params)
         )
 
     async def get_fundamentals_status(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None) -> FundamentalsStatus:
@@ -167,7 +167,7 @@ class AsyncKiteAlgoWorkerClient:
         params = _fundamentals_scope_params(symbols, index)
         params["schema_version"] = 1
         return FundamentalsStatus.model_validate(
-            await self._request_api_root("GET", "fundamentals/status", params=params)
+            await self._request("GET", "/worker/fundamentals/status", params=params)
         )
 
     async def get_fundamentals_statements(self, symbol: str, *, dataset: str, statement_scope: str = "consolidated") -> FundamentalsStatements:
@@ -176,9 +176,9 @@ class AsyncKiteAlgoWorkerClient:
         if not str(dataset).strip():
             raise ValueError("dataset is required")
         return FundamentalsStatements.model_validate(
-            await self._request_api_root(
+            await self._request(
                 "GET",
-                "fundamentals/statements",
+                "/worker/fundamentals/statements",
                 params={
                     "symbol": symbol_text.upper(),
                     "dataset": dataset,
@@ -205,7 +205,7 @@ class AsyncKiteAlgoWorkerClient:
             if not index_text:
                 raise ValueError("index must not be empty when provided")
             body["index"] = index_text
-        return FundamentalsSyncRun.model_validate(await self._request_api_root("POST", "fundamentals/sync", json=body))
+        return FundamentalsSyncRun.model_validate(await self._request("POST", "/worker/fundamentals/sync", json=body))
 
     async def place_gtt(self, payload: Mapping[str, Any]) -> JsonDict:
         return await self._request("POST", "/worker/gtt/triggers", json=dict(payload))
@@ -448,12 +448,6 @@ class AsyncKiteAlgoWorkerClient:
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> JsonDict:
         return await self._request_url(method, self._url(path), **kwargs)
-
-    async def _request_api_root(self, method: str, path: str, **kwargs: Any) -> JsonDict:
-        """Request a path relative to the server API root (outside the
-        ``/algo-workers`` worker prefix, e.g. ``fundamentals/features``)."""
-        base = self.config.base_url.rstrip("/")
-        return await self._request_url(method, f"{base}/{path.lstrip('/')}", **kwargs)
 
     async def _request_url(self, method: str, url: str, **kwargs: Any) -> JsonDict:
         response = await self.client.request(method, url, **kwargs)
