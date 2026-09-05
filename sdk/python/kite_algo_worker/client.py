@@ -3,12 +3,19 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
 import requests
 
 from .exceptions import KiteAlgoWorkerError, error_for_status
+from .investment import (
+    WorkerAccountPortfolioSnapshot,
+    WorkerIndexConstituentStatus,
+    WorkerIndexConstituentsSnapshot,
+    WorkerMarketCalendarSnapshot,
+    WorkerMarketCalendarStatus,
+)
 from .run_config import RunConfig
 from .models import (
     RunProtectionState,
@@ -63,6 +70,33 @@ def _build_historical_date_params(
         params["from"] = (to_dt - timedelta(days=int(lookback_days))).isoformat()
 
     return params
+
+
+def _require_identity_param(value: Any, *, field_name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    return text
+
+
+def _normalize_calendar_date_params(from_date: Any, to_date: Any, *, exchange: Any, segment: Any) -> JsonDict:
+    from_text = _require_identity_param(from_date, field_name="from_date")
+    to_text = _require_identity_param(to_date, field_name="to_date")
+    try:
+        start = date.fromisoformat(from_text)
+        end = date.fromisoformat(to_text)
+    except ValueError as exc:
+        raise ValueError("from_date and to_date must be ISO dates (YYYY-MM-DD)") from exc
+    if start > end:
+        raise ValueError("from_date must not be after to_date")
+    exchange_text = _require_identity_param(exchange, field_name="exchange").upper()
+    segment_text = _require_identity_param(segment, field_name="segment").upper()
+    return {
+        "from": from_text,
+        "to": to_text,
+        "exchange": exchange_text,
+        "segment": segment_text,
+    }
 
 
 @dataclass(frozen=True)
@@ -334,6 +368,70 @@ class KiteAlgoWorkerClient:
 
     def get_run_funds(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}/funds")
+
+    def get_index_constituents(self, source_list: str, *, schema_version: int = 1) -> JsonDict:
+        source = _require_identity_param(source_list, field_name="source_list")
+        return self._request(
+            "GET",
+            f"/worker/market/indices/{source}",
+            params={"schema_version": schema_version},
+        )
+
+    def get_index_constituents_snapshot(self, source_list: str, *, schema_version: int = 1) -> WorkerIndexConstituentsSnapshot:
+        return WorkerIndexConstituentsSnapshot.model_validate(
+            self.get_index_constituents(source_list, schema_version=schema_version)
+        )
+
+    def get_index_constituent_status(self, source_list: str, *, schema_version: int = 1) -> JsonDict:
+        source = _require_identity_param(source_list, field_name="source_list")
+        return self._request(
+            "GET",
+            f"/worker/market/indices/{source}/status",
+            params={"schema_version": schema_version},
+        )
+
+    def get_index_constituent_status_snapshot(self, source_list: str, *, schema_version: int = 1) -> WorkerIndexConstituentStatus:
+        return WorkerIndexConstituentStatus.model_validate(
+            self.get_index_constituent_status(source_list, schema_version=schema_version)
+        )
+
+    def get_market_calendar(self, from_date: Any, to_date: Any, *, exchange: str = "NSE", segment: str = "CM", schema_version: int = 1) -> JsonDict:
+        params = _normalize_calendar_date_params(from_date, to_date, exchange=exchange, segment=segment)
+        params["schema_version"] = schema_version
+        return self._request("GET", "/worker/market/calendar", params=params)
+
+    def get_market_calendar_snapshot(self, from_date: Any, to_date: Any, *, exchange: str = "NSE", segment: str = "CM", schema_version: int = 1) -> WorkerMarketCalendarSnapshot:
+        return WorkerMarketCalendarSnapshot.model_validate(
+            self.get_market_calendar(from_date, to_date, exchange=exchange, segment=segment, schema_version=schema_version)
+        )
+
+    def get_market_calendar_status(self, *, exchange: str = "NSE", segment: str = "CM", schema_version: int = 1) -> JsonDict:
+        exchange_text = _require_identity_param(exchange, field_name="exchange").upper()
+        segment_text = _require_identity_param(segment, field_name="segment").upper()
+        return self._request(
+            "GET",
+            "/worker/market/calendar/status",
+            params={"exchange": exchange_text, "segment": segment_text, "schema_version": schema_version},
+        )
+
+    def get_market_calendar_status_snapshot(self, *, exchange: str = "NSE", segment: str = "CM", schema_version: int = 1) -> WorkerMarketCalendarStatus:
+        return WorkerMarketCalendarStatus.model_validate(
+            self.get_market_calendar_status(exchange=exchange, segment=segment, schema_version=schema_version)
+        )
+
+    def get_account_portfolio(self, *, account_scope: Optional[str] = None, schema_version: int = 1) -> JsonDict:
+        params: JsonDict = {"schema_version": schema_version}
+        if account_scope is not None:
+            scope_text = str(account_scope).strip()
+            if not scope_text:
+                raise ValueError("account_scope must not be empty when provided")
+            params["account_scope"] = scope_text
+        return self._request("GET", "/worker/account/portfolio", params=params)
+
+    def get_account_portfolio_snapshot(self, *, account_scope: Optional[str] = None, schema_version: int = 1) -> WorkerAccountPortfolioSnapshot:
+        return WorkerAccountPortfolioSnapshot.model_validate(
+            self.get_account_portfolio(account_scope=account_scope, schema_version=schema_version)
+        )
 
     def stream_run_pnl(self, strategy_run_id: str, *, interval_seconds: float = 1.0) -> Iterator[JsonDict]:
         return self._stream_sse(

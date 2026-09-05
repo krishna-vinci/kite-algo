@@ -6,8 +6,15 @@ from datetime import datetime
 from importlib import import_module
 from typing import Any, Dict, Iterable, Mapping, Optional
 
-from .client import AlgoWorkerConfig, JsonDict, _build_historical_date_params
+from .client import AlgoWorkerConfig, JsonDict, _build_historical_date_params, _normalize_calendar_date_params, _require_identity_param
 from .exceptions import error_for_status
+from .investment import (
+    WorkerAccountPortfolioSnapshot,
+    WorkerIndexConstituentStatus,
+    WorkerIndexConstituentsSnapshot,
+    WorkerMarketCalendarSnapshot,
+    WorkerMarketCalendarStatus,
+)
 from .models import (
     WorkerGttTrigger,
     WorkerGttWriteResult,
@@ -73,6 +80,70 @@ class AsyncKiteAlgoWorkerClient:
 
     async def get_run_funds(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", f"/worker/runs/{strategy_run_id}/funds")
+
+    async def get_index_constituents(self, source_list: str, *, schema_version: int = 1) -> JsonDict:
+        source = _require_identity_param(source_list, field_name="source_list")
+        return await self._request(
+            "GET",
+            f"/worker/market/indices/{source}",
+            params={"schema_version": schema_version},
+        )
+
+    async def get_index_constituents_snapshot(self, source_list: str, *, schema_version: int = 1) -> WorkerIndexConstituentsSnapshot:
+        return WorkerIndexConstituentsSnapshot.model_validate(
+            await self.get_index_constituents(source_list, schema_version=schema_version)
+        )
+
+    async def get_index_constituent_status(self, source_list: str, *, schema_version: int = 1) -> JsonDict:
+        source = _require_identity_param(source_list, field_name="source_list")
+        return await self._request(
+            "GET",
+            f"/worker/market/indices/{source}/status",
+            params={"schema_version": schema_version},
+        )
+
+    async def get_index_constituent_status_snapshot(self, source_list: str, *, schema_version: int = 1) -> WorkerIndexConstituentStatus:
+        return WorkerIndexConstituentStatus.model_validate(
+            await self.get_index_constituent_status(source_list, schema_version=schema_version)
+        )
+
+    async def get_market_calendar(self, from_date: Any, to_date: Any, *, exchange: str = "NSE", segment: str = "CM", schema_version: int = 1) -> JsonDict:
+        params = _normalize_calendar_date_params(from_date, to_date, exchange=exchange, segment=segment)
+        params["schema_version"] = schema_version
+        return await self._request("GET", "/worker/market/calendar", params=params)
+
+    async def get_market_calendar_snapshot(self, from_date: Any, to_date: Any, *, exchange: str = "NSE", segment: str = "CM", schema_version: int = 1) -> WorkerMarketCalendarSnapshot:
+        return WorkerMarketCalendarSnapshot.model_validate(
+            await self.get_market_calendar(from_date, to_date, exchange=exchange, segment=segment, schema_version=schema_version)
+        )
+
+    async def get_market_calendar_status(self, *, exchange: str = "NSE", segment: str = "CM", schema_version: int = 1) -> JsonDict:
+        exchange_text = _require_identity_param(exchange, field_name="exchange").upper()
+        segment_text = _require_identity_param(segment, field_name="segment").upper()
+        return await self._request(
+            "GET",
+            "/worker/market/calendar/status",
+            params={"exchange": exchange_text, "segment": segment_text, "schema_version": schema_version},
+        )
+
+    async def get_market_calendar_status_snapshot(self, *, exchange: str = "NSE", segment: str = "CM", schema_version: int = 1) -> WorkerMarketCalendarStatus:
+        return WorkerMarketCalendarStatus.model_validate(
+            await self.get_market_calendar_status(exchange=exchange, segment=segment, schema_version=schema_version)
+        )
+
+    async def get_account_portfolio(self, *, account_scope: Optional[str] = None, schema_version: int = 1) -> JsonDict:
+        params: JsonDict = {"schema_version": schema_version}
+        if account_scope is not None:
+            scope_text = str(account_scope).strip()
+            if not scope_text:
+                raise ValueError("account_scope must not be empty when provided")
+            params["account_scope"] = scope_text
+        return await self._request("GET", "/worker/account/portfolio", params=params)
+
+    async def get_account_portfolio_snapshot(self, *, account_scope: Optional[str] = None, schema_version: int = 1) -> WorkerAccountPortfolioSnapshot:
+        return WorkerAccountPortfolioSnapshot.model_validate(
+            await self.get_account_portfolio(account_scope=account_scope, schema_version=schema_version)
+        )
 
     async def place_gtt(self, payload: Mapping[str, Any]) -> JsonDict:
         return await self._request("POST", "/worker/gtt/triggers", json=dict(payload))
