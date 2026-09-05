@@ -165,6 +165,18 @@ def parse_constituent_csv(text: str) -> List[Dict[str, str]]:
     return rows
 
 
+def is_tradable_constituent(item: Mapping[str, Any]) -> bool:
+    """Reject NSE's synthetic corporate-action placeholders from execution universes."""
+    symbol = str(item.get("symbol") or "").strip().upper()
+    isin_code = str(item.get("isin_code") or "").strip().upper()
+    company_name = str(item.get("company_name") or "").strip().lower()
+    return not (
+        symbol.startswith("DUMMY")
+        or isin_code.startswith("DUM")
+        or company_name.startswith("dummy ")
+    )
+
+
 def parse_top_holdings_csv(text: str) -> Dict[str, float]:
     reader = csv.DictReader(io.StringIO(text.strip()))
     weights: Dict[str, float] = {}
@@ -410,7 +422,10 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
     conn = get_db_connection()
     try:
         constituent_csv = client.fetch_text(config.constituent_csv_url, referer="https://www.nseindia.com/all-reports/", use_nse=True)
-        constituents = parse_constituent_csv(constituent_csv)
+        constituents = [
+            item for item in parse_constituent_csv(constituent_csv)
+            if is_tradable_constituent(item)
+        ]
         source_checksum = hashlib.sha256(constituent_csv.encode("utf-8")).hexdigest()
         instrument_map = _load_instrument_map(conn, constituents)
         existing_rows = _load_existing_rows(conn, normalized)

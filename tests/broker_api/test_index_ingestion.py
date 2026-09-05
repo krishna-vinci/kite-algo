@@ -18,6 +18,7 @@ from backend.broker_api.instruments.index_ingestion import (
     index_refresh_is_due,
     get_index_refresh_state,
     get_worker_index_status,
+    is_tradable_constituent,
     normalize_source_list,
     parse_constituent_csv,
     parse_top_holdings_csv,
@@ -82,6 +83,26 @@ class IndexIngestionHelpersTests(unittest.TestCase):
         self.assertEqual(rows[0]["symbol"], "HDFCBANK")
         self.assertEqual(rows[0]["series"], "EQ")
         self.assertEqual(rows[1]["isin_code"], "INE090A01021")
+
+    def test_nse_dummy_corporate_action_row_is_not_tradable(self):
+        self.assertFalse(
+            is_tradable_constituent(
+                {
+                    "symbol": "DUMMYHEG",
+                    "company_name": "Dummy HEG Ltd.",
+                    "isin_code": "DUM545A01024",
+                }
+            )
+        )
+        self.assertTrue(
+            is_tradable_constituent(
+                {
+                    "symbol": "HEG",
+                    "company_name": "H.E.G. Ltd.",
+                    "isin_code": "INE545A01024",
+                }
+            )
+        )
 
     def test_parse_top_holdings_csv(self):
         weights = parse_top_holdings_csv(
