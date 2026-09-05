@@ -54,6 +54,24 @@ class IndexIngestionHelpersTests(unittest.TestCase):
                 ],
             )
 
+    def test_newer_nse_series_symbol_replaces_stale_exact_symbol(self):
+        resolved = _resolve_nse_instrument_map(
+            [{"symbol": "HEG", "series": "EQ"}],
+            [
+                ("HEG", 342017, "NSE", datetime(2026, 5, 8, tzinfo=timezone.utc)),
+                ("HEG-BE", 1886209, "NSE", datetime(2026, 9, 5, tzinfo=timezone.utc)),
+            ],
+        )
+
+        self.assertEqual(
+            resolved["HEG"],
+            {
+                "tradingsymbol": "HEG-BE",
+                "instrument_token": 1886209,
+                "exchange": "NSE",
+            },
+        )
+
     def test_parse_constituent_csv_extracts_official_fields(self):
         rows = parse_constituent_csv(
             "Company Name,Industry,Symbol,Series,ISIN Code\n"

@@ -264,13 +264,16 @@ def _resolve_nse_instrument_map(
     """
 
     candidates: Dict[str, List[Dict[str, Any]]] = {}
-    for tradingsymbol, instrument_token, exchange in rows:
+    for row in rows:
+        tradingsymbol, instrument_token, exchange = row[:3]
+        last_updated = row[3] if len(row) > 3 else None
         if str(exchange).strip().upper() != "NSE":
             continue
         value = {
             "tradingsymbol": str(tradingsymbol),
             "instrument_token": instrument_token,
             "exchange": "NSE",
+            "_last_updated": last_updated,
         }
         for item in constituents:
             official_symbol = str(item.get("symbol") or "").strip()
@@ -283,7 +286,11 @@ def _resolve_nse_instrument_map(
     for item in constituents:
         official_symbol = str(item.get("symbol") or "").strip()
         matches = candidates.get(official_symbol, [])
-        exact = [item for item in matches if item["tradingsymbol"] == official_symbol]
+        dated = [candidate for candidate in matches if candidate.get("_last_updated") is not None]
+        if dated:
+            newest = max(candidate["_last_updated"] for candidate in dated)
+            matches = [candidate for candidate in matches if candidate.get("_last_updated") == newest]
+        exact = [candidate for candidate in matches if candidate["tradingsymbol"] == official_symbol]
         selected = exact if exact else matches
         if len(selected) > 1:
             symbols = ", ".join(sorted(str(item["tradingsymbol"]) for item in selected))
@@ -291,7 +298,9 @@ def _resolve_nse_instrument_map(
                 f"Ambiguous NSE instrument mapping for {official_symbol}: {symbols}"
             )
         if selected:
-            resolved[official_symbol] = selected[0]
+            resolved[official_symbol] = {
+                key: value for key, value in selected[0].items() if not key.startswith("_")
+            }
     return resolved
 
 
@@ -305,7 +314,7 @@ def _load_instrument_map(
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT tradingsymbol, instrument_token, exchange
+            SELECT tradingsymbol, instrument_token, exchange, last_updated
             FROM kite_instruments
             WHERE instrument_type = 'EQ'
               AND exchange = 'NSE'

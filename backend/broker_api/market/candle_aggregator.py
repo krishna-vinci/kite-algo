@@ -345,8 +345,12 @@ class CandleAggregator:
         seconds = INTERVAL_SECONDS[interval]
         
         if interval == 'day':
-            # Day candles start at 00:00 UTC
-            return ts.replace(hour=0, minute=0, second=0, microsecond=0)
+            # NSE trading days are defined in IST, not by the UTC date.
+            return (
+                ts.astimezone(IST)
+                .replace(hour=0, minute=0, second=0, microsecond=0)
+                .astimezone(timezone.utc)
+            )
         
         # For intraday intervals, align to interval boundaries
         epoch = int(ts.timestamp())

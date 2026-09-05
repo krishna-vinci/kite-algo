@@ -36,6 +36,7 @@ from backend.app.database import SessionLocal, database as async_db, get_db_conn
 from backend.journaling.runtime import JournalRuntimeWorker
 from backend.journaling.service import JournalService
 from backend.app.monitor import heartbeat, set_component_status, set_meta
+from backend.broker_api.market.daily_candle_finalization import schedule_daily_candle_finalization
 
 logger = logging.getLogger(__name__)
 market_data_runtime: MarketDataRuntime | None = None
@@ -64,6 +65,7 @@ async def combined_lifespan(app: FastAPI):
     index_refresh_task = None
     calendar_refresh_task = None
     fundamentals_sync_task = None
+    daily_candle_finalization_task = None
     order_runtime_task = None
     positions_runtime_task = None
     worker_protection_task = None
@@ -324,6 +326,7 @@ async def combined_lifespan(app: FastAPI):
         index_refresh_task = asyncio.create_task(_schedule_monthly_index_refresh())
         calendar_refresh_task = asyncio.create_task(_schedule_exchange_calendar_refresh())
         fundamentals_sync_task = asyncio.create_task(_schedule_fundamentals_nightly_refresh())
+        daily_candle_finalization_task = asyncio.create_task(schedule_daily_candle_finalization())
         try:
             startup_index_result = await asyncio.to_thread(refresh_live_metrics_for_indices, ["Nifty50", "NiftyBank"])
             set_meta("index_runtime_startup_refresh", {"last_result": startup_index_result, "last_success_at": datetime.utcnow().isoformat()})
@@ -545,6 +548,18 @@ async def combined_lifespan(app: FastAPI):
             fundamentals_sync_task.cancel()
             try:
                 await fundamentals_sync_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel post-close daily candle finalization scheduler
+    try:
+        if 'daily_candle_finalization_task' in locals() and daily_candle_finalization_task:
+            daily_candle_finalization_task.cancel()
+            try:
+                await daily_candle_finalization_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
     except Exception:

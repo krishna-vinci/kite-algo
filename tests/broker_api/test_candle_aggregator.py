@@ -1,5 +1,5 @@
 import unittest
-from datetime import timezone
+from datetime import datetime, timezone
 
 from tests.support.test_support import install_dependency_stubs
 
@@ -52,6 +52,14 @@ class CandleAggregatorRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ts = aggregator._normalize_tick_timestamp("2026-04-05T09:45:10+05:30")
         self.assertIsNotNone(ts.tzinfo)
         self.assertEqual(ts.tzinfo, timezone.utc)
+
+    def test_daily_bucket_uses_nse_ist_trading_date(self):
+        aggregator = CandleAggregator("test-key")
+        tick_ts = datetime.fromisoformat("2026-09-04T09:45:10+05:30").astimezone(timezone.utc)
+
+        bucket = aggregator._get_bucket_start(tick_ts, "day")
+
+        self.assertEqual(bucket, datetime.fromisoformat("2026-09-03T18:30:00+00:00"))
 
 
 if __name__ == "__main__":
