@@ -785,9 +785,11 @@ except CalendarRangeUncoveredError as exc:
 Screener.in-sourced company fundamentals, acquired, stored, and refreshed by the Kite Algo server. Consumers never scrape; they call the SDK. Responses are typed models carrying `schema_version`, `source: "screener"`, and `retrieved_at`.
 
 ```python
+from datetime import datetime, timezone
+
 from kite_algo_worker import KiteAlgoWorkerClient, AlgoWorkerConfig
 
-client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_..."))
+client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:18777", token="kwa_..."))
 
 # A single stock or an explicit list
 features = client.get_fundamentals_features(symbols=["RELIANCE", "TCS"])
@@ -813,13 +815,13 @@ for r in statements.rows:
 # features = await async_client.get_fundamentals_features(index="Nifty50")
 ```
 
-**Scope rule:** every method takes exactly one scope — `symbols` (one or many; at most 50 for `refresh_fundamentals`) or `index` (one of the server-supported universes; currently `Nifty50` and `Nifty500`). Passing both or neither raises `ValueError` before any network call.
+**Scope rule:** scoped methods take exactly one of `symbols` (one or many) or `index` (currently `Nifty50` and `Nifty500`). Passing both or neither raises `ValueError` before any network call. Reads support either index. On-demand refresh is capped after scope resolution at 50 symbols, so `Nifty50` can be refreshed explicitly while `Nifty500` is refreshed by the nightly scheduler.
 
 **Models:** `FundamentalFeatures` (list of `FundamentalFeatureRow` plus `missing_symbols`), `FundamentalsStatus` (per-symbol `last_checked_at`/`last_success_at`/`last_error` plus `recent_runs`), `FundamentalsStatements`, and `FundamentalsSyncRun` (the only mutating response). Unknown additive server fields are preserved in `raw` and round-trip through `model_dump()`.
 
 **Freshness is your policy:** the server stores derived features per symbol and reports `last_success_at` per symbol; apply your own staleness thresholds with `status.fresh_within(...)` before trusting data in time-sensitive strategies.
 
-**Refresh economics and guardrails:** `refresh_fundamentals` is the only mutating fundamentals method. The server deduplicates fetches with HTTP conditional requests (ETag / If-Modified-Since → `304 Not Modified`), isolates per-symbol failures, enforces the 50-symbol cap for symbol scopes, and single-flights syncs — a second concurrent refresh raises `KiteAlgoWorkerError` with status `409` ("fundamentals sync already in progress"). The nightly scheduler refreshes every supported index universe at 02:00 IST.
+**Refresh economics and guardrails:** `refresh_fundamentals` is the only mutating fundamentals method and requires a worker token with `market:read`. The server sends HTTP conditional headers when the source provides validators and always uses a content fingerprint to avoid unchanged writes; screener.in currently omits ETag/Last-Modified on observed company pages, so fingerprints are the normal no-op path. Per-symbol failures are isolated, the resolved on-demand scope is capped at 50 symbols, and syncs are single-flighted — a second concurrent refresh raises `KiteAlgoWorkerError` with status `409` ("fundamentals sync already in progress"). The nightly scheduler refreshes every supported index universe at 02:00 IST.
 
 **Read-only guarantee:** all `get_fundamentals_*` methods are observation-only and never enable live execution; the live-mode gate of the platform is unaffected.
 

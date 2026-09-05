@@ -172,6 +172,32 @@ Backend protection objects declare thresholds the backend enforces automatically
 
 Use `update_backend_protection(...)` and `patch_risk(...)` to adjust thresholds at runtime.
 
+## Fundamentals data (0.7.7)
+
+Kite Algo owns screener.in acquisition, validation, storage, and refresh. Strategy workers must never scrape screener.in or query fundamentals tables directly.
+
+```python
+from datetime import datetime, timezone
+
+features = client.get_fundamentals_features(symbols=["RELIANCE", "TCS"])
+row = features.for_symbol("RELIANCE")
+
+status = client.get_fundamentals_status(symbols=["RELIANCE", "TCS"])
+if not status.fresh_within("RELIANCE", hours=24, now=datetime.now(timezone.utc)):
+    result = client.refresh_fundamentals(symbols=["RELIANCE"], mode="incremental")
+    if result.symbols_failed:
+        raise RuntimeError(result.failed_symbols)
+
+quarterly = client.get_fundamentals_statements("RELIANCE", dataset="quarterly")
+```
+
+- `get_fundamentals_features(...)`, `get_fundamentals_status(...)`, and `get_fundamentals_statements(...)` are read-only.
+- Scoped methods accept exactly one of `symbols` or `index`; supported index reads are `Nifty50` and `Nifty500`.
+- `refresh_fundamentals(...)` is the only mutating fundamentals method and requires a worker token with `market:read`.
+- The server caps on-demand refresh after scope resolution at 50 symbols. `Nifty50` fits; `Nifty500` is handled by the 02:00 IST nightly scheduler.
+- Incremental refresh skips fresh symbols and uses content fingerprints as the normal unchanged-data path.
+- `missing_symbols` and `last_success_at` are data-quality signals. Apply the strategy's own completeness and freshness policy before trading.
+
 ## Options flow summary
 
 Prefer `client.options.*` and resolver helpers over manual option payload construction.

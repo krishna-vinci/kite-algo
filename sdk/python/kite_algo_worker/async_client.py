@@ -190,7 +190,7 @@ class AsyncKiteAlgoWorkerClient:
 
     async def refresh_fundamentals(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None, mode: str = "incremental") -> FundamentalsSyncRun:
         """Trigger an on-demand fundamentals sync. This is the only mutating
-        fundamentals method: the server caps symbol scopes at 50 per request
+        fundamentals method: the server caps the resolved scope at 50 symbols
         and single-flights syncs (409 when one is already running)."""
         if bool(symbols) == bool(index):
             raise ValueError("provide exactly one of 'symbols' or 'index'")

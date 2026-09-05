@@ -32,7 +32,18 @@ jobs:
       - name: Run focused SDK tests
         env:
           DATABASE_URL: postgresql://user:pass@localhost:5432/kite_test
-        run: python -m pytest tests/sdk/test_worker_sdk.py tests/sdk/test_worker_sdk_async.py tests/sdk/test_worker_sdk_ws.py tests/sdk/test_worker_sdk_options.py tests/sdk/test_worker_sdk_options_market.py -q
+        run: >-
+          python -m pytest
+          tests/sdk/test_worker_sdk.py
+          tests/sdk/test_worker_sdk_async.py
+          tests/sdk/test_worker_sdk_ws.py
+          tests/sdk/test_worker_sdk_options.py
+          tests/sdk/test_worker_sdk_options_market.py
+          tests/sdk/test_worker_sdk_fundamentals.py
+          tests/sdk/test_worker_sdk_investment.py
+          tests/sdk/test_worker_sdk_investment_async.py
+          tests/sdk/test_worker_sdk_preview_costs.py
+          -q
 
       - name: Verify tag matches SDK version
         if: startsWith(github.ref, 'refs/tags/')
