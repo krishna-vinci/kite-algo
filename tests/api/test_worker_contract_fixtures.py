@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 
-FIXTURES = Path(__file__).parent / "fixtures" / "worker_api" / "v1"
+FIXTURES = Path(__file__).parent.parent / "fixtures" / "worker_api" / "v1"
 
 
 def test_sanitized_v1_fixtures_have_a_stable_envelope():

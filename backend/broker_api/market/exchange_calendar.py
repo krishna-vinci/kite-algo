@@ -83,6 +83,97 @@ def require_exchange_calendar_schema(conn: Any) -> None:
         raise CalendarSchemaMigrationRequired("EXCHANGE_CALENDAR_SCHEMA_MIGRATION_REQUIRED")
 
 
+def _require_exchange_calendar_refresh_state_schema(conn: Any) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('public.exchange_calendar_refresh_state')")
+        row = cur.fetchone()
+    if not row or not row[0]:
+        raise CalendarSchemaMigrationRequired("EXCHANGE_CALENDAR_SCHEMA_MIGRATION_REQUIRED")
+
+
+def get_calendar_status(conn: Any, exchange: str, segment: str, *, now: datetime | None = None, warning_days: int = 45) -> Dict[str, Any]:
+    """Schema-version-1 calendar health envelope for one exchange segment.
+
+    Coverage is derived exclusively from the active immutable calendar version.
+    Missing calendar data yields a truthful incomplete status; it never infers
+    sessions. Missing migration/schema fails closed with
+    CalendarSchemaMigrationRequired.
+    """
+    exchange_text = str(exchange or "").strip().upper()
+    segment_text = str(segment or "").strip().upper()
+    if not exchange_text or not segment_text:
+        raise ValueError("exchange and segment are required")
+    now = now or datetime.now(timezone.utc)
+    retrieved_at = now.astimezone(timezone.utc).isoformat()
+    require_exchange_calendar_schema(conn)
+    _require_exchange_calendar_refresh_state_schema(conn)
+
+    refresh: Dict[str, Any] = {
+        "last_attempt_at": None,
+        "last_success_at": None,
+        "last_failure_at": None,
+        "last_error": None,
+        "observed_source_sha256": None,
+        "next_attempt_at": None,
+    }
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT last_attempt_at, last_success_at, last_failure_at, last_error,
+                      observed_source_sha256, next_attempt_at
+                 FROM public.exchange_calendar_refresh_state WHERE exchange=%s AND segment=%s""",
+            (exchange_text, segment_text),
+        )
+        state_row = cur.fetchone()
+        if state_row is not None:
+            refresh = {
+                "last_attempt_at": state_row[0].astimezone(timezone.utc).isoformat() if state_row[0] else None,
+                "last_success_at": state_row[1].astimezone(timezone.utc).isoformat() if state_row[1] else None,
+                "last_failure_at": state_row[2].astimezone(timezone.utc).isoformat() if state_row[2] else None,
+                "last_error": state_row[3],
+                "observed_source_sha256": state_row[4],
+                "next_attempt_at": state_row[5].astimezone(timezone.utc).isoformat() if state_row[5] else None,
+            }
+        cur.execute(
+            "SELECT MAX(calendar_version) FROM public.exchange_calendar_source_documents WHERE exchange=%s AND segment=%s",
+            (exchange_text, segment_text),
+        )
+        version_row = cur.fetchone()
+        active_version = int(version_row[0]) if version_row and version_row[0] is not None else None
+        coverage_start = coverage_end = None
+        if active_version is not None:
+            cur.execute(
+                """SELECT MIN(session_date), MAX(session_date) FROM public.exchange_calendar_sessions
+                    WHERE exchange=%s AND segment=%s AND calendar_version=%s""",
+                (exchange_text, segment_text, active_version),
+            )
+            coverage_row = cur.fetchone()
+            if coverage_row is not None:
+                coverage_start = coverage_row[0].isoformat() if coverage_row[0] else None
+                coverage_end = coverage_row[1].isoformat() if coverage_row[1] else None
+
+    complete = active_version is not None and coverage_start is not None and coverage_end is not None and date.fromisoformat(coverage_end) >= now.date()
+    expiry_warning = bool(coverage_end and date.fromisoformat(coverage_end) < (now.date() + timedelta(days=warning_days)))
+    return {
+        "schema_version": 1,
+        "source": "exchange_calendar_refresh",
+        "source_as_of": refresh.get("last_success_at"),
+        "retrieved_at": retrieved_at,
+        "exchange": exchange_text,
+        "segment": segment_text,
+        "active_calendar_version": active_version,
+        "coverage_start": coverage_start,
+        "coverage_end": coverage_end,
+        "complete": complete,
+        "expiry_warning": expiry_warning,
+        "last_attempt_at": refresh["last_attempt_at"],
+        "last_success_at": refresh["last_success_at"],
+        "last_failure_at": refresh["last_failure_at"],
+        "last_error": refresh["last_error"],
+        "observed_source_sha256": refresh["observed_source_sha256"],
+        "next_attempt_at": refresh["next_attempt_at"],
+    }
+
+
 def import_calendar_csv(conn: Any | None, text: str, *, exchange: str, segment: str, source_reference: str, official_source_document_sha256: str, parser_version: str, actor: str, reason: str, apply: bool) -> Dict[str, Any]:
     preview = dry_run_import(text, source_reference=source_reference, official_source_document_sha256=official_source_document_sha256, parser_version=parser_version, actor=actor, reason=reason)
     if not apply:

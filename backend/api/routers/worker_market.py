@@ -5,7 +5,7 @@ from datetime import date, datetime
 from typing import Any, Dict, Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from backend.api.schemas.investment_worker import CalendarResponse, IndexSnapshotResponse, IndexStatusResponse, PortfolioSnapshotResponse
+from backend.api.schemas.investment_worker import CalendarResponse, CalendarStatusResponse, IndexSnapshotResponse, IndexStatusResponse, PortfolioSnapshotResponse
 from backend.api.services.market_data import WorkerInstrumentResolveRequest, WorkerMarketSnapshotRequest, WorkerQuoteRequest
 from backend.api.routers.worker_shared import *
 
@@ -209,6 +209,21 @@ async def get_worker_index_status(request: Request, source_list: str, schema_ver
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+async def get_worker_market_calendar_status(request: Request, exchange: str = "NSE", segment: str = "CM", schema_version: int = Query(1, ge=1)):
+    _require_schema_version(schema_version)
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    from backend.app.database import get_db_connection
+    from backend.broker_api.market.exchange_calendar import CalendarSchemaMigrationRequired, get_calendar_status
+    conn = get_db_connection()
+    try:
+        return await asyncio.to_thread(get_calendar_status, conn, exchange.upper(), segment.upper())
+    except CalendarSchemaMigrationRequired as exc:
+        raise HTTPException(status_code=503, detail={"rejection_reason": str(exc)}) from exc
+    finally:
+        conn.close()
+
+
 async def get_worker_market_calendar(request: Request, exchange: str = "NSE", segment: str = "CM", from_date: date = Query(..., alias="from"), to_date: date = Query(..., alias="to"), schema_version: int = Query(1, ge=1)):
     _require_schema_version(schema_version)
     token = await require_worker_token(request)
@@ -322,6 +337,7 @@ router.add_api_route("/worker/funds", get_worker_funds, methods=["GET"])
 router.add_api_route("/worker/account/portfolio", get_worker_account_portfolio, methods=["GET"], response_model=PortfolioSnapshotResponse)
 router.add_api_route("/worker/market/indices/{source_list}", get_worker_index_constituents, methods=["GET"], response_model=IndexSnapshotResponse)
 router.add_api_route("/worker/market/indices/{source_list}/status", get_worker_index_status, methods=["GET"], response_model=IndexStatusResponse)
+router.add_api_route("/worker/market/calendar/status", get_worker_market_calendar_status, methods=["GET"], response_model=CalendarStatusResponse)
 router.add_api_route("/worker/market/calendar", get_worker_market_calendar, methods=["GET"], response_model=CalendarResponse)
 router.add_api_route("/worker/runs/{strategy_run_id}/funds", get_worker_run_funds, methods=["GET"])
 router.add_api_route("/worker/gtt/triggers", create_worker_gtt_trigger, methods=["POST"])

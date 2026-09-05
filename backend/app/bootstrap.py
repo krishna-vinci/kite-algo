@@ -20,7 +20,7 @@ from backend.app.background import (
     _worker_runtime_recovery_exit_loop,
     _worker_runtime_recovery_runs_loop,
 )
-from backend.app.schedulers import daily_token_ready, _schedule_daily_token_refresh, _schedule_monthly_index_refresh
+from backend.app.schedulers import daily_token_ready, _schedule_daily_token_refresh, _schedule_exchange_calendar_refresh, _schedule_monthly_index_refresh
 from backend.broker_api.broker_api import (
     run_headless_login_and_persist_system_token,
     schedule_daily_instruments_update,
@@ -62,6 +62,7 @@ async def combined_lifespan(app: FastAPI):
     scheduler_task = None
     daily_instruments_refresh_task = None
     index_refresh_task = None
+    calendar_refresh_task = None
     order_runtime_task = None
     positions_runtime_task = None
     worker_protection_task = None
@@ -320,6 +321,7 @@ async def combined_lifespan(app: FastAPI):
         scheduler_task = asyncio.create_task(_schedule_daily_token_refresh())
         daily_instruments_refresh_task = asyncio.create_task(schedule_daily_instruments_update())
         index_refresh_task = asyncio.create_task(_schedule_monthly_index_refresh())
+        calendar_refresh_task = asyncio.create_task(_schedule_exchange_calendar_refresh())
         try:
             startup_index_result = await asyncio.to_thread(refresh_live_metrics_for_indices, ["Nifty50", "NiftyBank"])
             set_meta("index_runtime_startup_refresh", {"last_result": startup_index_result, "last_success_at": datetime.utcnow().isoformat()})
@@ -521,6 +523,16 @@ async def combined_lifespan(app: FastAPI):
             index_refresh_task.cancel()
             try:
                 await index_refresh_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel daily exchange calendar refresh scheduler
+    try:
+        if 'calendar_refresh_task' in locals() and calendar_refresh_task:
+            calendar_refresh_task.cancel()
+            try:
+                await calendar_refresh_task
             except Exception:
                 pass
     except Exception:

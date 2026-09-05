@@ -37,3 +37,19 @@ class CalendarResponse(V1Envelope):
     segment: str
     calendar_version: int
     sessions: list[dict[str, Any]]
+
+
+class CalendarStatusResponse(V1Envelope):
+    exchange: str
+    segment: str
+    active_calendar_version: int | None
+    coverage_start: str | None
+    coverage_end: str | None
+    complete: bool
+    expiry_warning: bool
+    last_attempt_at: str | None = None
+    last_success_at: str | None = None
+    last_failure_at: str | None = None
+    last_error: str | None = None
+    observed_source_sha256: str | None = None
+    next_attempt_at: str | None = None

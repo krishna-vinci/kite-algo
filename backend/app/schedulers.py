@@ -120,6 +120,88 @@ async def _schedule_daily_token_refresh() -> None:
             set_component_status("daily_token_scheduler", "degraded", detail=str(e))
             await asyncio.sleep(30)
 
+async def _schedule_exchange_calendar_refresh(
+    *,
+    now_fn=None,
+    sleep_fn=None,
+    refresh_fn=None,
+    heartbeat_enabled: bool = True,
+) -> None:
+    """Run the official NSE calendar synchronization once daily at 05:45 IST.
+
+    ``refresh_fn`` receives the list of years (current and next). A failed or
+    awaiting-release refresh never retries rapidly: the loop simply sleeps
+    until the next daily 05:45 window.
+    """
+    tz = ZoneInfo("Asia/Kolkata")
+    now_fn = now_fn or (lambda: datetime.now(tz))
+    sleep_fn = sleep_fn or asyncio.sleep
+    if refresh_fn is None:
+        def refresh_fn(years):
+            from backend.app.database import get_db_connection
+            from backend.broker_api.market.nse_calendar_source import synchronize_official_calendar
+
+            conn = get_db_connection()
+            try:
+                return synchronize_official_calendar(conn, years)
+            finally:
+                conn.close()
+
+    async def _refresh(years):
+        return await asyncio.to_thread(refresh_fn, years)
+
+    set_component_status("calendar_refresh_scheduler", "healthy", detail="Daily exchange calendar refresh scheduler started")
+    while True:
+        try:
+            now = now_fn()
+            next_run = now.replace(hour=5, minute=45, second=0, microsecond=0)
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            sleep_sec = max(1, int((next_run - now).total_seconds()))
+            set_meta(
+                "calendar_refresh_scheduler",
+                {
+                    "next_run": next_run.isoformat(),
+                    "sleep_seconds": sleep_sec,
+                },
+            )
+            if heartbeat_enabled:
+                heartbeat("calendar_refresh_scheduler", detail="Sleeping until next calendar refresh window", meta={"next_run": next_run.isoformat()})
+            await sleep_fn(sleep_sec)
+
+            current = now_fn()
+            years = [current.year, current.year + 1]
+            set_component_status("calendar_refresh_scheduler", "running", detail=f"Refreshing official NSE calendar for {years}")
+            result = await _refresh(years)
+            status = str((result or {}).get("status") or "success")
+            if status == "failure":
+                set_component_status(
+                    "calendar_refresh_scheduler",
+                    "degraded",
+                    detail=str((result or {}).get("error") or "official calendar refresh failed"),
+                )
+            elif status == "awaiting_release":
+                set_component_status(
+                    "calendar_refresh_scheduler",
+                    "healthy",
+                    detail=f"Official next-year calendar not released yet; retaining current coverage ({years[1]})",
+                    meta={"awaiting_release_years": (result or {}).get("awaiting_release_years")},
+                )
+            else:
+                set_component_status(
+                    "calendar_refresh_scheduler",
+                    "healthy",
+                    detail=f"Official calendar refresh completed ({status})",
+                    meta={"result": result},
+                )
+        except asyncio.CancelledError:
+            set_component_status("calendar_refresh_scheduler", "stopped", detail="Exchange calendar refresh scheduler cancelled")
+            break
+        except Exception as e:
+            logging.error("[SCHED] Exchange calendar refresh failed: %s", e, exc_info=True)
+            set_component_status("calendar_refresh_scheduler", "degraded", detail=str(e))
+
+
 async def _schedule_monthly_index_refresh() -> None:
     tz = ZoneInfo("Asia/Kolkata")
     source_lists = list_supported_index_source_lists()

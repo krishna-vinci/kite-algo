@@ -5054,6 +5054,58 @@ def test_worker_market_calendar_route_locks_v1_contract():
     assert sessions_mock.call_args.kwargs["segment"] == "CM"
 
 
+def test_worker_market_calendar_status_route_locks_v1_contract():
+    repo = _FakeWorkerRepository(raw_token="secret-token")
+    fixture = _worker_api_fixture("calendar_status.json")
+    fake_conn = Mock()
+    with _investment_client(repo) as client:
+        with (
+            patch("backend.app.database.get_db_connection", return_value=fake_conn),
+            patch(
+                "backend.broker_api.market.exchange_calendar.get_calendar_status",
+                return_value=dict(fixture),
+            ) as status_mock,
+        ):
+            response = client.get(
+                "/api/algo-workers/worker/market/calendar/status?exchange=nse&segment=cm",
+                headers=_INVESTMENT_AUTH,
+            )
+    assert response.status_code == 200
+    status_payload = response.json()
+    assert status_payload["schema_version"] == 1
+    assert status_payload["source"] == "exchange_calendar_refresh"
+    assert status_payload["exchange"] == "NSE"
+    assert status_payload["segment"] == "CM"
+    assert status_payload["active_calendar_version"] == 3
+    assert status_payload["coverage_start"] == "2026-01-01"
+    assert status_payload["coverage_end"] == "2026-12-31"
+    assert status_payload["complete"] is True
+    assert status_payload["expiry_warning"] is True
+    assert status_mock.call_args.args[1] == "NSE"
+    assert status_mock.call_args.args[2] == "CM"
+
+
+def test_worker_market_calendar_status_route_reports_missing_schema_as_503():
+    repo = _FakeWorkerRepository(raw_token="secret-token")
+    fake_conn = Mock()
+    from backend.broker_api.market.exchange_calendar import CalendarSchemaMigrationRequired
+
+    with _investment_client(repo) as client:
+        with (
+            patch("backend.app.database.get_db_connection", return_value=fake_conn),
+            patch(
+                "backend.broker_api.market.exchange_calendar.get_calendar_status",
+                side_effect=CalendarSchemaMigrationRequired("EXCHANGE_CALENDAR_SCHEMA_MIGRATION_REQUIRED"),
+            ),
+        ):
+            response = client.get(
+                "/api/algo-workers/worker/market/calendar/status",
+                headers=_INVESTMENT_AUTH,
+            )
+    assert response.status_code == 503
+    assert response.json()["detail"]["rejection_reason"] == "EXCHANGE_CALENDAR_SCHEMA_MIGRATION_REQUIRED"
+
+
 def test_worker_account_portfolio_route_locks_v1_contract():
     repo = _FakeWorkerRepository(raw_token="secret-token")
     fixture = _worker_api_fixture("portfolio_success.json")
@@ -5088,6 +5140,7 @@ def test_worker_investment_read_routes_reject_unsupported_schema_version():
         "/api/algo-workers/worker/market/indices/Nifty500",
         "/api/algo-workers/worker/market/indices/Nifty500/status",
         "/api/algo-workers/worker/market/calendar?from=2026-09-01&to=2026-12-31",
+        "/api/algo-workers/worker/market/calendar/status",
         "/api/algo-workers/worker/account/portfolio",
     ]
     with _investment_client(repo) as client:
