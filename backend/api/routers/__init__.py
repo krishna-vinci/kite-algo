@@ -6,6 +6,7 @@ from backend.api.routers.worker_protection import router as worker_protection_ro
 from backend.api.routers.analytics import router as analytics_router
 from backend.api.routers.auth import router as auth_router
 from backend.api.routers.control import router as control_router
+from backend.api.routers.fundamentals import router as fundamentals_router
 from backend.api.routers.historical import router as historical_router
 from backend.api.routers.ingestion import router as ingestion_router
 from backend.api.routers.instruments import router as instruments_router
@@ -25,6 +26,7 @@ ALL_ROUTERS = [
     (instruments_router, "/api"),
     (historical_router, "/api"),
     (ingestion_router, "/api"),
+    (fundamentals_router, "/api"),
     (user_settings_router, "/api"),
     (marketwatch_router, "/api"),
     (worker_auth_router, "/api"),

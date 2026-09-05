@@ -57,15 +57,46 @@ class _FakeConn:
 
 
 def test_index_scope_resolves_from_constituent_store(monkeypatch):
+    from fundamentals import index_scopes
+
     members = [("INFY",), ("RELIANCE",), ("TCS",)]
-    monkeypatch.setattr(ingestion, "get_db_connection", lambda: _FakeConn(members))
+    monkeypatch.setattr(index_scopes, "get_db_connection", lambda: _FakeConn(members))
     assert resolve_scope_symbols(SyncScope(scope_type="index", scope_value="Nifty50")) == ["INFY", "RELIANCE", "TCS"]
 
 
 def test_unknown_index_scope_raises(monkeypatch):
-    monkeypatch.setattr(ingestion, "get_db_connection", lambda: _FakeConn([]))
-    with pytest.raises(ValueError, match="no constituents"):
+    with pytest.raises(ValueError, match="index must be one of"):
         resolve_scope_symbols(SyncScope(scope_type="index", scope_value="nonexistent"))
+
+
+def test_index_scope_without_constituents_raises(monkeypatch):
+    from fundamentals import index_scopes
+
+    monkeypatch.setattr(index_scopes, "get_db_connection", lambda: _FakeConn([]))
+    with pytest.raises(ValueError, match="no constituents"):
+        resolve_scope_symbols(SyncScope(scope_type="index", scope_value="Nifty50"))
+
+
+def test_index_scope_keys_are_case_insensitive(monkeypatch):
+    from fundamentals import index_scopes
+
+    members = [("INFY",)]
+    monkeypatch.setattr(index_scopes, "get_db_connection", lambda: _FakeConn(members))
+    assert resolve_scope_symbols(SyncScope(scope_type="index", scope_value="nifty50")) == ["INFY"]
+
+
+def test_index_scope_adapter_is_extensible(monkeypatch):
+    """Adding a future index is one registry entry; nothing else changes."""
+    from fundamentals import index_scopes
+
+    adapters = dict(index_scopes._INDEX_SCOPE_ADAPTERS)
+    adapters["NiftyMidcap150"] = index_scopes.IndexScopeAdapter(key="NiftyMidcap150", description="future")
+    monkeypatch.setattr(index_scopes, "_INDEX_SCOPE_ADAPTERS", adapters)
+    monkeypatch.setattr(index_scopes, "_CASE_FOLD", {key.casefold(): key for key in adapters})
+    monkeypatch.setattr(index_scopes, "get_db_connection", lambda: _FakeConn([("ABC",)]))
+
+    assert index_scopes.supported_index_scopes() == ["Nifty50", "Nifty500", "NiftyMidcap150"]
+    assert resolve_scope_symbols(SyncScope(scope_type="index", scope_value="niftymidcap150")) == ["ABC"]
 
 
 def test_unsupported_scope_type_raises():

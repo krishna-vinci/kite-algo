@@ -18,6 +18,7 @@ import pandas as pd
 
 from backend.app.database import get_db_connection
 from fundamentals.features import compute_features_from_rows
+from fundamentals.index_scopes import resolve_index_symbols
 from fundamentals.screener_client import ScreenerClient
 from fundamentals.screener_parser import ensure_screener_parser_ready, parse_screener_company_page
 
@@ -53,23 +54,9 @@ def resolve_scope_symbols(scope: SyncScope) -> list[str]:
         return [s.strip().upper() for s in scope.scope_value.split(",") if s.strip()]
     if scope.scope_type != "index":
         raise ValueError(f"unsupported scope type '{scope.scope_type}'")
-    # Index scope: reuse the same constituent membership the 0.7.6 snapshot
-    # route serves (public.kite_ticker_tickers by source_list).
-    sql = """
-        SELECT DISTINCT tradingsymbol FROM public.kite_ticker_tickers
-        WHERE source_list = %s AND tradingsymbol IS NOT NULL
-        ORDER BY tradingsymbol
-    """
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, (scope.scope_value,))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-    if not rows:
-        raise ValueError(f"no constituents found for index scope '{scope.scope_value}'")
-    return [row[0] for row in rows]
+    # Index scope: the adapter resolves membership from the same constituent
+    # store the 0.7.6 snapshot route serves, and validates the scope key.
+    return resolve_index_symbols(scope.scope_value)
 
 
 def _load_symbol_state(symbol: str, statement_scope: str) -> dict[str, Any]:
