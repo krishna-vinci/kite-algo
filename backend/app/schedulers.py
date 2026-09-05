@@ -202,6 +202,79 @@ async def _schedule_exchange_calendar_refresh(
             set_component_status("calendar_refresh_scheduler", "degraded", detail=str(e))
 
 
+async def _schedule_fundamentals_nightly_refresh(
+    *,
+    now_fn=None,
+    sleep_fn=None,
+    sync_fn=None,
+    heartbeat_enabled: bool = True,
+    sync_hour: int = 2,
+) -> None:
+    """Nightly incremental fundamentals refresh for every supported index scope.
+
+    Runs once daily at 02:00 Asia/Kolkata and walks the index-scope adapter
+    registry dynamically, so indexes added to
+    ``fundamentals.index_scopes`` are picked up with no code change here.
+    Per-index failures are logged and the remaining indexes still run; the
+    scheduler simply waits for the next daily window (no rapid retry loops).
+    """
+    from fundamentals.index_scopes import supported_index_scopes
+
+    tz = ZoneInfo("Asia/Kolkata")
+    now_fn = now_fn or (lambda: datetime.now(tz))
+    sleep_fn = sleep_fn or asyncio.sleep
+    if sync_fn is None:
+        def sync_fn(index_key):
+            from fundamentals.ingestion import SyncConfig, SyncScope, run_fundamentals_sync
+
+            return run_fundamentals_sync(
+                SyncConfig(scope=SyncScope(scope_type="index", scope_value=index_key), mode="incremental")
+            )
+
+    set_component_status("fundamentals_scheduler", "healthy", detail="Nightly fundamentals scheduler started")
+    while True:
+        try:
+            now = now_fn()
+            next_run = now.replace(hour=sync_hour, minute=0, second=0, microsecond=0)
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            sleep_sec = max(1, int((next_run - now).total_seconds()))
+            set_meta(
+                "fundamentals_scheduler",
+                {
+                    "next_run": next_run.isoformat(),
+                    "sleep_seconds": sleep_sec,
+                    "index_scopes": supported_index_scopes(),
+                },
+            )
+            if heartbeat_enabled:
+                heartbeat("fundamentals_scheduler", detail="Sleeping until next fundamentals sync window", meta={"next_run": next_run.isoformat()})
+            await sleep_fn(sleep_sec)
+
+            scopes = supported_index_scopes()
+            set_component_status("fundamentals_scheduler", "running", detail=f"Nightly fundamentals sync for {scopes}")
+            for index_key in scopes:
+                try:
+                    result = await sync_fn(index_key)
+                    set_meta("fundamentals_scheduler", {
+                        "last_index": index_key,
+                        "last_result": result,
+                        "last_success_at": datetime.utcnow().isoformat(),
+                    })
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Per-index isolation: one failing universe never blocks the others.
+                    logging.error("[SCHED] Fundamentals nightly sync failed for %s: %s", index_key, e, exc_info=True)
+                    set_component_status("fundamentals_scheduler", "degraded", detail=f"{index_key}: {e}")
+            set_component_status("fundamentals_scheduler", "healthy", detail=f"Nightly fundamentals sync window completed for {scopes}")
+        except asyncio.CancelledError:
+            set_component_status("fundamentals_scheduler", "stopped", detail="Nightly fundamentals scheduler cancelled")
+            break
+        except Exception as e:
+            logging.error("[SCHED] Fundamentals scheduler loop error: %s", e, exc_info=True)
+            set_component_status("fundamentals_scheduler", "degraded", detail=str(e))
+
 async def _schedule_monthly_index_refresh() -> None:
     tz = ZoneInfo("Asia/Kolkata")
     source_lists = list_supported_index_source_lists()
