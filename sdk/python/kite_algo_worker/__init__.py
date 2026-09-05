@@ -20,6 +20,18 @@ from .helpers import (
     wait_for_terminal_order_state,
     warmup_history,
 )
+from .investment import (
+    WorkerAccountPortfolioSnapshot,
+    WorkerCalendarSession,
+    WorkerIndexConstituentStatus,
+    WorkerIndexConstituentsSnapshot,
+    WorkerIndexMember,
+    WorkerMarketCalendarSnapshot,
+    WorkerMarketCalendarStatus,
+    WorkerPortfolioHolding,
+    WorkerPortfolioPosition,
+    WorkerSourceEnvelope,
+)
 from .managed_run import ManagedRun
 from .indicators import BaseIndicator, IndicatorInput, IndicatorValue, LiveIndicatorEngine, NUMBA_AVAILABLE, TechnicalAnalysis, crossover, format_output, njit, normalize_input, sma, ta
 from .models import (
@@ -185,6 +197,16 @@ __all__ = [
     "WorkerTickWebSocketClient",
     "WorkerWebSocketClient",
     "WorkerTradesResponse",
+    "WorkerAccountPortfolioSnapshot",
+    "WorkerCalendarSession",
+    "WorkerIndexConstituentStatus",
+    "WorkerIndexConstituentsSnapshot",
+    "WorkerIndexMember",
+    "WorkerMarketCalendarSnapshot",
+    "WorkerMarketCalendarStatus",
+    "WorkerPortfolioHolding",
+    "WorkerPortfolioPosition",
+    "WorkerSourceEnvelope",
 ]
 
 if _MARKETDATA_AVAILABLE:

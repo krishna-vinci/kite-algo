@@ -1,1 +1,16 @@
-{"schema_version": 1, "source": "kite_connect_portfolio", "source_as_of": null, "retrieved_at": "2026-08-29T09:00:01+00:00", "error": {"rejection_reason": "PORTFOLIO_SNAPSHOT_UNAVAILABLE"}}
+{
+  "schema_version": 1,
+  "account_scope": "kite:SANITIZED",
+  "source": "kite_connect_portfolio",
+  "source_as_of": null,
+  "retrieved_at": "2026-08-29T09:00:01+00:00",
+  "component_times": {"funds": "2026-08-29T08:59:56+00:00", "holdings": "2026-08-29T08:59:40+00:00"},
+  "coherent": false,
+  "coherence_skew_ms": 4200,
+  "funds": {"equity": {"available": {"cash": 50000}}},
+  "holdings": [],
+  "net_positions": [],
+  "day_positions": [],
+  "profile_capabilities": {"demat_consent": null},
+  "error": {"rejection_reason": "PORTFOLIO_SNAPSHOT_COHERENCE_SKEW_EXCEEDED"}
+}
