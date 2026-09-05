@@ -285,4 +285,3 @@ def test_investment_methods_reject_invalid_arguments():
     with pytest.raises(ValueError):
         client.get_market_calendar_status(exchange="NSE", segment="")
     assert calls == []
-

@@ -7,14 +7,14 @@ Kite Algo is a self-hosted algorithmic trading platform for Zerodha/Kite workflo
 ## Package status and install
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.5
+python3 -m pip install kite-algo-worker==0.7.6
 ```
 
 Extras:
 
 ```bash
-python3 -m pip install "kite-algo-worker[dataframe]==0.7.5"
-python3 -m pip install "kite-algo-worker[indicators]==0.7.5"
+python3 -m pip install "kite-algo-worker[dataframe]==0.7.6"
+python3 -m pip install "kite-algo-worker[indicators]==0.7.6"
 ```
 
 - base SDK: HTTP/WebSocket clients, typed models, order helpers
@@ -32,8 +32,9 @@ Pin to an immutable version in production.
 | Funds + run state | `get_funds(...)`, `get_run_funds(...)`, `get_run_health_snapshot(...)` |
 | Market data | `resolve_ticker(...)`, `search_tickers(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `stream_candles(...)`, `get_historical_candles(...)` |
 | Order types | equity/option market, limit, SL, SL-M across regular, AMO, CO, iceberg, auction varieties |
-| Order placement | `preview_order(...)`, `place_order(...)`, `cancel_order(...)`, `modify_order(...)`, order builders |
-| Basket execution | `preview_basket(...)`, `place_basket(...)` |
+| Order placement | `preview_order(...)`, `preview_order_snapshot(...)`, `place_order(...)`, `cancel_order(...)`, `modify_order(...)`, order builders |
+| Basket execution | `preview_basket(...)`, `preview_basket_snapshot(...)`, `place_basket(...)` |
+| Investment data (read-only) | `get_market_calendar(...)`, `get_market_calendar_status(...)`, `get_index_constituents(...)`, `get_index_constituent_status(...)`, `get_account_portfolio(...)` and their `*_snapshot(...)` typed variants |
 | Safety + protection | `safety_check(...)`, `BackendProtection`, `update_backend_protection(...)`, `patch_risk(...)` |
 | Grouped P&L + monitoring | `get_run_pnl(...)`, `stream_run_pnl(...)`, `list_timeline(...)`, `log_decision_event(...)`, `stream_timeline(...)` |
 | Options namespace | `client.options.*`, resolver helpers, options run lifecycle |
@@ -452,6 +453,41 @@ preview = client.preview_order(
 
 **Response:** margin estimate, charges breakdown, validation warnings.
 
+### preview_order_snapshot(...) / preview_basket_snapshot(...)
+
+Typed variants of the preview endpoints. They call the same raw preview methods, validate the response into an `OrderPreview` model, and **never submit orders** — the backend preview endpoints are dry-run only.
+
+```python
+from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient
+
+client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:18777", token="kwa_..."))
+
+preview = client.preview_order_snapshot(
+    "run_basic_equity_001",
+    {"exchange": "NSE", "tradingsymbol": "INFY", "transaction_type": "BUY",
+     "variety": "regular", "product": "CNC", "order_type": "MARKET", "quantity": 1},
+)
+contract = preview.preview.cost_contract
+print(contract.margin_required, contract.total_charges)
+
+basket_preview = client.preview_basket_snapshot(
+    "run_basic_equity_001",
+    [{"exchange": "NSE", "tradingsymbol": "INFY", "transaction_type": "BUY",
+      "variety": "regular", "product": "CNC", "order_type": "MARKET", "quantity": 1}],
+    all_or_none=True,
+)
+
+# Async client mirrors the same helpers:
+# preview = await async_client.preview_order_snapshot("run_basic_equity_001", order)
+# preview = await async_client.preview_basket_snapshot("run_basic_equity_001", orders)
+```
+
+Raw `preview_order(...)` / `preview_basket(...)` still return plain dictionaries for backward compatibility.
+
+**Itemized costs (`CostContract.itemized`)**: an `ItemizedCharges` model with optional float components — `brokerage`, `exchange_transaction_charge`, `stt`, `stamp_duty`, `sebi_charge`, `gst`. Unknown future charge keys returned by the server are preserved in `raw` and round-trip through `model_dump()`. Absent components stay `None` and are never reported as zero.
+
+**DP charge availability**: `dp_charge` is a float only when the backend could compute the depository charge. An absent or unavailable DP charge stays `None` (never `0.0`) and `dp_charge_status` explains why — e.g. `"unavailable"` or `"estimated"`. Treat `dp_charge is None` as "no DP charge information", not "no DP charge".
+
 ### place_order(...)
 
 | Field | Type | Required | Description |
@@ -677,6 +713,70 @@ SSE stream of timeline events.
 ```python
 for event in client.stream_timeline("run_managed_001"):
     print(event["event_type"], event.get("summary"))
+```
+
+## Investment data (read-only)
+
+`get_market_calendar(...)`, `get_market_calendar_status(...)`, `get_index_constituents(...)`, `get_index_constituent_status(...)`, and `get_account_portfolio(...)` are **read-only observation endpoints**. They expose official reference data and coherent account snapshots; calling them never enables live execution, never places orders, and never mutates backend state. Live trading still requires the explicit `KITE_ALGO_ENABLE_LIVE=1` gate and a `live` execution-mode run.
+
+Every method has a typed `*_snapshot(...)` variant built on `RawModelMixin`: known fields are typed, unknown additive server fields are preserved in `raw` and round-trip through `model_dump()`.
+
+### Market calendar and status
+
+```python
+calendar = client.get_market_calendar_snapshot("2026-09-01", "2026-12-31", exchange="NSE", segment="CM")
+for session in calendar.sessions:
+    print(session.session_date, session.session_type, session.opens_at, session.closes_at)
+
+status = client.get_market_calendar_status_snapshot(exchange="NSE", segment="CM")
+print(status.active_calendar_version, status.coverage_start, status.coverage_end, status.complete)
+```
+
+- Coverage comes exclusively from the active immutable calendar version. If a requested range is uncovered, the backend returns `503 CALENDAR_RANGE_UNCOVERED` and the SDK raises `CalendarRangeUncoveredError` — an uncovered date is never inferred to be a holiday.
+- `get_market_calendar_status_snapshot(...)` reports `complete` and `expiry_warning` (true when coverage ends within 45 days) plus refresh-state fields, so workers can distinguish "backend can serve this range" from "coverage is about to expire".
+
+### Index constituents and status
+
+```python
+snapshot = client.get_index_constituents_snapshot("Nifty500")
+for member in snapshot.members:
+    print(member.tradingsymbol, member.instrument_token, member.exchange)
+
+index_status = client.get_index_constituent_status_snapshot("Nifty500")
+print(index_status.complete, index_status.actual_member_count, index_status.next_attempt_at)
+```
+
+Status is per source list: success for `Nifty500` implies nothing about `Nifty50` or `NiftyBank`.
+
+### Account portfolio
+
+```python
+portfolio = client.get_account_portfolio_snapshot()  # or account_scope="kite:paper-a"
+print(portfolio.coherent, portfolio.coherence_skew_ms, len(portfolio.holdings), len(portfolio.net_positions))
+```
+
+A portfolio snapshot is evidence about the broker account at a point in time. It is not strategy ownership, not durable P&L history, and not an execution capability.
+
+### Data-unavailable errors
+
+Read surfaces fail closed with typed errors instead of fabricating data:
+
+| Error | Raised when |
+| --- | --- |
+| `WorkerDataUnavailableError` | A 503 response with `CALENDAR_UNAVAILABLE` or `PORTFOLIO_SNAPSHOT_UNAVAILABLE` |
+| `CalendarRangeUncoveredError` | A 503 response with `CALENDAR_RANGE_UNCOVERED` (subclass of `WorkerDataUnavailableError`) |
+| `UnsupportedSchemaVersionError` | A 422 response with `UNSUPPORTED_SCHEMA_VERSION` (subclass of `BrokerValidationError`) |
+| `AuthError` / `PermissionDeniedError` | 401 / 403 responses (unchanged) |
+
+Every `KiteAlgoWorkerError` exposes `status_code`, `response_body`, and a normalized `rejection_reason` taken from `response_body["rejection_reason"]` or `response_body["detail"]["rejection_reason"]`.
+
+```python
+from kite_algo_worker import CalendarRangeUncoveredError, KiteAlgoWorkerClient
+
+try:
+    calendar = client.get_market_calendar_snapshot("2024-01-01", "2024-03-31")
+except CalendarRangeUncoveredError as exc:
+    print(exc.status_code, exc.rejection_reason)  # 503 CALENDAR_RANGE_UNCOVERED
 ```
 
 ## Options workflows

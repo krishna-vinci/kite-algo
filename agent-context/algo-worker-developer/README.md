@@ -13,13 +13,13 @@ Give this pack to an external coding agent when you want worker code written in 
 ## Current package status
 
 - Package name: `kite-algo-worker`
-- Current public PyPI release: `0.7.5`
+- Current public PyPI release: `0.7.6`
 - SDK tag convention: `kite-algo-worker-vX.Y.Z`
 
 Canonical public install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.5
+python3 -m pip install kite-algo-worker==0.7.6
 ```
 
 This pack describes the current released SDK surface. If this pack and the repo disagree, trust the repo files.

@@ -126,13 +126,19 @@ class _StatusConnection:
         return _StatusCursor(self._results)
 
 
-def _status_connection(*, calendar_schema=True, refresh_schema=True, refresh_row=None, version=3, coverage=(date(2026, 1, 1), date(2026, 12, 31))):
+def _full_coverage(start, end):
+    """Fake coverage aggregate for a continuous, fully verified range."""
+    expected = (end - start).days + 1
+    return (start, end, expected, expected, 0)
+
+
+def _status_connection(*, calendar_schema=True, refresh_schema=True, refresh_row=None, version=3, coverage=None):
     return _StatusConnection([
         ("exchange_calendar_source_documents'), to_regclass", ("public.exchange_calendar_source_documents", "public.exchange_calendar_sessions") if calendar_schema else (None, None)),
         ("exchange_calendar_refresh_state')", ("public.exchange_calendar_refresh_state",) if refresh_schema else (None,)),
         ("SELECT last_attempt_at", refresh_row),
         ("SELECT MAX(calendar_version)", (version,)),
-        ("SELECT MIN(session_date), MAX(session_date)", coverage if version is not None else None),
+        ("SELECT MIN(session_date), MAX(session_date)", coverage if (version is not None and coverage is not None) else None),
     ])
 
 
@@ -148,7 +154,7 @@ def _refresh_row():
 
 
 def test_calendar_status_locks_schema_v1_envelope_with_healthy_coverage():
-    conn = _status_connection(refresh_row=_refresh_row())
+    conn = _status_connection(refresh_row=_refresh_row(), coverage=_full_coverage(date(2026, 1, 1), date(2026, 12, 31)))
     status = get_calendar_status(conn, "NSE", "CM", now=datetime(2026, 9, 5, 0, 15, tzinfo=timezone.utc))
     assert status["schema_version"] == 1
     assert status["source"] == "exchange_calendar_refresh"
@@ -166,13 +172,13 @@ def test_calendar_status_locks_schema_v1_envelope_with_healthy_coverage():
 
 
 def test_calendar_status_warns_when_coverage_expires_within_warning_window():
-    conn = _status_connection(coverage=(date(2026, 1, 1), date(2026, 10, 1)))
+    conn = _status_connection(coverage=_full_coverage(date(2026, 1, 1), date(2026, 10, 1)))
     status = get_calendar_status(conn, "NSE", "CM", now=datetime(2026, 9, 5, tzinfo=timezone.utc))
     # 2026-10-01 is inside the 45-day window ending 2026-10-20.
     assert status["expiry_warning"] is True
     assert status["complete"] is True
 
-    conn = _status_connection(coverage=(date(2026, 1, 1), date(2026, 10, 20)))
+    conn = _status_connection(coverage=_full_coverage(date(2026, 1, 1), date(2026, 10, 20)))
     status = get_calendar_status(conn, "NSE", "CM", now=datetime(2026, 9, 5, tzinfo=timezone.utc), warning_days=45)
     assert status["expiry_warning"] is False
 
@@ -185,6 +191,32 @@ def test_calendar_status_is_truthful_when_calendar_data_is_missing():
     assert status["coverage_end"] is None
     assert status["complete"] is False
     assert status["expiry_warning"] is False
+
+
+def test_calendar_status_incomplete_when_a_date_is_missing_inside_the_range():
+    start, end = date(2026, 1, 1), date(2026, 12, 31)
+    expected = (end - start).days + 1
+    conn = _status_connection(coverage=(start, end, expected - 1, expected - 1, 0))
+    status = get_calendar_status(conn, "NSE", "CM", now=datetime(2026, 9, 5, tzinfo=timezone.utc))
+    assert status["complete"] is False
+    assert status["coverage_end"] == "2026-12-31"
+
+
+def test_calendar_status_incomplete_when_any_row_is_unverified():
+    start, end = date(2026, 1, 1), date(2026, 12, 31)
+    expected = (end - start).days + 1
+    conn = _status_connection(coverage=(start, end, expected, expected, 1))
+    status = get_calendar_status(conn, "NSE", "CM", now=datetime(2026, 9, 5, tzinfo=timezone.utc))
+    assert status["complete"] is False
+
+
+def test_calendar_status_incomplete_when_coverage_has_expired():
+    start, end = date(2026, 1, 1), date(2026, 8, 31)
+    expected = (end - start).days + 1
+    conn = _status_connection(coverage=(start, end, expected, expected, 0))
+    status = get_calendar_status(conn, "NSE", "CM", now=datetime(2026, 9, 5, tzinfo=timezone.utc))
+    assert status["complete"] is False
+    assert status["expiry_warning"] is True
 
 
 def test_calendar_status_normalizes_identity_and_reports_fresh_state_when_row_missing():

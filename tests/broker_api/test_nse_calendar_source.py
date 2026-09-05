@@ -321,6 +321,28 @@ def test_synchronize_reports_awaiting_release_and_keeps_active_calendar():
     import_mock.assert_not_called()
 
 
+def test_synchronize_partial_release_preserves_active_calendar_and_records_healthy_state():
+    # Current year 2026 is released but requested 2027 is not: the active
+    # calendar must be preserved with a healthy awaiting result, not an import
+    # of the current year alone.
+    raw = _official_payload_bytes(_payload(_holiday("26-Jan-2026")))
+    conn = _conn(observed_sha=None, version=4)
+    import_mock = Mock()
+    with patch_object(nse_module, "import_calendar_csv", import_mock):
+        result = synchronize_official_calendar(conn, [2026, 2027], client=_FakeClient(raw=raw), now=datetime(2026, 8, 1, tzinfo=timezone.utc))
+    assert result["status"] == "awaiting_release"
+    assert result["released"] is False
+    assert result["changed"] is False
+    assert result["awaiting_release_years"] == [2027]
+    import_mock.assert_not_called()
+    # Healthy refresh state with a next daily attempt, not a failure record.
+    state_calls = [call for call in conn.log if "INSERT INTO public.exchange_calendar_refresh_state" in call[0]]
+    assert len(state_calls) == 1
+    assert "last_failure_at" in state_calls[0][0]
+    assert "COALESCE(EXCLUDED.active_calendar_version" in state_calls[0][0]
+    assert conn.rollbacks == 0
+
+
 def test_synchronize_failed_refresh_records_failure_and_retains_active_version():
     conn = _conn(observed_sha=None, version=2)
     import_mock = Mock()

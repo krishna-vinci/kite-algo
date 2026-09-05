@@ -273,8 +273,9 @@ def synchronize_official_calendar(conn: Any, years: Iterable[int], client: Optio
     """Refresh the canonical calendar from the official NSE source.
 
     Returns a result dict with ``released`` and ``changed`` flags. The active
-    immutable version is only replaced when at least one requested year has
-    been released AND the official source hash changed; any failure retains the
+    immutable version is only replaced when every requested year has been
+    released AND the official source hash changed; a partial or missing release
+    yields a healthy awaiting_release result, and any failure retains the
     existing active version.
     """
     years = sorted({int(year) for year in years})
@@ -305,15 +306,17 @@ def synchronize_official_calendar(conn: Any, years: Iterable[int], client: Optio
         _record_refresh_failure(conn, now, message)
         return {"status": "failure", "released": False, "changed": False, "official_source_sha256": official_sha, "error": message}
 
-    if not released_rows:
-        # Official source is healthy but none of the requested years has been
-        # released; retain current coverage and record a healthy awaiting state.
+    awaiting_release_years = sorted(set(years) - set(released_rows))
+    if awaiting_release_years:
+        # Any requested year without official data — including a partial release
+        # where only the current year is available — preserves the active
+        # calendar and records a healthy awaiting state, never a failure.
         _record_refresh_success(conn, now, observed_sha=official_sha, next_attempt=_next_daily_attempt(now))
         return {
             "status": "awaiting_release",
             "released": False,
             "changed": False,
-            "awaiting_release_years": years,
+            "awaiting_release_years": awaiting_release_years,
             "official_source_sha256": official_sha,
         }
 

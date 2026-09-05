@@ -95,6 +95,9 @@ def get_calendar_status(conn: Any, exchange: str, segment: str, *, now: datetime
     """Schema-version-1 calendar health envelope for one exchange segment.
 
     Coverage is derived exclusively from the active immutable calendar version.
+    ``complete`` requires every date between coverage_start and coverage_end to
+    exist exactly once, all rows to be verified, and coverage to reach today;
+    a gapped, duplicated, or unverified calendar is never reported complete.
     Missing calendar data yields a truthful incomplete status; it never infers
     sessions. Missing migration/schema fails closed with
     CalendarSchemaMigrationRequired.
@@ -140,18 +143,32 @@ def get_calendar_status(conn: Any, exchange: str, segment: str, *, now: datetime
         version_row = cur.fetchone()
         active_version = int(version_row[0]) if version_row and version_row[0] is not None else None
         coverage_start = coverage_end = None
+        total_sessions = distinct_dates = unverified_sessions = 0
         if active_version is not None:
             cur.execute(
-                """SELECT MIN(session_date), MAX(session_date) FROM public.exchange_calendar_sessions
+                """SELECT MIN(session_date), MAX(session_date), COUNT(*), COUNT(DISTINCT session_date),
+                          COUNT(*) FILTER (WHERE NOT verified)
+                     FROM public.exchange_calendar_sessions
                     WHERE exchange=%s AND segment=%s AND calendar_version=%s""",
                 (exchange_text, segment_text, active_version),
             )
             coverage_row = cur.fetchone()
-            if coverage_row is not None:
-                coverage_start = coverage_row[0].isoformat() if coverage_row[0] else None
-                coverage_end = coverage_row[1].isoformat() if coverage_row[1] else None
+            if coverage_row is not None and coverage_row[0] is not None:
+                coverage_start = coverage_row[0].isoformat()
+                coverage_end = coverage_row[1].isoformat()
+                total_sessions = int(coverage_row[2])
+                distinct_dates = int(coverage_row[3])
+                unverified_sessions = int(coverage_row[4])
 
-    complete = active_version is not None and coverage_start is not None and coverage_end is not None and date.fromisoformat(coverage_end) >= now.date()
+    complete = False
+    if active_version is not None and coverage_start and coverage_end:
+        expected_days = (date.fromisoformat(coverage_end) - date.fromisoformat(coverage_start)).days + 1
+        complete = (
+            total_sessions == expected_days
+            and distinct_dates == expected_days
+            and unverified_sessions == 0
+            and date.fromisoformat(coverage_end) >= now.date()
+        )
     expiry_warning = bool(coverage_end and date.fromisoformat(coverage_end) < (now.date() + timedelta(days=warning_days)))
     return {
         "schema_version": 1,

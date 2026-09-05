@@ -5080,7 +5080,8 @@ def test_worker_market_calendar_status_route_locks_v1_contract():
     assert status_payload["coverage_start"] == "2026-01-01"
     assert status_payload["coverage_end"] == "2026-12-31"
     assert status_payload["complete"] is True
-    assert status_payload["expiry_warning"] is True
+    # Coverage through 2026-12-31 is outside the 45-day window from 2026-09-05.
+    assert status_payload["expiry_warning"] is False
     assert status_mock.call_args.args[1] == "NSE"
     assert status_mock.call_args.args[2] == "CM"
 
