@@ -33,6 +33,7 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code
 COPY backend/ /app/backend/
+COPY fundamentals/ /app/fundamentals/
 
 EXPOSE 8777
 
