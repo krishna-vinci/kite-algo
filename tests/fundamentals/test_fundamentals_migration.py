@@ -19,4 +19,3 @@ def test_nullable_period_natural_key_migration(monkeypatch):
     assert "UNIQUE NULLS NOT DISTINCT" in sql
     for column in ("SYMBOL", "STATEMENT_SCOPE", "DATASET", "PERIOD_END", "METRIC_KEY"):
         assert column in sql
-

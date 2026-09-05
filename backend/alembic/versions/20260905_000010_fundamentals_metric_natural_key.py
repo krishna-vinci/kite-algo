@@ -62,4 +62,3 @@ def downgrade() -> None:
         UNIQUE (symbol, statement_scope, dataset, period_end, metric_key)
         """
     )
-
