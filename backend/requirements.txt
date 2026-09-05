@@ -4,6 +4,7 @@ requests
 httpx
 #numpy<1.24
 numpy
+lxml
 pandas
 pandas_market_calendars
 plotly
