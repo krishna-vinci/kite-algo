@@ -252,6 +252,7 @@ async def _schedule_fundamentals_nightly_refresh(
             await sleep_fn(sleep_sec)
 
             scopes = supported_index_scopes()
+            failed_scopes = []
             set_component_status("fundamentals_scheduler", "running", detail=f"Nightly fundamentals sync for {scopes}")
             for index_key in scopes:
                 try:
@@ -265,9 +266,18 @@ async def _schedule_fundamentals_nightly_refresh(
                     raise
                 except Exception as e:
                     # Per-index isolation: one failing universe never blocks the others.
+                    failed_scopes.append(index_key)
                     logging.error("[SCHED] Fundamentals nightly sync failed for %s: %s", index_key, e, exc_info=True)
                     set_component_status("fundamentals_scheduler", "degraded", detail=f"{index_key}: {e}")
-            set_component_status("fundamentals_scheduler", "healthy", detail=f"Nightly fundamentals sync window completed for {scopes}")
+            if failed_scopes:
+                set_component_status(
+                    "fundamentals_scheduler",
+                    "degraded",
+                    detail=f"Nightly fundamentals sync window completed with failures for {failed_scopes}",
+                    meta={"failed_scopes": failed_scopes},
+                )
+            else:
+                set_component_status("fundamentals_scheduler", "healthy", detail=f"Nightly fundamentals sync window completed for {scopes}")
         except asyncio.CancelledError:
             set_component_status("fundamentals_scheduler", "stopped", detail="Nightly fundamentals scheduler cancelled")
             break

@@ -101,6 +101,30 @@ def test_scheduler_continues_remaining_indexes_after_one_fails():
     assert len(sleeps) >= 2
 
 
+def test_scheduler_window_remains_degraded_when_any_index_fails(monkeypatch):
+    statuses = []
+    monkeypatch.setattr(
+        schedulers,
+        "set_component_status",
+        lambda component, status, **kwargs: statuses.append(
+            (component, status, kwargs.get("detail"), kwargs.get("meta"))
+        ),
+    )
+
+    _run_scheduler(
+        now_sequence=[
+            datetime(2026, 9, 5, 2, 0, tzinfo=IST),
+            datetime(2026, 9, 6, 2, 0, tzinfo=IST),
+            datetime(2026, 9, 6, 2, 0, tzinfo=IST),
+        ],
+        sync_error=RuntimeError("screener unreachable"),
+    )
+
+    completions = [item for item in statuses if "window completed" in str(item[2])]
+    assert completions[-1][1] == "degraded"
+    assert completions[-1][3] == {"failed_scopes": ["Nifty50", "Nifty500"]}
+
+
 def test_scheduler_cancellation_stops_cleanly():
     from backend.app.monitor import get_components
 

@@ -101,6 +101,16 @@ def _fingerprint(parsed: dict[str, pd.DataFrame]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _validate_parsed_datasets(parsed: dict[str, pd.DataFrame]) -> None:
+    """Reject block/error pages before they can replace stored features."""
+    if any(
+        isinstance(parsed.get(name), pd.DataFrame) and not parsed[name].empty
+        for name in DATASETS
+    ):
+        return
+    raise ValueError("Screener page contained no recognized fundamentals datasets")
+
+
 def _upsert_symbol(symbol: str, statement_scope: str, parsed: dict[str, pd.DataFrame], scraped_at: str) -> None:
     import psycopg2.extras
 
@@ -288,7 +298,6 @@ async def run_fundamentals_sync(config: SyncConfig) -> dict[str, Any]:
     if _sync_lock.locked():
         raise RuntimeError("fundamentals sync already in progress")
     async with _sync_lock:
-        ensure_screener_parser_ready()
         symbols = resolve_scope_symbols(config.scope)
         if config.on_demand and len(symbols) > MAX_ON_DEMAND_SYMBOLS:
             raise ValueError(f"on-demand sync limited to {MAX_ON_DEMAND_SYMBOLS} symbols per request")
@@ -297,6 +306,7 @@ async def run_fundamentals_sync(config: SyncConfig) -> dict[str, Any]:
         changed = unchanged = failed = skipped = 0
         errors: list[dict[str, str]] = []
         try:
+            ensure_screener_parser_ready()
             for offset, symbol in enumerate(symbols, start=1):
                 state = _load_symbol_state(symbol, config.statement_scope)
                 if not _should_fetch(state, config):
@@ -318,6 +328,7 @@ async def run_fundamentals_sync(config: SyncConfig) -> dict[str, Any]:
                                             source_url=result.source_url, error=None)
                     else:
                         parsed = parse_screener_company_page(result)
+                        _validate_parsed_datasets(parsed)
                         fingerprint = _fingerprint(parsed)
                         if fingerprint == state.get("content_fingerprint"):
                             unchanged += 1
@@ -334,8 +345,6 @@ async def run_fundamentals_sync(config: SyncConfig) -> dict[str, Any]:
                                                 source_url=result.source_url, error=None)
                 except (ImportError, ModuleNotFoundError) as exc:
                     # Fatal setup error (missing HTML parser dependency): abort loudly.
-                    _finish_run(run_id, changed=changed, unchanged=unchanged, failed=failed,
-                                skipped=skipped, status="failed", error=f"{type(exc).__name__}: {exc}")
                     raise
                 except Exception as exc:  # per-symbol isolation
                     failed += 1
@@ -351,9 +360,8 @@ async def run_fundamentals_sync(config: SyncConfig) -> dict[str, Any]:
             _finish_run(run_id, changed=changed, unchanged=unchanged, failed=failed,
                         skipped=skipped, status="completed")
         except Exception as exc:
-            if not isinstance(exc, (ImportError, ModuleNotFoundError)):
-                _finish_run(run_id, changed=changed, unchanged=unchanged, failed=failed,
-                            skipped=skipped, status="failed", error=f"{type(exc).__name__}: {exc}")
+            _finish_run(run_id, changed=changed, unchanged=unchanged, failed=failed,
+                        skipped=skipped, status="failed", error=f"{type(exc).__name__}: {exc}")
             raise
         return {"run_id": str(run_id), "scope": {"scope_type": config.scope.scope_type, "scope_value": config.scope.scope_value},
                 "mode": config.mode, "symbols_requested": len(symbols), "symbols_changed": changed,

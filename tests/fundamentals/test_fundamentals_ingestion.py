@@ -164,7 +164,15 @@ class _FakeFetchResult:
         self.html = "" if not_modified else f"<html>{symbol}</html>"
 
 
-def _install_engine_fakes(monkeypatch, *, states, not_modified_symbols=(), unchanged_by_fingerprint=(), failing_symbols=()):
+def _install_engine_fakes(
+    monkeypatch,
+    *,
+    states,
+    not_modified_symbols=(),
+    unchanged_by_fingerprint=(),
+    failing_symbols=(),
+    empty_parsed_symbols=(),
+):
     """Wire run_fundamentals_sync to in-memory fakes; returns captured calls."""
     sleeps = []
     state_writes = []
@@ -186,6 +194,8 @@ def _install_engine_fakes(monkeypatch, *, states, not_modified_symbols=(), uncha
             return _FakeFetchResult(symbol, not_modified=symbol in not_modified_symbols)
 
     def fake_parse(result):
+        if result.requested_symbol in empty_parsed_symbols:
+            return {name: pd.DataFrame() for name in ingestion.DATASETS}
         if result.requested_symbol in unchanged_by_fingerprint:
             return {"quarterly": pd.DataFrame([{"metric_key": "sales", "numeric_value": 1.0}])}
         return {"quarterly": pd.DataFrame([{"metric_key": "sales", "numeric_value": 2.0}])}
@@ -312,11 +322,39 @@ async def _contended_run():
 
 
 def test_run_sync_fatal_parser_dependency_aborts_run(monkeypatch):
+    finished = []
+
     def boom():
         raise ModuleNotFoundError("No module named 'lxml'")
 
     monkeypatch.setattr(ingestion, "ensure_screener_parser_ready", boom)
     monkeypatch.setattr(ingestion, "_start_run", lambda config, requested: ingestion.uuid.uuid4())
-    monkeypatch.setattr(ingestion, "_finish_run", lambda run_id, **kwargs: None)
+    monkeypatch.setattr(ingestion, "_finish_run", lambda run_id, **kwargs: finished.append(kwargs))
     with pytest.raises(ModuleNotFoundError):
         asyncio.run(run_fundamentals_sync(_config_for(["A"], delay=0)))
+    assert finished == [
+        {
+            "changed": 0,
+            "unchanged": 0,
+            "failed": 0,
+            "skipped": 0,
+            "status": "failed",
+            "error": "ModuleNotFoundError: No module named 'lxml'",
+        }
+    ]
+
+
+def test_run_sync_rejects_page_without_recognized_datasets(monkeypatch):
+    sleeps, state_writes, upserts, started, finished = _install_engine_fakes(
+        monkeypatch,
+        states={},
+        empty_parsed_symbols={"BLOCKED"},
+    )
+
+    result = asyncio.run(run_fundamentals_sync(_config_for(["BLOCKED"], delay=0)))
+
+    assert result["symbols_changed"] == 0
+    assert result["symbols_failed"] == 1
+    assert upserts == []
+    assert state_writes == [("BLOCKED", "failed")]
+    assert "no recognized fundamentals datasets" in result["failed_symbols"][0]["error"]
