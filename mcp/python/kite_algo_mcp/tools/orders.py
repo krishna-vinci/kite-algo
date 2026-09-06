@@ -70,15 +70,24 @@ def register(server: FastMCP, runtime: MCPRuntime) -> None:
         values = args_model(request)
         patch = request.model_dump(exclude_none=True, exclude={"strategy_run_id", "order_id", "variety"}, mode="json")
         async def operation(lease: Any) -> Any:
-            lease.ensure_alive()
-            return await runtime.client.modify_order(request.strategy_run_id, request.order_id, patch, variety=request.variety)
+            return await lease.call(
+                runtime.client.modify_order,
+                request.strategy_run_id,
+                request.order_id,
+                patch,
+                variety=request.variety,
+            )
         return await runtime.invoke("modify_order", values, operation, run_id=request.strategy_run_id)
 
     async def cancel_order(request: OrderActionRequest) -> Any:
         values = args_model(request)
         async def operation(lease: Any) -> Any:
-            lease.ensure_alive()
-            return await runtime.client.cancel_order(request.strategy_run_id, request.order_id, variety=request.variety)
+            return await lease.call(
+                runtime.client.cancel_order,
+                request.strategy_run_id,
+                request.order_id,
+                variety=request.variety,
+            )
         return await runtime.invoke("cancel_order", values, operation, run_id=request.strategy_run_id)
 
     async def list_baskets(request: RunSelector, limit: int = 100) -> Any:

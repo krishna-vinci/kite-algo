@@ -11,7 +11,8 @@ from kite_algo_mcp.server import create_server
 
 class FundamentalsFake:
     async def health(self):
-        return {"allowed_actions": ["fundamentals:read", "fundamentals:write"]}
+        # The worker API gates fundamentals through its market:read action.
+        return {"allowed_actions": ["market:read"]}
 
     async def get_fundamentals_features(self, **kwargs):
         return {"symbols": kwargs["symbols"], "rows": [{"symbol": "ABC", "pe": None}]}

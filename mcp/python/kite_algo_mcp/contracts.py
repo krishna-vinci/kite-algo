@@ -238,7 +238,7 @@ class BracketRequest(RunSelector):
     entry_order: OrderRequest
     stoploss: OrderRequest
     target: OrderRequest | None = None
-    idempotency_key: str | None = Field(default=None, min_length=8, max_length=160)
+    idempotency_key: str = Field(min_length=8, max_length=160)
 
 
 class ExitRunRequest(RunSelector):
@@ -377,11 +377,27 @@ class OptionRunRequest(StrictModel):
     idempotency_key: str | None = Field(default=None, min_length=8, max_length=160)
 
 
+class OptionCreateRunRequest(OptionRunRequest):
+    """Create an option run only inside an explicitly authorized worker run."""
+
+    strategy_run_id: str = Field(min_length=1, max_length=120)
+    account_scope: str = Field(min_length=1, max_length=120)
+    execution_mode: Literal["paper", "live", "dry_run"]
+
+
 class OptionActionRequest(RunSelector):
     execution_mode: Literal["paper", "live", "dry_run"] | None = None
     account_scope: str | None = Field(default=None, max_length=120)
     idempotency_key: str | None = Field(default=None, min_length=8, max_length=160)
     all_or_none: bool = False
+
+
+class OptionWriteActionRequest(OptionActionRequest):
+    """Option entry/exit requests must carry a stable submission key."""
+
+    execution_mode: Literal["paper", "live", "dry_run"]
+    account_scope: str = Field(min_length=1, max_length=120)
+    idempotency_key: str = Field(min_length=8, max_length=160)
 
 
 class OptionMetricSnapshot(StrictModel):
@@ -443,5 +459,5 @@ __all__ = [
     "RunSelector", "RunListRequest", "CreateRunRequest", "OrderRequest", "BasketRequest",
     "OrderActionRequest", "OrderModifyRequest", "PlaceOrderRequest", "ExitRunRequest", "RiskRequest",
     "ProtectionRequest", "DecisionRequest", "PageRequest", "BracketRequest", "GttOrder", "GttRequest", "OptionSelector",
-    "OptionRequest", "OptionRunRequest", "OptionActionRequest", "OptionMetricSnapshot", "OptionReplayRequest", "IndicatorBar", "IndicatorRequest",
+    "OptionRequest", "OptionRunRequest", "OptionCreateRunRequest", "OptionActionRequest", "OptionWriteActionRequest", "OptionMetricSnapshot", "OptionReplayRequest", "IndicatorBar", "IndicatorRequest",
 ]

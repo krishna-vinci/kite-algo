@@ -53,19 +53,18 @@ def register(server: FastMCP, runtime: MCPRuntime) -> None:
     async def exit_run(request: ExitRunRequest) -> Any:
         values = args_model(request)
         async def operation(lease: Any) -> Any:
-            lease.ensure_alive()
-            return await runtime.client.exit_run(
+            return await lease.call(
+                runtime.client.exit_run,
                 request.strategy_run_id,
                 reason=request.reason,
                 idempotency_key=request.idempotency_key,
-                session_nonce=getattr(lease, "_nonce", None),
             )
         return await runtime.invoke("exit_run", values, operation, run_id=request.strategy_run_id)
 
     async def update_run_risk(request: RiskRequest) -> Any:
         values = args_model(request)
         async def operation(lease: Any) -> Any:
-            return await runtime.client.patch_risk(request.strategy_run_id, request.patch(), reason=request.reason, session_nonce=getattr(lease, "_nonce", None))
+            return await lease.call(runtime.client.patch_risk, request.strategy_run_id, request.patch(), reason=request.reason)
         return await runtime.invoke("update_run_risk", values, operation, run_id=request.strategy_run_id)
 
     async def update_run_protection(request: ProtectionRequest) -> Any:
@@ -83,21 +82,21 @@ def register(server: FastMCP, runtime: MCPRuntime) -> None:
                     trailing_drawdown_pct=request.trailing_drawdown_pct,
                 ) if any(value is not None for value in (request.stoploss_pct, request.target_pct, request.trailing_activate_pct, request.trailing_drawdown_pct)) else None,
             )
-            return await runtime.client.update_backend_protection(
+            return await lease.call(
+                runtime.client.update_backend_protection,
                 request.strategy_run_id,
                 protection,
                 reason=request.reason,
-                session_nonce=getattr(lease, "_nonce", None),
             )
         return await runtime.invoke("update_run_protection", values, operation, run_id=request.strategy_run_id)
 
     async def log_run_decision(request: DecisionRequest) -> Any:
         values = args_model(request)
         async def operation(lease: Any) -> Any:
-            lease.ensure_alive()
             # The SDK exposes this as keyword fields; only the reviewed fields
             # cross the MCP boundary.
-            return await runtime.client.log_decision_event(
+            return await lease.call(
+                runtime.client.log_decision_event,
                 request.strategy_run_id,
                 decision_type=request.decision_type,
                 summary=request.summary,

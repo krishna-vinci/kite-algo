@@ -167,11 +167,19 @@ class AsyncKiteAlgoWorkerClient:
             await self._request("GET", f"/worker/runs/{strategy_run_id}/safety-check")
         )
 
-    async def cancel_order(self, strategy_run_id: str, order_id: str, *, variety: str = "regular") -> JsonDict:
+    async def cancel_order(
+        self,
+        strategy_run_id: str,
+        order_id: str,
+        *,
+        variety: str = "regular",
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
         return await self._request(
             "POST",
             f"/worker/orders/{order_id}/cancel",
             json={"strategy_run_id": strategy_run_id, "variety": variety},
+            headers=session_headers(session_nonce),
         )
 
     async def modify_order(
@@ -181,11 +189,13 @@ class AsyncKiteAlgoWorkerClient:
         patch: Mapping[str, Any],
         *,
         variety: str = "regular",
+        session_nonce: Optional[str] = None,
     ) -> JsonDict:
         return await self._request(
             "POST",
             f"/worker/orders/{order_id}/modify",
             json={"strategy_run_id": strategy_run_id, "variety": variety, **dict(patch)},
+            headers=session_headers(session_nonce),
         )
 
     async def place_order(
@@ -470,8 +480,19 @@ class AsyncKiteAlgoWorkerClient:
     async def delete_gtt_snapshot(self, trigger_id: int) -> WorkerGttWriteResult:
         return WorkerGttWriteResult.model_validate(await self.delete_gtt(trigger_id))
 
-    async def log_decision_event(self, strategy_run_id: str, **payload: Any) -> JsonDict:
-        return await self._request("POST", f"/worker/runs/{strategy_run_id}/decision-events", json=dict(payload))
+    async def log_decision_event(
+        self,
+        strategy_run_id: str,
+        *,
+        session_nonce: Optional[str] = None,
+        **payload: Any,
+    ) -> JsonDict:
+        return await self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/decision-events",
+            json=dict(payload),
+            headers=session_headers(session_nonce),
+        )
 
     async def list_timeline(self, strategy_run_id: str, **params: Any) -> JsonDict:
         return await self._request("GET", f"/worker/runs/{strategy_run_id}/timeline", params=dict(params or {}))

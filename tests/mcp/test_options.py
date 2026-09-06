@@ -69,6 +69,9 @@ class OptionsFake:
     async def health(self):
         return {"allowed_actions": ["market:read", "runs:create", "runs:read", "intents:submit", "risk:update"]}
 
+    async def get_run(self, run_id):
+        return {"strategy_run_id": run_id, "execution_mode": "paper", "account_scope": "kite:paper-a"}
+
     async def claim_session(self, run_id):
         return {"session_nonce": "hidden"}
 
@@ -97,5 +100,5 @@ async def test_option_preview_replay_and_paper_entry_remain_explicit() -> None:
         assert json.loads(preview.content[0].text)["data"]["preview"] is True
         replay = await client.call_tool("replay_option_protection", {"request": {"strategy_run_id": "opt-1", "metric_snapshots": [{"spot": 100}]}})
         assert "events" in replay.content[0].text
-        entered = await client.call_tool("enter_option_run", {"request": {"strategy_run_id": "opt-1", "idempotency_key": "opt-entry-1234"}})
+        entered = await client.call_tool("enter_option_run", {"request": {"strategy_run_id": "opt-1", "execution_mode": "paper", "account_scope": "kite:paper-a", "idempotency_key": "opt-entry-1234"}})
         assert "entered" in entered.content[0].text

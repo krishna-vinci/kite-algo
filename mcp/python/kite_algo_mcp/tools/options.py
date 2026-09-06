@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from fastmcp import FastMCP
 
-from ..contracts import OptionActionRequest, OptionMetricSnapshot, OptionReplayRequest, OptionRequest, OptionRunRequest
+from ..contracts import OptionActionRequest, OptionCreateRunRequest, OptionMetricSnapshot, OptionReplayRequest, OptionRequest, OptionRunRequest, OptionWriteActionRequest
 from ..server import MCPRuntime
 from .common import args_model, register_tool
 
@@ -23,6 +23,27 @@ def _selection_payload(request: OptionRequest) -> dict[str, Any]:
     if request.selector:
         payload["legs"] = [request.selector.sdk_selection()]
     return payload
+
+
+async def _authorized_worker_run(runtime: MCPRuntime, strategy_run_id: str) -> Mapping[str, Any]:
+    getter = getattr(runtime.client, "get_run", None)
+    if getter is None:
+        raise RuntimeError("worker SDK does not expose run authorization for option operations")
+    result = await getter(strategy_run_id)
+    if not isinstance(result, Mapping):
+        raise ValueError("worker run authorization returned no structured run")
+    return result
+
+
+def _check_option_context(request: OptionWriteActionRequest | OptionCreateRunRequest, run: Mapping[str, Any]) -> None:
+    actual_mode = str(run.get("execution_mode") or "").strip().lower()
+    requested_mode = str(request.execution_mode).strip().lower()
+    if actual_mode and actual_mode != requested_mode:
+        raise ValueError("option execution_mode must match the authorized worker run")
+    actual_account = str(run.get("account_scope") or "").strip().lower()
+    requested_account = str(request.account_scope).strip().lower()
+    if actual_account and actual_account != requested_account:
+        raise ValueError("option account_scope must match the authorized worker run")
 
 
 async def _resolved_legs(runtime: MCPRuntime, request: OptionRunRequest) -> list[dict[str, Any]]:
@@ -95,36 +116,58 @@ def register(server: FastMCP, runtime: MCPRuntime) -> None:
 
     async def preview_option_entry(request: OptionActionRequest) -> Any:
         values = args_model(request)
-        return await runtime.invoke("preview_option_entry", values, lambda _lease: _options(runtime).preview_run_entry(request.strategy_run_id, {}), run_id=request.strategy_run_id)
+        async def operation(_lease: Any) -> Any:
+            await _authorized_worker_run(runtime, request.strategy_run_id)
+            return await _options(runtime).preview_run_entry(request.strategy_run_id, {})
+        return await runtime.invoke("preview_option_entry", values, operation, run_id=request.strategy_run_id)
 
     async def preview_option_exit(request: OptionActionRequest) -> Any:
         values = args_model(request)
-        return await runtime.invoke("preview_option_exit", values, lambda _lease: _options(runtime).preview_exit(request.strategy_run_id, {}), run_id=request.strategy_run_id)
-
-    async def create_option_run(request: OptionRunRequest) -> Any:
-        values = args_model(request)
         async def operation(_lease: Any) -> Any:
-            legs = await _resolved_legs(runtime, request)
-            return await _options(runtime).create_run(strategy_name=request.strategy_name, product=request.product, legs=legs)
-        return await runtime.invoke("create_option_run", values, operation)
+            await _authorized_worker_run(runtime, request.strategy_run_id)
+            return await _options(runtime).preview_exit(request.strategy_run_id, {})
+        return await runtime.invoke("preview_option_exit", values, operation, run_id=request.strategy_run_id)
 
-    async def enter_option_run(request: OptionActionRequest) -> Any:
+    async def create_option_run(request: OptionCreateRunRequest) -> Any:
+        values = args_model(request)
+        async def operation(lease: Any) -> Any:
+            worker_run = await _authorized_worker_run(runtime, request.strategy_run_id)
+            _check_option_context(request, worker_run)
+            legs = await _resolved_legs(runtime, request)
+            return await lease.call(
+                _options(runtime).create_run,
+                strategy_name=request.strategy_name,
+                product=request.product,
+                legs=legs,
+                strategy_run_id=request.strategy_run_id,
+                metadata={"account_scope": request.account_scope, "execution_mode": request.execution_mode},
+            )
+        return await runtime.invoke("create_option_run", values, operation, run_id=request.strategy_run_id)
+
+    async def enter_option_run(request: OptionWriteActionRequest) -> Any:
         values = args_model(request)
         payload = {key: value for key, value in {"execution_mode": request.execution_mode, "account_scope": request.account_scope, "idempotency_key": request.idempotency_key, "all_or_none": request.all_or_none}.items() if value is not None}
         async def operation(lease: Any) -> Any:
+            worker_run = await _authorized_worker_run(runtime, request.strategy_run_id)
+            _check_option_context(request, worker_run)
             return await lease.call(_options(runtime).enter, request.strategy_run_id, payload)
         return await runtime.invoke("enter_option_run", values, operation, run_id=request.strategy_run_id)
 
-    async def exit_option_run(request: OptionActionRequest) -> Any:
+    async def exit_option_run(request: OptionWriteActionRequest) -> Any:
         values = args_model(request)
         payload = {key: value for key, value in {"execution_mode": request.execution_mode, "account_scope": request.account_scope, "idempotency_key": request.idempotency_key, "all_or_none": request.all_or_none}.items() if value is not None}
         async def operation(lease: Any) -> Any:
+            worker_run = await _authorized_worker_run(runtime, request.strategy_run_id)
+            _check_option_context(request, worker_run)
             return await lease.call(_options(runtime).exit, request.strategy_run_id, payload)
         return await runtime.invoke("exit_option_run", values, operation, run_id=request.strategy_run_id)
 
     async def get_option_run_state(request: OptionActionRequest) -> Any:
         values = args_model(request)
-        return await runtime.invoke("get_option_run_state", values, lambda _lease: _options(runtime).get_run_state(request.strategy_run_id), run_id=request.strategy_run_id)
+        async def operation(_lease: Any) -> Any:
+            await _authorized_worker_run(runtime, request.strategy_run_id)
+            return await _options(runtime).get_run_state(request.strategy_run_id)
+        return await runtime.invoke("get_option_run_state", values, operation, run_id=request.strategy_run_id)
 
     async def update_option_protection(request: OptionActionRequest, stoploss_pct: float | None = None, target_pct: float | None = None) -> Any:
         if stoploss_pct is None and target_pct is None:
@@ -132,17 +175,24 @@ def register(server: FastMCP, runtime: MCPRuntime) -> None:
         values = {**args_model(request), "stoploss_pct": stoploss_pct, "target_pct": target_pct}
         protection = {key: value for key, value in {"stoploss_pct": stoploss_pct, "target_pct": target_pct}.items() if value is not None}
         async def operation(lease: Any) -> Any:
+            await _authorized_worker_run(runtime, request.strategy_run_id)
             return await lease.call(_options(runtime).update_protection, request.strategy_run_id, protection)
         return await runtime.invoke("update_option_protection", values, operation, run_id=request.strategy_run_id)
 
     async def get_option_protection(request: OptionActionRequest) -> Any:
         values = args_model(request)
-        return await runtime.invoke("get_option_protection", values, lambda _lease: _options(runtime).get_protection_state(request.strategy_run_id), run_id=request.strategy_run_id)
+        async def operation(_lease: Any) -> Any:
+            await _authorized_worker_run(runtime, request.strategy_run_id)
+            return await _options(runtime).get_protection_state(request.strategy_run_id)
+        return await runtime.invoke("get_option_protection", values, operation, run_id=request.strategy_run_id)
 
     async def replay_option_protection(request: OptionReplayRequest) -> Any:
         values = args_model(request)
         snapshots = [item.model_dump(exclude_none=True, mode="json") for item in request.metric_snapshots]
-        return await runtime.invoke("replay_option_protection", values, lambda _lease: _options(runtime).replay_protection(request.strategy_run_id, snapshots), run_id=request.strategy_run_id)
+        async def operation(_lease: Any) -> Any:
+            await _authorized_worker_run(runtime, request.strategy_run_id)
+            return await _options(runtime).replay_protection(request.strategy_run_id, snapshots)
+        return await runtime.invoke("replay_option_protection", values, operation, run_id=request.strategy_run_id)
 
     for name, function in {
         "list_option_expiries": list_option_expiries,

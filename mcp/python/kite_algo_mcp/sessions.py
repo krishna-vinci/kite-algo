@@ -15,6 +15,10 @@ class SessionError(RuntimeError):
     pass
 
 
+class SessionOutcomeUnknownError(SessionError):
+    """The worker call returned but the lease was lost before confirmation."""
+
+
 class RunLease:
     def __init__(self, manager: "RunSessionManager", run_id: str, nonce: str, heartbeat_interval: float) -> None:
         self.manager = manager
@@ -55,7 +59,10 @@ class RunLease:
         self.ensure_alive()
         kwargs.setdefault("session_nonce", self._nonce)
         result = await method(*args, **kwargs)
-        self.ensure_alive()
+        if self.lost:
+            raise SessionOutcomeUnknownError(
+                "worker run lease heartbeat was lost after the mutation returned; outcome requires reconciliation"
+            )
         return result
 
     async def close(self) -> None:
@@ -86,10 +93,17 @@ class RunSessionManager:
         normalized = str(run_id).strip()
         if not normalized:
             raise SessionError("strategy_run_id is required for a run mutation")
+        for method_name in ("claim_session", "run_heartbeat", "release_session"):
+            if not callable(getattr(self.client, method_name, None)):
+                raise SessionError(f"worker client does not support {method_name}; mutation refused")
         lock = await self._lock_for(normalized)
         async with lock:
             claimed = await self.client.claim_session(normalized)
-            nonce = claimed.get("session_nonce") if isinstance(claimed, dict) else None
+            nonce = None
+            if isinstance(claimed, dict):
+                # The public SDK returns the backend's exact field name.  The
+                # shorter alias remains accepted for older/fake clients.
+                nonce = claimed.get("worker_session_nonce") or claimed.get("session_nonce")
             if not nonce:
                 raise SessionError("worker did not return a lease; mutation refused")
             lease = RunLease(self, normalized, str(nonce), self.heartbeat_interval)
@@ -100,4 +114,4 @@ class RunSessionManager:
                 await lease.close()
 
 
-__all__ = ["SessionError", "RunLease", "RunSessionManager"]
+__all__ = ["SessionError", "SessionOutcomeUnknownError", "RunLease", "RunSessionManager"]

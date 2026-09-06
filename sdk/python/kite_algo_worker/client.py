@@ -259,18 +259,35 @@ class KiteAlgoWorkerClient:
     def get_order_history_snapshot(self, strategy_run_id: str, order_id: str) -> WorkerOrderHistoryResponse:
         return WorkerOrderHistoryResponse.model_validate(self.get_order_history(strategy_run_id, order_id))
 
-    def cancel_order(self, strategy_run_id: str, order_id: str, *, variety: str = "regular") -> JsonDict:
+    def cancel_order(
+        self,
+        strategy_run_id: str,
+        order_id: str,
+        *,
+        variety: str = "regular",
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
         return self._request(
             "POST",
             f"/worker/orders/{order_id}/cancel",
             json={"strategy_run_id": strategy_run_id, "variety": variety},
+            headers=session_headers(session_nonce),
         )
 
-    def modify_order(self, strategy_run_id: str, order_id: str, patch: Mapping[str, Any], *, variety: str = "regular") -> JsonDict:
+    def modify_order(
+        self,
+        strategy_run_id: str,
+        order_id: str,
+        patch: Mapping[str, Any],
+        *,
+        variety: str = "regular",
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
         return self._request(
             "POST",
             f"/worker/orders/{order_id}/modify",
             json={"strategy_run_id": strategy_run_id, "variety": variety, **dict(patch)},
+            headers=session_headers(session_nonce),
         )
 
     def preview_order(self, strategy_run_id: str, order: Mapping[str, Any], *, metadata: Optional[Mapping[str, Any]] = None) -> JsonDict:
@@ -621,8 +638,19 @@ class KiteAlgoWorkerClient:
             params={"interval_seconds": interval_seconds},
         )
 
-    def log_decision_event(self, strategy_run_id: str, **payload: Any) -> JsonDict:
-        return self._request("POST", f"/worker/runs/{strategy_run_id}/decision-events", json=dict(payload))
+    def log_decision_event(
+        self,
+        strategy_run_id: str,
+        *,
+        session_nonce: Optional[str] = None,
+        **payload: Any,
+    ) -> JsonDict:
+        return self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/decision-events",
+            json=dict(payload),
+            headers=session_headers(session_nonce),
+        )
 
     def list_timeline(self, strategy_run_id: str, **params: Any) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}/timeline", params=dict(params or {}))

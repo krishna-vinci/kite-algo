@@ -108,12 +108,15 @@ class AsyncOptionWorkerClient:
         strategy_name: str,
         product: str,
         legs: Iterable[Mapping[str, Any]],
+        strategy_run_id: str | None = None,
         protection: Optional[Mapping[str, Any]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        session_nonce: str | None = None,
     ) -> dict[str, Any]:
         request = OptionRunCreateRequest(
             strategy_name=strategy_name,
             product=product,
+            strategy_run_id=strategy_run_id,
             legs=[
                 leg if isinstance(leg, OptionExecutionLeg) else OptionExecutionLeg.model_validate(dict(leg))
                 for leg in legs
@@ -124,7 +127,12 @@ class AsyncOptionWorkerClient:
         payload = request.model_dump(exclude_none=True)
         if request.protection is None:
             payload.pop("protection", None)
-        return await self._client._request("POST", "/worker/options/runs", json=payload)
+        return await self._client._request(
+            "POST",
+            "/worker/options/runs",
+            json=payload,
+            headers=session_headers(session_nonce),
+        )
 
     async def preview_run_entry(
         self, strategy_run_id: str, payload: Optional[Mapping[str, Any]] = None
