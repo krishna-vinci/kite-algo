@@ -72,6 +72,9 @@ def test_async_index_constituent_methods_use_server_contract(load_worker_fixture
 
         snapshot = await client.get_index_constituents_snapshot("Nifty500")
         assert isinstance(snapshot, WorkerIndexConstituentsSnapshot)
+        assert snapshot.members[0].sector == "Financial Services"
+        assert snapshot.members[1].sector is None
+        assert snapshot.members[1].model_dump(exclude_none=False)["sector"] is None
 
         calls2 = _capture_request(client, status_payload)
         raw_status = await client.get_index_constituent_status("Nifty500")

@@ -5018,6 +5018,8 @@ def test_worker_index_constituents_route_locks_v1_contract():
     assert constituent_payload["source_list"] == "Nifty500"
     assert constituent_payload["complete"] is True
     assert all(member["exchange"] == "NSE" for member in constituent_payload["members"])
+    assert constituent_payload["members"][0]["sector"] == "Financial Services"
+    assert constituent_payload["members"][1]["sector"] is None
 
 
 def test_worker_index_status_route_locks_v1_contract():

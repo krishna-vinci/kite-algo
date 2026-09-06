@@ -17,6 +17,7 @@ from backend.broker_api.instruments.index_ingestion import (
     compute_points_contribution,
     index_refresh_is_due,
     get_index_refresh_state,
+    get_worker_index_snapshot,
     get_worker_index_status,
     is_tradable_constituent,
     normalize_source_list,
@@ -169,6 +170,79 @@ class IndexIngestionHelpersTests(unittest.TestCase):
         ):
             self.assertTrue(get_worker_index_status(SOURCE_LIST_NIFTY500)["complete"])
             self.assertFalse(get_worker_index_status(SOURCE_LIST_NIFTY50)["complete"])
+
+    def test_worker_snapshot_selects_and_preserves_nullable_sector(self):
+        rows = [
+            {
+                "exchange": "NSE",
+                "tradingsymbol": "HDFCBANK",
+                "instrument_token": 101,
+                "company_name": "HDFC Bank Ltd.",
+                "sector": "Financial Services",
+                "series": "EQ",
+                "source_url": "https://example.test/nifty500.csv",
+                "last_refreshed_at": datetime(2026, 9, 6, tzinfo=timezone.utc),
+            },
+            {
+                "exchange": "NSE",
+                "tradingsymbol": "SECTORLESS",
+                "instrument_token": 202,
+                "company_name": "Sectorless Ltd.",
+                "sector": None,
+                "series": "EQ",
+                "source_url": "https://example.test/nifty500.csv",
+                "last_refreshed_at": datetime(2026, 9, 6, tzinfo=timezone.utc),
+            },
+        ]
+
+        class _Cursor:
+            def __init__(self):
+                self.query = ""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, query, _params):
+                self.query = query
+
+            def fetchall(self):
+                return rows
+
+        class _Connection:
+            def __init__(self):
+                self.cursor_instance = _Cursor()
+
+            def cursor(self, **_kwargs):
+                return self.cursor_instance
+
+            def close(self):
+                return None
+
+        connection = _Connection()
+        status = {
+            "source": "nse_official_constituent_csv",
+            "source_as_of": "2026-09-06T00:00:00+00:00",
+            "complete": True,
+            "checksum": "a" * 64,
+        }
+        with (
+            patch(
+                "backend.broker_api.instruments.index_ingestion.get_db_connection",
+                return_value=connection,
+            ),
+            patch(
+                "backend.broker_api.instruments.index_ingestion.get_worker_index_status",
+                return_value=status,
+            ),
+        ):
+            snapshot = get_worker_index_snapshot(SOURCE_LIST_NIFTY500)
+
+        self.assertIn("sector", connection.cursor_instance.query)
+        self.assertEqual(snapshot["members"][0]["sector"], "Financial Services")
+        self.assertIsNone(snapshot["members"][1]["sector"])
 
 
 if __name__ == "__main__":

@@ -1036,7 +1036,7 @@ def get_worker_index_snapshot(source_list: str) -> Dict[str, Any]:
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""SELECT instrument_token,tradingsymbol,exchange,company_name,series,source_url,last_refreshed_at
+            cur.execute("""SELECT instrument_token,tradingsymbol,exchange,company_name,sector,series,source_url,last_refreshed_at
                 FROM public.kite_ticker_tickers WHERE source_list=%s ORDER BY exchange,tradingsymbol,instrument_token""", (normalized,))
             members = [dict(row) for row in cur.fetchall()]
     finally:

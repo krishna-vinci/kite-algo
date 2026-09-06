@@ -53,6 +53,7 @@ class WorkerIndexMember(RawModelMixin):
     series: Optional[str] = None
     isin_code: Optional[str] = None
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+    sector: Optional[str] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "exchange", _required_str(self.exchange, field_name="exchange"))
@@ -64,6 +65,7 @@ class WorkerIndexMember(RawModelMixin):
         object.__setattr__(self, "series", _optional_str(self.series))
         object.__setattr__(self, "isin_code", _optional_str(self.isin_code))
         object.__setattr__(self, "raw", dict(self.raw or {}))
+        object.__setattr__(self, "sector", _optional_str(self.sector))
 
 
 @dataclass(frozen=True)

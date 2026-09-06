@@ -34,6 +34,9 @@ def test_index_snapshot_preserves_nse_identity(load_worker_fixture):
     assert model.member_count == len(model.members)
     assert model.complete is True
     assert {member.exchange for member in model.members} == {"NSE"}
+    assert model.members[0].sector == "Financial Services"
+    assert model.members[1].sector is None
+    assert model.members[1].model_dump(exclude_none=False)["sector"] is None
 
 
 def test_index_model_is_not_hardcoded_to_nifty500(load_worker_fixture):
@@ -43,6 +46,22 @@ def test_index_model_is_not_hardcoded_to_nifty500(load_worker_fixture):
     payload["source_list"] = "Nifty50"
     model = WorkerIndexConstituentsSnapshot.model_validate(payload)
     assert model.source_list == "Nifty50"
+
+
+def test_index_member_sector_addition_preserves_legacy_positional_arguments():
+    from kite_algo_worker import WorkerIndexMember
+
+    member = WorkerIndexMember(
+        "NSE",
+        "SYNTH",
+        101,
+        "Synthetic Ltd",
+        "EQ",
+        "INE000A00000",
+        {"legacy": True},
+    )
+    assert member.raw == {"legacy": True}
+    assert member.sector is None
 
 
 def test_index_status_model_is_source_list_scoped(load_worker_fixture):
