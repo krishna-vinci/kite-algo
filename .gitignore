@@ -70,3 +70,9 @@ quant-ml-india/
 # Handoff packages (design/plan docs must never be committed)
 kite-algo-fundamentals-0.7.7-handoff/
 kite-algo-*-handoff/
+
+# Isolated MCP environment and local package build output
+mcp/python/.venv/
+mcp/python/build/
+mcp/python/dist/
+mcp/python/*.egg-info/

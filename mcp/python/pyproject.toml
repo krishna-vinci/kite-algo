@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kite-algo-mcp"
+version = "0.1.0"
+description = "Safe stdio MCP adapter for the Kite Algo worker SDK"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.10"
+dependencies = [
+  "fastmcp==4.0.3",
+  "mcp==2.1.1",
+  "pydantic>=2,<3",
+  "kite-algo-worker>=0.9,<0.10",
+  "numpy>=1.24",
+  "pandas>=2",
+]
+
+[project.scripts]
+kite-algo-mcp = "kite_algo_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kite_algo_mcp*"]
+
+[tool.setuptools.package-data]
+kite_algo_mcp = ["coverage.json"]

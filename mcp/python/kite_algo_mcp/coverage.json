@@ -171,7 +171,7 @@
     "method": "POST",
     "path": "/worker/market/quotes",
     "disposition": "tool",
-    "tools": ["get_quotes"],
+    "tools": ["get_quotes", "get_market_depth"],
     "reason": "Expose batched quote reads with stale and unavailable states preserved."
   },
   {
@@ -367,7 +367,7 @@
     "method": "GET",
     "path": "/worker/runs/{strategy_run_id}",
     "disposition": "tool",
-    "tools": ["get_run"],
+    "tools": ["get_run", "get_run_health"],
     "reason": "Expose one token-authorized run summary."
   },
   {
@@ -472,7 +472,7 @@
     "method": "POST",
     "path": "/worker/runs/{strategy_run_id}/intents",
     "disposition": "tool",
-    "tools": ["place_order"],
+    "tools": ["place_order", "place_basket"],
     "reason": "Expose explicit idempotent order submission after policy and backend safety checks."
   },
   {
@@ -507,7 +507,7 @@
     "method": "PATCH",
     "path": "/worker/runs/{strategy_run_id}/protection",
     "disposition": "tool",
-    "tools": ["update_run_protection"],
+    "tools": ["update_run_protection", "get_run_protection"],
     "reason": "Expose scoped backend protection updates through existing rules."
   },
   {
