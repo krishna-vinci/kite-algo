@@ -1,0 +1,639 @@
+[
+  {
+    "method": "GET",
+    "path": "/worker/account/portfolio",
+    "disposition": "tool",
+    "tools": ["get_account_portfolio"],
+    "reason": "Expose the token-scoped account portfolio as a bounded read."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/fundamentals/export.csv",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "JSON fundamentals cover MCP research; local file and unbounded CSV export are out of scope."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/fundamentals/features",
+    "disposition": "tool",
+    "tools": ["get_fundamentals_features"],
+    "reason": "Expose structured fundamental feature rows with freshness and missing values preserved."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/fundamentals/statements",
+    "disposition": "tool",
+    "tools": ["get_fundamentals_statements"],
+    "reason": "Expose structured statements with statement scope and periods preserved."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/fundamentals/status",
+    "disposition": "tool",
+    "tools": ["get_fundamentals_status"],
+    "reason": "Expose fundamentals freshness and job state without fabricating data."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/fundamentals/sync",
+    "disposition": "tool",
+    "tools": ["refresh_fundamentals"],
+    "reason": "Expose bounded data refresh only through the explicit refresh policy."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/funds",
+    "disposition": "tool",
+    "tools": ["get_funds"],
+    "reason": "Expose the authorized worker account funds snapshot."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/gtt/triggers",
+    "disposition": "tool",
+    "tools": ["list_gtts"],
+    "reason": "Expose account-scoped GTT inspection with live-only semantics disclosed."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/gtt/triggers",
+    "disposition": "tool",
+    "tools": ["create_gtt"],
+    "reason": "Expose explicit GTT creation as a write subject to backend and profile policy."
+  },
+  {
+    "method": "DELETE",
+    "path": "/worker/gtt/triggers/{trigger_id}",
+    "disposition": "tool",
+    "tools": ["delete_gtt"],
+    "reason": "Expose exact account-level GTT deletion as an annotated write."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/gtt/triggers/{trigger_id}",
+    "disposition": "tool",
+    "tools": ["get_gtt"],
+    "reason": "Expose exact GTT inspection without broad account administration."
+  },
+  {
+    "method": "PUT",
+    "path": "/worker/gtt/triggers/{trigger_id}",
+    "disposition": "tool",
+    "tools": ["modify_gtt"],
+    "reason": "Expose exact GTT modification as a backend-authorized write."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/health",
+    "disposition": "tool",
+    "tools": ["get_capabilities"],
+    "reason": "Use worker health and capability metadata for safe discovery with credential redaction."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/heartbeat",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "Heartbeat is owned by the MCP lease lifecycle and is never model-visible."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/market/calendar",
+    "disposition": "tool",
+    "tools": ["get_market_calendar"],
+    "reason": "Expose exchange calendar sessions and source freshness."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/market/calendar/status",
+    "disposition": "tool",
+    "tools": ["get_market_calendar_status"],
+    "reason": "Expose calendar availability and schema status."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/market/candles",
+    "disposition": "tool",
+    "tools": ["get_candles", "get_current_candle"],
+    "reason": "Expose bounded candle snapshots and current-candle views without ingestion."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/market/candles/stream",
+    "disposition": "deferred",
+    "tools": [],
+    "reason": "Bounded snapshots cover v1; endless SSE calls are not MCP tools."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/market/history",
+    "disposition": "tool",
+    "tools": ["get_historical_candles", "request_history"],
+    "reason": "Separate ordinary historical reads from the explicit ingestion-enabled request_history policy."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/market/indices/{source_list}",
+    "disposition": "tool",
+    "tools": ["get_index_constituents"],
+    "reason": "Expose supported index universes, member metadata and nullable stored sectors."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/market/indices/{source_list}/status",
+    "disposition": "tool",
+    "tools": ["get_index_status"],
+    "reason": "Expose index refresh status and source provenance."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/market/instruments/resolve",
+    "disposition": "tool",
+    "tools": ["resolve_instruments"],
+    "reason": "Expose single instrument resolution with symbol metadata and trading constraints."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/market/instruments/resolve",
+    "disposition": "tool",
+    "tools": ["resolve_instruments"],
+    "reason": "Expose existing batch instrument resolution without creating a second tool alias."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/market/instruments/search",
+    "disposition": "tool",
+    "tools": ["search_instruments"],
+    "reason": "Expose bounded instrument lookup rather than a full instrument-master download."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/market/quotes",
+    "disposition": "tool",
+    "tools": ["get_quotes"],
+    "reason": "Expose batched quote reads with stale and unavailable states preserved."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/market/snapshot",
+    "disposition": "tool",
+    "tools": ["get_market_snapshot"],
+    "reason": "Expose the existing combined market snapshot read."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/market/ticks/stream",
+    "disposition": "deferred",
+    "tools": [],
+    "reason": "Snapshot tools cover v1; endless tick SSE calls are not MCP tools."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/options/runs",
+    "disposition": "tool",
+    "tools": ["create_option_run"],
+    "reason": "Expose explicit option-run creation with profile and account selection."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/options/runs/{strategy_run_id}/enter",
+    "disposition": "tool",
+    "tools": ["enter_option_run"],
+    "reason": "Expose explicit option-run entry as a scoped write."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/options/runs/{strategy_run_id}/exit",
+    "disposition": "tool",
+    "tools": ["exit_option_run"],
+    "reason": "Expose exact option-run exit as a scoped risk-reducing write."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/options/runs/{strategy_run_id}/preview-entry",
+    "disposition": "tool",
+    "tools": ["preview_option_entry"],
+    "reason": "Expose option entry preview without implicit creation or submission."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/options/runs/{strategy_run_id}/preview-exit",
+    "disposition": "tool",
+    "tools": ["preview_option_exit"],
+    "reason": "Expose option exit preview without implicit execution."
+  },
+  {
+    "method": "PUT",
+    "path": "/worker/options/runs/{strategy_run_id}/protection",
+    "disposition": "tool",
+    "tools": ["update_option_protection"],
+    "reason": "Expose option protection updates through existing backend rules."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/options/runs/{strategy_run_id}/protection/replay",
+    "disposition": "tool",
+    "tools": ["replay_option_protection"],
+    "reason": "Expose only after the Task 10 audit classifies simulation versus write behavior."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/options/runs/{strategy_run_id}/protection/state",
+    "disposition": "tool",
+    "tools": ["get_option_protection"],
+    "reason": "Expose option protection state for the authorized run."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/options/runs/{strategy_run_id}/state",
+    "disposition": "tool",
+    "tools": ["get_option_run_state"],
+    "reason": "Expose option-run state without lease or nonce management."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/options/strategies/preview",
+    "disposition": "tool",
+    "tools": ["preview_option_strategy"],
+    "reason": "Expose strategy composition preview only; no strategy engine is introduced."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/options/underlyings/{underlying}/analytics/max-pain",
+    "disposition": "tool",
+    "tools": ["get_option_max_pain"],
+    "reason": "Expose existing option max-pain analytics with bounded output."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/options/underlyings/{underlying}/analytics/pcr",
+    "disposition": "tool",
+    "tools": ["get_option_pcr"],
+    "reason": "Expose existing option put-call ratio analytics."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/options/underlyings/{underlying}/chain",
+    "disposition": "tool",
+    "tools": ["get_option_chain"],
+    "reason": "Expose bounded option chain data when an authorized session exists."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/options/underlyings/{underlying}/expiries",
+    "disposition": "tool",
+    "tools": ["list_option_expiries"],
+    "reason": "Expose available option expiries without creating a session implicitly."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/options/underlyings/{underlying}/greeks",
+    "disposition": "tool",
+    "tools": ["get_option_greeks"],
+    "reason": "Expose existing Greek data with documented units and availability."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/options/underlyings/{underlying}/mini-chain",
+    "disposition": "tool",
+    "tools": ["get_option_mini_chain"],
+    "reason": "Expose bounded mini-chain data for authorized option sessions."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/options/underlyings/{underlying}/selection/resolve",
+    "disposition": "tool",
+    "tools": ["resolve_option_contracts"],
+    "reason": "Expose typed supported contract selectors rather than arbitrary option payloads."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/options/underlyings/{underlying}/session",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "Session creation is a data side effect owned by policy, not a model-visible read."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/orders",
+    "disposition": "tool",
+    "tools": ["list_orders"],
+    "reason": "Expose bounded orders for the authorized account or run scope."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/orders/{order_id}",
+    "disposition": "tool",
+    "tools": ["get_order"],
+    "reason": "Expose exact order inspection while preserving partial and rejected states."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/orders/{order_id}/cancel",
+    "disposition": "tool",
+    "tools": ["cancel_order"],
+    "reason": "Expose exact order cancellation as a scoped risk-reducing write."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/orders/{order_id}/history",
+    "disposition": "tool",
+    "tools": ["get_order_history"],
+    "reason": "Expose order event history for reconciliation."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/orders/{order_id}/modify",
+    "disposition": "tool",
+    "tools": ["modify_order"],
+    "reason": "Expose exact order modification with backend idempotency and safety checks."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/runs",
+    "disposition": "tool",
+    "tools": ["create_run"],
+    "reason": "Expose explicit run creation with account, mode, family and template inputs."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}",
+    "disposition": "tool",
+    "tools": ["get_run"],
+    "reason": "Expose one token-authorized run summary."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/baskets",
+    "disposition": "tool",
+    "tools": ["list_baskets"],
+    "reason": "Expose bounded basket execution history for one authorized run."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/baskets/{basket_execution_id}",
+    "disposition": "tool",
+    "tools": ["get_basket"],
+    "reason": "Expose one exact basket execution and its partial results."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/brackets",
+    "disposition": "tool",
+    "tools": ["list_brackets"],
+    "reason": "Expose bounded bracket intents for one authorized run."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/runs/{strategy_run_id}/brackets",
+    "disposition": "tool",
+    "tools": ["create_bracket"],
+    "reason": "Expose bracket creation through existing backend protection and idempotency."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}",
+    "disposition": "tool",
+    "tools": ["get_bracket"],
+    "reason": "Expose one exact bracket intent state."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}/cancel",
+    "disposition": "tool",
+    "tools": ["cancel_bracket"],
+    "reason": "Expose exact bracket cancellation as an annotated write."
+  },
+  {
+    "method": "DELETE",
+    "path": "/worker/runs/{strategy_run_id}/claim-session",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "MCP owns temporary leases; model-visible tools never manage nonces directly."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/runs/{strategy_run_id}/claim-session",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "MCP claims a lease internally and refuses conflicts without force takeover."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/runs/{strategy_run_id}/decision-events",
+    "disposition": "tool",
+    "tools": ["log_run_decision"],
+    "reason": "Expose bounded structured decision logging without secrets."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/execution-events",
+    "disposition": "tool",
+    "tools": ["list_execution_events"],
+    "reason": "Expose bounded execution event pages for reconciliation."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/execution-events/stream",
+    "disposition": "deferred",
+    "tools": [],
+    "reason": "Bounded event pages cover v1; endless SSE calls are not MCP tools."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/runs/{strategy_run_id}/exit",
+    "disposition": "tool",
+    "tools": ["exit_run"],
+    "reason": "Expose exact run exit without account-wide close-all behavior."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/funds",
+    "disposition": "tool",
+    "tools": ["get_run_funds"],
+    "reason": "Expose funds associated with one authorized run scope."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/runs/{strategy_run_id}/heartbeat",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "Run lease heartbeats remain server-owned lifecycle operations."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/runs/{strategy_run_id}/intents",
+    "disposition": "tool",
+    "tools": ["place_order"],
+    "reason": "Expose explicit idempotent order submission after policy and backend safety checks."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/pnl",
+    "disposition": "tool",
+    "tools": ["get_run_pnl"],
+    "reason": "Expose bounded run PnL with freshness and degradation state."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/pnl/stream",
+    "disposition": "deferred",
+    "tools": [],
+    "reason": "Snapshot PnL covers v1; endless SSE calls are not MCP tools."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/runs/{strategy_run_id}/preview/basket",
+    "disposition": "tool",
+    "tools": ["preview_basket"],
+    "reason": "Expose basket preview without implicit order submission."
+  },
+  {
+    "method": "POST",
+    "path": "/worker/runs/{strategy_run_id}/preview/order",
+    "disposition": "tool",
+    "tools": ["preview_order"],
+    "reason": "Expose order preview and margin/cost degradation explicitly."
+  },
+  {
+    "method": "PATCH",
+    "path": "/worker/runs/{strategy_run_id}/protection",
+    "disposition": "tool",
+    "tools": ["update_run_protection"],
+    "reason": "Expose scoped backend protection updates through existing rules."
+  },
+  {
+    "method": "PATCH",
+    "path": "/worker/runs/{strategy_run_id}/risk",
+    "disposition": "tool",
+    "tools": ["update_run_risk"],
+    "reason": "Expose scoped run risk updates as annotated writes."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/safety-check",
+    "disposition": "tool",
+    "tools": ["check_run_safety"],
+    "reason": "Expose current safety state without promising an eventual fill."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/timeline",
+    "disposition": "tool",
+    "tools": ["list_run_timeline"],
+    "reason": "Expose bounded run timeline pages."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/runs/{strategy_run_id}/timeline/stream",
+    "disposition": "deferred",
+    "tools": [],
+    "reason": "Bounded timeline pages cover v1; endless SSE calls are not MCP tools."
+  },
+  {
+    "method": "GET",
+    "path": "/worker/trades",
+    "disposition": "tool",
+    "tools": ["list_trades"],
+    "reason": "Expose bounded trade history with partial fills and rejections preserved."
+  },
+  {
+    "method": "WS",
+    "path": "/worker/ws/market/ticks",
+    "disposition": "deferred",
+    "tools": [],
+    "reason": "WebSocket streams are deferred; bounded market snapshots cover v1."
+  },
+  {
+    "method": "WS",
+    "path": "/worker/ws/market/candles",
+    "disposition": "deferred",
+    "tools": [],
+    "reason": "WebSocket streams are deferred; bounded candle snapshots cover v1."
+  },
+  {
+    "method": "WS",
+    "path": "/worker/ws/runs/{strategy_run_id}/pnl",
+    "disposition": "deferred",
+    "tools": [],
+    "reason": "WebSocket streams are deferred; bounded PnL reads cover v1."
+  },
+  {
+    "method": "HELPER",
+    "path": "indicators",
+    "disposition": "tool",
+    "tools": ["calculate_indicator"],
+    "reason": "Allowlisted local SDK indicators are exposed as bounded calculations, not screeners."
+  },
+  {
+    "method": "HELPER",
+    "path": "options/resolvers",
+    "disposition": "tool",
+    "tools": ["resolve_option_contracts"],
+    "reason": "Typed local option selectors compose the public contract-resolution tool."
+  },
+  {
+    "method": "HELPER",
+    "path": "orders",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "Order builders are typed composition conveniences and never submit by themselves."
+  },
+  {
+    "method": "HELPER",
+    "path": "run_config",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "Run configuration models remain internal typed composition."
+  },
+  {
+    "method": "HELPER",
+    "path": "protection",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "Protection models are reused by scoped tools and are not independent MCP tools."
+  },
+  {
+    "method": "HELPER",
+    "path": "helpers",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "Wait, warmup, ensure-run and preview-place helpers cannot bypass explicit policy."
+  },
+  {
+    "method": "HELPER",
+    "path": "managed_run",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "ManagedRun is not a continuous MCP heartbeat service."
+  },
+  {
+    "method": "HELPER",
+    "path": "marketdata",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "DataFrame and OHLCV adapters are implementation conveniences."
+  },
+  {
+    "method": "HELPER",
+    "path": "websocket/reconnect",
+    "disposition": "deferred",
+    "tools": [],
+    "reason": "Reconnect managers belong to deferred streaming transport, not endless tool calls."
+  },
+  {
+    "method": "HELPER",
+    "path": "transport/errors",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "HTTP transport and typed errors support adapters but are not user-facing tools."
+  },
+  {
+    "method": "HELPER",
+    "path": "certification",
+    "disposition": "internal",
+    "tools": [],
+    "reason": "Certification helpers remain testing and operational support code."
+  }
+]
