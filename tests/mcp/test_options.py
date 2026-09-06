@@ -102,3 +102,21 @@ async def test_option_preview_replay_and_paper_entry_remain_explicit() -> None:
         assert "events" in replay.content[0].text
         entered = await client.call_tool("enter_option_run", {"request": {"strategy_run_id": "opt-1", "execution_mode": "paper", "account_scope": "kite:paper-a", "idempotency_key": "opt-entry-1234"}})
         assert "entered" in entered.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_option_write_cannot_cross_authorized_worker_account_scope() -> None:
+    server = create_server(MCPConfig(api_url="http://127.0.0.1:18777", worker_token="secret", profile="paper"), client=OptionsFake())
+    async with Client(server) as client:
+        with pytest.raises(Exception, match="account_scope"):
+            await client.call_tool(
+                "enter_option_run",
+                {
+                    "request": {
+                        "strategy_run_id": "opt-1",
+                        "execution_mode": "paper",
+                        "account_scope": "kite:paper-other",
+                        "idempotency_key": "opt-entry-5678",
+                    }
+                },
+            )

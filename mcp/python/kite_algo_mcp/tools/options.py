@@ -32,17 +32,20 @@ async def _authorized_worker_run(runtime: MCPRuntime, strategy_run_id: str) -> M
     result = await getter(strategy_run_id)
     if not isinstance(result, Mapping):
         raise ValueError("worker run authorization returned no structured run")
+    actual_run_id = str(result.get("strategy_run_id") or "").strip()
+    if actual_run_id != str(strategy_run_id).strip():
+        raise ValueError("worker run authorization returned a different run")
     return result
 
 
 def _check_option_context(request: OptionWriteActionRequest | OptionCreateRunRequest, run: Mapping[str, Any]) -> None:
     actual_mode = str(run.get("execution_mode") or "").strip().lower()
     requested_mode = str(request.execution_mode).strip().lower()
-    if actual_mode and actual_mode != requested_mode:
+    if not actual_mode or actual_mode != requested_mode:
         raise ValueError("option execution_mode must match the authorized worker run")
     actual_account = str(run.get("account_scope") or "").strip().lower()
     requested_account = str(request.account_scope).strip().lower()
-    if actual_account and actual_account != requested_account:
+    if not actual_account or actual_account != requested_account:
         raise ValueError("option account_scope must match the authorized worker run")
 
 
