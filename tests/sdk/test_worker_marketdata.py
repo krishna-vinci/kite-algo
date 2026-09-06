@@ -78,3 +78,36 @@ def test_ohlcv_arrays_normalizes_dataframe_input_and_string_flags():
     assert list(arrays.index.astype(str)) == ["2026-04-28 09:15:00+05:30", "2026-04-28 09:20:00+05:30"]
     assert arrays.is_complete.tolist() == [False, True]
     assert arrays.oi is None
+
+
+def test_sdk_quote_response_preserves_depth_and_unavailable_state():
+    from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient
+
+    payload = {
+        "quotes": [
+            {
+                "symbol": "NSE:INFY",
+                "depth": {
+                    "buy": [{"price": 1525.45, "quantity": 100, "orders": 3}],
+                    "sell": [{"price": 1525.55, "quantity": 80, "orders": 2}],
+                },
+                "depth_available": True,
+                "depth_unavailable_reason": None,
+            },
+            {
+                "symbol": "NSE:SBIN",
+                "depth": None,
+                "depth_available": False,
+                "depth_unavailable_reason": "depth_not_supplied_by_feed",
+            },
+        ],
+        "missing": [],
+    }
+    client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:8000", token="kwa_test"))
+    client._request = lambda *_args, **_kwargs: payload
+
+    response = client.get_quotes(["NSE:INFY", "NSE:SBIN"], mode="full")
+
+    assert response["quotes"][0]["depth"]["buy"][0]["orders"] == 3
+    assert response["quotes"][1]["depth"] is None
+    assert response["quotes"][1]["depth_unavailable_reason"] == "depth_not_supplied_by_feed"
