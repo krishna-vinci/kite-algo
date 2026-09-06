@@ -25,8 +25,12 @@ async def test_official_mcp_client_can_initialize_stdio_server() -> None:
             async with ClientSession(read_stream, write_stream) as session:
                 initialized = await session.initialize()
                 result = await session.list_tools()
+                resources = await session.list_resources()
+                usage = await session.read_resource("kite://usage")
                 assert initialized.protocol_version == "2025-11-25"
                 assert len(result.tools) == 53
                 assert {tool.name for tool in result.tools}.isdisjoint({"place_order", "place_gtt"})
+                assert {str(resource.uri) for resource in resources.resources} == {"kite://capabilities", "kite://usage"}
+                assert "unknown_write" in usage.contents[0].text
 
     await asyncio.wait_for(probe(), timeout=15)

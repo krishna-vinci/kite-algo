@@ -183,7 +183,7 @@ def _annotations(spec: ToolSpec) -> dict[str, Any]:
 
 def _register_resource(server: FastMCP, uri: str, name: str, description: str, payload: Callable[[], str]) -> None:
     @server.resource(uri, name=name, description=description, mime_type="application/json")
-    def _resource() -> str:
+    async def _resource() -> str:
         return payload()
 
 
