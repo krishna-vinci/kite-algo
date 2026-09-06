@@ -7,14 +7,14 @@ Kite Algo is a self-hosted algorithmic trading platform for Zerodha/Kite workflo
 ## Package status and install
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.7
+python3 -m pip install kite-algo-worker==0.8.0
 ```
 
 Extras:
 
 ```bash
-python3 -m pip install "kite-algo-worker[dataframe]==0.7.7"
-python3 -m pip install "kite-algo-worker[indicators]==0.7.7"
+python3 -m pip install "kite-algo-worker[dataframe]==0.8.0"
+python3 -m pip install "kite-algo-worker[indicators]==0.8.0"
 ```
 
 - base SDK: HTTP/WebSocket clients, typed models, order helpers
@@ -35,7 +35,10 @@ Pin to an immutable version in production.
 | Order placement | `preview_order(...)`, `preview_order_snapshot(...)`, `place_order(...)`, `cancel_order(...)`, `modify_order(...)`, order builders |
 | Basket execution | `preview_basket(...)`, `preview_basket_snapshot(...)`, `place_basket(...)` |
 | Investment data (read-only) | `get_market_calendar(...)`, `get_market_calendar_status(...)`, `get_index_constituents(...)`, `get_index_constituent_status(...)`, `get_account_portfolio(...)` and their `*_snapshot(...)` typed variants |
-| Fundamentals (0.7.7) | `get_fundamentals_features(...)`, `get_fundamentals_status(...)`, `get_fundamentals_statements(...)`, `refresh_fundamentals(...)` |
+| Fundamentals (0.8.0) | `get_fundamentals_features(...)`, `get_fundamentals_status(...)`, `get_fundamentals_statements(...)`, `refresh_fundamentals(...)`, `export_fundamentals_csv(...)` |
+| Execution recovery | `get_order_history(...)`, `list_baskets(...)`, `get_basket(...)`, `list_execution_events(...)`, `stream_execution_events(...)` |
+| Bracket lifecycle | `create_bracket(...)`, `list_brackets(...)`, `get_bracket(...)`, `cancel_bracket(...)` |
+| Async parity | `AsyncKiteAlgoWorkerClient` supports the same worker HTTP operations as `KiteAlgoWorkerClient`; async streams use `async for` |
 | Safety + protection | `safety_check(...)`, `BackendProtection`, `update_backend_protection(...)`, `patch_risk(...)` |
 | Grouped P&L + monitoring | `get_run_pnl(...)`, `stream_run_pnl(...)`, `list_timeline(...)`, `log_decision_event(...)`, `stream_timeline(...)` |
 | Options namespace | `client.options.*`, resolver helpers, options run lifecycle |
@@ -569,6 +572,38 @@ basket = client.place_basket(
 - `dry_run=True` previews the basket without placing any orders — useful for live operations
 - Basket keys should be as deterministic as single-order keys
 
+### Execution recovery and brackets
+
+The acceptance response is not durable execution truth. After a restart,
+recover backend-owned state from order history, basket/bracket snapshots, and
+cursor-based execution events:
+
+```python
+baskets = client.list_baskets_snapshot("run_basic_equity_001")
+events = client.list_execution_events_snapshot("run_basic_equity_001", after_cursor=0)
+
+for basket in baskets.baskets:
+    print(basket.basket_execution_id, basket.status)
+
+for event in events.events:
+    print(event.cursor, event.event_type)
+```
+
+Bracket lifecycle helpers are `create_bracket(...)`, `list_brackets(...)`,
+`get_bracket(...)`, and `cancel_bracket(...)`. Use `get_order_history(...)` to
+inspect broker transitions rather than inferring fills from an intent response.
+The equivalent async stream uses `async for`:
+
+```python
+async for event in async_client.stream_execution_events(
+    "run_basic_equity_001", after_cursor=events.last_cursor
+):
+    print(event["event_type"])
+```
+
+`export_fundamentals_csv(...)` returns the server-generated CSV text; callers
+choose whether and where to write it.
+
 ## Safety and protection
 
 ### safety_check(strategy_run_id)
@@ -780,7 +815,7 @@ except CalendarRangeUncoveredError as exc:
     print(exc.status_code, exc.rejection_reason)  # 503 CALENDAR_RANGE_UNCOVERED
 ```
 
-## Fundamentals (0.7.7)
+## Fundamentals (0.8.0)
 
 Screener.in-sourced company fundamentals, acquired, stored, and refreshed by the Kite Algo server. Consumers never scrape; they call the SDK. Responses are typed models carrying `schema_version`, `source: "screener"`, and `retrieved_at`.
 

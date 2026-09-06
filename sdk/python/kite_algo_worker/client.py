@@ -3,12 +3,24 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
 import requests
 
 from .exceptions import KiteAlgoWorkerError, error_for_status
+from ._shared import (
+    build_create_run_payload,
+    build_heartbeat_payload,
+    build_historical_date_params,
+    build_intent_payload,
+    fundamentals_scope_params,
+    normalize_calendar_date_params,
+    require_idempotency_key,
+    require_identity_param,
+    session_headers,
+    split_instruments,
+)
 from .fundamentals import (
     FundamentalFeatures,
     FundamentalsStatements,
@@ -31,6 +43,13 @@ from .models import (
     WorkerGttTrigger,
     WorkerGttWriteResult,
     WorkerHistoricalCandles,
+    WorkerBasketExecution,
+    WorkerBasketExecutionsResponse,
+    WorkerBracketActionResult,
+    WorkerBracketIntent,
+    WorkerBracketListResponse,
+    WorkerExecutionEventsResponse,
+    WorkerOrderHistoryResponse,
     WorkerOrderSnapshot,
     WorkerOrdersResponse,
     WorkerRunHealthSnapshot,
@@ -44,81 +63,11 @@ from .protection import BackendProtection
 
 JsonDict = Dict[str, Any]
 
-
-def _coerce_datetime(value: str | datetime) -> datetime:
-    if isinstance(value, datetime):
-        return value
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-
-
-def _build_historical_date_params(
-    *,
-    from_date: Optional[str | datetime] = None,
-    to_date: Optional[str | datetime] = None,
-    lookback_days: Optional[int] = None,
-) -> JsonDict:
-    if lookback_days is not None and lookback_days <= 0:
-        raise ValueError("lookback_days must be positive")
-    if from_date is not None and lookback_days is not None:
-        raise ValueError("from_date and lookback_days are mutually exclusive")
-
-    params: JsonDict = {}
-    if to_date is not None:
-        params["to"] = to_date.isoformat() if isinstance(to_date, datetime) else to_date
-    elif lookback_days is not None:
-        params["to"] = datetime.now(timezone.utc).isoformat()
-
-    if from_date is not None:
-        params["from"] = from_date.isoformat() if isinstance(from_date, datetime) else from_date
-    elif lookback_days is not None:
-        to_dt = _coerce_datetime(params["to"])
-        if to_dt.tzinfo is None:
-            raise ValueError("to_date must include timezone information when lookback_days is used")
-        params["from"] = (to_dt - timedelta(days=int(lookback_days))).isoformat()
-
-    return params
-
-
-def _require_identity_param(value: Any, *, field_name: str) -> str:
-    text = str(value or "").strip()
-    if not text:
-        raise ValueError(f"{field_name} is required")
-    return text
-
-
-def _fundamentals_scope_params(symbols: Optional[Iterable[str]], index: Optional[str]) -> JsonDict:
-    """Validate the exclusive symbols/index scope shared by fundamentals methods."""
-    if bool(symbols) == bool(index):
-        raise ValueError("provide exactly one of 'symbols' or 'index'")
-    if symbols:
-        cleaned = [str(s).strip().upper() for s in symbols if str(s).strip()]
-        if not cleaned:
-            raise ValueError("symbols must not be empty when provided")
-        return {"symbols": cleaned}
-    index_text = str(index or "").strip()
-    if not index_text:
-        raise ValueError("index must not be empty when provided")
-    return {"index": index_text}
-
-
-def _normalize_calendar_date_params(from_date: Any, to_date: Any, *, exchange: Any, segment: Any) -> JsonDict:
-    from_text = _require_identity_param(from_date, field_name="from_date")
-    to_text = _require_identity_param(to_date, field_name="to_date")
-    try:
-        start = date.fromisoformat(from_text)
-        end = date.fromisoformat(to_text)
-    except ValueError as exc:
-        raise ValueError("from_date and to_date must be ISO dates (YYYY-MM-DD)") from exc
-    if start > end:
-        raise ValueError("from_date must not be after to_date")
-    exchange_text = _require_identity_param(exchange, field_name="exchange").upper()
-    segment_text = _require_identity_param(segment, field_name="segment").upper()
-    return {
-        "from": from_text,
-        "to": to_text,
-        "exchange": exchange_text,
-        "segment": segment_text,
-    }
+# Keep the old private names importable for downstream code and existing tests.
+_build_historical_date_params = build_historical_date_params
+_fundamentals_scope_params = fundamentals_scope_params
+_normalize_calendar_date_params = normalize_calendar_date_params
+_require_identity_param = require_identity_param
 
 
 @dataclass(frozen=True)
@@ -163,9 +112,7 @@ class KiteAlgoWorkerClient:
         status: str = "healthy",
         metrics: Optional[Mapping[str, Any]] = None,
     ) -> JsonDict:
-        payload: JsonDict = {"status": status, "metrics": dict(metrics or {})}
-        if worker_id is not None:
-            payload["worker_id"] = worker_id
+        payload = build_heartbeat_payload(worker_id=worker_id, status=status, metrics=metrics)
         return self._request("POST", "/worker/heartbeat", json=payload)
 
     def create_run(
@@ -182,21 +129,18 @@ class KiteAlgoWorkerClient:
         metadata: Optional[Mapping[str, Any]] = None,
         backend_protection: Optional[BackendProtection] = None,
     ) -> JsonDict:
-        runtime_state_payload: JsonDict = dict(runtime_state or {})
-        if backend_protection is not None:
-            runtime_state_payload["backend_protection"] = backend_protection.to_dict()
-        payload: JsonDict = {
-            "template_id": template_id,
-            "account_scope": account_scope,
-            "execution_mode": execution_mode,
-            "summary_fields": [dict(item) for item in (summary_fields or [])],
-            "risk_schema": [dict(item) for item in (risk_schema or [])],
-            "allowed_actions": list(allowed_actions or ["edit_risk", "exit_strategy"]),
-            "runtime_state": runtime_state_payload,
-            "metadata": dict(metadata or {}),
-        }
-        if strategy_run_id is not None:
-            payload["strategy_run_id"] = strategy_run_id
+        payload = build_create_run_payload(
+            template_id=template_id,
+            account_scope=account_scope,
+            strategy_run_id=strategy_run_id,
+            execution_mode=execution_mode,
+            summary_fields=summary_fields,
+            risk_schema=risk_schema,
+            allowed_actions=allowed_actions,
+            runtime_state=runtime_state,
+            metadata=metadata,
+            backend_protection=backend_protection,
+        )
         return self._request("POST", "/worker/runs", json=payload)
 
     def create_run_from_config(self, config: RunConfig) -> JsonDict:
@@ -254,7 +198,7 @@ class KiteAlgoWorkerClient:
         return self._request(
             "DELETE",
             f"/worker/runs/{strategy_run_id}/claim-session",
-            headers={"X-Worker-Session-Nonce": str(session_nonce)},
+            headers=session_headers(session_nonce),
         )
 
     def run_heartbeat(
@@ -266,13 +210,11 @@ class KiteAlgoWorkerClient:
         status: str = "healthy",
         metrics: Optional[Mapping[str, Any]] = None,
     ) -> JsonDict:
-        payload: JsonDict = {"status": status, "metrics": dict(metrics or {})}
-        if worker_id is not None:
-            payload["worker_id"] = worker_id
+        payload = build_heartbeat_payload(worker_id=worker_id, status=status, metrics=metrics)
         return self._request(
             "POST",
             f"/worker/runs/{strategy_run_id}/heartbeat",
-            headers={"X-Worker-Session-Nonce": str(session_nonce)},
+            headers=session_headers(session_nonce),
             json=payload,
         )
 
@@ -300,6 +242,16 @@ class KiteAlgoWorkerClient:
     def get_order_snapshot(self, strategy_run_id: str, order_id: str) -> WorkerOrderSnapshot:
         response = self._request("GET", f"/worker/orders/{order_id}", params={"strategy_run_id": strategy_run_id})
         return WorkerOrderSnapshot.model_validate(response.get("order") or response)
+
+    def get_order_history(self, strategy_run_id: str, order_id: str) -> JsonDict:
+        return self._request(
+            "GET",
+            f"/worker/orders/{order_id}/history",
+            params={"strategy_run_id": strategy_run_id},
+        )
+
+    def get_order_history_snapshot(self, strategy_run_id: str, order_id: str) -> WorkerOrderHistoryResponse:
+        return WorkerOrderHistoryResponse.model_validate(self.get_order_history(strategy_run_id, order_id))
 
     def cancel_order(self, strategy_run_id: str, order_id: str, *, variety: str = "regular") -> JsonDict:
         return self._request(
@@ -356,6 +308,135 @@ class KiteAlgoWorkerClient:
         return OrderPreview.model_validate(
             self.preview_basket(strategy_run_id, orders, metadata=metadata, all_or_none=all_or_none)
         )
+
+    def list_baskets(self, strategy_run_id: str, *, limit: int = 100) -> JsonDict:
+        return self._request(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/baskets",
+            params={"limit": limit},
+        )
+
+    def list_baskets_snapshot(self, strategy_run_id: str, *, limit: int = 100) -> WorkerBasketExecutionsResponse:
+        return WorkerBasketExecutionsResponse.model_validate(self.list_baskets(strategy_run_id, limit=limit))
+
+    def get_basket(self, strategy_run_id: str, basket_execution_id: str) -> JsonDict:
+        return self._request(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/baskets/{basket_execution_id}",
+        )
+
+    def get_basket_snapshot(self, strategy_run_id: str, basket_execution_id: str) -> WorkerBasketExecution:
+        return WorkerBasketExecution.model_validate(self.get_basket(strategy_run_id, basket_execution_id))
+
+    def create_bracket(
+        self,
+        strategy_run_id: str,
+        *,
+        entry_order: Mapping[str, Any],
+        stoploss: Mapping[str, Any],
+        target: Optional[Mapping[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        session_nonce: str,
+    ) -> JsonDict:
+        return self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/brackets",
+            json={
+                "entry_order": dict(entry_order),
+                "stoploss": dict(stoploss),
+                "target": dict(target) if target is not None else None,
+                "idempotency_key": idempotency_key,
+                "metadata": dict(metadata or {}),
+            },
+            headers=session_headers(session_nonce),
+        )
+
+    def create_bracket_snapshot(self, strategy_run_id: str, **kwargs: Any) -> WorkerBracketActionResult:
+        return WorkerBracketActionResult.model_validate(self.create_bracket(strategy_run_id, **kwargs))
+
+    def list_brackets(self, strategy_run_id: str, *, limit: int = 50) -> JsonDict:
+        return self._request(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/brackets",
+            params={"limit": limit},
+        )
+
+    def list_brackets_snapshot(self, strategy_run_id: str, *, limit: int = 50) -> WorkerBracketListResponse:
+        return WorkerBracketListResponse.model_validate(self.list_brackets(strategy_run_id, limit=limit))
+
+    def get_bracket(self, strategy_run_id: str, bracket_intent_id: str) -> JsonDict:
+        return self._request(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}",
+        )
+
+    def get_bracket_snapshot(self, strategy_run_id: str, bracket_intent_id: str) -> WorkerBracketIntent:
+        return WorkerBracketIntent.model_validate(self.get_bracket(strategy_run_id, bracket_intent_id))
+
+    def cancel_bracket(self, strategy_run_id: str, bracket_intent_id: str, *, session_nonce: str) -> JsonDict:
+        return self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}/cancel",
+            headers=session_headers(session_nonce),
+        )
+
+    def cancel_bracket_snapshot(
+        self,
+        strategy_run_id: str,
+        bracket_intent_id: str,
+        *,
+        session_nonce: str,
+    ) -> WorkerBracketActionResult:
+        return WorkerBracketActionResult.model_validate(
+            self.cancel_bracket(strategy_run_id, bracket_intent_id, session_nonce=session_nonce)
+        )
+
+    def list_execution_events(
+        self,
+        strategy_run_id: str,
+        *,
+        after_cursor: int = 0,
+        limit: int = 200,
+        basket_execution_id: Optional[str] = None,
+        event_type: Optional[str] = None,
+    ) -> JsonDict:
+        return self._request(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/execution-events",
+            params={
+                "after_cursor": after_cursor,
+                "limit": limit,
+                "basket_execution_id": basket_execution_id,
+                "event_type": event_type,
+            },
+        )
+
+    def list_execution_events_snapshot(
+        self, strategy_run_id: str, **params: Any
+    ) -> WorkerExecutionEventsResponse:
+        return WorkerExecutionEventsResponse.model_validate(
+            self.list_execution_events(strategy_run_id, **params)
+        )
+
+    def stream_execution_events(self, strategy_run_id: str, **params: Any) -> Iterator[JsonDict]:
+        return self._stream_sse(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/execution-events/stream",
+            params=dict(params or {}),
+        )
+
+    def export_fundamentals_csv(
+        self,
+        *,
+        symbols: Optional[Iterable[str]] = None,
+        index: Optional[str] = None,
+        dataset: str = "fundamentals_features",
+        schema_version: int = 1,
+    ) -> str:
+        params = fundamentals_scope_params(symbols, index)
+        params.update({"dataset": dataset, "schema_version": schema_version})
+        return self._request_text("GET", "/worker/fundamentals/export.csv", params=params)
 
     def get_run_protection_state(self, strategy_run_id: str) -> JsonDict:
         run = self.get_run(strategy_run_id)
@@ -472,7 +553,7 @@ class KiteAlgoWorkerClient:
             self.get_account_portfolio(account_scope=account_scope, schema_version=schema_version)
         )
 
-    # -- Fundamentals (0.7.7; read-only except refresh_fundamentals) --------
+    # -- Fundamentals (0.8.0; read-only except refresh_fundamentals) --------
 
     def get_fundamentals_features(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None) -> FundamentalFeatures:
         """Typed fundamentals feature snapshot for symbols or an index universe."""
@@ -731,15 +812,7 @@ class KiteAlgoWorkerClient:
 
     @staticmethod
     def _split_instruments(instruments: Iterable[str | int]) -> tuple[List[str], List[int]]:
-        symbols: List[str] = []
-        tokens: List[int] = []
-        for item in instruments:
-            value = str(item).strip()
-            if isinstance(item, int) or value.isdigit():
-                tokens.append(int(value))
-            else:
-                symbols.append(value)
-        return symbols, tokens
+        return split_instruments(instruments)
 
     def place_order(
         self,
@@ -750,17 +823,20 @@ class KiteAlgoWorkerClient:
         safety_token: Optional[str] = None,
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
-        key = self._require_idempotency_key(idempotency_key)
-        payload: JsonDict = {
-            "intent_type": "place_order",
-            "payload": {"order": dict(order)},
-            "idempotency_key": key,
-            "metadata": dict(metadata or {}),
-        }
-        if safety_token is not None:
-            payload["safety_token"] = str(safety_token)
-        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
-        return self._request("POST", f"/worker/runs/{strategy_run_id}/intents", json=payload, headers=headers)
+        payload = build_intent_payload(
+            intent_type="place_order",
+            body_key="order",
+            body=dict(order),
+            idempotency_key=idempotency_key,
+            metadata=metadata,
+            safety_token=safety_token,
+        )
+        return self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/intents",
+            json=payload,
+            headers=session_headers(session_nonce),
+        )
 
     def place_basket(
         self,
@@ -774,18 +850,21 @@ class KiteAlgoWorkerClient:
         safety_token: Optional[str] = None,
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
-        key = self._require_idempotency_key(idempotency_key)
         order_list: List[JsonDict] = [dict(order) for order in orders]
-        payload: JsonDict = {
-            "intent_type": "place_basket",
-            "payload": {"basket": {"orders": order_list, "all_or_none": all_or_none, "dry_run": dry_run}},
-            "idempotency_key": key,
-            "metadata": dict(metadata or {}),
-        }
-        if safety_token is not None:
-            payload["safety_token"] = str(safety_token)
-        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
-        return self._request("POST", f"/worker/runs/{strategy_run_id}/intents", json=payload, headers=headers)
+        payload = build_intent_payload(
+            intent_type="place_basket",
+            body_key="basket",
+            body={"orders": order_list, "all_or_none": all_or_none, "dry_run": dry_run},
+            idempotency_key=idempotency_key,
+            metadata=metadata,
+            safety_token=safety_token,
+        )
+        return self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/intents",
+            json=payload,
+            headers=session_headers(session_nonce),
+        )
 
     def patch_risk(
         self,
@@ -794,12 +873,11 @@ class KiteAlgoWorkerClient:
         reason: Optional[str] = None,
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
-        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
         return self._request(
             "PATCH",
             f"/worker/runs/{strategy_run_id}/risk",
             json={"patch": dict(patch), "reason": reason},
-            headers=headers,
+            headers=session_headers(session_nonce),
         )
 
     def update_backend_protection(
@@ -811,7 +889,6 @@ class KiteAlgoWorkerClient:
         reset_trailing: bool = True,
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
-        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
         return self._request(
             "PATCH",
             f"/worker/runs/{strategy_run_id}/protection",
@@ -820,7 +897,7 @@ class KiteAlgoWorkerClient:
                 "reason": reason,
                 "reset_trailing": reset_trailing,
             },
-            headers=headers,
+            headers=session_headers(session_nonce),
         )
 
     def exit_run(
@@ -831,22 +908,16 @@ class KiteAlgoWorkerClient:
         dry_run: bool = False,
         session_nonce: Optional[str] = None,
     ) -> JsonDict:
-        headers = {"X-Worker-Session-Nonce": str(session_nonce)} if session_nonce is not None else None
         return self._request(
             "POST",
             f"/worker/runs/{strategy_run_id}/exit",
             json={"reason": reason, "idempotency_key": idempotency_key, "dry_run": dry_run},
-            headers=headers,
+            headers=session_headers(session_nonce),
         )
 
     @staticmethod
     def _require_idempotency_key(idempotency_key: str) -> str:
-        key = str(idempotency_key or "").strip()
-        if not key:
-            raise ValueError("idempotency_key is required for order intents")
-        if not 8 <= len(key) <= 160:
-            raise ValueError("idempotency_key must be between 8 and 160 characters")
-        return key
+        return require_idempotency_key(idempotency_key)
 
     def _url(self, path: str) -> str:
         base = self.config.base_url.rstrip("/")
@@ -856,6 +927,13 @@ class KiteAlgoWorkerClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> JsonDict:
         return self._request_url(method, self._url(path), **kwargs)
+
+    def _request_text(self, method: str, path: str, **kwargs: Any) -> str:
+        response = self.session.request(method, self._url(path), timeout=self.config.timeout, **kwargs)
+        if 200 <= response.status_code < 300:
+            return response.text
+        self._raise_response_error(response, method, path)
+        raise AssertionError("unreachable")
 
     def _request_url(self, method: str, url: str, **kwargs: Any) -> JsonDict:
         response = self.session.request(method, url, timeout=self.config.timeout, **kwargs)

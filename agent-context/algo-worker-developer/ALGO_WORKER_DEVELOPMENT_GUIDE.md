@@ -14,7 +14,7 @@ Workers must only call the public worker API through the Python SDK. Never call 
 ## Install
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.7
+python3 -m pip install kite-algo-worker==0.8.0
 ```
 
 ## Environment variables
@@ -150,6 +150,27 @@ with client.run(config) as run:
 | `idempotency_key` | no | Deterministic exit key |
 | `dry_run` | no | Preview exit without placing orders (safe for live) |
 
+## Execution recovery and async parity
+
+The acceptance response is not durable execution truth. After a worker restart,
+inspect backend-owned state before resuming decisions:
+
+```python
+history = client.get_order_history("run_demo_001", "broker-order-id")
+baskets = client.list_baskets_snapshot("run_demo_001")
+events = client.list_execution_events_snapshot("run_demo_001", after_cursor=0)
+```
+
+Use `create_bracket(...)`, `list_brackets(...)`, `get_bracket(...)`, and
+`cancel_bracket(...)` for bracket lifecycle operations. Consume
+`stream_execution_events(...)` from the last cursor rather than inferring fills
+from an intent response. `export_fundamentals_csv(...)` returns server-generated
+CSV text for the caller to persist.
+
+`AsyncKiteAlgoWorkerClient` supports the same worker HTTP operations. Await JSON
+methods and consume its SSE helpers with `async for`; close the client after a
+worker loop exits.
+
 ## Order builder summary
 
 | Helper | Use for |
@@ -172,7 +193,7 @@ Backend protection objects declare thresholds the backend enforces automatically
 
 Use `update_backend_protection(...)` and `patch_risk(...)` to adjust thresholds at runtime.
 
-## Fundamentals data (0.7.7)
+## Fundamentals data (0.8.0)
 
 Kite Algo owns screener.in acquisition, validation, storage, and refresh. Strategy workers must never scrape screener.in or query fundamentals tables directly.
 

@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kite-algo-worker"
-version = "0.7.7"
+version = "0.8.0"
 description = "Thin Python SDK for external Kite Algo strategy workers"
 readme = { file = "README.md", content-type = "text/markdown" }
-license = "Apache-2.0"
+license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 keywords = ["kite", "zerodha", "algo-trading", "trading", "sdk"]
 dependencies = ["requests>=2", "httpx>=0.27", "websockets>=12"]

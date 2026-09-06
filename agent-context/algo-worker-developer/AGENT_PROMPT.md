@@ -69,7 +69,7 @@ client.place_order(run["strategy_run_id"], order, "run_my_strategy_001:entry:001
 
 When using the full SDK surface, prefer the managed-lifecycle example in `ALGO_WORKER_DEVELOPMENT_GUIDE.md` and `examples/managed_run_worker.py`.
 
-## Fundamentals pattern (0.7.7)
+## Fundamentals pattern (0.8.0)
 
 ```python
 from datetime import datetime, timezone

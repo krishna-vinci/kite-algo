@@ -43,6 +43,10 @@ jobs:
           tests/sdk/test_worker_sdk_investment.py
           tests/sdk/test_worker_sdk_investment_async.py
           tests/sdk/test_worker_sdk_preview_costs.py
+          tests/sdk/test_worker_sdk_execution_observability.py
+          tests/sdk/test_worker_sdk_async_parity.py
+          tests/sdk/test_worker_sdk_contract_coverage.py
+          tests/api/test_algo_worker_route_mounts.py
           -q
 
       - name: Verify tag matches SDK version

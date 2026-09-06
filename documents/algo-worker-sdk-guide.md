@@ -219,6 +219,21 @@ This strengthens the audit trail: the timeline shows both what the backend execu
 
 `stream_run_pnl(...)` provides real-time SSE updates so workers can react to changing P&L without polling.
 
+### Execution recovery
+
+After submitting an intent, recover durable truth through order history,
+basket/bracket state, and cursor-based execution events. Do not infer fills
+from the original submission response. The SDK exposes
+`get_order_history(...)`, `list_baskets(...)`, `get_basket(...)`,
+`create_bracket(...)`, `list_brackets(...)`, `get_bracket(...)`,
+`cancel_bracket(...)`, `list_execution_events(...)`, and
+`stream_execution_events(...)`. `export_fundamentals_csv(...)` returns CSV
+content as text for the caller to persist where appropriate.
+
+The `AsyncKiteAlgoWorkerClient` exposes the same worker HTTP contract in 0.8.0;
+its SSE helpers are consumed with `async for`. External adapters should depend
+on this public SDK rather than backend-internal services.
+
 ## 8. Exit and recovery
 
 ### Exiting a run
@@ -237,8 +252,11 @@ If a worker process restarts:
 
 1. `get_run(strategy_run_id)` — the backend still knows your run state
 2. warm up historical candles and rebuild local indicator state
-3. reconnect `stream_ticks(...)`, `stream_candles(...)`, or `stream_run_pnl(...)`
-4. resume your decision loop
+3. inspect `get_order_history(...)`, `list_baskets(...)`, and
+   `list_execution_events(...)` from the last cursor
+4. reconnect `stream_ticks(...)`, `stream_candles(...)`,
+   `stream_run_pnl(...)`, or `stream_execution_events(...)`
+5. resume your decision loop
 
 The backend owns run identity and state. Worker restarts are a normal operational event, not a disaster.
 

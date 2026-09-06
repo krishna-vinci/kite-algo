@@ -1,4 +1,5 @@
 from .client import OptionWorkerClient
+from .async_client import AsyncOptionWorkerClient
 from .models import (
     OptionEntryPreviewRequest,
     OptionExecutionLeg,
@@ -13,6 +14,7 @@ from .structures import option_leg
 
 __all__ = [
     "OptionWorkerClient",
+    "AsyncOptionWorkerClient",
     "OptionEntryPreviewRequest",
     "OptionExecutionLeg",
     "OptionExpirySnapshot",

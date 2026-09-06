@@ -643,6 +643,279 @@ class WorkerTimelineResponse(ModelMixin):
         object.__setattr__(self, "events", normalized_events)
 
 
+@dataclass(frozen=True)
+class WorkerOrderHistoryResponse(RawModelMixin):
+    """Durable broker order-history entries for one worker run."""
+
+    strategy_run_id: str
+    order_id: str
+    history: List[WorkerOrderSnapshot] = field(default_factory=list)
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "order_id", str(self.order_id))
+        object.__setattr__(
+            self,
+            "history",
+            [
+                item if isinstance(item, WorkerOrderSnapshot) else WorkerOrderSnapshot.model_validate(item)
+                for item in list(self.history or [])
+            ],
+        )
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+# The broker order snapshot already carries all order-event fields and retains
+# unknown broker keys.  Keep a descriptive alias for callers dealing with a
+# history response without introducing a second, subtly different schema.
+WorkerOrderHistoryEvent = WorkerOrderSnapshot
+
+
+@dataclass(frozen=True)
+class WorkerBasketExecutionLeg(RawModelMixin):
+    basket_execution_id: str
+    leg_index: int
+    status: str
+    exchange: Optional[str] = None
+    tradingsymbol: Optional[str] = None
+    product: Optional[str] = None
+    transaction_type: Optional[str] = None
+    requested_quantity: int = 0
+    broker_order_id: Optional[str] = None
+    client_order_ref: Optional[str] = None
+    latest_broker_status: Optional[str] = None
+    last_seen_filled_quantity: int = 0
+    average_price: Optional[float] = None
+    request: Dict[str, Any] = field(default_factory=dict)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "basket_execution_id", str(self.basket_execution_id))
+        object.__setattr__(self, "leg_index", _coerce_int(self.leg_index))
+        object.__setattr__(self, "status", str(self.status))
+        object.__setattr__(self, "exchange", None if self.exchange is None else str(self.exchange))
+        object.__setattr__(self, "tradingsymbol", None if self.tradingsymbol is None else str(self.tradingsymbol))
+        object.__setattr__(self, "product", None if self.product is None else str(self.product))
+        object.__setattr__(self, "transaction_type", None if self.transaction_type is None else str(self.transaction_type))
+        object.__setattr__(self, "requested_quantity", _coerce_int(self.requested_quantity))
+        object.__setattr__(self, "broker_order_id", None if self.broker_order_id is None else str(self.broker_order_id))
+        object.__setattr__(self, "client_order_ref", None if self.client_order_ref is None else str(self.client_order_ref))
+        object.__setattr__(self, "latest_broker_status", None if self.latest_broker_status is None else str(self.latest_broker_status))
+        object.__setattr__(self, "last_seen_filled_quantity", _coerce_int(self.last_seen_filled_quantity))
+        object.__setattr__(self, "average_price", _coerce_optional_float(self.average_price))
+        object.__setattr__(self, "request", dict(self.request or {}))
+        object.__setattr__(self, "created_at", None if self.created_at is None else str(self.created_at))
+        object.__setattr__(self, "updated_at", None if self.updated_at is None else str(self.updated_at))
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+@dataclass(frozen=True)
+class WorkerBasketExecution(RawModelMixin):
+    basket_execution_id: str
+    strategy_run_id: str
+    status: str
+    account_id: Optional[str] = None
+    execution_mode: Optional[str] = None
+    all_or_none: bool = False
+    action_required: bool = False
+    action_reason: Optional[str] = None
+    rollback_status: Optional[str] = None
+    requested_leg_count: int = 0
+    completed_leg_count: int = 0
+    terminal_leg_count: int = 0
+    total_requested_quantity: int = 0
+    total_filled_quantity: int = 0
+    latest_event_cursor: Optional[int] = None
+    latest_event_at: Optional[str] = None
+    request: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    legs: List[WorkerBasketExecutionLeg] = field(default_factory=list)
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "basket_execution_id", str(self.basket_execution_id))
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "status", str(self.status))
+        object.__setattr__(self, "account_id", None if self.account_id is None else str(self.account_id))
+        object.__setattr__(self, "execution_mode", None if self.execution_mode is None else str(self.execution_mode))
+        object.__setattr__(self, "all_or_none", _coerce_bool(self.all_or_none))
+        object.__setattr__(self, "action_required", _coerce_bool(self.action_required))
+        object.__setattr__(self, "action_reason", None if self.action_reason is None else str(self.action_reason))
+        object.__setattr__(self, "rollback_status", None if self.rollback_status is None else str(self.rollback_status))
+        for name in (
+            "requested_leg_count",
+            "completed_leg_count",
+            "terminal_leg_count",
+            "total_requested_quantity",
+            "total_filled_quantity",
+        ):
+            object.__setattr__(self, name, _coerce_int(getattr(self, name)))
+        object.__setattr__(self, "latest_event_cursor", _coerce_optional_int(self.latest_event_cursor))
+        object.__setattr__(self, "latest_event_at", None if self.latest_event_at is None else str(self.latest_event_at))
+        object.__setattr__(self, "request", dict(self.request or {}))
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(self, "created_at", None if self.created_at is None else str(self.created_at))
+        object.__setattr__(self, "updated_at", None if self.updated_at is None else str(self.updated_at))
+        object.__setattr__(
+            self,
+            "legs",
+            [
+                item if isinstance(item, WorkerBasketExecutionLeg) else WorkerBasketExecutionLeg.model_validate(item)
+                for item in list(self.legs or [])
+            ],
+        )
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+@dataclass(frozen=True)
+class WorkerBasketExecutionsResponse(RawModelMixin):
+    strategy_run_id: str
+    baskets: List[WorkerBasketExecution] = field(default_factory=list)
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(
+            self,
+            "baskets",
+            [
+                item if isinstance(item, WorkerBasketExecution) else WorkerBasketExecution.model_validate(item)
+                for item in list(self.baskets or [])
+            ],
+        )
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+@dataclass(frozen=True)
+class WorkerBracketIntent(RawModelMixin):
+    bracket_intent_id: str
+    strategy_run_id: str
+    status: str
+    account_id: Optional[str] = None
+    entry_basket_execution_id: Optional[str] = None
+    action_required: bool = False
+    action_reason: Optional[str] = None
+    config: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    closed_at: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bracket_intent_id", str(self.bracket_intent_id))
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "status", str(self.status))
+        object.__setattr__(self, "account_id", None if self.account_id is None else str(self.account_id))
+        object.__setattr__(self, "entry_basket_execution_id", None if self.entry_basket_execution_id is None else str(self.entry_basket_execution_id))
+        object.__setattr__(self, "action_required", _coerce_bool(self.action_required))
+        object.__setattr__(self, "action_reason", None if self.action_reason is None else str(self.action_reason))
+        object.__setattr__(self, "config", dict(self.config or {}))
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(self, "created_at", None if self.created_at is None else str(self.created_at))
+        object.__setattr__(self, "updated_at", None if self.updated_at is None else str(self.updated_at))
+        object.__setattr__(self, "closed_at", None if self.closed_at is None else str(self.closed_at))
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+@dataclass(frozen=True)
+class WorkerBracketActionResult(RawModelMixin):
+    strategy_run_id: str
+    bracket_intent_id: str
+    status: str
+    action_required: bool = False
+    action_reason: Optional[str] = None
+    entry_result: Optional[Dict[str, Any]] = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "bracket_intent_id", str(self.bracket_intent_id))
+        object.__setattr__(self, "status", str(self.status))
+        object.__setattr__(self, "action_required", _coerce_bool(self.action_required))
+        object.__setattr__(self, "action_reason", None if self.action_reason is None else str(self.action_reason))
+        object.__setattr__(self, "entry_result", None if self.entry_result is None else dict(self.entry_result))
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+@dataclass(frozen=True)
+class WorkerBracketListResponse(RawModelMixin):
+    strategy_run_id: str
+    brackets: List[WorkerBracketIntent] = field(default_factory=list)
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(
+            self,
+            "brackets",
+            [
+                item if isinstance(item, WorkerBracketIntent) else WorkerBracketIntent.model_validate(item)
+                for item in list(self.brackets or [])
+            ],
+        )
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+@dataclass(frozen=True)
+class WorkerExecutionEvent(RawModelMixin):
+    cursor: int
+    strategy_run_id: str
+    account_id: str
+    basket_execution_id: Optional[str] = None
+    event_kind: str = "execution"
+    event_source: str = "legacy_execution"
+    event_type: str = ""
+    related_resource_type: Optional[str] = None
+    related_resource_id: Optional[str] = None
+    summary: Optional[str] = None
+    payload: Dict[str, Any] = field(default_factory=dict)
+    created_at: Any = None
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cursor", _coerce_int(self.cursor))
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "account_id", str(self.account_id))
+        object.__setattr__(self, "basket_execution_id", None if self.basket_execution_id is None else str(self.basket_execution_id))
+        object.__setattr__(self, "event_kind", str(self.event_kind))
+        object.__setattr__(self, "event_source", str(self.event_source))
+        object.__setattr__(self, "event_type", str(self.event_type))
+        object.__setattr__(self, "related_resource_type", None if self.related_resource_type is None else str(self.related_resource_type))
+        object.__setattr__(self, "related_resource_id", None if self.related_resource_id is None else str(self.related_resource_id))
+        object.__setattr__(self, "summary", None if self.summary is None else str(self.summary))
+        object.__setattr__(self, "payload", dict(self.payload or {}))
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
+@dataclass(frozen=True)
+class WorkerExecutionEventsResponse(RawModelMixin):
+    strategy_run_id: str
+    after_cursor: int
+    last_cursor: int
+    events: List[WorkerExecutionEvent] = field(default_factory=list)
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id))
+        object.__setattr__(self, "after_cursor", _coerce_int(self.after_cursor))
+        object.__setattr__(self, "last_cursor", _coerce_int(self.last_cursor))
+        object.__setattr__(
+            self,
+            "events",
+            [
+                item if isinstance(item, WorkerExecutionEvent) else WorkerExecutionEvent.model_validate(item)
+                for item in list(self.events or [])
+            ],
+        )
+        object.__setattr__(self, "raw", dict(self.raw or {}))
+
+
 __all__ = [
     "CostContract",
     "ItemizedCharges",
@@ -661,6 +934,16 @@ __all__ = [
     "SafetyCheckResult",
     "WorkerTimelineEvent",
     "WorkerTimelineResponse",
+    "WorkerOrderHistoryResponse",
+    "WorkerOrderHistoryEvent",
+    "WorkerBasketExecutionLeg",
+    "WorkerBasketExecution",
+    "WorkerBasketExecutionsResponse",
+    "WorkerBracketIntent",
+    "WorkerBracketActionResult",
+    "WorkerBracketListResponse",
+    "WorkerExecutionEvent",
+    "WorkerExecutionEventsResponse",
     "WorkerOrderResult",
     "WorkerOrdersResponse",
     "WorkerTradesResponse",

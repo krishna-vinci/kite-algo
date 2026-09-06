@@ -54,7 +54,15 @@ from .indicators import BaseIndicator, IndicatorInput, IndicatorValue, LiveIndic
 from .models import (
     CostContract,
     ItemizedCharges,
+    WorkerBasketExecution,
+    WorkerBasketExecutionLeg,
+    WorkerBasketExecutionsResponse,
+    WorkerBracketActionResult,
+    WorkerBracketIntent,
+    WorkerBracketListResponse,
     WorkerCandle,
+    WorkerExecutionEvent,
+    WorkerExecutionEventsResponse,
     WorkerHistoricalCandles,
     OrderPreview,
     PreviewPayload,
@@ -62,6 +70,8 @@ from .models import (
     SafetyCheckResult,
     WorkerGttTrigger,
     WorkerGttWriteResult,
+    WorkerOrderHistoryEvent,
+    WorkerOrderHistoryResponse,
     WorkerOrderSnapshot,
     WorkerFundsSegment,
     WorkerFundsSnapshot,
@@ -78,6 +88,7 @@ from .models import (
 )
 from .orders import OrderBuilder, equity_market_order, limit_order, market_order, option_market_order, sl_m_order, sl_order
 from .options import (
+    AsyncOptionWorkerClient,
     OptionEntryPreviewRequest,
     OptionExpirySnapshot,
     OptionWorkerClient,
@@ -118,14 +129,18 @@ except ModuleNotFoundError as exc:
 
 
 def _resolve_version() -> str:
+    # Prefer the source checkout's canonical metadata so tests and local
+    # tooling do not report a stale editable-install version after a bump.
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    try:
+        match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject.read_text(encoding="utf-8"), re.MULTILINE)
+    except OSError:
+        match = None
+    if match:
+        return match.group(1)
     try:
         return _package_version("kite-algo-worker")
     except PackageNotFoundError:
-        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
-        try:
-            match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject.read_text(encoding="utf-8"), re.MULTILINE)
-        except OSError:
-            match = None
         return match.group(1) if match else "0+unknown"
 
 
@@ -135,11 +150,18 @@ __all__ = [
     "__version__",
     "AlgoWorkerConfig",
     "AsyncKiteAlgoWorkerClient",
+    "AsyncOptionWorkerClient",
     "AuthError",
     "amo_limit_order",
     "amo_market_order",
     "BackendProtection",
     "BasketProtection",
+    "WorkerBasketExecution",
+    "WorkerBasketExecutionLeg",
+    "WorkerBasketExecutionsResponse",
+    "WorkerBracketActionResult",
+    "WorkerBracketIntent",
+    "WorkerBracketListResponse",
     "BrokerValidationError",
     "CalendarRangeUncoveredError",
     "CostContract",
@@ -184,6 +206,8 @@ __all__ = [
     "SpreadLegSelection",
     "SpreadSpec",
     "WorkerOrderSnapshot",
+    "WorkerOrderHistoryEvent",
+    "WorkerOrderHistoryResponse",
     "sl_order",
     "sl_m_order",
     "StreamDisconnectedError",
@@ -221,6 +245,8 @@ __all__ = [
     "WorkerRunPnlTotals",
     "WorkerTimelineEvent",
     "WorkerTimelineResponse",
+    "WorkerExecutionEvent",
+    "WorkerExecutionEventsResponse",
     "WorkerTradeSnapshot",
     "WorkerRunPnlWebSocketClient",
     "WorkerTickWebSocketClient",

@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from importlib import import_module
 from typing import Any, Dict, Iterable, Mapping, Optional
 
-from .client import AlgoWorkerConfig, JsonDict, _build_historical_date_params, _fundamentals_scope_params, _normalize_calendar_date_params, _require_identity_param
-from .exceptions import error_for_status
+from ._shared import (
+    build_create_run_payload,
+    build_heartbeat_payload,
+    build_historical_date_params,
+    build_intent_payload,
+    fundamentals_scope_params,
+    normalize_calendar_date_params,
+    session_headers,
+    split_instruments,
+    require_identity_param,
+)
+from .client import AlgoWorkerConfig, JsonDict
+from .exceptions import KiteAlgoWorkerError, error_for_status
 from .fundamentals import (
     FundamentalFeatures,
     FundamentalsStatements,
@@ -26,19 +38,30 @@ from .models import (
     WorkerGttTrigger,
     WorkerGttWriteResult,
     WorkerHistoricalCandles,
+    WorkerBasketExecution,
+    WorkerBasketExecutionsResponse,
+    WorkerBracketActionResult,
+    WorkerBracketIntent,
+    WorkerBracketListResponse,
+    WorkerExecutionEventsResponse,
+    WorkerOrderHistoryResponse,
     WorkerOrderSnapshot,
     WorkerOrdersResponse,
     WorkerRunHealthSnapshot,
     WorkerRunPnlSnapshot,
+    SafetyCheckResult,
     WorkerTimelineResponse,
     WorkerTradesResponse,
 )
+from .protection import BackendProtection
+from .options.async_client import AsyncOptionWorkerClient
 
 
 @dataclass(frozen=True)
 class AsyncKiteAlgoWorkerClient:
     config: AlgoWorkerConfig
     client: Any = field(init=False, repr=False)
+    options: AsyncOptionWorkerClient = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.config.base_url:
@@ -54,6 +77,7 @@ class AsyncKiteAlgoWorkerClient:
             },
             timeout=self.config.timeout,
         ))
+        object.__setattr__(self, "options", AsyncOptionWorkerClient(self))
 
     async def __aenter__(self) -> "AsyncKiteAlgoWorkerClient":
         return self
@@ -66,6 +90,205 @@ class AsyncKiteAlgoWorkerClient:
 
     async def health(self) -> JsonDict:
         return await self._request("GET", "/worker/health")
+
+    async def heartbeat(
+        self,
+        worker_id: Optional[str] = None,
+        status: str = "healthy",
+        metrics: Optional[Mapping[str, Any]] = None,
+    ) -> JsonDict:
+        return await self._request(
+            "POST",
+            "/worker/heartbeat",
+            json=build_heartbeat_payload(worker_id=worker_id, status=status, metrics=metrics),
+        )
+
+    async def create_run(
+        self,
+        *,
+        template_id: str,
+        account_scope: str,
+        strategy_run_id: Optional[str] = None,
+        execution_mode: str = "paper",
+        summary_fields: Optional[Iterable[Mapping[str, Any]]] = None,
+        risk_schema: Optional[Iterable[Mapping[str, Any]]] = None,
+        allowed_actions: Optional[Iterable[str]] = None,
+        runtime_state: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        backend_protection: Optional[BackendProtection] = None,
+    ) -> JsonDict:
+        payload = build_create_run_payload(
+            template_id=template_id,
+            account_scope=account_scope,
+            strategy_run_id=strategy_run_id,
+            execution_mode=execution_mode,
+            summary_fields=summary_fields,
+            risk_schema=risk_schema,
+            allowed_actions=allowed_actions,
+            runtime_state=runtime_state,
+            metadata=metadata,
+            backend_protection=backend_protection,
+        )
+        return await self._request("POST", "/worker/runs", json=payload)
+
+    async def create_run_from_config(self, config: Any) -> JsonDict:
+        return await self._request("POST", "/worker/runs", json=config.to_create_run_payload())
+
+    async def claim_session(self, strategy_run_id: str) -> JsonDict:
+        return await self._request("POST", f"/worker/runs/{strategy_run_id}/claim-session")
+
+    async def release_session(self, strategy_run_id: str, *, session_nonce: str) -> JsonDict:
+        return await self._request(
+            "DELETE",
+            f"/worker/runs/{strategy_run_id}/claim-session",
+            headers=session_headers(session_nonce),
+        )
+
+    async def run_heartbeat(
+        self,
+        strategy_run_id: str,
+        *,
+        session_nonce: str,
+        worker_id: Optional[str] = None,
+        status: str = "healthy",
+        metrics: Optional[Mapping[str, Any]] = None,
+    ) -> JsonDict:
+        return await self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/heartbeat",
+            headers=session_headers(session_nonce),
+            json=build_heartbeat_payload(worker_id=worker_id, status=status, metrics=metrics),
+        )
+
+    async def safety_check(self, strategy_run_id: str):
+        return SafetyCheckResult.model_validate(
+            await self._request("GET", f"/worker/runs/{strategy_run_id}/safety-check")
+        )
+
+    async def cancel_order(self, strategy_run_id: str, order_id: str, *, variety: str = "regular") -> JsonDict:
+        return await self._request(
+            "POST",
+            f"/worker/orders/{order_id}/cancel",
+            json={"strategy_run_id": strategy_run_id, "variety": variety},
+        )
+
+    async def modify_order(
+        self,
+        strategy_run_id: str,
+        order_id: str,
+        patch: Mapping[str, Any],
+        *,
+        variety: str = "regular",
+    ) -> JsonDict:
+        return await self._request(
+            "POST",
+            f"/worker/orders/{order_id}/modify",
+            json={"strategy_run_id": strategy_run_id, "variety": variety, **dict(patch)},
+        )
+
+    async def place_order(
+        self,
+        strategy_run_id: str,
+        order: Mapping[str, Any],
+        idempotency_key: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+        safety_token: Optional[str] = None,
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
+        payload = build_intent_payload(
+            intent_type="place_order",
+            body_key="order",
+            body=dict(order),
+            idempotency_key=idempotency_key,
+            metadata=metadata,
+            safety_token=safety_token,
+        )
+        return await self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/intents",
+            json=payload,
+            headers=session_headers(session_nonce),
+        )
+
+    async def place_basket(
+        self,
+        strategy_run_id: str,
+        orders: Iterable[Mapping[str, Any]],
+        idempotency_key: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+        *,
+        all_or_none: bool = False,
+        dry_run: bool = False,
+        safety_token: Optional[str] = None,
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
+        payload = build_intent_payload(
+            intent_type="place_basket",
+            body_key="basket",
+            body={
+                "orders": [dict(order) for order in orders],
+                "all_or_none": all_or_none,
+                "dry_run": dry_run,
+            },
+            idempotency_key=idempotency_key,
+            metadata=metadata,
+            safety_token=safety_token,
+        )
+        return await self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/intents",
+            json=payload,
+            headers=session_headers(session_nonce),
+        )
+
+    async def patch_risk(
+        self,
+        strategy_run_id: str,
+        patch: Mapping[str, Any],
+        reason: Optional[str] = None,
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
+        return await self._request(
+            "PATCH",
+            f"/worker/runs/{strategy_run_id}/risk",
+            json={"patch": dict(patch), "reason": reason},
+            headers=session_headers(session_nonce),
+        )
+
+    async def update_backend_protection(
+        self,
+        strategy_run_id: str,
+        backend_protection: BackendProtection,
+        *,
+        reason: Optional[str] = None,
+        reset_trailing: bool = True,
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
+        return await self._request(
+            "PATCH",
+            f"/worker/runs/{strategy_run_id}/protection",
+            json={
+                "backend_protection": backend_protection.to_dict(),
+                "reason": reason,
+                "reset_trailing": reset_trailing,
+            },
+            headers=session_headers(session_nonce),
+        )
+
+    async def exit_run(
+        self,
+        strategy_run_id: str,
+        reason: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        dry_run: bool = False,
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
+        return await self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/exit",
+            json={"reason": reason, "idempotency_key": idempotency_key, "dry_run": dry_run},
+            headers=session_headers(session_nonce),
+        )
 
     async def get_run(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", f"/worker/runs/{strategy_run_id}")
@@ -89,7 +312,7 @@ class AsyncKiteAlgoWorkerClient:
         return await self._request("GET", f"/worker/runs/{strategy_run_id}/funds")
 
     async def get_index_constituents(self, source_list: str, *, schema_version: int = 1) -> JsonDict:
-        source = _require_identity_param(source_list, field_name="source_list")
+        source = require_identity_param(source_list, field_name="source_list")
         return await self._request(
             "GET",
             f"/worker/market/indices/{source}",
@@ -102,7 +325,7 @@ class AsyncKiteAlgoWorkerClient:
         )
 
     async def get_index_constituent_status(self, source_list: str, *, schema_version: int = 1) -> JsonDict:
-        source = _require_identity_param(source_list, field_name="source_list")
+        source = require_identity_param(source_list, field_name="source_list")
         return await self._request(
             "GET",
             f"/worker/market/indices/{source}/status",
@@ -115,7 +338,7 @@ class AsyncKiteAlgoWorkerClient:
         )
 
     async def get_market_calendar(self, from_date: Any, to_date: Any, *, exchange: str = "NSE", segment: str = "CM", schema_version: int = 1) -> JsonDict:
-        params = _normalize_calendar_date_params(from_date, to_date, exchange=exchange, segment=segment)
+        params = normalize_calendar_date_params(from_date, to_date, exchange=exchange, segment=segment)
         params["schema_version"] = schema_version
         return await self._request("GET", "/worker/market/calendar", params=params)
 
@@ -125,8 +348,8 @@ class AsyncKiteAlgoWorkerClient:
         )
 
     async def get_market_calendar_status(self, *, exchange: str = "NSE", segment: str = "CM", schema_version: int = 1) -> JsonDict:
-        exchange_text = _require_identity_param(exchange, field_name="exchange").upper()
-        segment_text = _require_identity_param(segment, field_name="segment").upper()
+        exchange_text = require_identity_param(exchange, field_name="exchange").upper()
+        segment_text = require_identity_param(segment, field_name="segment").upper()
         return await self._request(
             "GET",
             "/worker/market/calendar/status",
@@ -152,11 +375,11 @@ class AsyncKiteAlgoWorkerClient:
             await self.get_account_portfolio(account_scope=account_scope, schema_version=schema_version)
         )
 
-    # -- Fundamentals (0.7.7; read-only except refresh_fundamentals) --------
+    # -- Fundamentals (0.8.0; read-only except refresh_fundamentals) --------
 
     async def get_fundamentals_features(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None) -> FundamentalFeatures:
         """Typed fundamentals feature snapshot for symbols or an index universe."""
-        params = _fundamentals_scope_params(symbols, index)
+        params = fundamentals_scope_params(symbols, index)
         params["schema_version"] = 1
         return FundamentalFeatures.model_validate(
             await self._request("GET", "/worker/fundamentals/features", params=params)
@@ -164,7 +387,7 @@ class AsyncKiteAlgoWorkerClient:
 
     async def get_fundamentals_status(self, *, symbols: Optional[Iterable[str]] = None, index: Optional[str] = None) -> FundamentalsStatus:
         """Per-symbol fundamentals freshness plus recent sync-run history."""
-        params = _fundamentals_scope_params(symbols, index)
+        params = fundamentals_scope_params(symbols, index)
         params["schema_version"] = 1
         return FundamentalsStatus.model_validate(
             await self._request("GET", "/worker/fundamentals/status", params=params)
@@ -172,7 +395,7 @@ class AsyncKiteAlgoWorkerClient:
 
     async def get_fundamentals_statements(self, symbol: str, *, dataset: str, statement_scope: str = "consolidated") -> FundamentalsStatements:
         """Raw statement rows for one symbol and dataset (e.g. ``quarterly``)."""
-        symbol_text = _require_identity_param(symbol, field_name="symbol")
+        symbol_text = require_identity_param(symbol, field_name="symbol")
         if not str(dataset).strip():
             raise ValueError("dataset is required")
         return FundamentalsStatements.model_validate(
@@ -265,6 +488,134 @@ class AsyncKiteAlgoWorkerClient:
         response = await self._request("GET", f"/worker/orders/{order_id}", params={"strategy_run_id": strategy_run_id})
         return WorkerOrderSnapshot.model_validate(response.get("order") or response)
 
+    async def get_order_history(self, strategy_run_id: str, order_id: str) -> JsonDict:
+        return await self._request(
+            "GET",
+            f"/worker/orders/{order_id}/history",
+            params={"strategy_run_id": strategy_run_id},
+        )
+
+    async def get_order_history_snapshot(self, strategy_run_id: str, order_id: str) -> WorkerOrderHistoryResponse:
+        return WorkerOrderHistoryResponse.model_validate(await self.get_order_history(strategy_run_id, order_id))
+
+    async def list_baskets(self, strategy_run_id: str, *, limit: int = 100) -> JsonDict:
+        return await self._request(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/baskets",
+            params={"limit": limit},
+        )
+
+    async def list_baskets_snapshot(self, strategy_run_id: str, *, limit: int = 100) -> WorkerBasketExecutionsResponse:
+        return WorkerBasketExecutionsResponse.model_validate(await self.list_baskets(strategy_run_id, limit=limit))
+
+    async def get_basket(self, strategy_run_id: str, basket_execution_id: str) -> JsonDict:
+        return await self._request(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/baskets/{basket_execution_id}",
+        )
+
+    async def get_basket_snapshot(self, strategy_run_id: str, basket_execution_id: str) -> WorkerBasketExecution:
+        return WorkerBasketExecution.model_validate(await self.get_basket(strategy_run_id, basket_execution_id))
+
+    async def create_bracket(
+        self,
+        strategy_run_id: str,
+        *,
+        entry_order: Mapping[str, Any],
+        stoploss: Mapping[str, Any],
+        target: Optional[Mapping[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        session_nonce: str,
+    ) -> JsonDict:
+        return await self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/brackets",
+            json={
+                "entry_order": dict(entry_order),
+                "stoploss": dict(stoploss),
+                "target": dict(target) if target is not None else None,
+                "idempotency_key": idempotency_key,
+                "metadata": dict(metadata or {}),
+            },
+            headers=session_headers(session_nonce),
+        )
+
+    async def create_bracket_snapshot(self, strategy_run_id: str, **kwargs: Any) -> WorkerBracketActionResult:
+        return WorkerBracketActionResult.model_validate(await self.create_bracket(strategy_run_id, **kwargs))
+
+    async def list_brackets(self, strategy_run_id: str, *, limit: int = 50) -> JsonDict:
+        return await self._request(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/brackets",
+            params={"limit": limit},
+        )
+
+    async def list_brackets_snapshot(self, strategy_run_id: str, *, limit: int = 50) -> WorkerBracketListResponse:
+        return WorkerBracketListResponse.model_validate(await self.list_brackets(strategy_run_id, limit=limit))
+
+    async def get_bracket(self, strategy_run_id: str, bracket_intent_id: str) -> JsonDict:
+        return await self._request(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}",
+        )
+
+    async def get_bracket_snapshot(self, strategy_run_id: str, bracket_intent_id: str) -> WorkerBracketIntent:
+        return WorkerBracketIntent.model_validate(await self.get_bracket(strategy_run_id, bracket_intent_id))
+
+    async def cancel_bracket(self, strategy_run_id: str, bracket_intent_id: str, *, session_nonce: str) -> JsonDict:
+        return await self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/brackets/{bracket_intent_id}/cancel",
+            headers=session_headers(session_nonce),
+        )
+
+    async def cancel_bracket_snapshot(
+        self, strategy_run_id: str, bracket_intent_id: str, *, session_nonce: str
+    ) -> WorkerBracketActionResult:
+        return WorkerBracketActionResult.model_validate(
+            await self.cancel_bracket(strategy_run_id, bracket_intent_id, session_nonce=session_nonce)
+        )
+
+    async def list_execution_events(
+        self,
+        strategy_run_id: str,
+        *,
+        after_cursor: int = 0,
+        limit: int = 200,
+        basket_execution_id: Optional[str] = None,
+        event_type: Optional[str] = None,
+    ) -> JsonDict:
+        return await self._request(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/execution-events",
+            params={
+                "after_cursor": after_cursor,
+                "limit": limit,
+                "basket_execution_id": basket_execution_id,
+                "event_type": event_type,
+            },
+        )
+
+    async def list_execution_events_snapshot(
+        self, strategy_run_id: str, **params: Any
+    ) -> WorkerExecutionEventsResponse:
+        return WorkerExecutionEventsResponse.model_validate(
+            await self.list_execution_events(strategy_run_id, **params)
+        )
+
+    async def export_fundamentals_csv(
+        self,
+        *,
+        symbols: Optional[Iterable[str]] = None,
+        index: Optional[str] = None,
+        dataset: str = "fundamentals_features",
+        schema_version: int = 1,
+    ) -> str:
+        params = fundamentals_scope_params(symbols, index)
+        params.update({"dataset": dataset, "schema_version": schema_version})
+        return await self._request_text("GET", "/worker/fundamentals/export.csv", params=params)
+
     async def get_candles(self, instrument: str | int, interval: str = "5minute", lookback: int = 50) -> JsonDict:
         """Return recent live/cache candles.
 
@@ -297,7 +648,7 @@ class AsyncKiteAlgoWorkerClient:
             params["instrument_token"] = int(instrument_value)
         else:
             params["symbol"] = instrument_value
-        params.update(_build_historical_date_params(from_date=from_date, to_date=to_date, lookback_days=lookback_days))
+        params.update(build_historical_date_params(from_date=from_date, to_date=to_date, lookback_days=lookback_days))
         return await self._request("GET", "/worker/market/history", params=params)
 
     async def get_historical_candles_snapshot(
@@ -326,14 +677,7 @@ class AsyncKiteAlgoWorkerClient:
         return await self._request("GET", "/worker/market/instruments/resolve", params={"symbol": symbol})
 
     async def resolve_tickers(self, instruments: Iterable[str | int]) -> JsonDict:
-        symbols: list[str] = []
-        tokens: list[int] = []
-        for instrument in instruments:
-            value = str(instrument).strip()
-            if isinstance(instrument, int) or value.isdigit():
-                tokens.append(int(value))
-            elif value:
-                symbols.append(value)
+        symbols, tokens = split_instruments(instruments)
         return await self._request(
             "POST",
             "/worker/market/instruments/resolve",
@@ -347,14 +691,7 @@ class AsyncKiteAlgoWorkerClient:
         return await self._request("GET", "/worker/market/instruments/search", params=params)
 
     async def get_quotes(self, instruments: Iterable[str | int], mode: str = "quote") -> JsonDict:
-        symbols: list[str] = []
-        tokens: list[int] = []
-        for instrument in instruments:
-            value = str(instrument).strip()
-            if isinstance(instrument, int) or value.isdigit():
-                tokens.append(int(value))
-            elif value:
-                symbols.append(value)
+        symbols, tokens = split_instruments(instruments)
         return await self._request(
             "POST",
             "/worker/market/quotes",
@@ -422,6 +759,48 @@ class AsyncKiteAlgoWorkerClient:
             await self.preview_basket(strategy_run_id, orders, metadata=metadata, all_or_none=all_or_none)
         )
 
+    def stream_ticks(self, instruments: Iterable[str | int], mode: str = "quote"):
+        symbols, tokens = split_instruments(instruments)
+        return self._stream_sse(
+            "GET",
+            "/worker/market/ticks/stream",
+            params={
+                "symbols": ",".join(symbols),
+                "tokens": ",".join(str(token) for token in tokens),
+                "mode": mode,
+            },
+        )
+
+    def stream_candles(self, instrument: str | int, interval: str = "5minute"):
+        value = str(instrument).strip()
+        params: JsonDict = {"interval": interval}
+        if isinstance(instrument, int) or value.isdigit():
+            params["instrument_token"] = int(value)
+        else:
+            params["symbol"] = value
+        return self._stream_sse("GET", "/worker/market/candles/stream", params=params)
+
+    def stream_run_pnl(self, strategy_run_id: str, *, interval_seconds: float = 1.0):
+        return self._stream_sse(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/pnl/stream",
+            params={"interval_seconds": interval_seconds},
+        )
+
+    def stream_timeline(self, strategy_run_id: str, **params: Any):
+        return self._stream_sse(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/timeline/stream",
+            params=dict(params or {}),
+        )
+
+    def stream_execution_events(self, strategy_run_id: str, **params: Any):
+        return self._stream_sse(
+            "GET",
+            f"/worker/runs/{strategy_run_id}/execution-events/stream",
+            params=dict(params or {}),
+        )
+
     async def wait_for_terminal_order_state(
         self,
         strategy_run_id: str,
@@ -439,6 +818,74 @@ class AsyncKiteAlgoWorkerClient:
         if last_snapshot is None:
             raise RuntimeError("wait_for_terminal_order_state exhausted without fetching an order snapshot")
         return last_snapshot
+
+    async def _request_text(self, method: str, path: str, **kwargs: Any) -> str:
+        response = await self.client.request(method, self._url(path), **kwargs)
+        if 200 <= response.status_code < 300:
+            return response.text
+        # ``httpx.Response`` bodies are already read by ``request``.  Test
+        # doubles may expose an explicit ``aread``; consume it before parsing
+        # either JSON or text so error details are never lost.
+        aread = getattr(response, "aread", None)
+        if aread is not None:
+            await aread()
+        try:
+            body: Any = response.json()
+        except (TypeError, ValueError):
+            body = {"raw": response.text}
+        raise error_for_status(
+            response.status_code,
+            body,
+            fallback=f"Worker API returned {response.status_code} for {method} {path}",
+        )
+
+    async def _stream_sse(self, method: str, path: str, params: Optional[Mapping[str, Any]] = None):
+        async with self.client.stream(method, self._url(path), params=dict(params or {})) as response:
+            if not 200 <= response.status_code < 300:
+                aread = getattr(response, "aread", None)
+                if aread is not None:
+                    await aread()
+                try:
+                    body: Any = response.json()
+                except (TypeError, ValueError):
+                    body = {"raw": response.text}
+                raise error_for_status(
+                    response.status_code,
+                    body,
+                    fallback=f"Worker API returned {response.status_code} for {method} {path}",
+                )
+
+            current_event = "message"
+            async for line in response.aiter_lines():
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    current_event = line.split(":", 1)[1].strip() or "message"
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                payload = line.split(":", 1)[1].strip()
+                if not payload:
+                    continue
+                try:
+                    decoded = json.loads(payload)
+                except json.JSONDecodeError as exc:
+                    raise KiteAlgoWorkerError(
+                        f"Worker API stream at {path} returned invalid JSON: {exc}",
+                        status_code=0,
+                        response_body=payload,
+                    ) from exc
+                if current_event == "error":
+                    raise KiteAlgoWorkerError(
+                        f"Worker API stream error at {path}: "
+                        f"{decoded.get('detail') if isinstance(decoded, dict) else decoded}",
+                        status_code=0,
+                        response_body=decoded,
+                    )
+                if current_event == "end":
+                    return
+                yield decoded
+                current_event = "message"
 
     def _url(self, path: str) -> str:
         base = self.config.base_url.rstrip("/")
@@ -459,6 +906,13 @@ class AsyncKiteAlgoWorkerClient:
             except ValueError:
                 return {"raw": response.text}
 
+        # ``httpx.AsyncClient.request`` normally reads non-streaming response
+        # bodies for us, but a custom transport/test double may leave the body
+        # unread.  Consume it before attempting JSON/text error parsing so the
+        # SDK never drops the backend's detail payload.
+        aread = getattr(response, "aread", None)
+        if aread is not None:
+            await aread()
         try:
             body: Any = response.json()
         except ValueError:
