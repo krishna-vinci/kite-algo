@@ -374,8 +374,8 @@ def test_async_get_historical_candles_supports_lookback_days():
     assert httpx.calls[0]["url"] == "http://localhost:8000/api/algo-workers/worker/market/history"
     assert httpx.calls[0]["kwargs"]["params"] == {
         "timeframe": "day",
-        "ingest": True,
-        "passthrough": True,
+        "ingest": "True",
+        "passthrough": "True",
         "symbol": "NSE:INFY",
         "to": "2024-12-31T00:00:00+00:00",
         "from": "2023-12-31T00:00:00+00:00",

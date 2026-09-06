@@ -604,7 +604,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
         payload = WorkerTokenCreateRequest(name="ml-worker", account_scope="kite:AB1234", allowed_modes=["paper", "live"])
 
-        with patch("api.routers.algo_workers.require_app_user", return_value=SimpleNamespace(username="admin")):
+        with patch("backend.api.routers.worker_auth.require_app_user", return_value=SimpleNamespace(username="admin")):
             response = await create_worker_token(request, payload)
 
         self.assertEqual(response.account_scope, "kite:AB1234")
@@ -1083,17 +1083,24 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        response = await get_worker_market_history(
-            request,
-            SimpleNamespace(add_task=lambda *args, **kwargs: None),
-            symbol="NSE:INFY",
-            instrument_token=None,
-            timeframe="day",
-            from_ts=datetime.fromisoformat("2024-01-01T00:00:00+00:00"),
-            to_ts=datetime.fromisoformat("2024-12-31T00:00:00+00:00"),
-            ingest=True,
-            passthrough=True,
-        )
+        with (
+            patch("backend.app.database.get_db_connection", return_value=Mock()),
+            patch(
+                "backend.broker_api.market.exchange_calendar.get_calendar_sessions",
+                return_value={"calendar_version": 1, "sessions": []},
+            ),
+        ):
+            response = await get_worker_market_history(
+                request,
+                SimpleNamespace(add_task=lambda *args, **kwargs: None),
+                symbol="NSE:INFY",
+                instrument_token=None,
+                timeframe="day",
+                from_ts=datetime.fromisoformat("2024-01-01T00:00:00+00:00"),
+                to_ts=datetime.fromisoformat("2024-12-31T00:00:00+00:00"),
+                ingest=True,
+                passthrough=True,
+            )
 
         self.assertEqual(response["source"], "kite_passthrough")
         self.assertEqual(captured["symbol"], "NSE:INFY")
@@ -1112,14 +1119,21 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        await get_worker_market_history(
-            request,
-            SimpleNamespace(add_task=lambda *args, **kwargs: None),
-            symbol="NSE:INFY",
-            timeframe="day",
-            from_date=datetime.fromisoformat("2024-01-01T00:00:00+00:00"),
-            to_date=datetime.fromisoformat("2024-12-31T00:00:00+00:00"),
-        )
+        with (
+            patch("backend.app.database.get_db_connection", return_value=Mock()),
+            patch(
+                "backend.broker_api.market.exchange_calendar.get_calendar_sessions",
+                return_value={"calendar_version": 1, "sessions": []},
+            ),
+        ):
+            await get_worker_market_history(
+                request,
+                SimpleNamespace(add_task=lambda *args, **kwargs: None),
+                symbol="NSE:INFY",
+                timeframe="day",
+                from_date=datetime.fromisoformat("2024-01-01T00:00:00+00:00"),
+                to_date=datetime.fromisoformat("2024-12-31T00:00:00+00:00"),
+            )
 
         self.assertEqual(captured["from_date"], datetime.fromisoformat("2024-01-01T00:00:00+00:00"))
         self.assertEqual(captured["to_date"], datetime.fromisoformat("2024-12-31T00:00:00+00:00"))
@@ -1328,7 +1342,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
         payload = WorkerTokenCreateRequest(name="ml-worker", account_scope="paper-a", allowed_modes=["live"])
 
-        with patch("api.routers.algo_workers.require_app_user", return_value=SimpleNamespace(username="admin")):
+        with patch("backend.api.routers.worker_auth.require_app_user", return_value=SimpleNamespace(username="admin")):
             with self.assertRaises(HTTPException) as ctx:
                 await create_worker_token(request, payload)
 
@@ -1340,7 +1354,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
         payload = WorkerTokenCreateRequest(name="ml-worker", account_scope="kite:paper-a", allowed_modes=["live"])
 
-        with patch("api.routers.algo_workers.require_app_user", return_value=SimpleNamespace(username="admin")):
+        with patch("backend.api.routers.worker_auth.require_app_user", return_value=SimpleNamespace(username="admin")):
             with self.assertRaises(HTTPException) as ctx:
                 await create_worker_token(request, payload)
 
@@ -1508,7 +1522,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
 
         with patch(
-            "api.routers.algo_workers._option_run_protection_snapshot_for_worker",
+            "backend.api.routers.worker_protection._option_run_protection_snapshot_for_worker",
             AsyncMock(
                 return_value={
                     "applicable": False,
@@ -1553,8 +1567,8 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         }
         request = self._request(repo, paper_runtime=SimpleNamespace(place_order=AsyncMock(return_value={"status": "success"})))
 
-        with patch("api.routers.algo_workers._worker_safety_secret", lambda _request: "secret-key"), patch(
-            "api.routers.algo_workers._option_run_protection_snapshot_for_worker",
+        with patch("backend.api.routers.worker_protection._worker_safety_secret", lambda _request: "secret-key"), patch(
+            "backend.api.routers.worker_protection._option_run_protection_snapshot_for_worker",
             AsyncMock(
                 return_value={
                     "applicable": False,
@@ -1611,7 +1625,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
 
         with patch(
-            "api.routers.algo_workers._option_run_protection_snapshot_for_worker",
+            "backend.api.routers.worker_protection._option_run_protection_snapshot_for_worker",
             AsyncMock(
                 return_value={
                     "applicable": True,
@@ -1662,7 +1676,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
             os.environ.pop(key, None)
         try:
             with patch(
-                "api.routers.algo_workers._option_run_protection_snapshot_for_worker",
+                "backend.api.routers.worker_protection._option_run_protection_snapshot_for_worker",
                 AsyncMock(
                     return_value={
                         "applicable": False,
@@ -1704,7 +1718,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
 
         with patch(
-            "api.routers.algo_workers._option_run_protection_snapshot_for_worker",
+            "backend.api.routers.worker_protection._option_run_protection_snapshot_for_worker",
             AsyncMock(
                 return_value={
                     "applicable": True,
@@ -2165,8 +2179,8 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
         request.app.state.algo_worker_orders_service = live_orders
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ):
             response = await submit_worker_intent(
@@ -2242,14 +2256,14 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ), patch(
-            "api.routers.algo_workers.basket_execution_store.create_live_basket_execution",
+            "backend.api.routers.worker_execution.basket_execution_store.create_live_basket_execution",
             return_value={"basket_execution_id": "basket-live-1", "status": "submitting", "action_required": False, "action_reason": None},
         ), patch(
-            "api.routers.algo_workers.basket_execution_store.get_basket_for_run",
+            "backend.api.routers.worker_execution.basket_execution_store.get_basket_for_run",
             return_value={"basket_execution_id": "basket-live-1", "status": "active", "action_required": False, "action_reason": None},
         ):
             response = await submit_worker_intent(
@@ -2336,14 +2350,14 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ), patch(
-            "api.routers.algo_workers.basket_execution_store.create_live_basket_execution",
+            "backend.api.routers.worker_execution.basket_execution_store.create_live_basket_execution",
             return_value={"basket_execution_id": "basket-live-dup", "status": "submitting", "action_required": False, "action_reason": None},
         ), patch(
-            "api.routers.algo_workers.basket_execution_store.get_basket_for_run",
+            "backend.api.routers.worker_execution.basket_execution_store.get_basket_for_run",
             return_value={"basket_execution_id": "basket-live-dup", "status": "active", "action_required": False, "action_reason": None},
         ):
             first = await submit_worker_intent(request, "run-live-1", intent)
@@ -2385,11 +2399,11 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         live_orders = SimpleNamespace(place_basket=AsyncMock())
         request.app.state.algo_worker_orders_service = live_orders
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ), patch(
-            "api.routers.algo_workers.basket_execution_store.create_live_basket_execution"
+            "backend.api.routers.worker_execution.basket_execution_store.create_live_basket_execution"
         ) as create_basket:
             response = await submit_worker_intent(
                 request,
@@ -2446,7 +2460,7 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
 
         with patch(
-            "api.routers.algo_workers.basket_execution_store.get_basket_for_run",
+            "backend.api.routers.worker_execution.basket_execution_store.get_basket_for_run",
             return_value={"basket_execution_id": "basket-1", "status": "active", "legs": []},
         ):
             response = await get_worker_basket(request, "run-live-1", "basket-1")
@@ -2480,7 +2494,7 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
 
         with patch(
-            "api.routers.algo_workers.worker_timeline_store.list_events",
+            "backend.api.routers.worker_protection.worker_timeline_store.list_events",
             return_value=[
                 {
                     "cursor": 11,
@@ -2535,7 +2549,7 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
 
         with patch(
-            "api.routers.algo_workers.worker_timeline_store.list_events",
+            "backend.api.routers.worker_protection.worker_timeline_store.list_events",
             return_value=[
                 {
                     "cursor": 31,
@@ -2636,8 +2650,8 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
         fake_redis = SimpleNamespace(pubsub=lambda: _FakePubSub(request))
 
-        with patch("api.routers.algo_workers.get_redis", return_value=fake_redis), patch(
-            "api.routers.algo_workers.worker_timeline_store.list_events",
+        with patch("backend.api.routers.worker_protection.get_redis", return_value=fake_redis), patch(
+            "backend.api.routers.worker_protection.worker_timeline_store.list_events",
             return_value=[],
         ):
             response = await stream_worker_execution_events(request, "run-live-1")
@@ -2707,8 +2721,8 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
         fake_redis = SimpleNamespace(pubsub=lambda: _FakePubSub(request))
 
-        with patch("api.routers.algo_workers.get_redis", return_value=fake_redis), patch(
-            "api.routers.algo_workers.worker_timeline_store.list_events",
+        with patch("backend.api.routers.worker_protection.get_redis", return_value=fake_redis), patch(
+            "backend.api.routers.worker_protection.worker_timeline_store.list_events",
             return_value=[],
         ):
             response = await stream_worker_execution_events(request, "run-live-1")
@@ -2845,7 +2859,7 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
 
         session_factory = sessionmaker(bind=engine)
 
-        with patch("api.routers.algo_workers.SessionLocal", session_factory):
+        with patch("backend.api.routers.worker_protection.SessionLocal", session_factory):
             with self.assertRaises(HTTPException) as ctx:
                 await create_worker_decision_event(
                     request,
@@ -2896,8 +2910,8 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
         request.app.state.algo_worker_orders_service = live_orders
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ):
             response = await list_worker_orders(request, "run-live")
@@ -3214,20 +3228,20 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             intents[bracket_intent_id]["status"] = "cancelling"
             return dict(intents[bracket_intent_id])
 
-        with patch("api.routers.algo_workers.SessionLocal", return_value=_FakeDB()), patch(
-            "api.routers.algo_workers.bracket_runtime_store.create_bracket_intent",
+        with patch("backend.api.routers.worker_execution.SessionLocal", return_value=_FakeDB()), patch(
+            "backend.api.routers.worker_execution.bracket_runtime_store.create_bracket_intent",
             side_effect=_create_bracket_intent,
         ), patch(
-            "api.routers.algo_workers.bracket_runtime_store.update_bracket_status",
+            "backend.api.routers.worker_execution.bracket_runtime_store.update_bracket_status",
             side_effect=_update_bracket_status,
         ), patch(
-            "api.routers.algo_workers.bracket_runtime_store.get_bracket_intent",
+            "backend.api.routers.worker_execution.bracket_runtime_store.get_bracket_intent",
             side_effect=_get_bracket_intent,
         ), patch(
-            "api.routers.algo_workers.bracket_runtime_store.request_cancel_bracket",
+            "backend.api.routers.worker_execution.bracket_runtime_store.request_cancel_bracket",
             side_effect=_request_cancel_bracket,
-        ), patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        ), patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ):
             response = await create_worker_bracket(
@@ -3298,7 +3312,7 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             def close(self):
                 return None
 
-        with patch("api.routers.algo_workers.SessionLocal", return_value=_FakeDB()):
+        with patch("backend.api.routers.worker_execution.SessionLocal", return_value=_FakeDB()):
             with self.assertRaises(HTTPException) as ctx:
                 await cancel_worker_bracket(request, "run-live", "brk-session")
         self.assertEqual(ctx.exception.status_code, 409)
@@ -3335,8 +3349,8 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ):
             response = await list_worker_orders(request, "run-live")
@@ -3375,8 +3389,8 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ):
             response = await list_worker_trades(request, "run-live")
@@ -3412,8 +3426,8 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ):
             response = await get_worker_order(request, "OID-1", strategy_run_id="run-live")
@@ -3453,8 +3467,8 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ):
             response = await get_worker_order(request, "OID-1", strategy_run_id="run-live")
@@ -3487,8 +3501,8 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ):
             with self.assertRaises(HTTPException) as ctx:
@@ -3526,8 +3540,8 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ):
             response = await get_worker_order_history(request, "OID-1", strategy_run_id="run-live")
@@ -3538,8 +3552,8 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             "broker_order_ids": ["OID-Z"],
             "client_order_refs": ["OTHER-TAG"],
         }
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution.asyncio.to_thread",
             _run_to_thread_inline,
         ):
             with self.assertRaises(HTTPException) as ctx:
@@ -3619,10 +3633,10 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(
             sys.modules,
-            {"execution_accounting.kite_costs": SimpleNamespace(build_live_order_cost_contract=lambda **kwargs: _CostContract())},
+            {"backend.execution_accounting.kite_costs": SimpleNamespace(build_live_order_cost_contract=lambda **kwargs: _CostContract())},
         ):
-            with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-                "api.routers.algo_workers.asyncio.to_thread",
+            with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+                "backend.api.routers.worker_execution.asyncio.to_thread",
                 _run_to_thread_inline,
             ):
                 response = await preview_worker_order(
@@ -3678,10 +3692,10 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         ]
         request = self._request(repo)
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers._refresh_live_account_state",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution._refresh_live_account_state",
             AsyncMock(return_value={"account_id": "kite:AB1234", "reconciled_positions": 1}),
-        ), patch("api.routers.algo_workers.asyncio.to_thread", _run_to_thread_inline):
+        ), patch("backend.api.routers.worker_execution.asyncio.to_thread", _run_to_thread_inline):
             response = await exit_worker_run(request, "run-live", WorkerExitRequest(reason="preview", idempotency_key="run:exit:preview:001", dry_run=True))
 
         self.assertEqual(response["status"], "dry_run")
@@ -3760,10 +3774,10 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         paper_runtime = SimpleNamespace(exit_strategy=AsyncMock())
         request = self._request(repo, paper_runtime=paper_runtime)
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers._refresh_live_account_state",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution._refresh_live_account_state",
             AsyncMock(return_value={"account_id": "kite:AB1234", "reconciled_positions": 0}),
-        ), patch("api.routers.algo_workers.asyncio.to_thread", _run_to_thread_inline):
+        ), patch("backend.api.routers.worker_execution.asyncio.to_thread", _run_to_thread_inline):
             response = await exit_worker_run(request, "run-live", WorkerExitRequest(reason="target reached"))
 
         self.assertEqual(response["mode"], "live")
@@ -3805,10 +3819,10 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         paper_runtime = SimpleNamespace(exit_strategy=AsyncMock())
         request = self._request(repo, paper_runtime=paper_runtime)
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers._refresh_live_account_state",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution._refresh_live_account_state",
             AsyncMock(return_value={"account_id": "kite:AB1234", "reconciled_positions": 1}),
-        ), patch("api.routers.algo_workers.asyncio.to_thread", _run_to_thread_inline):
+        ), patch("backend.api.routers.worker_execution.asyncio.to_thread", _run_to_thread_inline):
             response = await exit_worker_run(request, "run-live", WorkerExitRequest(reason="target reached"))
 
         self.assertEqual(response["status"], "deferred")
@@ -3871,10 +3885,10 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=fake_kite), patch(
-            "api.routers.algo_workers._refresh_live_account_state",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=fake_kite), patch(
+            "backend.api.routers.worker_execution._refresh_live_account_state",
             AsyncMock(return_value={"account_id": "kite:AB1234", "reconciled_positions": 1}),
-        ), patch("api.routers.algo_workers.asyncio.to_thread", _run_to_thread_inline):
+        ), patch("backend.api.routers.worker_execution.asyncio.to_thread", _run_to_thread_inline):
             response = await exit_worker_run(request, "run-live", WorkerExitRequest(reason="target reached"))
 
         self.assertEqual(response["status"], "deferred")
@@ -3928,10 +3942,10 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
         request.app.state.algo_worker_orders_service = live_orders
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers._refresh_live_account_state",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution._refresh_live_account_state",
             AsyncMock(return_value={"account_id": "kite:AB1234", "reconciled_positions": 1}),
-        ), patch("api.routers.algo_workers.asyncio.to_thread", _run_to_thread_inline):
+        ), patch("backend.api.routers.worker_execution.asyncio.to_thread", _run_to_thread_inline):
             response = await exit_worker_run(request, "run-live", WorkerExitRequest(reason="operator exit", idempotency_key="exit-0001"))
 
         self.assertEqual(response["mode"], "live")
@@ -3979,10 +3993,10 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         request = self._request(repo)
         request.app.state.algo_worker_orders_service = live_orders
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers._refresh_live_account_state",
+        with patch("backend.api.routers.worker_execution._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_execution._refresh_live_account_state",
             AsyncMock(return_value={"account_id": "kite:AB1234", "reconciled_positions": 1}),
-        ), patch("api.routers.algo_workers.asyncio.to_thread", _run_to_thread_inline):
+        ), patch("backend.api.routers.worker_execution.asyncio.to_thread", _run_to_thread_inline):
             with self.assertRaises(HTTPException) as ctx:
                 await exit_worker_run(request, "run-live", WorkerExitRequest(reason="operator exit"))
 
@@ -4672,7 +4686,7 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
             is_disconnected=AsyncMock(return_value=False),
         )
 
-        with patch("api.routers.algo_workers._utcnow", return_value=datetime(2026, 5, 6, 9, 10, tzinfo=timezone.utc)):
+        with patch("backend.api.routers.worker_auth._utcnow", return_value=datetime(2026, 5, 6, 9, 10, tzinfo=timezone.utc)):
             run = await get_worker_run(request, "run-health")
 
         self.assertEqual(run["health_status"], "disconnected")
@@ -4738,8 +4752,8 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
             ],
         }
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_market._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_market.asyncio.to_thread",
             _run_to_thread_inline,
         ), patch(
             "broker_api.orders.gtt_service.place_gtt",
@@ -4765,8 +4779,8 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
             is_disconnected=AsyncMock(return_value=False),
         )
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_market._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_market.asyncio.to_thread",
             _run_to_thread_inline,
         ), patch(
             "broker_api.orders.gtt_service.get_gtt",
@@ -4813,8 +4827,8 @@ class AlgoWorkerRepositoryMappingTests(unittest.TestCase):
             ],
         }
 
-        with patch("api.routers.algo_workers._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
-            "api.routers.algo_workers.asyncio.to_thread",
+        with patch("backend.api.routers.worker_market._load_live_kite_for_account", return_value=SimpleNamespace(access_token="token")), patch(
+            "backend.api.routers.worker_market.asyncio.to_thread",
             _run_to_thread_inline,
         ), patch(
             "broker_api.orders.gtt_service.modify_gtt",

@@ -14,6 +14,7 @@ from ._shared import (
     build_intent_payload,
     fundamentals_scope_params,
     normalize_calendar_date_params,
+    omit_none_params,
     session_headers,
     split_instruments,
     require_identity_param,
@@ -820,6 +821,8 @@ class AsyncKiteAlgoWorkerClient:
         return last_snapshot
 
     async def _request_text(self, method: str, path: str, **kwargs: Any) -> str:
+        if "params" in kwargs:
+            kwargs["params"] = omit_none_params(kwargs["params"])
         response = await self.client.request(method, self._url(path), **kwargs)
         if 200 <= response.status_code < 300:
             return response.text
@@ -840,7 +843,8 @@ class AsyncKiteAlgoWorkerClient:
         )
 
     async def _stream_sse(self, method: str, path: str, params: Optional[Mapping[str, Any]] = None):
-        async with self.client.stream(method, self._url(path), params=dict(params or {})) as response:
+        normalized_params = omit_none_params(params)
+        async with self.client.stream(method, self._url(path), params=normalized_params) as response:
             if not 200 <= response.status_code < 300:
                 aread = getattr(response, "aread", None)
                 if aread is not None:
@@ -897,6 +901,8 @@ class AsyncKiteAlgoWorkerClient:
         return await self._request_url(method, self._url(path), **kwargs)
 
     async def _request_url(self, method: str, url: str, **kwargs: Any) -> JsonDict:
+        if "params" in kwargs:
+            kwargs["params"] = omit_none_params(kwargs["params"])
         response = await self.client.request(method, url, **kwargs)
         if 200 <= response.status_code < 300:
             if response.status_code == 204 or not response.content:

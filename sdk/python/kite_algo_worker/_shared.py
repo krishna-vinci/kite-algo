@@ -13,6 +13,51 @@ from typing import Any, Iterable, Mapping, Optional
 JsonDict = dict[str, Any]
 
 
+def omit_none_params(params: Any) -> Any:
+    """Remove omitted query values while preserving sync query semantics.
+
+    ``requests`` skips ``None`` query values while preparing a request, but
+    ``httpx`` serializes them as empty values.  Keep this normalization in the
+    transport-neutral module so async JSON, text, and streaming calls share the
+    same wire contract as the synchronous client.  ``requests`` also spells
+    boolean query values as ``True``/``False`` while ``httpx`` lowercases them,
+    so normalize that representation without dropping meaningful false-y
+    values.  Lists/tuples of query pairs are supported as well as mappings
+    because both are accepted by the HTTP clients.
+    """
+
+    def _normalize_value(value: Any) -> Any:
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, list):
+            return [_normalize_value(item) for item in value if item is not None]
+        if isinstance(value, tuple):
+            return tuple(_normalize_value(item) for item in value if item is not None)
+        return value
+
+    if params is None:
+        return None
+    if isinstance(params, Mapping):
+        return {
+            key: _normalize_value(value)
+            for key, value in params.items()
+            if value is not None
+        }
+    if isinstance(params, list):
+        return [
+            (key, _normalize_value(value))
+            for key, value in params
+            if value is not None
+        ]
+    if isinstance(params, tuple):
+        return tuple(
+            (key, _normalize_value(value))
+            for key, value in params
+            if value is not None
+        )
+    return params
+
+
 def require_identity_param(value: Any, *, field_name: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -169,6 +214,7 @@ __all__ = [
     "build_intent_payload",
     "fundamentals_scope_params",
     "normalize_calendar_date_params",
+    "omit_none_params",
     "require_idempotency_key",
     "require_identity_param",
     "session_headers",

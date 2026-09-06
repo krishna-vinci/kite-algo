@@ -12,6 +12,7 @@ from backend.broker_api.orders.basket_execution import basket_execution_store
 from backend.broker_api.orders.bracket_runtime import bracket_runtime_store
 from backend.api.schemas.worker import WorkerBasketPreviewRequest, WorkerBracketCreateRequest, WorkerExitRequest, WorkerIntentRequest, WorkerOrderActionRequest, WorkerOrderModifyRequest, WorkerOrderPreviewRequest
 from backend.api.routers.worker_shared import *
+from backend.shared.serialization import _json_dumps
 from backend.api.routers.worker_protection import _build_worker_run_pnl_snapshot, validate_worker_run_safety_token
 from backend.algo_runtime.execution_attribution import build_execution_attribution, build_paper_execution_attribution
 
