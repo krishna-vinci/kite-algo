@@ -132,8 +132,9 @@ isolated MCP environment; those dependencies are not installed in the backend
 types, but uses native asyncio pipes for stdio: the released `mcp==2.1.1`
 `anyio.wrap_file` bridge did not drain subprocess pipes in this execution
 environment. An official `mcp.ClientSession` initialize/list-tools smoke test
-passes against both the editable and clean wheel installs. CI builds and
-installs wheels before running protocol tests. No live credentials or live
+passes against both the editable and clean wheel installs, including listing
+and reading the two static resources. CI builds and installs wheels before
+running protocol tests. No live credentials or live
 submissions are used by package tests. Telegram alerts,
 dedicated screeners, schedulers, autonomous rebalancing, optimizers,
 backtests, smart/split-order executors, and service deployment remain outside
