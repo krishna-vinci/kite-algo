@@ -40,8 +40,7 @@ def test_worker_http_manifest_matches_mounted_openapi() -> None:
     mounted = _mounted_http_operations()
     declared = {(item.method, item.path) for item in WORKER_HTTP_ENDPOINTS}
 
-    assert len(mounted) == 77
-    assert len(WORKER_HTTP_ENDPOINTS) == 77
+    assert len(mounted) == len(WORKER_HTTP_ENDPOINTS)
     assert declared == mounted
 
 
@@ -89,9 +88,10 @@ def test_manifest_classifies_non_json_and_mutating_operations() -> None:
 def test_certification_reports_measured_sync_and_async_coverage() -> None:
     coverage = collect_endpoint_coverage()
 
+    expected_http = len(WORKER_HTTP_ENDPOINTS)
     assert coverage == {
-        "worker_http_operations": 77,
-        "sync_http_operations": 77,
-        "async_http_operations": 77,
-        "worker_websocket_routes": 3,
+        "worker_http_operations": expected_http,
+        "sync_http_operations": expected_http,
+        "async_http_operations": expected_http,
+        "worker_websocket_routes": len(WORKER_WEBSOCKET_PATHS),
     }

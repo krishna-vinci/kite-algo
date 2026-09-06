@@ -65,6 +65,20 @@ def require_identity_param(value: Any, *, field_name: str) -> str:
     return text
 
 
+def run_list_params(*, limit: int = 25, cursor: Optional[str] = None) -> JsonDict:
+    """Build the common token-scoped run-list query for both transports."""
+
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    params: JsonDict = {"limit": limit}
+    if cursor is not None:
+        cursor_text = str(cursor).strip()
+        if not cursor_text:
+            raise ValueError("cursor must not be empty when provided")
+        params["cursor"] = cursor_text
+    return params
+
+
 def require_idempotency_key(value: str) -> str:
     key = str(value or "").strip()
     if not key:
@@ -217,6 +231,7 @@ __all__ = [
     "omit_none_params",
     "require_idempotency_key",
     "require_identity_param",
+    "run_list_params",
     "session_headers",
     "split_instruments",
 ]

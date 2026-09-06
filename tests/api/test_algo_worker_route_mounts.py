@@ -54,6 +54,7 @@ def test_generic_algo_worker_routes_are_mounted() -> None:
         ("DELETE", "/api/algo-workers/worker/runs/{strategy_run_id}/claim-session"),
         ("POST", "/api/algo-workers/worker/runs/{strategy_run_id}/heartbeat"),
         ("POST", "/api/algo-workers/worker/runs"),
+        ("GET", "/api/algo-workers/worker/runs"),
         ("GET", "/api/algo-workers/worker/runs/{strategy_run_id}"),
         ("GET", "/api/algo-workers/worker/runs/{strategy_run_id}/safety-check"),
         ("GET", "/api/algo-workers/worker/market/instruments/resolve"),

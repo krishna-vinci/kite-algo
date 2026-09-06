@@ -15,6 +15,7 @@ from ._shared import (
     fundamentals_scope_params,
     normalize_calendar_date_params,
     omit_none_params,
+    run_list_params,
     session_headers,
     split_instruments,
     require_identity_param,
@@ -293,6 +294,11 @@ class AsyncKiteAlgoWorkerClient:
 
     async def get_run(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", f"/worker/runs/{strategy_run_id}")
+
+    async def list_runs(self, *, limit: int = 25, cursor: Optional[str] = None) -> JsonDict:
+        """List runs visible to this worker token using stable pagination."""
+
+        return await self._request("GET", "/worker/runs", params=run_list_params(limit=limit, cursor=cursor))
 
     async def get_run_health_snapshot(self, strategy_run_id: str) -> WorkerRunHealthSnapshot:
         return WorkerRunHealthSnapshot.model_validate(await self.get_run(strategy_run_id))

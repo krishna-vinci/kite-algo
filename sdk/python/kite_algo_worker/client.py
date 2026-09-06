@@ -18,6 +18,7 @@ from ._shared import (
     normalize_calendar_date_params,
     require_idempotency_key,
     require_identity_param,
+    run_list_params,
     session_headers,
     split_instruments,
 )
@@ -187,6 +188,11 @@ class KiteAlgoWorkerClient:
 
     def get_run(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", f"/worker/runs/{strategy_run_id}")
+
+    def list_runs(self, *, limit: int = 25, cursor: Optional[str] = None) -> JsonDict:
+        """List runs visible to this worker token using stable pagination."""
+
+        return self._request("GET", "/worker/runs", params=run_list_params(limit=limit, cursor=cursor))
 
     def get_run_health_snapshot(self, strategy_run_id: str) -> WorkerRunHealthSnapshot:
         return WorkerRunHealthSnapshot.model_validate(self.get_run(strategy_run_id))

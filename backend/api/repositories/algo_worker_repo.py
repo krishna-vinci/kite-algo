@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import os
 import uuid
 from dataclasses import dataclass
@@ -10,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from backend.algo_runtime.account_scope import parse_account_scope
 from backend.broker_api.core.redis_events import publish_event
 from backend.broker_api.timeline.worker_timeline import worker_timeline_store
 from backend.app.database import SessionLocal
@@ -25,6 +29,113 @@ WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS = int(
 WORKER_RUN_STALE_ACTION_SECONDS = int(
     os.getenv("WORKER_RUN_STALE_ACTION_SECONDS", "180")
 )
+WORKER_RUN_LIST_DEFAULT_LIMIT = 25
+WORKER_RUN_LIST_MAX_LIMIT = 100
+_WORKER_RUN_CURSOR_VERSION = 1
+_WORKER_RUN_CURSOR_SECRET = os.getenv(
+    "ALGO_WORKER_RUN_CURSOR_SECRET", "kite-algo-worker-run-cursor"
+).encode("utf-8")
+
+
+def _worker_token_allows_account_scope(token_scope: Optional[str], requested_scope: Any) -> bool:
+    """Mirror worker_shared account-scope semantics without importing the router."""
+
+    normalized_token_scope = str(token_scope or "").strip()
+    if not normalized_token_scope:
+        return True
+    normalized_requested_scope = str(requested_scope or "").strip()
+    if not normalized_requested_scope:
+        return False
+    try:
+        token_parsed = parse_account_scope(normalized_token_scope)
+        requested_parsed = parse_account_scope(normalized_requested_scope)
+    except ValueError:
+        return normalized_token_scope == normalized_requested_scope
+
+    if token_parsed.mode == "live":
+        if requested_parsed.mode == "paper":
+            return True
+        return requested_parsed.normalized == token_parsed.normalized
+    return requested_parsed.normalized == token_parsed.normalized
+
+
+def _worker_run_is_visible_to_token(token: WorkerToken, row: Any) -> bool:
+    payload = _row_mapping(row)
+    mode = str(payload.get("execution_mode") or "").strip().lower()
+    allowed_modes = {str(value).strip().lower() for value in token.allowed_modes}
+    if mode not in allowed_modes:
+        return False
+    template_id = str(payload.get("template_id") or "")
+    if token.allowed_templates and template_id not in set(token.allowed_templates):
+        return False
+    return _worker_token_allows_account_scope(token.account_scope, payload.get("account_scope"))
+
+
+def _cursor_text(value: Any) -> str:
+    if value is None:
+        raise ValueError("Run cursor is missing its creation timestamp")
+    if hasattr(value, "isoformat"):
+        value = value.isoformat()
+    text_value = str(value).strip()
+    if not text_value or len(text_value) > 128:
+        raise ValueError("Run cursor contains an invalid creation timestamp")
+    return text_value
+
+
+def _cursor_b64encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _cursor_b64decode(value: str) -> bytes:
+    if not value or len(value) > 512:
+        raise ValueError("Invalid run cursor")
+    try:
+        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Invalid run cursor") from exc
+
+
+def _encode_worker_run_cursor(created_at: Any, strategy_run_id: str) -> str:
+    run_id = str(strategy_run_id or "").strip()
+    if not run_id or len(run_id) > 256:
+        raise ValueError("Cannot create a cursor for a run without an ID")
+    body = _json_dumps(
+        {
+            "v": _WORKER_RUN_CURSOR_VERSION,
+            "created_at": _cursor_text(created_at),
+            "strategy_run_id": run_id,
+        }
+    ).encode("utf-8")
+    signature = hmac.new(_WORKER_RUN_CURSOR_SECRET, body, hashlib.sha256).digest()
+    return f"{_cursor_b64encode(body)}.{_cursor_b64encode(signature)}"
+
+
+def _decode_worker_run_cursor(cursor: str) -> Dict[str, str]:
+    if not isinstance(cursor, str) or len(cursor) > 1024:
+        raise ValueError("Invalid run cursor")
+    parts = cursor.split(".")
+    if len(parts) != 2:
+        raise ValueError("Invalid run cursor")
+    body = _cursor_b64decode(parts[0])
+    signature = _cursor_b64decode(parts[1])
+    expected = hmac.new(_WORKER_RUN_CURSOR_SECRET, body, hashlib.sha256).digest()
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("Invalid run cursor")
+    try:
+        payload = _json_loads(body.decode("utf-8"), None)
+    except (UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise ValueError("Invalid run cursor") from exc
+    if not isinstance(payload, dict) or set(payload) != {"v", "created_at", "strategy_run_id"}:
+        raise ValueError("Invalid run cursor")
+    if payload.get("v") != _WORKER_RUN_CURSOR_VERSION:
+        raise ValueError("Invalid run cursor")
+    run_id = payload.get("strategy_run_id")
+    created_at = payload.get("created_at")
+    if not isinstance(run_id, str) or not run_id.strip() or len(run_id) > 256:
+        raise ValueError("Invalid run cursor")
+    if not isinstance(created_at, str) or not created_at.strip() or len(created_at) > 128:
+        raise ValueError("Invalid run cursor")
+    return {"created_at": created_at, "strategy_run_id": run_id}
 
 
 @dataclass
@@ -65,6 +176,15 @@ class SqlAlchemyAlgoWorkerRepository:
 
     async def get_run(self, strategy_run_id: str) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._get_run_sync, strategy_run_id)
+
+    async def list_runs(
+        self,
+        token: WorkerToken,
+        *,
+        limit: int = WORKER_RUN_LIST_DEFAULT_LIMIT,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._list_runs_sync, token, limit, cursor)
 
     async def list_runs_for_control_plane(self) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(self._list_runs_for_control_plane_sync)
@@ -452,6 +572,71 @@ class SqlAlchemyAlgoWorkerRepository:
             return self._run_view(row) if row else None
         finally:
             db.close()
+
+    def _list_runs_sync(
+        self,
+        token: WorkerToken,
+        limit: int,
+        cursor: Optional[str],
+    ) -> Dict[str, Any]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= WORKER_RUN_LIST_MAX_LIMIT:
+            raise ValueError(f"limit must be between 1 and {WORKER_RUN_LIST_MAX_LIMIT}")
+
+        cursor_values = _decode_worker_run_cursor(cursor) if cursor is not None else None
+        db = self.session_factory()
+        try:
+            conditions = ["r.token_id = :token_id"]
+            params: Dict[str, Any] = {"token_id": token.token_id}
+            if cursor_values is not None:
+                conditions.append(
+                    "(r.created_at < :cursor_created_at "
+                    "OR (r.created_at = :cursor_created_at "
+                    "AND r.strategy_run_id < :cursor_strategy_run_id))"
+                )
+                params.update(
+                    {
+                        "cursor_created_at": cursor_values["created_at"],
+                        "cursor_strategy_run_id": cursor_values["strategy_run_id"],
+                    }
+                )
+
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    text(
+                        """
+                        SELECT r.strategy_run_id, r.token_id, r.template_id,
+                               r.account_scope, r.execution_mode, r.status,
+                               r.metadata_json, r.created_at, r.updated_at, r.closed_at
+                        FROM public.algo_worker_runs r
+                        WHERE __WHERE__
+                        ORDER BY r.created_at DESC, r.strategy_run_id DESC
+                        """.replace("__WHERE__", " AND ".join(conditions))
+                    ),
+                    params,
+                ).mappings().all()
+            ]
+        finally:
+            db.close()
+
+        # Filtering is intentionally applied to the token-owned rows before
+        # selecting a page.  In particular, the query must never reuse the
+        # unrestricted control-plane listing and then redact its output.
+        visible_rows = [
+            row
+            for row in rows
+            if _worker_run_is_visible_to_token(token, row)
+        ]
+        page = visible_rows[: limit + 1]
+        has_more = len(page) > limit
+        items = [self._run_summary(row) for row in page[:limit]]
+        next_cursor = None
+        if has_more and items:
+            last = page[limit - 1]
+            next_cursor = _encode_worker_run_cursor(
+                last.get("created_at"), str(last.get("strategy_run_id") or "")
+            )
+        return {"items": items, "next_cursor": next_cursor}
 
     def _list_runs_for_control_plane_sync(self) -> List[Dict[str, Any]]:
         db = self.session_factory()
@@ -1693,6 +1878,31 @@ class SqlAlchemyAlgoWorkerRepository:
             "worker_session_nonce": payload.get("worker_session_nonce"),
             "worker_session_claimed_at": payload.get("worker_session_claimed_at"),
             "last_heartbeat_at": payload.get("last_heartbeat_at"),
+            "created_at": payload.get("created_at"),
+            "updated_at": payload.get("updated_at"),
+            "closed_at": payload.get("closed_at"),
+        }
+
+    def _run_summary(self, row: Any) -> Dict[str, Any]:
+        payload = _row_mapping(row)
+        metadata = _json_loads(payload.get("metadata_json"), {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        strategy_run_id = str(payload.get("strategy_run_id") or "")
+        template_id = str(payload.get("template_id") or "")
+        name = str(
+            metadata.get("strategy_name")
+            or metadata.get("name")
+            or template_id
+            or strategy_run_id
+        ).strip()
+        return {
+            "strategy_run_id": strategy_run_id,
+            "name": name or strategy_run_id,
+            "template_id": template_id,
+            "account_scope": str(payload.get("account_scope") or ""),
+            "execution_mode": str(payload.get("execution_mode") or ""),
+            "status": str(payload.get("status") or "open"),
             "created_at": payload.get("created_at"),
             "updated_at": payload.get("updated_at"),
             "closed_at": payload.get("closed_at"),

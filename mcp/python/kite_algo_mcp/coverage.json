@@ -358,6 +358,13 @@
   },
   {
     "method": "GET",
+    "path": "/worker/runs",
+    "disposition": "tool",
+    "tools": ["list_runs"],
+    "reason": "Expose stable, token-owned run discovery without control-plane metadata or session credentials."
+  },
+  {
+    "method": "GET",
     "path": "/worker/runs/{strategy_run_id}",
     "disposition": "tool",
     "tools": ["get_run"],

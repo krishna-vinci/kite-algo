@@ -83,6 +83,33 @@ class WorkerRunCreateRequest(BaseModel):
     def _clean_mode(cls, value: str) -> str:
         return str(value or "paper").strip().lower()
 
+
+class WorkerRunSummary(BaseModel):
+    """Public, token-scoped run listing fields.
+
+    Deliberately excludes worker token identifiers, metadata, and session
+    nonces.  The detail route remains the place for the richer run document.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_run_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    template_id: str = Field(min_length=1)
+    account_scope: str = Field(min_length=1)
+    execution_mode: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
+
+
+class WorkerRunListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: List[WorkerRunSummary] = Field(default_factory=list)
+    next_cursor: Optional[str] = None
+
 class WorkerRiskPatchRequest(BaseModel):
     patch: Dict[str, Any] = Field(default_factory=dict)
     reason: Optional[str] = None

@@ -7,7 +7,14 @@ from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from backend.algo_runtime.account_scope import parse_account_scope
 from backend.app.auth import require_app_user
-from backend.api.schemas.worker import WorkerTokenCreateRequest, WorkerTokenCreateResponse, WorkerTokenView, WorkerHeartbeatRequest, WorkerRunCreateRequest
+from backend.api.schemas.worker import (
+    WorkerHeartbeatRequest,
+    WorkerRunCreateRequest,
+    WorkerRunListResponse,
+    WorkerTokenCreateRequest,
+    WorkerTokenCreateResponse,
+    WorkerTokenView,
+)
 from backend.api.routers.worker_shared import *
 
 router = APIRouter(prefix='/algo-workers', tags=['Algo Workers'])
@@ -55,6 +62,20 @@ async def worker_heartbeat(request: Request, payload: WorkerHeartbeatRequest):
     token = await require_worker_token(request)
     _require_action(token, "heartbeat")
     return await _repo(request).record_heartbeat(token.token_id, payload)
+
+
+async def list_worker_runs(request: Request, limit: int = 25, cursor: str | None = None):
+    token = await require_worker_token(request)
+    _require_action(token, "runs:read")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 100")
+    try:
+        return await _repo(request).list_runs(token, limit=limit, cursor=cursor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        logger.exception("algo_worker_run_list_database_failed")
+        raise HTTPException(status_code=503, detail="Worker run listing unavailable") from exc
 
 async def claim_worker_run_session(request: Request, strategy_run_id: str):
     token = await require_worker_token(request)
@@ -321,4 +342,5 @@ router.add_api_route("/worker/runs/{strategy_run_id}/claim-session", claim_worke
 router.add_api_route("/worker/runs/{strategy_run_id}/claim-session", release_worker_run_session, methods=["DELETE"])
 router.add_api_route("/worker/runs/{strategy_run_id}/heartbeat", heartbeat_worker_run_session, methods=["POST"])
 router.add_api_route("/worker/runs", create_worker_run, methods=["POST"])
+router.add_api_route("/worker/runs", list_worker_runs, methods=["GET"], response_model=WorkerRunListResponse)
 router.add_api_route("/worker/runs/{strategy_run_id}", get_worker_run, methods=["GET"])

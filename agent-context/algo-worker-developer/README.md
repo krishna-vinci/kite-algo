@@ -13,15 +13,15 @@ Give this pack to an external coding agent when you want worker code written in 
 ## Current package status
 
 - Package name: `kite-algo-worker`
-- SDK version described by this pack: `0.8.0`
+- SDK version described by this pack: `0.9.0`
 - Current public PyPI release: `0.7.7`
-- Pending release tag: `kite-algo-worker-v0.8.0`
+- Pending release tag: `kite-algo-worker-v0.9.0`
 - SDK tag convention: `kite-algo-worker-vX.Y.Z`
 
 Canonical public install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.8.0
+python3 -m pip install kite-algo-worker==0.9.0
 ```
 
 This pack documents the 0.8.0 release candidate. Keep the exact pin when the
