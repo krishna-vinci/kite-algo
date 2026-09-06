@@ -1,0 +1,48 @@
+name: test-kite-algo-mcp
+
+on:
+  push:
+    paths:
+      - "mcp/python/**"
+      - "sdk/python/**"
+      - "tests/mcp/**"
+      - ".github/workflows/test-kite-algo-mcp.yml"
+  pull_request:
+    paths:
+      - "mcp/python/**"
+      - "sdk/python/**"
+      - "tests/mcp/**"
+      - ".github/workflows/test-kite-algo-mcp.yml"
+
+jobs:
+  mcp:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build worker and MCP wheels
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build sdk/python
+          python -m build mcp/python
+      - name: Install the built packages and locked dependencies
+        run: |
+          python -m pip install -r mcp/python/requirements.lock
+          python -m pip install sdk/python/dist/*.whl mcp/python/dist/*.whl pytest pytest-asyncio
+          python -m pip check
+      - name: Assert released framework versions
+        run: |
+          python - <<'PY'
+          from importlib.metadata import version
+          assert version("fastmcp") == "4.0.3"
+          assert version("mcp") == "2.1.1"
+          PY
+      - name: Run installed-package MCP tests
+        env:
+          PYTHONPATH: ""
+        run: python -m pytest tests/mcp -q
