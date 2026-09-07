@@ -564,3 +564,24 @@ Remaining before cutover (Phase 2): dispatch semantics -- schema validation,
 policy/profiles/capability filtering, run leases with heartbeats, error
 taxonomy, concurrency semaphore, result caps (spec section 5) -- each with
 tests; then Phase 3 hardening + comparison matrix + cutover.
+
+
+## Phase 2+3 outcome (2026-09-08, commit fff3e2c)
+
+Phase 2 (safeguards) and the Phase 3 transport items are implemented and
+tested. Deployment decision per user: NO cutover - python (18788) and go
+(18789) adapters run side by side as permanent containers.
+
+- Dispatch table: 73 entries generated from endpoint_manifest + tool
+  closures; 13 trade_write tools under leases; safety pre-check on
+  place_order/place_basket/enter_option_run.
+- Safeguards tests: policy (visibility, capability normalization,
+  action/mode/account gates, empty-template rule), session (lifecycle,
+  heartbeat-loss refusal, outcome-unknown), dispatch (unknown tool,
+  policy refusal, status taxonomy, lease claim/nonce/release, safety
+  refusal, claim-failure mapping, shapers).
+- Transport: bearer guard honored from KITE_MCP_HTTP_TOKEN; /mcp +
+  stateless JSON to mirror the python adapter.
+- E2E through BOTH containers vs live backend: 73/73 names, caps MATCH,
+  calculate_indicator MATCH (go->backend->SDK pandas), funds/search OK,
+  backend_action_denied identical. Go RSS ~10-16 MiB in Docker.
