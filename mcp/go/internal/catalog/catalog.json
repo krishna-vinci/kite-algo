@@ -1,0 +1,5487 @@
+{
+  "tools": [
+    {
+      "description": "Return redacted worker capabilities and maintained constants.",
+      "effect": "read",
+      "group": "discovery",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_capabilities",
+      "reconcile_with": null,
+      "request_model": null,
+      "required_action": "",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded list runs read.",
+      "effect": "read",
+      "group": "discovery",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cursor"
+          },
+          "limit": {
+            "default": 25,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "RunListRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "list_runs",
+      "reconcile_with": null,
+      "request_model": "RunListRequest",
+      "required_action": "runs:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get run read.",
+      "effect": "read",
+      "group": "discovery",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "RunSelector",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_run",
+      "reconcile_with": null,
+      "request_model": "RunSelector",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded get run health read.",
+      "effect": "read",
+      "group": "discovery",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "RunSelector",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_run_health",
+      "reconcile_with": null,
+      "request_model": "RunSelector",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded get funds read.",
+      "effect": "read",
+      "group": "discovery",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_funds",
+      "reconcile_with": null,
+      "request_model": null,
+      "required_action": "funds:read",
+      "scope": "account"
+    },
+    {
+      "description": "Bounded get run funds read.",
+      "effect": "read",
+      "group": "discovery",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "RunSelector",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_run_funds",
+      "reconcile_with": null,
+      "request_model": "RunSelector",
+      "required_action": "funds:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded get account portfolio read.",
+      "effect": "read",
+      "group": "discovery",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_scope": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_scope"
+        ],
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_account_portfolio",
+      "reconcile_with": null,
+      "request_model": null,
+      "required_action": "funds:read",
+      "scope": "account"
+    },
+    {
+      "description": "Bounded search instruments read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "exchange": {
+            "anyOf": [
+              {
+                "maxLength": 12,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Exchange"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "query": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "SearchInstrumentsRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "search_instruments",
+      "reconcile_with": null,
+      "request_model": "SearchInstrumentsRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded resolve instruments read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "symbols": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Symbols",
+            "type": "array"
+          }
+        },
+        "required": [
+          "symbols"
+        ],
+        "title": "SymbolRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "resolve_instruments",
+      "reconcile_with": null,
+      "request_model": "SymbolRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get quotes read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "symbols": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Symbols",
+            "type": "array"
+          }
+        },
+        "required": [
+          "symbols"
+        ],
+        "title": "SymbolRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_quotes",
+      "reconcile_with": null,
+      "request_model": "SymbolRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get market snapshot read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "symbols": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Symbols",
+            "type": "array"
+          }
+        },
+        "required": [
+          "symbols"
+        ],
+        "title": "SymbolRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_market_snapshot",
+      "reconcile_with": null,
+      "request_model": "SymbolRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get market depth read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "symbols": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Symbols",
+            "type": "array"
+          }
+        },
+        "required": [
+          "symbols"
+        ],
+        "title": "SymbolRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_market_depth",
+      "reconcile_with": null,
+      "request_model": "SymbolRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get candles read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "instrument": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Instrument",
+            "type": "string"
+          },
+          "interval": {
+            "default": "5minute",
+            "maxLength": 20,
+            "minLength": 1,
+            "title": "Interval",
+            "type": "string"
+          },
+          "lookback": {
+            "default": 50,
+            "maximum": 1000,
+            "minimum": 1,
+            "title": "Lookback",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instrument"
+        ],
+        "title": "CandleRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_candles",
+      "reconcile_with": null,
+      "request_model": "CandleRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get current candle read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "instrument": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Instrument",
+            "type": "string"
+          },
+          "interval": {
+            "default": "5minute",
+            "maxLength": 20,
+            "minLength": 1,
+            "title": "Interval",
+            "type": "string"
+          },
+          "lookback": {
+            "default": 50,
+            "maximum": 1000,
+            "minimum": 1,
+            "title": "Lookback",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instrument"
+        ],
+        "title": "CandleRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_current_candle",
+      "reconcile_with": null,
+      "request_model": "CandleRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get historical candles read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "from_date": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "From Date"
+          },
+          "instrument": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Instrument",
+            "type": "string"
+          },
+          "lookback_days": {
+            "anyOf": [
+              {
+                "maximum": 1000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Lookback Days"
+          },
+          "passthrough": {
+            "default": false,
+            "title": "Passthrough",
+            "type": "boolean"
+          },
+          "timeframe": {
+            "default": "day",
+            "maxLength": 20,
+            "minLength": 1,
+            "title": "Timeframe",
+            "type": "string"
+          },
+          "to_date": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "To Date"
+          }
+        },
+        "required": [
+          "instrument"
+        ],
+        "title": "HistoricalCandleRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_historical_candles",
+      "reconcile_with": null,
+      "request_model": "HistoricalCandleRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Explicitly request bounded historical ingestion.",
+      "effect": "data_write",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "from_date": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "From Date"
+          },
+          "instrument": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Instrument",
+            "type": "string"
+          },
+          "lookback_days": {
+            "anyOf": [
+              {
+                "maximum": 1000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Lookback Days"
+          },
+          "passthrough": {
+            "default": false,
+            "title": "Passthrough",
+            "type": "boolean"
+          },
+          "timeframe": {
+            "default": "day",
+            "maxLength": 20,
+            "minLength": 1,
+            "title": "Timeframe",
+            "type": "string"
+          },
+          "to_date": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "To Date"
+          }
+        },
+        "required": [
+          "instrument"
+        ],
+        "title": "HistoricalCandleRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "request_history",
+      "reconcile_with": null,
+      "request_model": "HistoricalCandleRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get market calendar read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "exchange": {
+            "default": "NSE",
+            "maxLength": 12,
+            "minLength": 1,
+            "title": "Exchange",
+            "type": "string"
+          },
+          "from_date": {
+            "format": "date",
+            "title": "From Date",
+            "type": "string"
+          },
+          "segment": {
+            "default": "CM",
+            "maxLength": 12,
+            "minLength": 1,
+            "title": "Segment",
+            "type": "string"
+          },
+          "to_date": {
+            "format": "date",
+            "title": "To Date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from_date",
+          "to_date"
+        ],
+        "title": "CalendarRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_market_calendar",
+      "reconcile_with": null,
+      "request_model": "CalendarRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get market calendar status read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_market_calendar_status",
+      "reconcile_with": null,
+      "request_model": null,
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get index constituents read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "source_list": {
+            "enum": [
+              "nifty50",
+              "nifty500",
+              "niftybank"
+            ],
+            "title": "Source List",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_list"
+        ],
+        "title": "IndexRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_index_constituents",
+      "reconcile_with": null,
+      "request_model": "IndexRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get index status read.",
+      "effect": "read",
+      "group": "market",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "source_list": {
+            "enum": [
+              "nifty50",
+              "nifty500",
+              "niftybank"
+            ],
+            "title": "Source List",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_list"
+        ],
+        "title": "IndexRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_index_status",
+      "reconcile_with": null,
+      "request_model": "IndexRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get fundamentals features read.",
+      "effect": "read",
+      "group": "fundamentals",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "anyOf": [
+              {
+                "enum": [
+                  "nifty50",
+                  "nifty500"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Index"
+          },
+          "symbols": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 50,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Symbols"
+          }
+        },
+        "title": "FundamentalsScopeRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_fundamentals_features",
+      "reconcile_with": null,
+      "request_model": "FundamentalsScopeRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get fundamentals statements read.",
+      "effect": "read",
+      "group": "fundamentals",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dataset": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Dataset",
+            "type": "string"
+          },
+          "statement_scope": {
+            "default": "consolidated",
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Statement Scope",
+            "type": "string"
+          },
+          "symbol": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Symbol",
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol",
+          "dataset"
+        ],
+        "title": "FundamentalsStatementRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_fundamentals_statements",
+      "reconcile_with": null,
+      "request_model": "FundamentalsStatementRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get fundamentals status read.",
+      "effect": "read",
+      "group": "fundamentals",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "anyOf": [
+              {
+                "enum": [
+                  "nifty50",
+                  "nifty500"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Index"
+          },
+          "symbols": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 50,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Symbols"
+          }
+        },
+        "title": "FundamentalsScopeRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_fundamentals_status",
+      "reconcile_with": null,
+      "request_model": "FundamentalsScopeRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Explicit refresh fundamentals data refresh.",
+      "effect": "data_write",
+      "group": "fundamentals",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "anyOf": [
+              {
+                "enum": [
+                  "nifty50",
+                  "nifty500"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Index"
+          },
+          "mode": {
+            "default": "incremental",
+            "enum": [
+              "incremental",
+              "full"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "symbols": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 50,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Symbols"
+          }
+        },
+        "title": "FundamentalsRefreshRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "refresh_fundamentals",
+      "reconcile_with": null,
+      "request_model": "FundamentalsRefreshRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Explicit create run write.",
+      "effect": "trade_write",
+      "group": "runs",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_scope": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Account Scope",
+            "type": "string"
+          },
+          "execution_mode": {
+            "default": "paper",
+            "enum": [
+              "paper",
+              "live",
+              "dry_run"
+            ],
+            "title": "Execution Mode",
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Strategy Run Id"
+          },
+          "template_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Template Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "template_id",
+          "account_scope"
+        ],
+        "title": "CreateRunRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "create_run",
+      "reconcile_with": null,
+      "request_model": "CreateRunRequest",
+      "required_action": "runs:create",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded check run safety read.",
+      "effect": "read",
+      "group": "runs",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "RunSelector",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "check_run_safety",
+      "reconcile_with": null,
+      "request_model": "RunSelector",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded preview order read.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OrderRequest": {
+            "additionalProperties": false,
+            "properties": {
+              "disclosed_quantity": {
+                "anyOf": [
+                  {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Disclosed Quantity"
+              },
+              "exchange": {
+                "default": "NSE",
+                "maxLength": 12,
+                "minLength": 1,
+                "title": "Exchange",
+                "type": "string"
+              },
+              "instrument_token": {
+                "anyOf": [
+                  {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Instrument Token"
+              },
+              "order_type": {
+                "default": "MARKET",
+                "enum": [
+                  "MARKET",
+                  "LIMIT",
+                  "SL",
+                  "SL-M"
+                ],
+                "title": "Order Type",
+                "type": "string"
+              },
+              "price": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Price"
+              },
+              "product": {
+                "default": "CNC",
+                "enum": [
+                  "CNC",
+                  "MIS",
+                  "NRML"
+                ],
+                "title": "Product",
+                "type": "string"
+              },
+              "quantity": {
+                "exclusiveMinimum": 0,
+                "maximum": 1000000,
+                "title": "Quantity",
+                "type": "integer"
+              },
+              "symbol": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Symbol"
+              },
+              "tag": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Tag"
+              },
+              "transaction_type": {
+                "enum": [
+                  "BUY",
+                  "SELL"
+                ],
+                "title": "Transaction Type",
+                "type": "string"
+              },
+              "trigger_price": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Trigger Price"
+              },
+              "validity": {
+                "default": "DAY",
+                "enum": [
+                  "DAY",
+                  "IOC"
+                ],
+                "title": "Validity",
+                "type": "string"
+              }
+            },
+            "required": [
+              "transaction_type",
+              "quantity"
+            ],
+            "title": "OrderRequest",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "idempotency_key": {
+            "maxLength": 160,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "order": {
+            "$ref": "#/$defs/OrderRequest"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "order",
+          "idempotency_key"
+        ],
+        "title": "PlaceOrderRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "preview_order",
+      "reconcile_with": null,
+      "request_model": "PlaceOrderRequest",
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded preview basket read.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OrderRequest": {
+            "additionalProperties": false,
+            "properties": {
+              "disclosed_quantity": {
+                "anyOf": [
+                  {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Disclosed Quantity"
+              },
+              "exchange": {
+                "default": "NSE",
+                "maxLength": 12,
+                "minLength": 1,
+                "title": "Exchange",
+                "type": "string"
+              },
+              "instrument_token": {
+                "anyOf": [
+                  {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Instrument Token"
+              },
+              "order_type": {
+                "default": "MARKET",
+                "enum": [
+                  "MARKET",
+                  "LIMIT",
+                  "SL",
+                  "SL-M"
+                ],
+                "title": "Order Type",
+                "type": "string"
+              },
+              "price": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Price"
+              },
+              "product": {
+                "default": "CNC",
+                "enum": [
+                  "CNC",
+                  "MIS",
+                  "NRML"
+                ],
+                "title": "Product",
+                "type": "string"
+              },
+              "quantity": {
+                "exclusiveMinimum": 0,
+                "maximum": 1000000,
+                "title": "Quantity",
+                "type": "integer"
+              },
+              "symbol": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Symbol"
+              },
+              "tag": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Tag"
+              },
+              "transaction_type": {
+                "enum": [
+                  "BUY",
+                  "SELL"
+                ],
+                "title": "Transaction Type",
+                "type": "string"
+              },
+              "trigger_price": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Trigger Price"
+              },
+              "validity": {
+                "default": "DAY",
+                "enum": [
+                  "DAY",
+                  "IOC"
+                ],
+                "title": "Validity",
+                "type": "string"
+              }
+            },
+            "required": [
+              "transaction_type",
+              "quantity"
+            ],
+            "title": "OrderRequest",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "all_or_none": {
+            "default": false,
+            "title": "All Or None",
+            "type": "boolean"
+          },
+          "idempotency_key": {
+            "maxLength": 160,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "orders": {
+            "items": {
+              "$ref": "#/$defs/OrderRequest"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Orders",
+            "type": "array"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "orders",
+          "idempotency_key"
+        ],
+        "title": "BasketRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "preview_basket",
+      "reconcile_with": null,
+      "request_model": "BasketRequest",
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit place order write.",
+      "effect": "trade_write",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OrderRequest": {
+            "additionalProperties": false,
+            "properties": {
+              "disclosed_quantity": {
+                "anyOf": [
+                  {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Disclosed Quantity"
+              },
+              "exchange": {
+                "default": "NSE",
+                "maxLength": 12,
+                "minLength": 1,
+                "title": "Exchange",
+                "type": "string"
+              },
+              "instrument_token": {
+                "anyOf": [
+                  {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Instrument Token"
+              },
+              "order_type": {
+                "default": "MARKET",
+                "enum": [
+                  "MARKET",
+                  "LIMIT",
+                  "SL",
+                  "SL-M"
+                ],
+                "title": "Order Type",
+                "type": "string"
+              },
+              "price": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Price"
+              },
+              "product": {
+                "default": "CNC",
+                "enum": [
+                  "CNC",
+                  "MIS",
+                  "NRML"
+                ],
+                "title": "Product",
+                "type": "string"
+              },
+              "quantity": {
+                "exclusiveMinimum": 0,
+                "maximum": 1000000,
+                "title": "Quantity",
+                "type": "integer"
+              },
+              "symbol": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Symbol"
+              },
+              "tag": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Tag"
+              },
+              "transaction_type": {
+                "enum": [
+                  "BUY",
+                  "SELL"
+                ],
+                "title": "Transaction Type",
+                "type": "string"
+              },
+              "trigger_price": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Trigger Price"
+              },
+              "validity": {
+                "default": "DAY",
+                "enum": [
+                  "DAY",
+                  "IOC"
+                ],
+                "title": "Validity",
+                "type": "string"
+              }
+            },
+            "required": [
+              "transaction_type",
+              "quantity"
+            ],
+            "title": "OrderRequest",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "idempotency_key": {
+            "maxLength": 160,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "order": {
+            "$ref": "#/$defs/OrderRequest"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "order",
+          "idempotency_key"
+        ],
+        "title": "PlaceOrderRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "place_order",
+      "reconcile_with": null,
+      "request_model": "PlaceOrderRequest",
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit place basket write.",
+      "effect": "trade_write",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OrderRequest": {
+            "additionalProperties": false,
+            "properties": {
+              "disclosed_quantity": {
+                "anyOf": [
+                  {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Disclosed Quantity"
+              },
+              "exchange": {
+                "default": "NSE",
+                "maxLength": 12,
+                "minLength": 1,
+                "title": "Exchange",
+                "type": "string"
+              },
+              "instrument_token": {
+                "anyOf": [
+                  {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Instrument Token"
+              },
+              "order_type": {
+                "default": "MARKET",
+                "enum": [
+                  "MARKET",
+                  "LIMIT",
+                  "SL",
+                  "SL-M"
+                ],
+                "title": "Order Type",
+                "type": "string"
+              },
+              "price": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Price"
+              },
+              "product": {
+                "default": "CNC",
+                "enum": [
+                  "CNC",
+                  "MIS",
+                  "NRML"
+                ],
+                "title": "Product",
+                "type": "string"
+              },
+              "quantity": {
+                "exclusiveMinimum": 0,
+                "maximum": 1000000,
+                "title": "Quantity",
+                "type": "integer"
+              },
+              "symbol": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Symbol"
+              },
+              "tag": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Tag"
+              },
+              "transaction_type": {
+                "enum": [
+                  "BUY",
+                  "SELL"
+                ],
+                "title": "Transaction Type",
+                "type": "string"
+              },
+              "trigger_price": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Trigger Price"
+              },
+              "validity": {
+                "default": "DAY",
+                "enum": [
+                  "DAY",
+                  "IOC"
+                ],
+                "title": "Validity",
+                "type": "string"
+              }
+            },
+            "required": [
+              "transaction_type",
+              "quantity"
+            ],
+            "title": "OrderRequest",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "all_or_none": {
+            "default": false,
+            "title": "All Or None",
+            "type": "boolean"
+          },
+          "idempotency_key": {
+            "maxLength": 160,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "orders": {
+            "items": {
+              "$ref": "#/$defs/OrderRequest"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Orders",
+            "type": "array"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "orders",
+          "idempotency_key"
+        ],
+        "title": "BasketRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "place_basket",
+      "reconcile_with": null,
+      "request_model": "BasketRequest",
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded list orders read.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "RunSelector",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "list_orders",
+      "reconcile_with": null,
+      "request_model": "RunSelector",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded list trades read.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "RunSelector",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "list_trades",
+      "reconcile_with": null,
+      "request_model": "RunSelector",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded get order read.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "order_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Order Id",
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          },
+          "variety": {
+            "default": "regular",
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Variety",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "order_id"
+        ],
+        "title": "OrderActionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_order",
+      "reconcile_with": null,
+      "request_model": "OrderActionRequest",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded get order history read.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "order_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Order Id",
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          },
+          "variety": {
+            "default": "regular",
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Variety",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "order_id"
+        ],
+        "title": "OrderActionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_order_history",
+      "reconcile_with": null,
+      "request_model": "OrderActionRequest",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit modify order write.",
+      "effect": "trade_write",
+      "group": "orders",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "order_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Order Id",
+            "type": "string"
+          },
+          "order_type": {
+            "anyOf": [
+              {
+                "enum": [
+                  "MARKET",
+                  "LIMIT",
+                  "SL",
+                  "SL-M"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Order Type"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Price"
+          },
+          "quantity": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "maximum": 1000000,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Quantity"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          },
+          "trigger_price": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Trigger Price"
+          },
+          "validity": {
+            "anyOf": [
+              {
+                "enum": [
+                  "DAY",
+                  "IOC"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Validity"
+          },
+          "validity_ttl": {
+            "anyOf": [
+              {
+                "maximum": 86400,
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Validity Ttl"
+          },
+          "variety": {
+            "default": "regular",
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Variety",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "order_id"
+        ],
+        "title": "OrderModifyRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "modify_order",
+      "reconcile_with": null,
+      "request_model": "OrderModifyRequest",
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit cancel order write.",
+      "effect": "trade_write",
+      "group": "orders",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "order_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Order Id",
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          },
+          "variety": {
+            "default": "regular",
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Variety",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "order_id"
+        ],
+        "title": "OrderActionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "cancel_order",
+      "reconcile_with": null,
+      "request_model": "OrderActionRequest",
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded list baskets read.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "RunSelector",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "list_baskets",
+      "reconcile_with": null,
+      "request_model": "RunSelector",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded get basket read.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "basket_execution_id": {
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "basket_execution_id",
+          "strategy_run_id"
+        ],
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_basket",
+      "reconcile_with": null,
+      "request_model": null,
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit create bracket write.",
+      "effect": "trade_write",
+      "group": "orders",
+      "idempotent": false,
+      "input_schema": {
+        "$defs": {
+          "OrderRequest": {
+            "additionalProperties": false,
+            "properties": {
+              "disclosed_quantity": {
+                "anyOf": [
+                  {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Disclosed Quantity"
+              },
+              "exchange": {
+                "default": "NSE",
+                "maxLength": 12,
+                "minLength": 1,
+                "title": "Exchange",
+                "type": "string"
+              },
+              "instrument_token": {
+                "anyOf": [
+                  {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Instrument Token"
+              },
+              "order_type": {
+                "default": "MARKET",
+                "enum": [
+                  "MARKET",
+                  "LIMIT",
+                  "SL",
+                  "SL-M"
+                ],
+                "title": "Order Type",
+                "type": "string"
+              },
+              "price": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Price"
+              },
+              "product": {
+                "default": "CNC",
+                "enum": [
+                  "CNC",
+                  "MIS",
+                  "NRML"
+                ],
+                "title": "Product",
+                "type": "string"
+              },
+              "quantity": {
+                "exclusiveMinimum": 0,
+                "maximum": 1000000,
+                "title": "Quantity",
+                "type": "integer"
+              },
+              "symbol": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Symbol"
+              },
+              "tag": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Tag"
+              },
+              "transaction_type": {
+                "enum": [
+                  "BUY",
+                  "SELL"
+                ],
+                "title": "Transaction Type",
+                "type": "string"
+              },
+              "trigger_price": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Trigger Price"
+              },
+              "validity": {
+                "default": "DAY",
+                "enum": [
+                  "DAY",
+                  "IOC"
+                ],
+                "title": "Validity",
+                "type": "string"
+              }
+            },
+            "required": [
+              "transaction_type",
+              "quantity"
+            ],
+            "title": "OrderRequest",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "entry_order": {
+            "$ref": "#/$defs/OrderRequest"
+          },
+          "idempotency_key": {
+            "maxLength": 160,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "stoploss": {
+            "$ref": "#/$defs/OrderRequest"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/OrderRequest"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "entry_order",
+          "stoploss",
+          "idempotency_key"
+        ],
+        "title": "BracketRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "create_bracket",
+      "reconcile_with": null,
+      "request_model": "BracketRequest",
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded list brackets read.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "RunSelector",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "list_brackets",
+      "reconcile_with": null,
+      "request_model": "RunSelector",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded get bracket read.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "bracket_intent_id": {
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bracket_intent_id",
+          "strategy_run_id"
+        ],
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_bracket",
+      "reconcile_with": null,
+      "request_model": null,
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit cancel bracket write.",
+      "effect": "trade_write",
+      "group": "orders",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "bracket_intent_id": {
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bracket_intent_id",
+          "strategy_run_id"
+        ],
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "cancel_bracket",
+      "reconcile_with": null,
+      "request_model": null,
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit create gtt write.",
+      "effect": "trade_write",
+      "group": "orders",
+      "idempotent": false,
+      "input_schema": {
+        "$defs": {
+          "GttOrder": {
+            "additionalProperties": false,
+            "properties": {
+              "exchange": {
+                "default": "NSE",
+                "maxLength": 12,
+                "minLength": 1,
+                "title": "Exchange",
+                "type": "string"
+              },
+              "order_type": {
+                "const": "LIMIT",
+                "default": "LIMIT",
+                "title": "Order Type",
+                "type": "string"
+              },
+              "price": {
+                "exclusiveMinimum": 0,
+                "title": "Price",
+                "type": "number"
+              },
+              "product": {
+                "default": "CNC",
+                "enum": [
+                  "CNC",
+                  "MIS",
+                  "NRML"
+                ],
+                "title": "Product",
+                "type": "string"
+              },
+              "quantity": {
+                "exclusiveMinimum": 0,
+                "maximum": 1000000,
+                "title": "Quantity",
+                "type": "integer"
+              },
+              "tradingsymbol": {
+                "maxLength": 40,
+                "minLength": 1,
+                "title": "Tradingsymbol",
+                "type": "string"
+              },
+              "transaction_type": {
+                "enum": [
+                  "BUY",
+                  "SELL"
+                ],
+                "title": "Transaction Type",
+                "type": "string"
+              }
+            },
+            "required": [
+              "tradingsymbol",
+              "transaction_type",
+              "quantity",
+              "price"
+            ],
+            "title": "GttOrder",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "last_price": {
+            "exclusiveMinimum": 0,
+            "title": "Last Price",
+            "type": "number"
+          },
+          "orders": {
+            "items": {
+              "$ref": "#/$defs/GttOrder"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Orders",
+            "type": "array"
+          },
+          "tradingsymbol": {
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Tradingsymbol",
+            "type": "string"
+          },
+          "trigger_values": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Trigger Values",
+            "type": "array"
+          },
+          "type": {
+            "enum": [
+              "single",
+              "two-leg"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "tradingsymbol",
+          "trigger_values",
+          "last_price",
+          "orders"
+        ],
+        "title": "GttRequest",
+        "type": "object"
+      },
+      "live_only": true,
+      "name": "create_gtt",
+      "reconcile_with": null,
+      "request_model": "GttRequest",
+      "required_action": "gtt:write",
+      "scope": "account"
+    },
+    {
+      "description": "Inspect live account-level GTTs.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "list_gtts",
+      "reconcile_with": null,
+      "request_model": null,
+      "required_action": "gtt:read",
+      "scope": "account"
+    },
+    {
+      "description": "Bounded get gtt read.",
+      "effect": "read",
+      "group": "orders",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "trigger_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trigger_id"
+        ],
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_gtt",
+      "reconcile_with": null,
+      "request_model": null,
+      "required_action": "gtt:read",
+      "scope": "account"
+    },
+    {
+      "description": "Explicit modify gtt write.",
+      "effect": "trade_write",
+      "group": "orders",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "request": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "trigger_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "request",
+          "trigger_id"
+        ],
+        "type": "object"
+      },
+      "live_only": true,
+      "name": "modify_gtt",
+      "reconcile_with": null,
+      "request_model": null,
+      "required_action": "gtt:write",
+      "scope": "account"
+    },
+    {
+      "description": "Explicit delete gtt write.",
+      "effect": "trade_write",
+      "group": "orders",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "trigger_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trigger_id"
+        ],
+        "type": "object"
+      },
+      "live_only": true,
+      "name": "delete_gtt",
+      "reconcile_with": null,
+      "request_model": null,
+      "required_action": "gtt:write",
+      "scope": "account"
+    },
+    {
+      "description": "Explicit exit run write.",
+      "effect": "trade_write",
+      "group": "runs",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "minLength": 8,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Idempotency Key"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reason"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "ExitRunRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "exit_run",
+      "reconcile_with": null,
+      "request_model": "ExitRunRequest",
+      "required_action": "runs:exit",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit update run risk write.",
+      "effect": "trade_write",
+      "group": "runs",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_daily_loss": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Daily Loss"
+          },
+          "max_open_orders": {
+            "anyOf": [
+              {
+                "maximum": 10000,
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Open Orders"
+          },
+          "max_position_value": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Position Value"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reason"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "RiskRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "update_run_risk",
+      "reconcile_with": null,
+      "request_model": "RiskRequest",
+      "required_action": "risk:update",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit update run protection write.",
+      "effect": "trade_write",
+      "group": "runs",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "mode": {
+            "default": "exposure",
+            "maxLength": 40,
+            "minLength": 1,
+            "title": "Mode",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reason"
+          },
+          "stoploss_pct": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Stoploss Pct"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          },
+          "target_pct": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Target Pct"
+          },
+          "trailing_activate_pct": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Trailing Activate Pct"
+          },
+          "trailing_drawdown_pct": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Trailing Drawdown Pct"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "ProtectionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "update_run_protection",
+      "reconcile_with": null,
+      "request_model": "ProtectionRequest",
+      "required_action": "risk:update",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded get run protection read.",
+      "effect": "read",
+      "group": "runs",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "RunSelector",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_run_protection",
+      "reconcile_with": null,
+      "request_model": "RunSelector",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded get run pnl read.",
+      "effect": "read",
+      "group": "runs",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "RunSelector",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_run_pnl",
+      "reconcile_with": null,
+      "request_model": "RunSelector",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded list run timeline read.",
+      "effect": "read",
+      "group": "runs",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "after_cursor": {
+            "default": 0,
+            "minimum": 0,
+            "title": "After Cursor",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 100,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "PageRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "list_run_timeline",
+      "reconcile_with": null,
+      "request_model": "PageRequest",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded list execution events read.",
+      "effect": "read",
+      "group": "runs",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "after_cursor": {
+            "default": 0,
+            "minimum": 0,
+            "title": "After Cursor",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 100,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "PageRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "list_execution_events",
+      "reconcile_with": null,
+      "request_model": "PageRequest",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit log run decision write.",
+      "effect": "trade_write",
+      "group": "runs",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "decision_type": {
+            "enum": [
+              "signal",
+              "entry",
+              "exit",
+              "risk_update"
+            ],
+            "title": "Decision Type",
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          },
+          "summary": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "decision_type",
+          "summary"
+        ],
+        "title": "DecisionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "log_run_decision",
+      "reconcile_with": null,
+      "request_model": "DecisionRequest",
+      "required_action": "runs:log",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded list option expiries read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OptionSelector": {
+            "additionalProperties": false,
+            "properties": {
+              "delta_target": {
+                "anyOf": [
+                  {
+                    "exclusiveMaximum": 1,
+                    "exclusiveMinimum": -1,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Delta Target"
+              },
+              "kind": {
+                "default": "exact",
+                "enum": [
+                  "exact",
+                  "offset",
+                  "delta",
+                  "spread"
+                ],
+                "title": "Kind",
+                "type": "string"
+              },
+              "offset": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Offset"
+              },
+              "option_type": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "CE",
+                      "PE"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Option Type"
+              },
+              "spread_type": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Spread Type"
+              },
+              "strike": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Strike"
+              }
+            },
+            "title": "OptionSelector",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "expiry": {
+            "anyOf": [
+              {
+                "maxLength": 30,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expiry"
+          },
+          "product": {
+            "default": "NRML",
+            "enum": [
+              "NRML",
+              "MIS"
+            ],
+            "title": "Product",
+            "type": "string"
+          },
+          "quantity_lots": {
+            "default": 1,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Quantity Lots",
+            "type": "integer"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/OptionSelector"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "transaction_type": {
+            "default": "BUY",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Transaction Type",
+            "type": "string"
+          },
+          "underlying": {
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Underlying",
+            "type": "string"
+          }
+        },
+        "required": [
+          "underlying"
+        ],
+        "title": "OptionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "list_option_expiries",
+      "reconcile_with": null,
+      "request_model": "OptionRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get option chain read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OptionSelector": {
+            "additionalProperties": false,
+            "properties": {
+              "delta_target": {
+                "anyOf": [
+                  {
+                    "exclusiveMaximum": 1,
+                    "exclusiveMinimum": -1,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Delta Target"
+              },
+              "kind": {
+                "default": "exact",
+                "enum": [
+                  "exact",
+                  "offset",
+                  "delta",
+                  "spread"
+                ],
+                "title": "Kind",
+                "type": "string"
+              },
+              "offset": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Offset"
+              },
+              "option_type": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "CE",
+                      "PE"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Option Type"
+              },
+              "spread_type": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Spread Type"
+              },
+              "strike": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Strike"
+              }
+            },
+            "title": "OptionSelector",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "expiry": {
+            "anyOf": [
+              {
+                "maxLength": 30,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expiry"
+          },
+          "product": {
+            "default": "NRML",
+            "enum": [
+              "NRML",
+              "MIS"
+            ],
+            "title": "Product",
+            "type": "string"
+          },
+          "quantity_lots": {
+            "default": 1,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Quantity Lots",
+            "type": "integer"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/OptionSelector"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "transaction_type": {
+            "default": "BUY",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Transaction Type",
+            "type": "string"
+          },
+          "underlying": {
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Underlying",
+            "type": "string"
+          }
+        },
+        "required": [
+          "underlying"
+        ],
+        "title": "OptionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_option_chain",
+      "reconcile_with": null,
+      "request_model": "OptionRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get option mini chain read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OptionSelector": {
+            "additionalProperties": false,
+            "properties": {
+              "delta_target": {
+                "anyOf": [
+                  {
+                    "exclusiveMaximum": 1,
+                    "exclusiveMinimum": -1,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Delta Target"
+              },
+              "kind": {
+                "default": "exact",
+                "enum": [
+                  "exact",
+                  "offset",
+                  "delta",
+                  "spread"
+                ],
+                "title": "Kind",
+                "type": "string"
+              },
+              "offset": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Offset"
+              },
+              "option_type": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "CE",
+                      "PE"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Option Type"
+              },
+              "spread_type": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Spread Type"
+              },
+              "strike": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Strike"
+              }
+            },
+            "title": "OptionSelector",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "expiry": {
+            "anyOf": [
+              {
+                "maxLength": 30,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expiry"
+          },
+          "product": {
+            "default": "NRML",
+            "enum": [
+              "NRML",
+              "MIS"
+            ],
+            "title": "Product",
+            "type": "string"
+          },
+          "quantity_lots": {
+            "default": 1,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Quantity Lots",
+            "type": "integer"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/OptionSelector"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "transaction_type": {
+            "default": "BUY",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Transaction Type",
+            "type": "string"
+          },
+          "underlying": {
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Underlying",
+            "type": "string"
+          }
+        },
+        "required": [
+          "underlying"
+        ],
+        "title": "OptionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_option_mini_chain",
+      "reconcile_with": null,
+      "request_model": "OptionRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get option greeks read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OptionSelector": {
+            "additionalProperties": false,
+            "properties": {
+              "delta_target": {
+                "anyOf": [
+                  {
+                    "exclusiveMaximum": 1,
+                    "exclusiveMinimum": -1,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Delta Target"
+              },
+              "kind": {
+                "default": "exact",
+                "enum": [
+                  "exact",
+                  "offset",
+                  "delta",
+                  "spread"
+                ],
+                "title": "Kind",
+                "type": "string"
+              },
+              "offset": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Offset"
+              },
+              "option_type": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "CE",
+                      "PE"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Option Type"
+              },
+              "spread_type": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Spread Type"
+              },
+              "strike": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Strike"
+              }
+            },
+            "title": "OptionSelector",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "expiry": {
+            "anyOf": [
+              {
+                "maxLength": 30,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expiry"
+          },
+          "product": {
+            "default": "NRML",
+            "enum": [
+              "NRML",
+              "MIS"
+            ],
+            "title": "Product",
+            "type": "string"
+          },
+          "quantity_lots": {
+            "default": 1,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Quantity Lots",
+            "type": "integer"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/OptionSelector"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "transaction_type": {
+            "default": "BUY",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Transaction Type",
+            "type": "string"
+          },
+          "underlying": {
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Underlying",
+            "type": "string"
+          }
+        },
+        "required": [
+          "underlying"
+        ],
+        "title": "OptionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_option_greeks",
+      "reconcile_with": null,
+      "request_model": "OptionRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get option pcr read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OptionSelector": {
+            "additionalProperties": false,
+            "properties": {
+              "delta_target": {
+                "anyOf": [
+                  {
+                    "exclusiveMaximum": 1,
+                    "exclusiveMinimum": -1,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Delta Target"
+              },
+              "kind": {
+                "default": "exact",
+                "enum": [
+                  "exact",
+                  "offset",
+                  "delta",
+                  "spread"
+                ],
+                "title": "Kind",
+                "type": "string"
+              },
+              "offset": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Offset"
+              },
+              "option_type": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "CE",
+                      "PE"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Option Type"
+              },
+              "spread_type": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Spread Type"
+              },
+              "strike": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Strike"
+              }
+            },
+            "title": "OptionSelector",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "expiry": {
+            "anyOf": [
+              {
+                "maxLength": 30,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expiry"
+          },
+          "product": {
+            "default": "NRML",
+            "enum": [
+              "NRML",
+              "MIS"
+            ],
+            "title": "Product",
+            "type": "string"
+          },
+          "quantity_lots": {
+            "default": 1,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Quantity Lots",
+            "type": "integer"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/OptionSelector"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "transaction_type": {
+            "default": "BUY",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Transaction Type",
+            "type": "string"
+          },
+          "underlying": {
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Underlying",
+            "type": "string"
+          }
+        },
+        "required": [
+          "underlying"
+        ],
+        "title": "OptionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_option_pcr",
+      "reconcile_with": null,
+      "request_model": "OptionRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded get option max pain read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OptionSelector": {
+            "additionalProperties": false,
+            "properties": {
+              "delta_target": {
+                "anyOf": [
+                  {
+                    "exclusiveMaximum": 1,
+                    "exclusiveMinimum": -1,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Delta Target"
+              },
+              "kind": {
+                "default": "exact",
+                "enum": [
+                  "exact",
+                  "offset",
+                  "delta",
+                  "spread"
+                ],
+                "title": "Kind",
+                "type": "string"
+              },
+              "offset": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Offset"
+              },
+              "option_type": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "CE",
+                      "PE"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Option Type"
+              },
+              "spread_type": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Spread Type"
+              },
+              "strike": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Strike"
+              }
+            },
+            "title": "OptionSelector",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "expiry": {
+            "anyOf": [
+              {
+                "maxLength": 30,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expiry"
+          },
+          "product": {
+            "default": "NRML",
+            "enum": [
+              "NRML",
+              "MIS"
+            ],
+            "title": "Product",
+            "type": "string"
+          },
+          "quantity_lots": {
+            "default": 1,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Quantity Lots",
+            "type": "integer"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/OptionSelector"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "transaction_type": {
+            "default": "BUY",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Transaction Type",
+            "type": "string"
+          },
+          "underlying": {
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Underlying",
+            "type": "string"
+          }
+        },
+        "required": [
+          "underlying"
+        ],
+        "title": "OptionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_option_max_pain",
+      "reconcile_with": null,
+      "request_model": "OptionRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded resolve option contracts read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OptionSelector": {
+            "additionalProperties": false,
+            "properties": {
+              "delta_target": {
+                "anyOf": [
+                  {
+                    "exclusiveMaximum": 1,
+                    "exclusiveMinimum": -1,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Delta Target"
+              },
+              "kind": {
+                "default": "exact",
+                "enum": [
+                  "exact",
+                  "offset",
+                  "delta",
+                  "spread"
+                ],
+                "title": "Kind",
+                "type": "string"
+              },
+              "offset": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Offset"
+              },
+              "option_type": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "CE",
+                      "PE"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Option Type"
+              },
+              "spread_type": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Spread Type"
+              },
+              "strike": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Strike"
+              }
+            },
+            "title": "OptionSelector",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "expiry": {
+            "anyOf": [
+              {
+                "maxLength": 30,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expiry"
+          },
+          "product": {
+            "default": "NRML",
+            "enum": [
+              "NRML",
+              "MIS"
+            ],
+            "title": "Product",
+            "type": "string"
+          },
+          "quantity_lots": {
+            "default": 1,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Quantity Lots",
+            "type": "integer"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/OptionSelector"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "transaction_type": {
+            "default": "BUY",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Transaction Type",
+            "type": "string"
+          },
+          "underlying": {
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Underlying",
+            "type": "string"
+          }
+        },
+        "required": [
+          "underlying"
+        ],
+        "title": "OptionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "resolve_option_contracts",
+      "reconcile_with": null,
+      "request_model": "OptionRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    },
+    {
+      "description": "Bounded preview option strategy read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OptionSelector": {
+            "additionalProperties": false,
+            "properties": {
+              "delta_target": {
+                "anyOf": [
+                  {
+                    "exclusiveMaximum": 1,
+                    "exclusiveMinimum": -1,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Delta Target"
+              },
+              "kind": {
+                "default": "exact",
+                "enum": [
+                  "exact",
+                  "offset",
+                  "delta",
+                  "spread"
+                ],
+                "title": "Kind",
+                "type": "string"
+              },
+              "offset": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Offset"
+              },
+              "option_type": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "CE",
+                      "PE"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Option Type"
+              },
+              "spread_type": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Spread Type"
+              },
+              "strike": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Strike"
+              }
+            },
+            "title": "OptionSelector",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "expiry": {
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Expiry",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "minLength": 8,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Idempotency Key"
+          },
+          "legs": {
+            "items": {
+              "$ref": "#/$defs/OptionSelector"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Legs",
+            "type": "array"
+          },
+          "product": {
+            "default": "NRML",
+            "enum": [
+              "NRML",
+              "MIS"
+            ],
+            "title": "Product",
+            "type": "string"
+          },
+          "quantity_lots": {
+            "default": 1,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Quantity Lots",
+            "type": "integer"
+          },
+          "strategy_name": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Name",
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Strategy Run Id"
+          },
+          "transaction_type": {
+            "default": "BUY",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Transaction Type",
+            "type": "string"
+          },
+          "underlying": {
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Underlying",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_name",
+          "underlying",
+          "expiry",
+          "legs"
+        ],
+        "title": "OptionRunRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "preview_option_strategy",
+      "reconcile_with": null,
+      "request_model": "OptionRunRequest",
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded preview option entry read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_scope": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Account Scope"
+          },
+          "all_or_none": {
+            "default": false,
+            "title": "All Or None",
+            "type": "boolean"
+          },
+          "execution_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "paper",
+                  "live",
+                  "dry_run"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Execution Mode"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "minLength": 8,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Idempotency Key"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "OptionActionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "preview_option_entry",
+      "reconcile_with": null,
+      "request_model": "OptionActionRequest",
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded preview option exit read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_scope": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Account Scope"
+          },
+          "all_or_none": {
+            "default": false,
+            "title": "All Or None",
+            "type": "boolean"
+          },
+          "execution_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "paper",
+                  "live",
+                  "dry_run"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Execution Mode"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "minLength": 8,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Idempotency Key"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "OptionActionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "preview_option_exit",
+      "reconcile_with": null,
+      "request_model": "OptionActionRequest",
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit create option run write.",
+      "effect": "trade_write",
+      "group": "options",
+      "idempotent": false,
+      "input_schema": {
+        "$defs": {
+          "OptionSelector": {
+            "additionalProperties": false,
+            "properties": {
+              "delta_target": {
+                "anyOf": [
+                  {
+                    "exclusiveMaximum": 1,
+                    "exclusiveMinimum": -1,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Delta Target"
+              },
+              "kind": {
+                "default": "exact",
+                "enum": [
+                  "exact",
+                  "offset",
+                  "delta",
+                  "spread"
+                ],
+                "title": "Kind",
+                "type": "string"
+              },
+              "offset": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Offset"
+              },
+              "option_type": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "CE",
+                      "PE"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Option Type"
+              },
+              "spread_type": {
+                "anyOf": [
+                  {
+                    "maxLength": 40,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Spread Type"
+              },
+              "strike": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Strike"
+              }
+            },
+            "title": "OptionSelector",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "description": "Create an option run only inside an explicitly authorized worker run.",
+        "properties": {
+          "account_scope": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Account Scope",
+            "type": "string"
+          },
+          "execution_mode": {
+            "enum": [
+              "paper",
+              "live",
+              "dry_run"
+            ],
+            "title": "Execution Mode",
+            "type": "string"
+          },
+          "expiry": {
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Expiry",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "minLength": 8,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Idempotency Key"
+          },
+          "legs": {
+            "items": {
+              "$ref": "#/$defs/OptionSelector"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Legs",
+            "type": "array"
+          },
+          "product": {
+            "default": "NRML",
+            "enum": [
+              "NRML",
+              "MIS"
+            ],
+            "title": "Product",
+            "type": "string"
+          },
+          "quantity_lots": {
+            "default": 1,
+            "maximum": 100,
+            "minimum": 1,
+            "title": "Quantity Lots",
+            "type": "integer"
+          },
+          "strategy_name": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Name",
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          },
+          "transaction_type": {
+            "default": "BUY",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Transaction Type",
+            "type": "string"
+          },
+          "underlying": {
+            "maxLength": 30,
+            "minLength": 1,
+            "title": "Underlying",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_name",
+          "strategy_run_id",
+          "underlying",
+          "expiry",
+          "legs",
+          "account_scope",
+          "execution_mode"
+        ],
+        "title": "OptionCreateRunRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "create_option_run",
+      "reconcile_with": null,
+      "request_model": "OptionCreateRunRequest",
+      "required_action": "runs:create",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit enter option run write.",
+      "effect": "trade_write",
+      "group": "options",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "description": "Option entry/exit requests must carry a stable submission key.",
+        "properties": {
+          "account_scope": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Account Scope",
+            "type": "string"
+          },
+          "all_or_none": {
+            "default": false,
+            "title": "All Or None",
+            "type": "boolean"
+          },
+          "execution_mode": {
+            "enum": [
+              "paper",
+              "live",
+              "dry_run"
+            ],
+            "title": "Execution Mode",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "maxLength": 160,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "execution_mode",
+          "account_scope",
+          "idempotency_key"
+        ],
+        "title": "OptionWriteActionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "enter_option_run",
+      "reconcile_with": null,
+      "request_model": "OptionWriteActionRequest",
+      "required_action": "intents:submit",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit exit option run write.",
+      "effect": "trade_write",
+      "group": "options",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "description": "Option entry/exit requests must carry a stable submission key.",
+        "properties": {
+          "account_scope": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Account Scope",
+            "type": "string"
+          },
+          "all_or_none": {
+            "default": false,
+            "title": "All Or None",
+            "type": "boolean"
+          },
+          "execution_mode": {
+            "enum": [
+              "paper",
+              "live",
+              "dry_run"
+            ],
+            "title": "Execution Mode",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "maxLength": 160,
+            "minLength": 8,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "execution_mode",
+          "account_scope",
+          "idempotency_key"
+        ],
+        "title": "OptionWriteActionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "exit_option_run",
+      "reconcile_with": null,
+      "request_model": "OptionWriteActionRequest",
+      "required_action": "runs:exit",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded get option run state read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_scope": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Account Scope"
+          },
+          "all_or_none": {
+            "default": false,
+            "title": "All Or None",
+            "type": "boolean"
+          },
+          "execution_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "paper",
+                  "live",
+                  "dry_run"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Execution Mode"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "minLength": 8,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Idempotency Key"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "OptionActionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_option_run_state",
+      "reconcile_with": null,
+      "request_model": "OptionActionRequest",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Explicit update option protection write.",
+      "effect": "trade_write",
+      "group": "options",
+      "idempotent": false,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_scope": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Account Scope"
+          },
+          "all_or_none": {
+            "default": false,
+            "title": "All Or None",
+            "type": "boolean"
+          },
+          "execution_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "paper",
+                  "live",
+                  "dry_run"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Execution Mode"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "minLength": 8,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Idempotency Key"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "OptionActionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "update_option_protection",
+      "reconcile_with": null,
+      "request_model": "OptionActionRequest",
+      "required_action": "risk:update",
+      "scope": "run"
+    },
+    {
+      "description": "Bounded get option protection read.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_scope": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Account Scope"
+          },
+          "all_or_none": {
+            "default": false,
+            "title": "All Or None",
+            "type": "boolean"
+          },
+          "execution_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "paper",
+                  "live",
+                  "dry_run"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Execution Mode"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "minLength": 8,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Idempotency Key"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id"
+        ],
+        "title": "OptionActionRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "get_option_protection",
+      "reconcile_with": null,
+      "request_model": "OptionActionRequest",
+      "required_action": "runs:read",
+      "scope": "run"
+    },
+    {
+      "description": "Pure simulation of option protection against supplied snapshots.",
+      "effect": "read",
+      "group": "options",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "OptionMetricSnapshot": {
+            "additionalProperties": false,
+            "properties": {
+              "delta": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Delta"
+              },
+              "gamma": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Gamma"
+              },
+              "pnl": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Pnl"
+              },
+              "price": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Price"
+              },
+              "spot": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Spot"
+              },
+              "theta": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Theta"
+              },
+              "timestamp": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Timestamp"
+              },
+              "underlying_price": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Underlying Price"
+              },
+              "vega": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Vega"
+              }
+            },
+            "title": "OptionMetricSnapshot",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "metric_snapshots": {
+            "items": {
+              "$ref": "#/$defs/OptionMetricSnapshot"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Metric Snapshots",
+            "type": "array"
+          },
+          "strategy_run_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Strategy Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_run_id",
+          "metric_snapshots"
+        ],
+        "title": "OptionReplayRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "replay_option_protection",
+      "reconcile_with": null,
+      "request_model": "OptionReplayRequest",
+      "required_action": "market:read",
+      "scope": "run"
+    },
+    {
+      "description": "Calculate one allowlisted SDK indicator over bounded supplied candles.",
+      "effect": "read",
+      "group": "indicators",
+      "idempotent": true,
+      "input_schema": {
+        "$defs": {
+          "IndicatorBar": {
+            "additionalProperties": false,
+            "properties": {
+              "close": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Close"
+              },
+              "high": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "High"
+              },
+              "is_complete": {
+                "default": true,
+                "title": "Is Complete",
+                "type": "boolean"
+              },
+              "low": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Low"
+              },
+              "open": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Open"
+              },
+              "timestamp": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Timestamp"
+              },
+              "volume": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Volume"
+              }
+            },
+            "title": "IndicatorBar",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "bars": {
+            "items": {
+              "$ref": "#/$defs/IndicatorBar"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Bars",
+            "type": "array"
+          },
+          "fast_period": {
+            "default": 12,
+            "maximum": 500,
+            "minimum": 1,
+            "title": "Fast Period",
+            "type": "integer"
+          },
+          "include_forming": {
+            "default": false,
+            "title": "Include Forming",
+            "type": "boolean"
+          },
+          "multiplier": {
+            "default": 2.0,
+            "exclusiveMinimum": 0,
+            "maximum": 10,
+            "title": "Multiplier",
+            "type": "number"
+          },
+          "name": {
+            "enum": [
+              "sma",
+              "ema",
+              "wma",
+              "vwma",
+              "supertrend",
+              "rsi",
+              "macd",
+              "ppo",
+              "dpo",
+              "stochastic",
+              "cci",
+              "williams_r",
+              "linreg",
+              "atr",
+              "bbands",
+              "keltner",
+              "adx",
+              "aroon",
+              "sar",
+              "obv",
+              "vwap",
+              "mfi",
+              "crossover",
+              "crossunder",
+              "highest",
+              "lowest",
+              "rising",
+              "falling"
+            ],
+            "title": "Name",
+            "type": "string"
+          },
+          "period": {
+            "default": 14,
+            "maximum": 500,
+            "minimum": 1,
+            "title": "Period",
+            "type": "integer"
+          },
+          "signal_period": {
+            "default": 9,
+            "maximum": 500,
+            "minimum": 1,
+            "title": "Signal Period",
+            "type": "integer"
+          },
+          "slow_period": {
+            "default": 26,
+            "maximum": 500,
+            "minimum": 1,
+            "title": "Slow Period",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "bars"
+        ],
+        "title": "IndicatorRequest",
+        "type": "object"
+      },
+      "live_only": false,
+      "name": "calculate_indicator",
+      "reconcile_with": null,
+      "request_model": "IndicatorRequest",
+      "required_action": "market:read",
+      "scope": "none"
+    }
+  ]
+}
