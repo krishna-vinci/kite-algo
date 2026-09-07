@@ -168,6 +168,7 @@ def main() -> None:
             "input_schema": input_schema,
         })
 
+    tools.sort(key=lambda entry: entry["name"])
     out = REPO / "mcp/go/internal/catalog/catalog.json"
     out.write_text(json.dumps({"tools": tools}, indent=2, sort_keys=True) + "\n")
 
