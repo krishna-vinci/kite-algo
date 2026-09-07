@@ -1,0 +1,29 @@
+# Phase 1 parity service: Go MCP adapter beside the Python one.
+# Usage:
+#   docker compose -f compose.yml -f compose.mcp-go.yml --profile mcp up -d mcp-go
+# At Phase 3 cutover this merges into compose.yml and the Python service retires.
+services:
+  mcp-go:
+    profiles: [mcp]
+    build:
+      context: ./mcp/go
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    environment:
+      KITE_MCP_TRANSPORT: http
+      KITE_MCP_HOST: 0.0.0.0
+      KITE_MCP_PORT: "8788"
+      KITE_MCP_API_URL: http://finance-app:8777
+      KITE_MCP_WORKER_TOKEN: ${KITE_MCP_WORKER_TOKEN:-}
+    ports:
+      - "${KITE_MCP_BIND_ADDRESS:-0.0.0.0}:18789:8788"
+    depends_on:
+      finance-app:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true

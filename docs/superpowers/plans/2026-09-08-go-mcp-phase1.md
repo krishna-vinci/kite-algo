@@ -543,11 +543,24 @@ Run: golden parity test, contract harness subset, RSS measurement, `go vet ./...
 
 ## Phase 1 outcome
 
-Progress as of 2026-09-08: Tasks 0-6 complete (toolchain go1.24 via
-GOTOOLCHAIN auto to 1.25, module + SDK v1.7.0, catalog exporter with
-request-model map + synthesized ad-hoc schemas, embedded catalog with
-golden parity tests, backend client, healthz transport, adapter with
-tools/list parity proven over in-memory session AND live streamable
-HTTP: 73 tools). Tasks 7-9 (contract harness env-switch, Dockerfile +
-compose mcp-go service on 18789, phase gate with RSS < 40MiB check)
-remain.
+**Complete (2026-09-08).** All nine tasks green.
+
+- Toolchain: go1.24 installed; SDK auto-chained GOTOOLCHAIN to go1.25.0.
+- Module `mcp/go` on `github.com/modelcontextprotocol/go-sdk` v1.7.0 (only dependency).
+- Catalog exporter (`tools/export_catalog.py`) emits all 73 tools with
+  request-model JSON Schemas (pydantic `model_json_schema`) plus synthesized
+  schemas for the 8 ad-hoc-arg tools; golden fixture pins names.
+- Embedded catalog passes golden name parity + schema presence + ByName tests.
+- Backend client (bearer, typed HTTPError) and /healthz transport tested.
+- Adapter serves the full catalog over the SDK: tools/list parity proven via
+  in-memory session, pytest harness (`tests/mcp/test_go_parity.py`, run with
+  KITE_MCP_PARITY_BIN set) AND a live curl streamable-HTTP handshake (73 tools).
+- Dockerfile: multi-stage alpine build -> **19.6 MB image** (Python: 230 MB);
+  compose override `compose.mcp-go.yml` runs `mcp-go` on 18789.
+- **Phase gate: RSS 8.0-8.1 MiB serving tools/list in Docker -- target <40 MiB
+  exceeded by 5x.** go vet clean, gofmt clean.
+
+Remaining before cutover (Phase 2): dispatch semantics -- schema validation,
+policy/profiles/capability filtering, run leases with heartbeats, error
+taxonomy, concurrency semaphore, result caps (spec section 5) -- each with
+tests; then Phase 3 hardening + comparison matrix + cutover.
