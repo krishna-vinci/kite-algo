@@ -1,0 +1,12 @@
+# Test image context contains only disposable MCP checks; no source, secrets,
+# virtual environments, build artifacts, or Compose configuration are sent.
+**
+!tests/
+!tests/mcp/
+!tests/mcp/**
+!scripts/
+!scripts/mcp_codex_headers.py
+!mcp/
+!mcp/python/
+!mcp/python/kite_algo_mcp/
+!mcp/python/kite_algo_mcp/coverage.json

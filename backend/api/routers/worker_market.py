@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from backend.api.schemas.investment_worker import CalendarResponse, CalendarStatusResponse, IndexSnapshotResponse, IndexStatusResponse, PortfolioSnapshotResponse
+from backend.api.schemas.worker_indicators import WorkerIndicatorRequest
 from backend.api.services.market_data import WorkerInstrumentResolveRequest, WorkerMarketSnapshotRequest, WorkerQuoteRequest
 from backend.api.routers.worker_shared import *
 
@@ -324,6 +325,20 @@ async def delete_worker_gtt_trigger(request: Request, trigger_id: int):
         raise _normalize_worker_gtt_error(exc) from exc
 
 
+async def compute_worker_market_indicator(request: Request, payload: WorkerIndicatorRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    # Imported lazily so environments without the optional numerical stack can
+    # still import this router (tests, tooling); the backend runtime always
+    # has pandas/numpy.
+    from backend.api.services.indicators_service import compute_indicator
+
+    try:
+        return await asyncio.to_thread(compute_indicator, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 router.add_api_route("/worker/market/instruments/resolve", resolve_worker_market_ticker, methods=["GET"])
 router.add_api_route("/worker/market/instruments/search", search_worker_market_tickers, methods=["GET"])
 router.add_api_route("/worker/market/instruments/resolve", resolve_worker_market_tickers, methods=["POST"])
@@ -333,6 +348,7 @@ router.add_api_route("/worker/market/candles", get_worker_market_candles, method
 router.add_api_route("/worker/market/history", get_worker_market_history, methods=["GET"])
 router.add_api_route("/worker/market/candles/stream", stream_worker_market_candles, methods=["GET"])
 router.add_api_route("/worker/market/snapshot", get_worker_market_snapshot, methods=["POST"])
+router.add_api_route("/worker/indicators", compute_worker_market_indicator, methods=["POST"])
 router.add_api_route("/worker/funds", get_worker_funds, methods=["GET"])
 router.add_api_route("/worker/account/portfolio", get_worker_account_portfolio, methods=["GET"], response_model=PortfolioSnapshotResponse)
 router.add_api_route("/worker/market/indices/{source_list}", get_worker_index_constituents, methods=["GET"], response_model=IndexSnapshotResponse)

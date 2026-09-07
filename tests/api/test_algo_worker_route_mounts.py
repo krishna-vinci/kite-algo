@@ -61,6 +61,7 @@ def test_generic_algo_worker_routes_are_mounted() -> None:
         ("GET", "/api/algo-workers/worker/market/instruments/search"),
         ("POST", "/api/algo-workers/worker/market/instruments/resolve"),
         ("POST", "/api/algo-workers/worker/market/quotes"),
+        ("POST", "/api/algo-workers/worker/indicators"),
         ("GET", "/api/algo-workers/worker/market/ticks/stream"),
         ("GET", "/api/algo-workers/worker/market/candles"),
         ("GET", "/api/algo-workers/worker/market/history"),

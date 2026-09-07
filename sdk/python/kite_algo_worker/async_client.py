@@ -745,6 +745,16 @@ class AsyncKiteAlgoWorkerClient:
             },
         )
 
+    async def calculate_indicator(self, request: Mapping[str, Any]) -> JsonDict:
+        """Compute one allowlisted indicator over supplied candles server-side.
+
+        ``request`` mirrors the worker contract: ``name``, ``bars`` and the
+        optional ``period``/``fast_period``/``slow_period``/``signal_period``/
+        ``multiplier``/``include_forming`` knobs.  The heavy numerical stack
+        stays on the worker, so callers never need pandas for this.
+        """
+        return await self._request("POST", "/worker/indicators", json=dict(request))
+
     async def preview_order(self, strategy_run_id: str, order: Mapping[str, Any], *, metadata: Optional[Mapping[str, Any]] = None) -> JsonDict:
         return await self._request(
             "POST",

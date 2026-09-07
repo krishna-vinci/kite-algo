@@ -686,6 +686,16 @@ class KiteAlgoWorkerClient:
             json={"symbols": symbols, "instrument_tokens": tokens, "mode": mode},
         )
 
+    def calculate_indicator(self, request: Mapping[str, Any]) -> JsonDict:
+        """Compute one allowlisted indicator over supplied candles server-side.
+
+        ``request`` mirrors the worker contract: ``name``, ``bars`` and the
+        optional ``period``/``fast_period``/``slow_period``/``signal_period``/
+        ``multiplier``/``include_forming`` knobs.  The heavy numerical stack
+        stays on the worker, so callers never need pandas for this.
+        """
+        return self._request("POST", "/worker/indicators", json=dict(request))
+
     def stream_ticks(self, instruments: Iterable[str | int], mode: str = "quote") -> Iterator[JsonDict]:
         symbols, tokens = self._split_instruments(instruments)
         return self._stream_sse(

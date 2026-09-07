@@ -31,6 +31,17 @@ class WorkflowFake:
     async def get_candles(self, instrument, interval, lookback):
         return {"candles": [{"timestamp": str(index), "close": 10 + index, "open": 9 + index, "high": 11 + index, "low": 8 + index, "volume": 10} for index in range(lookback)]}
 
+    async def calculate_indicator(self, payload):
+        count = len(payload["bars"])
+        return {
+            "name": payload["name"],
+            "timestamps": [str(index) for index in range(count)],
+            "values": [None] * count,
+            "included_forming": payload["include_forming"],
+            "ready": False,
+            "warmup_rows": count,
+        }
+
     async def create_run(self, **kwargs):
         return {"strategy_run_id": "run-1", "execution_mode": kwargs["execution_mode"]}
 

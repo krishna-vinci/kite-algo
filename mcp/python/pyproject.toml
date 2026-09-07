@@ -5,16 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kite-algo-mcp"
 version = "0.1.0"
-description = "Safe stdio MCP adapter for the Kite Algo worker SDK"
+description = "Authenticated stdio and Streamable HTTP MCP adapter for the Kite Algo worker SDK"
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "fastmcp==4.0.3",
   "mcp==2.1.1",
   "pydantic>=2,<3",
   "kite-algo-worker>=0.9,<0.10",
-  "numpy>=1.24",
-  "pandas>=2",
 ]
 
 [project.scripts]

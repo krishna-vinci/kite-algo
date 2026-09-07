@@ -58,6 +58,7 @@ WORKER_HTTP_ENDPOINTS = (
     _e("GET", "/worker/gtt/triggers/{trigger_id}", "get_gtt"),
     _e("PUT", "/worker/gtt/triggers/{trigger_id}", "modify_gtt", mutates=True),
     _e("GET", "/worker/health", "health"),
+    _e("POST", "/worker/indicators", "calculate_indicator"),
     _e("POST", "/worker/heartbeat", "heartbeat", mutates=True),
     _e("GET", "/worker/market/calendar", "get_market_calendar"),
     _e("GET", "/worker/market/calendar/status", "get_market_calendar_status"),

@@ -1,10 +1,17 @@
-"""Thin Python SDK for external Kite Algo strategy workers."""
+"""Thin Python SDK for external Kite Algo strategy workers.
 
+Only the HTTP client stack imports eagerly.  Everything that needs optional
+numerical dependencies (``pandas``/``numpy``/``numba`` via ``indicators`` and
+``marketdata``) resolves lazily through module ``__getattr__``, so embedding
+processes such as the MCP adapter stay light until they actually touch the
+heavy surfaces.
+"""
+
+from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version as _package_version
 from pathlib import Path
 import re
 
-from . import options
 from .async_client import AsyncKiteAlgoWorkerClient
 from .client import AlgoWorkerConfig, KiteAlgoWorkerClient, KiteAlgoWorkerError
 from .exceptions import (
@@ -16,116 +23,80 @@ from .exceptions import (
     UnsupportedSchemaVersionError,
     WorkerDataUnavailableError,
 )
-from .fundamentals import (
-    FundamentalFeatureRow,
-    FundamentalFeatures,
-    FundamentalsEnvelope,
-    FundamentalsStatus,
-    FundamentalsStatements,
-    FundamentalsSymbolStatus,
-    FundamentalsSyncRun,
-)
-from .helpers import (
-    amo_limit_order,
-    amo_market_order,
-    ensure_run,
-    live_equity_market_order,
-    preview_then_place_order,
-    wait_for_fresh_candle,
-    wait_for_history,
-    wait_for_quotes,
-    wait_for_terminal_order_state,
-    warmup_history,
-)
-from .investment import (
-    WorkerAccountPortfolioSnapshot,
-    WorkerCalendarSession,
-    WorkerIndexConstituentStatus,
-    WorkerIndexConstituentsSnapshot,
-    WorkerIndexMember,
-    WorkerMarketCalendarSnapshot,
-    WorkerMarketCalendarStatus,
-    WorkerPortfolioHolding,
-    WorkerPortfolioPosition,
-    WorkerSourceEnvelope,
-)
-from .managed_run import ManagedRun
-from .indicators import BaseIndicator, IndicatorInput, IndicatorValue, LiveIndicatorEngine, NUMBA_AVAILABLE, TechnicalAnalysis, crossover, format_output, njit, normalize_input, sma, ta
-from .models import (
-    CostContract,
-    ItemizedCharges,
-    WorkerBasketExecution,
-    WorkerBasketExecutionLeg,
-    WorkerBasketExecutionsResponse,
-    WorkerBracketActionResult,
-    WorkerBracketIntent,
-    WorkerBracketListResponse,
-    WorkerCandle,
-    WorkerExecutionEvent,
-    WorkerExecutionEventsResponse,
-    WorkerHistoricalCandles,
-    OrderPreview,
-    PreviewPayload,
-    RunProtectionState,
-    SafetyCheckResult,
-    WorkerGttTrigger,
-    WorkerGttWriteResult,
-    WorkerOrderHistoryEvent,
-    WorkerOrderHistoryResponse,
-    WorkerOrderSnapshot,
-    WorkerFundsSegment,
-    WorkerFundsSnapshot,
-    WorkerOrderResult,
-    WorkerOrdersResponse,
-    WorkerRunHealthSnapshot,
-    WorkerRunPnlLeg,
-    WorkerRunPnlSnapshot,
-    WorkerRunPnlTotals,
-    WorkerTimelineEvent,
-    WorkerTimelineResponse,
-    WorkerTradeSnapshot,
-    WorkerTradesResponse,
-)
-from .orders import OrderBuilder, equity_market_order, limit_order, market_order, option_market_order, sl_m_order, sl_order
-from .options import (
-    AsyncOptionWorkerClient,
-    OptionEntryPreviewRequest,
-    OptionExpirySnapshot,
-    OptionWorkerClient,
-    SpreadLegSelection,
-    SpreadSpec,
-    option_leg,
-    resolve_delta_leg,
-    resolve_offset_leg,
-    resolve_option_contracts,
-    resolve_option_leg,
-    resolve_spread,
-)
-from .protection import BackendProtection, BasketProtection, OperationalProtection, ProtectedPosition
-from .run_config import RunConfig
-from .ws import StreamHealth, WorkerCandleWebSocketClient, WorkerRunPnlWebSocketClient, WorkerTickWebSocketClient, WorkerWebSocketClient
 
-_MARKETDATA_AVAILABLE = False
+_LAZY_EXPORTS: dict[str, str] = {}
 
-try:
-    from .marketdata import OhlcvArrays as _OhlcvArrays, candles_to_df as _candles_to_df, ohlcv_arrays as _ohlcv_arrays
 
-    OhlcvArrays = _OhlcvArrays  # type: ignore[assignment]
-    candles_to_df = _candles_to_df  # type: ignore[assignment]
-    ohlcv_arrays = _ohlcv_arrays  # type: ignore[assignment]
-    _MARKETDATA_AVAILABLE = True
-except ModuleNotFoundError as exc:
-    if exc.name not in {"numpy", "pandas"}:
-        raise
+def _lazy(module: str, *names: str) -> None:
+    for name in names:
+        _LAZY_EXPORTS[name] = module
 
-    class OhlcvArrays:  # type: ignore[no-redef]
-        pass
 
-    def candles_to_df(*_args, **_kwargs):  # type: ignore[no-redef]
-        raise ModuleNotFoundError("pandas and numpy are required for kite_algo_worker marketdata helpers")
+_lazy("fundamentals", "FundamentalFeatureRow", "FundamentalFeatures", "FundamentalsEnvelope", "FundamentalsStatus", "FundamentalsStatements", "FundamentalsSymbolStatus", "FundamentalsSyncRun")
+_lazy("helpers", "amo_limit_order", "amo_market_order", "ensure_run", "live_equity_market_order", "preview_then_place_order", "wait_for_fresh_candle", "wait_for_history", "wait_for_quotes", "wait_for_terminal_order_state", "warmup_history")
+_lazy("investment", "WorkerAccountPortfolioSnapshot", "WorkerCalendarSession", "WorkerIndexConstituentStatus", "WorkerIndexConstituentsSnapshot", "WorkerIndexMember", "WorkerMarketCalendarSnapshot", "WorkerMarketCalendarStatus", "WorkerPortfolioHolding", "WorkerPortfolioPosition", "WorkerSourceEnvelope")
+_lazy("managed_run", "ManagedRun")
+_lazy("indicators", "BaseIndicator", "IndicatorInput", "IndicatorValue", "LiveIndicatorEngine", "NUMBA_AVAILABLE", "TechnicalAnalysis", "crossover", "format_output", "njit", "normalize_input", "sma", "ta")
+_lazy("models", "CostContract", "ItemizedCharges", "WorkerBasketExecution", "WorkerBasketExecutionLeg", "WorkerBasketExecutionsResponse", "WorkerBracketActionResult", "WorkerBracketIntent", "WorkerBracketListResponse", "WorkerCandle", "WorkerExecutionEvent", "WorkerExecutionEventsResponse", "WorkerHistoricalCandles", "OrderPreview", "PreviewPayload", "RunProtectionState", "SafetyCheckResult", "WorkerGttTrigger", "WorkerGttWriteResult", "WorkerOrderHistoryEvent", "WorkerOrderHistoryResponse", "WorkerOrderSnapshot", "WorkerFundsSegment", "WorkerFundsSnapshot", "WorkerOrderResult", "WorkerOrdersResponse", "WorkerRunHealthSnapshot", "WorkerRunPnlLeg", "WorkerRunPnlSnapshot", "WorkerRunPnlTotals", "WorkerTimelineEvent", "WorkerTimelineResponse", "WorkerTradeSnapshot", "WorkerTradesResponse")
+_lazy("orders", "OrderBuilder", "equity_market_order", "limit_order", "market_order", "option_market_order", "sl_m_order", "sl_order")
+_lazy("options", "AsyncOptionWorkerClient", "OptionEntryPreviewRequest", "OptionExpirySnapshot", "OptionWorkerClient", "SpreadLegSelection", "SpreadSpec", "option_leg", "resolve_delta_leg", "resolve_offset_leg", "resolve_option_contracts", "resolve_option_leg", "resolve_spread")
+_lazy("protection", "BackendProtection", "BasketProtection", "OperationalProtection", "ProtectedPosition")
+_lazy("run_config", "RunConfig")
+_lazy("ws", "StreamHealth", "WorkerCandleWebSocketClient", "WorkerRunPnlWebSocketClient", "WorkerTickWebSocketClient", "WorkerWebSocketClient")
 
-    def ohlcv_arrays(*_args, **_kwargs):  # type: ignore[no-redef]
-        raise ModuleNotFoundError("pandas and numpy are required for kite_algo_worker marketdata helpers")
+_MARKETDATA_NAMES = ("OhlcvArrays", "candles_to_df", "ohlcv_arrays")
+_MARKETDATA_MODULE = None
+_MARKETDATA_RESOLVED = False
+
+
+class OhlcvArraysStub:
+    """Placeholder type for ``OhlcvArrays`` when pandas/numpy are unavailable."""
+
+
+def _missing_marketdata_helper(*_args, **_kwargs):
+    raise ModuleNotFoundError("pandas and numpy are required for kite_algo_worker marketdata helpers")
+
+
+def _load_marketdata():
+    global _MARKETDATA_MODULE, _MARKETDATA_RESOLVED
+    if not _MARKETDATA_RESOLVED:
+        try:
+            _MARKETDATA_MODULE = import_module(".marketdata", __name__)
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"numpy", "pandas"}:
+                raise
+        _MARKETDATA_RESOLVED = True
+    return _MARKETDATA_MODULE, _MARKETDATA_MODULE is not None
+
+
+def __getattr__(name: str):
+    if name == "_MARKETDATA_AVAILABLE":
+        globals()[name] = _load_marketdata()[1]
+        return globals()[name]
+    if name in _MARKETDATA_NAMES:
+        module, _available = _load_marketdata()
+        if module is not None:
+            value = getattr(module, name)
+        elif name == "OhlcvArrays":
+            value = OhlcvArraysStub
+        else:
+            value = _missing_marketdata_helper
+        globals()[name] = value
+        return value
+    if name == "options":
+        module = import_module(".options", __name__)
+        globals()[name] = module
+        return module
+    module_name = _LAZY_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f".{module_name}", __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_EXPORTS) | set(_MARKETDATA_NAMES) | {"options"})
 
 
 def _resolve_version() -> str:
@@ -262,7 +233,7 @@ __all__ = [
     "WorkerPortfolioHolding",
     "WorkerPortfolioPosition",
     "WorkerSourceEnvelope",
+    "OhlcvArrays",
+    "candles_to_df",
+    "ohlcv_arrays",
 ]
-
-if _MARKETDATA_AVAILABLE:
-    __all__.extend(["OhlcvArrays", "candles_to_df", "ohlcv_arrays"])

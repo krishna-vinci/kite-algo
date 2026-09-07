@@ -34,6 +34,8 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copy application code
 COPY backend/ /app/backend/
 COPY fundamentals/ /app/fundamentals/
+# Indicator compute imports the SDK's TechnicalAnalysis directly
+COPY sdk/python/kite_algo_worker/ /app/kite_algo_worker/
 
 EXPOSE 8777
 
