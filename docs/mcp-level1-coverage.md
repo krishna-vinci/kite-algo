@@ -1,11 +1,18 @@
 # Kite Algo MCP Level 1
 
-The `kite-algo-mcp` package is a local stdio adapter over the public
+The `kite-algo-mcp` package supports local stdio and authenticated LAN Streamable HTTP over the public
 `kite-algo-worker` SDK 0.9.0. It does not add a backend strategy service. The
 worker remains authoritative for token scope, account access, execution risk,
 leases, persistence, and broker responses.
 
 ## Start-up
+
+Docker users can enable the optional `mcp` Compose profile and connect devices
+to `http://<server-LAN-IP>:18788/mcp`. Configure separate HTTP client and backend
+worker tokens, plus the server Host allowlist. Execution defaults to `read`;
+paper/live remain separate choices. See [Docker setup](../mcp/python/README.md)
+for exact environment settings, startup/stop commands and plaintext-HTTP caveats.
+No firewall or personal MCP-client settings are changed automatically.
 
 Build or install the package in its isolated environment:
 
@@ -20,8 +27,10 @@ mcp/python/.venv/bin/kite-algo-mcp
 ```
 
 Loopback `http://127.0.0.1`, `http://localhost`, and `http://[::1]` are
-allowed for local development; non-loopback URLs must use HTTPS. Credentials
-are read from the environment, never command-line arguments. The server emits
+allowed for local development; non-loopback backend URLs require HTTPS unless
+`KITE_MCP_ALLOW_INSECURE_BACKEND_HTTP=true` explicitly permits plaintext (used
+for the Compose-internal backend connection). Credentials are read from the
+environment or mounted secret files, never command-line arguments. Stdio emits
 protocol data only on stdout and diagnostics only on stderr.
 
 Profiles are `read`, `paper`, and `live`. Read mode exposes research and

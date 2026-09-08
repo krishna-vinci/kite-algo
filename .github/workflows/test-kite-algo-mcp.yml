@@ -3,13 +3,21 @@ name: test-kite-algo-mcp
 on:
   push:
     paths:
-      - "mcp/python/**"
+      - "mcp/**"
+      - "compose*.yml"
+      - ".env.example"
+      - "scripts/check_mcp_http_docker.py"
+      - "scripts/mcp_codex_headers.py"
       - "sdk/python/**"
       - "tests/mcp/**"
       - ".github/workflows/test-kite-algo-mcp.yml"
   pull_request:
     paths:
-      - "mcp/python/**"
+      - "mcp/**"
+      - "compose*.yml"
+      - ".env.example"
+      - "scripts/check_mcp_http_docker.py"
+      - "scripts/mcp_codex_headers.py"
       - "sdk/python/**"
       - "tests/mcp/**"
       - ".github/workflows/test-kite-algo-mcp.yml"
@@ -19,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11"]
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -46,3 +54,25 @@ jobs:
         env:
           PYTHONPATH: ""
         run: python -m pytest tests/mcp -q
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate optional Compose service
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+          docker compose -f compose.dev.yml config --quiet
+      - name: Build isolated MCP image
+        run: docker build -f mcp/Dockerfile -t kite-algo-mcp:test .
+      - name: Build isolated MCP test image
+        run: docker build -f mcp/test.Dockerfile --build-arg MCP_RUNTIME_IMAGE=kite-algo-mcp:test -t kite-algo-mcp-tests:test .
+      - name: Run MCP tests from the isolated test image
+        run: docker run --rm --network none kite-algo-mcp-tests:test
+      - name: Check installed dependencies and unprivileged user
+        run: |
+          docker run --rm --network none kite-algo-mcp:test python -m pip check
+          docker run --rm --network none kite-algo-mcp:test python -c 'import os; assert os.getuid() == 10001'
+      - name: Verify authenticated HTTP and profile separation
+        run: python3 scripts/check_mcp_http_docker.py --image kite-algo-mcp:test
