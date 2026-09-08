@@ -6,6 +6,7 @@ from fastmcp import FastMCP
 
 from ..server import MCPRuntime
 from ..contracts import CreateRunRequest, RunListRequest, RunSelector
+from ..policy import BackendCapabilities
 from .common import args_model, register_tool
 
 
@@ -14,6 +15,7 @@ def register(server: FastMCP, runtime: MCPRuntime) -> None:
         async def operation(_lease: Any) -> dict[str, Any]:
             health = await runtime.client.health()
             body = dict(health or {}) if isinstance(health, dict) else {"status": str(health)}
+            runtime.policy.capabilities = BackendCapabilities.from_health(body)
             # Keep maintained, useful capability metadata stable even when a
             # backend version returns additional private fields.
             known = {
@@ -35,6 +37,8 @@ def register(server: FastMCP, runtime: MCPRuntime) -> None:
                 ],
                 "mcp_profile": runtime.config.profile,
                 "data_refresh_enabled": runtime.config.allow_data_refresh,
+                "available_data_tools": [spec.name for spec in runtime.policy.backend_visible_specs() if spec.effect == "data_write"],
+                "available_trade_tools": [spec.name for spec in runtime.policy.backend_visible_specs() if spec.effect == "trade_write"],
             })
             return known
 

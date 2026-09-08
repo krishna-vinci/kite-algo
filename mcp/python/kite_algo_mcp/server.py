@@ -24,7 +24,7 @@ from .config import MCPConfig, load_config
 from .contracts import ToolResult
 from .policy import PolicyService, PolicyViolation
 from .serialization import SerializationLimitError, error_result, ok_result
-from .sessions import RunSessionManager, SessionError
+from .sessions import RunSessionManager, SessionError, SessionOutcomeUnknownError
 
 
 LOGGER = logging.getLogger("kite_algo_mcp")
@@ -58,7 +58,10 @@ def _status_code(exc: BaseException) -> int | None:
 def _submission_identifiers(arguments: Mapping[str, Any], exc: BaseException | None = None) -> dict[str, str | int]:
     """Keep non-secret reconciliation handles when a write outcome is unknown."""
     identifiers: dict[str, str | int] = {}
-    names = ("strategy_run_id", "order_id", "intent_id", "basket_execution_id", "client_order_ref", "idempotency_key")
+    names = (
+        "strategy_run_id", "order_id", "intent_id", "basket_execution_id",
+        "bracket_intent_id", "trigger_id", "client_order_ref", "idempotency_key",
+    )
 
     def collect(source: Any) -> None:
         if not isinstance(source, Mapping):
@@ -125,6 +128,16 @@ class MCPRuntime:
         except PolicyViolation as exc:
             result = error_result(exc.code, exc.message, retryable=exc.retryable)
             raise FrameworkToolError(_error_text(result)) from exc
+        except SessionOutcomeUnknownError as exc:
+            reconcile_with = spec.reconcile_with if spec is not None else None
+            result = error_result(
+                "write_outcome_unknown",
+                "worker lease was lost after the write returned; reconcile with a read tool before retrying",
+                outcome_unknown=True,
+                reconcile_with=reconcile_with,
+                identifiers=_submission_identifiers(arguments),
+            )
+            raise FrameworkToolError(_error_text(result)) from exc
         except SessionError as exc:
             result = error_result("lease_refused", str(exc), reconcile_with="get_run")
             raise FrameworkToolError(_error_text(result)) from exc
@@ -138,7 +151,7 @@ class MCPRuntime:
                 "worker request timed out; reconcile with a read tool before retrying" if unknown else "worker request timed out",
                 retryable=not unknown,
                 outcome_unknown=unknown,
-                reconcile_with="get_order" if unknown else None,
+                reconcile_with=spec.reconcile_with if unknown and spec is not None else None,
                 identifiers=_submission_identifiers(arguments) if unknown else None,
             )
             raise FrameworkToolError(_error_text(result)) from exc
@@ -150,6 +163,8 @@ class MCPRuntime:
             status = _status_code(exc)
             if status in {401, 403}:
                 code, message, retryable = "backend_unauthorized", "worker rejected this operation", False
+            elif status in {400, 422}:
+                code, message, retryable = "invalid_request", "worker rejected the request parameters", False
             elif status == 404:
                 code, message, retryable = "not_found", "requested worker object was not found", False
             elif status == 409:
@@ -167,7 +182,7 @@ class MCPRuntime:
                 message = "write outcome is unknown; reconcile with a read tool before retrying"
                 retryable = False
             result = error_result(code, message, retryable=retryable, outcome_unknown=unknown,
-                                  reconcile_with="get_order" if unknown else None,
+                                  reconcile_with=spec.reconcile_with if unknown and spec is not None else None,
                                   identifiers=_submission_identifiers(arguments, exc) if unknown else None)
             raise FrameworkToolError(_error_text(result)) from exc
 
@@ -263,7 +278,7 @@ def run_stdio(server: FastMCP) -> None:
     anyio.run(_run_stdio_compat, server)
 
 
-def create_server(config: MCPConfig | None = None, *, client: Any | None = None) -> FastMCP:
+def create_server(config: MCPConfig | None = None, *, client: Any | None = None, auth: Any | None = None) -> FastMCP:
     """Build a server without starting transport or performing network I/O."""
 
     resolved = config if config is not None else load_config()
@@ -289,6 +304,7 @@ def create_server(config: MCPConfig | None = None, *, client: Any | None = None)
 
     server = FastMCP(
         "kite-algo-mcp",
+        auth=auth,
         version="0.1.0",
         instructions="Bounded Kite Algo worker research and explicitly scoped execution primitives.",
         lifespan=lifespan,
@@ -324,6 +340,8 @@ def create_server(config: MCPConfig | None = None, *, client: Any | None = None)
             "index_universes": ["nifty50", "nifty500", "niftybank"],
             "execution_modes": ["paper", "dry_run"] if resolved.profile != "live" else ["paper", "dry_run", "live"],
             "data_refresh_enabled": resolved.allow_data_refresh,
+            "configured_data_tools": [spec.name for spec in runtime.policy.visible_specs() if spec.effect == "data_write"],
+            "configured_trade_tools": [spec.name for spec in runtime.policy.visible_specs() if spec.effect == "trade_write"],
         }, separators=(",", ":")),
     )
     _register_resource(

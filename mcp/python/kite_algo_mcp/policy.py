@@ -90,7 +90,7 @@ class PolicyService:
         if spec.effect == "read":
             return True
         if spec.effect == "data_write":
-            return self.config.allow_data_refresh and self.config.profile in {"paper", "live"}
+            return self.config.allow_data_refresh
         if self.config.profile not in {"paper", "live"}:
             return False
         if spec.live_only and self.config.profile != "live":
@@ -116,7 +116,7 @@ class PolicyService:
         if self.capabilities.actions is not None and spec.required_action:
             if spec.required_action.lower() not in self.capabilities.actions and "*" not in self.capabilities.actions:
                 return False
-        if self.capabilities.modes is not None and not self.capabilities.modes and spec.effect != "read":
+        if self.capabilities.modes is not None and not self.capabilities.modes and spec.effect not in {"read", "data_write"}:
             return False
         if self.capabilities.accounts is not None and not self.capabilities.accounts and spec.scope == "account":
             return False
@@ -136,7 +136,11 @@ class PolicyService:
     def _check_profile_arguments(self, spec: ToolSpec, arguments: Mapping[str, Any]) -> None:
         if not self.visible(spec.name):
             raise PolicyViolation("tool_disabled", f"{spec.name} is disabled for the {self.config.profile} profile")
-        mode = arguments.get("execution_mode") or arguments.get("mode")
+        mode = arguments.get("execution_mode")
+        if mode is None:
+            candidate = arguments.get("mode")
+            if str(candidate).lower() in {"paper", "live", "dry_run"}:
+                mode = candidate
         if mode is not None and str(mode).lower() == "live" and self.config.profile != "live":
             raise PolicyViolation("live_profile_required", "live execution requires KITE_MCP_PROFILE=live")
         if self.capabilities.modes is not None and mode is not None and str(mode).lower() not in self.capabilities.modes:

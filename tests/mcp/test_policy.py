@@ -17,6 +17,14 @@ def test_visibility_matrix_is_default_deny_for_writes() -> None:
     assert not read.visible("refresh_fundamentals")
     assert not read.visible("place_order")
 
+    read_refresh = _policy("read", True)
+    assert read_refresh.visible("refresh_fundamentals")
+    assert not read_refresh.visible("place_order")
+
+    paper_without_refresh = _policy("paper", False)
+    assert not paper_without_refresh.visible("refresh_fundamentals")
+    assert paper_without_refresh.visible("place_order")
+
     paper = _policy("paper", True)
     assert paper.visible("refresh_fundamentals")
     assert paper.visible("place_order")
@@ -25,6 +33,15 @@ def test_visibility_matrix_is_default_deny_for_writes() -> None:
     live = _policy("live", True)
     assert live.visible("create_gtt")
     assert len(TOOL_CATALOG) == 73
+
+
+def test_all_profile_refresh_combinations_have_independent_gates() -> None:
+    for profile in ("read", "paper", "live"):
+        for refresh in (False, True):
+            policy = _policy(profile, refresh)
+            assert policy.visible("request_history") is refresh
+            assert policy.visible("place_order") is (profile in {"paper", "live"})
+            assert policy.visible("create_gtt") is (profile == "live")
 
 
 @pytest.mark.asyncio
@@ -95,6 +112,14 @@ async def test_scalar_account_scope_and_explicit_empty_modes_are_restrictive() -
     class EmptyModes:
         async def health(self):
             return {"allowed_actions": ["runs:create"], "allowed_modes": []}
+
+    service = _policy("paper")
+    service.capabilities = BackendCapabilities(actions={"market:read"}, modes=set())
+    assert service.backend_visible("request_history") is False
+
+    service = _policy("paper", True)
+    service.capabilities = BackendCapabilities(actions={"market:read"}, modes=set())
+    assert service.backend_visible("request_history") is True
 
     service = _policy("paper")
     with pytest.raises(PolicyViolation, match="execution mode"):

@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 from fastmcp import FastMCP
 
-from ..contracts import CalendarRequest, CandleRequest, HistoricalCandleRequest, IndexRequest, InstrumentRequest, SearchInstrumentsRequest, SymbolRequest
+from ..contracts import CalendarRequest, CandleRequest, HistoricalCandleRequest, IndexRequest, InstrumentRequest, SearchInstrumentsRequest, SymbolRequest, normalize_history_bound
 from ..server import MCPRuntime
 from .common import args_model, register_tool
 
@@ -45,11 +45,11 @@ def register(server: FastMCP, runtime: MCPRuntime) -> None:
         return await runtime.invoke("resolve_instruments", values, lambda _lease: runtime.client.resolve_tickers(request.symbols))
 
     async def get_quotes(request: SymbolRequest, mode: Literal["ltp", "quote", "full"] = "quote") -> Any:
-        values = {**args_model(request), "mode": mode}
+        values = {**args_model(request), "quote_mode": mode}
         return await runtime.invoke("get_quotes", values, lambda _lease: runtime.client.get_quotes(request.symbols, mode=mode))
 
     async def get_market_snapshot(request: SymbolRequest, mode: Literal["ltp", "quote", "full"] = "quote") -> Any:
-        values = {**args_model(request), "mode": mode}
+        values = {**args_model(request), "quote_mode": mode}
         return await runtime.invoke("get_market_snapshot", values, lambda _lease: runtime.client.get_market_snapshot(symbols=request.symbols, mode=mode))
 
     async def get_market_depth(request: SymbolRequest) -> Any:
@@ -74,30 +74,36 @@ def register(server: FastMCP, runtime: MCPRuntime) -> None:
 
     async def get_historical_candles(request: HistoricalCandleRequest) -> Any:
         values = args_model(request)
+        from_date = normalize_history_bound(request.from_date)
+        to_date = normalize_history_bound(request.to_date, upper=True)
         return await runtime.invoke(
             "get_historical_candles",
             values,
             lambda _lease: runtime.client.get_historical_candles(
                 request.instrument,
                 timeframe=request.timeframe,
-                from_date=request.from_date,
-                to_date=request.to_date,
+                from_date=from_date,
+                to_date=to_date,
                 lookback_days=request.lookback_days,
                 ingest=False,
-                passthrough=False,
+                passthrough=request.passthrough,
             ),
         )
 
     async def request_history(request: HistoricalCandleRequest) -> Any:
+        if request.passthrough:
+            raise ValueError("request_history cannot combine ingestion with passthrough")
         values = {**args_model(request), "request_history": True}
+        from_date = normalize_history_bound(request.from_date)
+        to_date = normalize_history_bound(request.to_date, upper=True)
         return await runtime.invoke(
             "request_history",
             values,
             lambda _lease: runtime.client.get_historical_candles(
                 request.instrument,
                 timeframe=request.timeframe,
-                from_date=request.from_date,
-                to_date=request.to_date,
+                from_date=from_date,
+                to_date=to_date,
                 lookback_days=request.lookback_days,
                 ingest=True,
                 passthrough=False,

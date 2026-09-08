@@ -7,10 +7,11 @@ unknown fields before an SDK call is made.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 MAX_SYMBOLS = 50
@@ -19,6 +20,7 @@ MAX_PAGE = 100
 MAX_EVENTS = 100
 MAX_BASKET_LEGS = 50
 MAX_RESULT_BYTES = 256 * 1024
+EXCHANGE_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 
 class StrictModel(BaseModel):
@@ -95,21 +97,43 @@ class CandleRequest(StrictModel):
     lookback: int = Field(default=50, ge=1, le=MAX_CANDLES)
 
 
+def normalize_history_bound(value: date | datetime | None, *, upper: bool = False) -> datetime | None:
+    """Return a timezone-aware inclusive history bound for the worker API."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("history timestamps must include timezone information")
+        return value
+    boundary = time.max if upper else time.min
+    return datetime.combine(value, boundary, tzinfo=EXCHANGE_TIMEZONE)
+
+
 class HistoricalCandleRequest(StrictModel):
     instrument: str = Field(min_length=1, max_length=40)
     timeframe: str = Field(default="day", min_length=1, max_length=20)
-    from_date: date | None = None
-    to_date: date | None = None
+    from_date: datetime | date | None = None
+    to_date: datetime | date | None = None
     lookback_days: int | None = Field(default=None, ge=1, le=MAX_CANDLES)
-    request_history: bool = False
+    passthrough: bool = False
+
+    @field_validator("from_date", "to_date", mode="before")
+    @classmethod
+    def _parse_history_bound(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            text = value.strip()
+            if "T" in text or " " in text:
+                return datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return date.fromisoformat(text)
+        return value
 
     @model_validator(mode="after")
     def _date_range(self) -> "HistoricalCandleRequest":
-        if self.from_date and self.to_date and self.from_date > self.to_date:
+        start = normalize_history_bound(self.from_date)
+        end = normalize_history_bound(self.to_date, upper=True)
+        if start and end and start > end:
             raise ValueError("from_date must not be after to_date")
-        if not self.request_history:
-            # A normal historical read must not silently opt into ingestion.
-            return self
         if self.lookback_days is not None and (self.from_date or self.to_date):
             raise ValueError("use lookback_days or an explicit date range, not both")
         return self
@@ -372,6 +396,7 @@ class OptionRunRequest(StrictModel):
     underlying: str = Field(min_length=1, max_length=30)
     expiry: str = Field(min_length=1, max_length=30)
     legs: list[OptionSelector] = Field(min_length=1, max_length=20)
+    quantity_lots: int = Field(default=1, ge=1, le=100)
     product: Literal["NRML", "MIS"] = "NRML"
     transaction_type: Literal["BUY", "SELL"] = "BUY"
     idempotency_key: str | None = Field(default=None, min_length=8, max_length=160)
@@ -454,7 +479,7 @@ class IndicatorRequest(StrictModel):
 __all__ = [
     "MAX_SYMBOLS", "MAX_CANDLES", "MAX_PAGE", "MAX_EVENTS", "MAX_BASKET_LEGS", "MAX_RESULT_BYTES",
     "ToolError", "ToolResult", "SymbolRequest", "InstrumentRequest", "SearchInstrumentsRequest",
-    "CandleRequest", "HistoricalCandleRequest", "CalendarRequest", "IndexRequest",
+    "CandleRequest", "HistoricalCandleRequest", "normalize_history_bound", "CalendarRequest", "IndexRequest",
     "FundamentalsScopeRequest", "FundamentalsStatementRequest", "FundamentalsRefreshRequest",
     "RunSelector", "RunListRequest", "CreateRunRequest", "OrderRequest", "BasketRequest",
     "OrderActionRequest", "OrderModifyRequest", "PlaceOrderRequest", "ExitRunRequest", "RiskRequest",

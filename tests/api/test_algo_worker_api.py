@@ -1089,6 +1089,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
                 "backend.broker_api.market.exchange_calendar.get_calendar_sessions",
                 return_value={"calendar_version": 1, "sessions": []},
             ),
+            patch("backend.api.routers.worker_market.asyncio.to_thread", _run_to_thread_inline),
         ):
             response = await get_worker_market_history(
                 request,
@@ -1125,6 +1126,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
                 "backend.broker_api.market.exchange_calendar.get_calendar_sessions",
                 return_value={"calendar_version": 1, "sessions": []},
             ),
+            patch("backend.api.routers.worker_market.asyncio.to_thread", _run_to_thread_inline),
         ):
             await get_worker_market_history(
                 request,
@@ -1172,7 +1174,10 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ]
 
-        with patch("backend.api.services.market_data.WorkerMarketDataService._get_system_kite_client", AsyncMock(return_value=object())):
+        with (
+            patch("backend.api.services.market_data.WorkerMarketDataService._get_system_kite_client", AsyncMock(return_value=object())),
+            patch("backend.api.services.market_data.asyncio.to_thread", _run_to_thread_inline),
+        ):
             with patch("backend.broker_api.market.candle_ingestion.CandleIngestion", FakeIngestion):
                 response = await service.get_historical_candles(
                     symbol="NSE:INFY",
@@ -1203,7 +1208,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with self.assertRaises(HTTPException) as ctx:
+        with patch("backend.api.services.market_data.asyncio.to_thread", _run_to_thread_inline), self.assertRaises(HTTPException) as ctx:
             await service.get_historical_candles(
                 symbol="NSE:INFY",
                 timeframe="day",
@@ -1233,7 +1238,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with self.assertRaises(HTTPException) as ctx:
+        with patch("backend.api.services.market_data.asyncio.to_thread", _run_to_thread_inline), self.assertRaises(HTTPException) as ctx:
             await service.get_historical_candles(
                 symbol="NSE:INFY",
                 timeframe="day",
@@ -1265,7 +1270,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("backend.broker_api.market.candle_storage.CandleStorage.query_candles", side_effect=RuntimeError("db down")):
-            with self.assertRaises(HTTPException) as ctx:
+            with patch("backend.api.services.market_data.asyncio.to_thread", _run_to_thread_inline), self.assertRaises(HTTPException) as ctx:
                 await service.get_historical_candles(
                     symbol="NSE:INFY",
                     timeframe="day",
