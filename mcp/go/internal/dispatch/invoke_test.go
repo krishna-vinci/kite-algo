@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -36,14 +37,20 @@ func (f *fakeWorker) route(key string, fn func(r callRecord) (int, map[string]an
 
 func (f *fakeWorker) Call(_ context.Context, method, path string, payload any, headers map[string]string) (map[string]any, error) {
 	f.mu.Lock()
-	f.calls = append(f.calls, callRecord{Method: method, Path: path, Headers: headers})
-	rec := f.calls[len(f.calls)-1]
+	rec := callRecord{Method: method, Path: path, Headers: headers}
 	if payload != nil {
 		if m, ok := payload.(map[string]any); ok {
 			rec.Body = m
 		}
 	}
+	f.calls = append(f.calls, rec)
 	fn, ok := f.handlers[method+" "+path]
+	if !ok {
+		// Routes may be registered without the query string.
+		if q := strings.IndexByte(path, '?'); q >= 0 {
+			fn, ok = f.handlers[method+" "+path[:q]]
+		}
+	}
 	f.mu.Unlock()
 	if !ok {
 		return nil, &backend.HTTPError{Status: http.StatusNotFound, Body: []byte(`{"detail":"no route"}`)}
@@ -248,5 +255,115 @@ func TestDepthShaperAvailableAndAbsent(t *testing.T) {
 	absent := ShapeDepthView(map[string]any{"quotes": []any{map[string]any{"symbol": "INFY"}}})
 	if absent["available"] != false {
 		t.Fatalf("absent: %s", MarshalCompact(absent))
+	}
+}
+
+// Regression tests for flat-argument dispatch: the Go catalog advertises flat
+// schemas, so every builder must see the top-level arguments even though it
+// reads the nested request model. These go through Invoker.Call, unlike the
+// builder tests that pass requestObj as arguments.
+
+func newFlatTestInvoker(t *testing.T) (*Invoker, *fakeWorker) {
+	t.Helper()
+	worker := &fakeWorker{handlers: map[string]func(callRecord) (int, map[string]any){
+		"GET /worker/health": func(callRecord) (int, map[string]any) { return http.StatusOK, map[string]any{"status": "ok"} },
+	}}
+	return newTestInvoker(worker, "live"), worker
+}
+
+func TestFlatArgsReachQuotesBuilder(t *testing.T) {
+	inv, worker := newFlatTestInvoker(t)
+	worker.route("POST /worker/market/quotes", func(r callRecord) (int, map[string]any) {
+		return http.StatusOK, map[string]any{"quotes": []any{}}
+	})
+	r := inv.Call(context.Background(), "get_quotes", []byte(`{"symbols":["NSE:RELIANCE"]}`))
+	if r.IsError {
+		t.Fatalf("get_quotes with flat args errored: %s", r.Text)
+	}
+	body := worker.calls[len(worker.calls)-1].Body
+	symbols, _ := body["symbols"].([]string)
+	if len(symbols) != 1 || symbols[0] != "NSE:RELIANCE" {
+		t.Fatalf("flat symbols did not reach the quotes body: %#v", body)
+	}
+}
+
+func TestFlatArgsReachCandleQuery(t *testing.T) {
+	inv, worker := newFlatTestInvoker(t)
+	worker.route("GET /worker/market/candles", func(callRecord) (int, map[string]any) {
+		return http.StatusOK, map[string]any{"candles": []any{}}
+	})
+	r := inv.Call(context.Background(), "get_candles", []byte(`{"instrument":"NSE:RELIANCE","interval":"day","lookback":5}`))
+	if r.IsError {
+		t.Fatalf("get_candles with flat args errored: %s", r.Text)
+	}
+	path := worker.calls[len(worker.calls)-1].Path
+	if !strings.Contains(path, "symbol=NSE%3ARELIANCE") || !strings.Contains(path, "lookback=5") {
+		t.Fatalf("flat instrument/lookback did not reach the query: %s", path)
+	}
+}
+
+func TestFlatArgsReachCalendarQuery(t *testing.T) {
+	inv, worker := newFlatTestInvoker(t)
+	worker.route("GET /worker/market/calendar", func(callRecord) (int, map[string]any) {
+		return http.StatusOK, map[string]any{"sessions": []any{}}
+	})
+	r := inv.Call(context.Background(), "get_market_calendar", []byte(`{"from_date":"2026-09-01","to_date":"2026-09-08"}`))
+	if r.IsError {
+		t.Fatalf("get_market_calendar with flat ISO dates errored: %s", r.Text)
+	}
+	path := worker.calls[len(worker.calls)-1].Path
+	for _, want := range []string{"from=2026-09-01", "to=2026-09-08", "schema_version=1"} {
+		if !strings.Contains(path, want) {
+			t.Fatalf("calendar query missing %s: %s", want, path)
+		}
+	}
+}
+
+func TestFlatArgsReachFundamentalsScope(t *testing.T) {
+	inv, worker := newFlatTestInvoker(t)
+	worker.route("GET /worker/fundamentals/status", func(callRecord) (int, map[string]any) {
+		return http.StatusOK, map[string]any{"rows": []any{}}
+	})
+	r := inv.Call(context.Background(), "get_fundamentals_status", []byte(`{"index":"nifty50"}`))
+	if r.IsError {
+		t.Fatalf("get_fundamentals_status with flat index errored: %s", r.Text)
+	}
+	path := worker.calls[len(worker.calls)-1].Path
+	if !strings.Contains(path, "index=nifty50") {
+		t.Fatalf("flat index did not reach the scope query: %s", path)
+	}
+}
+
+func TestFlatArgsReachIndicatorBody(t *testing.T) {
+	inv, worker := newFlatTestInvoker(t)
+	worker.route("POST /worker/indicators", func(callRecord) (int, map[string]any) {
+		return http.StatusOK, map[string]any{"values": []any{}}
+	})
+	args := `{"name":"sma","period":10,"bars":[{"open":1,"high":2,"low":0.5,"close":1.5,"volume":10}]}`
+	r := inv.Call(context.Background(), "calculate_indicator", []byte(args))
+	if r.IsError {
+		t.Fatalf("calculate_indicator with flat args errored: %s", r.Text)
+	}
+	body := worker.calls[len(worker.calls)-1].Body
+	if body["name"] != "sma" {
+		t.Fatalf("flat name did not reach the indicator body: %#v", body)
+	}
+	if _, ok := body["bars"].([]any); !ok {
+		t.Fatalf("flat bars array did not reach the indicator body: %#v", body)
+	}
+}
+
+func TestNestedRequestModelWinsOverFlatArgs(t *testing.T) {
+	inv, worker := newFlatTestInvoker(t)
+	worker.route("GET /worker/market/candles", func(callRecord) (int, map[string]any) {
+		return http.StatusOK, map[string]any{"candles": []any{}}
+	})
+	r := inv.Call(context.Background(), "get_candles", []byte(`{"request":{"instrument":"738561","lookback":9},"instrument":"NSE:RELIANCE","lookback":5}`))
+	if r.IsError {
+		t.Fatalf("nested+flat call errored: %s", r.Text)
+	}
+	path := worker.calls[len(worker.calls)-1].Path
+	if !strings.Contains(path, "instrument_token=738561") || !strings.Contains(path, "lookback=9") {
+		t.Fatalf("nested request model should win over flat args: %s", path)
 	}
 }

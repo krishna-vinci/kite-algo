@@ -85,6 +85,9 @@ func (inv *Invoker) Call(ctx context.Context, name string, argsJSON json.RawMess
 	}
 	var arguments map[string]any
 	_ = json.Unmarshal(argsJSON, &arguments)
+	if arguments == nil {
+		arguments = map[string]any{}
+	}
 
 	if err := inv.Policy.Authorize(ctx, inv.Client, name, spec.Effect, spec.RequiredAction, spec.LiveOnly, arguments); err != nil {
 		return violationResult(err)
@@ -94,6 +97,19 @@ func (inv *Invoker) Call(ctx context.Context, name string, argsJSON json.RawMess
 	requestObj, _ := arguments["request"].(map[string]any)
 	if requestObj == nil {
 		requestObj = map[string]any{}
+	}
+	// The Go catalog advertises flat schemas, so clients send the inputs at
+	// the top level while the per-tool builders read the nested request model
+	// the Python server sends. Fill the model from the flat arguments
+	// (model keys win) so both call shapes reach the builders, mirroring the
+	// Python values = args_model(request) + extras merge.
+	for key, value := range arguments {
+		if key == "request" {
+			continue
+		}
+		if _, exists := requestObj[key]; !exists {
+			requestObj[key] = value
+		}
 	}
 	runID := ""
 	if entry.RunIDField != "" {
