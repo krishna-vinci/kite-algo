@@ -28,6 +28,9 @@ type Dispatch struct {
 	PreCheckSafety bool   // refuse entry unless /safety-check allows
 	Shaper         Shaper
 	Kind           Kind
+	AuthRun        bool // GET the run first and verify identity (option flows)
+	OptCtx         bool // execution_mode/account_scope must match the run
+	ResolveLegs    bool // resolve option legs before the main call
 }
 
 // ShapeDepthView ports _depth_view: expose only depth present in quotes.
@@ -101,14 +104,20 @@ func firstString(m map[string]any, keys ...string) any {
 	return nil
 }
 
-// ShapeCurrentCandle trims a candles payload to the most recent row.
+// ShapeCurrentCandle trims a candles payload to the most recent row while
+// preserving the sibling fields, like {**response, "candles": [-1:]}.
 func ShapeCurrentCandle(response map[string]any) map[string]any {
 	candles, ok := response["candles"].([]any)
 	if !ok {
 		return response
 	}
 	if len(candles) > 1 {
-		return map[string]any{"candles": candles[len(candles)-1:]}
+		trimmed := map[string]any{}
+		for k, v := range response {
+			trimmed[k] = v
+		}
+		trimmed["candles"] = candles[len(candles)-1:]
+		return trimmed
 	}
 	return response
 }

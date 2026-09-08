@@ -125,14 +125,53 @@ func (inv *Invoker) Call(ctx context.Context, name string, argsJSON json.RawMess
 		}
 	}
 
+	if entry.AuthRun && runID != "" {
+		runResp, err := inv.Client.Call(ctx, http.MethodGet, "/worker/runs/"+runID, nil, nil)
+		if err != nil {
+			return httpResult(spec, err)
+		}
+		actualRunID, _ := runResp["strategy_run_id"].(string)
+		if strings.TrimSpace(actualRunID) != strings.TrimSpace(runID) {
+			te := errResult("invalid_request", "option run authorization returned a different run", nil)
+			return Result{Text: te.Error(), IsError: true}
+		}
+		if entry.OptCtx {
+			actualMode, _ := runResp["execution_mode"].(string)
+			requestMode, _ := requestObj["execution_mode"].(string)
+			if strings.TrimSpace(strings.ToLower(actualMode)) == "" || strings.ToLower(strings.TrimSpace(actualMode)) != strings.ToLower(strings.TrimSpace(requestMode)) {
+				te := errResult("invalid_request", "option execution_mode must match the authorized worker run", nil)
+				return Result{Text: te.Error(), IsError: true}
+			}
+			actualAccount, _ := runResp["account_scope"].(string)
+			requestAccount, _ := requestObj["account_scope"].(string)
+			if strings.TrimSpace(strings.ToLower(actualAccount)) == "" || strings.ToLower(strings.TrimSpace(actualAccount)) != strings.ToLower(strings.TrimSpace(requestAccount)) {
+				te := errResult("invalid_request", "option account_scope must match the authorized worker run", nil)
+				return Result{Text: te.Error(), IsError: true}
+			}
+		}
+	}
+
 	path := renderPath(entry.Path, requestObj, arguments)
 	headers := map[string]string{}
 	if lease != nil {
 		headers["X-Worker-Session-Nonce"] = lease.Nonce()
 	}
 	var payload any
-	if entry.Method != http.MethodGet && entry.Kind != KindCapabilities {
-		payload = requestBody(requestObj, arguments)
+	if builder, ok := Builders[name]; ok {
+		var query url.Values
+		var err error
+		path, query, payload, err = builder(entry.Path, requestObj, arguments)
+		if err != nil {
+			v := &policy.Violation{Code: "invalid_request", Message: err.Error()}
+			return violationResult(v)
+		}
+		if entry.Method == http.MethodGet && len(query) > 0 {
+			sep := "?"
+			if strings.Contains(path, "?") {
+				sep = "&"
+			}
+			path += sep + query.Encode()
+		}
 	} else if entry.Method == http.MethodGet {
 		if query := queryString(requestObj, arguments); query != "" {
 			sep := "?"
@@ -141,6 +180,20 @@ func (inv *Invoker) Call(ctx context.Context, name string, argsJSON json.RawMess
 			}
 			path += sep + query
 		}
+	} else if entry.Kind != KindCapabilities {
+		payload = requestBody(requestObj, arguments)
+	}
+
+	if entry.ResolveLegs {
+		resolved, err := inv.resolveOptionLegs(ctx, requestObj, arguments, headers)
+		if err != nil {
+			var v *policy.Violation
+			if errors.As(err, &v) {
+				return violationResult(err)
+			}
+			return httpResult(spec, err)
+		}
+		payload = resolved
 	}
 
 	if entry.PreCheckSafety && runID != "" {
@@ -238,6 +291,92 @@ func (inv *Invoker) capabilities(health map[string]any) map[string]any {
 	data["available_data_tools"] = dataTools
 	data["available_trade_tools"] = tradeTools
 	return data
+}
+
+// resolveOptionLegs ports _resolved_legs: resolve selectors against the
+// selection/resolve endpoint, then size each leg from the resolved lot size.
+// The returned payload is the final option-run create body.
+func (inv *Invoker) resolveOptionLegs(ctx context.Context, requestObj, arguments map[string]any, headers map[string]string) (map[string]any, error) {
+	underlying, ok := optionUnderlying(requestObj)
+	if !ok {
+		return nil, &policy.Violation{Code: "invalid_request", Message: "underlying is required"}
+	}
+	resolveBody := map[string]any{
+		"expiry": requestObj["expiry"],
+		"legs":   optionSelections(requestObj),
+	}
+	resolvePath := "/worker/options/underlyings/" + underlying + "/selection/resolve"
+	resolved, err := inv.Client.Call(ctx, http.MethodPost, resolvePath, resolveBody, headers)
+	if err != nil {
+		return nil, err
+	}
+	contracts, _ := resolved["resolved"].([]any)
+	if contracts == nil {
+		contracts, _ = resolved["contracts"].([]any)
+	}
+	selectors := optionSelections(requestObj)
+	if len(contracts) < len(selectors) {
+		return nil, &policy.Violation{Code: "invalid_request", Message: "option resolver returned fewer contracts than requested legs"}
+	}
+	transactionType, _ := requestObj["transaction_type"].(string)
+	if transactionType == "" {
+		transactionType = "BUY"
+	}
+	product := argDefaultString(requestObj, "product", "NRML")
+	quantityLots := argInt(requestObj, arguments, "quantity_lots", 1)
+	expiry, _ := requestObj["expiry"].(string)
+	legs := []map[string]any{}
+	for index, rawContract := range contracts {
+		contract, ok := rawContract.(map[string]any)
+		if !ok {
+			return nil, &policy.Violation{Code: "invalid_request", Message: "resolved option contract has no valid lot_size"}
+		}
+		lotSize := argInt(contract, nil, "lot_size", 0)
+		if lotSize <= 0 {
+			return nil, &policy.Violation{Code: "invalid_request", Message: "resolved option contract has no valid lot_size"}
+		}
+		expiryKey := expiry
+		if v, ok := contract["expiry_key"].(string); ok && v != "" {
+			expiryKey = v
+		}
+		var optionType any = requestObj["option_type"]
+		if v, ok := contract["option_type"]; ok && v != nil {
+			optionType = v
+		} else if index < len(selectors) {
+			if v, ok := selectors[index]["option_type"]; ok {
+				optionType = v
+			}
+		}
+		exchange := "NFO"
+		if v, ok := contract["exchange"].(string); ok && v != "" {
+			exchange = v
+		}
+		legs = append(legs, map[string]any{
+			"tradingsymbol":    contract["tradingsymbol"],
+			"transaction_type": transactionType,
+			"quantity":         float64(lotSize * quantityLots),
+			"exchange":         exchange,
+			"product":          product,
+			"instrument_token": contract["instrument_token"],
+			"strike":           contract["strike"],
+			"option_type":      optionType,
+			"expiry_key":       expiryKey,
+			"ltp":              contract["ltp"],
+			"lot_size":         float64(lotSize),
+			"lots":             float64(quantityLots),
+			"order_type":       "MARKET",
+		})
+	}
+	return map[string]any{
+		"strategy_name":   requestObj["strategy_name"],
+		"product":         product,
+		"strategy_run_id": requestObj["strategy_run_id"],
+		"legs":            legs,
+		"metadata": map[string]any{
+			"account_scope":  requestObj["account_scope"],
+			"execution_mode": requestObj["execution_mode"],
+		},
+	}, nil
 }
 
 // segment exists to keep the call closure explicit for the lease guard above.

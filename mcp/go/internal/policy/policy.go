@@ -179,7 +179,18 @@ func (s *Service) Authorize(ctx context.Context, client HealthClient, name, effe
 }
 
 func (s *Service) checkProfileArguments(liveOnly bool, arguments map[string]any) error {
-	if mode := argString(arguments, "execution_mode", "mode"); mode != nil {
+	mode := argString(arguments, "execution_mode")
+	if mode == nil {
+		// A bare `mode` argument only counts as an execution mode when its
+		// value is one; get_quotes/get_market_snapshot use ltp/quote/full.
+		if candidate := argString(arguments, "mode"); candidate != nil {
+			switch strings.ToLower(*candidate) {
+			case "paper", "live", "dry_run":
+				mode = candidate
+			}
+		}
+	}
+	if mode != nil {
 		lower := strings.ToLower(*mode)
 		if lower == "live" && s.Config.Profile != "live" {
 			return violation("live_profile_required", "live execution requires KITE_MCP_PROFILE=live", false)
