@@ -10,7 +10,6 @@ import (
 	_ "github.com/lib/pq"
 )
 
-
 // stringPool interns repeated strings to reduce memory.
 // Exchange values ("NFO", "NSE", ...) and instrument types ("CE", "PE", ...)
 // appear tens of thousands of times — interning deduplicates their backing storage.
