@@ -14,7 +14,7 @@ Epoch / continuity semantics (spec §5.7, E-5, E-6):
   and never fires.
 - ``candle_close`` clock: the runtime stamps completed candles with the
   stable ``"candle"`` epoch, so state survives restarts via the checkpoint.
-  A bar arriving more than 2.5 expected intervals after the stored
+  A bar arriving more than 1.5 expected intervals after the stored
   ``last_bar_ts`` is a feed gap: the rule gets fresh epoch semantics (the
   stale bar initializes state, never fires) and the caller sees the
   ``"feed_gap"`` suppression reason for health reporting.
@@ -29,12 +29,13 @@ checkpoint so the first live bar can fire on a real crossing, but never
 records a signal event or advances subscription lifecycle; a would-be emit
 is reported with the ``"warmup"`` suppression reason.
 
-Session identity: ``session_provider(obs_ts)`` returns
-``(session_active, session_id)`` or ``None``; ``None`` (or no provider)
-falls back to ``(True, observation-date-in-IST)``. ``once_per_session``
-alerts re-arm when the session id changes. Every suppression is logged at
-INFO (rule/alert id, instrument, reason) so audit can see why an alert was
-silent.
+Session identity: a contextual ``session_provider(session_name,
+instrument_key, obs_ts)`` returns ``(session_active, session_id)`` or
+``None``; timestamp-only providers remain supported for isolated callers.
+No provider falls back to ``(True, observation-date-in-IST)``.
+``once_per_session`` alerts re-arm when the session id changes. Every
+suppression is logged at INFO (rule/alert id, instrument, reason) so audit can
+see why an alert is silent.
 
 ``ensure_subscriptions`` materializes ``alert_subscriptions`` rows for an
 activated revision's document (alerts x instruments) and is idempotent; the
@@ -46,6 +47,9 @@ This module is import-safe without redis and has no network dependencies.
 from __future__ import annotations
 
 import logging
+import hashlib
+import inspect
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -83,18 +87,19 @@ TIMEFRAME_SECONDS: dict[str, int] = {
     "day": 86400,
 }
 
-# Gap threshold multiplier: a bar later than 2.5 expected intervals is a gap.
-GAP_MULTIPLIER = 2.5
+# Gap threshold multiplier: a bar later than 1.5 expected intervals is a gap.
+GAP_MULTIPLIER = 1.5
 
 # Channel resolver: turns (owner_id, channel names) into a ``{name: channel_id}``
 # mapping. Names absent from the mapping are unresolved: the service skips
 # (and logs) them; the worker counts them in its health counters.
 ChannelResolver = Callable[[str, Sequence[str]], Dict[str, str]]
 
-# Session provider: maps an observation timestamp to
-# ``(session_active, session_id)`` or ``None`` (caller falls back to
-# ``(True, observation-date-in-IST)``).
-SessionProvider = Callable[[datetime], Optional[Tuple[bool, str]]]
+# Session provider: maps workflow session + instrument + observation timestamp
+# to ``(session_active, session_id)`` or ``None`` (caller falls back to
+# ``(True, observation-date-in-IST)``). Timestamp-only providers remain
+# supported for isolated callers and older tests.
+SessionProvider = Callable[..., Optional[Tuple[bool, str]]]
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -135,12 +140,17 @@ class EvaluationService:
         clock: Optional[Callable[[], datetime]] = None,
         channel_resolver: Optional[ChannelResolver] = None,
         session_provider: Optional[SessionProvider] = None,
+        owner_id: Optional[str] = None,
+        ownership_lease_s: float = 120.0,
     ) -> None:
         self.workflow_repo = workflow_repo
         self.session_factory = session_factory
         self.clock = clock
         self.channel_resolver = channel_resolver
         self.session_provider = session_provider
+        self._session_provider_with_context = self._supports_session_context(session_provider)
+        self.owner_id = owner_id or f"evaluation-worker:{uuid.uuid4()}"
+        self.ownership_lease_s = max(1.0, float(ownership_lease_s))
 
     # ------------------------------------------------------------------
     # subscriptions
@@ -173,11 +183,31 @@ class EvaluationService:
             ).scalars().all()
             known = {(row.alert_id, row.instrument_key) for row in existing}
             created = 0
+            rebound = 0
             for alert in document.alerts:
                 for instrument in document.instruments:
                     key = (alert.id, instrument.key())
                     if key in known:
+                        # C6: existing subscriptions receive a controlled
+                        # binding when catalog data becomes available, or when
+                        # the mapping/generation moved; metadata is not only
+                        # populated on newly created rows.
+                        row = next(
+                            (r for r in existing if r.alert_id == alert.id and r.instrument_key == instrument.key()),
+                            None,
+                        )
+                        if row is not None:
+                            binding = self._resolve_catalog_binding(instrument.key(), session)
+                            if binding is not None and binding != (row.config or {}).get("instrument_binding"):
+                                config = dict(row.config or {})
+                                config["instrument_binding"] = binding
+                                row.config = config
+                                rebound += 1
                         continue
+                    config = self._alert_config(alert)
+                    binding = self._resolve_catalog_binding(instrument.key(), session)
+                    if binding is not None:
+                        config["instrument_binding"] = binding
                     session.add(
                         AlertSubscription(
                             id=str(uuid.uuid4()),
@@ -188,7 +218,7 @@ class EvaluationService:
                             instrument_exchange=instrument.exchange,
                             instrument_key=instrument.key(),
                             trigger=alert.trigger,
-                            config=self._alert_config(alert),
+                            config=config,
                             state="active",
                         )
                     )
@@ -196,6 +226,11 @@ class EvaluationService:
                     created += 1
             if owned:
                 session.commit()
+            if rebound:
+                logger.info(
+                    "refreshed catalog binding on %d existing subscription(s) for revision %s",
+                    rebound, revision.id,
+                )
             return created
         except IntegrityError:
             # A concurrent creator won the unique (revision, alert, instrument)
@@ -224,6 +259,32 @@ class EvaluationService:
             "channels": list(alert.channels),
             "message": alert.message,
         }
+
+    @staticmethod
+    def _resolve_catalog_binding(instrument_key: str, session: Session) -> Optional[dict]:
+        """Persist catalog provenance when the catalog migration is present.
+
+        Alert tests and pre-migration deployments continue to materialize
+        subscriptions without a binding; the worker resolves them on startup.
+        """
+        try:
+            from backend.broker_api.instruments.catalog import (
+                CatalogUnavailableError,
+                InstrumentCatalog,
+                InstrumentNotFoundError,
+            )
+
+            descriptor = InstrumentCatalog(db=session).resolve_public_key(instrument_key)
+            return {
+                "instrument_id": descriptor.instrument_id,
+                "public_key": descriptor.public_key,
+                "broker": descriptor.broker,
+                "broker_token": descriptor.broker_token,
+                "catalog_generation": descriptor.catalog_generation,
+                "lifecycle_status": descriptor.lifecycle_status,
+            }
+        except (CatalogUnavailableError, InstrumentNotFoundError):
+            return None
 
     # ------------------------------------------------------------------
     # evaluation
@@ -272,17 +333,54 @@ class EvaluationService:
         owned = db is None
         session = db if db is not None else self.session_factory()
         try:
+            ownership_now = self.clock() if self.clock is not None else obs.ts
+            owner_epoch = self.workflow_repo.claim_evaluation(
+                sub.id,
+                sub.instrument_key,
+                self.owner_id,
+                lease_seconds=self.ownership_lease_s,
+                now=ownership_now,
+                db=session,
+            )
+            if owner_epoch is None:
+                self._log_suppression(sub, "not_owner")
+                return HandleResult(False, False, "not_owner", False)
+
             checkpoint = self.workflow_repo.load_checkpoint(
                 sub.id, sub.instrument_key, obs.epoch_id, db=session,
             )
+            if checkpoint is None and stage.clock == "ltp":
+                latest = self.workflow_repo.load_latest_checkpoint(
+                    sub.id, sub.instrument_key, db=session,
+                )
+                if latest is not None:
+                    _previous_epoch, latest_state, latest_owner_epoch = latest
+                    checkpoint = (latest_state, latest_owner_epoch)
             if checkpoint is None:
                 state, stored_epoch = {}, 0
             else:
                 state, stored_epoch = checkpoint
 
-            # A bar at or before the stored last_bar_ts was already processed:
-            # ignore it entirely instead of re-running it against newer state.
-            if stage.clock == "candle_close" and self._is_stale_bar(state, obs):
+            observation_epoch_changed = bool(
+                state.get("epoch_id") is not None
+                and state.get("epoch_id") != obs.epoch_id
+            )
+
+            correction = False
+            if stage.clock == "candle_close" and self._is_correction(state, obs):
+                prior_state = state.get("last_bar_state")
+                if isinstance(prior_state, dict):
+                    state = dict(prior_state)
+                    correction = True
+                else:
+                    self._log_suppression(sub, "stale_bar")
+                    return HandleResult(False, False, "stale_bar", False)
+
+            # A bar at or before the stored last_bar_ts was already processed.
+            # Exact duplicate payloads are ignored; a changed same-timestamp
+            # final bar takes the correction path above and recomputes from the
+            # checkpoint immediately before the corrected bar.
+            if stage.clock == "candle_close" and self._is_stale_bar(state, obs) and not correction:
                 self._log_suppression(sub, "stale_bar")
                 return HandleResult(
                     fired=False,
@@ -295,11 +393,23 @@ class EvaluationService:
             if stage.clock == "candle_close":
                 gap = self._detect_gap(stage, state, obs)
                 if gap:
-                    state = {}  # new epoch semantics: nothing carries over
+                    state = self._reset_observation_state(state)
 
-            session_active, session_id = self._resolve_session(obs)
+            # LTP worker epochs reset crossing/baseline continuity but retain
+            # durable trigger bookkeeping (once/session/cooldown/rearm). The
+            # predicate layer clears its condition-local epoch keys below.
+            if stage.clock == "ltp" and observation_epoch_changed:
+                state = dict(state)
+
+            session_active, session_id = self._resolve_session(sub, document, obs)
 
             pred = evaluate_stage(stage, obs, state, context)
+            engine_state = dict(pred.state)
+            if stage.clock == "ltp" and observation_epoch_changed:
+                # Make the first observation of a new epoch pass through the
+                # activation guard without erasing fired_once/last_session or
+                # other durable trigger bookkeeping.
+                engine_state.pop("initialized", None)
             now = self.clock() if self.clock is not None else obs.ts
             # The engine chains on the predicate's OUTPUT state (pred.state
             # carries per-condition prev/baseline/... for this observation).
@@ -308,45 +418,92 @@ class EvaluationService:
             engine = decide(
                 alert,
                 fired=pred.fired,
-                state=pred.state,
+                state=engine_state,
                 now=now,
                 session_active=session_active,
                 current_value=_stage_current_value(stage, obs),
-                already_true=pred.matched if not state.get("initialized") else None,
+                already_true=(
+                    pred.matched
+                    if observation_epoch_changed or not state.get("initialized")
+                    else None
+                ),
                 session_id=session_id,
                 matched=pred.matched,
             )
 
             emitted = False
+            event = None
+            correction_audited = False
+            base_occurrence_key = (
+                f"{sub.workflow_id}:{sub.revision_id}:{sub.id}:"
+                f"{sub.alert_id}:{sub.instrument_key}:{obs.ts.isoformat()}"
+            )
+            evidence = {
+                **pred.evidence,
+                "epoch_id": obs.epoch_id,
+                "stage_id": sub.stage_id,
+                "timeframe": stage.timeframe,
+            }
+            # C6: every event carries the binding in force at evaluation time.
+            # Rebinding later must not overwrite the meaning of old events —
+            # this snapshot is copied into the immutable event row.
+            binding = (sub.config or {}).get("instrument_binding")
+            if isinstance(binding, dict) and binding:
+                evidence["instrument_binding"] = dict(binding)
             if engine.emit and allow_emit:
-                occurrence_key = (
-                    f"{sub.workflow_id}:{sub.alert_id}:{sub.instrument_key}:"
-                    f"{obs.epoch_id}:{obs.ts.isoformat()}"
+                self.workflow_repo.assert_evaluation_owner(
+                    sub.id,
+                    sub.instrument_key,
+                    self.owner_id,
+                    owner_epoch,
+                    now=ownership_now,
+                    db=session,
                 )
-                evidence = {
-                    **pred.evidence,
-                    "epoch_id": obs.epoch_id,
-                    "stage_id": sub.stage_id,
-                    "timeframe": stage.timeframe,
-                }
-                try:
-                    event = self.workflow_repo.record_signal(
-                        sub.id,
-                        occurrence_key,
-                        fired_at=obs.ts,
-                        evidence=evidence,
-                        channel_ids=channel_ids,
-                        db=session,
+                occurrence_key = base_occurrence_key
+                existing_event = self.workflow_repo.get_signal_by_occurrence(
+                    occurrence_key, db=session
+                )
+                if existing_event is None and stage.clock == "candle_close":
+                    # Compatibility with Phase 1 rows written before the
+                    # revision-aware occurrence contract landed. New writes
+                    # always use the revision/subscription key above.
+                    legacy_key = (
+                        f"{sub.workflow_id}:{sub.alert_id}:{sub.instrument_key}:"
+                        f"candle:{obs.ts.isoformat()}"
                     )
+                    existing_event = self.workflow_repo.get_signal_by_occurrence(
+                        legacy_key, db=session
+                    )
+                try:
+                    if existing_event is None:
+                        with session.begin_nested():
+                            event = self.workflow_repo.record_signal(
+                                sub.id,
+                                occurrence_key,
+                                fired_at=obs.ts,
+                                evidence=evidence,
+                                channel_ids=channel_ids,
+                                now=now,
+                                db=session,
+                            )
+                    else:
+                        event = None
                 except IntegrityError:
                     # E-2/E-7: a racing writer (or a re-delivered bar) already
                     # committed this occurrence key; the whole transaction
                     # rolls back and the loser skips without crashing.
-                    session.rollback()
                     logger.info(
                         "occurrence %s already recorded for subscription %s; skipping",
                         occurrence_key, sub.id,
                     )
+                    self._log_suppression(sub, "duplicate_occurrence")
+                    event = None
+                    existing_event = True
+                if correction and existing_event is not None:
+                    correction_audited = self._record_correction_notice(
+                        sub, obs, base_occurrence_key, evidence, now, session
+                    )
+                elif existing_event is not None:
                     self._log_suppression(sub, "duplicate_occurrence")
                     return HandleResult(
                         fired=bool(pred.fired),
@@ -355,6 +512,35 @@ class EvaluationService:
                         rule_completed=False,
                     )
                 emitted = event is not None  # None: occurrence key already exists
+
+            # A correction can legitimately remove the crossing that caused
+            # the original event. It still needs an auditable, silent
+            # correction record; the `engine.emit` branch above only handles
+            # corrections that remain trigger-eligible after recomputation.
+            if correction and allow_emit and not correction_audited and event is None:
+                existing_event = self.workflow_repo.get_signal_by_occurrence(
+                    base_occurrence_key, db=session
+                )
+                if existing_event is None and stage.clock == "candle_close":
+                    legacy_key = (
+                        f"{sub.workflow_id}:{sub.alert_id}:{sub.instrument_key}:"
+                        f"candle:{obs.ts.isoformat()}"
+                    )
+                    existing_event = self.workflow_repo.get_signal_by_occurrence(
+                        legacy_key, db=session
+                    )
+                if existing_event is not None:
+                    self.workflow_repo.assert_evaluation_owner(
+                        sub.id,
+                        sub.instrument_key,
+                        self.owner_id,
+                        owner_epoch,
+                        now=ownership_now,
+                        db=session,
+                    )
+                    correction_audited = self._record_correction_notice(
+                        sub, obs, base_occurrence_key, evidence, now, session
+                    )
 
             # Always persist the checkpoint (even for suppressed evaluations)
             # so state continuity survives restarts.
@@ -369,10 +555,23 @@ class EvaluationService:
                     new_state.pop(key, None)
             new_state["epoch_id"] = obs.epoch_id
             if obs.final:
+                prior_bar_state = dict(state)
+                prior_bar_state.pop("last_bar_state", None)
+                prior_bar_state.pop("last_bar_payload", None)
+                new_state["last_bar_state"] = prior_bar_state
+                new_state["last_bar_payload"] = self._bar_payload(obs)
                 new_state["last_bar_ts"] = obs.ts.isoformat()
             # non-final observations keep the stored last_bar_ts untouched
 
             try:
+                self.workflow_repo.assert_evaluation_owner(
+                    sub.id,
+                    sub.instrument_key,
+                    self.owner_id,
+                    owner_epoch,
+                    now=ownership_now,
+                    db=session,
+                )
                 self.workflow_repo.save_checkpoint(
                     sub.id,
                     sub.instrument_key,
@@ -409,7 +608,9 @@ class EvaluationService:
             if owned:
                 session.commit()
 
-            if not allow_emit and engine.emit:
+            if correction and not emitted:
+                suppression_reason = "candle_correction"
+            elif not allow_emit and engine.emit:
                 suppression_reason: Optional[str] = "warmup"
             elif engine.emit:
                 suppression_reason = None if emitted else "duplicate_occurrence"
@@ -440,6 +641,81 @@ class EvaluationService:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _reset_observation_state(state: dict) -> dict:
+        """Reset continuity while retaining durable trigger bookkeeping."""
+        reset = dict(state or {})
+        for key in ("conds", "epoch_id", "last_bar_ts", "initialized"):
+            reset.pop(key, None)
+        reset.pop("last_bar_state", None)
+        reset.pop("last_bar_payload", None)
+        return reset
+
+    @staticmethod
+    def _bar_payload(obs: Observation) -> dict:
+        return {
+            "ts": obs.ts.isoformat(),
+            "ltp": obs.ltp,
+            "open": obs.open,
+            "high": obs.high,
+            "low": obs.low,
+            "close": obs.close,
+            "volume": obs.volume,
+            "final": bool(obs.final),
+        }
+
+    def _record_correction_notice(
+        self,
+        sub: ActiveSubscription,
+        obs: Observation,
+        base_occurrence_key: str,
+        evidence: dict,
+        now: datetime,
+        session: Session,
+    ) -> bool:
+        """Record one silent, idempotent audit event for a changed final bar."""
+        correction_hash = hashlib.sha256(
+            json.dumps(self._bar_payload(obs), sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        correction_key = f"correction:{base_occurrence_key}:{correction_hash}"
+        if self.workflow_repo.get_signal_by_occurrence(correction_key, db=session) is not None:
+            return True
+        correction_evidence = {
+            **evidence,
+            "correction_of": base_occurrence_key,
+            "correction_hash": correction_hash,
+        }
+        try:
+            with session.begin_nested():
+                self.workflow_repo.record_signal(
+                    sub.id,
+                    correction_key,
+                    fired_at=obs.ts,
+                    evidence=correction_evidence,
+                    channel_ids=(),
+                    now=now,
+                    db=session,
+                )
+        except IntegrityError:
+            # Another correction writer won the unique occurrence key. The
+            # checkpoint can still be committed by the current owner.
+            return True
+        return True
+
+    @classmethod
+    def _is_correction(cls, state: dict, obs: Observation) -> bool:
+        last_raw = state.get("last_bar_ts")
+        payload = state.get("last_bar_payload")
+        if not last_raw or not isinstance(payload, dict) or not obs.final:
+            return False
+        try:
+            last_ts = datetime.fromisoformat(str(last_raw))
+        except (TypeError, ValueError):
+            return False
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+        return obs.ts == last_ts.astimezone(obs.ts.tzinfo or timezone.utc) and payload != cls._bar_payload(obs)
+
+    @staticmethod
     def _is_stale_bar(state: dict, obs: Observation) -> bool:
         """True when the observation is at or before the stored last bar.
 
@@ -463,10 +739,36 @@ class EvaluationService:
         ts = obs.ts if obs.ts.tzinfo is not None else obs.ts.replace(tzinfo=timezone.utc)
         return ts.astimezone(_IST).date().isoformat()
 
-    def _resolve_session(self, obs: Observation) -> tuple[bool, str]:
+    @staticmethod
+    def _supports_session_context(provider: Optional[SessionProvider]) -> bool:
+        if provider is None:
+            return False
+        try:
+            parameters = inspect.signature(provider).parameters.values()
+        except (TypeError, ValueError):
+            return True
+        if any(parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
+            return True
+        positional = [
+            parameter
+            for parameter in parameters
+            if parameter.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        return len(positional) >= 3
+
+    def _resolve_session(
+        self,
+        sub: ActiveSubscription,
+        document: WorkflowDocument,
+        obs: Observation,
+    ) -> tuple[bool, str]:
         """(session_active, session_id) from the provider, or the IST fallback."""
         if self.session_provider is not None:
-            resolved = self.session_provider(obs.ts)
+            if self._session_provider_with_context:
+                resolved = self.session_provider(document.session, sub.instrument_key, obs.ts)
+            else:
+                resolved = self.session_provider(obs.ts)
             if resolved is not None:
                 return bool(resolved[0]), str(resolved[1])
         return True, self._fallback_session_id(obs)

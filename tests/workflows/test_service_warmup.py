@@ -122,11 +122,16 @@ def _prev_day_doc() -> WorkflowDocument:
     )
 
 
-def _ltp_doc(trigger: str = "once_per_session") -> WorkflowDocument:
+def _ltp_doc(
+    trigger: str = "once_per_session",
+    *,
+    exchange: str = "NSE",
+    session: str = "nse_equity",
+) -> WorkflowDocument:
     return WorkflowDocument(
         version=1,
         name="ltp-cross",
-        instruments=(InstrumentRef(symbol="RELIANCE", exchange="NSE"),),
+        instruments=(InstrumentRef(symbol="RELIANCE", exchange=exchange),),
         stages=(
             Stage(
                 id="px",
@@ -145,6 +150,7 @@ def _ltp_doc(trigger: str = "once_per_session") -> WorkflowDocument:
         alerts=(
             AlertSpec(id="cross", source="px", trigger=trigger, channels=("c1",)),
         ),
+        session=session,
     )
 
 
@@ -444,6 +450,35 @@ def test_session_fallback_without_provider_is_obs_date_in_ist(repo, session_fact
     r5 = service.handle_observation(sub, refire)
     assert r5.emitted is True
     assert len(_events(session_factory)) == 2
+
+
+def test_service_passes_workflow_session_and_instrument_to_provider(repo, session_factory):
+    _workflow, revision = _activate(
+        repo,
+        _ltp_doc(
+            trigger="once",
+            exchange="MCX",
+            session="mcx_commodity",
+        ),
+    )
+    calls = []
+
+    def provider(session_name, instrument_key, timestamp):
+        calls.append((session_name, instrument_key, timestamp))
+        return True, "MCX:2026-09-08"
+
+    service = _candle_service(
+        repo,
+        session_factory,
+        session_provider=provider,
+    )
+    service.ensure_subscriptions(revision)
+    sub = _single_sub(repo)
+
+    result = service.handle_observation(sub, _tick(0, 95.0))
+
+    assert result.emitted is False
+    assert calls == [("mcx_commodity", "MCX:RELIANCE", T0)]
 
 
 # ---------------------------------------------------------------------------

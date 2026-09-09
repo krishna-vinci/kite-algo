@@ -76,7 +76,9 @@ def build_message(
             ist_str=ist_str,
             utc_str=utc_str,
         )
-    return subject, _cap_body(body)
+    if event_id is not None and str(event_id) not in body:
+        body = f"{body}\nevent_id: {event_id}"
+    return subject, _cap_body(body, event_id=event_id)
 
 
 def _default_body(
@@ -112,13 +114,14 @@ def _render_template(
     event_id: Optional[str],
     ist_str: str,
 ) -> str:
+    flattened = _flatten_condition_evidence(evidence)
     values: dict[str, str] = {
         "symbol": instrument_key,
         "rule": rule_name,
         "time": ist_str,
         "event_id": event_id if event_id is not None else "-",
-        "level": _evidence_str(evidence, "level"),
-        "ltp": _evidence_str(evidence, "ltp"),
+        "level": flattened.get("level", "-"),
+        "ltp": flattened.get("ltp", "-"),
     }
 
     def _replace(match: re.Match[str]) -> str:
@@ -133,12 +136,45 @@ def _evidence_str(evidence: dict, key: str) -> str:
     return str(evidence[key])
 
 
+def _flatten_condition_evidence(evidence: dict) -> dict[str, str]:
+    """Expose unambiguous aliases while retaining nested evidence in output.
+
+    Predicate evidence is keyed by condition identity. A single condition can
+    safely provide ``${ltp}``/``${level}``; with multiple conflicting
+    conditions the placeholder becomes ``-`` instead of silently selecting a
+    condition. Equal values remain usable (for example two conditions sharing
+    one threshold).
+    """
+    values: dict[str, list[str]] = {}
+    for key, value in evidence.items():
+        if not isinstance(value, dict):
+            if key in {"ltp", "level"} and value is not None:
+                values.setdefault(key, []).append(str(value))
+            continue
+        for nested_key in ("ltp", "level"):
+            nested_value = value.get(nested_key)
+            if nested_value is not None:
+                values.setdefault(nested_key, []).append(str(nested_value))
+    flattened: dict[str, str] = {}
+    for key, candidates in values.items():
+        unique = list(dict.fromkeys(candidates))
+        if len(unique) == 1:
+            flattened[key] = unique[0]
+    return flattened
+
+
 def _cap_subject(subject: str) -> str:
     return subject[:SUBJECT_MAX]
 
 
-def _cap_body(body: str) -> str:
+def _cap_body(body: str, *, event_id: Optional[str] = None) -> str:
     if len(body) <= BODY_MAX:
         return body
-    keep = BODY_MAX - len(TRUNCATION_MARKER)
-    return body[:keep] + TRUNCATION_MARKER
+    suffix = ""
+    if event_id is not None:
+        suffix = f"\nevent_id: {event_id}"
+    keep = BODY_MAX - len(TRUNCATION_MARKER) - len(suffix)
+    if keep < 0:
+        suffix = suffix[-(BODY_MAX - len(TRUNCATION_MARKER)):]
+        keep = 0
+    return body[:keep] + TRUNCATION_MARKER + suffix

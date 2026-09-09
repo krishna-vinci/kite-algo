@@ -44,14 +44,18 @@ type NormalizedTick struct {
 	IsTradable         bool             `json:"is_tradable"`
 	IsIndex            bool             `json:"is_index"`
 	// Instrument metadata enriched by the instrument store (omitempty when unavailable).
-	Tradingsymbol  string  `json:"tradingsymbol,omitempty"`
-	Exchange       string  `json:"exchange,omitempty"`
-	InstrumentType string  `json:"instrument_type,omitempty"`
-	LotSize        int32   `json:"lot_size,omitempty"`
-	TickSize       float64 `json:"tick_size,omitempty"`
-	Strike         float64 `json:"strike,omitempty"`
-	Expiry         string  `json:"expiry,omitempty"`
-	Underlying     string  `json:"underlying,omitempty"`
+	InstrumentID      string  `json:"instrument_id,omitempty"`
+	Tradingsymbol     string  `json:"tradingsymbol,omitempty"`
+	Exchange          string  `json:"exchange,omitempty"`
+	Segment           string  `json:"segment,omitempty"`
+	InstrumentType    string  `json:"instrument_type,omitempty"`
+	OptionType        string  `json:"option_type,omitempty"`
+	LotSize           int32   `json:"lot_size,omitempty"`
+	TickSize          float64 `json:"tick_size,omitempty"`
+	Strike            float64 `json:"strike,omitempty"`
+	Expiry            string  `json:"expiry,omitempty"`
+	Underlying        string  `json:"underlying,omitempty"`
+	CatalogGeneration string  `json:"catalog_generation,omitempty"`
 }
 
 type NormalizedOHLC struct {

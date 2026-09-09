@@ -143,6 +143,17 @@ def test_unknown_trigger_rejected() -> None:
     assert any(issue.code == "bad_value" for issue in exc.value.issues)
 
 
+def test_session_mismatch_rejects_mcx_in_nse_equity_workflow() -> None:
+    obj = _minimal_doc()
+    obj["instruments"] = ["MCX:GOLD26OCTFUT"]
+    doc = parse_workflow_dict(obj)
+
+    with pytest.raises(WorkflowValidationError) as exc:
+        compile_document(doc)
+
+    assert any(issue.code == "session_mismatch" for issue in exc.value.issues)
+
+
 def test_stage_input_cycle_rejected() -> None:
     obj = _minimal_doc()
     obj["stages"] = [

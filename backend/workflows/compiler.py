@@ -107,6 +107,27 @@ def _validate(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:
     if not doc.name:
         _add(ValidationIssue("document.name", "bad_value", "workflow name must not be empty"))
 
+    if not registry.is_supported_session(doc.session):
+        _add(
+            ValidationIssue(
+                "document.session",
+                "unknown_capability",
+                f"session '{doc.session}' is not supported in Phase 1 "
+                f"(supported: {sorted(registry.SESSIONS)})",
+            )
+        )
+    else:
+        for index, instrument in enumerate(doc.instruments):
+            if not registry.session_accepts_exchange(doc.session, instrument.exchange):
+                _add(
+                    ValidationIssue(
+                        f"document.instruments[{index}].exchange",
+                        "session_mismatch",
+                        f"session '{doc.session}' does not support exchange "
+                        f"'{instrument.exchange}'",
+                    )
+                )
+
     _validate_reserved(doc, issues)
 
     if doc.data_policy.missing not in DATA_POLICY_MISSING:

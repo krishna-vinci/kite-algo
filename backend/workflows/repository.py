@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional, Sequence
 
 from sqlalchemy import (
@@ -52,6 +52,7 @@ __all__ = [
     "WorkflowRevision",
     "AlertSubscription",
     "EvaluationCheckpoint",
+    "EvaluationOwnership",
     "SignalEvent",
     "ActiveSubscription",
     "SqlAlchemyWorkflowRepository",
@@ -170,6 +171,25 @@ class EvaluationCheckpoint(Base):
     epoch_id = Column(String(128), primary_key=True)
     state = Column(JSON, nullable=False, default=dict)
     owner_epoch = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class EvaluationOwnership(Base):
+    """Durable subscription/instrument evaluation fence.
+
+    Checkpoint rows are observation-epoch scoped for recovery semantics. This
+    separate row keeps ownership stable across worker epochs so two workers
+    cannot both evaluate the same live subscription merely because their feed
+    sources minted different epoch ids.
+    """
+
+    __tablename__ = "evaluation_ownership"
+
+    subscription_id = Column(String(36), primary_key=True)
+    instrument_key = Column(String(128), primary_key=True)
+    owner_id = Column(String(255), nullable=False)
+    owner_epoch = Column(Integer, nullable=False, default=1)
+    lease_until = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
@@ -550,6 +570,145 @@ class SqlAlchemyWorkflowRepository:
         finally:
             session.close()
 
+    def load_latest_checkpoint(
+        self,
+        subscription_id: str,
+        instrument_key: str,
+        *,
+        db: Optional[Session] = None,
+    ):
+        """Return the newest checkpoint across observation epochs."""
+        if db is not None:
+            return self._load_latest_checkpoint(db, subscription_id, instrument_key)
+        session = self._session()
+        try:
+            return self._load_latest_checkpoint(session, subscription_id, instrument_key)
+        finally:
+            session.close()
+
+    @staticmethod
+    def _load_latest_checkpoint(session, subscription_id, instrument_key):
+        row = session.execute(
+            select(EvaluationCheckpoint)
+            .where(
+                EvaluationCheckpoint.subscription_id == subscription_id,
+                EvaluationCheckpoint.instrument_key == instrument_key,
+            )
+            .order_by(EvaluationCheckpoint.updated_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return row.epoch_id, dict(row.state or {}), int(row.owner_epoch or 0)
+
+    # -- durable evaluation ownership --------------------------------------
+
+    def claim_evaluation(
+        self,
+        subscription_id: str,
+        instrument_key: str,
+        owner_id: str,
+        *,
+        lease_seconds: float = 120.0,
+        now: Optional[datetime] = None,
+        db: Optional[Session] = None,
+    ) -> Optional[int]:
+        """Claim or renew the live evaluation fence.
+
+        ``None`` means another unexpired owner holds the subscription. A
+        takeover increments ``owner_epoch`` so a stale worker can be fenced at
+        the transaction boundary.
+        """
+        if db is not None:
+            return self._claim_evaluation(db, subscription_id, instrument_key, owner_id, lease_seconds, now)
+        session = self._session()
+        try:
+            epoch = self._claim_evaluation(session, subscription_id, instrument_key, owner_id, lease_seconds, now)
+            session.commit()
+            return epoch
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _claim_evaluation(self, session, subscription_id, instrument_key, owner_id, lease_seconds, now):
+        timestamp = now or _utcnow()
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        timestamp = timestamp.astimezone(timezone.utc)
+        stmt = select(EvaluationOwnership).where(
+            EvaluationOwnership.subscription_id == subscription_id,
+            EvaluationOwnership.instrument_key == instrument_key,
+        )
+        if _is_postgres(session):
+            stmt = stmt.with_for_update()
+        row = session.execute(stmt).scalar_one_or_none()
+        lease_until = timestamp + timedelta(seconds=max(1.0, float(lease_seconds)))
+        if row is None:
+            session.add(
+                EvaluationOwnership(
+                    subscription_id=subscription_id,
+                    instrument_key=instrument_key,
+                    owner_id=owner_id,
+                    owner_epoch=1,
+                    lease_until=lease_until,
+                    updated_at=timestamp,
+                )
+            )
+            session.flush()
+            return 1
+        stored_lease = row.lease_until
+        if stored_lease is not None and stored_lease.tzinfo is None:
+            stored_lease = stored_lease.replace(tzinfo=timezone.utc)
+        if row.owner_id != owner_id and stored_lease is not None and stored_lease > timestamp:
+            return None
+        if row.owner_id != owner_id:
+            row.owner_epoch = int(row.owner_epoch or 0) + 1
+        row.owner_id = owner_id
+        row.lease_until = lease_until
+        row.updated_at = timestamp
+        session.flush()
+        return int(row.owner_epoch or 0)
+
+    def assert_evaluation_owner(
+        self,
+        subscription_id: str,
+        instrument_key: str,
+        owner_id: str,
+        owner_epoch: int,
+        *,
+        now: Optional[datetime] = None,
+        db: Optional[Session] = None,
+    ) -> None:
+        if db is not None:
+            return self._assert_evaluation_owner(db, subscription_id, instrument_key, owner_id, owner_epoch, now)
+        session = self._session()
+        try:
+            self._assert_evaluation_owner(session, subscription_id, instrument_key, owner_id, owner_epoch, now)
+        finally:
+            session.close()
+
+    @staticmethod
+    def _assert_evaluation_owner(session, subscription_id, instrument_key, owner_id, owner_epoch, now):
+        timestamp = now or _utcnow()
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        row = session.get(EvaluationOwnership, (subscription_id, instrument_key))
+        stored_lease = row.lease_until if row is not None else None
+        if stored_lease is not None and stored_lease.tzinfo is None:
+            stored_lease = stored_lease.replace(tzinfo=timezone.utc)
+        if (
+            row is None
+            or row.owner_id != owner_id
+            or int(row.owner_epoch or 0) != int(owner_epoch)
+            or stored_lease is None
+            or stored_lease <= timestamp.astimezone(timezone.utc)
+        ):
+            raise LeaseConflict(
+                f"evaluation {subscription_id}/{instrument_key}: ownership lease lost"
+            )
+
     def _load_checkpoint(self, session, subscription_id, instrument_key, epoch_id):
         row = session.get(EvaluationCheckpoint, (subscription_id, instrument_key, epoch_id))
         if row is None:
@@ -683,6 +842,24 @@ class SqlAlchemyWorkflowRepository:
         except Exception:
             session.rollback()
             raise
+        finally:
+            session.close()
+
+    def get_signal_by_occurrence(
+        self,
+        occurrence_key: str,
+        *,
+        db: Optional[Session] = None,
+    ):
+        if db is not None:
+            return db.execute(
+                select(SignalEvent).where(SignalEvent.occurrence_key == occurrence_key)
+            ).scalar_one_or_none()
+        session = self._session()
+        try:
+            return session.execute(
+                select(SignalEvent).where(SignalEvent.occurrence_key == occurrence_key)
+            ).scalar_one_or_none()
         finally:
             session.close()
 

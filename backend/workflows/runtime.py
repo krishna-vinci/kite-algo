@@ -70,10 +70,11 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 import uuid
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import (
     Any,
     Callable,
@@ -84,10 +85,13 @@ from typing import (
     Sequence,
     Tuple,
 )
+from zoneinfo import ZoneInfo
 
 from backend.alerts.predicates import Observation
+from backend.workflows.instrument_bindings import BindingChange, InstrumentBindingRegistry
 from backend.workflows.models import Stage, WorkflowDocument
 from backend.workflows.parser import WorkflowParseError, parse_workflow_dict
+from backend.workflows import registry
 from backend.workflows.repository import (
     ActiveSubscription,
     SqlAlchemyWorkflowRepository,
@@ -100,7 +104,10 @@ __all__ = [
     "RedisTickSource",
     "RedisCandleSource",
     "PgCandleHistory",
+    "build_nse_session_provider",
+    "build_market_session_provider",
     "EvaluationWorker",
+    "InstrumentBindingRegistry",
     "MARKET_TICKS_CHANNEL",
     "REALTIME_CANDLES_CHANNEL_PREFIX",
     "CANDLE_EPOCH_ID",
@@ -124,19 +131,24 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _parse_ts(raw: Any) -> datetime:
-    """Normalize runtime timestamps (ISO strings or datetimes) to aware UTC."""
+def _parse_ts(raw: Any) -> Optional[datetime]:
+    """Normalize an exchange event timestamp; never fabricate one."""
     if isinstance(raw, datetime):
         dt = raw
     elif isinstance(raw, str):
         try:
             dt = datetime.fromisoformat(raw.replace("Z", "+00:00").replace("z", "+00:00"))
         except ValueError:
-            return _utcnow()
+            return None
     elif isinstance(raw, (int, float)):
-        return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+        if isinstance(raw, bool) or not math.isfinite(float(raw)):
+            return None
+        try:
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     else:
-        return _utcnow()
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
@@ -163,6 +175,10 @@ class CandleHistory(Protocol):
     """Synchronous warmup reads of completed candles (ascending by ts)."""
 
     def recent_bars(self, instrument_key: str, timeframe: str, limit: int) -> List[Observation]: ...
+
+    def previous_session_levels(
+        self, instrument_key: str, at: datetime
+    ) -> Optional[Dict[str, float]]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +258,14 @@ class RedisTickSource:
             if ltp is None:
                 continue
             ts = _parse_ts(payload.get("exchange_timestamp", payload.get("ts")))
-            return Observation(ts=ts, epoch_id=self._epoch_id, ltp=float(ltp))
+            try:
+                ltp_value = float(ltp)
+            except (TypeError, ValueError):
+                continue
+            if ts is None or not math.isfinite(ltp_value):
+                logger.warning("discarding tick with missing/invalid exchange timestamp or ltp")
+                continue
+            return Observation(ts=ts, epoch_id=self._epoch_id, ltp=ltp_value)
 
     async def stop(self) -> None:
         if self._pubsub is not None:
@@ -325,15 +348,20 @@ class RedisCandleSource:
                 continue
             try:
                 ts = _parse_ts(candle[0])
+                if ts is None:
+                    raise ValueError("missing/invalid candle event timestamp")
+                values = [float(value) for value in candle[1:6]]
+                if not all(math.isfinite(value) for value in values):
+                    raise ValueError("non-finite candle value")
                 obs = Observation(
                     ts=ts,
                     epoch_id=CANDLE_EPOCH_ID,
-                    ltp=float(candle[4]),
-                    open=float(candle[1]),
-                    high=float(candle[2]),
-                    low=float(candle[3]),
-                    close=float(candle[4]),
-                    volume=float(candle[5] or 0.0),
+                    ltp=values[3],
+                    open=values[0],
+                    high=values[1],
+                    low=values[2],
+                    close=values[3],
+                    volume=values[4],
                     final=True,
                 )
             except (TypeError, ValueError):
@@ -358,18 +386,33 @@ class RedisCandleSource:
 class PgCandleHistory:
     """Warmup reads of completed candles from ``public.historical_candles``.
 
-    Built on a caller-provided SQLAlchemy engine; the SQL is issued lazily so
-    importing this module never touches a database.
+    Built on a caller-provided SQLAlchemy engine. ``instrument_tokens`` is
+    either a plain dict (snapshot copy, legacy behavior) or an
+    :class:`InstrumentBindingRegistry`-like provider exposing ``get()``; with
+    a provider every query resolves the CURRENT accepted binding instead of a
+    startup snapshot (C1). The SQL is issued lazily so importing this module
+    never touches a database.
     """
 
-    def __init__(self, engine: Any, instrument_tokens: Dict[str, int]) -> None:
+    def __init__(self, engine: Any, instrument_tokens: Any) -> None:
         self._engine = engine
-        self._instrument_tokens: Dict[str, int] = {
-            str(key): int(token) for key, token in (instrument_tokens or {}).items()
-        }
+        self._bindings = instrument_tokens
+        self._instrument_tokens: Optional[Dict[str, int]] = (
+            None
+            if hasattr(instrument_tokens, "get") and hasattr(instrument_tokens, "snapshot")
+            else {
+                str(key): int(token)
+                for key, token in (instrument_tokens or {}).items()
+            }
+        )
+
+    def _token_for(self, instrument_key: str) -> Optional[int]:
+        if self._instrument_tokens is not None:
+            return self._instrument_tokens.get(instrument_key)
+        return self._bindings.get(instrument_key)
 
     def recent_bars(self, instrument_key: str, timeframe: str, limit: int) -> List[Observation]:
-        token = self._instrument_tokens.get(instrument_key)
+        token = self._token_for(instrument_key)
         if token is None:
             return []
         try:
@@ -400,6 +443,8 @@ class PgCandleHistory:
                 ts = ts.astimezone(timezone.utc)
             else:
                 ts = _parse_ts(ts)
+                if ts is None:
+                    continue
             try:
                 bars.append(
                     Observation(
@@ -417,6 +462,164 @@ class PgCandleHistory:
             except (TypeError, ValueError):
                 continue
         return bars
+
+    def previous_session_levels(
+        self, instrument_key: str, at: datetime
+    ) -> Optional[Dict[str, float]]:
+        """Return levels from the previous completed daily candle.
+
+        The query intentionally selects the latest stored trading-session date
+        before the observation's local session date; subtracting one calendar
+        day would be wrong across weekends and holidays.
+        """
+        token = self._token_for(instrument_key)
+        if token is None:
+            return None
+        local_day = (at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)).astimezone(
+            ZoneInfo("Asia/Kolkata")
+        ).date()
+        try:
+            from sqlalchemy import text
+
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT high, low
+                          FROM public.historical_candles
+                         WHERE instrument_token = :token
+                           AND interval = 'day'
+                           AND (ts AT TIME ZONE 'Asia/Kolkata')::date = (
+                               SELECT MAX((ts AT TIME ZONE 'Asia/Kolkata')::date)
+                                 FROM public.historical_candles
+                                WHERE instrument_token = :token
+                                  AND interval = 'day'
+                                  AND (ts AT TIME ZONE 'Asia/Kolkata')::date < :session_date
+                           )
+                         ORDER BY ts DESC
+                         LIMIT 1
+                        """
+                    ),
+                    {"token": int(token), "session_date": local_day},
+                ).first()
+        except Exception:
+            logger.warning(
+                "previous-session query failed for %s at %s", instrument_key, local_day,
+                exc_info=True,
+            )
+            return None
+        if row is None:
+            return None
+        try:
+            high, low = float(row[0]), float(row[1])
+            if not math.isfinite(high) or not math.isfinite(low):
+                return None
+            return {"prev_day_high": high, "prev_day_low": low}
+        except (TypeError, ValueError):
+            return None
+
+
+def build_nse_session_provider(engine: Any):
+    """Build a fail-closed NSE CM session/calendar resolver.
+
+    The active operator-imported calendar is authoritative. Missing schema or
+    coverage produces an inactive session rather than silently treating a
+    weekend/holiday as an open market.
+    """
+    ist = ZoneInfo("Asia/Kolkata")
+    cache: Dict[Any, Tuple[Optional[int], Optional[dict]]] = {}
+
+    def resolve(at: datetime) -> Tuple[bool, str]:
+        moment = (at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)).astimezone(ist)
+        day = moment.date()
+        session_id = f"NSE:CM:{day.isoformat()}"
+        try:
+            from sqlalchemy import text
+
+            with engine.connect() as conn:
+                version = conn.execute(
+                    text(
+                        "SELECT MAX(calendar_version) "
+                        "FROM public.exchange_calendar_source_documents "
+                        "WHERE exchange = 'NSE' AND segment = 'CM'"
+                    )
+                ).scalar()
+                version = int(version) if version is not None else None
+                cached = cache.get(day)
+                if cached is not None and cached[0] == version:
+                    row = cached[1]
+                else:
+                    row = None
+                    if version is not None:
+                        row = conn.execute(
+                            text(
+                                "SELECT session_type, opens_at, closes_at, verified "
+                                "FROM public.exchange_calendar_sessions "
+                                "WHERE exchange = 'NSE' AND segment = 'CM' "
+                                "AND calendar_version = :version AND session_date = :day"
+                            ),
+                            {"version": version, "day": day},
+                        ).mappings().first()
+                    cache[day] = (version, dict(row) if row is not None else None)
+        except Exception:
+            logger.warning("NSE session calendar lookup failed", exc_info=True)
+            return False, f"{session_id}:calendar_unavailable"
+
+        if not row or not row.get("verified") or str(row.get("session_type", "")).upper() == "HOLIDAY":
+            return False, session_id
+        opens_at, closes_at = row.get("opens_at"), row.get("closes_at")
+        if opens_at is None or closes_at is None:
+            return False, f"{session_id}:invalid_hours"
+        try:
+            open_time = opens_at if hasattr(opens_at, "hour") else time.fromisoformat(str(opens_at))
+            close_time = closes_at if hasattr(closes_at, "hour") else time.fromisoformat(str(closes_at))
+            opened = moment.replace(
+                hour=open_time.hour,
+                minute=open_time.minute,
+                second=open_time.second,
+                microsecond=0,
+            )
+            closed = moment.replace(
+                hour=close_time.hour,
+                minute=close_time.minute,
+                second=close_time.second,
+                microsecond=0,
+            )
+            return opened <= moment <= closed, session_id
+        except (TypeError, ValueError, AttributeError):
+            return False, f"{session_id}:invalid_hours"
+
+    return resolve
+
+
+def build_market_session_provider(engine: Any):
+    """Build a session resolver for all Phase 1 market-session policies.
+
+    NSE equity uses the verified imported NSE-CM calendar. MCX and currency
+    sessions are feed-driven in Phase 1: a live observation is accepted and
+    receives a stable IST market-date identity without consulting the NSE
+    calendar. Unsupported or mismatched session/instrument pairs fail closed.
+    """
+    nse_provider = build_nse_session_provider(engine)
+    ist = ZoneInfo("Asia/Kolkata")
+
+    def resolve(
+        session_name: str,
+        instrument_key: str,
+        at: datetime,
+    ) -> Tuple[bool, str]:
+        exchange = str(instrument_key or "").partition(":")[0].strip().upper()
+        if not registry.is_supported_session(session_name):
+            return False, f"unsupported_session:{session_name}"
+        if not registry.session_accepts_exchange(session_name, exchange):
+            return False, f"session_mismatch:{session_name}:{exchange or 'unknown'}"
+        if session_name == "nse_equity":
+            return nse_provider(at)
+
+        moment = (at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)).astimezone(ist)
+        return True, f"{exchange}:{moment.date().isoformat()}"
+
+    return resolve
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +649,13 @@ class EvaluationWorker:
         health_file: Optional[str] = None,
         health_extra: Optional[Callable[[], Dict[str, Any]]] = None,
         source_rebuild_backoff_s: float = 5.0,
+        session_provider: Optional[Callable[..., Optional[Tuple[bool, str]]]] = None,
+        owner_id: Optional[str] = None,
+        ownership_lease_s: float = 120.0,
+        instrument_tokens: Optional[Dict[str, int]] = None,
+        instrument_resolver: Optional[Callable[[set[str]], Any]] = None,
+        binding_registry: Optional[InstrumentBindingRegistry] = None,
+        bindings_changed: Optional[Callable[[BindingChange], Any]] = None,
     ) -> None:
         self.workflow_repo = workflow_repo
         self.session_factory = session_factory
@@ -462,6 +672,15 @@ class EvaluationWorker:
         self.health_file = health_file
         self.health_extra = health_extra
         self.source_rebuild_backoff_s = max(0.0, float(source_rebuild_backoff_s))
+        self.owner_id = owner_id or f"evaluation-worker:{uuid.uuid4()}"
+        self.session_provider = session_provider
+        self.ownership_lease_s = max(1.0, float(ownership_lease_s))
+        # C1: exactly one mutable binding owner. Source factories, history
+        # readers, renewal, and health all read snapshots from the registry —
+        # never a private copy that drifts out of sync.
+        self.bindings = binding_registry or InstrumentBindingRegistry(instrument_tokens)
+        self.instrument_resolver = instrument_resolver
+        self._bindings_changed = bindings_changed
 
         self.health: Dict[str, Any] = {
             "started_at": None,
@@ -477,6 +696,9 @@ class EvaluationWorker:
             "rebuilds": 0,
             "last_refresh_at": None,
             "refresh_failures": 0,
+            "context_misses": 0,
+            "unresolved_instruments": 0,
+            "binding_revisions": 0,
         }
 
         if service is not None:
@@ -488,6 +710,9 @@ class EvaluationWorker:
                 workflow_repo,
                 session_factory,
                 channel_resolver=self._channel_resolver_with_health(),
+                session_provider=session_provider,
+                owner_id=self.owner_id,
+                ownership_lease_s=self.ownership_lease_s,
             )
 
         self._subscriptions: List[ActiveSubscription] = []
@@ -510,6 +735,8 @@ class EvaluationWorker:
         """Materialize subscriptions, warm candle rules, open feed sources."""
         self._ensure_subscription_rows()
         self._subscriptions = list(self.workflow_repo.list_active_subscriptions())
+        await self._resolve_instrument_tokens({sub.instrument_key for sub in self._subscriptions})
+        self._refresh_unresolved_instruments()
 
         self._ltp_subs = {}
         self._candle_subs = {}
@@ -641,6 +868,7 @@ class EvaluationWorker:
         next event.
         """
         current = list(self.workflow_repo.list_active_subscriptions())
+        await self._resolve_instrument_tokens({sub.instrument_key for sub in current})
         current_by_id = {sub.id: sub for sub in current}
         known_ids = {sub.id for sub in self._subscriptions}
 
@@ -652,6 +880,7 @@ class EvaluationWorker:
         for sub in removed:
             self._drop_subscription(sub)
         self._prune_orphan_sources()
+        self._refresh_unresolved_instruments()
 
         self._subscriptions = current
         self.health["last_refresh_at"] = _utcnow().isoformat()
@@ -661,6 +890,123 @@ class EvaluationWorker:
                 len(added), len(removed), len(current),
             )
         return {"added": len(added), "removed": len(removed)}
+
+    @property
+    def instrument_tokens(self) -> Dict[str, int]:
+        """Snapshot of the currently accepted instrument bindings (C1)."""
+        return self.bindings.snapshot()
+
+    async def _resolve_instrument_tokens(self, instrument_keys: set[str]) -> None:
+        """Run one catalog resolution pass and apply the binding diff.
+
+        A resolver exception keeps the current bindings untouched (the next
+        refresh pass retries); a successful pass applies additions, token
+        replacements, and authoritative removals to the shared registry and
+        rebuilds only the affected feed sources.
+        """
+        if self.instrument_resolver is None or not instrument_keys:
+            return
+        try:
+            outcome = self.instrument_resolver(set(instrument_keys))
+            if inspect.isawaitable(outcome):
+                outcome = await outcome
+            resolved, rejected = outcome
+        except Exception:
+            logger.warning(
+                "catalog instrument resolution failed; keeping current bindings",
+                exc_info=True,
+            )
+            self.health["refresh_failures"] += 1
+            return
+        try:
+            change = self.bindings.apply(resolved or {}, rejected or set())
+        except (TypeError, ValueError):
+            logger.warning("catalog returned invalid bindings; ignoring pass", exc_info=True)
+            return
+        await self._apply_binding_change(change)
+
+    async def _apply_binding_change(self, change: BindingChange) -> None:
+        """Rebuild feed sources after an accepted binding change (C1).
+
+        - added/replaced tokens: rebuild that instrument's sources through the
+          factories so ticks/candles/history use the accepted binding. A
+          replaced token yields a fresh observation epoch via the factory;
+          durable trigger state lives in checkpoints and is untouched.
+        - removed (rejected) tokens: stop sources and clear dispatch groups so
+          a retired/expired/ambiguous instrument stops evaluating.
+        """
+        if not change.has_changes:
+            return
+        self.health["binding_revisions"] += 1
+        affected = set(change.added) | set(change.changed) | set(change.removed)
+
+        for key in sorted(affected):
+            old = self._tick_sources.pop(key, None)
+            if old is not None:
+                await self._safe_stop_source(old)
+            if (
+                key not in change.removed
+                and self._ltp_subs.get(key)
+                and self.bindings.get(key) is not None
+            ):
+                source = self.tick_source_factory(key)
+                await source.start()
+                self._tick_sources[key] = source
+
+        candle_keys = [(k, tf) for (k, tf) in list(self._candle_subs) if k in affected]
+        for key in candle_keys:
+            old = self._candle_sources.pop(key, None)
+            if old is not None:
+                await self._safe_stop_source(old)
+            if (
+                key[0] not in change.removed
+                and self._candle_subs.get(key)
+                and self.bindings.get(key[0]) is not None
+            ):
+                # History replay completes BEFORE the rebuilt source is
+                # exposed; a replaced token invalidates the stored replay
+                # boundary because the history identity changed underneath.
+                await self._warm_candle_group(
+                    key[0], key[1], self._candle_subs.get(key, ()),
+                    ignore_boundary=key in change.changed,
+                )
+                source = self.candle_source_factory(*key)
+                await source.start()
+                self._candle_sources[key] = source
+
+        for key in change.removed:
+            self._ltp_subs.pop(key, None)
+            for candle_key in [k for k in list(self._candle_subs) if k[0] == key]:
+                self._candle_subs.pop(candle_key, None)
+
+        logger.info(
+            "instrument bindings updated: %d added, %d replaced, %d removed (revision %d)",
+            len(change.added), len(change.changed), len(change.removed), change.revision,
+        )
+        if self._bindings_changed is not None:
+            try:
+                result = self._bindings_changed(change)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.warning("bindings-changed callback failed", exc_info=True)
+
+    @staticmethod
+    async def _safe_stop_source(source: TickSource) -> None:
+        try:
+            await source.stop()
+        except Exception:
+            logger.warning("feed source stop failed during binding rebuild", exc_info=True)
+
+    def _refresh_unresolved_instruments(self) -> None:
+        """Expose active subscriptions with no accepted token binding."""
+        tokens = self.bindings.snapshot()
+        if not tokens:
+            self.health["unresolved_instruments"] = len(self._subscriptions)
+            return
+        self.health["unresolved_instruments"] = sum(
+            1 for sub in self._subscriptions if sub.instrument_key not in tokens
+        )
 
     async def _add_subscription(self, sub: ActiveSubscription) -> None:
         """Index a newly-activated subscription and warm it before dispatch."""
@@ -692,7 +1038,7 @@ class EvaluationWorker:
 
     def _prune_orphan_sources(self) -> None:
         """Stop feed sources whose subscription group emptied."""
-        live_instruments = set(self._ltp_subs)
+        live_instruments = {k for k, group in self._ltp_subs.items() if group}
         for instrument_key in list(self._tick_sources):
             if instrument_key not in live_instruments:
                 source = self._tick_sources.pop(instrument_key)
@@ -820,6 +1166,15 @@ class EvaluationWorker:
         for kind_key in due:
             kind, key = kind_key
             del self._pending_rebuilds[kind_key]
+            # Only catalog-managed bindings gate rebuilds; deployments without
+            # a resolver (tests, env-token mode) rebuild unconditionally.
+            binding_key = key if kind == "tick" else key[0]
+            if self.instrument_resolver is not None and self.bindings.get(binding_key) is None:
+                logger.info(
+                    "skipping rebuild of %s feed source for %s: instrument is not bound",
+                    kind, key,
+                )
+                continue
             try:
                 if kind == "tick":
                     source = self.tick_source_factory(key)
@@ -827,6 +1182,13 @@ class EvaluationWorker:
                     self._tick_sources[key] = source
                 else:
                     source = self.candle_source_factory(*key)
+                    # History replay must complete before the rebuilt live
+                    # source is exposed to poll_once. This catches a one-bar
+                    # outage even when elapsed time is below a coarse gap
+                    # heuristic and keeps catch-up notifications silent.
+                    await self._warm_candle_group(
+                        key[0], key[1], self._candle_subs.get(key, ())
+                    )
                     await source.start()
                     self._candle_sources[key] = source
                 self.health["rebuilds"] += 1
@@ -866,17 +1228,22 @@ class EvaluationWorker:
         instrument_key: str,
         timeframe: str,
         group: Sequence[ActiveSubscription],
+        *,
+        ignore_boundary: bool = False,
     ) -> None:
         """Replay recent history into candle rules silently (no emission).
 
         Bars at or before a subscription's checkpoint ``last_bar_ts`` were
         already processed and are skipped; every replayed bar goes through
         ``handle_observation(..., allow_emit=False)`` so warming can never
-        write signal events, deliveries, or lifecycle changes.
+        write signal events, deliveries, or lifecycle changes. ``ignore_boundary``
+        is used after a token replacement: the binding (and therefore the
+        history identity) changed underneath the subscription, so all warmup
+        bars are replayed to re-establish continuity safely.
         """
         bars = self.candle_history.recent_bars(instrument_key, timeframe, self.warmup_bars)
         for sub in group:
-            boundary = self._replay_boundary(sub)
+            boundary = None if ignore_boundary else self._replay_boundary(sub)
             for bar in bars:
                 if boundary is not None and bar.ts <= boundary:
                     continue  # already processed before this boot
@@ -978,11 +1345,35 @@ class EvaluationWorker:
     ) -> None:
         self.health["evaluations"] += 1
         self.health["last_evaluated_at"] = _utcnow().isoformat()
+        context = None
+        levels_loader = getattr(self.candle_history, "previous_session_levels", None)
+        if callable(levels_loader):
+            try:
+                context = levels_loader(sub.instrument_key, obs.ts)
+                if context is None:
+                    self.health["context_misses"] += 1
+            except Exception:
+                self.health["context_misses"] += 1
+                logger.warning(
+                    "previous-session context unavailable for %s", sub.instrument_key,
+                    exc_info=True,
+                )
+        supports_context = False
+        try:
+            supports_context = "context" in inspect.signature(
+                self.service.handle_observation
+            ).parameters
+        except (TypeError, ValueError):
+            supports_context = False
         try:
             if allow_emit or not self._service_supports_allow_emit():
-                result = self.service.handle_observation(sub, obs)
+                kwargs = {"context": context} if supports_context else {}
+                result = self.service.handle_observation(sub, obs, **kwargs)
             else:
-                result = self.service.handle_observation(sub, obs, allow_emit=False)
+                kwargs = {"allow_emit": False}
+                if supports_context:
+                    kwargs["context"] = context
+                result = self.service.handle_observation(sub, obs, **kwargs)
         except TypeError:
             logger.error(
                 "evaluation rejected observation for subscription %s (%s)",

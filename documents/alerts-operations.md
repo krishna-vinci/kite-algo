@@ -16,11 +16,12 @@ The evaluation worker is deliberately a separate process: restarting or deployin
 
 | Variable | Used by | Meaning |
 | --- | --- | --- |
-| `DATABASE_URL` | worker + API | Postgres connection (Phase 1 tests use in-memory SQLite) |
+| `DATABASE_URL` | worker + API | Postgres connection. If absent in Compose, both workers assemble it from `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD`; credentials are URL-encoded. |
 | `REDIS_URL` | evaluation worker | Redis for `market:ticks` and `realtime_candles:{token}:{interval}` pub/sub — worker exits if unset |
 | `MARKET_RUNTIME_URL` | evaluation worker | market-runtime HTTP endpoint used to register instrument subscriptions |
 | `ALERTS_INSTRUMENT_TOKENS` | evaluation worker | JSON map of `"EXCHANGE:SYMBOL"` to numeric instrument tokens, e.g. `{"NSE:RELIANCE": 738561}`. **Required for instrument resolution**: without a token for an instrument key the worker cannot subscribe to its ticks, resolve completed candles, or read candle history, so its rules stay silent. |
-| `ALERTS_REFRESH_INTERVAL_S` | evaluation worker | Seconds between subscription-refresh/renewal passes (default 30): the worker re-materializes subscriptions from the database (picking up activations/pauses without a restart) and renews its market-runtime registration on this interval |
+| `ALERTS_REFRESH_INTERVAL_S` | evaluation worker | Seconds between subscription-refresh/renewal passes (default 10): the worker re-materializes subscriptions from the database (picking up activations, pauses, archives, completed rules, and orphan cleanup without a restart) and renews its market-runtime registration on this interval |
+| `ALERTS_HEALTH_INTERVAL_S` / `ALERTS_HEALTH_FILE` | evaluation worker | Health snapshot cadence (default 30s) and optional JSON path. Compose writes `/app/alerts-health.json`, which is also the worker container healthcheck. |
 | `ALERTS_DELIVERY_ENABLED` | delivery (in-process) | Set `false`/`0` to disable the embedded delivery loop (outbox rows stay pending for a standalone delivery worker); delivery is on by default |
 | `ALERTS_HEALTH_FILE` | evaluation worker | Optional path where the worker periodically writes its health JSON (counters above + `last_evaluated_at`) for scraping without Redis/DB access |
 | `TELEGRAM_BOT_TOKEN` | delivery (channel `secret_env`) | bot token; chat id lives in the channel row |
@@ -30,7 +31,7 @@ Secrets exist only in env config. Channel rows reference them by name (`secret_e
 
 ## Database
 
-Migration `20260908_000011_alerts_platform_phase1` (head after `20260905_000010`) creates: `workflows`, `workflow_revisions`, `alert_subscriptions`, `evaluation_checkpoints`, `signal_events`, `channel_references`, `deliveries`, `delivery_attempts`. Apply with the project's normal `alembic upgrade head` flow. The historical dropped-alerts migration is never reversed.
+Migration `20260908_000011_alerts_platform_phase1` plus `20260909_000012_alerts_evaluation_ownership` creates the Phase 1 alert tables and the durable evaluation-owner lease table. Apply with the project's normal `alembic upgrade head` flow. The historical dropped-alerts migration is never reversed.
 
 ## Operating procedures
 
@@ -43,10 +44,14 @@ Migration `20260908_000011_alerts_platform_phase1` (head after `20260905_000010`
 **Subscription renewal:** every `ALERTS_REFRESH_INTERVAL_S` the worker re-reads active subscriptions from the database and renews its market-runtime instrument registration. Activations, pauses and rollbacks are picked up on the next refresh pass without a worker restart; checkpoints and event history are untouched by refreshes.
 
 **Restart the worker (planned or crash):**
-- `ltp`-clock rules intentionally start a **new observation epoch**: first tick initializes state, nothing fires from stale pre-restart data. A crossing during downtime is *missed and disclosed* (health gap counter), never fabricated.
+- Evaluation ownership is durable and fenced per `(subscription, instrument)`: one live worker evaluates a key at a time; a takeover increments the owner epoch.
+- `ltp`-clock rules intentionally start a **new observation epoch**: first tick initializes state, nothing fires from stale pre-restart data. A crossing during downtime is *missed and disclosed* (health gap counter), never fabricated. Trigger bookkeeping is retained so a restart cannot reset a `once` rule.
 - `candle_close` rules recover continuity from completed candles (warmup replay happens before live evaluation), so confirmed signals resume correctly.
+- A reconnect replays completed history before exposing live candles. A changed final bar at an existing timestamp is treated as a correction and produces a silent correction audit event; an identical duplicate is ignored.
 
 **Degraded feed:** a Pub/Sub disconnect or trimmed data breaks crossing continuity. The rule re-initializes on the next observation (new epoch) and the gap shows up in worker health (`gaps` counter). Missing data never manufactures a signal — unknown propagates.
+
+**Trading calendar:** production evaluation uses the operator-imported NSE CM session calendar, including holidays and special hours. An unsupported calendar name is rejected at validation; missing calendar coverage fails closed for live evaluation. Previous-day level predicates use the previous trading session, not the previous civil day.
 
 **Unknown sends:** a provider timeout is recorded as outcome `unknown` and the delivery is retried — but only a **finite** number of times (`max_unknown_retries`); after the last unknown attempt the delivery stops with `failed` and the attempts log records every outcome. **Exactly-once delivery to the provider is explicitly not promised**: at-least-once is the guarantee, provider acceptance is not a read receipt, and duplicates are identifiable from the attempt log (the event id is in every message).
 
@@ -56,10 +61,10 @@ Migration `20260908_000011_alerts_platform_phase1` (head after `20260905_000010`
 
 - `GET /api/worker/workflows/{id}/health` — active revision, per-subscription state **and `last_evaluated_at`** (from `evaluation_checkpoints.updated_at`, per subscription), last event time, delivery counts by status, and the constant `stale_after_seconds: 300`. A subscription whose `last_evaluated_at` is older than `stale_after_seconds` (relative to now) should be treated as stale — a stale workflow is visible as stale, never silently quiet (F11).
 - `GET /api/worker/workflows/{id}/events` — event history with evidence (values, epoch, timeframe); archived workflows keep their history.
-- Worker process logs report evaluations, emissions, suppression reasons (cooldown, not_armed, already_fired, quiet_session, expired), unresolved channels, and gaps. Every non-delivery has a recorded reason.
+- Worker process logs report evaluations, emissions, suppression reasons (cooldown, not_armed, already_fired, quiet_session, expired), unresolved channels/instruments, and gaps. Every non-delivery has a recorded reason.
 
 ## Known Phase 1 limitations
 
 - Delivery attempts and lease claims are tested on SQLite; true multi-process Postgres concurrency (`FOR UPDATE SKIP LOCKED`) is exercised in production Postgres only — Phase 1.5 follow-up adds a Postgres-based fault-injection suite (spec E-1…E-3).
-- Compose/service wiring for the worker process is intentionally deferred (in-flight compose changes); run via `python -m` behind a supervisor for now.
+- The API preview dry-run accepts caller-supplied, exchange-timestamped samples; it does not fetch a hidden live-data snapshot. It never writes checkpoints, events, or deliveries.
 - Indicators, universes, screeners, quiet hours/digest: later phases (schema reserves the names).

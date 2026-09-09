@@ -452,12 +452,45 @@ def test_preview_returns_warmup_report_and_writes_nothing():
     assert body["instruments"] == ["NSE:RELIANCE"]
     assert body["stages"] == ["px"]
     assert body["alerts"] == ["breakout"]
+    assert body["evaluation"] == "dry_run_no_data"
+    assert body["evaluated_observations"] == 0
 
     with factory() as session:
         assert session.execute(select(func.count()).select_from(Delivery)).scalar() == 0
         assert session.execute(select(func.count()).select_from(SignalEvent)).scalar() == 0
         assert session.execute(select(func.count()).select_from(WorkflowModel)).scalar() == 0
         assert session.execute(select(func.count()).select_from(AlertSubscription)).scalar() == 0
+
+
+def test_preview_dry_run_reports_would_fire_without_persisting():
+    client, factory = _client()
+    observations = [
+        {
+            "instrument_key": "NSE:RELIANCE",
+            "epoch_id": "preview-epoch",
+            "ts": "2026-09-08T09:15:00Z",
+            "ltp": 2990,
+        },
+        {
+            "instrument_key": "NSE:RELIANCE",
+            "epoch_id": "preview-epoch",
+            "ts": "2026-09-08T09:16:00Z",
+            "ltp": 3010,
+        },
+    ]
+    response = client.post(
+        f"{WF}/preview",
+        json={"yaml_text": VALID_YAML, "observations": observations},
+        headers=HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["evaluation"] == "dry_run"
+    assert body["evaluated_observations"] == 2
+    assert len(body["would_fire"]) == 1
+    assert body["would_fire"][0]["alert_id"] == "breakout"
+    with factory() as session:
+        assert session.execute(select(func.count()).select_from(SignalEvent)).scalar() == 0
 
 
 def test_events_endpoint_returns_seeded_events_paginated_newest_first():

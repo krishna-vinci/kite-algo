@@ -161,6 +161,7 @@ def _seed_event(
     channel_specs,
     fired_at=NOW,
     expires_at=None,
+    workflow_name="reliance-breakout",
 ):
     """Create workflow + subscription + channels, then one signal event.
 
@@ -168,7 +169,7 @@ def _seed_event(
     ``(event, {channel_name: channel})``.
     """
     workflow_repo = SqlAlchemyWorkflowRepository(session_factory)
-    compiled = compile_document(_document())
+    compiled = compile_document(_document(workflow_name))
     _wf, rev = workflow_repo.create_workflow(
         owner_id="owner-1",
         name=compiled.document.name,
@@ -332,7 +333,8 @@ def test_template_override_rendered_by_worker(session_factory):
 
     (call,) = adapter.calls
     assert call["subject"] == "[Alert] breakout: NSE:RELIANCE"  # default subject kept
-    assert call["body"] == "NSE:RELIANCE crossed 3002.5"
+    assert call["body"].startswith("NSE:RELIANCE crossed 3002.5")
+    assert "event_id:" in call["body"]
 
 
 def test_default_resolver_still_delivers(session_factory):
@@ -681,6 +683,54 @@ def test_run_forever_processes_and_stops_on_cancel(session_factory):
     assert len(adapter.calls) >= 1
 
 
+def test_live_clock_rechecks_expiry_between_batch_items(session_factory):
+    notification_repo = SqlAlchemyNotificationRepository(session_factory)
+    clock_now = [NOW]
+
+    def send_first_then_advance(_destination, _subject, _body):
+        clock_now[0] = NOW + timedelta(seconds=20)
+        return DeliveryOutcome(status="accepted", detail="ok")
+
+    adapter = _install_fake("fake-ok", FakeAdapter(outcomes=send_first_then_advance))
+    first_event, first_channels = _seed_event(
+        session_factory,
+        notification_repo,
+        occurrence="occ-clock-first",
+        channel_specs=[("fake-ok", "first")],
+    )
+    second_event, second_channels = _seed_event(
+        session_factory,
+        notification_repo,
+        occurrence="occ-clock-second",
+        channel_specs=[("fake-ok", "second")],
+        workflow_name="reliance-breakout-second",
+    )
+    rows = _deliveries_by_channel(session_factory, {**first_channels, **second_channels})
+    # Make the batch order deterministic; both helper events use the same
+    # synthetic fired_at timestamp and UUID ordering is intentionally random.
+    with session_factory() as session:
+        session.get(Delivery, rows["first"].id).created_at = NOW - timedelta(seconds=2)
+        session.get(Delivery, rows["second"].id).created_at = NOW - timedelta(seconds=1)
+        session.commit()
+    contexts = {
+        rows["first"].id: _context(fired_at=first_event.fired_at),
+        rows["second"].id: _context(
+            expires_at=NOW + timedelta(seconds=10), fired_at=second_event.fired_at
+        ),
+    }
+    worker = DeliveryWorker(
+        notification_repo,
+        resolver=lambda delivery_id: contexts.get(delivery_id),
+        clock=lambda: clock_now[0],
+    )
+
+    summary = asyncio.run(worker.run_once())
+
+    assert summary["delivered"] == 1
+    assert summary["expired"] == 1
+    assert len(adapter.calls) == 1
+
+
 # ---------------------------------------------------------------------------
 # lease-fenced completion (fault 2): worker catches LeaseConflict, counts fenced
 # ---------------------------------------------------------------------------
@@ -720,8 +770,9 @@ def test_lost_lease_discards_stale_attempt_and_counts_fenced(session_factory):
     assert summary == {
         "claimed": 2, "delivered": 1, "retrying": 0, "failed": 0, "expired": 0, "fenced": 1,
     }
-    # the stale worker's send happened but its attempt was discarded
-    assert len(adapter.calls) == 2
+    # the pre-send lease check prevented the stale provider call; completion
+    # remains fenced as a second line of defense.
+    assert len(adapter.calls) == 1
     bad_row = _delivery(session_factory, bad_id)
     assert bad_row.status == "delivering"  # still owned by the reclaiming worker
     assert bad_row.attempts == 0  # the fenced attempt did not count
@@ -902,7 +953,8 @@ def test_make_resolver_builds_send_context_and_merges_secret_env(session_factory
     assert context["provider"] == "telegram"
     assert context["destination"] == {"chat_id": "4242", "token_env": "ALERTS_RESOLVER_TOKEN_ENV"}
     assert context["subject"] == "[Alert] reliance-breakout:breakout: NSE:RELIANCE"
-    assert context["body"] == "NSE:RELIANCE crossed 3000.0"
+    assert context["body"].startswith("NSE:RELIANCE crossed 3000.0")
+    assert f"event_id: {event.id}" in context["body"]
     assert context["expires_at"] == expires_at.isoformat()
 
     worker = DeliveryWorker(notification_repo, resolver=resolver)

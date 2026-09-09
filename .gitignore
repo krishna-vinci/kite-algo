@@ -1,4 +1,7 @@
 /.env
+/.env*
+!/.env.example
+*.save
 /.venv/
 /.python-version
 
@@ -58,6 +61,7 @@ scripts/*
 !scripts/live_worker_e2e_validation.py
 !scripts/check_mcp_http_docker.py
 !scripts/mcp_codex_headers.py
+!scripts/smoke_alerts.sh
 
 # Agent Skills
 .agents/

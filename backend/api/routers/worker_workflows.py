@@ -17,6 +17,7 @@ stdlib + SQLAlchemy + PyYAML only.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -45,6 +46,8 @@ from backend.api.schemas.workflows import (
     issue,
 )
 from backend.notifications.repository import Delivery, SqlAlchemyNotificationRepository
+from backend.alerts.engine import decide
+from backend.alerts.predicates import Observation, evaluate_stage
 from backend.workflows.compiler import CompiledWorkflow, WorkflowValidationError, compile_document
 from backend.workflows.models import AlertSpec, WorkflowDocument
 from backend.workflows.parser import WorkflowParseError, parse_workflow_dict, parse_workflow_yaml
@@ -255,6 +258,115 @@ def _workflow_subscription_ids(session: Session, workflow_id: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+def _preview_observation(raw: Any, index: int) -> tuple[Optional[str], Optional[Observation], Optional[str]]:
+    """Parse one client-supplied preview sample without inventing event time."""
+    if not isinstance(raw, dict):
+        return None, None, f"observations[{index}]: not a mapping"
+    instrument_key = raw.get("instrument_key") or raw.get("instrument")
+    if not isinstance(instrument_key, str) or not instrument_key.strip():
+        return None, None, f"observations[{index}]: missing instrument_key"
+    raw_ts = raw.get("ts")
+    if not isinstance(raw_ts, (str, datetime)):
+        return instrument_key, None, f"observations[{index}]: missing or invalid ts"
+    try:
+        ts = raw_ts if isinstance(raw_ts, datetime) else datetime.fromisoformat(
+            raw_ts.replace("Z", "+00:00").replace("z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return instrument_key, None, f"observations[{index}]: malformed ts"
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    values: dict[str, Optional[float]] = {}
+    for field in ("ltp", "open", "high", "low", "close", "volume"):
+        value = raw.get(field)
+        if value is None:
+            values[field] = None
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            return instrument_key, None, f"observations[{index}]: invalid {field}"
+        values[field] = float(value)
+    epoch_id = raw.get("epoch_id", "preview")
+    if not isinstance(epoch_id, str) or not epoch_id:
+        return instrument_key, None, f"observations[{index}]: invalid epoch_id"
+    return instrument_key, Observation(
+        ts=ts.astimezone(timezone.utc),
+        epoch_id=epoch_id,
+        final=bool(raw.get("final", False)),
+        **values,
+    ), None
+
+
+def _preview_evaluate(doc: WorkflowDocument, rows: List[Dict[str, Any]]) -> dict:
+    """Run pure predicate/trigger evaluation over supplied recent samples."""
+    grouped: dict[str, list[Observation]] = {}
+    instrument_keys = {instrument.key() for instrument in doc.instruments}
+    unknown: list[str] = []
+    for index, raw in enumerate(rows):
+        instrument_key, observation, reason = _preview_observation(raw, index)
+        if reason:
+            unknown.append(reason)
+        if instrument_key and observation is not None:
+            if instrument_key not in instrument_keys:
+                unknown.append(f"observations[{index}]: instrument_not_in_workflow")
+            grouped.setdefault(instrument_key, []).append(observation)
+    for observations in grouped.values():
+        observations.sort(key=lambda item: item.ts)
+
+    would_fire: list[dict] = []
+    stages = {stage.id: stage for stage in doc.stages}
+    evaluated = sum(
+        len(observations)
+        for instrument_key, observations in grouped.items()
+        if instrument_key in instrument_keys
+    )
+    warmup_bars = sum(
+        1
+        for instrument_key, observations in grouped.items()
+        if instrument_key in instrument_keys
+        for observation in observations
+        if observation.final
+    )
+    for alert in doc.alerts:
+        stage = stages.get(alert.source)
+        if stage is None:
+            continue
+        for instrument in doc.instruments:
+            instrument_key = instrument.key()
+            state: dict = {}
+            for observation in grouped.get(instrument_key, []):
+                if stage.clock == "candle_close" and not observation.final:
+                    unknown.append(f"{alert.id}:{instrument_key}:non_final_candle")
+                    continue
+                predicate = evaluate_stage(stage, observation, state)
+                first_observation = not state.get("initialized")
+                decision = decide(
+                    alert,
+                    fired=predicate.fired,
+                    state=predicate.state,
+                    now=observation.ts,
+                    session_id=observation.ts.date().isoformat(),
+                    already_true=predicate.matched if first_observation else None,
+                    matched=predicate.matched,
+                )
+                state = decision.new_state
+                if predicate.matched is None:
+                    unknown.append(f"{alert.id}:{instrument_key}:missing_or_unsupported_data")
+                if decision.emit:
+                    would_fire.append({
+                        "alert_id": alert.id,
+                        "instrument_key": instrument_key,
+                        "fired_at": observation.ts.isoformat(),
+                        "evidence": predicate.evidence,
+                    })
+    return {
+        "evaluation": "dry_run" if grouped else "dry_run_no_data",
+        "warmup_bars": warmup_bars,
+        "evaluated_observations": evaluated,
+        "would_fire": would_fire,
+        "unknown_reasons": sorted(set(unknown)),
+    }
+
+
 async def validate_workflow(request: Request, payload: WorkflowValidateRequest):
     """Parse + compile a document and report issues. 200 even when invalid."""
     token, _ = await _authorize(request, "workflows:read")
@@ -279,7 +391,12 @@ async def validate_workflow(request: Request, payload: WorkflowValidateRequest):
 
 
 async def preview_workflow(request: Request, payload: WorkflowValidateRequest):
-    """Compile + basic warmup report. Purely in-memory: writes zero rows."""
+    """Compile + optional pure dry-run over supplied recent samples.
+
+    Preview never reads or writes alert state, sends notifications, or marks a
+    workflow active. The caller supplies timestamped samples so preview stays
+    deterministic and does not silently use a different market-data source.
+    """
     token, _ = await _authorize(request, "workflows:read")
     _ = token
     if (payload.yaml_text is None) == (payload.document is None):
@@ -304,13 +421,18 @@ async def preview_workflow(request: Request, payload: WorkflowValidateRequest):
             stages=[stage.id for stage in doc.stages],
             alerts=[alert.id for alert in doc.alerts],
         )
+    report = _preview_evaluate(doc, payload.observations)
     return PreviewResponse(
         ok=True,
         issues=[],
         instruments=[instrument.key() for instrument in doc.instruments],
         stages=[stage.id for stage in doc.stages],
         alerts=[alert.id for alert in doc.alerts],
-        note="preview only: compiled in memory; nothing is persisted (no workflows, signal events or deliveries)",
+        **report,
+        note=(
+            "preview only: compiled and evaluated in memory; nothing is persisted "
+            "(no workflows, signal events or deliveries)"
+        ),
     )
 
 

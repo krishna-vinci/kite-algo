@@ -203,6 +203,7 @@ class DeliveryWorker:
         max_unknown_retries: int = 3,
         default_backoff_s: float = 60.0,
         jitter_fraction: float = 0.2,
+        clock: Callable[[], dt.datetime] = _utcnow,
     ) -> None:
         self.notification_repo = notification_repo
         self.adapter_factory = adapter_factory
@@ -211,12 +212,14 @@ class DeliveryWorker:
         self.max_unknown_retries = max(0, int(max_unknown_retries))
         self.default_backoff_s = max(0.0, float(default_backoff_s))
         self.jitter_fraction = max(0.0, float(jitter_fraction))
+        self.clock = clock
 
     # -- loop ---------------------------------------------------------------
 
     async def run_once(self, now: Optional[dt.datetime] = None, limit: int = 10) -> dict:
         """Process up to ``limit`` due deliveries; return a summary counter dict."""
-        now = _as_utc(now) if now is not None else _utcnow()
+        explicit_now = now is not None
+        now = _as_utc(now) if explicit_now else self._now()
         claimed = self.notification_repo.claim_deliveries(now, limit=limit)
         summary = {
             "claimed": len(claimed),
@@ -227,15 +230,23 @@ class DeliveryWorker:
             "fenced": 0,
         }
         for delivery in claimed:
+            # A batch claim is only a snapshot. Slow provider calls, large
+            # batches, and fake-clock tests must not reuse the batch-start
+            # timestamp for expiry, lease fencing, or retry scheduling.
+            item_now = now if explicit_now else self._now()
             try:
                 try:
-                    status = await self._process_one(delivery, now)
+                    status = await self._process_one(delivery, item_now, live_clock=not explicit_now)
                 except LeaseConflict:
                     raise
                 except Exception as exc:
                     # sibling isolation: one bad delivery never stops the batch
                     logger.exception("delivery %s failed unexpectedly", delivery.id)
-                    status = self._record_unexpected(delivery, exc, now)
+                    status = self._record_unexpected(
+                        delivery,
+                        exc,
+                        self._now() if not explicit_now else item_now,
+                    )
             except LeaseConflict:
                 # Lease-fenced completion (fault 2): our lease expired and the
                 # delivery was (or is about to be) reclaimed elsewhere — the
@@ -249,6 +260,9 @@ class DeliveryWorker:
             if status in summary:
                 summary[status] += 1
         return summary
+
+    def _now(self) -> dt.datetime:
+        return _as_utc(self.clock())
 
     async def run_forever(self, poll_interval_s: float = 2.0) -> None:
         """Poll ``run_once`` forever; returns promptly on cancellation."""
@@ -266,7 +280,9 @@ class DeliveryWorker:
 
     # -- one delivery -------------------------------------------------------
 
-    async def _process_one(self, delivery: Delivery, now: dt.datetime) -> str:
+    async def _process_one(
+        self, delivery: Delivery, now: dt.datetime, *, live_clock: bool = False
+    ) -> str:
         """Send one claimed delivery and record the attempt; returns the new status."""
         resolved = self.resolver(delivery.id)
         if resolved is None:
@@ -305,6 +321,28 @@ class DeliveryWorker:
                 status="permanent", detail=f"channel {delivery.channel_id} not found"
             )
         else:
+            # Re-read the claim immediately before provider I/O. The row may
+            # have been reclaimed while resolving context or rendering a
+            # message. This check is advisory to the final lease-fenced write
+            # (a provider can still outlive a lease), but prevents avoidable
+            # sends after a known expiry/loss.
+            if live_clock:
+                now = self._now()
+            self._assert_claim_is_current(delivery, now)
+            expires_at = _parse_moment(context.get("expires_at"))
+            if expires_at is not None and _as_utc(expires_at) <= now:
+                detail = f"event expired at {_as_utc(expires_at).isoformat()}"
+                self.notification_repo.record_attempt(
+                    delivery.id,
+                    int(delivery.attempts or 0) + 1,
+                    "expired",
+                    detail,
+                    "expired",
+                    last_error=detail,
+                    lease_until=delivery.lease_until,
+                    now=now,
+                )
+                return "expired"
             subject, body = self._render(delivery, context, now)
             # resolver-provided provider/destination win; channel row fields
             # are the fallback, and the channel secret_env pointer is always
@@ -318,7 +356,21 @@ class DeliveryWorker:
             adapter = self.adapter_factory(provider)
             outcome = await adapter.send(destination, subject, body)
 
-        return self._record_outcome(delivery, outcome, now)
+        completion_now = self._now() if live_clock else now
+        return self._record_outcome(delivery, outcome, completion_now)
+
+    def _assert_claim_is_current(self, delivery: Delivery, now: dt.datetime) -> None:
+        current = self.notification_repo.get_delivery(delivery.id)
+        if current is None:
+            raise LeaseConflict(f"delivery {delivery.id}: row disappeared")
+        expected = delivery.lease_until
+        actual = current.lease_until
+        if current.status != "delivering" or (
+            expected is not None and actual != expected
+        ):
+            raise LeaseConflict(f"delivery {delivery.id}: claim was reclaimed")
+        if actual is not None and _as_utc(actual) <= now:
+            raise LeaseConflict(f"delivery {delivery.id}: lease expired before send")
 
     def _render(self, delivery: Delivery, context: dict, now: dt.datetime) -> tuple[str, str]:
         subject = context.get("subject")
@@ -405,19 +457,32 @@ class DeliveryWorker:
 
 
 def main() -> None:
-    """Blocking helper entry point (production wiring lands with the worker service)."""
-    import os
+    """Run the delivery worker with the same production wiring as evaluation.
+
+    The standalone entry point is intentionally configuration-compatible with
+    ``backend.workflows.worker_entry``.  It does not create tables or fall
+    back to a local SQLite file: schema creation belongs to migrations and a
+    missing/invalid production database configuration is an operator error.
+    """
 
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 
-    from backend.workflows.repository import Base
-
     from .repository import SqlAlchemyNotificationRepository
+    from backend.workflows.worker_entry import (
+        build_delivery_resolver,
+        build_subscription_loader,
+        resolve_database_url,
+    )
 
-    database_url = os.environ.get("ALERTS_DATABASE_URL", "sqlite+pysqlite:///./alerts-deliveries.db")
-    engine = create_engine(database_url)
-    Base.metadata.create_all(engine)
+    database_url = resolve_database_url()
+    engine = create_engine(database_url, pool_pre_ping=True)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
-    worker = DeliveryWorker(SqlAlchemyNotificationRepository(session_factory))
-    asyncio.run(worker.run_forever())
+    try:
+        notification_repo = SqlAlchemyNotificationRepository(session_factory)
+        subscription_loader = build_subscription_loader(session_factory)
+        resolver = build_delivery_resolver(notification_repo, subscription_loader)
+        worker = DeliveryWorker(notification_repo, resolver=resolver)
+        asyncio.run(worker.run_forever())
+    finally:
+        engine.dispose()

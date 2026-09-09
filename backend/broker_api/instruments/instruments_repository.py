@@ -18,6 +18,12 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from backend.app.database import SessionLocal
+from backend.broker_api.instruments.catalog import (
+    AmbiguousInstrumentError,
+    CatalogUnavailableError,
+    InstrumentCatalog,
+    InstrumentNotFoundError,
+)
 
 logger = logging.getLogger("instruments")
 
@@ -99,10 +105,11 @@ _async_breaker = _CircuitBreaker()
 # ── Repository ───────────────────────────────────────────────────────────────
 
 class InstrumentsRepository:
-    """Instrument lookups via Go HTTP, with PostgreSQL fallback."""
+    """Compatibility adapter over the published catalog and runtime cache."""
 
     def __init__(self, db: Optional[Session | Callable[[], Session]] = None):
         self.db = db
+        self.catalog = InstrumentCatalog(db=db)
 
     # ── session helpers ──────────────────────────────────────────────────
 
@@ -123,6 +130,13 @@ class InstrumentsRepository:
             yield session
         finally:
             session.close()
+
+    def _catalog_uninitialized(self) -> bool:
+        """Detect the migration window before the first catalog publication."""
+        try:
+            return self.catalog.health().get("status") == "uninitialized"
+        except CatalogUnavailableError:
+            return True
 
     # ── symbol normalisation ─────────────────────────────────────────────
 
@@ -393,11 +407,19 @@ class InstrumentsRepository:
     # ── public lookup API ────────────────────────────────────────────────
 
     def get_instrument_by_token(self, instrument_token: int) -> Optional[Dict[str, object]]:
-        """HTTP-first (Go), SQL fallback."""
+        """Published catalog first, then legacy Go/SQL compatibility paths."""
         try:
             token = int(instrument_token)
         except (TypeError, ValueError):
             return None
+
+        try:
+            return self.catalog.resolve_broker_token(token).to_dict()
+        except CatalogUnavailableError:
+            pass
+        except InstrumentNotFoundError:
+            if not self._catalog_uninitialized():
+                return None
 
         result = self._lookup_token_via_http(token)
         if result is not None:
@@ -405,11 +427,21 @@ class InstrumentsRepository:
         return self._get_instrument_by_token_sql(token)
 
     def get_instrument_by_exchange_symbol(self, exchange: str, tradingsymbol: str) -> Optional[Dict[str, object]]:
-        """HTTP-first (Go), SQL fallback."""
+        """Resolve a qualified key from the published catalog."""
         ex = str(exchange or "").strip().upper()
         sym = str(tradingsymbol or "").strip().upper()
         if not ex or not sym:
             return None
+
+        try:
+            return self.catalog.resolve_public_key(f"{ex}:{sym}").to_dict()
+        except CatalogUnavailableError:
+            pass
+        except InstrumentNotFoundError:
+            if not self._catalog_uninitialized():
+                return None
+        except AmbiguousInstrumentError:
+            raise
 
         result = self._lookup_symbol_via_http(ex, sym)
         if result is not None:
@@ -434,20 +466,41 @@ class InstrumentsRepository:
         return self.get_instrument_by_exchange_symbol(exchange, tradingsymbol)
 
     def get_lot_size(self, instrument_token: int) -> Optional[int]:
+        # Lot size is a compatibility helper used by order/options code.  Keep
+        # its single scalar query fast; the full catalog remains authoritative
+        # for identity and activation decisions.
+        legacy_lot_size = self._get_lot_size_sql(instrument_token)
+        if legacy_lot_size is not None:
+            return int(legacy_lot_size)
+        try:
+            descriptor = self.catalog.resolve_broker_token(int(instrument_token))
+            if descriptor.lot_size is not None:
+                return int(descriptor.lot_size)
+        except (CatalogUnavailableError, InstrumentNotFoundError):
+            pass
         instrument = self.get_instrument_by_token(instrument_token)
-        if instrument is not None:
-            ls = instrument.get("lot_size")
-            if ls is not None:
-                return int(ls)
-        return self._get_lot_size_sql(instrument_token)
+        if instrument is not None and instrument.get("lot_size") is not None:
+            return int(instrument["lot_size"])
+        return None
 
     def search_market_instruments(self, query: str, *, exchange: Optional[str] = None, limit: int = 20) -> List[Dict[str, object]]:
-        """Full-text ILIKE search — always hits PostgreSQL."""
+        """Search the published catalog, with a legacy-table fallback."""
         normalized_text = str(query or "").strip().upper()
         if not normalized_text:
             return []
         normalized_exchange = str(exchange or "").strip().upper() or None
         safe_limit = max(1, min(int(limit or 20), 50))
+        try:
+            catalog_rows = [row.to_dict() for row in self.catalog.search(
+                normalized_text,
+                exchange=normalized_exchange,
+                limit=safe_limit,
+            )]
+            if catalog_rows or not self._catalog_uninitialized():
+                return catalog_rows
+        except CatalogUnavailableError:
+            pass
+
         sql = text(
             """
             SELECT instrument_token, exchange, tradingsymbol, name, instrument_type,

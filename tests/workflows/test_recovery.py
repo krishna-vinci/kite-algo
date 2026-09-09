@@ -333,6 +333,31 @@ def test_ltp_crossing_fires_once_with_pending_delivery(session_factory, notif_re
     assert len(_deliveries(session_factory)) == 1
 
 
+def test_durable_evaluation_ownership_fences_overlapping_workers(session_factory, notif_repo, channel_id):
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    service_a = _service(
+        session_factory, repo, notif_repo, owner_id="evaluation-worker-a"
+    )
+    service_b = _service(
+        session_factory, repo, notif_repo, owner_id="evaluation-worker-b"
+    )
+    _workflow, revision = _activate(repo, _fixture_document())
+    service_a.ensure_subscriptions(revision)
+    sub = _single_sub(repo)
+
+    service_a.handle_observation(sub, _tick_obs("boot-a", 2999.0))
+    emitted = service_a.handle_observation(
+        sub, _tick_obs("boot-a", 3001.0, T0.replace(minute=1))
+    )
+    assert emitted.emitted is True
+
+    blocked = service_b.handle_observation(
+        sub, _tick_obs("boot-b", 3002.0, T0.replace(minute=2))
+    )
+    assert blocked.suppression_reason == "not_owner"
+    assert len(_events(session_factory)) == 1
+
+
 # ---------------------------------------------------------------------------
 # 3: ltp restart / new epoch never fires
 # ---------------------------------------------------------------------------
@@ -374,7 +399,7 @@ def test_candle_gap_opens_new_epoch_without_firing(session_factory, notif_repo, 
     assert service.handle_observation(sub, _bar(0, 95.0)).emitted is False
     assert service.handle_observation(sub, _bar(1, 99.0)).emitted is False
 
-    # 10:01 -> 10:09 is an 8-minute jump on a 1-minute timeframe (> 2.5 bars):
+    # 10:01 -> 10:09 is an 8-minute jump on a 1-minute timeframe (> 1.5 bars):
     # gap detected, fresh state, the stale 101 bar must not fire.
     stale = service.handle_observation(sub, _bar(9, 101.0))
     assert stale.fired is False
@@ -460,6 +485,29 @@ def test_duplicate_final_candle_creates_single_event(session_factory, notif_repo
     # loser's checkpoint write rolled back: prev is still 99.0 in the
     # condition's partitioned sub-state
     assert rolled_back_state["conds"][cross_key]["prev"] == 99.0
+
+
+def test_changed_final_candle_records_silent_correction_audit(session_factory, notif_repo, channel_id):
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    service = _service(session_factory, repo, notif_repo)
+    _workflow, revision = _activate(repo, _candle_document(level=100.0))
+    service.ensure_subscriptions(revision)
+    sub = _single_sub(repo)
+
+    service.handle_observation(sub, _bar(0, 95.0))
+    service.handle_observation(sub, _bar(1, 99.0))
+    original = service.handle_observation(sub, _bar(2, 101.0))
+    assert original.emitted is True
+
+    corrected = service.handle_observation(sub, _bar(2, 99.0))
+    assert corrected.emitted is False
+    assert corrected.suppression_reason == "candle_correction"
+    events = _events(session_factory)
+    assert len(events) == 2
+    correction = next(event for event in events if event.occurrence_key.startswith("correction:"))
+    assert correction.evidence["correction_of"].endswith(_bar(2, 99.0).ts.isoformat())
+    assert correction.evidence["correction_hash"]
+    assert len(_deliveries(session_factory)) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -61,12 +61,22 @@ TIMEFRAMES: frozenset[str] = frozenset(
     {"minute", "3minute", "5minute", "10minute", "15minute", "30minute", "60minute", "day"}
 )
 
+# Calendar/session implementations wired by the Phase 1 runtime. New names
+# must be added with a real provider; the compiler rejects unknown settings.
+SESSION_EXCHANGES: Mapping[str, frozenset[str]] = {
+    "nse_equity": frozenset({"NSE"}),
+    "mcx_commodity": frozenset({"MCX"}),
+    "currency": frozenset({"CDS", "BCD"}),
+}
+SESSIONS: frozenset[str] = frozenset(SESSION_EXCHANGES)
+
 CAPABILITIES: Mapping[str, object] = {
     "operators": OPERATORS,
     "fields": FIELDS,
     "clocks": CLOCKS,
     "triggers": TRIGGERS,
     "timeframes": TIMEFRAMES,
+    "sessions": SESSIONS,
 }
 
 
@@ -92,6 +102,17 @@ def is_known_trigger(name: object) -> bool:
 
 def is_supported_timeframe(name: object) -> bool:
     return isinstance(name, str) and name in TIMEFRAMES
+
+
+def is_supported_session(name: object) -> bool:
+    return isinstance(name, str) and name in SESSIONS
+
+
+def session_accepts_exchange(session: object, exchange: object) -> bool:
+    """Return whether a workflow session is valid for an instrument venue."""
+    if not isinstance(session, str) or not isinstance(exchange, str):
+        return False
+    return exchange.upper() in SESSION_EXCHANGES.get(session, frozenset())
 
 
 def is_namespaced_field(name: object) -> bool:

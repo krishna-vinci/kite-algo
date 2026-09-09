@@ -9,11 +9,15 @@ Environment:
 - ``REDIS_URL`` (required) — Redis for the tick / completed-candle pub/sub
 - ``MARKET_RUNTIME_URL`` (optional) — market-runtime HTTP base URL; forwarded
   to the client's own ``MARKET_RUNTIME_HTTP_URL`` variable when set
-- ``ALERTS_INSTRUMENT_TOKENS`` (optional) — JSON mapping of
+- ``ALERTS_INSTRUMENT_TOKENS`` (optional compatibility override) — JSON mapping of
   ``"EXCHANGE:SYMBOL"`` to numeric instrument tokens, e.g.
-  ``{"NSE:RELIANCE": 738561}``; the worker subscribes these tokens on the
-  market-runtime and uses them to resolve candle history. Empty/absent is
-  warned loudly: without tokens no instrument can resolve.
+  ``{"NSE:RELIANCE": 738561}``. The worker first resolves active workflow
+  symbols through the shared PostgreSQL catalog. This mapping is a
+  compatibility fallback ONLY when the catalog is uninitialized
+  (bootstrap/development). Once the catalog is initialized, authoritative
+  rejections (retired/expired/ambiguous/not-found) are never bypassed unless
+  ``ALERTS_INSTRUMENT_TOKEN_FALLBACK=always`` is explicitly set (loud,
+  logged, and still never applied to retired/expired records).
 - ``ALERTS_POLL_INTERVAL_S`` (optional, default 2.0)
 - ``ALERTS_REFRESH_INTERVAL_S`` (optional, default 10) — subscription
   activation/pause refresh cadence
@@ -41,6 +45,8 @@ import sys
 import uuid
 from typing import Any, Callable, Dict, Optional
 
+from backend.database_url import resolve_database_url as _resolve_database_url
+
 logger = logging.getLogger("backend.workflows.worker_entry")
 
 # ``make_resolver`` is a PINNED contract being added to
@@ -55,6 +61,20 @@ except ImportError:  # pragma: no cover
 _OFF_VALUES = {"0", "false", "no", "off"}
 
 
+def resolve_database_url(environ: Optional[dict[str, str]] = None) -> str:
+    """Resolve the alerts DB exactly like the Compose/API settings.
+
+    ``DATABASE_URL`` wins. Otherwise the conventional ``DB_*`` variables are
+    assembled into a URL with credentials percent-encoded, so passwords such
+    as ``p@ss/word`` cannot change the host, port, or database path.
+    """
+    return _resolve_database_url(
+        environ,
+        require_all=True,
+        driver="postgresql+psycopg2",
+    )
+
+
 def build_instrument_tokens(raw: Optional[str] = None) -> Dict[str, int]:
     """Parse ``ALERTS_INSTRUMENT_TOKENS`` (JSON: instrument key -> token)."""
     raw = (
@@ -66,7 +86,18 @@ def build_instrument_tokens(raw: Optional[str] = None) -> Dict[str, int]:
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("must be a JSON object")
-        return {str(key): int(value) for key, value in data.items()}
+        tokens: Dict[str, int] = {}
+        for key, value in data.items():
+            instrument_key = str(key).strip()
+            if instrument_key.count(":") != 1 or any(not part.strip() for part in instrument_key.split(":", 1)):
+                logger.error("invalid instrument key in ALERTS_INSTRUMENT_TOKENS: %r", key)
+                continue
+            token = int(value)
+            if token <= 0:
+                logger.error("instrument token must be positive for %s", instrument_key)
+                continue
+            tokens[instrument_key] = token
+        return tokens
     except (TypeError, ValueError) as exc:
         logger.error("invalid ALERTS_INSTRUMENT_TOKENS (%s); ignoring: %s", raw, exc)
         return {}
@@ -85,6 +116,149 @@ def warn_if_no_instruments(tokens: Dict[str, int]) -> None:
             "be warmed. Set ALERTS_INSTRUMENT_TOKENS to a JSON object like "
             '{"NSE:RELIANCE": 738561}.'
         )
+
+
+def resolve_catalog_instrument_tokens(
+    instrument_keys: set[str],
+    session_factory: Callable[[], Any],
+    *,
+    fallback_tokens: Optional[Dict[str, int]] = None,
+) -> Dict[str, int]:
+    """Resolve active alert symbols through the shared catalog.
+
+    Rejection classes (C2):
+
+    - ``active`` catalog record -> the resolved broker token.
+    - ``expired`` / ``retired`` / ambiguous record -> authoritative rejection;
+      the environment map is NEVER applied.
+    - not found while the catalog IS initialized -> authoritative rejection by
+      default. The environment map applies only when
+      ``ALERTS_INSTRUMENT_TOKEN_FALLBACK=always`` (explicit, loud compat mode).
+    - not found while the catalog is UNINITIALIZED (bootstrap/development) ->
+      the environment map applies with a warning.
+    - catalog unavailable (database down) -> raises ``CatalogUnavailableError``
+      unless the explicit ``always`` fallback is set; callers must keep their
+      current bindings and retry on the next refresh pass.
+
+    Returns ``(resolved, rejected)`` where ``rejected`` maps instrument keys
+    to a machine-readable reason.
+    """
+    from backend.broker_api.instruments.catalog import (
+        AmbiguousInstrumentError,
+        CatalogUnavailableError,
+        InstrumentCatalog,
+        InstrumentNotFoundError,
+    )
+
+    fallback_tokens = {
+        str(key).strip().upper(): int(token)
+        for key, token in (fallback_tokens or {}).items()
+    }
+    policy = os.environ.get("ALERTS_INSTRUMENT_TOKEN_FALLBACK", "").strip().lower()
+    catalog = InstrumentCatalog(db=session_factory)
+    resolved: Dict[str, int] = {}
+    rejected: Dict[str, str] = {}
+    catalog_initialized: Optional[bool] = None
+
+    def _initialized() -> bool:
+        nonlocal catalog_initialized
+        if catalog_initialized is None:
+            try:
+                catalog_initialized = catalog.health().get("status") != "uninitialized"
+            except CatalogUnavailableError:
+                raise
+        return catalog_initialized
+
+    def _fallback_allowed() -> bool:
+        return policy == "always"
+
+    for instrument_key in sorted({str(key).strip().upper() for key in instrument_keys if str(key).strip()}):
+        try:
+            descriptor = catalog.resolve_public_key(instrument_key)
+        except CatalogUnavailableError:
+            if _fallback_allowed() and instrument_key in fallback_tokens:
+                logger.warning(
+                    "catalog unavailable; ALERTS_INSTRUMENT_TOKEN_FALLBACK=always "
+                    "applies compatibility token for %s",
+                    instrument_key,
+                )
+                resolved[instrument_key] = fallback_tokens[instrument_key]
+                continue
+            raise
+        except AmbiguousInstrumentError as exc:
+            logger.error(
+                "catalog returned ambiguous active alert instrument %s: %s",
+                instrument_key, exc,
+            )
+            rejected[instrument_key] = "ambiguous"
+            continue
+        except InstrumentNotFoundError:
+            lifecycle = None
+            try:
+                lifecycle = catalog.lifecycle_for_public_key(instrument_key)
+            except CatalogUnavailableError:
+                lifecycle = None
+            if lifecycle == "retired":
+                logger.error(
+                    "catalog instrument %s is retired; refusing compatibility token",
+                    instrument_key,
+                )
+                rejected[instrument_key] = "retired"
+                continue
+            if lifecycle == "expired":
+                logger.error(
+                    "catalog instrument %s is expired; refusing compatibility token",
+                    instrument_key,
+                )
+                rejected[instrument_key] = "expired"
+                continue
+            if lifecycle is not None:
+                logger.error(
+                    "catalog instrument %s has non-active lifecycle %s",
+                    instrument_key, lifecycle,
+                )
+                rejected[instrument_key] = lifecycle
+                continue
+            # Genuinely absent from the records table.
+            if _fallback_allowed() and instrument_key in fallback_tokens:
+                logger.warning(
+                    "catalog has no record for %s; "
+                    "ALERTS_INSTRUMENT_TOKEN_FALLBACK=always applies compatibility token",
+                    instrument_key,
+                )
+                resolved[instrument_key] = fallback_tokens[instrument_key]
+            elif _fallback_allowed():
+                logger.error("catalog could not resolve active alert instrument %s: not found", instrument_key)
+                rejected[instrument_key] = "not_found"
+            elif not _initialized():
+                if instrument_key in fallback_tokens:
+                    logger.warning(
+                        "catalog is uninitialized; applying ALERTS_INSTRUMENT_TOKENS "
+                        "compatibility fallback for %s",
+                        instrument_key,
+                    )
+                    resolved[instrument_key] = fallback_tokens[instrument_key]
+                else:
+                    logger.error("catalog could not resolve active alert instrument %s: not found", instrument_key)
+                    rejected[instrument_key] = "not_found"
+            else:
+                logger.error(
+                    "catalog could not resolve active alert instrument %s: not found "
+                    "(initialized catalog; compatibility fallback refused)",
+                    instrument_key,
+                )
+                rejected[instrument_key] = "not_found"
+            continue
+        if descriptor.lifecycle_status != "active":
+            logger.error(
+                "catalog instrument %s is not active: %s",
+                instrument_key,
+                descriptor.lifecycle_status,
+            )
+            rejected[instrument_key] = descriptor.lifecycle_status
+            continue
+        resolved[instrument_key] = descriptor.broker_token
+    return resolved, rejected
 
 
 def delivery_enabled() -> bool:
@@ -128,11 +302,14 @@ def build_subscription_loader(session_factory: Callable[[], Any]) -> Callable[[s
                     "expires_at": config.get("expires_at"),
                     "workflow_name": workflow_name,
                 }
-        except Exception:
+        except Exception as exc:
             logger.error(
                 "subscription loader failed for %s", subscription_id, exc_info=True,
             )
-            return None
+            # A missing row is a permanent context problem. A database or
+            # transaction failure is not: let the delivery worker record an
+            # unknown attempt and retry without losing the outbox row.
+            raise RuntimeError("temporary subscription context failure") from exc
 
     return load
 
@@ -199,14 +376,20 @@ def build_delivery_resolver(
     return _fallback_make_resolver(notification_repo, subscription_loader)
 
 
-def build_renewal(
-    client: Any, owner_id: str, tokens: Dict[str, int]
-) -> Callable[[], Any]:
-    """Ownership renewal callable for EvaluationWorker (same client as start)."""
+def build_renewal(client: Any, owner_id: str, bindings: Any) -> Callable[[], Any]:
+    """Ownership renewal callable for EvaluationWorker (same client as start).
+
+    ``bindings`` is an :class:`InstrumentBindingRegistry`: every renewal reads
+    the CURRENT accepted snapshot, so a binding added after startup is
+    subscribed on market-runtime within one renewal interval (C1).
+    """
 
     async def renew() -> None:
+        snapshot = bindings.snapshot() if hasattr(bindings, "snapshot") else dict(bindings)
+        if not snapshot:
+            return
         await client.set_owner_subscriptions(
-            owner_id, {int(token): "full" for token in tokens.values()}
+            owner_id, {int(token): "full" for token in snapshot.values()}
         )
 
     return renew
@@ -278,15 +461,41 @@ async def _sync_market_runtime_subscriptions(owner_id: str, tokens: Dict[str, in
         )
 
 
+async def _log_market_runtime_cache_generation() -> None:
+    """Log the generation Go's cache currently serves (C3 observability).
+
+    A stale Go cache means new bindings subscribe on a store that cannot
+    route their ticks yet; surfacing the generation beside the binding
+    revision makes that mismatch explicit instead of silent.
+    """
+    try:
+        import httpx
+
+        base = os.environ.get("MARKET_RUNTIME_URL", "").strip()
+        if not base:
+            return
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"{base}/internal/market-runtime/instruments/health")
+            if resp.status_code == 200:
+                payload = resp.json()
+                logger.info(
+                    "market-runtime instrument cache: generation=%s count=%s",
+                    payload.get("generation"), payload.get("count"),
+                )
+    except Exception:
+        logger.debug("market-runtime instrument health check unavailable", exc_info=True)
+
+
 async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        logger.error("DATABASE_URL is required (Postgres DSN for durable state)")
+    try:
+        database_url = resolve_database_url()
+    except ValueError as exc:
+        logger.error("invalid alerts database configuration: %s", exc)
         return 2
     redis_url = os.environ.get("REDIS_URL")
     if not redis_url:
@@ -305,6 +514,7 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
 
     from backend.notifications.repository import SqlAlchemyNotificationRepository
     from backend.notifications.worker import DeliveryWorker
+    from backend.workflows.instrument_bindings import InstrumentBindingRegistry
     from backend.workflows.repository import SqlAlchemyWorkflowRepository
     from backend.workflows.runtime import (
         EvaluationWorker,
@@ -312,15 +522,38 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         PgCandleHistory,
         RedisCandleSource,
         RedisTickSource,
+        build_market_session_provider,
     )
 
     engine = create_engine(database_url, pool_pre_ping=True)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
     workflow_repo = SqlAlchemyWorkflowRepository(session_factory)
     notification_repo = SqlAlchemyNotificationRepository(session_factory)
-    instrument_tokens = build_instrument_tokens()
+    configured_tokens = build_instrument_tokens()
+    # C1: the registry is the ONLY mutable binding state. It starts from the
+    # accepted catalog resolutions (env map only per the C2 fallback policy),
+    # never from a pre-seeded environment dump, so a stale environment token
+    # cannot silently bind an instrument the catalog rejects.
+    bindings = InstrumentBindingRegistry()
+    active_keys = {
+        str(sub.instrument_key).strip().upper()
+        for sub in workflow_repo.list_active_subscriptions()
+        if str(sub.instrument_key).strip()
+    }
+    resolved_tokens, rejected_tokens = resolve_catalog_instrument_tokens(
+        active_keys,
+        session_factory,
+        fallback_tokens=configured_tokens,
+    )
+    bindings.apply(resolved_tokens, set(rejected_tokens))
+    for reason_key, reason in sorted(rejected_tokens.items()):
+        logger.warning(
+            "instrument %s rejected by catalog (%s); its rules stay silent",
+            reason_key, reason,
+        )
     if extra_tokens:
-        instrument_tokens.update(extra_tokens)
+        bindings.apply(extra_tokens, set())
+    instrument_tokens = bindings.snapshot()
     warn_if_no_instruments(instrument_tokens)
 
     def channel_resolver(owner_id: str, names):
@@ -342,22 +575,30 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         return 2
 
     runtime_owner_id = f"alerts-worker:{uuid.uuid4()}"
-    await _sync_market_runtime_subscriptions(runtime_owner_id, instrument_tokens)
+
+    async def sync_market_runtime_snapshot(_change: Any = None) -> None:
+        """Best-effort (re)registration of the CURRENT binding snapshot."""
+        await _sync_market_runtime_subscriptions(runtime_owner_id, bindings.snapshot())
+        await _log_market_runtime_cache_generation()
+
+    await sync_market_runtime_snapshot()
 
     def tick_source_factory(instrument_key: str) -> RedisTickSource:
-        token = instrument_tokens.get(instrument_key)
+        token = bindings.get(instrument_key)
         mapping = {token: instrument_key} if token is not None else {}
         # each call returns a NEW source (fresh uuid epoch): the worker
         # relies on that to re-initialize ltp rules after a feed outage (D2)
         return RedisTickSource(redis_client, mapping)
 
     def candle_source_factory(instrument_key: str, timeframe: str) -> RedisCandleSource:
-        token = instrument_tokens.get(instrument_key)
+        token = bindings.get(instrument_key)
         mapping = {token: instrument_key} if token is not None else {}
         return RedisCandleSource(redis_client, mapping, interval=timeframe)
 
     # market-runtime owner leases expire after ~TTLs without renewal; renew
-    # every TTL/3 with the SAME client used at startup.
+    # every TTL/3 with the SAME client used at startup. The renewal is built
+    # even with zero bindings: the first later activation must establish
+    # subscriptions and renewal without a process restart (C1).
     try:
         lease_ttl_s = float(os.environ.get(
             "MARKET_RUNTIME_OWNER_LEASE_TTL_SEC", MARKET_RUNTIME_OWNER_LEASE_TTL_S,
@@ -367,19 +608,18 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
     renewal_interval_s = max(1.0, lease_ttl_s / 3.0)
 
     renewal = None
-    if instrument_tokens:
-        try:
-            from backend.broker_api.orders.market_runtime_client import (
-                get_market_runtime_client,
-            )
+    try:
+        from backend.broker_api.orders.market_runtime_client import (
+            get_market_runtime_client,
+        )
 
-            market_client = await get_market_runtime_client()
-            renewal = build_renewal(market_client, runtime_owner_id, instrument_tokens)
-        except Exception:
-            logger.warning(
-                "market-runtime renewal client unavailable; ownership "
-                "renewal disabled", exc_info=True,
-            )
+        market_client = await get_market_runtime_client()
+        renewal = build_renewal(market_client, runtime_owner_id, bindings)
+    except Exception:
+        logger.warning(
+            "market-runtime renewal client unavailable; ownership "
+            "renewal disabled", exc_info=True,
+        )
 
     worker = EvaluationWorker(
         workflow_repo,
@@ -387,12 +627,22 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         channel_resolver,
         tick_source_factory,
         candle_source_factory,
-        candle_history=PgCandleHistory(engine, instrument_tokens),
+        candle_history=PgCandleHistory(engine, bindings),
         poll_interval_s=float(os.environ.get("ALERTS_POLL_INTERVAL_S", "2.0")),
         refresh_interval_s=float(os.environ.get("ALERTS_REFRESH_INTERVAL_S", "10")),
         renewal=renewal,
         renewal_interval_s=renewal_interval_s,
         health_interval_s=float(os.environ.get("ALERTS_HEALTH_INTERVAL_S", "30")),
+        session_provider=build_market_session_provider(engine),
+        owner_id=runtime_owner_id,
+        ownership_lease_s=lease_ttl_s,
+        binding_registry=bindings,
+        bindings_changed=sync_market_runtime_snapshot,
+        instrument_resolver=lambda keys: resolve_catalog_instrument_tokens(
+            keys,
+            session_factory,
+            fallback_tokens=configured_tokens,
+        ),
     )
 
     # Supervised delivery task: drains the signal outbox so emitted alerts

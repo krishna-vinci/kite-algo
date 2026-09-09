@@ -10,7 +10,7 @@ Status: implemented subset of [spec v2](../docs/superpowers/specs/2026-09-08-ale
 version: 1
 name: reliance-breakout            # unique per owner
 instruments: ["NSE:RELIANCE"]      # "EXCHANGE:SYMBOL" shorthand or {symbol, exchange}
-session: nse_equity                # optional, default nse_equity
+session: nse_equity                # nse_equity | mcx_commodity | currency
 stages:
   - id: px                         # required; unique
     type: signal                   # Phase 1 supports "signal"
@@ -38,6 +38,13 @@ data_policy:
 ```
 
 `reminder_interval` (alias `reminder_interval_s`) is only valid with `trigger: reminder`; the example above uses `trigger: once`, so it carries none.
+
+Session policies are market-segment-specific. `nse_equity` uses the imported
+NSE-CM calendar. `mcx_commodity` is feed-driven in Phase 1 for MCX
+instruments, and `currency` is feed-driven for CDS/BCD instruments; these two
+policies do not apply NSE holiday suppression. A workflow session must match
+the exchange of every instrument in the document, so MCX workflows should
+declare `session: mcx_commodity` rather than relying on the NSE default.
 
 Boolean shorthand `repeat: true/false` maps to `on_transition`/`once` and conflicts with an explicit `trigger`.
 
@@ -73,7 +80,7 @@ Canonical hashes are stable across key order; moving or reformatting does not ch
 | Operation | Endpoint |
 | --- | --- |
 | Validate without saving | `POST /api/worker/workflows/validate` |
-| Preview (writes nothing; responds with `evaluation: not_evaluated_phase_1`) | `POST /api/worker/workflows/preview` |
+| Preview (writes nothing; optionally evaluates supplied recent samples in memory) | `POST /api/worker/workflows/preview` |
 | Import YAML as draft | `POST /api/worker/workflows/import` |
 | Create / list | `POST /api/worker/workflows`, `GET /api/worker/workflows` |
 | Read / update (expected_revision) | `GET /api/worker/workflows/{id}`, `PATCH /api/worker/workflows/{id}` |
@@ -82,3 +89,24 @@ Canonical hashes are stable across key order; moving or reformatting does not ch
 | Channels | `GET|POST /api/worker/notification-channels`, `POST /api/worker/notification-channels/{id}/test` |
 
 Required worker-token actions: `workflows:read`, `workflows:write`, `workflows:activate`, `notifications:test`.
+
+### Preview samples
+
+Preview is deterministic and read-only. Add an `observations` array to the
+preview request when a dry-run is wanted:
+
+```json
+{
+  "yaml_text": "...",
+  "observations": [
+    {"instrument_key": "NSE:RELIANCE", "epoch_id": "preview-1", "ts": "2026-09-08T09:15:00Z", "ltp": 2990},
+    {"instrument_key": "NSE:RELIANCE", "epoch_id": "preview-1", "ts": "2026-09-08T09:16:00Z", "ltp": 3010}
+  ]
+}
+```
+
+The response reports `evaluation: dry_run`, `evaluated_observations`,
+`warmup_bars`, `would_fire`, and `unknown_reasons`. With no samples it reports
+`dry_run_no_data`. Samples need a real timestamp; the API never substitutes
+server wall-clock time. Preview does not persist checkpoints, signal events, or
+deliveries.

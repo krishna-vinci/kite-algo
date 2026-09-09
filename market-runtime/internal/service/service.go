@@ -247,14 +247,18 @@ func (s *Service) handleTick(tick kitemodels.Tick, shardID int) {
 	s.instrumentsMu.RUnlock()
 	if store != nil {
 		if meta := store.ByToken(normalized.InstrumentToken); meta != nil {
+			normalized.InstrumentID = meta.InstrumentID
 			normalized.Tradingsymbol = meta.Tradingsymbol
 			normalized.Exchange = meta.Exchange
+			normalized.Segment = meta.Segment
 			normalized.InstrumentType = meta.InstrumentType
+			normalized.OptionType = meta.OptionType
 			normalized.LotSize = meta.LotSize
 			normalized.TickSize = meta.TickSize
 			normalized.Strike = meta.Strike
 			normalized.Expiry = meta.Expiry
 			normalized.Underlying = meta.Underlying
+			normalized.CatalogGeneration = meta.Generation
 		}
 	}
 

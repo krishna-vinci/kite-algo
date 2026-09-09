@@ -32,6 +32,10 @@ def issue(where: str, code: str, message: str) -> ValidationIssueModel:
 class WorkflowValidateRequest(BaseModel):
     yaml_text: Optional[str] = None
     document: Optional[Dict[str, Any]] = None
+    # Optional recent samples for the read-only preview.  The API deliberately
+    # does not fetch live data or mutate evaluation state; callers may supply
+    # exchange-timestamped samples from their market-data snapshot.
+    observations: List[Dict[str, Any]] = []
 
 
 class WorkflowCreateRequest(BaseModel):
@@ -63,9 +67,11 @@ class PreviewResponse(IssueEnvelope):
     instruments: List[str] = []
     stages: List[str] = []
     alerts: List[str] = []
-    # Phase 1 preview compiles and reports warmup shape only; it never runs
-    # evaluation. The marker is a stable contract for clients.
-    evaluation: str = "not_evaluated_phase_1"
+    evaluation: str = "dry_run_no_data"
+    warmup_bars: int = 0
+    evaluated_observations: int = 0
+    would_fire: List[Dict[str, Any]] = []
+    unknown_reasons: List[str] = []
     note: str = ""
 
 

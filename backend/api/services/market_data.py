@@ -12,6 +12,7 @@ from fastapi import HTTPException, Request, WebSocket
 from pydantic import BaseModel, Field, field_validator
 
 from backend.algo_runtime.models import CandleSeriesSpec
+from backend.broker_api.instruments.catalog import AmbiguousInstrumentError
 from backend.broker_api.instruments.instruments_repository import InstrumentsRepository
 from backend.broker_api.orders.market_runtime_client import RUNTIME_TICKS_CHANNEL
 
@@ -200,6 +201,8 @@ class WorkerMarketDataService:
         tradingsymbol = str(row.get("tradingsymbol") or "").strip().upper()
         return {
             "symbol": f"{exchange}:{tradingsymbol}",
+            "public_key": row.get("public_key") or f"{exchange}:{tradingsymbol}",
+            "instrument_id": row.get("instrument_id"),
             "instrument_token": int(row["instrument_token"]),
             "exchange": exchange,
             "tradingsymbol": tradingsymbol,
@@ -210,10 +213,20 @@ class WorkerMarketDataService:
             "lot_size": int(row["lot_size"]) if row.get("lot_size") is not None else None,
             "expiry": row.get("expiry"),
             "strike": float(row["strike"]) if row.get("strike") is not None else None,
+            "underlying": row.get("underlying"),
+            "option_type": row.get("option_type"),
+            "catalog_generation": row.get("catalog_generation"),
+            "lifecycle_status": row.get("lifecycle_status"),
         }
 
     async def resolve_ticker(self, symbol: str) -> Dict[str, Any]:
-        row = await asyncio.to_thread(self.instruments.resolve_market_symbol, symbol)
+        try:
+            row = await asyncio.to_thread(self.instruments.resolve_market_symbol, symbol)
+        except AmbiguousInstrumentError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"rejection_reason": "AMBIGUOUS_INSTRUMENT", "symbol": symbol, "message": str(exc)},
+            ) from exc
         if not row:
             raise HTTPException(status_code=404, detail=f"Instrument not found for symbol {symbol}")
         return self._instrument_payload(row)
