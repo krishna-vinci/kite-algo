@@ -1,0 +1,17 @@
+version: 1
+name: bad-operator
+instruments: ["NSE:INFY"]
+stages:
+  - id: px
+    type: signal
+    clock: ltp
+    conditions:
+      all:
+        - left: {field: ltp}
+          op: whatever_unknown
+          right: {value: 100}
+alerts:
+  - id: never-fires
+    source: px
+    trigger: once
+    channels: [telegram_primary]

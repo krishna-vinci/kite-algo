@@ -1,0 +1,17 @@
+version: 1
+name: reliance-breakout
+instruments: ["NSE:RELIANCE"]
+stages:
+  - id: px
+    type: signal
+    clock: ltp
+    conditions:
+      all:
+        - left: {field: ltp}
+          op: crosses_above
+          right: {value: 3000}
+alerts:
+  - id: breakout
+    source: px
+    trigger: once
+    channels: [telegram_primary]

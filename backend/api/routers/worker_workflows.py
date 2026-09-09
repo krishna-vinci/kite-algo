@@ -1,0 +1,842 @@
+"""Worker API for alert workflows (Alerts Platform Phase 1, Task 8).
+
+Endpoints under ``/worker/workflows`` (mounted at ``/api`` like every other
+worker router). Auth uses the shared ``require_worker_token`` dependency plus
+per-action checks (``workflows:read`` / ``workflows:write`` /
+``workflows:activate``); every row is scoped to an owner derived from the
+token's account scope so one worker token can never touch another's alerts.
+
+The workflows/notifications tables come from the alerts-platform repositories
+(``backend.workflows.repository`` / ``backend.notifications.repository``).
+The sessionmaker is injected: ``app.state.alerts_session_factory`` wins, else
+the global ``SessionLocal``. Tests swap it via ``app.dependency_overrides``.
+
+Importing this module must not require redis; the workflows layer is
+stdlib + SQLAlchemy + PyYAML only.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import func, select, update
+from sqlalchemy.orm import Session
+
+from backend.api.routers.worker_shared import _require_action, require_worker_token
+from backend.api.schemas.workflows import (
+    ChannelResponse,
+    EventPage,
+    HealthResponse,
+    IssueEnvelope,
+    PreviewResponse,
+    RevisionSummary,
+    SignalEventItem,
+    SubscriptionHealth,
+    ValidationIssueModel,
+    WorkflowCreateRequest,
+    WorkflowExportResponse,
+    WorkflowListResponse,
+    WorkflowMutationResponse,
+    WorkflowPatchRequest,
+    WorkflowSummary,
+    WorkflowValidateRequest,
+    issue,
+)
+from backend.notifications.repository import Delivery, SqlAlchemyNotificationRepository
+from backend.workflows.compiler import CompiledWorkflow, WorkflowValidationError, compile_document
+from backend.workflows.models import AlertSpec, WorkflowDocument
+from backend.workflows.parser import WorkflowParseError, parse_workflow_dict, parse_workflow_yaml
+from backend.workflows.repository import (
+    AlertSubscription,
+    DomainConflict,
+    IdempotencyConflict,
+    SignalEvent,
+    SqlAlchemyWorkflowRepository,
+    Workflow as WorkflowModel,
+    WorkflowRevision,
+)
+
+router = APIRouter(prefix="/worker/workflows", tags=["Worker Workflows"])
+
+__all__ = [
+    "router",
+    "_alerts_db",
+    "_notification_repository",
+    "_workflow_repository",
+]
+
+
+# ---------------------------------------------------------------------------
+# injectable dependencies
+# ---------------------------------------------------------------------------
+
+
+def _alerts_db(request: Request):
+    """Sessionmaker for the alerts-platform tables (injectable for tests)."""
+    factory = getattr(request.app.state, "alerts_session_factory", None)
+    if factory is not None:
+        return factory
+    from backend.app.database import SessionLocal
+
+    return SessionLocal
+
+
+def _workflow_repository(
+    request: Request,
+    session_factory: Any = Depends(_alerts_db),
+) -> SqlAlchemyWorkflowRepository:
+    repository = getattr(request.app.state, "workflow_repository", None)
+    if repository is not None:
+        return repository
+    return SqlAlchemyWorkflowRepository(session_factory)
+
+
+def _notification_repository(
+    request: Request,
+    session_factory: Any = Depends(_alerts_db),
+) -> SqlAlchemyNotificationRepository:
+    repository = getattr(request.app.state, "notification_repository", None)
+    if repository is not None:
+        return repository
+    return SqlAlchemyNotificationRepository(session_factory)
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def _owner_id_for_token(token: Any) -> str:
+    scope = str(getattr(token, "account_scope", "") or "").strip()
+    return scope or f"worker:{getattr(token, 'token_id', '')}"
+
+
+async def _authorize(request: Request, action: str) -> Tuple[Any, str]:
+    token = await require_worker_token(request)
+    _require_action(token, action)
+    return token, _owner_id_for_token(token)
+
+
+def _iso(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
+
+
+def _load_document(yaml_text: Optional[str], document: Optional[Dict[str, Any]]) -> WorkflowDocument:
+    """Parse the request transport; 422 when the transport itself is bad."""
+    if (yaml_text is None) == (document is None):
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "issues": [issue("request", "bad_request", "provide exactly one of yaml_text or document").model_dump()]},
+        )
+    try:
+        if yaml_text is not None:
+            return parse_workflow_yaml(yaml_text)
+        return parse_workflow_dict(document)
+    except WorkflowParseError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "issues": [_parse_issues(exc)[0].model_dump()]},
+        ) from exc
+
+
+def _parse_issues(exc: WorkflowParseError) -> List[ValidationIssueModel]:
+    return [issue("document", "parse_error", str(exc))]
+
+
+def _validation_issues(exc: WorkflowValidationError) -> List[ValidationIssueModel]:
+    return [issue(item.where, item.code, item.message) for item in exc.issues]
+
+
+def _compile_or_422(doc: WorkflowDocument) -> CompiledWorkflow:
+    try:
+        return compile_document(doc)
+    except WorkflowValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "issues": [item.model_dump() for item in _validation_issues(exc)]},
+        ) from exc
+
+
+def _owned_workflow(session: Session, workflow_id: str, owner_id: str) -> WorkflowModel:
+    workflow = session.get(WorkflowModel, workflow_id)
+    if workflow is None or workflow.owner_id != owner_id:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return workflow
+
+
+def _latest_revision(session: Session, workflow_id: str) -> Optional[WorkflowRevision]:
+    return session.execute(
+        select(WorkflowRevision)
+        .where(WorkflowRevision.workflow_id == workflow_id)
+        .order_by(WorkflowRevision.revision.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _revision_by_number(session: Session, workflow_id: str, revision: int) -> Optional[WorkflowRevision]:
+    return session.execute(
+        select(WorkflowRevision)
+        .where(WorkflowRevision.workflow_id == workflow_id, WorkflowRevision.revision == revision)
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _revision_summary(revision: Optional[WorkflowRevision]) -> Optional[RevisionSummary]:
+    if revision is None:
+        return None
+    return RevisionSummary(
+        revision_id=revision.id,
+        revision=int(revision.revision),
+        status=str(revision.status),
+        canonical_hash=str(revision.canonical_hash),
+        created_at=_iso(revision.created_at),
+        activated_at=_iso(revision.activated_at),
+    )
+
+
+def _workflow_summary(session: Session, workflow: WorkflowModel) -> WorkflowSummary:
+    latest = _latest_revision(session, workflow.id)
+    active = session.execute(
+        select(WorkflowRevision)
+        .where(WorkflowRevision.workflow_id == workflow.id, WorkflowRevision.status == "active")
+        .order_by(WorkflowRevision.activated_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    return WorkflowSummary(
+        workflow_id=workflow.id,
+        name=str(workflow.name),
+        idempotency_key=workflow.idempotency_key,
+        archived=workflow.archived_at is not None,
+        archived_at=_iso(workflow.archived_at),
+        created_at=_iso(workflow.created_at),
+        updated_at=_iso(workflow.updated_at),
+        latest_revision=_revision_summary(latest),
+        active_revision=_revision_summary(active),
+    )
+
+
+def _subscription_config(alert: AlertSpec) -> Dict[str, Any]:
+    return {
+        "cooldown_s": alert.cooldown_s,
+        "rearm_level": alert.rearm_level,
+        "rearm_direction": alert.rearm_direction,
+        "reminder_interval_s": alert.reminder_interval_s,
+        "notify_if_already_true": alert.notify_if_already_true,
+        "expires_at": alert.expires_at,
+        "channels": list(alert.channels),
+        "message": alert.message,
+    }
+
+
+def _workflow_subscription_ids(session: Session, workflow_id: str) -> List[str]:
+    return list(
+        session.execute(
+            select(AlertSubscription.id)
+            .join(WorkflowRevision, AlertSubscription.revision_id == WorkflowRevision.id)
+            .where(WorkflowRevision.workflow_id == workflow_id)
+        ).scalars().all()
+    )
+
+
+# ---------------------------------------------------------------------------
+# validate / preview (read-only, never touch the database)
+# ---------------------------------------------------------------------------
+
+
+async def validate_workflow(request: Request, payload: WorkflowValidateRequest):
+    """Parse + compile a document and report issues. 200 even when invalid."""
+    token, _ = await _authorize(request, "workflows:read")
+    _ = token
+    if (payload.yaml_text is None) == (payload.document is None):
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "issues": [issue("request", "bad_request", "provide exactly one of yaml_text or document").model_dump()]},
+        )
+    try:
+        if payload.yaml_text is not None:
+            doc = parse_workflow_yaml(payload.yaml_text)
+        else:
+            doc = parse_workflow_dict(payload.document)
+    except WorkflowParseError as exc:
+        return IssueEnvelope(ok=False, issues=_parse_issues(exc))
+    try:
+        compile_document(doc)
+    except WorkflowValidationError as exc:
+        return IssueEnvelope(ok=False, issues=_validation_issues(exc))
+    return IssueEnvelope(ok=True, issues=[])
+
+
+async def preview_workflow(request: Request, payload: WorkflowValidateRequest):
+    """Compile + basic warmup report. Purely in-memory: writes zero rows."""
+    token, _ = await _authorize(request, "workflows:read")
+    _ = token
+    if (payload.yaml_text is None) == (payload.document is None):
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "issues": [issue("request", "bad_request", "provide exactly one of yaml_text or document").model_dump()]},
+        )
+    try:
+        if payload.yaml_text is not None:
+            doc = parse_workflow_yaml(payload.yaml_text)
+        else:
+            doc = parse_workflow_dict(payload.document)
+    except WorkflowParseError as exc:
+        return PreviewResponse(ok=False, issues=_parse_issues(exc))
+    try:
+        compile_document(doc)
+    except WorkflowValidationError as exc:
+        return PreviewResponse(
+            ok=False,
+            issues=_validation_issues(exc),
+            instruments=[instrument.key() for instrument in doc.instruments],
+            stages=[stage.id for stage in doc.stages],
+            alerts=[alert.id for alert in doc.alerts],
+        )
+    return PreviewResponse(
+        ok=True,
+        issues=[],
+        instruments=[instrument.key() for instrument in doc.instruments],
+        stages=[stage.id for stage in doc.stages],
+        alerts=[alert.id for alert in doc.alerts],
+        note="preview only: compiled in memory; nothing is persisted (no workflows, signal events or deliveries)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# CRUD
+# ---------------------------------------------------------------------------
+
+
+async def create_workflow(
+    request: Request,
+    payload: WorkflowCreateRequest,
+    workflow_repo: SqlAlchemyWorkflowRepository = Depends(_workflow_repository),
+    session_factory: Any = Depends(_alerts_db),
+):
+    token, owner_id = await _authorize(request, "workflows:write")
+    _ = token
+    doc = _load_document(payload.yaml_text, payload.document)
+    compiled = _compile_or_422(doc)
+    name = (payload.name or "").strip() or doc.name
+
+    existing_id: Optional[str] = None
+    if payload.idempotency_key:
+        session = session_factory()
+        try:
+            row = session.execute(
+                select(WorkflowModel).where(WorkflowModel.idempotency_key == payload.idempotency_key)
+            ).scalar_one_or_none()
+            existing_id = row.id if row is not None else None
+        finally:
+            session.close()
+
+    try:
+        workflow, revision = workflow_repo.create_workflow(
+            owner_id,
+            name,
+            compiled.document.to_document_dict(),
+            compiled.canonical_hash,
+            payload.idempotency_key,
+        )
+    except IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DomainConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return WorkflowMutationResponse(
+        workflow_id=workflow.id,
+        name=str(workflow.name),
+        idempotency_key=workflow.idempotency_key,
+        created=existing_id is None,
+        revision=int(revision.revision),
+        revision_id=revision.id,
+        revision_status=str(revision.status),
+        canonical_hash=str(revision.canonical_hash),
+    )
+
+
+async def import_workflow(
+    request: Request,
+    payload: WorkflowCreateRequest,
+    workflow_repo: SqlAlchemyWorkflowRepository = Depends(_workflow_repository),
+    session_factory: Any = Depends(_alerts_db),
+):
+    """POST /import: same semantics as create, YAML text only."""
+    if not payload.yaml_text:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "issues": [issue("request", "bad_request", "import requires yaml_text").model_dump()]},
+        )
+    return await create_workflow(request, payload, workflow_repo, session_factory)
+
+
+async def list_workflows(
+    request: Request,
+    session_factory: Any = Depends(_alerts_db),
+):
+    _, owner_id = await _authorize(request, "workflows:read")
+    session = session_factory()
+    try:
+        workflows = list(
+            session.execute(
+                select(WorkflowModel)
+                .where(WorkflowModel.owner_id == owner_id)
+                .order_by(WorkflowModel.created_at.desc(), WorkflowModel.id.desc())
+            ).scalars().all()
+        )
+        return WorkflowListResponse(
+            workflows=[_workflow_summary(session, workflow) for workflow in workflows]
+        )
+    finally:
+        session.close()
+
+
+async def get_workflow(
+    request: Request,
+    workflow_id: str,
+    session_factory: Any = Depends(_alerts_db),
+):
+    _, owner_id = await _authorize(request, "workflows:read")
+    session = session_factory()
+    try:
+        workflow = _owned_workflow(session, workflow_id, owner_id)
+        return _workflow_summary(session, workflow)
+    finally:
+        session.close()
+
+
+async def patch_workflow(
+    request: Request,
+    workflow_id: str,
+    payload: WorkflowPatchRequest,
+    workflow_repo: SqlAlchemyWorkflowRepository = Depends(_workflow_repository),
+    session_factory: Any = Depends(_alerts_db),
+):
+    _, owner_id = await _authorize(request, "workflows:write")
+    session = session_factory()
+    try:
+        _owned_workflow(session, workflow_id, owner_id)
+        latest = _latest_revision(session, workflow_id)
+        if latest is None or int(latest.revision) != payload.expected_revision:
+            stored = int(latest.revision) if latest is not None else 0
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "rejection_reason": "REVISION_CONFLICT",
+                    "expected_revision": payload.expected_revision,
+                    "current_revision": stored,
+                },
+            )
+    finally:
+        session.close()
+
+    doc = _load_document(payload.yaml_text, payload.document)
+    compiled = _compile_or_422(doc)
+    if compiled.canonical_hash == str(latest.canonical_hash):
+        return WorkflowMutationResponse(
+            workflow_id=workflow_id,
+            changed=False,
+            revision=int(latest.revision),
+            revision_id=latest.id,
+            revision_status=str(latest.status),
+            canonical_hash=str(latest.canonical_hash),
+        )
+    try:
+        revision = workflow_repo.add_draft_revision(
+            workflow_id,
+            compiled.document.to_document_dict(),
+            compiled.canonical_hash,
+        )
+    except DomainConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return WorkflowMutationResponse(
+        workflow_id=workflow_id,
+        changed=True,
+        revision=int(revision.revision),
+        revision_id=revision.id,
+        revision_status=str(revision.status),
+        canonical_hash=str(revision.canonical_hash),
+    )
+
+
+# ---------------------------------------------------------------------------
+# lifecycle: activate / pause / resume / archive
+# ---------------------------------------------------------------------------
+
+
+async def activate_workflow(
+    request: Request,
+    workflow_id: str,
+    workflow_repo: SqlAlchemyWorkflowRepository = Depends(_workflow_repository),
+    session_factory: Any = Depends(_alerts_db),
+):
+    _, owner_id = await _authorize(request, "workflows:activate")
+    session = session_factory()
+    try:
+        _owned_workflow(session, workflow_id, owner_id)
+        latest = _latest_revision(session, workflow_id)
+        if latest is None:
+            raise HTTPException(status_code=404, detail="Workflow has no revisions")
+        # Re-validate the stored revision; an invalid revision never activates.
+        try:
+            doc = parse_workflow_dict(latest.document)
+            compile_document(doc)
+        except WorkflowParseError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"ok": False, "issues": [_parse_issues(exc)[0].model_dump()]},
+            ) from exc
+        except WorkflowValidationError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"ok": False, "issues": [item.model_dump() for item in _validation_issues(exc)]},
+            ) from exc
+    finally:
+        session.close()
+
+    try:
+        revision = workflow_repo.activate_revision(workflow_id, latest.id)
+    except DomainConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # Materialize one subscription per (alert, instrument) for the revision.
+    created = 0
+    session = session_factory()
+    try:
+        existing = set(
+            session.execute(
+                select(AlertSubscription.alert_id, AlertSubscription.instrument_key)
+                .where(AlertSubscription.revision_id == revision.id)
+            ).all()
+        )
+        for alert in doc.alerts:
+            for instrument in doc.instruments:
+                key = (alert.id, instrument.key())
+                if key in existing:
+                    continue
+                session.add(
+                    AlertSubscription(
+                        revision_id=revision.id,
+                        alert_id=alert.id,
+                        stage_id=alert.source,
+                        instrument_symbol=instrument.symbol,
+                        instrument_exchange=instrument.exchange,
+                        instrument_key=instrument.key(),
+                        trigger=alert.trigger,
+                        config=_subscription_config(alert),
+                    )
+                )
+                created += 1
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+    return WorkflowMutationResponse(
+        workflow_id=workflow_id,
+        revision=int(revision.revision),
+        revision_id=revision.id,
+        revision_status=str(revision.status),
+        canonical_hash=str(revision.canonical_hash),
+        subscriptions_created=created,
+    )
+
+
+def _set_subscription_state(session_factory: Any, revision: WorkflowRevision, state: str) -> int:
+    session = session_factory()
+    try:
+        result = session.execute(
+            update(AlertSubscription)
+            .where(
+                AlertSubscription.revision_id == revision.id,
+                AlertSubscription.state.notin_(("expired", "completed")),
+            )
+            .values(state=state)
+        )
+        session.commit()
+        return int(result.rowcount or 0)
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+async def pause_workflow(
+    request: Request,
+    workflow_id: str,
+    session_factory: Any = Depends(_alerts_db),
+):
+    _, owner_id = await _authorize(request, "workflows:write")
+    session = session_factory()
+    try:
+        _owned_workflow(session, workflow_id, owner_id)
+        revision = session.execute(
+            select(WorkflowRevision)
+            .where(WorkflowRevision.workflow_id == workflow_id, WorkflowRevision.status == "active")
+            .order_by(WorkflowRevision.activated_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+    finally:
+        session.close()
+    if revision is None:
+        raise HTTPException(status_code=409, detail="Workflow has no active revision")
+    updated = _set_subscription_state(session_factory, revision, "paused")
+    return WorkflowMutationResponse(workflow_id=workflow_id, revision=int(revision.revision), state="paused", updated=updated)
+
+
+async def resume_workflow(
+    request: Request,
+    workflow_id: str,
+    session_factory: Any = Depends(_alerts_db),
+):
+    _, owner_id = await _authorize(request, "workflows:write")
+    session = session_factory()
+    try:
+        _owned_workflow(session, workflow_id, owner_id)
+        revision = session.execute(
+            select(WorkflowRevision)
+            .where(WorkflowRevision.workflow_id == workflow_id, WorkflowRevision.status == "active")
+            .order_by(WorkflowRevision.activated_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+    finally:
+        session.close()
+    if revision is None:
+        raise HTTPException(status_code=409, detail="Workflow has no active revision")
+    updated = _set_subscription_state(session_factory, revision, "active")
+    return WorkflowMutationResponse(workflow_id=workflow_id, revision=int(revision.revision), state="active", updated=updated)
+
+
+async def archive_workflow(
+    request: Request,
+    workflow_id: str,
+    session_factory: Any = Depends(_alerts_db),
+):
+    """Archive the workflow and every one of its revisions."""
+    _, owner_id = await _authorize(request, "workflows:write")
+    session = session_factory()
+    try:
+        workflow = _owned_workflow(session, workflow_id, owner_id)
+        workflow.archived_at = datetime.now(timezone.utc)
+        revisions_archived = int(
+            session.execute(
+                update(WorkflowRevision)
+                .where(
+                    WorkflowRevision.workflow_id == workflow_id,
+                    WorkflowRevision.status != "archived",
+                )
+                .values(status="archived")
+            ).rowcount or 0
+        )
+        session.commit()
+        return WorkflowMutationResponse(
+            workflow_id=workflow_id,
+            archived=True,
+            archived_at=_iso(workflow.archived_at),
+            revisions_archived=revisions_archived,
+        )
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# events / health / export
+# ---------------------------------------------------------------------------
+
+
+async def list_workflow_events(
+    request: Request,
+    workflow_id: str,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    workflow_repo: SqlAlchemyWorkflowRepository = Depends(_workflow_repository),
+    session_factory: Any = Depends(_alerts_db),
+):
+    _, owner_id = await _authorize(request, "workflows:read")
+    session = session_factory()
+    try:
+        _owned_workflow(session, workflow_id, owner_id)
+        subscription_alert_ids = dict(
+            session.execute(
+                select(AlertSubscription.id, AlertSubscription.alert_id)
+                .join(WorkflowRevision, AlertSubscription.revision_id == WorkflowRevision.id)
+                .where(WorkflowRevision.workflow_id == workflow_id)
+            ).all()
+        )
+    finally:
+        session.close()
+
+    subscription_ids = list(subscription_alert_ids.keys())
+    total = 0
+    if subscription_ids:
+        session = session_factory()
+        try:
+            total = int(
+                session.execute(
+                    select(func.count())
+                    .select_from(SignalEvent)
+                    .where(SignalEvent.subscription_id.in_(subscription_ids))
+                ).scalar()
+                or 0
+            )
+        finally:
+            session.close()
+
+    events = workflow_repo.list_events(subscription_ids, limit=limit, offset=offset)
+    return EventPage(
+        workflow_id=workflow_id,
+        limit=limit,
+        offset=offset,
+        total=total,
+        events=[
+            SignalEventItem(
+                id=event.id,
+                subscription_id=event.subscription_id,
+                alert_id=subscription_alert_ids.get(event.subscription_id),
+                occurrence_key=event.occurrence_key,
+                fired_at=_iso(event.fired_at),
+                evidence=dict(event.evidence or {}),
+            )
+            for event in events
+        ],
+    )
+
+
+async def get_workflow_health(
+    request: Request,
+    workflow_id: str,
+    session_factory: Any = Depends(_alerts_db),
+):
+    _, owner_id = await _authorize(request, "workflows:read")
+    session = session_factory()
+    try:
+        _owned_workflow(session, workflow_id, owner_id)
+        active = session.execute(
+            select(WorkflowRevision)
+            .where(WorkflowRevision.workflow_id == workflow_id, WorkflowRevision.status == "active")
+            .order_by(WorkflowRevision.activated_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
+        subscriptions: List[SubscriptionHealth] = []
+        if active is not None:
+            rows = list(
+                session.execute(
+                    select(AlertSubscription)
+                    .where(AlertSubscription.revision_id == active.id)
+                    .order_by(AlertSubscription.created_at.asc(), AlertSubscription.id.asc())
+                ).scalars().all()
+            )
+            subscriptions = [
+                SubscriptionHealth(
+                    alert_id=row.alert_id,
+                    instrument_key=row.instrument_key,
+                    state=str(row.state),
+                )
+                for row in rows
+            ]
+
+        subscription_ids = _workflow_subscription_ids(session, workflow_id)
+        last_event_at: Optional[str] = None
+        delivery_counts: Dict[str, int] = {}
+        if subscription_ids:
+            last_event_at = _iso(
+                session.execute(
+                    select(func.max(SignalEvent.fired_at)).where(
+                        SignalEvent.subscription_id.in_(subscription_ids)
+                    )
+                ).scalar()
+            )
+            counts = session.execute(
+                select(Delivery.status, func.count())
+                .join(SignalEvent, Delivery.event_id == SignalEvent.id)
+                .where(SignalEvent.subscription_id.in_(subscription_ids))
+                .group_by(Delivery.status)
+            ).all()
+            delivery_counts = {str(status): int(count) for status, count in counts}
+
+        return HealthResponse(
+            workflow_id=workflow_id,
+            active_revision=int(active.revision) if active is not None else None,
+            subscriptions=subscriptions,
+            last_event_at=last_event_at,
+            delivery_counts=delivery_counts,
+        )
+    finally:
+        session.close()
+
+
+async def export_workflow(
+    request: Request,
+    workflow_id: str,
+    revision: Optional[int] = Query(None, ge=1),
+    session_factory: Any = Depends(_alerts_db),
+):
+    """Export the document of the active (default) or requested revision."""
+    _, owner_id = await _authorize(request, "workflows:read")
+    session = session_factory()
+    try:
+        _owned_workflow(session, workflow_id, owner_id)
+        if revision is not None:
+            target = _revision_by_number(session, workflow_id, revision)
+            if target is None:
+                raise HTTPException(status_code=404, detail=f"Revision {revision} not found")
+        else:
+            target = session.execute(
+                select(WorkflowRevision)
+                .where(WorkflowRevision.workflow_id == workflow_id, WorkflowRevision.status == "active")
+                .order_by(WorkflowRevision.activated_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if target is None:
+                raise HTTPException(status_code=404, detail="Workflow has no active revision to export")
+        return WorkflowExportResponse(
+            workflow_id=workflow_id,
+            revision=int(target.revision),
+            canonical_hash=str(target.canonical_hash),
+            document=dict(target.document or {}),
+        )
+    finally:
+        session.close()
+
+
+# channel serialization shared with the notifications router
+
+
+def serialize_channel(channel: Any) -> ChannelResponse:
+    return ChannelResponse(
+        channel_id=channel.id,
+        name=str(channel.name),
+        provider=str(channel.provider),
+        destination=dict(channel.destination or {}),
+        secret_env=channel.secret_env,
+        enabled=bool(channel.enabled),
+        created_at=_iso(channel.created_at),
+    )
+
+
+router.add_api_route("/validate", validate_workflow, methods=["POST"], response_model=IssueEnvelope)
+router.add_api_route("/preview", preview_workflow, methods=["POST"], response_model=PreviewResponse)
+router.add_api_route("/import", import_workflow, methods=["POST"], response_model=WorkflowMutationResponse)
+router.add_api_route("", create_workflow, methods=["POST"], response_model=WorkflowMutationResponse)
+router.add_api_route("", list_workflows, methods=["GET"], response_model=WorkflowListResponse)
+router.add_api_route("/{workflow_id}", get_workflow, methods=["GET"], response_model=WorkflowSummary)
+router.add_api_route("/{workflow_id}", patch_workflow, methods=["PATCH"], response_model=WorkflowMutationResponse)
+router.add_api_route("/{workflow_id}/activate", activate_workflow, methods=["POST"], response_model=WorkflowMutationResponse)
+router.add_api_route("/{workflow_id}/pause", pause_workflow, methods=["POST"], response_model=WorkflowMutationResponse)
+router.add_api_route("/{workflow_id}/resume", resume_workflow, methods=["POST"], response_model=WorkflowMutationResponse)
+router.add_api_route("/{workflow_id}/archive", archive_workflow, methods=["POST"], response_model=WorkflowMutationResponse)
+router.add_api_route("/{workflow_id}/events", list_workflow_events, methods=["GET"], response_model=EventPage)
+router.add_api_route("/{workflow_id}/health", get_workflow_health, methods=["GET"], response_model=HealthResponse)
+router.add_api_route("/{workflow_id}/export", export_workflow, methods=["GET"], response_model=WorkflowExportResponse)

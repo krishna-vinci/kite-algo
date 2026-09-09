@@ -88,6 +88,10 @@ DEFAULT_WORKER_ACTIONS = {
     "market:read",
     "market:stream",
     "funds:read",
+    "workflows:read",
+    "workflows:write",
+    "workflows:activate",
+    "notifications:test",
 }
 _OPTION_PROTECTION_STATE_UNAVAILABLE = "__options_protection_state_unavailable__"
 ALLOWED_V1_MODES = {"paper", "dry_run", "live"}

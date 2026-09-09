@@ -1,0 +1,58 @@
+version: 1
+name: quality-momentum
+timezone: Asia/Kolkata
+universe:
+  union:
+    - index: Nifty50
+    - watchlist: my-selected-stocks
+  deduplicate: true
+stages:
+  - id: quality
+    type: filter
+    input: universe
+    evaluate_on: fundamentals_refresh
+    conditions:
+      all:
+        - field: fundamentals.quarterly_revenue_yoy_pct
+          op: gt
+          value: 15
+        - field: fundamentals.latest_roce_pct
+          op: gt
+          value: 18
+  - id: trend
+    type: filter
+    input: quality
+    evaluate_on: candle_close
+    timeframe: 1d
+    conditions:
+      all:
+        - left: {field: close}
+          op: gt
+          right: {indicator: ema, period: 200}
+  - id: breakout
+    type: signal
+    input: trend
+    evaluate_on: candle_close
+    timeframe: 5m
+    conditions:
+      all:
+        - left: {indicator: ema, period: 20}
+          op: crosses_above
+          right: {indicator: ema, period: 50}
+        - left: {field: volume}
+          op: gt
+          right:
+            multiply:
+              - 2
+              - {indicator: sma, source: volume, period: 20, offset: 1}
+alerts:
+  - id: stock-breakout
+    source: breakout
+    scope: per_symbol
+    trigger: on_signal
+    cooldown: 30m
+    channels: [telegram_primary, ntfy_primary]
+data_policy:
+  missing: exclude_and_report
+  insufficient_history: wait
+  require_closed_candles: true
