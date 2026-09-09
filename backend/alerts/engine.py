@@ -5,6 +5,16 @@ Implements spec v2 §5 and §6 E-9: triggers ``once`` / ``on_transition`` /
 state), rearm gating, expiry, quiet-session gating and the
 notify-if-already-true opt-in.
 
+``once_per_session`` identity is supplied per evaluation via ``session_id``
+(the caller resolves the trading session for the observation); the first
+emit of a session is recorded in ``state["last_session"]`` and later fires
+in the same session are suppressed until the session id changes.
+
+``reminder`` alerts emit not only on transitions (``fired``) but also while
+a level condition merely HOLDS (``matched is True``), re-emitting at most
+once per ``reminder_interval_s``. ``matched`` is therefore part of the
+pinned signature; other triggers ignore it.
+
 ``decide`` is pure: the input ``state`` dict is never mutated; a new state
 dict is always returned. All state values are JSON-serializable.
 """
@@ -57,6 +67,8 @@ def decide(
     session_active: bool = True,
     current_value: Optional[float] = None,
     already_true: Optional[bool] = None,
+    session_id: Optional[str] = None,
+    matched: Optional[bool] = None,
 ) -> EngineDecision:
     """Decide emission for one evaluation of an alert rule.
 
@@ -64,6 +76,10 @@ def decide(
     the alert configures ``rearm_level``).
     ``already_true``: whether the stage condition already matched on this
     observation (used for the E-9 activation decision on the first call).
+    ``session_id``: the trading-session identity of this observation, used by
+    ``once_per_session`` (a new id re-arms the alert).
+    ``matched``: whether the stage condition holds on this observation; only
+    ``reminder`` triggers use it (a held level re-emits after the interval).
     """
     new_state = dict(state)
     now = _aware(now)
@@ -85,6 +101,10 @@ def decide(
                 return EngineDecision(False, "already_true_at_activation", False, new_state)
             fired = True  # opt-in: activation match counts as a fire
 
+    # Reminder alerts are due on a real transition OR while the condition
+    # merely holds; every other trigger only advances on `fired`.
+    due = fired or (alert.trigger == "reminder" and matched is True)
+
     # 4. Rearm gating: after an emit the rule is disarmed until the value
     #    passes rearm_level from the configured side.
     armed = new_state.get("armed", True)
@@ -98,10 +118,10 @@ def decide(
         if rearm_hit:
             armed = True
             new_state["armed"] = True
-    if fired and not armed:
+    if due and not armed:
         return EngineDecision(False, "not_armed", False, new_state)
 
-    if not fired:
+    if not due:
         return EngineDecision(False, None, False, new_state)
 
     # 5. Trigger gating + bookkeeping (cooldown suppresses delivery, not state,
@@ -113,10 +133,10 @@ def decide(
         new_state["fired_once"] = True
         rule_completed = True
     elif alert.trigger == "once_per_session":
-        session = new_state.get("session")
-        if session is not None and new_state.get("last_session") == session:
-            return EngineDecision(False, "session_fired", False, new_state)
-        new_state["last_session"] = session
+        if session_id is not None:
+            if new_state.get("last_session") == session_id:
+                return EngineDecision(False, "session_fired", False, new_state)
+            new_state["last_session"] = session_id
     elif alert.trigger == "reminder":
         last_emitted = _parse_dt(new_state.get("last_emitted_ts"))
         interval = alert.reminder_interval_s or 0

@@ -37,6 +37,9 @@ RAW_TOKEN = "worker-secret-token"
 HEADERS = {"Authorization": f"Bearer {RAW_TOKEN}"}
 CHANNELS = "/api/worker/notification-channels"
 MISSING_SECRET_ENV = "ALERTS_TEST_SECRET_DEFINITELY_MISSING_42"
+# Provider defaults must NEVER be used when the channel names its own secret.
+TELEGRAM_DEFAULT_ENV = "TELEGRAM_BOT_TOKEN"
+NTFY_DEFAULT_ENV = "NTFY_PRIMARY_URL"
 
 
 class _StubWorkerTokenRepository:
@@ -154,8 +157,10 @@ def test_channel_test_missing_env_secret_returns_400_naming_env_var():
     response = client.post(f"{CHANNELS}/{created['channel_id']}/test", json={}, headers=HEADERS)
     assert response.status_code == 400, response.text
     body = response.json()
-    assert MISSING_SECRET_ENV in body["detail"]["secret_env"]
+    # the env var named is exactly the channel's secret_env, never a provider default
+    assert body["detail"]["secret_env"] == MISSING_SECRET_ENV
     assert MISSING_SECRET_ENV in body["detail"]["message"]
+    assert TELEGRAM_DEFAULT_ENV not in body["detail"]["message"]
 
 
 def test_channel_test_with_env_set_and_fake_adapter_returns_outcome(fake_telegram, monkeypatch):
@@ -175,7 +180,70 @@ def test_channel_test_with_env_set_and_fake_adapter_returns_outcome(fake_telegra
     call = fake_telegram.calls[0]
     assert call["subject"].startswith("[Test]")
     assert call["body"] == "ping"
-    assert call["destination"] == {"chat_id": "12345"}
+    # PINNED contract: the channel's secret_env overrides token_env in the
+    # destination — the adapter resolves exactly this variable.
+    assert call["destination"] == {"chat_id": "12345", "token_env": "ALERTS_TEST_SECRET_OK"}
+
+
+def test_channel_test_ntfy_uses_url_env_override_and_names_it_when_missing(monkeypatch):
+    """ntfy channels carry the secret through `url_env`; a missing env var is
+    reported 400 naming the channel's secret_env, not the provider default."""
+    client, _ = _client()
+    created = _create_channel(
+        client,
+        name="ntfy_primary",
+        provider="ntfy",
+        destination={"topic": "https://ntfy.sh/alerts"},
+        secret_env=MISSING_SECRET_ENV,
+    )
+    assert NTFY_DEFAULT_ENV != MISSING_SECRET_ENV
+    monkeypatch.delenv(NTFY_DEFAULT_ENV, raising=False)
+
+    response = client.post(f"{CHANNELS}/{created['channel_id']}/test", json={}, headers=HEADERS)
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["detail"]["secret_env"] == MISSING_SECRET_ENV
+    assert MISSING_SECRET_ENV in body["detail"]["message"]
+    assert NTFY_DEFAULT_ENV not in body["detail"]["message"]
+
+
+def test_channel_test_ntfy_destination_carries_url_env(monkeypatch):
+    class _FakeNtfy:
+        provider = "ntfy"
+
+        def __init__(self):
+            self.calls = []
+
+        async def send(self, destination, subject, body):
+            self.calls.append({"destination": dict(destination), "subject": subject, "body": body})
+            return DeliveryOutcome(status="accepted", provider_id="ntfy-1", detail="ok")
+
+    fake = _FakeNtfy()
+    previous = register_adapter("ntfy", lambda: fake)
+    try:
+        monkeypatch.setenv("ALERTS_TEST_NTFY_URL", "https://ntfy.sh/alerts-test")
+        client, _ = _client()
+        created = _create_channel(
+            client,
+            name="ntfy_primary",
+            provider="ntfy",
+            destination={"topic": "https://ntfy.sh/alerts"},
+            secret_env="ALERTS_TEST_NTFY_URL",
+        )
+        response = client.post(
+            f"{CHANNELS}/{created['channel_id']}/test",
+            json={"message": "ping"},
+            headers=HEADERS,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "accepted"
+        # PINNED contract: ntfy destination gets {"url_env": channel.secret_env}
+        assert fake.calls[0]["destination"] == {
+            "topic": "https://ntfy.sh/alerts",
+            "url_env": "ALERTS_TEST_NTFY_URL",
+        }
+    finally:
+        register_adapter("ntfy", previous)
 
 
 def test_channel_test_default_message_without_body(fake_telegram):

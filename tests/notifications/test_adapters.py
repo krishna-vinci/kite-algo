@@ -13,10 +13,12 @@ import httpx
 import pytest
 
 from backend.notifications.adapters import (
+    DEFAULT_TOKEN_ENV,
     DeliveryOutcome,
     NtfyAdapter,
     TelegramAdapter,
     get_adapter,
+    merge_secret_env,
     register_adapter,
 )
 from backend.notifications.message import build_message
@@ -211,6 +213,50 @@ def test_telegram_missing_env_permanent_names_env_var(monkeypatch):
     assert called.request is None  # no HTTP call attempted
 
 
+def test_telegram_missing_destination_override_names_override_env_var(monkeypatch):
+    # destination override -> provider default: the override env var is the
+    # one resolved (and named) when missing
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)  # default exists...
+    monkeypatch.delenv("ALERTS_TELEGRAM_OVERRIDE_TOKEN", raising=False)  # ...override does not
+    called = Capture()
+    adapter = make_telegram(called)
+
+    outcome = asyncio.run(
+        adapter.send({"chat_id": "4242", "token_env": "ALERTS_TELEGRAM_OVERRIDE_TOKEN"}, "s", "b")
+    )
+
+    assert outcome.status == "permanent"
+    assert "ALERTS_TELEGRAM_OVERRIDE_TOKEN" in outcome.detail
+    assert called.request is None
+
+
+def test_telegram_destination_override_beats_provider_default(monkeypatch):
+    override_token = "SECRET-OVERRIDE-TOKEN-1a2b"
+    monkeypatch.setenv(DEFAULT_TOKEN_ENV, TOKEN)
+    monkeypatch.setenv("ALERTS_TELEGRAM_OVERRIDE_TOKEN", override_token)
+    capture = Capture(200, {"ok": True, "result": {"message_id": 1}})
+    adapter = make_telegram(capture)
+
+    outcome = asyncio.run(
+        adapter.send({"chat_id": "4242", "token_env": "ALERTS_TELEGRAM_OVERRIDE_TOKEN"}, "s", "b")
+    )
+
+    assert outcome.status == "accepted"
+    # the send used the destination override, not the provider default
+    assert capture.request.url.path == f"/bot{override_token}/sendMessage"
+
+
+def test_telegram_destination_without_env_key_uses_provider_default(monkeypatch):
+    monkeypatch.setenv(DEFAULT_TOKEN_ENV, TOKEN)
+    capture = Capture(200, {"ok": True, "result": {"message_id": 1}})
+    adapter = make_telegram(capture)
+
+    outcome = asyncio.run(adapter.send({"chat_id": "4242"}, "s", "b"))
+
+    assert outcome.status == "accepted"
+    assert capture.request.url.path == f"/bot{TOKEN}/sendMessage"
+
+
 def test_telegram_outcomes_never_leak_token(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
     scenarios = [
@@ -351,6 +397,82 @@ def test_ntfy_missing_env_permanent_names_env_var(monkeypatch):
     assert outcome.status == "permanent"
     assert "NTFY_PRIMARY_URL" in outcome.detail
     assert called.request is None
+
+
+def test_ntfy_destination_override_beats_provider_default(monkeypatch):
+    override_url = "https://ntfy.override.example.com/topic"
+    monkeypatch.setenv("NTFY_PRIMARY_URL", "https://ntfy.default.example.com/topic")
+    monkeypatch.setenv("ALERTS_NTFY_OVERRIDE_URL", override_url)
+    capture = Capture(200)
+    adapter = make_ntfy(capture)
+
+    outcome = asyncio.run(
+        adapter.send({"url_env": "ALERTS_NTFY_OVERRIDE_URL"}, "t", "b")
+    )
+
+    assert outcome.status == "accepted"
+    # the send used the destination override, not the provider default
+    assert capture.request.url == httpx.URL(override_url)
+
+
+def test_ntfy_destination_without_env_key_uses_provider_default(monkeypatch):
+    monkeypatch.setenv("NTFY_PRIMARY_URL", "https://ntfy.default.example.com/topic")
+    capture = Capture(200)
+    adapter = make_ntfy(capture)
+
+    outcome = asyncio.run(adapter.send({}, "t", "b"))
+
+    assert outcome.status == "accepted"
+    assert capture.request.url == httpx.URL("https://ntfy.default.example.com/topic")
+
+
+def test_ntfy_missing_destination_override_names_override_env_var(monkeypatch):
+    monkeypatch.setenv("NTFY_PRIMARY_URL", "https://ntfy.default.example.com/topic")
+    monkeypatch.delenv("ALERTS_NTFY_OVERRIDE_URL", raising=False)
+    called = Capture()
+    adapter = make_ntfy(called)
+
+    outcome = asyncio.run(adapter.send({"url_env": "ALERTS_NTFY_OVERRIDE_URL"}, "t", "b"))
+
+    assert outcome.status == "permanent"
+    assert "ALERTS_NTFY_OVERRIDE_URL" in outcome.detail
+    assert called.request is None
+
+
+# --------------------------------------------------------------------------
+# secret_env -> destination merge (pinned send contract)
+# --------------------------------------------------------------------------
+
+
+def test_merge_secret_env_maps_provider_to_destination_key():
+    assert merge_secret_env("telegram", {"chat_id": "42"}, "CHAN_TOKEN_ENV") == {
+        "chat_id": "42",
+        "token_env": "CHAN_TOKEN_ENV",
+    }
+    assert merge_secret_env("ntfy", {"topic": "alerts"}, "CHAN_URL_ENV") == {
+        "topic": "alerts",
+        "url_env": "CHAN_URL_ENV",
+    }
+
+
+def test_merge_secret_env_overrides_existing_destination_env_name():
+    merged = merge_secret_env(
+        "telegram", {"chat_id": "42", "token_env": "DEST_ENV"}, "CHAN_ENV"
+    )
+    assert merged["token_env"] == "CHAN_ENV"
+    assert merged == {"chat_id": "42", "token_env": "CHAN_ENV"}
+
+
+def test_merge_secret_env_without_secret_or_unknown_provider_is_copy():
+    destination = {"chat_id": "42", "token_env": "DEST_ENV"}
+    assert merge_secret_env("telegram", destination, None) == destination
+    assert merge_secret_env("telegram", destination, "") == destination
+    # destination dict is never mutated
+    assert destination == {"chat_id": "42", "token_env": "DEST_ENV"}
+    # unknown provider: no mapped key, destination copied unchanged
+    assert merge_secret_env("carrier-pigeon", {"roost": "home"}, "CHAN_ENV") == {"roost": "home"}
+    assert merge_secret_env("ntfy", None, "CHAN_ENV") == {"url_env": "CHAN_ENV"}
+    assert merge_secret_env("ntfy", None, None) == {}
 
 
 # --------------------------------------------------------------------------

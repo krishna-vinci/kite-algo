@@ -19,10 +19,14 @@ The evaluation worker is deliberately a separate process: restarting or deployin
 | `DATABASE_URL` | worker + API | Postgres connection (Phase 1 tests use in-memory SQLite) |
 | `REDIS_URL` | evaluation worker | Redis for `market:ticks` and `realtime_candles:{token}:{interval}` pub/sub — worker exits if unset |
 | `MARKET_RUNTIME_URL` | evaluation worker | market-runtime HTTP endpoint used to register instrument subscriptions |
+| `ALERTS_INSTRUMENT_TOKENS` | evaluation worker | JSON map of `"EXCHANGE:SYMBOL"` to numeric instrument tokens, e.g. `{"NSE:RELIANCE": 738561}`. **Required for instrument resolution**: without a token for an instrument key the worker cannot subscribe to its ticks, resolve completed candles, or read candle history, so its rules stay silent. |
+| `ALERTS_REFRESH_INTERVAL_S` | evaluation worker | Seconds between subscription-refresh/renewal passes (default 30): the worker re-materializes subscriptions from the database (picking up activations/pauses without a restart) and renews its market-runtime registration on this interval |
+| `ALERTS_DELIVERY_ENABLED` | delivery (in-process) | Set `false`/`0` to disable the embedded delivery loop (outbox rows stay pending for a standalone delivery worker); delivery is on by default |
+| `ALERTS_HEALTH_FILE` | evaluation worker | Optional path where the worker periodically writes its health JSON (counters above + `last_evaluated_at`) for scraping without Redis/DB access |
 | `TELEGRAM_BOT_TOKEN` | delivery (channel `secret_env`) | bot token; chat id lives in the channel row |
 | `NTFY_PRIMARY_URL` (per channel `secret_env`) | delivery | full ntfy topic URL |
 
-Secrets exist only in env config. Channel rows reference them by name (`secret_env`); workflow documents contain channel *names* only.
+Secrets exist only in env config. Channel rows reference them by name (`secret_env`); workflow documents contain channel *names* only. A channel's `secret_env` names the variable the adapter resolves at send time (telegram `token_env`, ntfy `url_env`); test-send pre-checks exactly that variable and fails with a 400 naming it when unset.
 
 ## Database
 
@@ -34,7 +38,9 @@ Migration `20260908_000011_alerts_platform_phase1` (head after `20260905_000010`
 
 **Pause / resume:** `POST /{id}/pause|resume` flips subscription state; checkpoints and history are retained. Pausing stops evaluation effects but the worker keeps ownership bookkeeping.
 
-**Roll back an edit:** PATCH created a new draft you regret? Just activate the previously good revision (drafts are kept; `GET /{id}/export?revision=N` to inspect any revision).
+**Roll back an edit:** `POST /{id}/activate` with an explicit revision body — `{"revision": N}` — activates that revision (re-activating an archived one and archiving the currently-active revision; exactly one revision stays active). Regretting a PATCH that created a draft you never activated? Just activate the previously good revision. `GET /{id}/export?revision=N` inspects any revision first. Activating an archived workflow also un-archives it.
+
+**Subscription renewal:** every `ALERTS_REFRESH_INTERVAL_S` the worker re-reads active subscriptions from the database and renews its market-runtime instrument registration. Activations, pauses and rollbacks are picked up on the next refresh pass without a worker restart; checkpoints and event history are untouched by refreshes.
 
 **Restart the worker (planned or crash):**
 - `ltp`-clock rules intentionally start a **new observation epoch**: first tick initializes state, nothing fires from stale pre-restart data. A crossing during downtime is *missed and disclosed* (health gap counter), never fabricated.
@@ -42,13 +48,13 @@ Migration `20260908_000011_alerts_platform_phase1` (head after `20260905_000010`
 
 **Degraded feed:** a Pub/Sub disconnect or trimmed data breaks crossing continuity. The rule re-initializes on the next observation (new epoch) and the gap shows up in worker health (`gaps` counter). Missing data never manufactures a signal — unknown propagates.
 
-**Unknown sends:** a provider timeout is recorded as outcome `unknown`, the delivery retries after the default backoff, and delivery history keeps every attempt with its outcome. Provider acceptance is not a read receipt. At-least-once to the provider is the guarantee; the delivery attempt log makes duplicates identifiable (event id is in every message).
+**Unknown sends:** a provider timeout is recorded as outcome `unknown` and the delivery is retried — but only a **finite** number of times (`max_unknown_retries`); after the last unknown attempt the delivery stops with `failed` and the attempts log records every outcome. **Exactly-once delivery to the provider is explicitly not promised**: at-least-once is the guarantee, provider acceptance is not a read receipt, and duplicates are identifiable from the attempt log (the event id is in every message).
 
 **Test a channel:** `POST /api/worker/notification-channels/{id}/test` sends a real message (requires `notifications:test`). Missing env secret returns a 400 naming the variable — delivery would record `failed` similarly instead of dropping silently.
 
 ## Observability
 
-- `GET /api/worker/workflows/{id}/health` — active revision, per-subscription state, last event time, delivery counts by status.
+- `GET /api/worker/workflows/{id}/health` — active revision, per-subscription state **and `last_evaluated_at`** (from `evaluation_checkpoints.updated_at`, per subscription), last event time, delivery counts by status, and the constant `stale_after_seconds: 300`. A subscription whose `last_evaluated_at` is older than `stale_after_seconds` (relative to now) should be treated as stale — a stale workflow is visible as stale, never silently quiet (F11).
 - `GET /api/worker/workflows/{id}/events` — event history with evidence (values, epoch, timeframe); archived workflows keep their history.
 - Worker process logs report evaluations, emissions, suppression reasons (cooldown, not_armed, already_fired, quiet_session, expired), unresolved channels, and gaps. Every non-delivery has a recorded reason.
 

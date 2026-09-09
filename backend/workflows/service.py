@@ -20,9 +20,21 @@ Epoch / continuity semantics (spec §5.7, E-5, E-6):
   ``"feed_gap"`` suppression reason for health reporting.
 
 Duplicate completed candles produce the same occurrence key; the repository's
-unique constraint makes the second write a no-op (E-7). When the trigger is
-``once`` and the rule completed, the subscription row is flipped to
-``completed`` inside the same transaction.
+unique constraint makes the second write a no-op (E-7). Stale bars arriving
+AFTER newer state (``ts <= state["last_bar_ts"]`` for ``candle_close`` rules)
+are ignored entirely: they are never re-processed against newer state.
+
+Warmup (``allow_emit=False``) runs predicates + engine fully and saves the
+checkpoint so the first live bar can fire on a real crossing, but never
+records a signal event or advances subscription lifecycle; a would-be emit
+is reported with the ``"warmup"`` suppression reason.
+
+Session identity: ``session_provider(obs_ts)`` returns
+``(session_active, session_id)`` or ``None``; ``None`` (or no provider)
+falls back to ``(True, observation-date-in-IST)``. ``once_per_session``
+alerts re-arm when the session id changes. Every suppression is logged at
+INFO (rule/alert id, instrument, reason) so audit can see why an alert was
+silent.
 
 ``ensure_subscriptions`` materializes ``alert_subscriptions`` rows for an
 activated revision's document (alerts x instruments) and is idempotent; the
@@ -36,8 +48,9 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Callable, Dict, Optional, Sequence
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -78,6 +91,13 @@ GAP_MULTIPLIER = 2.5
 # (and logs) them; the worker counts them in its health counters.
 ChannelResolver = Callable[[str, Sequence[str]], Dict[str, str]]
 
+# Session provider: maps an observation timestamp to
+# ``(session_active, session_id)`` or ``None`` (caller falls back to
+# ``(True, observation-date-in-IST)``).
+SessionProvider = Callable[[datetime], Optional[Tuple[bool, str]]]
+
+_IST = ZoneInfo("Asia/Kolkata")
+
 
 @dataclass(frozen=True)
 class HandleResult:
@@ -114,11 +134,13 @@ class EvaluationService:
         *,
         clock: Optional[Callable[[], datetime]] = None,
         channel_resolver: Optional[ChannelResolver] = None,
+        session_provider: Optional[SessionProvider] = None,
     ) -> None:
         self.workflow_repo = workflow_repo
         self.session_factory = session_factory
         self.clock = clock
         self.channel_resolver = channel_resolver
+        self.session_provider = session_provider
 
     # ------------------------------------------------------------------
     # subscriptions
@@ -213,6 +235,8 @@ class EvaluationService:
         obs: Observation,
         *,
         db: Optional[Session] = None,
+        allow_emit: bool = True,
+        context: Optional[dict] = None,
     ) -> HandleResult:
         """Evaluate one observation for one active subscription.
 
@@ -220,6 +244,14 @@ class EvaluationService:
         deliveries + checkpoint in a single transaction. On a checkpoint
         lease conflict (another worker owns the subscription) the whole
         transaction is rolled back and ``lease_lost`` is reported.
+
+        ``allow_emit=False`` (warmup): predicates + engine run fully and the
+        checkpoint is saved, but no signal event is recorded and the
+        subscription lifecycle never advances; a would-be emit is reported
+        as ``suppression_reason="warmup"``.
+
+        ``context``: optional mapping (e.g. ``prev_day_high``/``prev_day_low``
+        floats) passed through to the predicates for context-resolved levels.
         """
         document = self._parse_document(sub)
         if document is None:
@@ -248,30 +280,45 @@ class EvaluationService:
             else:
                 state, stored_epoch = checkpoint
 
+            # A bar at or before the stored last_bar_ts was already processed:
+            # ignore it entirely instead of re-running it against newer state.
+            if stage.clock == "candle_close" and self._is_stale_bar(state, obs):
+                self._log_suppression(sub, "stale_bar")
+                return HandleResult(
+                    fired=False,
+                    emitted=False,
+                    suppression_reason="stale_bar",
+                    rule_completed=False,
+                )
+
             gap = False
             if stage.clock == "candle_close":
                 gap = self._detect_gap(stage, state, obs)
                 if gap:
                     state = {}  # new epoch semantics: nothing carries over
 
-            pred = evaluate_stage(stage, obs, state)
+            session_active, session_id = self._resolve_session(obs)
+
+            pred = evaluate_stage(stage, obs, state, context)
             now = self.clock() if self.clock is not None else obs.ts
             # The engine chains on the predicate's OUTPUT state (pred.state
-            # carries prev/baseline/... for this observation). The E-9
-            # activation decision applies whenever the stored state has no
-            # "initialized" marker (fresh checkpoint or post-gap reset).
+            # carries per-condition prev/baseline/... for this observation).
+            # The E-9 activation decision applies whenever the stored state
+            # has no "initialized" marker (fresh checkpoint or post-gap reset).
             engine = decide(
                 alert,
                 fired=pred.fired,
                 state=pred.state,
                 now=now,
-                session_active=True,
+                session_active=session_active,
                 current_value=_stage_current_value(stage, obs),
                 already_true=pred.matched if not state.get("initialized") else None,
+                session_id=session_id,
+                matched=pred.matched,
             )
 
             emitted = False
-            if engine.emit:
+            if engine.emit and allow_emit:
                 occurrence_key = (
                     f"{sub.workflow_id}:{sub.alert_id}:{sub.instrument_key}:"
                     f"{obs.epoch_id}:{obs.ts.isoformat()}"
@@ -300,6 +347,7 @@ class EvaluationService:
                         "occurrence %s already recorded for subscription %s; skipping",
                         occurrence_key, sub.id,
                     )
+                    self._log_suppression(sub, "duplicate_occurrence")
                     return HandleResult(
                         fired=bool(pred.fired),
                         emitted=False,
@@ -311,6 +359,14 @@ class EvaluationService:
             # Always persist the checkpoint (even for suppressed evaluations)
             # so state continuity survives restarts.
             new_state = dict(engine.new_state)
+            if not allow_emit:
+                # Warmup replays history to establish predicate continuity
+                # (prev values, baselines). A crossing that happened before
+                # activation must not consume the alert's live lifecycle
+                # (once-completion, rearm, cooldown, reminders).
+                for key in ("fired_once", "last_session", "last_emitted_ts",
+                            "cooldown_until", "armed"):
+                    new_state.pop(key, None)
             new_state["epoch_id"] = obs.epoch_id
             if obs.final:
                 new_state["last_bar_ts"] = obs.ts.isoformat()
@@ -333,6 +389,7 @@ class EvaluationService:
                     "checkpoint lease lost for subscription %s (%s/%s); evaluation skipped",
                     sub.id, sub.instrument_key, obs.epoch_id,
                 )
+                self._log_suppression(sub, "lease_lost")
                 return HandleResult(
                     fired=bool(pred.fired or engine.emit),
                     emitted=False,
@@ -340,9 +397,9 @@ class EvaluationService:
                     rule_completed=False,
                 )
 
-            if engine.rule_completed:
+            if engine.rule_completed and allow_emit:
                 # Repository is frozen; flip the lifecycle via a scoped UPDATE
-                # inside the same transaction.
+                # inside the same transaction. Warmup never completes a rule.
                 session.execute(
                     update(AlertSubscription)
                     .where(AlertSubscription.id == sub.id)
@@ -352,21 +409,24 @@ class EvaluationService:
             if owned:
                 session.commit()
 
-            if engine.emit:
-                suppression_reason: Optional[str] = (
-                    None if emitted else "duplicate_occurrence"
-                )
+            if not allow_emit and engine.emit:
+                suppression_reason: Optional[str] = "warmup"
+            elif engine.emit:
+                suppression_reason = None if emitted else "duplicate_occurrence"
             elif gap:
                 suppression_reason = "feed_gap"
             else:
                 suppression_reason = engine.suppression_reason
 
-            return HandleResult(
+            result = HandleResult(
                 fired=bool(pred.fired or engine.emit),
                 emitted=emitted,
                 suppression_reason=suppression_reason,
-                rule_completed=engine.rule_completed,
+                rule_completed=engine.rule_completed if allow_emit else False,
             )
+            if suppression_reason:
+                self._log_suppression(sub, suppression_reason)
+            return result
         except Exception:
             if owned:
                 session.rollback()
@@ -378,6 +438,45 @@ class EvaluationService:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_stale_bar(state: dict, obs: Observation) -> bool:
+        """True when the observation is at or before the stored last bar.
+
+        Such a bar was already folded into the stored state; re-processing
+        it against newer state could manufacture phantom crossings.
+        """
+        last_raw = state.get("last_bar_ts")
+        if not last_raw:
+            return False
+        try:
+            last_ts = datetime.fromisoformat(str(last_raw))
+        except (TypeError, ValueError):
+            return False
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=obs.ts.tzinfo)
+        return obs.ts <= last_ts
+
+    @staticmethod
+    def _fallback_session_id(obs: Observation) -> str:
+        """Observation date in IST — the default trading-session identity."""
+        ts = obs.ts if obs.ts.tzinfo is not None else obs.ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(_IST).date().isoformat()
+
+    def _resolve_session(self, obs: Observation) -> tuple[bool, str]:
+        """(session_active, session_id) from the provider, or the IST fallback."""
+        if self.session_provider is not None:
+            resolved = self.session_provider(obs.ts)
+            if resolved is not None:
+                return bool(resolved[0]), str(resolved[1])
+        return True, self._fallback_session_id(obs)
+
+    def _log_suppression(self, sub: ActiveSubscription, reason: str) -> None:
+        """Every suppression is visible at INFO (audit requirement)."""
+        logger.info(
+            "alert %s (stage %s) suppressed for %s on %s: %s",
+            sub.alert_id, sub.stage_id, sub.instrument_key, sub.id, reason,
+        )
 
     def _parse_document(self, sub: ActiveSubscription) -> Optional[WorkflowDocument]:
         try:

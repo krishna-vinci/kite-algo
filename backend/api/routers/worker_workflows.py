@@ -34,6 +34,7 @@ from backend.api.schemas.workflows import (
     SignalEventItem,
     SubscriptionHealth,
     ValidationIssueModel,
+    WorkflowActivateRequest,
     WorkflowCreateRequest,
     WorkflowExportResponse,
     WorkflowListResponse,
@@ -50,7 +51,9 @@ from backend.workflows.parser import WorkflowParseError, parse_workflow_dict, pa
 from backend.workflows.repository import (
     AlertSubscription,
     DomainConflict,
+    EvaluationCheckpoint,
     IdempotencyConflict,
+    RevisionConflict,
     SignalEvent,
     SqlAlchemyWorkflowRepository,
     Workflow as WorkflowModel,
@@ -58,6 +61,10 @@ from backend.workflows.repository import (
 )
 
 router = APIRouter(prefix="/worker/workflows", tags=["Worker Workflows"])
+
+# Client-facing staleness contract: a subscription whose last_evaluated_at is
+# older than STALE_AFTER_SECONDS should be treated as stale (F11).
+STALE_AFTER_SECONDS = 300
 
 __all__ = [
     "router",
@@ -432,26 +439,43 @@ async def patch_workflow(
                     "current_revision": stored,
                 },
             )
+        latest_revision = int(latest.revision)
+        latest_id = latest.id
+        latest_status = str(latest.status)
+        latest_hash = str(latest.canonical_hash)
     finally:
         session.close()
 
     doc = _load_document(payload.yaml_text, payload.document)
     compiled = _compile_or_422(doc)
-    if compiled.canonical_hash == str(latest.canonical_hash):
+    if compiled.canonical_hash == latest_hash:
         return WorkflowMutationResponse(
             workflow_id=workflow_id,
             changed=False,
-            revision=int(latest.revision),
-            revision_id=latest.id,
-            revision_status=str(latest.status),
-            canonical_hash=str(latest.canonical_hash),
+            revision=latest_revision,
+            revision_id=latest_id,
+            revision_status=latest_status,
+            canonical_hash=latest_hash,
         )
     try:
+        # The expected_revision compare happens INSIDE the repo's insert
+        # transaction (atomic compare-and-insert; RevisionConflict on loss).
         revision = workflow_repo.add_draft_revision(
             workflow_id,
             compiled.document.to_document_dict(),
             compiled.canonical_hash,
+            expected_revision=payload.expected_revision,
         )
+    except RevisionConflict as exc:
+        current = _current_revision_number(session_factory, workflow_id)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "REVISION_CONFLICT",
+                "expected_revision": payload.expected_revision,
+                "current_revision": current,
+            },
+        ) from exc
     except DomainConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return WorkflowMutationResponse(
@@ -464,6 +488,15 @@ async def patch_workflow(
     )
 
 
+def _current_revision_number(session_factory: Any, workflow_id: str) -> int:
+    session = session_factory()
+    try:
+        latest = _latest_revision(session, workflow_id)
+        return int(latest.revision) if latest is not None else 0
+    finally:
+        session.close()
+
+
 # ---------------------------------------------------------------------------
 # lifecycle: activate / pause / resume / archive
 # ---------------------------------------------------------------------------
@@ -472,19 +505,36 @@ async def patch_workflow(
 async def activate_workflow(
     request: Request,
     workflow_id: str,
+    payload: Optional[WorkflowActivateRequest] = None,
     workflow_repo: SqlAlchemyWorkflowRepository = Depends(_workflow_repository),
     session_factory: Any = Depends(_alerts_db),
 ):
+    """Activate a revision.
+
+    Body ``{"revision": N}`` (optional) activates that explicit revision —
+    the rollback path, which also re-activates archived revisions and
+    un-archives an archived workflow. Without a body the latest revision is
+    activated, exactly as before.
+    """
     _, owner_id = await _authorize(request, "workflows:activate")
+    explicit_revision = payload.revision if payload is not None else None
     session = session_factory()
     try:
         _owned_workflow(session, workflow_id, owner_id)
-        latest = _latest_revision(session, workflow_id)
-        if latest is None:
-            raise HTTPException(status_code=404, detail="Workflow has no revisions")
+        if explicit_revision is not None:
+            target = _revision_by_number(session, workflow_id, explicit_revision)
+            if target is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Revision {explicit_revision} not found",
+                )
+        else:
+            target = _latest_revision(session, workflow_id)
+            if target is None:
+                raise HTTPException(status_code=404, detail="Workflow has no revisions")
         # Re-validate the stored revision; an invalid revision never activates.
         try:
-            doc = parse_workflow_dict(latest.document)
+            doc = parse_workflow_dict(target.document)
             compile_document(doc)
         except WorkflowParseError as exc:
             raise HTTPException(
@@ -496,11 +546,14 @@ async def activate_workflow(
                 status_code=409,
                 detail={"ok": False, "issues": [item.model_dump() for item in _validation_issues(exc)]},
             ) from exc
+        target_id = target.id
     finally:
         session.close()
 
     try:
-        revision = workflow_repo.activate_revision(workflow_id, latest.id)
+        # Accepts draft or archived revisions (rollback); also un-archives
+        # the workflow itself when it was archived.
+        revision = workflow_repo.activate_revision(workflow_id, target_id)
     except DomainConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -730,38 +783,57 @@ async def get_workflow_health(
         ).scalar_one_or_none()
 
         subscriptions: List[SubscriptionHealth] = []
+        subscription_rows: List[AlertSubscription] = []
         if active is not None:
-            rows = list(
+            subscription_rows = list(
                 session.execute(
                     select(AlertSubscription)
                     .where(AlertSubscription.revision_id == active.id)
                     .order_by(AlertSubscription.created_at.asc(), AlertSubscription.id.asc())
                 ).scalars().all()
             )
-            subscriptions = [
-                SubscriptionHealth(
-                    alert_id=row.alert_id,
-                    instrument_key=row.instrument_key,
-                    state=str(row.state),
-                )
-                for row in rows
-            ]
 
-        subscription_ids = _workflow_subscription_ids(session, workflow_id)
+        # Per-subscription freshness: max(evaluation_checkpoints.updated_at).
+        all_subscription_ids = _workflow_subscription_ids(session, workflow_id)
+        last_evaluated: Dict[str, str] = {}
+        if all_subscription_ids:
+            checkpoint_rows = session.execute(
+                select(
+                    EvaluationCheckpoint.subscription_id,
+                    func.max(EvaluationCheckpoint.updated_at),
+                )
+                .where(EvaluationCheckpoint.subscription_id.in_(all_subscription_ids))
+                .group_by(EvaluationCheckpoint.subscription_id)
+            ).all()
+            last_evaluated = {
+                str(subscription_id): _iso(value)
+                for subscription_id, value in checkpoint_rows
+                if value is not None
+            }
+        subscriptions = [
+            SubscriptionHealth(
+                alert_id=row.alert_id,
+                instrument_key=row.instrument_key,
+                state=str(row.state),
+                last_evaluated_at=last_evaluated.get(row.id),
+            )
+            for row in subscription_rows
+        ]
+
         last_event_at: Optional[str] = None
         delivery_counts: Dict[str, int] = {}
-        if subscription_ids:
+        if all_subscription_ids:
             last_event_at = _iso(
                 session.execute(
                     select(func.max(SignalEvent.fired_at)).where(
-                        SignalEvent.subscription_id.in_(subscription_ids)
+                        SignalEvent.subscription_id.in_(all_subscription_ids)
                     )
                 ).scalar()
             )
             counts = session.execute(
                 select(Delivery.status, func.count())
                 .join(SignalEvent, Delivery.event_id == SignalEvent.id)
-                .where(SignalEvent.subscription_id.in_(subscription_ids))
+                .where(SignalEvent.subscription_id.in_(all_subscription_ids))
                 .group_by(Delivery.status)
             ).all()
             delivery_counts = {str(status): int(count) for status, count in counts}
@@ -772,6 +844,7 @@ async def get_workflow_health(
             subscriptions=subscriptions,
             last_event_at=last_event_at,
             delivery_counts=delivery_counts,
+            stale_after_seconds=STALE_AFTER_SECONDS,
         )
     finally:
         session.close()

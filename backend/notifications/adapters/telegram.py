@@ -2,8 +2,13 @@
 
 Destination contract: ``{"chat_id": "<chat id>", "token_env": "TELEGRAM_BOT_TOKEN"}``.
 The bot token is read from the environment at call time (never stored, never
-logged). Sends POST ``https://api.telegram.org/bot<token>/sendMessage`` with
-JSON ``{"chat_id": ..., "text": ...}``.
+logged). The env var is resolved as destination override -> provider default:
+``destination["token_env"]`` when present, else ``DEFAULT_TOKEN_ENV``
+(``TELEGRAM_BOT_TOKEN``). The delivery worker merges the channel's
+``secret_env`` into the destination before send, so a channel's secret
+pointer always governs the real send. Sends POST
+``https://api.telegram.org/bot<token>/sendMessage`` with JSON
+``{"chat_id": ..., "text": ...}``.
 
 Classification (spec F4 / E-21):
 - 2xx -> accepted (provider_id from ``result.message_id`` when present)
@@ -22,7 +27,7 @@ from typing import Optional
 
 import httpx
 
-from . import DeliveryOutcome, truncate_text
+from . import DEFAULT_TOKEN_ENV, DeliveryOutcome, truncate_text
 
 MAX_TEXT_LEN = 4096
 DEFAULT_RETRY_AFTER_S = 5
@@ -43,7 +48,8 @@ class TelegramAdapter:
         return self._client
 
     async def send(self, destination: dict, subject: str, body: str) -> DeliveryOutcome:
-        token_env = destination.get("token_env") or "TELEGRAM_BOT_TOKEN"
+        # resolution order: destination override -> provider default env name
+        token_env = str(destination.get("token_env") or DEFAULT_TOKEN_ENV)
         chat_id = destination.get("chat_id")
         if not chat_id:
             return DeliveryOutcome(

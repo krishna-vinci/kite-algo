@@ -52,10 +52,20 @@ class WorkflowPatchRequest(BaseModel):
     expected_revision: int
 
 
+class WorkflowActivateRequest(BaseModel):
+    """Optional activate body: ``{"revision": N}`` activates that revision
+    (rollback path); absent/null revision activates the latest one."""
+
+    revision: Optional[int] = None
+
+
 class PreviewResponse(IssueEnvelope):
     instruments: List[str] = []
     stages: List[str] = []
     alerts: List[str] = []
+    # Phase 1 preview compiles and reports warmup shape only; it never runs
+    # evaluation. The marker is a stable contract for clients.
+    evaluation: str = "not_evaluated_phase_1"
     note: str = ""
 
 
@@ -131,6 +141,9 @@ class SubscriptionHealth(BaseModel):
     alert_id: str
     instrument_key: str
     state: str
+    # max(evaluation_checkpoints.updated_at) for this subscription; None when
+    # the subscription has never been evaluated.
+    last_evaluated_at: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -139,6 +152,9 @@ class HealthResponse(BaseModel):
     subscriptions: List[SubscriptionHealth] = []
     last_event_at: Optional[str] = None
     delivery_counts: Dict[str, int] = {}
+    # Constant so clients can compute staleness:
+    # now - last_evaluated_at > stale_after_seconds  =>  treat as stale.
+    stale_after_seconds: int = 300
 
 
 class ChannelCreateRequest(BaseModel):

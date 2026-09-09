@@ -315,3 +315,232 @@ def test_data_policy_round_trips() -> None:
     assert doc.data_policy.require_closed_candles is False
     reparsed = parse_workflow_dict(doc.to_document_dict())
     assert reparsed == doc
+
+
+# ---------------------------------------------------------------------------
+# malformed input hardening: every failure path is a WorkflowParseError (or a
+# compile ValidationIssue) naming the offending path — never KeyError/crash.
+# ---------------------------------------------------------------------------
+
+
+def test_conditions_empty_mapping_rejected_naming_all() -> None:
+    obj = _minimal_doc()
+    obj["stages"][0]["conditions"] = {}
+    with pytest.raises(WorkflowParseError) as exc:
+        parse_workflow_dict(obj)
+    assert "all" in str(exc.value)
+
+
+def test_conditions_all_must_be_a_list() -> None:
+    obj = _minimal_doc()
+    obj["stages"][0]["conditions"] = {"all": {"left": {"field": "ltp"}}}
+    with pytest.raises(WorkflowParseError):
+        parse_workflow_dict(obj)
+
+
+def test_condition_entries_must_be_mappings() -> None:
+    obj = _minimal_doc()
+    obj["stages"][0]["conditions"] = {"all": ["not-a-mapping"]}
+    with pytest.raises(WorkflowParseError) as exc:
+        parse_workflow_dict(obj)
+    assert "conditions[0]" in str(exc.value)
+
+
+def test_alert_without_source_is_a_parse_error_not_keyerror() -> None:
+    obj = _minimal_doc()
+    del obj["alerts"][0]["source"]
+    with pytest.raises(WorkflowParseError) as exc:
+        parse_workflow_dict(obj)
+    assert "source" in str(exc.value)
+
+
+def test_stage_without_id_is_a_parse_error_not_keyerror() -> None:
+    obj = _minimal_doc()
+    del obj["stages"][0]["id"]
+    with pytest.raises(WorkflowParseError) as exc:
+        parse_workflow_dict(obj)
+    assert "id" in str(exc.value)
+
+
+def test_stages_and_alerts_must_be_lists() -> None:
+    obj = _minimal_doc()
+    obj["stages"] = {"id": "px"}
+    with pytest.raises(WorkflowParseError) as exc:
+        parse_workflow_dict(obj)
+    assert "stages" in str(exc.value)
+
+    obj = _minimal_doc()
+    obj["alerts"] = {"id": "a1"}
+    with pytest.raises(WorkflowParseError) as exc:
+        parse_workflow_dict(obj)
+    assert "alerts" in str(exc.value)
+
+
+def test_stage_and_alert_entries_must_be_mappings() -> None:
+    obj = _minimal_doc()
+    obj["stages"] = ["px"]
+    with pytest.raises(WorkflowParseError) as exc:
+        parse_workflow_dict(obj)
+    assert "stages[0]" in str(exc.value)
+
+    obj = _minimal_doc()
+    obj["alerts"] = [42]
+    with pytest.raises(WorkflowParseError) as exc:
+        parse_workflow_dict(obj)
+    assert "alerts[0]" in str(exc.value)
+
+
+def _mutate_conditions_none(obj: dict) -> None:
+    obj["stages"][0]["conditions"] = None
+
+
+def _mutate_conditions_bad_entries(obj: dict) -> None:
+    obj["stages"][0]["conditions"] = {"all": [None, 7, {"op": "gt"}]}
+
+
+def _mutate_condition_missing_right(obj: dict) -> None:
+    obj["stages"][0]["conditions"] = {"all": [{"left": {"field": "ltp"}, "op": "gt"}]}
+
+
+def _mutate_instruments_bad_entries(obj: dict) -> None:
+    obj["instruments"] = [{"exchange": "NSE"}, None, 3]
+
+
+def _mutate_alert_missing_id(obj: dict) -> None:
+    del obj["alerts"][0]["id"]
+
+
+def _mutate_alert_bad_channels(obj: dict) -> None:
+    obj["alerts"][0]["channels"] = ["ok", 3, None]
+
+
+def _mutate_alert_bad_trigger(obj: dict) -> None:
+    obj["alerts"][0]["trigger"] = {"once": True}
+
+
+def _mutate_alert_bad_cooldown(obj: dict) -> None:
+    obj["alerts"][0]["cooldown"] = ["30m"]
+
+
+def _mutate_alert_bad_notify_flag(obj: dict) -> None:
+    obj["alerts"][0]["notify_if_already_true"] = "yes"
+
+
+def _mutate_alert_bad_rearm(obj: dict) -> None:
+    obj["alerts"][0]["rearm_below"] = "cheap"
+
+
+def _mutate_data_policy_list(obj: dict) -> None:
+    obj["data_policy"] = ["exclude_and_report"]
+
+
+def _mutate_operand_params_list(obj: dict) -> None:
+    obj["stages"][0]["conditions"]["all"][0] = {
+        "left": {"field": "ltp"},
+        "op": "gt",
+        "right": {"value": 1, "params": ["hi"]},
+    }
+
+
+MALFORMED_MUTATIONS = [
+    _mutate_conditions_none,
+    _mutate_conditions_bad_entries,
+    _mutate_condition_missing_right,
+    _mutate_instruments_bad_entries,
+    _mutate_alert_missing_id,
+    _mutate_alert_bad_channels,
+    _mutate_alert_bad_trigger,
+    _mutate_alert_bad_cooldown,
+    _mutate_alert_bad_notify_flag,
+    _mutate_alert_bad_rearm,
+    _mutate_data_policy_list,
+    _mutate_operand_params_list,
+]
+
+
+def test_malformed_documents_never_crash_or_pass_silently() -> None:
+    """Every malformed mutation must surface as a parse error or a compile
+    ValidationIssue — never KeyError/TypeError, never silent acceptance."""
+    for mutate in MALFORMED_MUTATIONS:
+        obj = _minimal_doc()
+        mutate(obj)
+        context = getattr(mutate, "__name__", str(mutate))
+        try:
+            doc = parse_workflow_dict(obj)
+        except WorkflowParseError:
+            continue
+        try:
+            compile_document(doc)
+        except WorkflowValidationError:
+            continue
+        raise AssertionError(f"malformed document passed silently: {context}")
+
+
+# ---------------------------------------------------------------------------
+# silent-capability rule: unsupported top-level capabilities fail validation
+# with named issues instead of being silently ignored.
+# ---------------------------------------------------------------------------
+
+
+def test_universe_reports_unknown_capability_at_compile() -> None:
+    obj = _minimal_doc()
+    obj["universe"] = {"union": [{"index": "Nifty50"}]}
+    doc = parse_workflow_dict(obj)  # parsing stays lenient
+    with pytest.raises(WorkflowValidationError) as exc:
+        compile_document(doc)
+    assert any(
+        issue.code == "unknown_capability" and issue.where == "document.universe"
+        for issue in exc.value.issues
+    )
+
+
+def test_empty_or_absent_universe_is_not_flagged() -> None:
+    obj = _minimal_doc()
+    obj["universe"] = {}
+    compile_document(parse_workflow_dict(obj))  # no raise
+
+    obj = _minimal_doc()
+    obj["universe"] = None
+    compile_document(parse_workflow_dict(obj))  # no raise
+
+
+def test_timezone_other_than_asia_kolkata_reports_bad_value() -> None:
+    obj = _minimal_doc()
+    obj["timezone"] = "UTC"
+    doc = parse_workflow_dict(obj)
+    with pytest.raises(WorkflowValidationError) as exc:
+        compile_document(doc)
+    assert any(
+        issue.code == "bad_value" and issue.where == "document.timezone"
+        for issue in exc.value.issues
+    )
+
+
+def test_asia_kolkata_timezone_compiles_clean() -> None:
+    obj = _minimal_doc()
+    obj["timezone"] = "Asia/Kolkata"
+    compile_document(parse_workflow_dict(obj))  # no raise
+
+
+def test_data_policy_values_outside_allowed_sets_flagged() -> None:
+    obj = _minimal_doc()
+    obj["data_policy"] = {
+        "missing": "drop",
+        "insufficient_history": "fail",
+        "require_closed_candles": True,
+    }
+    doc = parse_workflow_dict(obj)  # parse stays lenient
+    with pytest.raises(WorkflowValidationError) as exc:
+        compile_document(doc)
+    wheres = {issue.where for issue in exc.value.issues if issue.code == "bad_value"}
+    assert "document.data_policy.missing" in wheres
+    assert "document.data_policy.insufficient_history" in wheres
+
+    # the documented values stay valid
+    ok = _minimal_doc()
+    ok["data_policy"] = {
+        "missing": "exclude_and_report",
+        "insufficient_history": "wait",
+        "require_closed_candles": True,
+    }
+    compile_document(parse_workflow_dict(ok))  # no raise

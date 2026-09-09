@@ -171,6 +171,8 @@ def _check_keys(raw: dict, known: set[str], path: str) -> None:
 
 
 def _require_str(raw: dict, key: str, path: str, *, allow_empty: bool = False) -> Any:
+    if key not in raw:
+        raise _fail(f"{path}.{key}", f"requires '{key}' (missing); must be a non-empty string")
     value = raw[key]
     if not isinstance(value, str) or (not allow_empty and not value):
         raise _fail(f"{path}.{key}", f"must be a non-empty string, got {value!r}")
@@ -218,8 +220,8 @@ def _parse_document(obj: dict) -> WorkflowDocument:
     _check_keys(
         obj,
         {"version", "name", "instruments", "stages", "alerts", "data_policy",
-         "session", "timezone", "universe"},  # timezone/universe: reserved, ignored
-        "document",
+         "session", "timezone", "universe"},  # timezone/universe: reserved,
+        "document",                           # validated at compile (issues)
     )
 
     version = obj.get("version")
@@ -257,7 +259,7 @@ def _parse_document(obj: dict) -> WorkflowDocument:
 
     data_policy = _data_policy(obj.get("data_policy", {}))
 
-    return WorkflowDocument(
+    document = WorkflowDocument(
         version=1,
         name=name,
         session=session,
@@ -266,6 +268,14 @@ def _parse_document(obj: dict) -> WorkflowDocument:
         alerts=alerts,
         data_policy=data_policy,
     )
+    # Reserved top-level keys are outside the frozen dataclass model but must
+    # still reach the compiler so unsupported values fail *validation* (issue
+    # list) instead of being silently ignored. Parser-only channel; equality,
+    # canonical JSON and the canonical hash are unaffected.
+    reserved = {key: obj[key] for key in ("universe", "timezone") if key in obj}
+    if reserved:
+        object.__setattr__(document, "_reserved", reserved)
+    return document
 
 
 def _instrument(item: Any, path: str) -> InstrumentRef:
@@ -365,6 +375,9 @@ def _conditions(raw: Any, path: str) -> tuple[Condition, ...]:
         for key in raw:
             if not isinstance(key, str) or key != "all":
                 raise _unknown_field(path, key)
+        if "all" not in raw:
+            # `conditions: {}` and friends must name the path, not KeyError.
+            raise _fail(path, "must be a mapping with an 'all' list of conditions")
         items = raw["all"]
     elif isinstance(raw, list):
         items = raw

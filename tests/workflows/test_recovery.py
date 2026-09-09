@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -158,6 +159,14 @@ def _fixture_document() -> WorkflowDocument:
     return parse_workflow_yaml(FIXTURE.read_text())
 
 
+def _cond_key(document: WorkflowDocument, stage_id: str) -> str:
+    """Canonical predicate key of a stage's first condition (new shape)."""
+    from backend.alerts.predicates import cond_key
+
+    stage = next(s for s in document.stages if s.id == stage_id)
+    return cond_key(stage.conditions[0])
+
+
 def _candle_document(level: float = 100.0, trigger: str = "once") -> WorkflowDocument:
     return WorkflowDocument(
         version=1,
@@ -187,8 +196,6 @@ def _tick_obs(epoch: str, ltp: float, ts: datetime = T0) -> Observation:
 
 
 def _bar(minutes: float, close: float, epoch: str = "candle") -> Observation:
-    from datetime import timedelta
-
     ts = T0 + timedelta(minutes=minutes)
     return Observation(
         ts=ts,
@@ -299,7 +306,14 @@ def test_ltp_crossing_fires_once_with_pending_delivery(session_factory, notif_re
 
     events = _events(session_factory)
     assert len(events) == 1
-    assert events[0].evidence["level"] == 3000.0
+    cond = next(
+        c for s in _fixture_document().stages if s.id == "px" for c in s.conditions
+    )
+    from backend.alerts.predicates import cond_key as _ck
+
+    cond_evidence = events[0].evidence[_ck(cond)]
+    assert cond_evidence["level"] == 3000.0
+    assert cond_evidence["ltp"] == 3001.0
     assert events[0].evidence["epoch_id"] == "boot-1"
     assert events[0].evidence["stage_id"] == "px"
 
@@ -421,11 +435,16 @@ def test_duplicate_final_candle_creates_single_event(session_factory, notif_repo
     # rewind candle state to just below the level so the crossing genuinely
     # fires in-process (as if this worker had never seen the other's commit)
     _state, owner_epoch = repo.load_checkpoint(sub.id, sub.instrument_key, "candle")
+    cross_key = _cond_key(_candle_document(level=100.0), "bar")
     repo.save_checkpoint(
         sub.id,
         sub.instrument_key,
         "candle",
-        {"initialized": True, "epoch_id": "candle", "prev": 99.0},
+        {
+            "initialized": True,
+            "epoch_id": "candle",
+            "conds": {cross_key: {"prev": 99.0}},
+        },
         owner_epoch,
     )
 
@@ -438,7 +457,9 @@ def test_duplicate_final_candle_creates_single_event(session_factory, notif_repo
     assert len(_events(session_factory)) == 2
     assert len(_deliveries(session_factory)) == 1
     rolled_back_state, _ = repo.load_checkpoint(sub.id, sub.instrument_key, "candle")
-    assert rolled_back_state["prev"] == 99.0  # loser's checkpoint write rolled back
+    # loser's checkpoint write rolled back: prev is still 99.0 in the
+    # condition's partitioned sub-state
+    assert rolled_back_state["conds"][cross_key]["prev"] == 99.0
 
 
 # ---------------------------------------------------------------------------
@@ -618,3 +639,684 @@ def test_worker_entry_imports_cleanly_and_parses_tokens(monkeypatch):
 
     monkeypatch.setenv("ALERTS_INSTRUMENT_TOKENS", "not-json")
     assert entry.build_instrument_tokens() == {}
+
+
+# ---------------------------------------------------------------------------
+# fault 1 + 7: entrypoint delivery task, resolver, token env
+# ---------------------------------------------------------------------------
+
+
+class FakeAdapter:
+    """NotificationAdapter double: records sends, always accepts."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, destination, subject, body):
+        self.sent.append((dict(destination), subject, body))
+        from backend.notifications.adapters import DeliveryOutcome
+
+        return DeliveryOutcome(status="accepted", detail="fake ok")
+
+
+class StubEvalWorker:
+    """Duck-typed worker whose run() blocks until cancelled."""
+
+    def __init__(self):
+        self.stopped = False
+
+    async def run(self):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.stopped = True
+            raise
+
+
+def _seed_pending_delivery(session_factory, sub, channel_id, *, when=T0):
+    """Insert a signal_event + pending delivery row; returns the delivery id."""
+    import uuid as _uuid
+
+    event_id = str(_uuid.uuid4())
+    delivery_id = str(_uuid.uuid4())
+    with session_factory() as session:
+        session.add(
+            SignalEvent(
+                id=event_id,
+                subscription_id=sub.id,
+                occurrence_key=f"seed:{delivery_id}",
+                fired_at=when,
+                evidence={"seeded": True},
+                created_at=when,
+            )
+        )
+        session.add(
+            Delivery(
+                id=delivery_id,
+                event_id=event_id,
+                channel_id=channel_id,
+                status="pending",
+                attempts=0,
+            )
+        )
+        session.commit()
+    return delivery_id
+
+
+def test_subscription_loader_returns_pinned_context(session_factory, notif_repo, channel_id):
+    import backend.workflows.worker_entry as entry
+
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    service = _service(session_factory, repo, notif_repo)
+    _workflow, revision = _activate(repo, _fixture_document())
+    service.ensure_subscriptions(revision)
+    sub = _single_sub(repo)
+
+    loader = entry.build_subscription_loader(session_factory)
+    context = loader(sub.id)
+    assert context is not None
+    assert set(context.keys()) == {
+        "instrument_key", "alert_id", "message", "expires_at", "workflow_name",
+    }
+    assert context["instrument_key"] == "NSE:RELIANCE"
+    assert context["alert_id"] == "breakout"
+    assert context["workflow_name"]  # joined from workflows.name
+
+    assert loader("no-such-subscription") is None
+
+
+def test_delivery_resolver_fallback_resolves_delivery_context(session_factory, notif_repo, channel_id):
+    import backend.workflows.worker_entry as entry
+
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    service = _service(session_factory, repo, notif_repo)
+    _workflow, revision = _activate(repo, _fixture_document())
+    service.ensure_subscriptions(revision)
+    sub = _single_sub(repo)
+    delivery_id = _seed_pending_delivery(session_factory, sub, channel_id)
+
+    loader = entry.build_subscription_loader(session_factory)
+    resolver = entry.build_delivery_resolver(notif_repo, loader)
+    context = resolver(delivery_id)
+    assert context is not None
+    assert set(context.keys()) == {
+        "provider", "destination", "subject", "body", "expires_at",
+    }
+    assert context["provider"] == "telegram"
+    # the chat id is preserved; the pinned make_resolver additionally merges
+    # the channel's secret_env override into the destination
+    assert context["destination"]["chat_id"] == "12345"
+    assert context["subject"]
+    assert context["body"]
+    assert resolver("missing-delivery") is None
+
+
+def test_delivery_enabled_env_kill_switch(monkeypatch):
+    import backend.workflows.worker_entry as entry
+
+    monkeypatch.delenv("ALERTS_DELIVERY_ENABLED", raising=False)
+    assert entry.delivery_enabled() is True  # default on
+    monkeypatch.setenv("ALERTS_DELIVERY_ENABLED", "1")
+    assert entry.delivery_enabled() is True
+    for off in ("0", "false", "no", "off"):
+        monkeypatch.setenv("ALERTS_DELIVERY_ENABLED", off)
+        assert entry.delivery_enabled() is False
+
+
+def test_delivery_task_runs_and_processes_pending_outbox(session_factory, notif_repo, channel_id):
+    import backend.workflows.worker_entry as entry
+    from backend.notifications.worker import DeliveryWorker
+
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    service = _service(session_factory, repo, notif_repo)
+    _workflow, revision = _activate(repo, _fixture_document())
+    service.ensure_subscriptions(revision)
+    sub = _single_sub(repo)
+    delivery_id = _seed_pending_delivery(session_factory, sub, channel_id)
+
+    adapter = FakeAdapter()
+    loader = entry.build_subscription_loader(session_factory)
+    resolver = entry.build_delivery_resolver(notif_repo, loader)
+    delivery_worker = DeliveryWorker(
+        notif_repo, adapter_factory=lambda provider: adapter, resolver=resolver
+    )
+
+    async def scenario():
+        stop = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_later(0.5, stop.set_result(None))
+        # make the pending row due immediately even if backoff was seeded
+        results = await entry.supervise(
+            StubEvalWorker(), delivery_worker, stop=stop, delivery_poll_interval_s=0.01
+        )
+        return results
+
+    asyncio.run(scenario())
+
+    assert len(adapter.sent) == 1
+    rows = _deliveries(session_factory)
+    assert len(rows) == 1
+    assert rows[0].id == delivery_id
+    assert rows[0].status == "delivered"
+
+
+def test_delivery_task_disabled_by_env(monkeypatch, session_factory, notif_repo, channel_id):
+    import backend.workflows.worker_entry as entry
+    from backend.notifications.worker import DeliveryWorker
+
+    monkeypatch.setenv("ALERTS_DELIVERY_ENABLED", "0")
+    assert entry.delivery_enabled() is False
+
+    delivery_worker = DeliveryWorker(notif_repo, resolver=lambda delivery_id: {})
+    calls = []
+
+    async def spy_run_forever(interval):
+        calls.append(interval)
+
+    delivery_worker.run_forever = spy_run_forever
+
+    async def scenario():
+        stop = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_later(0.05, stop.set_result(None))
+        return await entry.supervise(
+            StubEvalWorker(), delivery_worker, stop=stop, delivery_poll_interval_s=0.01
+        )
+
+    asyncio.run(scenario())
+    assert calls == []  # delivery task never started
+
+
+def test_alerts_instrument_tokens_warn_when_empty(monkeypatch, caplog):
+    import backend.workflows.worker_entry as entry
+
+    monkeypatch.setenv("ALERTS_INSTRUMENT_TOKENS", json.dumps({"NSE:RELIANCE": 738561}))
+    assert entry.build_instrument_tokens() == {"NSE:RELIANCE": 738561}
+
+    # JSON array instead of object is rejected loudly
+    monkeypatch.setenv("ALERTS_INSTRUMENT_TOKENS", '["NSE:RELIANCE"]')
+    assert entry.build_instrument_tokens() == {}
+
+    # non-numeric token value is rejected
+    monkeypatch.setenv("ALERTS_INSTRUMENT_TOKENS", '{"NSE:RELIANCE": "abc"}')
+    assert entry.build_instrument_tokens() == {}
+
+    with caplog.at_level("WARNING", logger="backend.workflows.worker_entry"):
+        monkeypatch.delenv("ALERTS_INSTRUMENT_TOKENS", raising=False)
+        entry.warn_if_no_instruments(entry.build_instrument_tokens())
+        assert any("ALERTS_INSTRUMENT_TOKENS" in record.message for record in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="backend.workflows.worker_entry"):
+        entry.warn_if_no_instruments({"NSE:RELIANCE": 738561})
+        assert not [r for r in caplog.records if "no instruments" in r.message.lower()]
+
+
+def test_build_renewal_uses_same_client_on_interval(session_factory, notif_repo):
+    import backend.workflows.worker_entry as entry
+
+    class FakeMarketClient:
+        def __init__(self):
+            self.calls = []
+
+        async def set_owner_subscriptions(self, owner_id, tokens):
+            self.calls.append((owner_id, dict(tokens)))
+            return {}
+
+    client = FakeMarketClient()
+    renew = entry.build_renewal(client, "alerts-worker:test", {"NSE:RELIANCE": 738561})
+
+    from backend.workflows.runtime import EvaluationWorker
+
+    worker = EvaluationWorker(
+        SqlAlchemyWorkflowRepository(session_factory),
+        session_factory,
+        _resolver(notif_repo),
+        tick_source_factory=lambda ik: FakeSource(),
+        candle_source_factory=lambda ik, tf: FakeSource(),
+        candle_history=FakeHistory(),
+        renewal=renew,
+        renewal_interval_s=0.01,
+        poll_interval_s=0.01,
+        health_interval_s=3600,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(worker.run())
+        await asyncio.sleep(0.08)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+    assert len(client.calls) >= 2  # renewed repeatedly on the interval
+    owner, tokens = client.calls[0]
+    assert owner == "alerts-worker:test"
+    assert tokens == {738561: "full"}
+    assert worker.health["renewal_failures"] == 0
+
+
+def test_renewal_failure_does_not_crash_worker(session_factory, notif_repo):
+    import backend.workflows.worker_entry as entry
+
+    class FailingClient:
+        def __init__(self):
+            self.attempts = 0
+
+        async def set_owner_subscriptions(self, owner_id, tokens):
+            self.attempts += 1
+            raise RuntimeError("market-runtime down")
+
+    renew = entry.build_renewal(FailingClient(), "alerts-worker:test", {"NSE:RELIANCE": 738561})
+
+    from backend.workflows.runtime import EvaluationWorker
+
+    worker = EvaluationWorker(
+        SqlAlchemyWorkflowRepository(session_factory),
+        session_factory,
+        _resolver(notif_repo),
+        tick_source_factory=lambda ik: FakeSource(),
+        candle_source_factory=lambda ik, tf: FakeSource(),
+        candle_history=FakeHistory(),
+        renewal=renew,
+        renewal_interval_s=0.01,
+        poll_interval_s=0.01,
+        health_interval_s=3600,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(worker.run())
+        await asyncio.sleep(0.08)
+        assert not task.done()  # renewal outage must not crash the loop
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+    assert worker.health["renewal_failures"] >= 2
+    assert worker.health["last_renewal_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# fault 6: health file
+# ---------------------------------------------------------------------------
+
+
+def test_health_file_written_when_env_set(monkeypatch, session_factory, notif_repo, tmp_path):
+    from backend.workflows.runtime import EvaluationWorker
+
+    health_file = tmp_path / "health.json"
+    monkeypatch.setenv("ALERTS_HEALTH_FILE", str(health_file))
+
+    worker = EvaluationWorker(
+        SqlAlchemyWorkflowRepository(session_factory),
+        session_factory,
+        _resolver(notif_repo),
+        tick_source_factory=lambda ik: FakeSource(),
+        candle_source_factory=lambda ik, tf: FakeSource(),
+        candle_history=FakeHistory(),
+        health_interval_s=0.02,
+        poll_interval_s=0.01,
+        health_extra=lambda: {"deliveries": {"delivered": 3}},
+    )
+
+    async def scenario():
+        task = asyncio.create_task(worker.run())
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert health_file.exists()
+    snapshot = json.loads(health_file.read_text())
+    for key in (
+        "started_at", "last_evaluated_at", "evaluations", "emitted",
+        "suppressed", "gaps", "warmups", "unresolved_channels",
+        "renewal_failures", "deliveries",
+    ):
+        assert key in snapshot, f"health snapshot missing {key!r}: {snapshot}"
+    assert snapshot["deliveries"] == {"delivered": 3}
+
+
+# ---------------------------------------------------------------------------
+# fault 3: subscription refresh (activation/pause without restart)
+# ---------------------------------------------------------------------------
+
+
+def _candle_document_named(name: str, level: float, symbol: str = "RELIANCE") -> WorkflowDocument:
+    return WorkflowDocument(
+        version=1,
+        name=name,
+        instruments=(InstrumentRef(symbol=symbol, exchange="NSE"),),
+        stages=(
+            Stage(
+                id="bar",
+                type="signal",
+                clock="candle_close",
+                timeframe="minute",
+                conditions=(
+                    Condition(
+                        Operand(kind="field", name="close"),
+                        "crosses_above",
+                        Operand(kind="value", value=level),
+                    ),
+                ),
+            ),
+        ),
+        alerts=(AlertSpec(id="cross", source="bar", trigger="once", channels=("telegram_primary",)),),
+    )
+
+
+def test_subscription_refresh_adds_and_drops_without_restart(
+    session_factory, notif_repo, channel_id
+):
+    from backend.workflows.runtime import EvaluationWorker
+
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    _activate(repo, _candle_document_named("wf-one", level=100.0))
+
+    history = FakeHistory(
+        {
+            ("NSE:RELIANCE", "minute"): [_bar(0, 95.0), _bar(1, 99.0)],
+            ("NSE:TCS", "minute"): [_bar(0, 1950.0)],
+        }
+    )
+    tick_sources, candle_sources = {}, {}
+    worker = EvaluationWorker(
+        repo,
+        session_factory,
+        _resolver(notif_repo),
+        tick_source_factory=lambda ik: tick_sources.setdefault(ik, FakeSource()),
+        candle_source_factory=lambda ik, tf: candle_sources.setdefault((ik, tf), FakeSource()),
+        candle_history=history,
+        poll_interval_s=0.01,
+    )
+    asyncio.run(worker.start())
+
+    subs_before = {s.id for group in worker._candle_subs.values() for s in group}
+    assert len(subs_before) == 1
+
+    # activate a second workflow while the worker is running
+    _workflow2, revision2 = _activate(repo, _candle_document_named("wf-two", level=2000.0, symbol="TCS"))
+    service = _service(session_factory, repo, notif_repo)
+    service.ensure_subscriptions(revision2)
+
+    summary = asyncio.run(worker.refresh_subscriptions())
+    assert summary["added"] == 1
+    assert summary["removed"] == 0
+
+    subs_after = {s.id for group in worker._candle_subs.values() for s in group}
+    assert len(subs_after) == 2
+    # new subscription was warmed (candle rules) before live dispatch
+    warmups_after_add = worker.health["warmups"]
+    assert warmups_after_add == 3  # 2 bars RELIANCE + 1 bar TCS
+    assert ("NSE:TCS", "minute") in worker._candle_sources
+
+    # pause the first subscription; a refresh must drop it and prune its source
+    rows = _subscription_rows(session_factory)
+    target = [r for r in rows if r.instrument_key == "NSE:RELIANCE"][0]
+    with session_factory() as session:
+        from backend.workflows.repository import AlertSubscription
+
+        row = session.get(AlertSubscription, target.id)
+        row.state = "paused"
+        session.commit()
+
+    summary = asyncio.run(worker.refresh_subscriptions())
+    assert summary["removed"] == 1
+    assert summary["added"] == 0
+
+    current_ids = {s.id for group in worker._candle_subs.values() for s in group}
+    assert target.id not in current_ids
+    # source pruned once its group emptied
+    assert ("NSE:RELIANCE", "minute") not in worker._candle_sources
+
+    # dispatch consults the current set: a live bar for the paused instrument
+    # must not be dispatched to the paused subscription
+    evaluations_before = worker.health["evaluations"]
+    asyncio.run(worker.poll_once())
+    assert worker.health["evaluations"] == evaluations_before
+
+    asyncio.run(worker.stop())
+
+
+# ---------------------------------------------------------------------------
+# fault 4: redis outage -> rebuild source with a new epoch, loop survives
+# ---------------------------------------------------------------------------
+
+
+class FlakySource:
+    """TickSource double: raises on the first N polls, then replays a queue."""
+
+    def __init__(self, epoch_id, observations=None, fail_times=0):
+        self.epoch_id = epoch_id
+        self.queue = list(observations or [])
+        self.fail_times = int(fail_times)
+        self.polls = 0
+        self.stopped = False
+
+    async def start(self):
+        return None
+
+    async def next_observation(self):
+        self.polls += 1
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError(f"simulated redis outage (epoch {self.epoch_id})")
+        if self.queue:
+            return self.queue.pop(0)
+        return None
+
+    async def stop(self):
+        self.stopped = True
+        return None
+
+
+def test_redis_outage_rebuilds_source_new_epoch_no_phantom_fires(
+    session_factory, notif_repo, channel_id
+):
+    from backend.workflows.runtime import EvaluationWorker
+
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    _activate(repo, _fixture_document())  # ltp crossing at 3000, trigger once
+
+    built = {"count": 0}
+
+    def tick_factory(instrument_key):
+        built["count"] += 1
+        epoch = f"boot-{built['count']}"
+        # the first two epochs are mid-outage; boot-3 recovers high (a phantom
+        # epoch switch must not fire) then confirms a genuine crossing later
+        if built["count"] == 3:
+            return FlakySource(epoch, [_tick_obs(epoch, 3005.0, T0.replace(minute=1))])
+        return FlakySource(epoch, fail_times=1)
+
+    worker = EvaluationWorker(
+        repo,
+        session_factory,
+        _resolver(notif_repo),
+        tick_source_factory=tick_factory,
+        candle_source_factory=lambda ik, tf: FakeSource(),
+        candle_history=FakeHistory(),
+        poll_interval_s=0.01,
+        source_rebuild_backoff_s=0.0,
+    )
+    asyncio.run(worker.start())
+    assert built["count"] == 1
+
+    # poll 1: boot-1 raises -> gap, teardown, rebuild queued
+    asyncio.run(worker.poll_once())
+    assert worker.health["gaps"] == 1
+    # poll 2: boot-2 built (new epoch) and raises too -> second gap
+    asyncio.run(worker.poll_once())
+    assert worker.health["gaps"] == 2
+    assert built["count"] == 2
+
+    # poll 3: boot-3 built with a NEW epoch boot id; its first observation is
+    # above the level but must only initialize (no phantom fire, spec D2/E-5)
+    asyncio.run(worker.poll_once())
+    assert built["count"] == 3
+    source = worker._tick_sources["NSE:RELIANCE"]
+    assert source.epoch_id == "boot-3"
+    assert source.stopped is False  # the recovered source stays up
+    assert _events(session_factory) == []
+    assert _deliveries(session_factory) == []
+
+    # the recovered stream completes a genuine crossing: 3005 -> 2990 -> 3001
+    source.queue.append(_tick_obs("boot-3", 2990.0, T0.replace(minute=2)))
+    asyncio.run(worker.poll_once())
+    assert _events(session_factory) == []  # still below
+
+    source.queue.append(_tick_obs("boot-3", 3001.0, T0.replace(minute=3)))
+    asyncio.run(worker.poll_once())
+    events = _events(session_factory)
+    assert len(events) == 1  # real crossing fired exactly once
+    assert events[0].evidence["epoch_id"] == "boot-3"
+    assert len(_deliveries(session_factory)) == 1
+    assert worker.health["rebuilds"] == 2
+
+    asyncio.run(worker.stop())
+
+
+# ---------------------------------------------------------------------------
+# fault 5: warmup never emits historical notifications
+# ---------------------------------------------------------------------------
+
+
+class _PinnedFakeService:
+    """EvaluationService double implementing the pinned handle_observation
+    contract (``allow_emit``) for a simple close-crosses-level rule."""
+
+    def __init__(self, session_factory, level=100.0):
+        self.session_factory = session_factory
+        self.level = level
+        self.calls = []  # (sub_id, ts, allow_emit)
+        self._state = {}
+
+    def ensure_subscriptions(self, revision):
+        return 0  # rows are pre-created by the real service in these tests
+
+    def handle_observation(self, sub, obs, *, db=None, allow_emit=True, context=None):
+        self.calls.append((sub.id, obs.ts, allow_emit))
+        state = self._state.setdefault(sub.id, {"prev": None, "fired": False})
+        prev, state["prev"] = state["prev"], obs.close
+        crossed = prev is not None and prev < self.level <= obs.close
+        if not allow_emit:
+            # warmup: may advance internal state but never commits anything
+            return SimpleNamespace(emitted=False, suppression_reason=None, fired=False)
+        if crossed and not state["fired"]:
+            state["fired"] = True
+            with self.session_factory() as session:
+                session.add(
+                    SignalEvent(
+                        subscription_id=sub.id,
+                        occurrence_key=f"fake:{sub.id}:{obs.ts.isoformat()}",
+                        fired_at=obs.ts,
+                        evidence={"level": self.level, "epoch_id": obs.epoch_id},
+                        created_at=obs.ts,
+                    )
+                )
+                session.commit()
+            return SimpleNamespace(emitted=True, suppression_reason=None, fired=True)
+        return SimpleNamespace(emitted=False, suppression_reason="no_crossing", fired=False)
+
+
+def test_warmup_emits_nothing_then_live_bar_fires_once(session_factory, notif_repo, channel_id):
+    from backend.workflows.runtime import EvaluationWorker
+
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    real_service = _service(session_factory, repo, notif_repo)
+    _workflow, revision = _activate(repo, _candle_document(level=100.0))
+    real_service.ensure_subscriptions(revision)
+    sub = _single_sub(repo)
+
+    # 5 historical bars, two of which cross the level: warmup must stay silent
+    history = FakeHistory(
+        {("NSE:RELIANCE", "minute"): [
+            _bar(0, 95.0), _bar(1, 99.0), _bar(2, 101.0), _bar(3, 100.5), _bar(4, 99.0),
+        ]}
+    )
+    fake_service = _PinnedFakeService(session_factory, level=100.0)
+    tick_sources, candle_sources = {}, {}
+    worker = EvaluationWorker(
+        repo,
+        session_factory,
+        _resolver(notif_repo),
+        tick_source_factory=lambda ik: tick_sources.setdefault(ik, FakeSource()),
+        candle_source_factory=lambda ik, tf: candle_sources.setdefault((ik, tf), FakeSource()),
+        candle_history=history,
+        poll_interval_s=0.01,
+        service=fake_service,
+    )
+    asyncio.run(worker.start())
+
+    assert worker.health["warmups"] == 5
+    assert _events(session_factory) == []  # zero signal events from warmup
+    assert _deliveries(session_factory) == []
+    # every warmup call passed allow_emit=False (pinned contract)
+    assert len(fake_service.calls) == 5
+    assert all(allow is False for _, _, allow in fake_service.calls)
+    # warmup bars never touched the live queue
+    assert candle_sources[("NSE:RELIANCE", "minute")].queue == []
+
+    # live: a genuine crossing fires exactly once
+    source = candle_sources[("NSE:RELIANCE", "minute")]
+    source.queue.append(_bar(5, 101.0))
+    asyncio.run(worker.poll_once())
+    events = _events(session_factory)
+    assert len(events) == 1
+
+    source.queue.append(_bar(6, 102.0))
+    asyncio.run(worker.poll_once())
+    assert len(_events(session_factory)) == 1  # trigger-once semantics
+    assert worker.health["emitted"] == 1
+
+    asyncio.run(worker.stop())
+
+
+def test_warmup_skips_bars_already_processed(session_factory, notif_repo, channel_id):
+    from backend.workflows.runtime import EvaluationWorker
+
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    real_service = _service(session_factory, repo, notif_repo)
+    _workflow, revision = _activate(repo, _candle_document(level=100.0))
+    real_service.ensure_subscriptions(revision)
+    sub = _single_sub(repo)
+
+    # checkpoint says bars up to 10:02 were already processed
+    boundary_ts = _bar(2, 101.0).ts
+    repo.save_checkpoint(
+        sub.id, sub.instrument_key, "candle",
+        {"initialized": True, "epoch_id": "candle", "last_bar_ts": boundary_ts.isoformat()},
+        0,
+    )
+
+    history = FakeHistory(
+        {("NSE:RELIANCE", "minute"): [_bar(0, 95.0), _bar(1, 99.0), _bar(2, 101.0), _bar(3, 99.5)]}
+    )
+    fake_service = _PinnedFakeService(session_factory, level=100.0)
+    worker = EvaluationWorker(
+        repo,
+        session_factory,
+        _resolver(notif_repo),
+        tick_source_factory=lambda ik: FakeSource(),
+        candle_source_factory=lambda ik, tf: FakeSource(),
+        candle_history=history,
+        poll_interval_s=0.01,
+        service=fake_service,
+    )
+    asyncio.run(worker.start())
+
+    replayed = [ts for _sid, ts, _allow in fake_service.calls]
+    assert boundary_ts not in replayed
+    assert _bar(3, 99.5).ts in replayed  # strictly newer bars are replayed
+    assert len(replayed) == 1
+    assert _events(session_factory) == []
+
+    asyncio.run(worker.stop())

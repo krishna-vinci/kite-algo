@@ -11,6 +11,16 @@ never raise for provider/transport problems; they classify instead:
 
 Secrets (tokens, URLs containing credentials) must never appear in
 `DeliveryOutcome.detail` or `provider_id`.
+
+Pinned env-var resolution contract (send time): the adapter resolves the
+secret-bearing env var as *destination override -> provider default* —
+``destination["token_env"]`` (telegram) / ``destination["url_env"]`` (ntfy)
+when present, else the provider default below. Channel rows additionally
+carry ``secret_env`` (the name of the env var holding the secret); the
+delivery worker merges that pointer into the destination before send via
+:func:`merge_secret_env`, so a channel's ``secret_env`` always governs the
+real send. A missing env var at send time is a ``permanent`` outcome naming
+the resolved env var.
 """
 
 from __future__ import annotations
@@ -19,6 +29,16 @@ from dataclasses import dataclass
 from typing import Callable, Literal, Optional, Protocol
 
 TRUNCATION_MARKER = "…[truncated]"
+
+# Provider default env-var names (used when the destination carries no override).
+DEFAULT_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
+DEFAULT_URL_ENV = "NTFY_PRIMARY_URL"
+
+# provider -> destination key that carries the secret-bearing env-var name.
+SECRET_ENV_DESTINATION_KEY = {
+    "telegram": "token_env",
+    "ntfy": "url_env",
+}
 
 
 @dataclass(frozen=True)
@@ -47,6 +67,25 @@ def truncate_text(text: str, limit: int, marker: str = TRUNCATION_MARKER) -> str
     if keep <= 0:
         return text[:limit]
     return text[:keep] + marker
+
+
+def merge_secret_env(provider: str, destination: Optional[dict], secret_env: Optional[str]) -> dict:
+    """Merge a channel's ``secret_env`` pointer into a send destination.
+
+    Returns a copy of ``destination`` with the provider's secret-env key
+    (``token_env`` for telegram, ``url_env`` for ntfy) set to ``secret_env``
+    when one is given — the channel's ``secret_env`` is the authoritative
+    env-var name for the real send, so it overrides any env name already
+    present in the destination (which in turn overrides the provider
+    default). Only env-var *names* are carried — never secret values.
+    Unknown providers (no mapped key) or a falsy ``secret_env`` return the
+    destination copy unchanged.
+    """
+    merged = dict(destination or {})
+    key = SECRET_ENV_DESTINATION_KEY.get(str(provider or "").strip().lower())
+    if key and secret_env:
+        merged[key] = str(secret_env)
+    return merged
 
 
 # Factory registry. Factories take no arguments and build an adapter that owns

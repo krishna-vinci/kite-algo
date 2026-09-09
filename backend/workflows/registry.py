@@ -38,6 +38,10 @@ FIELDS: Mapping[str, dict] = {
     "low": {"unit": "price", "warmup_bars": 1},
     "close": {"unit": "price", "warmup_bars": 1},
     "volume": {"unit": "quantity", "warmup_bars": 1},
+    # Context-resolved at evaluation time from the runtime-supplied session
+    # context (previous trading day's levels), not from the observation bar.
+    "prev_day_high": {"unit": "price", "warmup_bars": 0, "context_resolved": True},
+    "prev_day_low": {"unit": "price", "warmup_bars": 0, "context_resolved": True},
 }
 
 CLOCKS: Mapping[str, dict] = {
@@ -72,6 +76,10 @@ def is_known_operator(name: object) -> bool:
 
 def is_known_field(name: object) -> bool:
     return isinstance(name, str) and name in FIELDS
+
+
+def is_context_field(name: object) -> bool:
+    return is_known_field(name) and bool(FIELDS[name].get("context_resolved"))
 
 
 def is_known_clock(name: object) -> bool:

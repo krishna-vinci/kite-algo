@@ -36,6 +36,11 @@ MAX_INSTRUMENTS = 1000
 MAX_CONDITIONS_PER_STAGE = 32
 
 
+# Allowed data_policy value sets (anything else is a bad_value issue).
+DATA_POLICY_MISSING = frozenset({"exclude_and_report"})
+DATA_POLICY_INSUFFICIENT_HISTORY = frozenset({"wait"})
+
+
 @dataclass(frozen=True)
 class ValidationIssue:
     where: str  # e.g. "stages.px.conditions[0]" or "alerts.breakout"
@@ -102,6 +107,28 @@ def _validate(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:
     if not doc.name:
         _add(ValidationIssue("document.name", "bad_value", "workflow name must not be empty"))
 
+    _validate_reserved(doc, issues)
+
+    if doc.data_policy.missing not in DATA_POLICY_MISSING:
+        _add(
+            ValidationIssue(
+                "document.data_policy.missing",
+                "bad_value",
+                f"data_policy.missing must be {sorted(DATA_POLICY_MISSING)[0]!r} in Phase 1, "
+                f"got {doc.data_policy.missing!r}",
+            )
+        )
+    if doc.data_policy.insufficient_history not in DATA_POLICY_INSUFFICIENT_HISTORY:
+        _add(
+            ValidationIssue(
+                "document.data_policy.insufficient_history",
+                "bad_value",
+                f"data_policy.insufficient_history must be "
+                f"{sorted(DATA_POLICY_INSUFFICIENT_HISTORY)[0]!r} in Phase 1, "
+                f"got {doc.data_policy.insufficient_history!r}",
+            )
+        )
+
     if len(doc.instruments) > MAX_INSTRUMENTS:
         _add(
             ValidationIssue(
@@ -127,6 +154,30 @@ def _validate(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:
     _validate_stages(doc.stages, stage_ids, issues)
     alert_ids = _collect_ids(doc.alerts, "alerts", issues)
     _validate_alerts(doc.alerts, alert_ids, stage_ids, issues)
+
+
+def _validate_reserved(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:
+    """Reserved top-level keys never vanish silently: unsupported values fail
+    validation with named issues (silent-capability rule)."""
+    reserved = getattr(doc, "_reserved", None) or {}
+    if "universe" in reserved and reserved["universe"] not in (None, {}, []):
+        issues.append(
+            ValidationIssue(
+                "document.universe",
+                "unknown_capability",
+                "document-level 'universe' is not available in Phase 1 "
+                "(Phase 1 monitors explicit instruments only)",
+            )
+        )
+    timezone_value = reserved.get("timezone")
+    if "timezone" in reserved and timezone_value is not None and timezone_value != "Asia/Kolkata":
+        issues.append(
+            ValidationIssue(
+                "document.timezone",
+                "bad_value",
+                f"timezone must be 'Asia/Kolkata' in Phase 1, got {timezone_value!r}",
+            )
+        )
 
 
 def _collect_ids(items: tuple, label: str, issues: list[ValidationIssue]) -> set[str]:
@@ -197,6 +248,18 @@ def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: lis
                     f"stage input references unknown stage '{stage.input}'",
                 )
             )
+        elif stage.input is not None:
+            # Resolved upstream reference: upstream stage evaluation is
+            # unimplemented in Phase 1, so this is a capability, not a graph
+            # error — failing validation beats silently ignoring it.
+            _add(
+                ValidationIssue(
+                    f"{where}.input",
+                    "unknown_capability",
+                    f"upstream stage evaluation (input: '{stage.input}') is not "
+                    "available in Phase 1",
+                )
+            )
 
         if len(stage.conditions) > MAX_CONDITIONS_PER_STAGE:
             _add(
@@ -222,8 +285,57 @@ def _validate_condition(condition: Condition, where: str, issues: list[Validatio
                 f"unknown operator '{condition.op}'",
             )
         )
+    if condition.op == "within":
+        _validate_within_bounds(condition, where, issues)
     _validate_operand(condition.left, f"{where}.left", issues)
     _validate_operand(condition.right, f"{where}.right", issues)
+    if condition.op not in ("breaks_prev_high", "breaks_prev_low"):
+        for side, operand in (("left", condition.left), ("right", condition.right)):
+            if operand.kind == "field" and registry.is_context_field(operand.name or ""):
+                _add(
+                    ValidationIssue(
+                        f"{where}.{side}",
+                        "bad_value",
+                        f"field '{operand.name}' is context-resolved and only valid "
+                        "as the right operand of breaks_prev_high/breaks_prev_low",
+                    )
+                )
+
+
+def _validate_within_bounds(condition: Condition, where: str, issues: list[ValidationIssue]) -> None:
+    """`within` needs a finite numeric upper bound in right params 'hi'; an
+    unbounded range would evaluate to permanent unknown and never fire."""
+    _add = issues.append
+    hi = condition.right.params.get("hi")
+    if (
+        isinstance(hi, bool)
+        or not isinstance(hi, (int, float))
+        or not math.isfinite(float(hi))
+    ):
+        _add(
+            ValidationIssue(
+                f"{where}.right.params.hi",
+                "bad_value",
+                "operator 'within' requires a finite numeric upper bound "
+                f"in the right operand's 'hi' param, got {hi!r}",
+            )
+        )
+    lo = condition.right.value if condition.right.value is not None else condition.right.params.get("lo")
+    if (
+        isinstance(lo, bool)
+        or not isinstance(lo, (int, float))
+        or not math.isfinite(float(lo))
+    ):
+        _add(
+            ValidationIssue(
+                f"{where}.right.params.lo"
+                if condition.right.value is None
+                else f"{where}.right.value",
+                "bad_value",
+                "operator 'within' requires a finite numeric lower bound "
+                f"in the right operand's value, got {lo!r}",
+            )
+        )
 
 
 def _validate_operand(operand: Operand, where: str, issues: list[ValidationIssue]) -> None:

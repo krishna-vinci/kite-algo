@@ -5,9 +5,14 @@ Endpoints under ``/worker/notification-channels`` (mounted at ``/api``).
 - ``POST /worker/notification-channels``            → workflows:write (upsert)
 - ``POST /worker/notification-channels/{id}/test``  → notifications:test
 
-The test endpoint resolves the channel's secret from the environment
-(``secret_env`` names the variable; the secret itself never enters the
-database or the response) and sends through the provider adapter from
+The test endpoint builds the destination through ONE code path
+(:func:`build_test_destination`) implementing the pinned contract: a channel
+with ``secret_env`` set overrides the provider's env-var slot in its own
+destination — telegram gets ``{"token_env": channel.secret_env}``, ntfy gets
+``{"url_env": channel.secret_env}`` — and the resolved variable is pre-checked
+against ``os.environ`` so a test send fails with a 400 naming the exact
+variable (never a provider default). The secret itself never enters the
+database or the response; the send goes through the provider adapter from
 ``backend.notifications.adapters``. Adapter outcomes are classified values
 (``accepted`` / ``retryable`` / ``permanent`` / ``unknown``), never raises for
 provider problems.
@@ -18,7 +23,7 @@ Shares the injectable alerts sessionmaker dependency from
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -43,7 +48,26 @@ router = APIRouter(prefix="/worker/notification-channels", tags=["Worker Notific
 
 __all__ = [
     "router",
+    "build_test_destination",
 ]
+
+
+def build_test_destination(channel: Any) -> Tuple[Dict[str, Any], Optional[str]]:
+    """PINNED test-send destination contract (single code path).
+
+    Returns ``(destination, secret_env)``: the stored destination with the
+    channel's ``secret_env`` overriding the provider's env-var slot —
+    ``token_env`` for telegram, ``url_env`` for ntfy — and the resolved env
+    variable name (None when the channel carries no secret reference).
+    """
+    secret_env = str(getattr(channel, "secret_env", "") or "").strip() or None
+    destination = dict(getattr(channel, "destination", None) or {})
+    provider = str(getattr(channel, "provider", "") or "").strip().lower()
+    if secret_env and provider == "telegram":
+        destination["token_env"] = secret_env
+    elif secret_env and provider == "ntfy":
+        destination["url_env"] = secret_env
+    return destination, secret_env
 
 
 async def list_channels(
@@ -90,7 +114,12 @@ async def test_channel(
     if channel is None or channel.owner_id != owner_id:
         raise HTTPException(status_code=404, detail="Notification channel not found")
 
-    secret_env = str(channel.secret_env or "").strip()
+    destination, secret_env = build_test_destination(channel)
+
+    # Pre-check the SAME variable the destination now names (never a provider
+    # default): a missing secret is a configuration error, reported as a 400
+    # naming the variable — delivery would record `permanent` analogously
+    # instead of dropping silently (E-24).
     if secret_env and os.environ.get(secret_env) is None:
         raise HTTPException(
             status_code=400,
@@ -109,7 +138,7 @@ async def test_channel(
     body = (payload.message if payload is not None else None) or (
         f"[Test] channel '{channel.name}' is wired up correctly."
     )
-    outcome = await adapter.send(dict(channel.destination or {}), subject=f"[Test] {channel.name}", body=body)
+    outcome = await adapter.send(destination, subject=f"[Test] {channel.name}", body=body)
     return ChannelTestResponse(status=outcome.status, provider_id=outcome.provider_id, detail=outcome.detail)
 
 

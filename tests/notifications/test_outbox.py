@@ -27,6 +27,7 @@ from backend.workflows.models import (
 from backend.workflows.repository import (
     AlertSubscription,
     Base,
+    LeaseConflict,
     SqlAlchemyWorkflowRepository,
 )
 
@@ -246,43 +247,173 @@ def test_record_attempt_updates_delivery_and_logs_row(session_factory):
     _seed_event(workflow_repo, sub_id, "occ-attempt", ["c1"], now)
     claimed = notification_repo.claim_deliveries(now, limit=1)[0]
 
-    delivered = notification_repo.record_attempt(
-        claimed.id,
-        1,
-        "accepted",
-        "telegram sendMessage 200",
-        "delivered",
-        delivered_at=now,
-        now=now,
-    )
-    assert delivered.status == "delivered"
-    assert delivered.attempts == 1
-    assert _utc(delivered.delivered_at) == now
-    assert delivered.lease_until is None
-    assert delivered.last_error is None
-
     retried = notification_repo.record_attempt(
         claimed.id,
-        2,
+        1,
         "retryable",
-        "timeout",
+        "provider 500",
         "retrying",
         next_attempt_at=now + timedelta(seconds=30),
-        last_error="timeout",
+        last_error="provider 500",
         now=now,
     )
     assert retried.status == "retrying"
-    assert retried.attempts == 2
-    assert retried.last_error == "timeout"
+    assert retried.attempts == 1
+    assert retried.last_error == "provider 500"
     assert _utc(retried.next_attempt_at) == now + timedelta(seconds=30)
+
+    # backoff elapsed: the same worker (or another) re-claims and completes
+    reclaimed = notification_repo.claim_deliveries(now + timedelta(seconds=31), limit=1)[0]
+    assert reclaimed.id == claimed.id
+    delivered = notification_repo.record_attempt(
+        reclaimed.id,
+        2,
+        "accepted",
+        "telegram sendMessage 200",
+        "delivered",
+        delivered_at=now + timedelta(seconds=31),
+        now=now + timedelta(seconds=31),
+    )
+    assert delivered.status == "delivered"
+    assert delivered.attempts == 2
+    assert _utc(delivered.delivered_at) == now + timedelta(seconds=31)
+    assert delivered.lease_until is None
+    assert delivered.last_error == "provider 500"
 
     with session_factory() as session:
         attempts = session.execute(select(DeliveryAttempt).order_by(DeliveryAttempt.attempt_no)).scalars().all()
-    assert [(a.attempt_no, a.outcome) for a in attempts] == [(1, "accepted"), (2, "retryable")]
+    assert [(a.attempt_no, a.outcome) for a in attempts] == [(1, "retryable"), (2, "accepted")]
     assert attempts[0].delivery_id == claimed.id
 
     with pytest.raises(KeyError):
         notification_repo.record_attempt("missing-delivery", 1, "accepted", "", "delivered")
+
+
+# ---------------------------------------------------------------------------
+# lease-fenced completion (fault 2)
+# ---------------------------------------------------------------------------
+
+
+def _row(session_factory, delivery_id):
+    with session_factory() as session:
+        return session.get(Delivery, delivery_id)
+
+
+def _attempt_rows(session_factory, delivery_id):
+    with session_factory() as session:
+        return list(
+            session.execute(
+                select(DeliveryAttempt).where(DeliveryAttempt.delivery_id == delivery_id)
+            ).scalars().all()
+        )
+
+
+def test_record_attempt_on_fresh_lease_records_fine(session_factory):
+    notification_repo = SqlAlchemyNotificationRepository(session_factory)
+    workflow_repo = SqlAlchemyWorkflowRepository(session_factory)
+    sub_id = _subscription_id(session_factory)
+    now = datetime(2026, 9, 8, 10, 0, tzinfo=timezone.utc)
+
+    _seed_event(workflow_repo, sub_id, "occ-fresh", ["c1"], now)
+    claimed = notification_repo.claim_deliveries(now, limit=1)[0]
+
+    # recording with the lease identity this worker holds succeeds
+    recorded = notification_repo.record_attempt(
+        claimed.id,
+        1,
+        "accepted",
+        "ok",
+        "delivered",
+        delivered_at=now,
+        now=now,
+        lease_until=claimed.lease_until,
+    )
+    assert recorded.status == "delivered"
+    assert recorded.attempts == 1
+    assert _attempt_rows(session_factory, claimed.id) != []
+
+
+def test_record_attempt_rejected_after_lease_expiry_without_changes(session_factory):
+    notification_repo = SqlAlchemyNotificationRepository(session_factory)
+    workflow_repo = SqlAlchemyWorkflowRepository(session_factory)
+    sub_id = _subscription_id(session_factory)
+    now = datetime(2026, 9, 8, 10, 0, tzinfo=timezone.utc)
+
+    _seed_event(workflow_repo, sub_id, "occ-expired-lease", ["c1"], now)
+    claimed = notification_repo.claim_deliveries(now, limit=1)[0]
+
+    # the lease expires before the worker gets to record
+    later = now + timedelta(seconds=121)
+    with session_factory() as session:
+        row = session.get(Delivery, claimed.id)
+        row.lease_until = now + timedelta(seconds=120)  # already past at `later`
+        session.commit()
+
+    before = _row(session_factory, claimed.id)
+    with pytest.raises(LeaseConflict):
+        notification_repo.record_attempt(
+            claimed.id,
+            1,
+            "accepted",
+            "stale worker finally finished",
+            "delivered",
+            now=later,
+        )
+    after = _row(session_factory, claimed.id)
+    # nothing changed: same status/lease/attempts and no audit row
+    assert (after.status, after.attempts) == (before.status, before.attempts)
+    assert _utc(after.lease_until) == _utc(before.lease_until)
+    assert _attempt_rows(session_factory, claimed.id) == []
+
+
+def test_record_attempt_rejected_after_another_worker_reclaimed(session_factory):
+    notification_repo = SqlAlchemyNotificationRepository(session_factory)
+    workflow_repo = SqlAlchemyWorkflowRepository(session_factory)
+    sub_id = _subscription_id(session_factory)
+    now = datetime(2026, 9, 8, 10, 0, tzinfo=timezone.utc)
+
+    _seed_event(workflow_repo, sub_id, "occ-reclaim-fence", ["c1"], now)
+    old_claim = notification_repo.claim_deliveries(now, limit=1)[0]
+    old_lease = old_claim.lease_until
+
+    # the old lease expires and another worker reclaims the delivery
+    later = now + timedelta(seconds=121)
+    with session_factory() as session:
+        row = session.get(Delivery, old_claim.id)
+        row.lease_until = now + timedelta(seconds=120)
+        session.commit()
+    new_claim = notification_repo.claim_deliveries(later, limit=1)[0]
+    assert new_claim.id == old_claim.id
+    assert new_claim.lease_until != old_lease
+
+    # the OLD worker's record (stale lease identity) is rejected even though
+    # the stored lease is fresh again — it no longer owns the delivery
+    with pytest.raises(LeaseConflict):
+        notification_repo.record_attempt(
+            old_claim.id,
+            1,
+            "accepted",
+            "old worker lands late",
+            "delivered",
+            now=later,
+            lease_until=old_lease,
+        )
+    assert _row(session_factory, old_claim.id).status == "delivering"
+    assert _attempt_rows(session_factory, old_claim.id) == []
+
+    # the new holder records fine with its own lease identity
+    recorded = notification_repo.record_attempt(
+        new_claim.id,
+        1,
+        "accepted",
+        "new holder delivers",
+        "delivered",
+        delivered_at=later,
+        now=later,
+        lease_until=new_claim.lease_until,
+    )
+    assert recorded.status == "delivered"
+    assert recorded.attempts == 1
 
 
 def test_get_due_and_stale_partition(session_factory):

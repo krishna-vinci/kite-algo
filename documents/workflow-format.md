@@ -15,7 +15,7 @@ stages:
   - id: px                         # required; unique
     type: signal                   # Phase 1 supports "signal"
     clock: ltp                     # ltp | candle_close (alias: evaluate_on)
-    timeframe: 1m                  # required iff clock: candle_close
+    timeframe: minute              # required iff clock: candle_close
     conditions:
       all:                         # AND-combined, up to 32
         - left:  {field: ltp}
@@ -29,7 +29,6 @@ alerts:
     rearm_below: 2985              # re-arm only after value passes this level
     notify_if_already_true: false  # default false: silent arming at activation
     expires: "2026-09-30T00:00:00+05:30"   # ISO-8601; alias: expires_at
-    reminder_interval: 30m         # only with trigger: reminder
     channels: [telegram_primary]   # channel names defined via the API
     message: "${symbol} broke ${level} at ${ltp} (${time})"   # optional template
 data_policy:
@@ -37,6 +36,8 @@ data_policy:
   insufficient_history: wait
   require_closed_candles: true
 ```
+
+`reminder_interval` (alias `reminder_interval_s`) is only valid with `trigger: reminder`; the example above uses `trigger: once`, so it carries none.
 
 Boolean shorthand `repeat: true/false` maps to `on_transition`/`once` and conflicts with an explicit `trigger`.
 
@@ -46,9 +47,9 @@ Boolean shorthand `repeat: true/false` maps to `on_transition`/`once` and confli
 
 - Level ops (`gt gte lt lte`): match while the predicate holds; never fire by themselves.
 - `crosses_above` / `crosses_below`: fire on a state transition (`prev < level <= cur`, mirrored). First observation of an epoch initializes and never fires. After firing, `rearm_level` (from `rearm_above`/`rearm_below`) must be crossed back before the rule can fire again — otherwise re-armed only when the value returns past the base level.
-- `within`: right operand `{value: lo}`, with the upper bound in `params: {hi: ...}`; fires on outside→inside transition.
+- `within`: right operand `{value: lo}`, with the finite numeric upper bound in `params: {hi: ...}` (required — a missing `hi` fails validation with a `bad_value` issue); fires on outside→inside transition.
 - `rises_pct` / `falls_pct`: percentage move from the baseline captured on the epoch's first observation (never re-derived).
-- `breaks_prev_high` / `breaks_prev_low`: right operand `{value: <prev-day level>}` supplied by runtime context; guarded against re-firing every observation.
+- `breaks_prev_high` / `breaks_prev_low`: the right operand is a previous-day level — `right: {field: prev_day_high}` (or `prev_day_low`), resolved from runtime context; a caller-supplied literal value (`right: {value: <level>}`) is also allowed. Guarded against re-firing every observation.
 
 Fields: `ltp open high low close volume`. Missing data yields **unknown** — unknown propagates, only `true` matches, and a rule with any unknown condition never fires (E-15).
 
@@ -58,7 +59,7 @@ Fields: `ltp open high low close volume`. Missing data yields **unknown** — un
 
 ## Validation limits
 
-Docs > 256 KiB, > 64 stages, > 256 alerts, > 1000 instruments, or > 32 conditions per stage are rejected, as are duplicate keys, custom YAML tags, unknown fields (typo field names never silently parse), duplicate ids, missing `alert.source` references, cycles in stage `input` chains, and unsupported capabilities (indicators, `fundamentals.*`, non-`signal` stages — reserved for later phases; a document containing them parses but cannot be activated).
+Docs > 64 stages, > 256 alerts, > 1000 instruments, or > 32 conditions per stage are rejected, as are duplicate keys, custom YAML tags, unknown fields (typo field names never silently parse), duplicate ids, missing `alert.source` references, cycles in stage `input` chains, and unsupported capabilities (indicators, `fundamentals.*`, `universe`, upstream stage `input` references, non-`signal` stages — reserved for later phases; a document containing them parses but validation fails with named issues, so it cannot be activated). The **256 KiB size limit applies to the YAML text import** path (`POST .../import` and `yaml_text` fields); documents submitted through the JSON API (`document`) are bounded by the schema's own caps instead.
 
 Canonical hashes are stable across key order; moving or reformatting does not change identity, changing a level or period does.
 
@@ -72,11 +73,12 @@ Canonical hashes are stable across key order; moving or reformatting does not ch
 | Operation | Endpoint |
 | --- | --- |
 | Validate without saving | `POST /api/worker/workflows/validate` |
-| Preview (writes nothing) | `POST /api/worker/workflows/preview` |
+| Preview (writes nothing; responds with `evaluation: not_evaluated_phase_1`) | `POST /api/worker/workflows/preview` |
 | Import YAML as draft | `POST /api/worker/workflows/import` |
-| Create / list / read / update (expected_revision) | `POST|GET|PATCH /api/worker/workflows` |
-| Lifecycle | `POST /api/worker/workflows/{id}/activate|pause|resume|archive` |
-| History / health / export | `GET .../{id}/events?limit&offset`, `.../{id}/health`, `.../{id}/export` |
-| Channels | `GET|POST /api/worker/notification-channels`, `POST .../{id}/test` |
+| Create / list | `POST /api/worker/workflows`, `GET /api/worker/workflows` |
+| Read / update (expected_revision) | `GET /api/worker/workflows/{id}`, `PATCH /api/worker/workflows/{id}` |
+| Lifecycle | `POST /api/worker/workflows/{id}/activate|pause|resume|archive` (`activate` takes an optional body `{"revision": N}` to roll back to an explicit revision) |
+| History / health / export | `GET /api/worker/workflows/{id}/events?limit&offset`, `GET /api/worker/workflows/{id}/health`, `GET /api/worker/workflows/{id}/export` |
+| Channels | `GET|POST /api/worker/notification-channels`, `POST /api/worker/notification-channels/{id}/test` |
 
 Required worker-token actions: `workflows:read`, `workflows:write`, `workflows:activate`, `notifications:test`.

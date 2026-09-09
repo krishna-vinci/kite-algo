@@ -56,6 +56,7 @@ __all__ = [
     "ActiveSubscription",
     "SqlAlchemyWorkflowRepository",
     "DomainConflict",
+    "RevisionConflict",
     "IdempotencyConflict",
     "LeaseConflict",
 ]
@@ -71,6 +72,11 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _is_postgres(session: Any) -> bool:
+    bind = getattr(session, "bind", None)
+    return bind is not None and getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
+
+
 # ---------------------------------------------------------------------------
 # domain errors
 # ---------------------------------------------------------------------------
@@ -78,6 +84,10 @@ def _utcnow() -> datetime:
 
 class DomainConflict(Exception):
     """A domain invariant was violated (duplicate hash, illegal transition...)."""
+
+
+class RevisionConflict(DomainConflict):
+    """An expected_revision optimistic-concurrency check failed."""
 
 
 class IdempotencyConflict(DomainConflict):
@@ -297,16 +307,24 @@ class SqlAlchemyWorkflowRepository:
         workflow_id: str,
         document_dict: dict,
         canonical_hash: str,
+        expected_revision: Optional[int] = None,
         *,
         db: Optional[Session] = None,
         now: Optional[datetime] = None,
     ):
-        """Append a new draft revision; duplicate canonical_hash -> DomainConflict."""
+        """Append a new draft revision; duplicate canonical_hash -> DomainConflict.
+
+        When ``expected_revision`` is given, the workflow's current max
+        revision is re-read (and locked with ``FOR UPDATE`` on Postgres)
+        inside the SAME transaction as the insert and a mismatch raises
+        :class:`RevisionConflict` before any row is written — the
+        optimistic-concurrency check is atomic with the insert.
+        """
         if db is not None:
-            return self._add_draft_revision(db, workflow_id, document_dict, canonical_hash, now)
+            return self._add_draft_revision(db, workflow_id, document_dict, canonical_hash, now, expected_revision)
         session = self._session()
         try:
-            revision = self._add_draft_revision(session, workflow_id, document_dict, canonical_hash, now)
+            revision = self._add_draft_revision(session, workflow_id, document_dict, canonical_hash, now, expected_revision)
             session.commit()
             return revision
         except Exception:
@@ -315,16 +333,30 @@ class SqlAlchemyWorkflowRepository:
         finally:
             session.close()
 
-    def _add_draft_revision(self, session, workflow_id, document_dict, canonical_hash, now):
+    def _add_draft_revision(self, session, workflow_id, document_dict, canonical_hash, now, expected_revision=None):
         workflow = session.get(Workflow, workflow_id)
         if workflow is None:
             raise KeyError(workflow_id)
+        if expected_revision is not None:
+            # Serialize concurrent appends per workflow on Postgres: the row
+            # lock is taken BEFORE reading the max revision so the
+            # compare-and-insert below is one atomic unit. SQLite ignores the
+            # lock; the same-transaction check is the correctness fix.
+            if _is_postgres(session):
+                session.execute(select(Workflow.id).where(Workflow.id == workflow_id).with_for_update())
         latest = session.execute(
             select(WorkflowRevision)
             .where(WorkflowRevision.workflow_id == workflow_id)
             .order_by(WorkflowRevision.revision.desc())
             .limit(1)
         ).scalar_one_or_none()
+        if expected_revision is not None:
+            current = int(latest.revision) if latest is not None else 0
+            if current != int(expected_revision):
+                raise RevisionConflict(
+                    f"workflow {workflow_id}: expected_revision {expected_revision} "
+                    f"does not match current revision {current}"
+                )
         revision = WorkflowRevision(
             id=_uuid(),
             workflow_id=workflow_id,
@@ -351,7 +383,14 @@ class SqlAlchemyWorkflowRepository:
         db: Optional[Session] = None,
         now: Optional[datetime] = None,
     ):
-        """Activate one draft revision, archiving every other active revision."""
+        """Activate one revision, archiving every other active revision.
+
+        Accepts revisions in status ``draft`` **or** ``archived``: rolling back
+        to an older revision re-activates it. An already-active revision (or a
+        revision of another workflow) raises :class:`DomainConflict`; the
+        single-active invariant is always preserved. Activating also un-archives
+        the workflow itself.
+        """
         if db is not None:
             return self._activate_revision(db, workflow_id, revision_id, now)
         session = self._session()
@@ -366,6 +405,7 @@ class SqlAlchemyWorkflowRepository:
             session.close()
 
     def _activate_revision(self, session, workflow_id, revision_id, now):
+        timestamp = now or _utcnow()
         workflow = session.get(Workflow, workflow_id)
         if workflow is None:
             raise KeyError(workflow_id)
@@ -374,12 +414,13 @@ class SqlAlchemyWorkflowRepository:
             raise DomainConflict(
                 f"revision {revision_id} does not belong to workflow {workflow_id}"
             )
-        if revision.status != "draft":
+        if revision.status not in ("draft", "archived"):
             raise DomainConflict(
-                f"revision {revision_id} is {revision.status!r}, only draft revisions can be activated"
+                f"revision {revision_id} is {revision.status!r}; only draft or "
+                "archived revisions can be activated"
             )
         # Serialize concurrent activations per workflow on Postgres.
-        if session.bind is not None and getattr(session.bind.dialect, "name", "") == "postgresql":
+        if _is_postgres(session):
             session.execute(select(Workflow.id).where(Workflow.id == workflow_id).with_for_update())
         session.execute(
             update(WorkflowRevision)
@@ -387,7 +428,10 @@ class SqlAlchemyWorkflowRepository:
             .values(status="archived")
         )
         revision.status = "active"
-        revision.activated_at = now or _utcnow()
+        revision.activated_at = timestamp
+        # Reactivation (e.g. rollback after archive) un-archives the workflow.
+        workflow.archived_at = None
+        workflow.updated_at = timestamp
         session.flush()
         return revision
 
@@ -448,6 +492,9 @@ class SqlAlchemyWorkflowRepository:
             session.close()
 
     def _list_active_subscriptions(self, session):
+        # Only subscriptions of an ACTIVE revision of an un-archived workflow
+        # are eligible: superseded (archived) revisions and archived workflows
+        # must never be evaluated, even when their rows still say 'active'.
         rows = session.execute(
             select(
                 AlertSubscription,
@@ -457,7 +504,11 @@ class SqlAlchemyWorkflowRepository:
             )
             .join(WorkflowRevision, AlertSubscription.revision_id == WorkflowRevision.id)
             .join(Workflow, WorkflowRevision.workflow_id == Workflow.id)
-            .where(AlertSubscription.state == "active")
+            .where(
+                AlertSubscription.state == "active",
+                WorkflowRevision.status == "active",
+                Workflow.archived_at.is_(None),
+            )
             .order_by(AlertSubscription.created_at.asc(), AlertSubscription.id.asc())
         ).all()
         return [
@@ -516,11 +567,13 @@ class SqlAlchemyWorkflowRepository:
         db: Optional[Session] = None,
         now: Optional[datetime] = None,
     ):
-        """Compare-and-save a checkpoint.
+        """Atomic compare-and-swap of a checkpoint.
 
-        ``expected_owner_epoch`` is the value the caller believes is stored
-        (0 when absent). On mismatch raises :class:`LeaseConflict`; on success
-        the stored owner_epoch becomes ``expected + 1``.
+        The save is a single guarded ``UPDATE ... WHERE owner_epoch =
+        :expected`` (rowcount 0 -> guarded insert-if-missing -> retried CAS ->
+        :class:`LeaseConflict` when the stored owner_epoch moved on). On
+        success the stored owner_epoch becomes ``expected + 1``; concurrent
+        writers can never interleave a lost update between load and save.
         """
         if db is not None:
             return self._save_checkpoint(db, subscription_id, instrument_key, epoch_id, state, expected_owner_epoch, now)
@@ -535,31 +588,65 @@ class SqlAlchemyWorkflowRepository:
         finally:
             session.close()
 
-    def _save_checkpoint(self, session, subscription_id, instrument_key, epoch_id, state, expected_owner_epoch, now):
-        row = session.get(EvaluationCheckpoint, (subscription_id, instrument_key, epoch_id))
-        stored_epoch = 0 if row is None else int(row.owner_epoch or 0)
-        if expected_owner_epoch is not None and int(expected_owner_epoch) != stored_epoch:
-            raise LeaseConflict(
-                f"checkpoint {subscription_id}/{instrument_key}/{epoch_id}: "
-                f"expected owner_epoch {expected_owner_epoch}, stored {stored_epoch}"
-            )
-        timestamp = now or _utcnow()
-        new_epoch = stored_epoch + 1
-        if row is None:
-            row = EvaluationCheckpoint(
-                subscription_id=subscription_id,
-                instrument_key=instrument_key,
-                epoch_id=epoch_id,
+    def _cas_update(self, session, subscription_id, instrument_key, epoch_id, state, expected, timestamp):
+        """One guarded UPDATE; returns the statement result (check rowcount)."""
+        stmt = update(EvaluationCheckpoint).where(
+            EvaluationCheckpoint.subscription_id == subscription_id,
+            EvaluationCheckpoint.instrument_key == instrument_key,
+            EvaluationCheckpoint.epoch_id == epoch_id,
+        )
+        if expected is not None:
+            stmt = stmt.where(EvaluationCheckpoint.owner_epoch == expected)
+        return session.execute(
+            stmt.values(
                 state=dict(state or {}),
-                owner_epoch=new_epoch,
+                owner_epoch=EvaluationCheckpoint.owner_epoch + 1,
                 updated_at=timestamp,
             )
-            session.add(row)
-        else:
-            row.state = dict(state or {})
-            row.owner_epoch = new_epoch
-            row.updated_at = timestamp
-        session.flush()
+        )
+
+    def _save_checkpoint(self, session, subscription_id, instrument_key, epoch_id, state, expected_owner_epoch, now):
+        timestamp = now or _utcnow()
+        expected = None if expected_owner_epoch is None else int(expected_owner_epoch)
+
+        result = self._cas_update(session, subscription_id, instrument_key, epoch_id, state, expected, timestamp)
+        if result.rowcount:
+            return self._refresh_checkpoint(session, subscription_id, instrument_key, epoch_id)
+
+        # rowcount == 0: the row is missing, OR a racing writer already moved
+        # owner_epoch past our expectation. Try a guarded insert (savepoint so
+        # an IntegrityError never poisons the caller's transaction); when the
+        # insert loses the race, retry the CAS once — losing THAT is a real
+        # lease conflict.
+        try:
+            with session.begin_nested():
+                session.add(
+                    EvaluationCheckpoint(
+                        subscription_id=subscription_id,
+                        instrument_key=instrument_key,
+                        epoch_id=epoch_id,
+                        state=dict(state or {}),
+                        owner_epoch=(0 if expected is None else expected) + 1,
+                        updated_at=timestamp,
+                    )
+                )
+                session.flush()
+        except IntegrityError:
+            retry = self._cas_update(session, subscription_id, instrument_key, epoch_id, state, expected, timestamp)
+            if retry.rowcount == 0:
+                stored = session.get(EvaluationCheckpoint, (subscription_id, instrument_key, epoch_id))
+                stored_epoch = 0 if stored is None else int(stored.owner_epoch or 0)
+                raise LeaseConflict(
+                    f"checkpoint {subscription_id}/{instrument_key}/{epoch_id}: "
+                    f"expected owner_epoch {expected}, stored {stored_epoch}"
+                )
+        return self._refresh_checkpoint(session, subscription_id, instrument_key, epoch_id)
+
+    @staticmethod
+    def _refresh_checkpoint(session, subscription_id, instrument_key, epoch_id):
+        row = session.get(EvaluationCheckpoint, (subscription_id, instrument_key, epoch_id))
+        if row is not None:
+            session.refresh(row)  # the CAS UPDATE bypasses the identity map
         return row
 
     # -- signals ------------------------------------------------------------

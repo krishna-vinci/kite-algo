@@ -186,7 +186,9 @@ def test_stage_input_missing_reference_rejected() -> None:
     assert any(issue.code == "missing_reference" for issue in exc.value.issues)
 
 
-def test_acyclic_input_chain_allowed() -> None:
+def test_acyclic_input_chain_parses_but_flags_unknown_capability() -> None:
+    """Upstream stage evaluation is unimplemented in Phase 1: a *resolved*
+    ``input`` reference must fail compile with ``unknown_capability``."""
     obj = _minimal_doc()
     obj["stages"].append(
         {
@@ -199,8 +201,12 @@ def test_acyclic_input_chain_allowed() -> None:
     )
     obj["alerts"].append({"id": "a2", "source": "px2"})
     doc = parse_workflow_dict(obj)
-    compiled = compile_document(doc)  # no raise
-    assert compiled.canonical_hash
+    with pytest.raises(WorkflowValidationError) as exc:
+        compile_document(doc)
+    assert any(
+        issue.code == "unknown_capability" and ".input" in issue.where
+        for issue in exc.value.issues
+    )
 
 
 def test_oversized_stage_count_rejected() -> None:
@@ -218,6 +224,45 @@ def test_oversized_stage_count_rejected() -> None:
     ]
     obj["alerts"] = [{"id": "a1", "source": "s0"}]
     doc = parse_workflow_dict(obj)
+    with pytest.raises(WorkflowValidationError) as exc:
+        compile_document(doc)
+    assert any(issue.code == "bad_value" for issue in exc.value.issues)
+
+
+def _within_doc(right: dict) -> dict:
+    obj = _minimal_doc()
+    obj["stages"][0]["conditions"]["all"][0] = {
+        "left": {"field": "ltp"},
+        "op": "within",
+        "right": right,
+    }
+    return obj
+
+
+def test_within_without_upper_bound_is_rejected() -> None:
+    """`within` needs a finite numeric upper bound (right params 'hi');
+    an unbounded range would evaluate to permanent unknown (never fires)."""
+    doc = parse_workflow_dict(_within_doc({"value": 100}))
+    with pytest.raises(WorkflowValidationError) as exc:
+        compile_document(doc)
+    issue = next(i for i in exc.value.issues if "hi" in i.where or i.code == "bad_value")
+    assert issue.code == "bad_value"
+    assert "within" in issue.message
+
+
+def test_within_with_finite_hi_compiles() -> None:
+    doc = parse_workflow_dict(_within_doc({"value": 100, "params": {"hi": 110}}))
+    compiled = compile_document(doc)  # no raise
+    assert compiled.canonical_hash
+
+    # explicit serialized form without the params wrapper
+    doc = parse_workflow_dict(_within_doc({"kind": "value", "value": 100, "params": {"hi": 110}}))
+    compile_document(doc)  # no raise
+
+
+@pytest.mark.parametrize("hi", [None, "110", True])
+def test_within_non_numeric_upper_bound_rejected(hi) -> None:
+    doc = parse_workflow_dict(_within_doc({"value": 100, "params": {"hi": hi}}))
     with pytest.raises(WorkflowValidationError) as exc:
         compile_document(doc)
     assert any(issue.code == "bad_value" for issue in exc.value.issues)

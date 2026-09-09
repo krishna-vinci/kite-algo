@@ -1,7 +1,11 @@
 """ntfy adapter.
 
 Destination contract: ``{"url_env": "NTFY_PRIMARY_URL"}`` — the full topic URL
-lives in the environment (never in stored channel rows). Sends POST
+lives in the environment (never in stored channel rows). The env var is
+resolved as destination override -> provider default: ``destination["url_env"]``
+when present, else ``DEFAULT_URL_ENV`` (``NTFY_PRIMARY_URL``). The delivery
+worker merges the channel's ``secret_env`` into the destination before send,
+so a channel's secret pointer always governs the real send. Sends POST
 ``<url>`` with header ``Title: <subject>`` and the message body as the raw
 request body (``text/plain``).
 
@@ -21,7 +25,7 @@ from typing import Optional
 
 import httpx
 
-from . import DeliveryOutcome, truncate_text
+from . import DEFAULT_URL_ENV, DeliveryOutcome, truncate_text
 
 MAX_BODY_LEN = 4096
 MAX_TITLE_BYTES = 512
@@ -41,7 +45,8 @@ class NtfyAdapter:
         return self._client
 
     async def send(self, destination: dict, subject: str, body: str) -> DeliveryOutcome:
-        url_env = destination.get("url_env") or "NTFY_PRIMARY_URL"
+        # resolution order: destination override -> provider default env name
+        url_env = str(destination.get("url_env") or DEFAULT_URL_ENV)
         url = os.environ.get(url_env)
         if not url:
             return DeliveryOutcome(

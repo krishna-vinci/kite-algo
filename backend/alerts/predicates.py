@@ -7,26 +7,43 @@ Semantics (spec v2 §4 F3, §5; plan "Shared contract"):
 - ``crosses_above`` / ``crosses_below``: ``fired`` iff a previous value exists
   in the same epoch and ``prev < level and cur >= level`` (mirrored below).
   First observation of an epoch initializes without firing. After evaluation,
-  ``state["prev"]`` holds the current value.
+  the condition's ``prev`` holds the current value.
 - ``within``: level between ``lo`` and ``hi`` inclusive; ``fired`` on the
   outside->inside transition. Range bounds come from the right operand:
   ``value`` is ``lo`` and ``params["hi"]`` is ``hi``.
-- ``rises_pct`` / ``falls_pct``: compared against ``state["baseline"]``,
-  captured on the first observation of an epoch (with ``baseline_ts``) and
-  never re-derived while present. ``fired`` on the below->at-or-above
-  threshold transition.
-- ``breaks_prev_high`` / ``breaks_prev_low``: the right operand ``value``
-  holds the previous-day level supplied by runtime context. Fires when the
-  current value crosses strictly across it; the ``prev_day_*_broken`` guard
-  prevents refiring while beyond the level, and resets only when the value
-  returns to the other side.
+- ``rises_pct`` / ``falls_pct``: compared against the condition's stored
+  ``baseline``, captured on the first observation of an epoch (with
+  ``baseline_ts``) and never re-derived while present. ``fired`` on the
+  below->at-or-above threshold transition.
+- ``breaks_prev_high`` / ``breaks_prev_low``: the level comes from the right
+  operand — either a ``value`` literal or a context-resolved previous-day
+  field (``{kind: "field", name: "prev_day_high"|"prev_day_low"}``, resolved
+  numerically from the ``context`` mapping). Fires when the current value
+  crosses strictly across it; the ``prev_day_*_broken`` guard prevents
+  refiring while beyond the level, and resets only when the value returns to
+  the other side.
 - Unknown operand value (missing field / absent literal / unsupported
-  ``indicator`` kind) => ``matched=None`` (unknown propagates), ``fired=False``
-  and the state is left completely unchanged.
+  ``indicator`` kind / missing ``context`` entry) => ``matched=None``
+  (unknown propagates), ``fired=False`` and the state is left completely
+  unchanged.
 - An observation whose ``epoch_id`` differs from the one recorded in state
   re-initializes epoch-scoped keys and never fires on that observation. The
   runtime normally passes a fresh state per epoch; this is a second line of
   defense.
+
+State shape (pinned):
+
+- Top level carries ``epoch_id`` plus a ``conds`` mapping keyed by the
+  canonical condition key ``f"{op}:{left_key}:{right_key}"`` where
+  ``left_key``/``right_key`` are ``field:<name>``, ``value:<num>`` or
+  ``indicator:<name>:<params-json>``. Each condition reads and writes ONLY
+  its own ``state["conds"][cond_key]`` sub-dict, so a multi-condition stage
+  can never clobber another condition's ``prev``/``baseline``/guard state.
+- Each sub-dict also carries the ``epoch_id`` it was last evaluated with:
+  epoch-scoped keys are cleared per condition when that condition sees a
+  new epoch, independent of evaluation order within a stage.
+- ``evidence`` is partitioned the same way: ``evidence[cond_key]`` holds the
+  values observed for that condition alone.
 
 State values are JSON-serializable (floats, bools, ISO-8601 strings) so they
 can be persisted in evaluation checkpoints.
@@ -34,6 +51,7 @@ can be persisted in evaluation checkpoints.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -44,7 +62,11 @@ __all__ = ["Observation", "PredicateResult", "evaluate_condition", "evaluate_sta
 
 _OBSERVATION_FIELDS = ("ltp", "open", "high", "low", "close", "volume")
 
+# Previous-day levels resolved from the caller-supplied context mapping.
+_CONTEXT_FIELDS = ("prev_day_high", "prev_day_low")
+
 # Epoch-scoped state keys: cleared when an observation opens a new epoch.
+# These live inside each condition's own sub-dict.
 _EPOCH_KEYS = (
     "prev",
     "baseline",
@@ -80,18 +102,43 @@ class Observation:
 class PredicateResult:
     matched: Optional[bool]      # None = unknown (missing operand data)
     fired: bool                  # a transition/crossing fired on this observation
-    evidence: dict               # {"ltp": 3002.5, "level": 3000, "prev_ltp": 2999.1}
-    state: dict                  # new persistent state (prev, baseline, ...)
+    evidence: dict               # {cond_key: {"ltp": 3002.5, "level": 3000, ...}}
+    state: dict                  # new persistent state ({conds: {cond_key: {...}}})
 
 
-def _resolve_operand(operand: Operand, obs: Observation) -> Optional[float]:
+def _operand_key(operand: Operand) -> str:
+    """Canonical key fragment for one operand."""
+    if operand is None:
+        return "value:None"
+    if operand.kind == "field":
+        return f"field:{operand.name}"
+    if operand.kind == "value":
+        return f"value:{operand.value}"
+    params_json = json.dumps(operand.params or {}, sort_keys=True, separators=(",", ":"))
+    return f"indicator:{operand.name}:{params_json}"
+
+
+def cond_key(cond: Condition) -> str:
+    """Canonical identity of a condition: ``op:left_key:right_key``."""
+    return f"{cond.op}:{_operand_key(cond.left)}:{_operand_key(cond.right)}"
+
+
+def _resolve_operand(
+    operand: Operand, obs: Observation, context: Optional[dict] = None
+) -> Optional[float]:
     """Resolve an operand to a float, or None when unknown."""
     if operand is None:
         return None
     if operand.kind == "value":
         return operand.value
-    if operand.kind == "field" and operand.name in _OBSERVATION_FIELDS:
-        return getattr(obs, operand.name)
+    if operand.kind == "field":
+        if operand.name in _OBSERVATION_FIELDS:
+            return getattr(obs, operand.name)
+        if operand.name in _CONTEXT_FIELDS and context:
+            value = context.get(operand.name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+        return None  # unknown field / missing context entry
     return None  # indicator operands are unsupported in Phase 1 -> unknown
 
 
@@ -111,15 +158,32 @@ def _iso_ts(ts: datetime) -> str:
     return ts.astimezone(timezone.utc).isoformat()
 
 
-def _start_epoch(state: dict, obs: Observation) -> dict:
-    """Copy state, clearing epoch-scoped keys if obs opens a new epoch."""
-    working = dict(state)
-    prev_epoch = working.get("epoch_id")
+def _begin_observation(state: dict, key: str, obs: Observation) -> dict:
+    """Copy the condition's sub-state, clearing epoch-scoped keys on epoch change.
+
+    The epoch marker lives INSIDE the condition's own sub-dict, so the epoch
+    change is detected per condition even when a stage chains one condition's
+    output state into the next (which re-stamps the top-level epoch id).
+    """
+    conds = state.get("conds")
+    raw = conds.get(key) if isinstance(conds, dict) else None
+    sub = dict(raw) if isinstance(raw, dict) else {}
+    prev_epoch = sub.get("epoch_id")
     if prev_epoch is not None and prev_epoch != obs.epoch_id:
-        for key in _EPOCH_KEYS:
-            working.pop(key, None)
-    working["epoch_id"] = obs.epoch_id
-    return working
+        for epoch_key in _EPOCH_KEYS:
+            sub.pop(epoch_key, None)
+    return sub
+
+
+def _commit_substate(state: dict, key: str, sub: dict, obs: Observation) -> dict:
+    """Return a new top-level state with this condition's sub-dict written."""
+    sub["epoch_id"] = obs.epoch_id
+    out = dict(state)
+    conds = dict(out.get("conds") or {})
+    conds[key] = sub
+    out["conds"] = conds
+    out["epoch_id"] = obs.epoch_id
+    return out
 
 
 def _compare(op: str, cur: float, level: float) -> bool:
@@ -132,130 +196,172 @@ def _compare(op: str, cur: float, level: float) -> bool:
     return cur <= level  # lte
 
 
-def _evaluate_level_op(cond: Condition, obs: Observation, working: dict) -> PredicateResult:
-    level = _resolve_operand(cond.right, obs)
+def _evaluate_level_op(cond, obs, sub, context):
+    level = _resolve_operand(cond.right, obs, context)
     if level is None:
-        return _unknown(working)
-    cur = _resolve_operand(cond.left, obs)
+        return None
+    cur = _resolve_operand(cond.left, obs, context)
     matched = _compare(cond.op, cur, level)
     evidence = {_left_key(cond.left): cur, "level": level}
-    return PredicateResult(matched, False, evidence, _start_epoch(working, obs))
+    return matched, False, evidence, sub
 
 
-def _evaluate_cross_op(cond: Condition, obs: Observation, working: dict) -> PredicateResult:
-    level = _resolve_operand(cond.right, obs)
+def _evaluate_cross_op(cond, obs, sub, context):
+    level = _resolve_operand(cond.right, obs, context)
     if level is None:
-        return _unknown(working)
-    cur = _resolve_operand(cond.left, obs)
+        return None
+    cur = _resolve_operand(cond.left, obs, context)
     is_above = cond.op == "crosses_above"
-    state = _start_epoch(working, obs)
-    prev = state.get("prev")
+    prev = sub.get("prev")
     matched = cur >= level if is_above else cur <= level
     if prev is None:
         # First observation of the epoch: initialize without firing.
-        state["prev"] = cur
+        sub["prev"] = cur
         evidence = {_left_key(cond.left): cur, "level": level, "prev_ltp": None}
-        return PredicateResult(matched, False, evidence, state)
+        return matched, False, evidence, sub
     fired = (prev < level and cur >= level) if is_above else (prev > level and cur <= level)
-    state["prev"] = cur
+    sub["prev"] = cur
     evidence = {_left_key(cond.left): cur, "level": level, "prev_ltp": prev}
-    return PredicateResult(matched, fired, evidence, state)
+    return matched, fired, evidence, sub
 
 
-def _evaluate_within(cond: Condition, obs: Observation, working: dict) -> PredicateResult:
+def _evaluate_within(cond, obs, sub, context):
     right = cond.right
     lo = right.value if right.value is not None else right.params.get("lo")
     hi = right.params.get("hi")
     if lo is None or hi is None:
-        return _unknown(working)
-    cur = _resolve_operand(cond.left, obs)
-    state = _start_epoch(working, obs)
+        return None
+    cur = _resolve_operand(cond.left, obs, context)
     matched = lo <= cur <= hi
-    was_inside = state.get("within")
+    was_inside = sub.get("within")
     fired = was_inside is False and matched
-    state["within"] = matched
+    sub["within"] = matched
     evidence = {_left_key(cond.left): cur, "lo": lo, "hi": hi}
-    return PredicateResult(matched, fired, evidence, state)
+    return matched, fired, evidence, sub
 
 
-def _evaluate_pct_op(cond: Condition, obs: Observation, working: dict) -> PredicateResult:
-    threshold = _resolve_operand(cond.right, obs)
+def _evaluate_pct_op(cond, obs, sub, context):
+    threshold = _resolve_operand(cond.right, obs, context)
     if threshold is None:
-        return _unknown(working)
-    cur = _resolve_operand(cond.left, obs)
-    state = _start_epoch(working, obs)
-    baseline = state.get("baseline")
+        return None
+    cur = _resolve_operand(cond.left, obs, context)
+    baseline = sub.get("baseline")
     if baseline is None:
         if cur == 0:
-            return _unknown(working)  # cannot anchor a percentage at zero
-        state["baseline"] = cur
-        state["baseline_ts"] = _iso_ts(obs.ts)
+            return None  # cannot anchor a percentage at zero
+        sub["baseline"] = cur
+        sub["baseline_ts"] = _iso_ts(obs.ts)
         baseline = cur
     pct = (cur - baseline) / baseline * 100.0
     is_rise = cond.op == "rises_pct"
     matched = pct >= threshold if is_rise else pct <= -threshold
-    fired = state.get("pct_matched") is False and matched
-    state["pct_matched"] = matched
+    fired = sub.get("pct_matched") is False and matched
+    sub["pct_matched"] = matched
     evidence = {
         _left_key(cond.left): cur,
         "baseline": baseline,
-        "baseline_ts": state.get("baseline_ts"),
+        "baseline_ts": sub.get("baseline_ts"),
         "pct": pct,
         "threshold": threshold,
     }
-    return PredicateResult(matched, fired, evidence, state)
+    return matched, fired, evidence, sub
 
 
-def _evaluate_break_op(cond: Condition, obs: Observation, working: dict) -> PredicateResult:
-    level = _resolve_operand(cond.right, obs)
+def _evaluate_break_op(cond, obs, sub, context):
+    level = _resolve_operand(cond.right, obs, context)
     if level is None:
-        return _unknown(working)
-    cur = _resolve_operand(cond.left, obs)
+        return None
+    cur = _resolve_operand(cond.left, obs, context)
     is_high = cond.op == "breaks_prev_high"
-    state = _start_epoch(working, obs)
     seen_key = "prev_day_high_seen" if is_high else "prev_day_low_seen"
     broken_key = "prev_day_high_broken" if is_high else "prev_day_low_broken"
-    seen = state.get(seen_key, False)
-    broken = state.get(broken_key, False)
+    seen = sub.get(seen_key, False)
+    broken = sub.get(broken_key, False)
     matched = cur > level if is_high else cur < level
     fired = bool(seen) and matched and not broken
     if matched:
-        state[broken_key] = True
+        sub[broken_key] = True
     elif (cur < level) if is_high else (cur > level):
-        state[broken_key] = False  # back to the other side: re-arm the break
-    state[seen_key] = True
+        sub[broken_key] = False  # back to the other side: re-arm the break
+    sub[seen_key] = True
     evidence = {_left_key(cond.left): cur, "level": level}
-    return PredicateResult(matched, fired, evidence, state)
+    return matched, fired, evidence, sub
 
 
-def evaluate_condition(cond: Condition, obs: Observation, state: dict) -> PredicateResult:
-    """Evaluate one condition against an observation with explicit state."""
-    if _resolve_operand(cond.left, obs) is None:
-        return _unknown(state)
-    op = cond.op
+_OP_EVALUATORS = {
+    "level": _evaluate_level_op,
+    "cross": _evaluate_cross_op,
+    "within": _evaluate_within,
+    "pct": _evaluate_pct_op,
+    "break": _evaluate_break_op,
+}
+
+
+def _op_family(op: str) -> Optional[str]:
     if op in _LEVEL_OPS:
-        return _evaluate_level_op(cond, obs, state)
+        return "level"
     if op in _CROSS_OPS:
-        return _evaluate_cross_op(cond, obs, state)
+        return "cross"
     if op == "within":
-        return _evaluate_within(cond, obs, state)
+        return "within"
     if op in _PCT_OPS:
-        return _evaluate_pct_op(cond, obs, state)
+        return "pct"
     if op in _BREAK_OPS:
-        return _evaluate_break_op(cond, obs, state)
-    return _unknown(state)  # unknown operator -> unknown (compiler rejects earlier)
+        return "break"
+    return None
 
 
-def evaluate_stage(stage: Stage, obs: Observation, state: dict) -> PredicateResult:
-    """AND-combine the stage's conditions; unknown propagates and blocks firing."""
+def evaluate_condition(
+    cond: Condition,
+    obs: Observation,
+    state: dict,
+    context: Optional[dict] = None,
+) -> PredicateResult:
+    """Evaluate one condition against an observation with explicit state.
+
+    The condition reads and writes ONLY ``state["conds"][cond_key]``; the
+    rest of the state is passed through untouched.
+    """
+    if _resolve_operand(cond.left, obs, context) is None:
+        return _unknown(state)
+    key = cond_key(cond)
+    family = _op_family(cond.op)
+    evaluator = _OP_EVALUATORS.get(family) if family else None
+    if evaluator is None:
+        return _unknown(state)  # unknown operator -> unknown (compiler rejects earlier)
+    sub = _begin_observation(state, key, obs)
+    outcome = evaluator(cond, obs, sub, context)
+    if outcome is None:
+        return _unknown(state)  # unknown operand: state completely unchanged
+    matched, fired, cond_evidence, new_sub = outcome
+    return PredicateResult(
+        matched,
+        fired,
+        {key: cond_evidence},
+        _commit_substate(state, key, new_sub, obs),
+    )
+
+
+def evaluate_stage(
+    stage: Stage,
+    obs: Observation,
+    state: dict,
+    context: Optional[dict] = None,
+) -> PredicateResult:
+    """AND-combine the stage's conditions; unknown propagates and blocks firing.
+
+    Every condition is partitioned by its canonical key, so evaluating one
+    condition can never leak its updated state into another condition's
+    ``prev``/``baseline``/guard keys.
+    """
     working = dict(state)
     evidence: dict = {}
     results = []
     for cond in stage.conditions:
-        result = evaluate_condition(cond, obs, working)
+        result = evaluate_condition(cond, obs, working, context)
         results.append(result)
         working = result.state
-        evidence.update(result.evidence)
+        evidence.update(result.evidence)  # keys are cond keys: no clobbering
     if any(r.matched is None for r in results):
         return PredicateResult(matched=None, fired=False, evidence=evidence, state=working)
     matched = all(r.matched is True for r in results)

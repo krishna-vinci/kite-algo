@@ -233,6 +233,7 @@ def test_activate_happy_path_materializes_subscriptions_and_health():
 
     health = client.get(f"{WF}/{created['workflow_id']}/health", headers=HEADERS).json()
     assert health["active_revision"] == 1
+    assert health["stale_after_seconds"] == 300
     subscriptions = {
         (subscription["alert_id"], subscription["instrument_key"]): subscription["state"]
         for subscription in health["subscriptions"]
@@ -249,7 +250,79 @@ def test_activate_happy_path_materializes_subscriptions_and_health():
 
     # activating again without a new draft replays cleanly (idempotent rows)
     again = client.post(f"{WF}/{created['workflow_id']}/activate", headers=HEADERS)
-    assert again.status_code == 409  # only draft revisions can be activated
+    assert again.status_code == 409  # an already-active revision cannot re-activate
+
+
+def test_activate_explicit_revision_rolls_back():
+    """POST /{id}/activate {"revision": N} activates that revision (rollback)."""
+    client, _ = _client()
+    created = _create_workflow(client)
+    _activate(client, created["workflow_id"])
+    patched = client.patch(
+        f"{WF}/{created['workflow_id']}",
+        json={"yaml_text": VALID_YAML_V2, "expected_revision": 1},
+        headers=HEADERS,
+    )
+    assert patched.status_code == 200, patched.text
+    activated2 = client.post(
+        f"{WF}/{created['workflow_id']}/activate",
+        json={"revision": 2},
+        headers=HEADERS,
+    )
+    assert activated2.status_code == 200, activated2.text
+    assert activated2.json()["revision"] == 2
+
+    rolled = client.post(
+        f"{WF}/{created['workflow_id']}/activate",
+        json={"revision": 1},
+        headers=HEADERS,
+    )
+    assert rolled.status_code == 200, rolled.text
+    assert rolled.json()["revision"] == 1
+
+    got = client.get(f"{WF}/{created['workflow_id']}", headers=HEADERS).json()
+    assert got["active_revision"]["revision"] == 1
+    assert got["latest_revision"]["revision"] == 2
+    health = client.get(f"{WF}/{created['workflow_id']}/health", headers=HEADERS).json()
+    assert health["active_revision"] == 1
+
+
+def test_activate_archived_workflow_reactivates_it():
+    client, _ = _client()
+    created = _create_workflow(client)
+    _activate(client, created["workflow_id"])
+
+    archived = client.post(f"{WF}/{created['workflow_id']}/archive", headers=HEADERS)
+    assert archived.status_code == 200, archived.text
+    got = client.get(f"{WF}/{created['workflow_id']}", headers=HEADERS).json()
+    assert got["archived"] is True
+
+    # activating the archived workflow's revision un-archives the workflow
+    reactivated = client.post(
+        f"{WF}/{created['workflow_id']}/activate",
+        json={"revision": 1},
+        headers=HEADERS,
+    )
+    assert reactivated.status_code == 200, reactivated.text
+    assert reactivated.json()["revision"] == 1
+
+    got = client.get(f"{WF}/{created['workflow_id']}", headers=HEADERS).json()
+    assert got["archived"] is False
+    assert got["active_revision"]["revision"] == 1
+
+    health = client.get(f"{WF}/{created['workflow_id']}/health", headers=HEADERS).json()
+    assert health["active_revision"] == 1
+
+
+def test_activate_unknown_explicit_revision_is_404():
+    client, _ = _client()
+    created = _create_workflow(client)
+    response = client.post(
+        f"{WF}/{created['workflow_id']}/activate",
+        json={"revision": 99},
+        headers=HEADERS,
+    )
+    assert response.status_code == 404, response.text
 
 
 def test_patch_stale_expected_revision_conflicts_409():
@@ -450,6 +523,48 @@ def test_health_reports_delivery_counts_and_last_event_at():
     health = client.get(f"{WF}/{created['workflow_id']}/health", headers=HEADERS).json()
     assert health["delivery_counts"] == {"delivered": 1, "pending": 1}
     assert health["last_event_at"] is not None
+
+
+def test_health_reports_per_subscription_last_evaluated_at_and_stale_after():
+    """last_evaluated_at comes from evaluation_checkpoints.updated_at (max per
+    subscription) and stale_after_seconds is a stable constant clients compute
+    staleness against."""
+    from backend.workflows.repository import EvaluationCheckpoint
+
+    client, factory = _client()
+    created = _create_workflow(client)
+    _activate(client, created["workflow_id"])
+    subscription_id = _workflow_subscription_id(factory, created["workflow_id"])
+
+    with factory() as session:
+        session.add(
+            EvaluationCheckpoint(
+                subscription_id=subscription_id,
+                instrument_key="NSE:RELIANCE",
+                epoch_id="boot-1",
+                state={"prev": 2999.0},
+                owner_epoch=1,
+                updated_at=datetime(2026, 9, 8, 9, 30, tzinfo=timezone.utc),
+            )
+        )
+        session.commit()
+
+    health = client.get(f"{WF}/{created['workflow_id']}/health", headers=HEADERS).json()
+    assert health["stale_after_seconds"] == 300
+    subscriptions = health["subscriptions"]
+    assert len(subscriptions) == 1
+    evaluated = subscriptions[0]["last_evaluated_at"]
+    assert evaluated is not None
+    assert evaluated.startswith("2026-09-08T09:30:00")
+
+
+def test_health_last_evaluated_at_is_none_without_checkpoints():
+    client, _ = _client()
+    created = _create_workflow(client)
+    _activate(client, created["workflow_id"])
+    health = client.get(f"{WF}/{created['workflow_id']}/health", headers=HEADERS).json()
+    assert health["stale_after_seconds"] == 300
+    assert all(sub["last_evaluated_at"] is None for sub in health["subscriptions"])
 
 
 def test_pause_resume_and_archive():

@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -31,10 +31,12 @@ from backend.workflows.repository import (
     AlertSubscription,
     Base,
     DomainConflict,
+    EvaluationCheckpoint,
     IdempotencyConflict,
     LeaseConflict,
     SignalEvent,
     SqlAlchemyWorkflowRepository,
+    Workflow as WorkflowModel,
     WorkflowRevision,
 )
 
@@ -186,6 +188,34 @@ def test_add_draft_revision_duplicate_canonical_hash_conflict(session_factory):
         repo.add_draft_revision("missing-workflow", document_dict, canonical_hash)
 
 
+def test_add_draft_revision_expected_revision_checked_in_transaction(session_factory):
+    """expected_revision must be verified inside the SAME transaction as the
+    insert (compare-and-insert), so a stale expectation conflicts before any
+    row is written."""
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    wf, _rev1 = _create_workflow(repo)
+    doc2, hash2 = _compiled(_document(name="reliance-breakout-v2", level=3100.0))
+    rev2 = repo.add_draft_revision(wf.id, doc2, hash2)
+    assert rev2.revision == 2
+
+    doc3, hash3 = _compiled(_document(name="reliance-breakout-v3", level=3200.0))
+
+    # stale expectation (latest is 2, caller thinks 1): conflict, no revision
+    with pytest.raises(DomainConflict):
+        repo.add_draft_revision(wf.id, doc3, hash3, expected_revision=1)
+    with session_factory() as session:
+        revisions = session.execute(
+            select(WorkflowRevision).where(WorkflowRevision.workflow_id == wf.id)
+        ).scalars().all()
+    assert sorted(revision.revision for revision in revisions) == [1, 2]
+
+    # matching expectation inserts; unknown workflow still KeyErrors
+    rev3 = repo.add_draft_revision(wf.id, doc3, hash3, expected_revision=2)
+    assert rev3.revision == 3
+    with pytest.raises(KeyError):
+        repo.add_draft_revision("missing-workflow", doc3, hash3, expected_revision=0)
+
+
 def test_activate_revision_single_active_invariant(session_factory):
     repo = SqlAlchemyWorkflowRepository(session_factory)
     wf, rev1 = _create_workflow(repo)
@@ -215,19 +245,27 @@ def test_activate_revision_single_active_invariant(session_factory):
     assert statuses[rev3.id] == "active"
     assert repo.get_active_revision(wf.id).id == rev3.id
 
-    # only a draft revision may be activated
+    # an already-active revision cannot be activated again
     with pytest.raises(DomainConflict):
-        repo.activate_revision(wf.id, rev2.id)  # archived
-    with pytest.raises(DomainConflict):
-        repo.activate_revision(wf.id, rev3.id)  # already active
+        repo.activate_revision(wf.id, rev3.id)
     with pytest.raises(DomainConflict):
         repo.activate_revision(wf.id, str(uuid.uuid4()))  # unknown revision
+
+    # rollback: activating the ARCHIVED rev2 re-activates it and re-archives
+    # the currently-active rev3 (single-active invariant preserved)
+    repo.activate_revision(wf.id, rev2.id)
+    with session_factory() as session:
+        statuses = {row.id: row.status for row in session.execute(select(WorkflowRevision)).scalars()}
+    assert statuses[rev1.id] == "draft"
+    assert statuses[rev2.id] == "active"
+    assert statuses[rev3.id] == "archived"
+    assert repo.get_active_revision(wf.id).id == rev2.id
 
     # activating the remaining draft re-archives the current active revision
     repo.activate_revision(wf.id, rev1.id)
     assert repo.get_active_revision(wf.id).id == rev1.id
     with pytest.raises(DomainConflict):
-        repo.activate_revision(wf.id, rev1.id)  # no longer draft
+        repo.activate_revision(wf.id, rev1.id)  # no longer draft/archived (active)
 
     # a revision belonging to a different workflow is rejected
     wf_b, rev_b = _create_workflow(repo, doc=_document(name="other-breakout"))
@@ -237,6 +275,52 @@ def test_activate_revision_single_active_invariant(session_factory):
 
     with pytest.raises(KeyError):
         repo.activate_revision("missing-workflow", rev_b.id)
+
+
+def test_rollback_reactivates_older_revision_and_archives_current(session_factory):
+    """activate rev1 -> add+activate rev2 -> activate rev1 again: rev1 active,
+    rev2 archived, exactly one active revision."""
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    wf, rev1 = _create_workflow(repo)
+    doc2, hash2 = _compiled(_document(name="reliance-breakout-v2", level=3100.0))
+    rev2 = repo.add_draft_revision(wf.id, doc2, hash2)
+
+    repo.activate_revision(wf.id, rev1.id)
+    repo.activate_revision(wf.id, rev2.id)
+    assert repo.get_active_revision(wf.id).id == rev2.id
+
+    rolled_back = repo.activate_revision(wf.id, rev1.id)
+    assert rolled_back.status == "active"
+
+    active = repo.get_active_revision(wf.id)
+    assert active is not None and active.id == rev1.id
+    with session_factory() as session:
+        statuses = {row.id: row.status for row in session.execute(select(WorkflowRevision)).scalars()}
+    assert statuses[rev1.id] == "active"
+    assert statuses[rev2.id] == "archived"
+
+
+def test_activate_revision_unarchives_an_archived_workflow(session_factory):
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    wf, rev = _create_workflow(repo)
+    repo.activate_revision(wf.id, rev.id)
+    with session_factory() as session:
+        workflow = session.get(WorkflowModel, wf.id)
+        workflow.archived_at = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        session.execute(
+            update(WorkflowRevision)
+            .where(WorkflowRevision.workflow_id == wf.id)
+            .values(status="archived")
+        )
+        session.commit()
+
+    repo.activate_revision(wf.id, rev.id)
+
+    with session_factory() as session:
+        workflow = session.get(WorkflowModel, wf.id)
+        revision = session.get(WorkflowRevision, rev.id)
+    assert workflow.archived_at is None  # reactivation un-archives
+    assert revision.status == "active"
 
 
 def test_create_workflow_idempotency_key_replay_and_conflict(session_factory):
@@ -294,6 +378,40 @@ def test_list_active_subscriptions_exposes_owner_and_document(session_factory):
     assert row.document["stages"][0]["id"] == "px"
 
 
+def test_list_active_subscriptions_filters_superseded_and_archived(session_factory):
+    """Superseded revisions (archived) and archived workflows must never stay
+    eligible for evaluation, even when their subscription rows say 'active'."""
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+
+    # workflow A: rev1 activated + subscription, then superseded by rev2
+    wf_a, rev1_a = _create_workflow(repo, doc=_document(name="flow-a"))
+    repo.activate_revision(wf_a.id, rev1_a.id)
+    superseded_sub = _add_subscription(session_factory, rev1_a.id)
+    doc_a2, hash_a2 = _compiled(_document(name="flow-a-v2", level=3100.0))
+    rev2_a = repo.add_draft_revision(wf_a.id, doc_a2, hash_a2)
+    repo.activate_revision(wf_a.id, rev2_a.id)
+    active_sub = _add_subscription(session_factory, rev2_a.id)
+
+    # workflow B: activated + subscription, then archived entirely
+    wf_b, rev_b = _create_workflow(repo, doc=_document(name="flow-b"))
+    repo.activate_revision(wf_b.id, rev_b.id)
+    _add_subscription(session_factory, rev_b.id, alert_id="breakout",
+                      instrument_key="NSE:TCS")
+    with session_factory() as session:
+        workflow_b = session.get(WorkflowModel, wf_b.id)
+        workflow_b.archived_at = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        session.commit()
+
+    subs = repo.list_active_subscriptions()
+    assert [sub.id for sub in subs] == [active_sub], (
+        "only subscriptions of the active revision of an un-archived workflow "
+        "stay eligible; superseded/archived ones must be filtered out"
+    )
+    assert superseded_sub not in {sub.id for sub in subs}
+    assert all(sub.workflow_id != wf_b.id for sub in subs)
+    assert all(sub.revision_id == rev2_a.id for sub in subs)
+
+
 # ---------------------------------------------------------------------------
 # checkpoints
 # ---------------------------------------------------------------------------
@@ -324,6 +442,68 @@ def test_checkpoint_compare_and_swap(session_factory):
     repo.save_checkpoint(sub_id, key, "epoch-2", {"fresh": True}, 0)
     assert repo.load_checkpoint(sub_id, "NSE:TCS", "epoch-1") == ({}, 1)
     assert repo.load_checkpoint(sub_id, key, "epoch-2") == ({"fresh": True}, 1)
+
+
+def test_checkpoint_cas_update_is_atomic_compare_and_swap(session_factory):
+    """The save must be a single guarded UPDATE: a concurrent owner_epoch bump
+    between load and save makes the CAS lose (LeaseConflict) and the stored
+    state stays exactly as the winner wrote it."""
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    _wf, rev = _create_workflow(repo)
+    sub_id = _add_subscription(session_factory, rev.id)
+    key = "NSE:RELIANCE"
+
+    repo.save_checkpoint(sub_id, key, "epoch-1", {"prev": 99.0}, 0)
+
+    # simulate a racing writer moving owner_epoch behind our back
+    with session_factory() as session:
+        session.execute(
+            update(EvaluationCheckpoint)
+            .where(
+                EvaluationCheckpoint.subscription_id == sub_id,
+                EvaluationCheckpoint.instrument_key == key,
+                EvaluationCheckpoint.epoch_id == "epoch-1",
+            )
+            .values(state={"prev": 100.0}, owner_epoch=99)
+        )
+        session.commit()
+
+    with pytest.raises(LeaseConflict):
+        repo.save_checkpoint(sub_id, key, "epoch-1", {"prev": 101.0}, 1)
+    assert repo.load_checkpoint(sub_id, key, "epoch-1") == ({"prev": 100.0}, 99)
+
+
+def test_checkpoint_insert_race_loses_to_existing_newer_epoch(session_factory):
+    """rowcount==0 on the CAS UPDATE means missing row OR moved epoch; the
+    guarded insert path must detect the existing row and end in LeaseConflict
+    instead of clobbering it."""
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    _wf, rev = _create_workflow(repo)
+    sub_id = _add_subscription(session_factory, rev.id)
+    key = "NSE:RELIANCE"
+
+    # row exists with owner_epoch=5; caller still believes the row is absent
+    with session_factory() as session:
+        session.add(
+            EvaluationCheckpoint(
+                subscription_id=sub_id,
+                instrument_key=key,
+                epoch_id="epoch-1",
+                state={"prev": 42.0},
+                owner_epoch=5,
+                updated_at=datetime(2026, 9, 8, 10, 0, tzinfo=timezone.utc),
+            )
+        )
+        session.commit()
+
+    with pytest.raises(LeaseConflict):
+        repo.save_checkpoint(sub_id, key, "epoch-1", {"prev": 43.0}, 0)
+    assert repo.load_checkpoint(sub_id, key, "epoch-1") == ({"prev": 42.0}, 5)
+
+    # matching the real stored epoch succeeds and increments by exactly one
+    row = repo.save_checkpoint(sub_id, key, "epoch-1", {"prev": 44.0}, 5)
+    assert row.owner_epoch == 6
+    assert repo.load_checkpoint(sub_id, key, "epoch-1") == ({"prev": 44.0}, 6)
 
 
 # ---------------------------------------------------------------------------

@@ -33,6 +33,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     and_,
+    func,
     or_,
     select,
     update,
@@ -40,7 +41,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backend.workflows.repository import Base
+from backend.workflows.repository import Base, LeaseConflict
 
 __all__ = [
     "ChannelReference",
@@ -48,6 +49,7 @@ __all__ = [
     "DeliveryAttempt",
     "DELIVERY_STATUSES",
     "DEFAULT_LEASE_SECONDS",
+    "LeaseConflict",
     "SqlAlchemyNotificationRepository",
 ]
 
@@ -229,6 +231,16 @@ class SqlAlchemyNotificationRepository:
         finally:
             session.close()
 
+    def get_delivery(self, delivery_id: str, *, db: Optional[Session] = None):
+        """Return the ``Delivery`` row or ``None`` when unknown."""
+        if db is not None:
+            return db.get(Delivery, delivery_id)
+        session = self._session()
+        try:
+            return session.get(Delivery, delivery_id)
+        finally:
+            session.close()
+
     # -- outbox -------------------------------------------------------------
 
     @staticmethod
@@ -334,27 +346,35 @@ class SqlAlchemyNotificationRepository:
         next_attempt_at: Optional[datetime] = None,
         delivered_at: Optional[datetime] = None,
         last_error: Optional[str] = None,
+        lease_until: Optional[datetime] = None,
         db: Optional[Session] = None,
         now: Optional[datetime] = None,
     ):
-        """Log one attempt and update the delivery row accordingly.
+        """Log one attempt and update the delivery row under lease fencing.
 
-        Increments ``attempts`` to at least ``attempt_no``, writes the audit
-        row, clears the lease for non-``delivering`` statuses and applies the
-        optional ``next_attempt_at`` / ``delivered_at`` / ``last_error``.
+        The write only applies while this worker still owns the delivery:
+        the guarded UPDATE requires ``status='delivering'`` AND a still-fresh
+        lease (``lease_until`` IS NULL or ``> now``). When ``lease_until``
+        (the lease value the caller saw on its claimed row) is given, the
+        stored lease must also still equal it — so a record arriving after
+        another worker reclaimed the delivery is rejected too. Rowcount 0
+        raises :class:`LeaseConflict` and nothing is written (no audit row,
+        no status change). Non-``delivering`` statuses clear the lease and
+        apply the optional ``next_attempt_at`` / ``delivered_at`` /
+        ``last_error``.
         """
         if new_status not in DELIVERY_STATUSES:
             raise ValueError(f"unknown delivery status {new_status!r}")
         if db is not None:
             return self._record_attempt(
                 db, delivery_id, attempt_no, outcome, detail, new_status,
-                next_attempt_at, delivered_at, last_error, now,
+                next_attempt_at, delivered_at, last_error, lease_until, now,
             )
         session = self._session()
         try:
             delivery = self._record_attempt(
                 session, delivery_id, attempt_no, outcome, detail, new_status,
-                next_attempt_at, delivered_at, last_error, now,
+                next_attempt_at, delivered_at, last_error, lease_until, now,
             )
             session.commit()
             return delivery
@@ -365,11 +385,47 @@ class SqlAlchemyNotificationRepository:
             session.close()
 
     def _record_attempt(self, session, delivery_id, attempt_no, outcome, detail, new_status,
-                        next_attempt_at, delivered_at, last_error, now):
+                        next_attempt_at, delivered_at, last_error, expected_lease_until, now):
         delivery = session.get(Delivery, delivery_id)
         if delivery is None:
             raise KeyError(delivery_id)
         timestamp = now or _utcnow()
+
+        # Lease-fenced completion (fault 2): a stale worker whose lease
+        # expired — or whose delivery was reclaimed by another worker — must
+        # not overwrite the row. Guarded UPDATE; rowcount 0 -> LeaseConflict.
+        guard = [
+            Delivery.id == delivery_id,
+            Delivery.status == "delivering",
+            or_(Delivery.lease_until.is_(None), Delivery.lease_until > timestamp),
+        ]
+        if expected_lease_until is not None:
+            guard.append(Delivery.lease_until == expected_lease_until)
+
+        values = {
+            "status": new_status,
+            "attempts": max(int(delivery.attempts or 0), int(attempt_no)),
+            "next_attempt_at": next_attempt_at,
+            "updated_at": timestamp,
+        }
+        if delivered_at is not None:
+            values["delivered_at"] = delivered_at
+        if last_error is not None:
+            values["last_error"] = last_error
+        if new_status != "delivering":
+            values["lease_until"] = None
+
+        result = session.execute(
+            update(Delivery)
+            .where(*guard)
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount == 0:
+            raise LeaseConflict(
+                f"delivery {delivery_id}: lease expired or reclaimed; attempt discarded"
+            )
+
         session.add(
             DeliveryAttempt(
                 delivery_id=delivery_id,
@@ -379,18 +435,36 @@ class SqlAlchemyNotificationRepository:
                 created_at=timestamp,
             )
         )
-        delivery.status = new_status
-        delivery.attempts = max(int(delivery.attempts or 0), int(attempt_no))
-        delivery.next_attempt_at = next_attempt_at
-        if delivered_at is not None:
-            delivery.delivered_at = delivered_at
-        if last_error is not None:
-            delivery.last_error = last_error
-        if new_status != "delivering":
-            delivery.lease_until = None
-        delivery.updated_at = timestamp
         session.flush()
+        session.refresh(delivery)  # re-sync the ORM row with the guarded UPDATE
         return delivery
+
+    def count_attempts(
+        self,
+        delivery_id: str,
+        outcome: Optional[str] = None,
+        *,
+        db: Optional[Session] = None,
+    ) -> int:
+        """Number of recorded attempts for a delivery, optionally per outcome."""
+        if db is not None:
+            return self._count_attempts(db, delivery_id, outcome)
+        session = self._session()
+        try:
+            return self._count_attempts(session, delivery_id, outcome)
+        finally:
+            session.close()
+
+    @staticmethod
+    def _count_attempts(session, delivery_id, outcome) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(DeliveryAttempt)
+            .where(DeliveryAttempt.delivery_id == delivery_id)
+        )
+        if outcome is not None:
+            stmt = stmt.where(DeliveryAttempt.outcome == str(outcome))
+        return int(session.execute(stmt).scalar_one())
 
     def get_due_and_stale(self, now: datetime, *, db: Optional[Session] = None):
         """Return ``(due, stale)`` deliveries at ``now``.

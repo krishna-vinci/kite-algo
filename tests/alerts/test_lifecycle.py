@@ -67,16 +67,35 @@ def test_no_fire_means_no_emit_and_no_reason():
 
 def test_once_per_session_suppresses_same_session_emits_next():
     a = alert(trigger="once_per_session")
-    s1 = {"session": "2026-09-08"}
-    d1 = decide(a, True, s1, T0)
+    d1 = decide(a, True, {}, T0, session_id="2026-09-08")
     assert d1.emit is True
     assert d1.new_state["last_session"] == "2026-09-08"
-    d2 = decide(a, True, d1.new_state, later(1))
+    d2 = decide(a, True, d1.new_state, later(1), session_id="2026-09-08")
     assert d2.emit is False
     assert d2.suppression_reason == "session_fired"
-    new_day = dict(d1.new_state, session="2026-09-09")
-    d3 = decide(a, True, new_day, later(2))
+    d3 = decide(a, True, d1.new_state, later(2), session_id="2026-09-09")
     assert d3.emit is True
+    assert d3.new_state["last_session"] == "2026-09-09"
+
+
+def test_once_per_session_re_fires_when_session_id_changes():
+    a = alert(trigger="once_per_session")
+    state = {}
+    sessions = ["s1", "s1", "s1", "s2", "s2"]
+    emits = []
+    for i, sid in enumerate(sessions):
+        d = decide(a, True, state, later(i), session_id=sid)
+        state = d.new_state
+        emits.append(d.emit)
+    assert emits == [True, False, False, True, False]
+
+
+def test_once_per_session_without_session_id_never_gates():
+    a = alert(trigger="once_per_session")
+    d1 = decide(a, True, {}, T0, session_id=None)
+    d2 = decide(a, True, d1.new_state, later(1), session_id=None)
+    assert d1.emit is True
+    assert d2.emit is True  # no session identity: cannot gate
 
 
 # --- trigger: reminder -------------------------------------------------------
@@ -104,6 +123,86 @@ def test_reminder_parses_last_emitted_iso_robustly():
     assert d2.suppression_reason == "reminder_interval"
 
 
+def test_reminder_re_emits_while_level_condition_merely_holds():
+    # Fault 3: level ops never produce fired, so a reminder alert must be
+    # driven by matched=True too — emit at t0, again only after the interval.
+    a = alert(trigger="reminder", reminder_interval_s=300)
+    d1 = decide(a, False, {}, T0, matched=True)  # holding, never fired
+    assert d1.emit is True
+    assert d1.new_state["last_emitted_ts"] == T0.isoformat()
+    d2 = decide(a, False, d1.new_state, later(299), matched=True)
+    assert d2.emit is False
+    assert d2.suppression_reason == "reminder_interval"
+    d3 = decide(a, False, d2.new_state, later(300), matched=True)
+    assert d3.emit is True
+    # an unknown condition must not emit or advance the cycle
+    d4 = decide(a, False, d3.new_state, later(301), matched=None)
+    assert d4.emit is False
+    assert d4.suppression_reason is None
+
+
+def test_reminder_without_matched_or_fired_does_not_emit():
+    a = alert(trigger="reminder", reminder_interval_s=300)
+    d = decide(a, False, {}, T0, matched=False)
+    assert d.emit is False
+    assert d.suppression_reason is None
+
+
+def test_reminder_crossing_alert_still_works_on_transitions():
+    a = alert(trigger="reminder", reminder_interval_s=300)
+    d1 = decide(a, True, {}, T0, matched=True)  # a crossing fire
+    assert d1.emit is True
+    d2 = decide(a, False, d1.new_state, later(60), matched=True)  # still holding
+    assert d2.emit is False and d2.suppression_reason == "reminder_interval"
+    d3 = decide(a, False, d2.new_state, later(300), matched=True)
+    assert d3.emit is True
+
+
+def test_reminder_interval_gate_only_no_reset_on_unmatch():
+    # matched=False does NOT clear the reminder cycle (interval gate only).
+    a = alert(trigger="reminder", reminder_interval_s=300)
+    d1 = decide(a, False, {}, T0, matched=True)
+    assert d1.emit is True
+    d2 = decide(a, False, d1.new_state, later(100), matched=False)
+    assert d2.emit is False and d2.suppression_reason is None
+    assert d2.new_state.get("last_emitted_ts") == T0.isoformat()  # untouched
+    d3 = decide(a, False, d2.new_state, later(299), matched=True)
+    assert d3.emit is False and d3.suppression_reason == "reminder_interval"
+    d4 = decide(a, False, d3.new_state, later(300), matched=True)
+    assert d4.emit is True
+
+
+def test_matched_true_never_drives_non_reminder_triggers():
+    for trigger in ("once", "on_transition", "once_per_session"):
+        a = alert(trigger=trigger)
+        d = decide(a, False, {}, T0, matched=True)
+        assert d.emit is False
+        assert d.suppression_reason is None
+
+
+def test_reminder_subject_to_expiry_cooldown_and_rearm():
+    # expiry wins
+    expired = alert(trigger="reminder", reminder_interval_s=300,
+                    expires_at="2026-09-08T09:00:00+00:00")
+    d = decide(expired, False, {}, T0, matched=True)
+    assert d.suppression_reason == "expired"
+    # cooldown suppresses delivery while state advanced
+    cooled = alert(trigger="reminder", reminder_interval_s=60, cooldown_s=600)
+    d1 = decide(cooled, False, {}, T0, matched=True)
+    assert d1.emit is True
+    d2 = decide(cooled, False, d1.new_state, later(60), matched=True)
+    assert d2.emit is False and d2.suppression_reason == "cooldown"
+    # rearm: disarmed holding match does not emit until rearm level is hit
+    rearmed = alert(trigger="reminder", reminder_interval_s=60,
+                    rearm_level=95.0, rearm_direction="below")
+    r1 = decide(rearmed, False, {}, T0, matched=True, current_value=101.0)
+    assert r1.emit is True and r1.new_state["armed"] is False
+    r2 = decide(rearmed, False, r1.new_state, later(60), matched=True, current_value=101.0)
+    assert r2.emit is False and r2.suppression_reason == "not_armed"
+    r3 = decide(rearmed, False, r2.new_state, later(61), matched=True, current_value=94.0)
+    assert r3.emit is True
+
+
 # --- cooldown ---------------------------------------------------------------
 
 
@@ -126,9 +225,9 @@ def test_cooldown_suppresses_delivery_never_state_bookkeeping():
     # once_per_session + cooldown: a new-session fire inside the cooldown window
     # is delivery-suppressed, but the fired-state bookkeeping still advances.
     a = alert(trigger="once_per_session", cooldown_s=600)
-    d1 = decide(a, True, {"session": "d1"}, T0)
+    d1 = decide(a, True, {"session": "d1"}, T0, session_id="d1")
     assert d1.emit is True
-    suppressed = decide(a, True, dict(d1.new_state, session="d2"), later(10))
+    suppressed = decide(a, True, d1.new_state, later(10), session_id="d2")
     assert suppressed.emit is False
     assert suppressed.suppression_reason == "cooldown"
     assert suppressed.new_state["last_session"] == "d2"

@@ -1,0 +1,46 @@
+# Alerts evaluation/delivery worker.
+#
+# Deliberately a separate file: compose.yml / compose.dev.yml have in-flight
+# changes; this adds one service without touching them. Run with:
+#
+#   docker compose -f compose.yml -f compose.worker.yml up -d alerts-worker
+#
+# Migration runs in the finance-app container; this worker starts only after
+# the API is healthy so alembic never races.
+services:
+  alerts-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kite-alerts-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-postgres}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379/0
+      MARKET_RUNTIME_ENABLED: "true"
+      MARKET_RUNTIME_URL: http://market-runtime:8780
+      MARKET_RUNTIME_HTTP_URL: http://market-runtime:8780
+      ALERTS_INSTRUMENT_TOKENS: ${ALERTS_INSTRUMENT_TOKENS:-{}}
+      ALERTS_HEALTH_FILE: /app/alerts-health.json
+      PYTHONUNBUFFERED: "1"
+    command:
+      - python
+      - -m
+      - backend.workflows.worker_entry
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      market-runtime:
+        condition: service_healthy
+      finance-app:
+        condition: service_healthy
