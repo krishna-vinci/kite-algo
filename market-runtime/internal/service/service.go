@@ -60,12 +60,25 @@ func New(ctx context.Context, cfg config.Config) (*Service, error) {
 		log.Printf("market-runtime initial token read failed: %v", err)
 	}
 
-	// Load instrument metadata for tick enrichment (best-effort; graceful degradation).
+	// Load instrument metadata for tick enrichment (best-effort; graceful
+	// degradation). The initial load retries with backoff because the API
+	// container may still be running migrations when this service starts.
 	var instrumentsStore *instruments.Store
-	if instStore, err := instruments.LoadFromPostgres(ctx, cfg.PostgresDSN); err != nil {
-		log.Printf("instrument store load failed (tick enrichment disabled): %v", err)
-	} else {
-		instrumentsStore = instStore
+	for attempt := 1; attempt <= 5; attempt++ {
+		instStore, err := instruments.LoadFromPostgres(ctx, cfg.PostgresDSN)
+		if err == nil {
+			instrumentsStore = instStore
+			break
+		}
+		log.Printf("instrument store load attempt %d/5 failed: %v", attempt, err)
+		if attempt < 5 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Duration(attempt) * 3 * time.Second):
+			}
+		} else {
+			log.Printf("instrument store unavailable (tick enrichment disabled); recover via /internal/market-runtime/instruments/refresh")
+		}
 	}
 
 	s := &Service{

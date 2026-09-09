@@ -26,7 +26,12 @@ from backend.database_url import resolve_database_url
 
 
 def _default_connection():
-    return psycopg2.connect(resolve_database_url())
+    # resolve_database_url() may return a SQLAlchemy-flavored DSN
+    # (postgresql+psycopg2://), which raw psycopg2 rejects.
+    url = resolve_database_url()
+    if url.startswith("postgresql+psycopg2://"):
+        url = "postgresql://" + url[len("postgresql+psycopg2://"):]
+    return psycopg2.connect(url)
 
 
 def _utcnow_iso() -> str:
