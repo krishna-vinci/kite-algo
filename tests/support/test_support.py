@@ -1,13 +1,30 @@
+import importlib.machinery
 import os
 import sys
 import types
+
+
+def _stub_module(name: str, **attrs) -> types.ModuleType:
+    """Create a stub module that survives ``importlib.util.find_spec(name)``.
+
+    ``find_spec`` raises ``ValueError`` when an already-imported module has
+    ``__spec__ is None`` (the default for ``types.ModuleType``), which broke
+    whole-directory pytest collection: an earlier test's redis stub poisoned
+    later ``find_spec("redis")`` guards.
+    """
+    module = types.ModuleType(name)
+    module.__spec__ = importlib.machinery.ModuleSpec(name, None, is_package=True)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    sys.modules[name] = module
+    return module
 
 
 def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
     os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
     if "kiteconnect" not in sys.modules:
-        kiteconnect = types.ModuleType("kiteconnect")
+        kiteconnect = _stub_module("kiteconnect")
 
         class KiteConnect:
             pass
@@ -22,13 +39,12 @@ def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
 
         kiteconnect.KiteConnect = KiteConnect
         kiteconnect.KiteTicker = KiteTicker
-        sys.modules["kiteconnect"] = kiteconnect
 
     if "psycopg2" not in sys.modules:
-        psycopg2 = types.ModuleType("psycopg2")
+        psycopg2 = _stub_module("psycopg2")
         psycopg2.connect = lambda *args, **kwargs: None
         psycopg2.paramstyle = "pyformat"
-        extras = types.ModuleType("psycopg2.extras")
+        extras = _stub_module("psycopg2.extras")
         extras.execute_values = lambda *args, **kwargs: None
         extras.execute_batch = lambda *args, **kwargs: None
 
@@ -41,11 +57,9 @@ def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
         extras.DictCursor = DictCursor
         extras.RealDictCursor = RealDictCursor
         psycopg2.extras = extras
-        sys.modules["psycopg2"] = psycopg2
-        sys.modules["psycopg2.extras"] = extras
 
     if "databases" not in sys.modules:
-        databases = types.ModuleType("databases")
+        databases = _stub_module("databases")
 
         class Database:
             def __init__(self, *args, **kwargs):
@@ -58,12 +72,11 @@ def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
                 self.is_connected = False
 
         databases.Database = Database
-        sys.modules["databases"] = databases
 
     if "redis" not in sys.modules:
-        redis_pkg = types.ModuleType("redis")
-        redis_asyncio = types.ModuleType("redis.asyncio")
-        redis_exceptions = types.ModuleType("redis.exceptions")
+        redis_pkg = _stub_module("redis")
+        redis_asyncio = _stub_module("redis.asyncio")
+        redis_exceptions = _stub_module("redis.exceptions")
 
         class ConnectionError(Exception):
             pass
@@ -99,12 +112,9 @@ def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
         redis_asyncio.exceptions = redis_exceptions
         redis_pkg.asyncio = redis_asyncio
         redis_pkg.exceptions = redis_exceptions
-        sys.modules["redis"] = redis_pkg
-        sys.modules["redis.asyncio"] = redis_asyncio
-        sys.modules["redis.exceptions"] = redis_exceptions
 
     if stub_kite_orders and "broker_api.orders" not in sys.modules:
-        kite_orders = types.ModuleType("broker_api.orders")
+        kite_orders = _stub_module("broker_api.orders")
 
         try:
             from pydantic import BaseModel
@@ -153,10 +163,9 @@ def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
         kite_orders.ChargesOrderInput = ChargesOrderInput
         kite_orders.OrderMarginInput = OrderMarginInput
         kite_orders.OrdersService = OrdersService
-        sys.modules["broker_api.orders"] = kite_orders
 
     if "broker_api.kite_session" not in sys.modules:
-        kite_session = types.ModuleType("broker_api.kite_session")
+        kite_session = _stub_module("broker_api.kite_session")
 
         class KiteSession:
             pass
@@ -188,4 +197,3 @@ def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
         kite_session.build_kite_client = build_kite_client
         kite_session.get_system_access_token = get_system_access_token
         kite_session.get_kite_session_id = get_kite_session_id
-        sys.modules["broker_api.kite_session"] = kite_session
