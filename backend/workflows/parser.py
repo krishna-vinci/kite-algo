@@ -34,6 +34,8 @@ from .models import (
     InstrumentRef,
     Operand,
     Stage,
+    UniverseRef,
+    UniverseSpec,
     WorkflowDocument,
 )
 
@@ -47,7 +49,29 @@ _DURATION_RE = re.compile(r"^(\d+)\s*([smhd])$")
 _DURATION_UNITS_S = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 # Proposal-v1 names normalized into the v2 contract.
-_EVALUATE_ON_TO_CLOCK = {"ltp": "ltp", "candle_close": "candle_close"}
+# "fundamentals_refresh" maps to candle_close: fundamentals conditions use
+# the latest snapshot (with acquisition metadata) evaluated on candle events
+# — a dedicated fundamentals stream is an explicit Phase 2 scope limitation.
+_EVALUATE_ON_TO_CLOCK = {
+    "ltp": "ltp",
+    "candle_close": "candle_close",
+    "fundamentals_refresh": "candle_close",
+}
+
+# Timeframe shorthand -> Kite interval names.
+_TIMEFRAME_ALIASES = {
+    "1m": "minute",
+    "1minute": "minute",
+    "3m": "3minute",
+    "5m": "5minute",
+    "10m": "10minute",
+    "15m": "15minute",
+    "30m": "30minute",
+    "60m": "60minute",
+    "1h": "60minute",
+    "1d": "day",
+    "daily": "day",
+}
 _ON_SIGNAL = "on_signal"
 
 
@@ -220,8 +244,8 @@ def _parse_document(obj: dict) -> WorkflowDocument:
     _check_keys(
         obj,
         {"version", "name", "instruments", "stages", "alerts", "data_policy",
-         "session", "timezone", "universe"},  # timezone/universe: reserved,
-        "document",                           # validated at compile (issues)
+         "session", "timezone", "universe"},  # timezone stays reserved;
+        "document",                           # universe is typed below
     )
 
     version = obj.get("version")
@@ -259,6 +283,12 @@ def _parse_document(obj: dict) -> WorkflowDocument:
 
     data_policy = _data_policy(obj.get("data_policy", {}))
 
+    universe = (
+        _universe_spec(obj["universe"])
+        if "universe" in obj and obj["universe"] not in (None, {}, [])
+        else None
+    )
+
     document = WorkflowDocument(
         version=1,
         name=name,
@@ -267,15 +297,67 @@ def _parse_document(obj: dict) -> WorkflowDocument:
         stages=stages,
         alerts=alerts,
         data_policy=data_policy,
+        universe=universe,
     )
     # Reserved top-level keys are outside the frozen dataclass model but must
     # still reach the compiler so unsupported values fail *validation* (issue
     # list) instead of being silently ignored. Parser-only channel; equality,
     # canonical JSON and the canonical hash are unaffected.
-    reserved = {key: obj[key] for key in ("universe", "timezone") if key in obj}
+    reserved = {key: obj[key] for key in ("timezone",) if key in obj}
     if reserved:
         object.__setattr__(document, "_reserved", reserved)
     return document
+
+
+def _universe_ref(raw: Any, path: str) -> UniverseRef:
+    if not isinstance(raw, dict):
+        raise _fail(path, f"universe reference must be a mapping, got {raw!r}")
+    _check_keys(raw, {"kind", "name", "universe", "index", "watchlist"}, path)
+    if "kind" in raw:
+        kind = _require_str(raw, "kind", path)
+        if kind not in ("universe", "index", "watchlist"):
+            raise _fail(f"{path}.kind", f"unknown universe reference kind '{kind}'")
+        return UniverseRef(kind=kind, name=_require_str(raw, "name", path))
+    for kind in ("universe", "index", "watchlist"):
+        if kind in raw:
+            return UniverseRef(kind=kind, name=_require_str(raw, kind, path))
+    raise _fail(path, "universe reference requires 'universe', 'index', or 'watchlist'")
+
+
+def _universe_spec(raw: Any) -> UniverseSpec:
+    if not isinstance(raw, dict):
+        raise _fail("document.universe", "must be a mapping")
+    _check_keys(raw, {"union", "exclude", "deduplicate", "refs", "name"}, "document.universe")
+
+    refs_raw = None
+    if "union" in raw:
+        refs_raw = raw["union"]
+    elif "refs" in raw:
+        refs_raw = raw["refs"]
+    if refs_raw is None:
+        raise _fail("document.universe.union", "requires a 'union' list of references")
+    if not isinstance(refs_raw, list) or not refs_raw:
+        raise _fail("document.universe.union", "must be a non-empty list of references")
+    refs = tuple(
+        _universe_ref(item, f"document.universe.union[{i}]")
+        for i, item in enumerate(refs_raw)
+    )
+
+    exclude: tuple[UniverseRef, ...] = ()
+    if "exclude" in raw and raw["exclude"] is not None:
+        exclude_raw = raw["exclude"]
+        if not isinstance(exclude_raw, list):
+            raise _fail("document.universe.exclude", "must be a list of references")
+        exclude = tuple(
+            _universe_ref(item, f"document.universe.exclude[{i}]")
+            for i, item in enumerate(exclude_raw)
+        )
+
+    deduplicate = raw.get("deduplicate", True)
+    if not isinstance(deduplicate, bool):
+        raise _fail("document.universe.deduplicate", "must be a boolean")
+
+    return UniverseSpec(refs=refs, exclude=exclude, deduplicate=deduplicate)
 
 
 def _instrument(item: Any, path: str) -> InstrumentRef:
@@ -333,7 +415,11 @@ def _stage(raw: Any, index: int) -> Stage:
     path = f"document.stages.{sid}"
     _check_keys(
         raw,
-        {"id", "type", "clock", "timeframe", "conditions", "input", "evaluate_on"},
+        {
+            "id", "type", "clock", "timeframe", "conditions", "input", "evaluate_on",
+            "any", "not", "any_conditions", "not_conditions",
+            "function", "params", "stage_params", "source", "source_field",
+        },
         path,
     )
 
@@ -354,11 +440,39 @@ def _stage(raw: Any, index: int) -> Stage:
         raise _fail(path, "stage requires 'clock' (or 'evaluate_on')")
 
     timeframe = _optional_str(raw, "timeframe", path)
+    if timeframe is not None:
+        timeframe = _TIMEFRAME_ALIASES.get(timeframe.strip().lower(), timeframe)
     stage_input = _optional_str(raw, "input", path)
 
-    if "conditions" not in raw:
+    function = _optional_str(raw, "function", path)
+    stage_params_raw = raw.get("params", raw.get("stage_params"))
+    if stage_params_raw is not None and not isinstance(stage_params_raw, dict):
+        raise _fail(f"{path}.params", "must be a mapping")
+    stage_params = dict(stage_params_raw or {})
+    if "stage_params" in raw and "params" in raw and raw["stage_params"] != raw["params"]:
+        raise _fail(f"{path}.stage_params", "conflicts with params")
+    source_field = _optional_str(raw, "source", path) or _optional_str(raw, "source_field", path)
+    if "source" in raw and "source_field" in raw and raw["source"] != raw["source_field"]:
+        raise _fail(f"{path}.source_field", "conflicts with source")
+
+    has_conditions = "conditions" in raw
+    has_groups = any(key in raw for key in ("any", "not", "any_conditions", "not_conditions"))
+    if not has_conditions and not has_groups and stage_type != "feature":
         raise _fail(path, "stage requires 'conditions'")
-    conditions = _conditions(raw["conditions"], f"{path}.conditions")
+
+    conditions: tuple[Condition, ...] = ()
+    any_conditions: tuple[Condition, ...] = ()
+    not_conditions: tuple[Condition, ...] = ()
+    if has_conditions:
+        conditions = _conditions(raw["conditions"], f"{path}.conditions", group="all")
+    if "any" in raw or "any_conditions" in raw:
+        items = raw.get("any", raw.get("any_conditions"))
+        any_conditions = _condition_list(items, f"{path}.any")
+    if "not" in raw or "not_conditions" in raw:
+        items = raw.get("not", raw.get("not_conditions"))
+        if isinstance(items, dict) or isinstance(items, Condition):
+            items = [items]
+        not_conditions = _condition_list(items, f"{path}.not")
 
     return Stage(
         id=sid,
@@ -367,24 +481,35 @@ def _stage(raw: Any, index: int) -> Stage:
         timeframe=timeframe,
         conditions=conditions,
         input=stage_input,
+        any_conditions=any_conditions,
+        not_conditions=not_conditions,
+        function=function,
+        stage_params=stage_params,
+        source_field=source_field,
     )
 
 
-def _conditions(raw: Any, path: str) -> tuple[Condition, ...]:
+def _conditions(raw: Any, path: str, *, group: str = "all") -> tuple[Condition, ...]:
     if isinstance(raw, dict):
         for key in raw:
-            if not isinstance(key, str) or key != "all":
+            if not isinstance(key, str) or key not in ("all", "any", "not"):
                 raise _unknown_field(path, key)
-        if "all" not in raw:
+        if group not in raw:
             # `conditions: {}` and friends must name the path, not KeyError.
-            raise _fail(path, "must be a mapping with an 'all' list of conditions")
-        items = raw["all"]
+            raise _fail(path, f"must be a mapping with an '{group}' list of conditions")
+        items = raw[group]
     elif isinstance(raw, list):
         items = raw
     else:
-        raise _fail(path, "must be a mapping with 'all' or a list of conditions")
+        raise _fail(path, "must be a mapping with 'all'/'any'/'not' or a list of conditions")
+    return _condition_list(items, path)
+
+
+def _condition_list(items: Any, path: str) -> tuple[Condition, ...]:
     if not isinstance(items, list):
-        raise _fail(f"{path}.all", "must be a list of conditions")
+        raise _fail(path, "must be a list of conditions")
+    if len(items) > 1 and path.endswith(".not"):
+        raise _fail(path, "a 'not' group takes exactly one condition")
     return tuple(_condition(item, f"{path}[{i}]") for i, item in enumerate(items))
 
 
@@ -434,8 +559,8 @@ def _operand(raw: Any, path: str) -> Operand:
         raise _fail(path, f"operand must be a number or a mapping, got {raw!r}")
 
     if "kind" in raw:
-        # explicit (serialized) form: {kind, name, value, params}
-        _check_keys(raw, {"kind", "name", "value", "params"}, path)
+        # explicit (serialized) form: {kind, name, value, params, source, offset}
+        _check_keys(raw, {"kind", "name", "value", "params", "source", "offset"}, path)
         kind = _require_str(raw, "kind", path)
         if kind not in ("field", "value", "indicator"):
             raise _fail(f"{path}.kind", f"unknown operand kind '{kind}'")
@@ -446,7 +571,16 @@ def _operand(raw: Any, path: str) -> Operand:
         params_raw = raw.get("params", {})
         if not isinstance(params_raw, dict):
             raise _fail(f"{path}.params", "must be a mapping")
-        return Operand(kind=kind, name=name, value=value, params=dict(params_raw))
+        offset_raw = raw.get("offset")
+        offset = offset_raw if isinstance(offset_raw, int) and not isinstance(offset_raw, bool) else None
+        return Operand(
+            kind=kind,
+            name=name,
+            value=value,
+            params=dict(params_raw),
+            source=_optional_str(raw, "source", path),
+            offset=offset,
+        )
 
     # lenient shorthand form: {field}|{indicator}|{value} plus extra keys that
     # become indicator params (e.g. {indicator: ema, period: 200}) or capture
@@ -471,7 +605,16 @@ def _operand(raw: Any, path: str) -> Operand:
     if indicator is not None:
         if not isinstance(indicator, str) or not indicator:
             raise _fail(f"{path}.indicator", f"must be a non-empty string, got {indicator!r}")
-        return Operand(kind="indicator", name=indicator, params=params)
+        source = params.pop("source", None)
+        offset = params.pop("offset", None)
+        offset_val = offset if isinstance(offset, int) and not isinstance(offset, bool) else None
+        return Operand(
+            kind="indicator",
+            name=indicator,
+            params=params,
+            source=source if isinstance(source, str) else None,
+            offset=offset_val,
+        )
     if value is not None:
         return Operand(kind="value", value=_number(value, f"{path}.value"), params=params)
     # future expression syntax: capture whole mapping as an unnamed indicator

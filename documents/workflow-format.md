@@ -1,8 +1,8 @@
-# Workflow format — Phase 1 authoring contract
+# Workflow format — authoring contract (Phase 1 + Phase 2)
 
 The canonical definition is a JSON document; YAML is its human-editable representation. Files describe **what to monitor**; the API decides **what runs** (import always creates a draft; activation is an explicit API call). Any capability listed as unsupported fails validation with a named issue instead of being partially interpreted.
 
-Status: implemented subset of [spec v2](../docs/superpowers/specs/2026-09-08-alerts-platform-spec-v2.md). Schema version: `1`.
+Status: implemented subset of [spec v2](../docs/superpowers/specs/2026-09-08-alerts-platform-spec-v2.md) — Phase 1 (F1–F6, F11) plus Phase 2 (F7 universes, F8 shared indicators and layered conditions). Schema version: `1`. Executable capabilities are discoverable at `GET /api/worker/workflows/capabilities`.
 
 ## Document shape
 
@@ -47,6 +47,69 @@ the exchange of every instrument in the document, so MCX workflows should
 declare `session: mcx_commodity` rather than relying on the NSE default.
 
 Boolean shorthand `repeat: true/false` maps to `on_transition`/`once` and conflicts with an explicit `trigger`.
+
+## Phase 2 — universes, shared features, layered stages
+
+### Universe membership (F7)
+
+A document may declare a membership expression instead of (or in addition to) explicit `instruments`. References combine by UNION and are deduplicated exchange-qualified:
+
+```yaml
+universe:
+  union:
+    - universe: my-watchlist   # a saved universe (API-managed; owner-scoped)
+    - index: nifty50           # an index constituent source list
+  exclude:
+    - universe: illiquid-names
+  deduplicate: true            # default true
+```
+
+`EXCHANGE:SYMBOL` identity is preserved throughout: the same text on NSE and BSE stays distinct. Membership resolves against the published catalog; non-active members are reported in coverage (`rejected` with reasons), never silently dropped. New members are admitted with a fresh observation epoch — warmup gates their first signal; departed members are paused (history retained) and their subscriptions released. Every event records the membership revision in force at evaluation time. A failed membership resolution keeps the last valid membership (degraded, visible in worker health) and never materializes an empty union.
+
+Universes are managed (and previews resolved without side effects) via `/api/worker/universes`; portfolio-derived universes are owner-scoped and read-only.
+
+### Shared features and layered stages (F8)
+
+Stage types: `signal` (fires alerts), `filter` (a condition layer that gates downstream stages), `feature` (declares a shared computed indicator). Layered chains use `input` (bounded depth 8, acyclic); a filter chain must all hold — evaluated under three-valued logic.
+
+```yaml
+stages:
+  - id: trend                      # a shared feature stage
+    type: feature
+    clock: candle_close
+    timeframe: day
+    function: ema
+    params: {period: 200}
+  - id: breakout
+    type: signal
+    input: trend                   # ancestor filters gate this stage
+    clock: candle_close
+    timeframe: 5minute
+    conditions:
+      all:
+        - {left: {indicator: ema, period: 20},
+           op: crosses_above,
+           right: {indicator: ema, period: 50}}
+        - {left: {field: volume},
+           op: gt,
+           right: {multiply: [2, {indicator: sma, source: volume, period: 20, offset: 1}]}}
+      any:
+        - {left: {field: close}, op: gt, right: {value: 100}}
+      not:
+        - {left: {field: fundamentals.latest_roce_pct}, op: lt, right: {value: 0}}
+```
+
+- **Inline indicators**: `{indicator: <function>, period: ..., source: <field>, offset: <bars>, output: <key>}`. Supported functions: `sma ema wma rsi macd atr bollinger supertrend vwap_session volume_sma volume_ratio` (see `capabilities`). Numerics match the worker SDK fixtures (verified to ≤1e-9).
+- **Feature identity**: (instrument, timeframe, function, canonical parameters, source field, offset, output, calculation version). Identical dependencies compute ONCE per market event in the engine and fan out to every dependent rule; rule-specific trigger state stays in checkpoints.
+- **Stage references**: `{indicator: "stage:<feature-stage-id>"}` use a feature stage's value/timeframe.
+- **Bounded arithmetic**: `add subtract multiply divide` over operands (depth ≤ 3); division by zero/unknown is **unknown** (E-26), never an error.
+- **Three-valued groups**: `all` AND, `any` OR, `not` negation with unknown propagation — unknown AND true = unknown; a rule with any unknown group never fires (E-15).
+- **Warmup and confirmations**: features compute over COMPLETED candles only; a `day`-timeframe feature never sees a forming daily candle (E-16). Insufficient history is unknown with warmup progress in health. VWAP resets per session using the worker session policy — MCX/currency VWAP never silently uses NSE boundaries.
+- **Layered clocks**: an ancestor filter evaluated on a different timeframe consumes that timeframe's latest COMPLETED bar snapshot (never a forming candle); fundamentals conditions use the latest snapshot with acquisition metadata evaluated on candle events (documented scope decision — there is no fundamentals event stream).
+
+### Delivery storm controls (E-25)
+
+Per (workflow, alert) rolling emissions budget (`ALERTS_DELIVERY_BUDGET_PER_WINDOW`, default 60 per 60 s). Excess emissions are suppressed with reason `storm_budget` and reported; admitted members start silent until warmed, so membership expansion cannot manufacture an alert storm.
 
 ## Operators
 

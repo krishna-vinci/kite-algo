@@ -57,8 +57,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from backend.alerts.types import Condition, Operand, Stage
+from backend.workflows import registry
 
 __all__ = ["Observation", "PredicateResult", "evaluate_condition", "evaluate_stage"]
+
+# Feature-stage ids referenced by operand kind "indicator" with name set to
+# a stage id ("stage:" prefix disambiguates from inline indicator functions).
+_STAGE_REF_PREFIX = "stage:"
 
 _OBSERVATION_FIELDS = ("ltp", "open", "high", "low", "close", "volume")
 
@@ -106,6 +111,56 @@ class PredicateResult:
     state: dict                  # new persistent state ({conds: {cond_key: {...}}})
 
 
+def feature_operand_id(operand: Operand) -> Optional[str]:
+    """Canonical feature key for an inline indicator operand.
+
+    Matches the identity used by the feature engine: ``function:params_json:
+    source`` plus an optional ``@offset`` suffix. Stage references (name
+    starting with ``stage:``) resolve by that stage id directly.
+    """
+    if operand is None or operand.kind != "indicator":
+        return None
+    if operand.name and operand.name.startswith(_STAGE_REF_PREFIX):
+        return operand.name
+    if not operand.name:
+        return None  # expression operands are evaluated structurally
+    source = operand.source or "close"
+    base = registry.feature_feature_id(operand.name, operand.params or {}, source)
+    return f"{base}@{operand.offset}" if operand.offset else base
+
+
+def _resolve_arithmetic(operand: Operand, resolve) -> Optional[float]:
+    """Evaluate a bounded arithmetic operand with unknown propagation."""
+    op_name = next(
+        (k for k in (operand.params or {}) if k in registry.ARITHMETIC_OPS), None
+    )
+    if op_name is None:
+        return None
+    args = operand.params[op_name]
+    if not isinstance(args, list) or len(args) != registry.ARITHMETIC_OPS[op_name]["arity"]:
+        return None
+    from backend.workflows.compiler import _coerce_expression_arg
+
+    values = []
+    for arg in args:
+        child = _coerce_expression_arg(arg)
+        value = resolve(child)
+        if value is None:
+            return None  # unknown propagates through arithmetic
+        values.append(value)
+    a, b = values
+    if op_name == "add":
+        return a + b
+    if op_name == "subtract":
+        return a - b
+    if op_name == "multiply":
+        return a * b
+    # divide: zero/invalid denominator is unknown, never an error (E-26)
+    if abs(b) < 1e-12:
+        return None
+    return a / b
+
+
 def _operand_key(operand: Operand) -> str:
     """Canonical key fragment for one operand."""
     if operand is None:
@@ -124,7 +179,10 @@ def cond_key(cond: Condition) -> str:
 
 
 def _resolve_operand(
-    operand: Operand, obs: Observation, context: Optional[dict] = None
+    operand: Operand,
+    obs: Observation,
+    context: Optional[dict] = None,
+    features: Optional[dict] = None,
 ) -> Optional[float]:
     """Resolve an operand to a float, or None when unknown."""
     if operand is None:
@@ -133,13 +191,48 @@ def _resolve_operand(
         return operand.value
     if operand.kind == "field":
         if operand.name in _OBSERVATION_FIELDS:
-            return getattr(obs, operand.name)
+            value = getattr(obs, operand.name)
+            if value is not None:
+                return value
+            # Layered snapshot fallback: a filter stage on an upstream
+            # timeframe resolves its bar fields from the feature engine's
+            # latest COMPLETED bar of that timeframe (never a forming candle).
+            if features:
+                snapshot_value = features.get(f"field:{operand.name}")
+                if isinstance(snapshot_value, (int, float)) and not isinstance(snapshot_value, bool):
+                    return float(snapshot_value)
+            return None
         if operand.name in _CONTEXT_FIELDS and context:
             value = context.get(operand.name)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 return float(value)
+        if isinstance(operand.name, str) and operand.name.startswith("fundamentals."):
+            # Latest fundamentals snapshot, resolved from context; absent
+            # data is unknown, never false.
+            if context:
+                value = context.get(operand.name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return float(value)
+            return None
         return None  # unknown field / missing context entry
-    return None  # indicator operands are unsupported in Phase 1 -> unknown
+    # indicator operand: stage reference or inline feature / expression
+    if operand.name and operand.name.startswith(_STAGE_REF_PREFIX):
+        if features and operand.name in features:
+            value = features[operand.name]
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+        return None
+    if operand.name:
+        feature_id = feature_operand_id(operand)
+        if feature_id and features and feature_id in features:
+            value = features[feature_id]
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+        return None  # feature value not available for this event
+    return _resolve_arithmetic(
+        operand,
+        lambda child: _resolve_operand(child, obs, context, features),
+    )
 
 
 def _left_key(operand: Operand) -> str:
@@ -196,21 +289,21 @@ def _compare(op: str, cur: float, level: float) -> bool:
     return cur <= level  # lte
 
 
-def _evaluate_level_op(cond, obs, sub, context):
-    level = _resolve_operand(cond.right, obs, context)
+def _evaluate_level_op(cond, obs, sub, context, features):
+    level = _resolve_operand(cond.right, obs, context, features)
     if level is None:
         return None
-    cur = _resolve_operand(cond.left, obs, context)
+    cur = _resolve_operand(cond.left, obs, context, features)
     matched = _compare(cond.op, cur, level)
     evidence = {_left_key(cond.left): cur, "level": level}
     return matched, False, evidence, sub
 
 
-def _evaluate_cross_op(cond, obs, sub, context):
-    level = _resolve_operand(cond.right, obs, context)
+def _evaluate_cross_op(cond, obs, sub, context, features):
+    level = _resolve_operand(cond.right, obs, context, features)
     if level is None:
         return None
-    cur = _resolve_operand(cond.left, obs, context)
+    cur = _resolve_operand(cond.left, obs, context, features)
     is_above = cond.op == "crosses_above"
     prev = sub.get("prev")
     matched = cur >= level if is_above else cur <= level
@@ -225,13 +318,13 @@ def _evaluate_cross_op(cond, obs, sub, context):
     return matched, fired, evidence, sub
 
 
-def _evaluate_within(cond, obs, sub, context):
+def _evaluate_within(cond, obs, sub, context, features):
     right = cond.right
     lo = right.value if right.value is not None else right.params.get("lo")
     hi = right.params.get("hi")
     if lo is None or hi is None:
         return None
-    cur = _resolve_operand(cond.left, obs, context)
+    cur = _resolve_operand(cond.left, obs, context, features)
     matched = lo <= cur <= hi
     was_inside = sub.get("within")
     fired = was_inside is False and matched
@@ -240,11 +333,11 @@ def _evaluate_within(cond, obs, sub, context):
     return matched, fired, evidence, sub
 
 
-def _evaluate_pct_op(cond, obs, sub, context):
-    threshold = _resolve_operand(cond.right, obs, context)
+def _evaluate_pct_op(cond, obs, sub, context, features):
+    threshold = _resolve_operand(cond.right, obs, context, features)
     if threshold is None:
         return None
-    cur = _resolve_operand(cond.left, obs, context)
+    cur = _resolve_operand(cond.left, obs, context, features)
     baseline = sub.get("baseline")
     if baseline is None:
         if cur == 0:
@@ -267,11 +360,11 @@ def _evaluate_pct_op(cond, obs, sub, context):
     return matched, fired, evidence, sub
 
 
-def _evaluate_break_op(cond, obs, sub, context):
-    level = _resolve_operand(cond.right, obs, context)
+def _evaluate_break_op(cond, obs, sub, context, features):
+    level = _resolve_operand(cond.right, obs, context, features)
     if level is None:
         return None
-    cur = _resolve_operand(cond.left, obs, context)
+    cur = _resolve_operand(cond.left, obs, context, features)
     is_high = cond.op == "breaks_prev_high"
     seen_key = "prev_day_high_seen" if is_high else "prev_day_low_seen"
     broken_key = "prev_day_high_broken" if is_high else "prev_day_low_broken"
@@ -316,13 +409,14 @@ def evaluate_condition(
     obs: Observation,
     state: dict,
     context: Optional[dict] = None,
+    features: Optional[dict] = None,
 ) -> PredicateResult:
     """Evaluate one condition against an observation with explicit state.
 
     The condition reads and writes ONLY ``state["conds"][cond_key]``; the
     rest of the state is passed through untouched.
     """
-    if _resolve_operand(cond.left, obs, context) is None:
+    if _resolve_operand(cond.left, obs, context, features) is None:
         return _unknown(state)
     key = cond_key(cond)
     family = _op_family(cond.op)
@@ -330,7 +424,7 @@ def evaluate_condition(
     if evaluator is None:
         return _unknown(state)  # unknown operator -> unknown (compiler rejects earlier)
     sub = _begin_observation(state, key, obs)
-    outcome = evaluator(cond, obs, sub, context)
+    outcome = evaluator(cond, obs, sub, context, features)
     if outcome is None:
         return _unknown(state)  # unknown operand: state completely unchanged
     matched, fired, cond_evidence, new_sub = outcome
@@ -342,28 +436,75 @@ def evaluate_condition(
     )
 
 
+def _combine_all(matched_list):
+    """Three-valued AND: False dominates, then unknown, else True."""
+    if any(m is False for m in matched_list):
+        return False
+    if any(m is None for m in matched_list):
+        return None
+    return all(m is True for m in matched_list)
+
+
+def _combine_any(matched_list):
+    """Three-valued OR: True dominates, then unknown, else False."""
+    if any(m is True for m in matched_list):
+        return True
+    if any(m is None for m in matched_list):
+        return None
+    return False
+
+
+def _combine_not(matched_list):
+    """Three-valued NOT over a single-condition group."""
+    if not matched_list:
+        return True
+    m = matched_list[0]
+    if m is None:
+        return None
+    return not m
+
+
 def evaluate_stage(
     stage: Stage,
     obs: Observation,
     state: dict,
     context: Optional[dict] = None,
+    features: Optional[dict] = None,
 ) -> PredicateResult:
-    """AND-combine the stage's conditions; unknown propagates and blocks firing.
+    """Combine the stage's condition groups with three-valued logic.
 
-    Every condition is partitioned by its canonical key, so evaluating one
-    condition can never leak its updated state into another condition's
-    ``prev``/``baseline``/guard keys.
+    ``all`` groups AND, ``any`` groups OR, ``not`` groups negate; unknown
+    propagates (unknown AND true = unknown, NOT unknown = unknown) and a rule
+    with any unknown group result never fires. Every condition is partitioned
+    by its canonical key, so evaluating one condition can never leak its
+    updated state into another condition's ``prev``/``baseline``/guard keys.
     """
     working = dict(state)
     evidence: dict = {}
-    results = []
-    for cond in stage.conditions:
-        result = evaluate_condition(cond, obs, working, context)
-        results.append(result)
-        working = result.state
-        evidence.update(result.evidence)  # keys are cond keys: no clobbering
-    if any(r.matched is None for r in results):
+    group_matched = []
+    any_fired = False
+
+    def _run(group):
+        nonlocal working, any_fired
+        results = []
+        for cond in group:
+            result = evaluate_condition(cond, obs, working, context, features)
+            results.append(result)
+            working = result.state
+            evidence.update(result.evidence)  # keys are cond keys: no clobbering
+        matched_list = [r.matched for r in results]
+        fired_here = any(r.fired for r in results if r.matched is not None)
+        any_fired = any_fired or fired_here
+        return matched_list
+
+    group_matched.append(_combine_all(_run(stage.conditions)))
+    if stage.any_conditions:
+        group_matched.append(_combine_any(_run(stage.any_conditions)))
+    if stage.not_conditions:
+        group_matched.append(_combine_not(_run(stage.not_conditions)))
+
+    matched = _combine_all(group_matched)
+    if matched is None:
         return PredicateResult(matched=None, fired=False, evidence=evidence, state=working)
-    matched = all(r.matched is True for r in results)
-    fired = matched and any(r.fired for r in results)
+    fired = bool(matched) and any_fired
     return PredicateResult(matched, fired, evidence, working)

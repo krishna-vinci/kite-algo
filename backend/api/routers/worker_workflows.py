@@ -367,6 +367,55 @@ def _preview_evaluate(doc: WorkflowDocument, rows: List[Dict[str, Any]]) -> dict
     }
 
 
+async def workflow_capabilities(request: Request):
+    """Phase 2 discovery: only EXECUTABLE capabilities are exposed (F6/P2-D).
+
+    Compiler validation and this discovery endpoint read the same registry,
+    so a capability listed here is exactly one the worker can evaluate.
+    """
+    token, _ = await _authorize(request, "workflows:read")
+    _ = token
+    from backend.workflows import registry as wf_registry
+
+    features = {
+        name: {
+            "params": {
+                param: {"min": bounds[0], "max": bounds[1]}
+                for param, bounds in spec["params"].items()
+            },
+            "defaults": dict(spec.get("defaults", {})),
+            "inputs": list(spec["inputs"]),
+            "outputs": list(spec.get("outputs", ["value"])),
+        }
+        for name, spec in sorted(wf_registry.FEATURE_FUNCTIONS.items())
+    }
+    return {
+        "ok": True,
+        "capabilities": {
+            "operators": {name: spec.get("kind") for name, spec in sorted(wf_registry.OPERATORS.items())},
+            "fields": sorted(wf_registry.FIELDS),
+            "fundamentals_fields": sorted(wf_registry.FUNDAMENTALS_FIELDS),
+            "clocks": sorted(wf_registry.CLOCKS),
+            "triggers": sorted(wf_registry.TRIGGERS),
+            "timeframes": sorted(wf_registry.TIMEFRAMES),
+            "sessions": sorted(wf_registry.SESSIONS),
+            "features": features,
+            "arithmetic": sorted(wf_registry.ARITHMETIC_OPS),
+            "limits": {
+                "max_stages": 64,
+                "max_alerts": 256,
+                "max_instruments": 1000,
+                "max_feature_stages": wf_registry.MAX_FEATURE_STAGES,
+                "max_conditions_per_group": wf_registry.MAX_CONDITIONS_PER_GROUP,
+                "max_arithmetic_depth": wf_registry.MAX_ARITHMETIC_DEPTH,
+                "max_input_chain_depth": wf_registry.MAX_INPUT_CHAIN_DEPTH,
+            },
+            "stage_types": ["signal", "filter", "feature"],
+            "universe_ref_kinds": ["universe", "index", "watchlist"],
+        },
+    }
+
+
 async def validate_workflow(request: Request, payload: WorkflowValidateRequest):
     """Parse + compile a document and report issues. 200 even when invalid."""
     token, _ = await _authorize(request, "workflows:read")
@@ -1021,6 +1070,7 @@ def serialize_channel(channel: Any) -> ChannelResponse:
     )
 
 
+router.add_api_route("/capabilities", workflow_capabilities, methods=["GET"])
 router.add_api_route("/validate", validate_workflow, methods=["POST"], response_model=IssueEnvelope)
 router.add_api_route("/preview", preview_workflow, methods=["POST"], response_model=PreviewResponse)
 router.add_api_route("/import", import_workflow, methods=["POST"], response_model=WorkflowMutationResponse)

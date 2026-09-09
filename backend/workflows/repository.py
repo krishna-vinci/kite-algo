@@ -315,12 +315,39 @@ class SqlAlchemyWorkflowRepository:
         session.add(workflow)
         session.add(revision)
         try:
-            session.flush()
+            # Savepoint: losing an idempotency race must not poison the
+            # session, so the E-29 replay lookup below can still run.
+            with session.begin_nested():
+                session.flush()
         except IntegrityError as exc:
+            if idempotency_key:
+                session.rollback()
+                replayed = self._replay_idempotent_workflow(
+                    session, idempotency_key, name,
+                )
+                if replayed is not None:
+                    return replayed
             raise DomainConflict(
                 f"workflow {name!r} already exists for owner {owner_id!r}"
             ) from exc
         return workflow, revision
+
+    @staticmethod
+    def _replay_idempotent_workflow(session, idempotency_key, name):
+        existing = session.execute(
+            select(Workflow).where(Workflow.idempotency_key == idempotency_key)
+        ).scalar_one_or_none()
+        if existing is None or existing.name != name:
+            return None
+        latest = session.execute(
+            select(WorkflowRevision)
+            .where(WorkflowRevision.workflow_id == existing.id)
+            .order_by(WorkflowRevision.revision.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if latest is None:
+            return None
+        return existing, latest
 
     def add_draft_revision(
         self,

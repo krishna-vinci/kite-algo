@@ -95,8 +95,9 @@ def test_hash_changes_when_indicator_param_changes() -> None:
     ema20 = parse_workflow_dict(_with_ema_indicator(20))
     ema50 = parse_workflow_dict(_with_ema_indicator(50))
     assert canonical_json(ema20) != canonical_json(ema50)
-    with pytest.raises(WorkflowValidationError):
-        compile_document(ema20)
+    # the hash identity itself is what matters; Phase 2 supports ema params
+    compile_document(ema20)
+    compile_document(ema50)
 
 
 def test_compile_raises_with_issues_naming_offending_stage() -> None:
@@ -124,10 +125,16 @@ def test_unknown_field_operand_reports_unknown_field() -> None:
 
 
 def test_namespaced_future_field_reports_unknown_capability() -> None:
+    """Phase 2 supports an explicit fundamentals allowlist; unknown dotted
+    domains are still rejected with unknown_capability."""
     obj = _minimal_doc()
     obj["stages"][0]["conditions"]["all"][0]["left"] = {
         "field": "fundamentals.latest_roce_pct"
     }
+    doc = parse_workflow_dict(obj)
+    compile_document(doc)  # allowlisted fundamentals field
+
+    obj["stages"][0]["conditions"]["all"][0]["left"] = {"field": "options.iv_rank"}
     doc = parse_workflow_dict(obj)
     with pytest.raises(WorkflowValidationError) as exc:
         compile_document(doc)
@@ -197,9 +204,9 @@ def test_stage_input_missing_reference_rejected() -> None:
     assert any(issue.code == "missing_reference" for issue in exc.value.issues)
 
 
-def test_acyclic_input_chain_parses_but_flags_unknown_capability() -> None:
-    """Upstream stage evaluation is unimplemented in Phase 1: a *resolved*
-    ``input`` reference must fail compile with ``unknown_capability``."""
+def test_acyclic_input_chain_compiles_under_phase2() -> None:
+    """Phase 2 supports layered stage chains: a resolved ``input`` reference
+    compiles; only unknown upstream ids are rejected."""
     obj = _minimal_doc()
     obj["stages"].append(
         {
@@ -212,12 +219,13 @@ def test_acyclic_input_chain_parses_but_flags_unknown_capability() -> None:
     )
     obj["alerts"].append({"id": "a2", "source": "px2"})
     doc = parse_workflow_dict(obj)
+    compile_document(doc)
+
+    obj["stages"][1]["input"] = "missing-stage"
+    doc = parse_workflow_dict(obj)
     with pytest.raises(WorkflowValidationError) as exc:
         compile_document(doc)
-    assert any(
-        issue.code == "unknown_capability" and ".input" in issue.where
-        for issue in exc.value.issues
-    )
+    assert any(issue.code == "missing_reference" for issue in exc.value.issues)
 
 
 def test_oversized_stage_count_rejected() -> None:

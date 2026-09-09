@@ -186,11 +186,21 @@ def test_candle_close_without_timeframe_rejected() -> None:
 def test_unsupported_timeframe_rejected() -> None:
     obj = _minimal_doc()
     obj["stages"][0]["clock"] = "candle_close"
-    obj["stages"][0]["timeframe"] = "1d"
+    # "1d" normalizes to the supported "day"; a genuinely unknown interval
+    # is still rejected.
+    obj["stages"][0]["timeframe"] = "2h"
     doc = parse_workflow_dict(obj)
     with pytest.raises(WorkflowValidationError) as exc:
         compile_document(doc)
     assert any(issue.code == "timeframe_unsupported" for issue in exc.value.issues)
+
+
+def test_timeframe_shorthand_normalizes() -> None:
+    obj = _minimal_doc()
+    obj["stages"][0]["clock"] = "candle_close"
+    obj["stages"][0]["timeframe"] = "1d"
+    doc = parse_workflow_dict(obj)
+    assert doc.stages[0].timeframe == "day"
 
 
 def test_duplicate_stage_and_alert_ids_rejected() -> None:
@@ -218,26 +228,25 @@ def test_quality_momentum_parses_despite_future_capabilities() -> None:
     assert doc.name == "quality-momentum"
     assert [stage.id for stage in doc.stages] == ["quality", "trend", "breakout"]
     # proposal shorthand: evaluate_on -> clock, on_signal -> on_transition,
-    # cooldown: 30m -> cooldown_s = 1800
-    assert doc.stages[0].clock == "fundamentals_refresh"
+    # cooldown: 30m -> cooldown_s = 1800. "fundamentals_refresh" maps to
+    # candle_close (latest-snapshot fundamentals evaluated on candle events).
+    assert doc.stages[0].clock == "candle_close"
     assert doc.stages[1].clock == "candle_close"
     assert doc.alerts[0].trigger == "on_transition"
     assert doc.alerts[0].cooldown_s == 1800
     assert doc.instruments == ()
 
 
-def test_quality_momentum_flags_unknown_capabilities() -> None:
+def test_quality_momentum_compiles_under_phase2_capabilities() -> None:
+    """Phase 2 implements universes, fundamentals fields, indicators and
+    layered filter stages, so the reference fixture now compiles cleanly."""
     doc = parse_workflow_yaml(_fixture_text("quality-momentum.yaml"))
-    with pytest.raises(WorkflowValidationError) as exc:
-        compile_document(doc)
-    messages = " | ".join(issue.message for issue in exc.value.issues)
-    assert any(issue.code == "unknown_capability" for issue in exc.value.issues)
-    assert "fundamentals.quarterly_revenue_yoy_pct" in messages
-    assert any("ema" in issue.message for issue in exc.value.issues)
-    assert not exc.value.issues == [] and all(issue.where for issue in exc.value.issues)
+    compiled = compile_document(doc)
+    assert compiled.canonical_hash
 
 
-def test_indicator_operand_reports_unknown_capability() -> None:
+def test_indicator_operand_validated_under_phase2() -> None:
+    """Known indicator functions compile; unknown functions are rejected."""
     obj = _minimal_doc()
     obj["stages"][0]["conditions"]["all"][0] = {
         "left": {"field": "close"},
@@ -247,6 +256,10 @@ def test_indicator_operand_reports_unknown_capability() -> None:
     doc = parse_workflow_dict(obj)
     assert doc.stages[0].conditions[0].right.kind == "indicator"
     assert doc.stages[0].conditions[0].right.params == {"period": 200}
+    compile_document(doc)  # ema is a supported Phase 2 feature function
+
+    obj["stages"][0]["conditions"]["all"][0]["right"] = {"indicator": "zigzag", "period": 14}
+    doc = parse_workflow_dict(obj)
     with pytest.raises(WorkflowValidationError) as exc:
         compile_document(doc)
     assert any(issue.code == "unknown_capability" for issue in exc.value.issues)
@@ -482,16 +495,14 @@ def test_malformed_documents_never_crash_or_pass_silently() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_universe_reports_unknown_capability_at_compile() -> None:
+def test_universe_spec_is_typed_at_compile() -> None:
+    """Phase 2 supports document-level universe membership expressions."""
     obj = _minimal_doc()
-    obj["universe"] = {"union": [{"index": "Nifty50"}]}
-    doc = parse_workflow_dict(obj)  # parsing stays lenient
-    with pytest.raises(WorkflowValidationError) as exc:
-        compile_document(doc)
-    assert any(
-        issue.code == "unknown_capability" and issue.where == "document.universe"
-        for issue in exc.value.issues
-    )
+    obj["universe"] = {"union": [{"index": "Nifty50"}], "deduplicate": True}
+    doc = parse_workflow_dict(obj)
+    assert doc.universe is not None
+    assert doc.universe.refs[0].kind == "index"
+    compile_document(doc)  # compiles; membership resolves at activation
 
 
 def test_empty_or_absent_universe_is_not_flagged() -> None:

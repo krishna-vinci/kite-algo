@@ -61,7 +61,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.alerts.engine import decide
-from backend.alerts.predicates import Observation, evaluate_stage
+from backend.alerts.predicates import Observation, PredicateResult, evaluate_stage
 from backend.workflows.models import AlertSpec, Stage, WorkflowDocument
 from backend.workflows.parser import WorkflowParseError, parse_workflow_dict
 from backend.workflows.repository import (
@@ -151,6 +151,17 @@ class EvaluationService:
         self._session_provider_with_context = self._supports_session_context(session_provider)
         self.owner_id = owner_id or f"evaluation-worker:{uuid.uuid4()}"
         self.ownership_lease_s = max(1.0, float(ownership_lease_s))
+        # E-25 delivery-storm budget: per (workflow, alert) rolling emissions
+        # window, worker-local (ownership fencing makes one live writer).
+        import os as _os
+        try:
+            self.delivery_budget_per_window = max(
+                1, int(_os.environ.get("ALERTS_DELIVERY_BUDGET_PER_WINDOW", "60"))
+            )
+        except ValueError:
+            self.delivery_budget_per_window = 60
+        self.delivery_budget_window_s = 60.0
+        self._emission_windows: dict = {}
 
     # ------------------------------------------------------------------
     # subscriptions
@@ -247,6 +258,106 @@ class EvaluationService:
             if owned:
                 session.close()
 
+    def sync_universe_members(
+        self,
+        revision: Any,
+        members: Sequence[str],
+        *,
+        universe_revision: Optional[int] = None,
+        db: Optional[Session] = None,
+    ) -> dict:
+        """Materialize one subscription per (alert, universe member) (F7).
+
+        New members are admitted with a fresh checkpoint (the initialization
+        guard keeps them silent until warmed); departed members are PAUSED
+        with a visible reason — their event history is retained. Returns
+        ``{"created": n, "departed": m}``.
+        """
+        try:
+            document = parse_workflow_dict(revision.document)
+        except (WorkflowParseError, ValueError, TypeError, AttributeError):
+            return {"created": 0, "departed": 0}
+
+        wanted: dict = {}
+        for alert in document.alerts:
+            for member in members:
+                key = str(member).strip().upper()
+                exchange, _, symbol = key.partition(":")
+                wanted[(alert.id, key)] = (symbol, exchange)
+
+        owned = db is None
+        session = db if db is not None else self.session_factory()
+        try:
+            existing = session.execute(
+                select(AlertSubscription).where(
+                    AlertSubscription.revision_id == revision.id,
+                    AlertSubscription.instrument_symbol == AlertSubscription.instrument_symbol,
+                )
+            ).scalars().all()
+            member_rows = [
+                row for row in existing
+                if isinstance(row.config or {}, dict) and row.config.get("universe_member")
+            ]
+            known_pairs = {(r.alert_id, r.instrument_key) for r in member_rows}
+            created = 0
+            for alert in document.alerts:
+                for (_alert_id, member), (symbol, exchange) in wanted.items():
+                    if (alert.id, member) in known_pairs:
+                        continue
+                    config = self._alert_config(alert)
+                    binding = self._resolve_catalog_binding(member, session)
+                    if binding is not None:
+                        config["instrument_binding"] = binding
+                    config["universe_member"] = True
+                    if universe_revision is not None:
+                        config["universe_revision"] = universe_revision
+                    session.add(
+                        AlertSubscription(
+                            id=str(uuid.uuid4()),
+                            revision_id=revision.id,
+                            alert_id=alert.id,
+                            stage_id=alert.source,
+                            instrument_symbol=symbol,
+                            instrument_exchange=exchange,
+                            instrument_key=member,
+                            trigger=alert.trigger,
+                            config=config,
+                            state="active",
+                        )
+                    )
+                    created += 1
+
+            departed = 0
+            wanted_keys = set(wanted.keys())
+            for row in member_rows:
+                if (row.alert_id, row.instrument_key) in wanted_keys:
+                    continue
+                if row.state == "active":
+                    config = dict(row.config or {})
+                    config["universe_departed"] = True
+                    row.config = config
+                    row.state = "paused"
+                    departed += 1
+            if owned:
+                session.commit()
+            if created or departed:
+                logger.info(
+                    "universe membership sync for revision %s: %d admitted, %d departed",
+                    revision.id, created, departed,
+                )
+            return {"created": created, "departed": departed}
+        except IntegrityError:
+            if owned:
+                session.rollback()
+            return {"created": 0, "departed": 0}
+        except Exception:
+            if owned:
+                session.rollback()
+            raise
+        finally:
+            if owned:
+                session.close()
+
     @staticmethod
     def _alert_config(alert: AlertSpec) -> dict:
         return {
@@ -298,6 +409,8 @@ class EvaluationService:
         db: Optional[Session] = None,
         allow_emit: bool = True,
         context: Optional[dict] = None,
+        features: Optional[dict] = None,
+        layers: Optional[list] = None,
     ) -> HandleResult:
         """Evaluate one observation for one active subscription.
 
@@ -313,6 +426,15 @@ class EvaluationService:
 
         ``context``: optional mapping (e.g. ``prev_day_high``/``prev_day_low``
         floats) passed through to the predicates for context-resolved levels.
+
+        ``features``: shared feature values (feature-id -> value) computed
+        once per market event by the FeatureEngine; indicator operands
+        resolve from here (Phase 2 F8).
+
+        ``layers``: ancestor filter stages of a layered chain, each as
+        ``(stage, features_dict)``. Their conditions are ANDed with the
+        stage's own conditions under three-valued logic; unknown upstream
+        never manufactures a firing. Evidence is recorded per layer.
         """
         document = self._parse_document(sub)
         if document is None:
@@ -403,7 +525,25 @@ class EvaluationService:
 
             session_active, session_id = self._resolve_session(sub, document, obs)
 
-            pred = evaluate_stage(stage, obs, state, context)
+            pred = evaluate_stage(stage, obs, state, context, features)
+            for layer_stage, layer_features in layers or ():
+                layer_result = evaluate_stage(
+                    layer_stage, obs, pred.state, context, layer_features
+                )
+                layer_evidence = {
+                    f"layer:{layer_stage.id}:{key}": value
+                    for key, value in layer_result.evidence.items()
+                }
+                pred = PredicateResult(
+                    matched=(
+                        None
+                        if pred.matched is None or layer_result.matched is None
+                        else (pred.matched and layer_result.matched)
+                    ),
+                    fired=bool(pred.fired and layer_result.matched is True),
+                    evidence={**pred.evidence, **layer_evidence},
+                    state=layer_result.state,
+                )
             engine_state = dict(pred.state)
             if stage.clock == "ltp" and observation_epoch_changed:
                 # Make the first observation of a new epoch pass through the
@@ -450,7 +590,25 @@ class EvaluationService:
             binding = (sub.config or {}).get("instrument_binding")
             if isinstance(binding, dict) and binding:
                 evidence["instrument_binding"] = dict(binding)
+            universe_revision = (sub.config or {}).get("universe_revision")
+            if universe_revision is not None:
+                # F7: events retain the membership revision in force at
+                # evaluation time.
+                evidence["universe_revision"] = universe_revision
+            if engine.emit and allow_emit and self._storm_budget_exceeded(sub, now):
+                suppression = "storm_budget"
+                engine_result = HandleResult(
+                    fired=bool(pred.fired or engine.emit),
+                    emitted=False,
+                    suppression_reason=suppression,
+                    rule_completed=False,
+                )
+                if owned:
+                    session.rollback()
+                self._log_suppression(sub, suppression)
+                return engine_result
             if engine.emit and allow_emit:
+                self._record_emission(sub, now)
                 self.workflow_repo.assert_evaluation_owner(
                     sub.id,
                     sub.instrument_key,
@@ -639,6 +797,21 @@ class EvaluationService:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+
+    def _storm_budget_exceeded(self, sub: ActiveSubscription, now: datetime) -> bool:
+        window = self._emission_windows.get((sub.workflow_id, sub.alert_id))
+        if not window:
+            return False
+        cutoff = now.timestamp() - self.delivery_budget_window_s
+        return sum(1 for ts in window if ts >= cutoff) >= self.delivery_budget_per_window
+
+    def _record_emission(self, sub: ActiveSubscription, now: datetime) -> None:
+        window = self._emission_windows.setdefault((sub.workflow_id, sub.alert_id), [])
+        window.append(now.timestamp())
+        cutoff = now.timestamp() - self.delivery_budget_window_s
+        del window[: max(0, len(window) - self.delivery_budget_per_window - 10)]
+        while window and window[0] < cutoff:
+            window.pop(0)
 
     @staticmethod
     def _reset_observation_state(state: dict) -> dict:

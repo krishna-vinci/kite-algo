@@ -645,6 +645,18 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         ),
     )
 
+    # Phase 2 (F7): universe membership resolution wired into the refresh
+    # pass; resolution cadence is decoupled from subscription refresh.
+    try:
+        from backend.workflows.universes import UniverseService
+
+        worker.universe_service = UniverseService(session_factory)
+        worker.universe_resolve_interval_s = max(
+            30.0, float(os.environ.get("ALERTS_UNIVERSE_RESOLVE_INTERVAL_S", "300"))
+        )
+    except Exception:
+        logger.warning("universe service unavailable; universe workflows inert", exc_info=True)
+
     # Supervised delivery task: drains the signal outbox so emitted alerts
     # actually reach their channels (default-on; env kill-switch).
     delivery_worker = None

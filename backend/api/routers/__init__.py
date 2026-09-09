@@ -3,6 +3,7 @@ from backend.api.routers.worker_auth import router as worker_auth_router
 from backend.api.routers.worker_execution import router as worker_execution_router
 from backend.api.routers.worker_market import router as worker_market_router
 from backend.api.routers.worker_notifications import router as worker_notifications_router
+from backend.api.routers.worker_universes import router as worker_universes_router
 from backend.api.routers.worker_protection import router as worker_protection_router
 from backend.api.routers.worker_workflows import router as worker_workflows_router
 from backend.api.routers.analytics import router as analytics_router
@@ -37,6 +38,7 @@ ALL_ROUTERS = [
     (worker_protection_router, "/api"),
     (worker_workflows_router, "/api"),
     (worker_notifications_router, "/api"),
+    (worker_universes_router, "/api"),
     (control_router, "/api"),
     (journal_router, "/api"),
     (analytics_router, "/api"),

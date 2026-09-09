@@ -7,6 +7,7 @@ instead of being partially interpreted. Keep this module dependency-free.
 
 from __future__ import annotations
 
+import json
 from typing import Mapping
 
 # Phase 1 operators. "kind" describes evaluation semantics:
@@ -70,6 +71,64 @@ SESSION_EXCHANGES: Mapping[str, frozenset[str]] = {
 }
 SESSIONS: frozenset[str] = frozenset(SESSION_EXCHANGES)
 
+# ---------------------------------------------------------------------------
+# Phase 2: shared feature functions (F8). "params" names required/allowed
+# parameters with bounds; "inputs" names the bar fields the function needs.
+# Numerics live in backend/alerts/features.py and match SDK fixtures.
+# ---------------------------------------------------------------------------
+FEATURE_FUNCTIONS: Mapping[str, dict] = {
+    "sma": {"params": {"period": (2, 500)}, "inputs": ("close",)},
+    "ema": {"params": {"period": (2, 500)}, "inputs": ("close",)},
+    "wma": {"params": {"period": (2, 500)}, "inputs": ("close",)},
+    "rsi": {"params": {"period": (2, 500)}, "inputs": ("close",)},
+    "macd": {
+        "params": {"fast": (2, 200), "slow": (3, 400), "signal": (2, 200)},
+        "defaults": {"fast": 12, "slow": 26, "signal": 9},
+        "inputs": ("close",),
+        "outputs": ("macd", "signal", "hist"),
+    },
+    "atr": {"params": {"period": (2, 500)}, "inputs": ("high", "low", "close")},
+    "bollinger": {
+        "params": {"period": (2, 500), "num_std": (0.1, 10.0)},
+        "defaults": {"num_std": 2.0},
+        "inputs": ("close",),
+        "outputs": ("mid", "upper", "lower"),
+    },
+    "supertrend": {
+        "params": {"period": (2, 500), "multiplier": (0.5, 20.0)},
+        "defaults": {"multiplier": 3.0},
+        "inputs": ("high", "low", "close"),
+        "outputs": ("value", "direction"),
+    },
+    "vwap_session": {"params": {}, "inputs": ("high", "low", "close", "volume")},
+    "volume_sma": {"params": {"period": (2, 500)}, "inputs": ("volume",)},
+    "volume_ratio": {"params": {"period": (2, 500), "offset": (0, 100)}, "defaults": {"offset": 0}, "inputs": ("volume",)},
+}
+
+# Bounded arithmetic operators for layered operands (spec F8): bounded depth
+# and width; division by zero/unknown denominators is unknown, never an error.
+ARITHMETIC_OPS: Mapping[str, dict] = {
+    "add": {"arity": 2},
+    "subtract": {"arity": 2},
+    "multiply": {"arity": 2},
+    "divide": {"arity": 2},
+}
+MAX_ARITHMETIC_DEPTH = 3
+MAX_CONDITIONS_PER_GROUP = 32
+MAX_FEATURE_STAGES = 8
+MAX_INPUT_CHAIN_DEPTH = 8
+
+# Fundamentals observation fields (latest snapshot with acquisition metadata).
+# Values are carried as context; replay never treats them as historical truth.
+FUNDAMENTALS_FIELDS: frozenset[str] = frozenset(
+    {
+        "fundamentals.quarterly_revenue_yoy_pct",
+        "fundamentals.latest_roce_pct",
+        "fundamentals.pe_ratio",
+        "fundamentals.market_cap",
+    }
+)
+
 CAPABILITIES: Mapping[str, object] = {
     "operators": OPERATORS,
     "fields": FIELDS,
@@ -77,7 +136,28 @@ CAPABILITIES: Mapping[str, object] = {
     "triggers": TRIGGERS,
     "timeframes": TIMEFRAMES,
     "sessions": SESSIONS,
+    "features": FEATURE_FUNCTIONS,
+    "arithmetic": ARITHMETIC_OPS,
 }
+
+
+def is_known_feature_function(name: object) -> bool:
+    return isinstance(name, str) and name in FEATURE_FUNCTIONS
+
+
+def is_known_arithmetic_op(name: object) -> bool:
+    return isinstance(name, str) and name in ARITHMETIC_OPS
+
+
+def feature_feature_id(function: str, params: Mapping[str, object], source_field: str) -> str:
+    """Canonical feature identity (function + sorted params + source field).
+
+    The calc version lives in backend.alerts.features.CALC_VERSION and the
+    timeframe/instrument are engine-side scope, so they are not repeated in
+    the per-document id.
+    """
+    canonical = json.dumps(dict(params), sort_keys=True, separators=(",", ":"), default=str)
+    return f"{function}:{canonical}:{source_field}"
 
 
 def is_known_operator(name: object) -> bool:

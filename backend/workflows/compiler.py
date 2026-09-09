@@ -34,6 +34,10 @@ MAX_STAGES = 64
 MAX_ALERTS = 256
 MAX_INSTRUMENTS = 1000
 MAX_CONDITIONS_PER_STAGE = 32
+MAX_FEATURE_STAGES = registry.MAX_FEATURE_STAGES
+MAX_CONDITIONS_PER_GROUP = registry.MAX_CONDITIONS_PER_GROUP
+MAX_ARITHMETIC_DEPTH = registry.MAX_ARITHMETIC_DEPTH
+MAX_INPUT_CHAIN_DEPTH = registry.MAX_INPUT_CHAIN_DEPTH
 
 
 # Allowed data_policy value sets (anything else is a bad_value issue).
@@ -164,6 +168,15 @@ def _validate(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:
                 "document.stages", "bad_value", f"too many stages ({len(doc.stages)} > {MAX_STAGES})"
             )
         )
+    feature_stage_count = sum(1 for stage in doc.stages if stage.type == "feature")
+    if feature_stage_count > MAX_FEATURE_STAGES:
+        _add(
+            ValidationIssue(
+                "document.stages",
+                "bad_value",
+                f"too many feature stages ({feature_stage_count} > {MAX_FEATURE_STAGES})",
+            )
+        )
     if len(doc.alerts) > MAX_ALERTS:
         _add(
             ValidationIssue(
@@ -171,8 +184,10 @@ def _validate(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:
             )
         )
 
+    _validate_universe(doc.universe, issues)
+
     stage_ids = _collect_ids(doc.stages, "stages", issues)
-    _validate_stages(doc.stages, stage_ids, issues)
+    _validate_stages(doc.stages, stage_ids, issues, doc_ref=doc)
     alert_ids = _collect_ids(doc.alerts, "alerts", issues)
     _validate_alerts(doc.alerts, alert_ids, stage_ids, issues)
 
@@ -181,15 +196,6 @@ def _validate_reserved(doc: WorkflowDocument, issues: list[ValidationIssue]) -> 
     """Reserved top-level keys never vanish silently: unsupported values fail
     validation with named issues (silent-capability rule)."""
     reserved = getattr(doc, "_reserved", None) or {}
-    if "universe" in reserved and reserved["universe"] not in (None, {}, []):
-        issues.append(
-            ValidationIssue(
-                "document.universe",
-                "unknown_capability",
-                "document-level 'universe' is not available in Phase 1 "
-                "(Phase 1 monitors explicit instruments only)",
-            )
-        )
     timezone_value = reserved.get("timezone")
     if "timezone" in reserved and timezone_value is not None and timezone_value != "Asia/Kolkata":
         issues.append(
@@ -217,21 +223,34 @@ def _collect_ids(items: tuple, label: str, issues: list[ValidationIssue]) -> set
     return ids
 
 
-def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: list[ValidationIssue]) -> None:
+def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: list[ValidationIssue], doc_ref=None) -> None:
     _add = issues.append
     for stage in stages:
         if not stage.id:
             continue  # already reported
         where = f"stages.{stage.id}"
 
-        if stage.type != "signal":
+        if stage.type not in ("signal", "filter", "feature"):
             _add(
                 ValidationIssue(
                     where,
                     "unknown_capability",
-                    f"stage type '{stage.type}' is not available in Phase 1 (only 'signal')",
+                    f"stage type '{stage.type}' is not available "
+                    "(supported: 'signal', 'filter', 'feature')",
                 )
             )
+
+        if stage.type == "feature":
+            _validate_feature_stage(stage, where, issues)
+        else:
+            if stage.function is not None:
+                _add(
+                    ValidationIssue(
+                        f"{where}.function",
+                        "bad_value",
+                        "'function' is only valid on feature stages",
+                    )
+                )
 
         if not registry.is_known_clock(stage.clock):
             _add(
@@ -244,13 +263,14 @@ def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: lis
             )
         elif stage.clock == "candle_close":
             if stage.timeframe is None:
-                _add(
-                    ValidationIssue(
-                        f"{where}.timeframe",
-                        "timeframe_missing",
-                        "clock 'candle_close' requires a timeframe",
+                if not _stage_is_fundamentals_only(stage):
+                    _add(
+                        ValidationIssue(
+                            f"{where}.timeframe",
+                            "timeframe_missing",
+                            "clock 'candle_close' requires a timeframe",
+                        )
                     )
-                )
             elif not registry.is_supported_timeframe(stage.timeframe):
                 _add(
                     ValidationIssue(
@@ -262,23 +282,33 @@ def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: lis
                 )
 
         if stage.input is not None and stage.input not in stage_ids:
-            _add(
-                ValidationIssue(
-                    f"{where}.input",
-                    "missing_reference",
-                    f"stage input references unknown stage '{stage.input}'",
+            if stage.input == "universe":
+                # The implicit membership source: valid when the document
+                # declares a universe expression.
+                if getattr(doc_ref, "universe", None) is None:
+                    _add(
+                        ValidationIssue(
+                            f"{where}.input",
+                            "missing_reference",
+                            "stage input references 'universe' but the document "
+                            "declares no universe expression",
+                        )
+                    )
+            else:
+                _add(
+                    ValidationIssue(
+                        f"{where}.input",
+                        "missing_reference",
+                        f"stage input references unknown stage '{stage.input}'",
+                    )
                 )
-            )
-        elif stage.input is not None:
-            # Resolved upstream reference: upstream stage evaluation is
-            # unimplemented in Phase 1, so this is a capability, not a graph
-            # error — failing validation beats silently ignoring it.
+        elif stage.type == "feature":
             _add(
                 ValidationIssue(
                     f"{where}.input",
-                    "unknown_capability",
-                    f"upstream stage evaluation (input: '{stage.input}') is not "
-                    "available in Phase 1",
+                    "bad_value",
+                    "feature stages do not take an upstream input; they compute "
+                    "over completed candles of their timeframe",
                 )
             )
 
@@ -290,10 +320,138 @@ def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: lis
                     f"too many conditions ({len(stage.conditions)} > {MAX_CONDITIONS_PER_STAGE})",
                 )
             )
+        if len(stage.any_conditions) > MAX_CONDITIONS_PER_GROUP:
+            _add(
+                ValidationIssue(
+                    f"{where}.any",
+                    "bad_value",
+                    f"too many conditions in 'any' group ({len(stage.any_conditions)} > {MAX_CONDITIONS_PER_GROUP})",
+                )
+            )
+        if len(stage.not_conditions) > MAX_CONDITIONS_PER_GROUP:
+            _add(
+                ValidationIssue(
+                    f"{where}.not",
+                    "bad_value",
+                    f"too many conditions in 'not' group ({len(stage.not_conditions)} > {MAX_CONDITIONS_PER_GROUP})",
+                )
+            )
         for index, condition in enumerate(stage.conditions):
             _validate_condition(condition, f"{where}.conditions[{index}]", issues)
+        for index, condition in enumerate(stage.any_conditions):
+            _validate_condition(condition, f"{where}.any[{index}]", issues)
+        for index, condition in enumerate(stage.not_conditions):
+            _validate_condition(condition, f"{where}.not[{index}]", issues)
 
     _detect_cycles(stages, issues)
+    _validate_chain_depth(stages, issues)
+
+
+def _stage_is_fundamentals_only(stage: Stage) -> bool:
+    """True when every condition references only fundamentals fields.
+
+    Such stages evaluate the latest snapshot (with acquisition metadata) on
+    candle events; no bar timeframe is required. Documented Phase 2 scope
+    decision: there is no dedicated fundamentals evaluation stream.
+    """
+    conditions = list(stage.conditions) + list(stage.any_conditions) + list(stage.not_conditions)
+    if not conditions:
+        return False
+
+    def _fields_only_fundamentals(operand) -> bool:
+        if operand is None:
+            return True
+        if operand.kind == "field":
+            return isinstance(operand.name, str) and operand.name.startswith("fundamentals.")
+        if operand.kind == "value":
+            return True
+        return False
+
+    for cond in conditions:
+        if not _fields_only_fundamentals(cond.left) or not _fields_only_fundamentals(cond.right):
+            return False
+    return True
+
+
+def _validate_feature_stage(stage: Stage, where: str, issues: list[ValidationIssue]) -> None:
+    _add = issues.append
+    if not registry.is_known_feature_function(stage.function):
+        _add(
+            ValidationIssue(
+                f"{where}.function",
+                "unknown_capability",
+                f"unknown feature function '{stage.function}' "
+                f"(supported: {sorted(registry.FEATURE_FUNCTIONS)})",
+            )
+        )
+        return
+    spec = registry.FEATURE_FUNCTIONS[stage.function]
+    params = dict(spec.get("defaults", {}))
+    for name, value in (stage.stage_params or {}).items():
+        if name not in spec["params"]:
+            _add(
+                ValidationIssue(
+                    f"{where}.params.{name}",
+                    "bad_value",
+                    f"unknown param '{name}' for feature '{stage.function}' "
+                    f"(supported: {sorted(spec['params'])})",
+                )
+            )
+            continue
+        params[name] = value
+    for name, value in params.items():
+        low, high = spec["params"][name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not (low <= value <= high):
+            _add(
+                ValidationIssue(
+                    f"{where}.params.{name}",
+                    "bad_value",
+                    f"param '{name}' for feature '{stage.function}' must be a number in "
+                    f"[{low}, {high}], got {value!r}",
+                )
+            )
+    if stage.source_field is not None and not registry.is_known_field(stage.source_field):
+        _add(
+            ValidationIssue(
+                f"{where}.source",
+                "unknown_field",
+                f"unknown feature source field '{stage.source_field}'",
+            )
+        )
+    else:
+        expected_inputs = spec["inputs"]
+        if stage.source_field is not None and len(expected_inputs) > 1:
+            _add(
+                ValidationIssue(
+                    f"{where}.source",
+                    "bad_value",
+                    f"feature '{stage.function}' needs fields {list(expected_inputs)}; "
+                    "a single source override is not valid",
+                )
+            )
+
+
+def _validate_chain_depth(stages: tuple[Stage, ...], issues: list[ValidationIssue]) -> None:
+    by_id = {stage.id: stage for stage in stages if stage.id}
+    for stage in by_id.values():
+        depth = 0
+        cursor = stage
+        seen = set()
+        while cursor.input is not None:
+            if cursor.id in seen or depth > MAX_INPUT_CHAIN_DEPTH:
+                issues.append(
+                    ValidationIssue(
+                        f"stages.{stage.id}.input",
+                        "bad_value",
+                        f"input chain exceeds the maximum depth of {MAX_INPUT_CHAIN_DEPTH}",
+                    )
+                )
+                break
+            seen.add(cursor.id)
+            depth += 1
+            cursor = by_id.get(cursor.input)
+            if cursor is None:
+                break  # missing_reference already reported
 
 
 def _validate_condition(condition: Condition, where: str, issues: list[ValidationIssue]) -> None:
@@ -366,12 +524,14 @@ def _validate_operand(operand: Operand, where: str, issues: list[ValidationIssue
             _add(ValidationIssue(where, "bad_value", "field operand has no name"))
         elif registry.is_namespaced_field(operand.name):
             domain = operand.name.split(".", 1)[0]
+            if domain == "fundamentals" and operand.name in registry.FUNDAMENTALS_FIELDS:
+                return  # Phase 2: latest-snapshot fundamentals observation
             _add(
                 ValidationIssue(
                     where,
                     "unknown_capability",
                     f"field '{operand.name}' belongs to capability domain '{domain}' "
-                    "which is not available in Phase 1",
+                    "which is not available",
                 )
             )
         elif not registry.is_known_field(operand.name):
@@ -382,29 +542,184 @@ def _validate_operand(operand: Operand, where: str, issues: list[ValidationIssue
                     f"unknown field '{operand.name}' (supported: {sorted(registry.FIELDS)})",
                 )
             )
-    elif operand.kind == "indicator":
-        label = operand.name or "expression"
-        _add(
-            ValidationIssue(
-                where,
-                "unknown_capability",
-                f"indicator '{label}' is not available in Phase 1",
-            )
-        )
-    else:  # value
+    elif operand.kind == "value":
         if operand.value is None:
             _add(ValidationIssue(where, "bad_value", "value operand has no value"))
         elif not math.isfinite(operand.value):
             _add(ValidationIssue(where, "bad_value", f"value operand must be finite, got {operand.value}"))
+    elif operand.kind == "indicator":
+        _validate_indicator_operand(operand, where, issues)
 
-    _check_params_finite(operand.params, where, issues)
+
+def _validate_indicator_operand(operand: Operand, where: str, issues: list[ValidationIssue]) -> None:
+    """Validate inline indicator references and bounded arithmetic trees."""
+    _add = issues.append
+    if operand.kind == "value":
+        if operand.value is None:
+            _add(ValidationIssue(where, "bad_value", "value operand has no value"))
+        elif not math.isfinite(operand.value):
+            _add(ValidationIssue(where, "bad_value", f"value operand must be finite, got {operand.value}"))
+        return
+    if operand.kind == "field":
+        _validate_operand(operand, where, issues)
+        return
+    if operand.name is not None:
+        if not registry.is_known_feature_function(operand.name):
+            _add(
+                ValidationIssue(
+                    where,
+                    "unknown_capability",
+                    f"unknown indicator function '{operand.name}' "
+                    f"(supported: {sorted(registry.FEATURE_FUNCTIONS)})",
+                )
+            )
+        else:
+            spec = registry.FEATURE_FUNCTIONS[operand.name]
+            defaults = dict(spec.get("defaults", {}))
+            for name, value in (operand.params or {}).items():
+                if name in registry.ARITHMETIC_OPS:
+                    continue  # expression keys handled below
+                if name not in spec["params"]:
+                    _add(
+                        ValidationIssue(
+                            f"{where}.params.{name}",
+                            "bad_value",
+                            f"unknown param '{name}' for indicator '{operand.name}' "
+                            f"(supported: {sorted(spec['params'])})",
+                        )
+                    )
+                    continue
+                defaults[name] = value
+            for name, value in defaults.items():
+                low, high = spec["params"][name]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not (low <= value <= high):
+                    _add(
+                        ValidationIssue(
+                            f"{where}.params.{name}",
+                            "bad_value",
+                            f"param '{name}' for indicator '{operand.name}' must be a number in "
+                            f"[{low}, {high}], got {value!r}",
+                        )
+                    )
+        if operand.source is not None:
+            if not registry.is_known_field(operand.source):
+                _add(ValidationIssue(f"{where}.source", "unknown_field", f"unknown indicator source field '{operand.source}'"))
+            elif len(registry.FEATURE_FUNCTIONS.get(operand.name, {}).get("inputs", ())) > 1:
+                _add(
+                    ValidationIssue(
+                        f"{where}.source",
+                        "bad_value",
+                        f"indicator '{operand.name}' needs multiple inputs; a single source override is not valid",
+                    )
+                )
+        offset = operand.offset
+        if offset is not None and (isinstance(offset, bool) or offset < 0 or offset > 100):
+            _add(ValidationIssue(f"{where}.offset", "bad_value", f"offset must be an integer in [0, 100], got {offset!r}"))
+        # any leftover param keys that are neither spec params nor expression ops
+        if operand.name in registry.FEATURE_FUNCTIONS:
+            known = set(registry.FEATURE_FUNCTIONS[operand.name]["params"]) | set(registry.ARITHMETIC_OPS)
+            for key in (operand.params or {}):
+                if key not in known:
+                    _add(
+                        ValidationIssue(
+                            f"{where}.params.{key}",
+                            "bad_value",
+                            f"unknown param '{key}' for indicator '{operand.name}'",
+                        )
+                    )
+    else:
+        # expression operand: params must contain exactly one arithmetic op
+        expression_ops = [k for k in (operand.params or {}) if k in registry.ARITHMETIC_OPS]
+        unknown_keys = [k for k in (operand.params or {}) if k not in registry.ARITHMETIC_OPS]
+        for key in unknown_keys:
+            _add(ValidationIssue(f"{where}.params.{key}", "bad_value", f"unknown expression key '{key}'"))
+        if len(expression_ops) != 1:
+            _add(
+                ValidationIssue(
+                    where,
+                    "bad_value",
+                    "an arithmetic operand requires exactly one of "
+                    f"{sorted(registry.ARITHMETIC_OPS)}",
+                )
+            )
+            return
+        op_name = expression_ops[0]
+        arity = registry.ARITHMETIC_OPS[op_name]["arity"]
+        args = operand.params[op_name]
+        if not isinstance(args, list) or len(args) != arity:
+            _add(
+                ValidationIssue(
+                    f"{where}.params.{op_name}",
+                    "bad_value",
+                    f"arithmetic '{op_name}' requires exactly {arity} operand arguments",
+                )
+            )
+            return
+        for index, arg in enumerate(args):
+            child = _coerce_expression_arg(arg)
+            if child is None:
+                _add(
+                    ValidationIssue(
+                        f"{where}.params.{op_name}[{index}]",
+                        "bad_value",
+                        f"arithmetic arguments must be numbers or operand mappings, got {arg!r}",
+                    )
+                )
+                continue
+            _validate_indicator_operand(child, f"{where}.params.{op_name}[{index}]", issues)
 
 
-def _check_params_finite(params: dict, where: str, issues: list[ValidationIssue]) -> None:
-    for key, value in params.items():
-        if isinstance(value, float) and not math.isfinite(value):
+def _coerce_expression_arg(arg: Any) -> Optional[Operand]:
+    """Normalize one raw arithmetic argument into an operand for validation.
+
+    Expression arguments are the raw parser-captured mappings (numbers,
+    {field: ...}, {indicator: ...}, or nested {multiply: [...]}, etc.).
+    """
+    if isinstance(arg, bool):
+        return None
+    if isinstance(arg, (int, float)):
+        return Operand(kind="value", value=float(arg))
+    if not isinstance(arg, dict):
+        return None
+    if "kind" in arg or "field" in arg or "indicator" in arg or "value" in arg:
+        from backend.workflows.parser import _operand  # lenient operand parser
+
+        try:
+            return _operand(arg, "expr")
+        except Exception:
+            return None
+    if set(arg.keys()) & set(registry.ARITHMETIC_OPS):
+        return Operand(kind="indicator", name=None, params=dict(arg))
+    return None
+
+
+def _validate_universe(universe, issues: list[ValidationIssue]) -> None:
+    """Validate the document-level membership expression (Phase 2 F7).
+
+    Membership resolution itself happens at activation/refresh against the
+    saved universes and index sources; a document referencing an unknown
+    universe fails at materialization with an explicit error (and preview
+    reports it) rather than being rejected here without database context.
+    """
+    if universe is None:
+        return
+    for index, ref in enumerate(universe.refs):
+        if not ref.name:
             issues.append(
-                ValidationIssue(f"{where}.params.{key}", "bad_value", f"parameter must be finite, got {value}")
+                ValidationIssue(
+                    f"document.universe.union[{index}].name",
+                    "bad_value",
+                    "universe reference name must not be empty",
+                )
+            )
+    for index, ref in enumerate(universe.exclude):
+        if not ref.name:
+            issues.append(
+                ValidationIssue(
+                    f"document.universe.exclude[{index}].name",
+                    "bad_value",
+                    "universe exclusion name must not be empty",
+                )
             )
 
 

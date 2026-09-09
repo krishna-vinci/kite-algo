@@ -63,6 +63,28 @@ Migration `20260908_000011_alerts_platform_phase1` plus `20260909_000012_alerts_
 - `GET /api/worker/workflows/{id}/events` — event history with evidence (values, epoch, timeframe); archived workflows keep their history.
 - Worker process logs report evaluations, emissions, suppression reasons (cooldown, not_armed, already_fired, quiet_session, expired), unresolved channels/instruments, and gaps. Every non-delivery has a recorded reason.
 
+## Phase 2 additions (universes, features, layered rules)
+
+- **Universes:** documents may reference saved universes and index sources
+  (`universe:` block). The worker re-resolves membership every
+  `ALERTS_UNIVERSE_RESOLVE_INTERVAL_S` (default 300 s); new members are
+  admitted with a fresh epoch and warmed before they may signal; departed
+  members are paused with `universe_departed` in their config. A failed
+  resolution keeps the last valid membership and increments
+  `universe_membership.resolution_failures` in worker health.
+- **Shared features:** indicator/layered stages compute through one feature
+  engine per worker; identical dependencies compute once per event. Windows
+  are bounded (`400` completed bars per instrument/timeframe) and warmed from
+  durable history before live evaluation. Insufficient history is `unknown`,
+  never a signal.
+- **Storm guard:** emissions per (workflow, alert) are bounded by
+  `ALERTS_DELIVERY_BUDGET_PER_WINDOW` (default 60/60s); excess is suppressed
+  with reason `storm_budget`.
+- **Capabilities:** `GET /api/worker/workflows/capabilities` lists exactly the
+  executable functions/operators/limits; authoring contract in
+  [workflow-format.md](workflow-format.md); full parity in
+  [alerts-phase2-parity.md](alerts-phase2-parity.md).
+
 ## Known Phase 1 limitations
 
 - Delivery attempts and lease claims are tested on SQLite; true multi-process Postgres concurrency (`FOR UPDATE SKIP LOCKED`) is exercised in production Postgres only — Phase 1.5 follow-up adds a Postgres-based fault-injection suite (spec E-1…E-3).

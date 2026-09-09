@@ -88,6 +88,8 @@ from typing import (
 from zoneinfo import ZoneInfo
 
 from backend.alerts.predicates import Observation
+from backend.workflows.feature_engine import FeatureEngine, FeatureSpec  # noqa: F401 (re-export)
+from backend.workflows.feature_planner import SubscriptionPlan, build_subscription_plan
 from backend.workflows.instrument_bindings import BindingChange, InstrumentBindingRegistry
 from backend.workflows.models import Stage, WorkflowDocument
 from backend.workflows.parser import WorkflowParseError, parse_workflow_dict
@@ -720,6 +722,16 @@ class EvaluationWorker:
         self._candle_subs: Dict[Tuple[str, str], List[ActiveSubscription]] = {}
         self._tick_sources: Dict[str, TickSource] = {}
         self._candle_sources: Dict[Tuple[str, str], TickSource] = {}
+        # Phase 2 (F8): shared feature computation + layered plans.
+        self.feature_engine = FeatureEngine()
+        self._sub_plans: Dict[str, SubscriptionPlan] = {}
+        self._feature_sources: Dict[Tuple[str, str], TickSource] = {}
+        self._feature_warmed: set = set()
+        # Phase 2 (F7): universe membership resolution state.
+        self.universe_service = None  # optional UniverseService, wired by entry
+        self.universe_resolve_interval_s = 300.0
+        self._universe_cache: Dict[str, Tuple[float, set]] = {}
+        self._universe_health = {"stale_universes": 0, "resolution_failures": 0}
         self._document_cache: Dict[str, Optional[WorkflowDocument]] = {}
         self._pending_rebuilds: Dict[Tuple[str, Any], datetime] = {}
         self._bg_tasks: List[asyncio.Task] = []
@@ -734,6 +746,7 @@ class EvaluationWorker:
     async def start(self) -> None:
         """Materialize subscriptions, warm candle rules, open feed sources."""
         self._ensure_subscription_rows()
+        await self._sync_universe_memberships()
         self._subscriptions = list(self.workflow_repo.list_active_subscriptions())
         await self._resolve_instrument_tokens({sub.instrument_key for sub in self._subscriptions})
         self._refresh_unresolved_instruments()
@@ -759,6 +772,7 @@ class EvaluationWorker:
             source = self.candle_source_factory(instrument_key, timeframe)
             await source.start()
             self._candle_sources[(instrument_key, timeframe)] = source
+        await self._sync_feature_sources()
 
         self._resolved_health_file = (
             self.health_file
@@ -825,7 +839,8 @@ class EvaluationWorker:
                 continue
             saw_any = True
             for sub in self._ltp_subs.get(instrument_key, ()):
-                self._dispatch(sub, obs)
+                features, layers = self._plan_dispatch(sub)
+                self._dispatch(sub, obs, features=features, layers=layers)
         for key, source in list(self._candle_sources.items()):
             try:
                 obs = await source.next_observation()
@@ -835,8 +850,26 @@ class EvaluationWorker:
             if obs is None:
                 continue
             saw_any = True
+            # F8: one window update + one feature computation per event,
+            # shared by every rule that dispatches on this bar.
+            snapshot = self.feature_engine.on_bar(key[0], key[1], obs)
             for sub in self._candle_subs.get(key, ()):
-                self._dispatch(sub, obs)
+                features, layers = self._plan_dispatch(sub)
+                if features is None:
+                    features = dict(snapshot) if snapshot else None
+                self._dispatch(sub, obs, features=features, layers=layers)
+        # Feature-only windows (upstream timeframes of layered chains): their
+        # completions update the shared snapshots but dispatch to no rule.
+        for key, source in list(self._feature_sources.items()):
+            try:
+                obs = await source.next_observation()
+            except Exception:
+                await self._handle_source_failure("candle", key, source)
+                continue
+            if obs is None:
+                continue
+            saw_any = True
+            self.feature_engine.on_bar(key[0], key[1], obs)
         return saw_any
 
     # ------------------------------------------------------------------
@@ -867,6 +900,9 @@ class EvaluationWorker:
         always consults these tables, so the change takes effect on the
         next event.
         """
+        # Universe membership first: newly admitted members must be part of
+        # THIS pass's added set so they are indexed and warmed before dispatch.
+        await self._sync_universe_memberships()
         current = list(self.workflow_repo.list_active_subscriptions())
         await self._resolve_instrument_tokens({sub.instrument_key for sub in current})
         current_by_id = {sub.id: sub for sub in current}
@@ -880,6 +916,7 @@ class EvaluationWorker:
         for sub in removed:
             self._drop_subscription(sub)
         self._prune_orphan_sources()
+        await self._sync_feature_sources()
         self._refresh_unresolved_instruments()
 
         self._subscriptions = current
@@ -1008,6 +1045,180 @@ class EvaluationWorker:
             1 for sub in self._subscriptions if sub.instrument_key not in tokens
         )
 
+    async def _sync_universe_memberships(self) -> None:
+        """Re-resolve universe membership and materialize/depart members (F7).
+
+        The last persisted membership is used between resolutions; a failed
+        resolution keeps the last valid membership and is counted in health
+        (explicit freshness policy, degraded coverage visible).
+        """
+        if self.universe_service is None:
+            return
+        now = _utcnow().timestamp()
+        try:
+            from sqlalchemy import select as _select
+
+            with self.session_factory() as session:
+                from backend.workflows.repository import WorkflowRevision
+
+                revisions = session.execute(
+                    _select(WorkflowRevision).where(WorkflowRevision.status == "active")
+                ).scalars().all()
+                revision_rows = [
+                    (r, self.workflow_repo.get_workflow(r.workflow_id, db=session))
+                    for r in revisions
+                ]
+        except Exception:
+            logger.warning("universe sync: active revision read failed", exc_info=True)
+            return
+        for revision, workflow in revision_rows:
+            document = self._document_for_revision(revision)
+            if document is None or document.universe is None:
+                continue
+            owner_id = workflow.owner_id if workflow is not None else None
+            if owner_id is None:
+                continue
+            members: set = {inst.key() for inst in document.instruments}
+            degraded = False
+            skip_sync = False
+            universe_revision = None
+            for ref in document.universe.refs:
+                cache_key = f"{owner_id}:{ref.kind}:{ref.name}"
+                cached = self._universe_cache.get(cache_key)
+                if cached is not None and now - cached[0] < self.universe_resolve_interval_s:
+                    members |= cached[1]
+                    continue
+                try:
+                    if ref.kind in ("universe", "watchlist"):
+                        latest = self.universe_service.latest_revision(owner_id, ref.name)
+                        if latest is None:
+                            logger.warning(
+                                "universe %s referenced by workflow %s has no resolved membership",
+                                ref.name, revision.id,
+                            )
+                            self._universe_health["stale_universes"] += 1
+                            degraded = True
+                            continue
+                        resolved = set(latest.get("members") or ())
+                        try:
+                            universe_revision = max(
+                                universe_revision or 0, int(latest.get("revision") or 0)
+                            ) or None
+                        except (TypeError, ValueError):
+                            pass
+                    else:  # index source list
+                        preview = self.universe_service.preview_membership(
+                            owner_id, "index", {"source_list": ref.name}
+                        )
+                        resolved = set(preview.get("members") or ())
+                    self._universe_cache[cache_key] = (now, resolved)
+                    members |= resolved
+                except Exception as exc:
+                    # Explicit freshness policy: a failed resolution with no
+                    # cached membership skips materialization entirely — the
+                    # last valid DB state stays in force, never an empty union.
+                    self._universe_health["resolution_failures"] += 1
+                    if cached is not None:
+                        members |= cached[1]
+                        logger.warning(
+                            "universe membership resolution failed for %s (%s); "
+                            "keeping last cached membership",
+                            ref.name, exc,
+                        )
+                    else:
+                        logger.warning(
+                            "universe membership resolution failed for %s (%s); "
+                            "keeping last materialized state unchanged",
+                            ref.name, exc,
+                        )
+                        skip_sync = True
+                        break
+                    degraded = True
+            for ref in document.universe.exclude:
+                try:
+                    if ref.kind in ("universe", "watchlist"):
+                        latest = self.universe_service.latest_revision(owner_id, ref.name)
+                        if latest:
+                            members -= set(latest.get("members") or ())
+                except Exception:
+                    logger.warning("universe exclusion failed for %s", ref.name, exc_info=True)
+            if skip_sync:
+                continue
+            try:
+                self.service.sync_universe_members(
+                    revision, sorted(members), universe_revision=universe_revision
+                )
+            except Exception:
+                logger.warning(
+                    "universe membership materialization failed for revision %s",
+                    revision.id, exc_info=True,
+                )
+
+    def _document_for_revision(self, revision):
+        cached = self._document_cache.get(revision.id)
+        if cached is not None:
+            return cached if cached != "invalid" else None
+        try:
+            document = parse_workflow_dict(revision.document)
+        except Exception:
+            document = None
+        self._document_cache[revision.id] = document
+        return document
+
+    async def _sync_feature_sources(self) -> None:
+        """Open candle sources for feature timeframes beyond rule groups.
+
+        Layered chains read upstream snapshots (e.g. a daily EMA200 filter
+        evaluated on 5m events), so the engine needs completed-candle feeds
+        for those timeframes even when no rule evaluates on them directly.
+        """
+        needed: Dict[Tuple[str, str], bool] = {}
+        for sub in self._subscriptions:
+            plan = self._sub_plans.get(sub.id)
+            if plan is None:
+                plan = build_subscription_plan(self._document_for(sub), sub.stage_id)
+                self._sub_plans[sub.id] = plan
+            for timeframe, spec in plan.specs:
+                needed[(sub.instrument_key, timeframe)] = True
+            for timeframe in plan.feature_timeframes:
+                needed.setdefault((sub.instrument_key, timeframe), True)
+        for (key, timeframe) in sorted(needed):
+            if (key, timeframe) in self._feature_sources or (key, timeframe) in self._candle_sources:
+                continue
+            if (key, timeframe) not in self._feature_warmed:
+                self._feature_warmed.add((key, timeframe))
+                self.feature_engine.warm(key, timeframe, self.candle_history)
+            source = self.candle_source_factory(key, timeframe)
+            await source.start()
+            self._feature_sources[(key, timeframe)] = source
+        # release feature sources that no plan needs anymore
+        for window_key in list(self._feature_sources):
+            if window_key not in needed:
+                source = self._feature_sources.pop(window_key)
+                self._close_source(source)
+
+    def _plan_dispatch(self, sub: ActiveSubscription) -> tuple:
+        """(features, layers) for one subscription from the shared engine."""
+        plan = self._sub_plans.get(sub.id)
+        if plan is None or not plan.has_features:
+            return None, None
+        key = sub.instrument_key
+        engine = self.feature_engine
+        merged: Dict[str, object] = {}
+        for timeframe in plan.feature_timeframes:
+            for source_map in (engine.snapshot(key, timeframe), engine.field_snapshot(key, timeframe)):
+                for feature_id, value in source_map.items():
+                    merged.setdefault(feature_id, value)
+        layers = []
+        for layer_stage, layer_tf in plan.layers:
+            if layer_tf:
+                layer_features = dict(engine.snapshot(key, layer_tf))
+                layer_features.update(engine.field_snapshot(key, layer_tf))
+                layers.append((layer_stage, layer_features))
+            else:
+                layers.append((layer_stage, None))
+        return merged or None, layers or None
+
     async def _add_subscription(self, sub: ActiveSubscription) -> None:
         """Index a newly-activated subscription and warm it before dispatch."""
         self._index_subscription(sub)
@@ -1031,6 +1242,7 @@ class EvaluationWorker:
 
     def _drop_subscription(self, sub: ActiveSubscription) -> None:
         self._subscriptions = [s for s in self._subscriptions if s.id != sub.id]
+        self._sub_plans.pop(sub.id, None)
         for group in self._ltp_subs.values():
             group[:] = [s for s in group if s.id != sub.id]
         for group in self._candle_subs.values():
@@ -1106,6 +1318,8 @@ class EvaluationWorker:
         snapshot: Dict[str, Any] = {}
         for key, value in self.health.items():
             snapshot[key] = dict(value) if isinstance(value, Counter) else value
+        snapshot["universe_membership"] = dict(self._universe_health)
+        snapshot["feature_windows"] = len(self._feature_sources) + len(self._candle_sources)
         if self.health_extra is not None:
             try:
                 extra = self.health_extra()
@@ -1209,10 +1423,15 @@ class EvaluationWorker:
     # ------------------------------------------------------------------
 
     def _index_subscription(self, sub: ActiveSubscription) -> None:
-        """Classify a subscription into the ltp / candle dispatch tables."""
+        """Classify a subscription and register its feature dependencies."""
         stage = self._stage_for(sub)
         if stage is None:
             return
+        # Phase 2: per-subscription layered plan + shared feature declaration
+        plan = build_subscription_plan(self._document_for(sub), sub.stage_id)
+        self._sub_plans[sub.id] = plan
+        for timeframe, spec in plan.specs:
+            self.feature_engine.declare(sub.instrument_key, timeframe, spec)
         if stage.clock == "ltp":
             group = self._ltp_subs.setdefault(sub.instrument_key, [])
             if all(s.id != sub.id for s in group):
@@ -1341,7 +1560,13 @@ class EvaluationWorker:
         return next((s for s in document.stages if s.id == sub.stage_id), None)
 
     def _dispatch(
-        self, sub: ActiveSubscription, obs: Observation, *, allow_emit: bool = True
+        self,
+        sub: ActiveSubscription,
+        obs: Observation,
+        *,
+        allow_emit: bool = True,
+        features: Optional[dict] = None,
+        layers: Optional[list] = None,
     ) -> None:
         self.health["evaluations"] += 1
         self.health["last_evaluated_at"] = _utcnow().isoformat()
@@ -1359,20 +1584,31 @@ class EvaluationWorker:
                     exc_info=True,
                 )
         supports_context = False
+        supports_features = False
+        supports_layers = False
         try:
-            supports_context = "context" in inspect.signature(
-                self.service.handle_observation
-            ).parameters
+            params = inspect.signature(self.service.handle_observation).parameters
+            supports_context = "context" in params
+            supports_features = "features" in params
+            supports_layers = "layers" in params
         except (TypeError, ValueError):
             supports_context = False
         try:
             if allow_emit or not self._service_supports_allow_emit():
                 kwargs = {"context": context} if supports_context else {}
+                if supports_features:
+                    kwargs["features"] = features
+                if supports_layers:
+                    kwargs["layers"] = layers
                 result = self.service.handle_observation(sub, obs, **kwargs)
             else:
                 kwargs = {"allow_emit": False}
                 if supports_context:
                     kwargs["context"] = context
+                if supports_features:
+                    kwargs["features"] = features
+                if supports_layers:
+                    kwargs["layers"] = layers
                 result = self.service.handle_observation(sub, obs, **kwargs)
         except TypeError:
             logger.error(
