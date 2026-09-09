@@ -98,6 +98,7 @@ class UniverseSpec:
 
     refs: tuple[UniverseRef, ...]
     exclude: tuple[UniverseRef, ...] = ()
+    intersect: tuple[UniverseRef, ...] = ()
     deduplicate: bool = True
 
     def to_document_dict(self) -> dict[str, Any]:
@@ -107,6 +108,8 @@ class UniverseSpec:
         }
         if self.exclude:
             payload["exclude"] = [ref.to_ref_dict() for ref in self.exclude]
+        if self.intersect:
+            payload["intersect"] = [ref.to_ref_dict() for ref in self.intersect]
         return payload
 
 

@@ -327,7 +327,10 @@ def _universe_ref(raw: Any, path: str) -> UniverseRef:
 def _universe_spec(raw: Any) -> UniverseSpec:
     if not isinstance(raw, dict):
         raise _fail("document.universe", "must be a mapping")
-    _check_keys(raw, {"union", "exclude", "deduplicate", "refs", "name"}, "document.universe")
+    _check_keys(
+        raw, {"union", "exclude", "intersect", "deduplicate", "refs", "name"},
+        "document.universe",
+    )
 
     refs_raw = None
     if "union" in raw:
@@ -353,11 +356,21 @@ def _universe_spec(raw: Any) -> UniverseSpec:
             for i, item in enumerate(exclude_raw)
         )
 
+    intersect: tuple[UniverseRef, ...] = ()
+    if "intersect" in raw and raw["intersect"] is not None:
+        intersect_raw = raw["intersect"]
+        if not isinstance(intersect_raw, list) or not intersect_raw:
+            raise _fail("document.universe.intersect", "must be a non-empty list of references")
+        intersect = tuple(
+            _universe_ref(item, f"document.universe.intersect[{i}]")
+            for i, item in enumerate(intersect_raw)
+        )
+
     deduplicate = raw.get("deduplicate", True)
     if not isinstance(deduplicate, bool):
         raise _fail("document.universe.deduplicate", "must be a boolean")
 
-    return UniverseSpec(refs=refs, exclude=exclude, deduplicate=deduplicate)
+    return UniverseSpec(refs=refs, exclude=exclude, intersect=intersect, deduplicate=deduplicate)
 
 
 def _instrument(item: Any, path: str) -> InstrumentRef:

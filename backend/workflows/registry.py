@@ -50,6 +50,72 @@ CLOCKS: Mapping[str, dict] = {
     "candle_close": {"latency": "one_bar"},
 }
 
+# Authoring-time aliases: fundamentals_refresh normalizes to candle_close.
+# There is no dedicated fundamentals stream; fundamentals conditions ride the
+# declared candle clock and read the latest stored snapshot.
+CLOCK_ALIASES: Mapping[str, str] = {
+    "fundamentals_refresh": "candle_close",
+}
+
+CLOCK_METADATA: Mapping[str, dict] = {
+    "ltp": {
+        "latency": "seconds",
+        "source": "market:ticks pub/sub (live LTP)",
+    },
+    "candle_close": {
+        "latency": "one_bar",
+        "source": "completed candles (redis completions + postgres continuity)",
+        "note": (
+            "fundamentals.* conditions evaluate on this clock too, reading "
+            "the latest stored fundamentals snapshot (fundamentals_refresh "
+            "is an alias, not a separate stream)"
+        ),
+    },
+}
+
+# registry field name -> public.fundamentals_features column
+FUNDAMENTALS_COLUMN_MAP: Mapping[str, str] = {
+    "fundamentals.quarterly_revenue_yoy_pct": "quarterly_revenue_yoy_pct",
+    "fundamentals.latest_roce_pct": "latest_roce_pct",
+    "fundamentals.pe_ratio": "stock_pe",
+    "fundamentals.market_cap": "market_cap_cr",
+}
+
+
+def operand_uses_fundamentals(operand: object, depth: int = 0) -> bool:
+    """True when an operand (descending arithmetic trees) references a
+    ``fundamentals.*`` field."""
+    if operand is None or depth > 6:
+        return False
+    if getattr(operand, "kind", None) == "field":
+        name = getattr(operand, "name", None)
+        return isinstance(name, str) and name.startswith("fundamentals.")
+    if getattr(operand, "kind", None) == "indicator":
+        from backend.workflows.compiler import _coerce_expression_arg
+
+        for value in (getattr(operand, "params", None) or {}).values():
+            if not isinstance(value, list):
+                continue
+            for arg in value:
+                if operand_uses_fundamentals(_coerce_expression_arg(arg), depth + 1):
+                    return True
+    return False
+
+
+def stage_uses_fundamentals(stage: object) -> bool:
+    """True when any condition of the stage can reference fundamentals."""
+    for group in (
+        getattr(stage, "conditions", ()),
+        getattr(stage, "any_conditions", ()),
+        getattr(stage, "not_conditions", ()),
+    ):
+        for cond in group:
+            if operand_uses_fundamentals(getattr(cond, "left", None)) or (
+                operand_uses_fundamentals(getattr(cond, "right", None))
+            ):
+                return True
+    return False
+
 TRIGGERS: Mapping[str, dict] = {
     "once": {"max_fires": 1},
     "on_transition": {"max_fires": None},

@@ -64,6 +64,7 @@ from backend.alerts.engine import decide
 from backend.alerts.predicates import Observation, PredicateResult, evaluate_stage
 from backend.workflows.models import AlertSpec, Stage, WorkflowDocument
 from backend.workflows.parser import WorkflowParseError, parse_workflow_dict
+from backend.workflows.registry import stage_uses_fundamentals
 from backend.workflows.repository import (
     ActiveSubscription,
     AlertSubscription,
@@ -595,6 +596,20 @@ class EvaluationService:
                 # F7: events retain the membership revision in force at
                 # evaluation time.
                 evidence["universe_revision"] = universe_revision
+            # Spec §5.8: fundamental observations carry acquisition metadata.
+            # When fundamentals participate in this stage or any ancestor
+            # layer being evaluated, copy the freshness the evaluation
+            # actually saw into immutable event evidence.
+            if context and (
+                stage_uses_fundamentals(stage)
+                or any(stage_uses_fundamentals(layer) for layer, _ in (layers or ()))
+            ):
+                acquired_at = context.get("fundamentals.acquired_at")
+                if acquired_at:
+                    evidence["fundamentals_acquired_at"] = str(acquired_at)
+                as_of = context.get("fundamentals.as_of_date")
+                if as_of:
+                    evidence["fundamentals_as_of_date"] = str(as_of)
             if engine.emit and allow_emit and self._storm_budget_exceeded(sub, now):
                 suppression = "storm_budget"
                 engine_result = HandleResult(

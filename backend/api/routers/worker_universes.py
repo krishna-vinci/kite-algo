@@ -49,7 +49,7 @@ from backend.workflows.universes import (
     UniverseValidationError,
 )
 
-router = APIRouter(prefix="/universes", tags=["worker-universes"])
+router = APIRouter(prefix="/worker/universes", tags=["Worker Universes"])
 
 __all__ = ["router", "_universes_db", "_universe_service"]
 

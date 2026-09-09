@@ -225,6 +225,11 @@ def _collect_ids(items: tuple, label: str, issues: list[ValidationIssue]) -> set
 
 def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: list[ValidationIssue], doc_ref=None) -> None:
     _add = issues.append
+    feature_ids = {
+        stage.id
+        for stage in stages
+        if stage.type == "feature" and stage.function
+    }
     for stage in stages:
         if not stage.id:
             continue  # already reported
@@ -263,7 +268,22 @@ def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: lis
             )
         elif stage.clock == "candle_close":
             if stage.timeframe is None:
-                if not _stage_is_fundamentals_only(stage):
+                if _stage_is_fundamentals_only(stage):
+                    # Fundamentals ride the declared candle clock: the latest
+                    # stored snapshot is read at each candle evaluation. With
+                    # no timeframe the stage would never be dispatched, so
+                    # reject instead of accepting a silently dead stage.
+                    _add(
+                        ValidationIssue(
+                            f"{where}.timeframe",
+                            "timeframe_missing",
+                            "fundamentals conditions evaluate on the declared "
+                            "candle clock (no dedicated fundamentals stream "
+                            "exists): specify a timeframe (e.g. timeframe: 1d) "
+                            "so the stage is dispatched",
+                        )
+                    )
+                else:
                     _add(
                         ValidationIssue(
                             f"{where}.timeframe",
@@ -281,36 +301,37 @@ def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: lis
                     )
                 )
 
-        if stage.input is not None and stage.input not in stage_ids:
-            if stage.input == "universe":
-                # The implicit membership source: valid when the document
-                # declares a universe expression.
-                if getattr(doc_ref, "universe", None) is None:
+        if stage.input is not None:
+            if stage.input not in stage_ids:
+                if stage.input == "universe":
+                    # The implicit membership source: valid when the document
+                    # declares a universe expression.
+                    if getattr(doc_ref, "universe", None) is None:
+                        _add(
+                            ValidationIssue(
+                                f"{where}.input",
+                                "missing_reference",
+                                "stage input references 'universe' but the document "
+                                "declares no universe expression",
+                            )
+                        )
+                else:
                     _add(
                         ValidationIssue(
                             f"{where}.input",
                             "missing_reference",
-                            "stage input references 'universe' but the document "
-                            "declares no universe expression",
+                            f"stage input references unknown stage '{stage.input}'",
                         )
                     )
-            else:
+            elif stage.type == "feature":
                 _add(
                     ValidationIssue(
                         f"{where}.input",
-                        "missing_reference",
-                        f"stage input references unknown stage '{stage.input}'",
+                        "bad_value",
+                        "feature stages do not take an upstream input; they compute "
+                        "over completed candles of their timeframe",
                     )
                 )
-        elif stage.type == "feature":
-            _add(
-                ValidationIssue(
-                    f"{where}.input",
-                    "bad_value",
-                    "feature stages do not take an upstream input; they compute "
-                    "over completed candles of their timeframe",
-                )
-            )
 
         if len(stage.conditions) > MAX_CONDITIONS_PER_STAGE:
             _add(
@@ -337,11 +358,11 @@ def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: lis
                 )
             )
         for index, condition in enumerate(stage.conditions):
-            _validate_condition(condition, f"{where}.conditions[{index}]", issues)
+            _validate_condition(condition, f"{where}.conditions[{index}]", issues, feature_ids)
         for index, condition in enumerate(stage.any_conditions):
-            _validate_condition(condition, f"{where}.any[{index}]", issues)
+            _validate_condition(condition, f"{where}.any[{index}]", issues, feature_ids)
         for index, condition in enumerate(stage.not_conditions):
-            _validate_condition(condition, f"{where}.not[{index}]", issues)
+            _validate_condition(condition, f"{where}.not[{index}]", issues, feature_ids)
 
     _detect_cycles(stages, issues)
     _validate_chain_depth(stages, issues)
@@ -350,9 +371,9 @@ def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: lis
 def _stage_is_fundamentals_only(stage: Stage) -> bool:
     """True when every condition references only fundamentals fields.
 
-    Such stages evaluate the latest snapshot (with acquisition metadata) on
-    candle events; no bar timeframe is required. Documented Phase 2 scope
-    decision: there is no dedicated fundamentals evaluation stream.
+    Used to tailor the ``timeframe_missing`` issue: fundamentals evaluate on
+    the declared candle clock (latest stored snapshot + acquisition
+    metadata); there is no dedicated fundamentals evaluation stream.
     """
     conditions = list(stage.conditions) + list(stage.any_conditions) + list(stage.not_conditions)
     if not conditions:
@@ -454,7 +475,12 @@ def _validate_chain_depth(stages: tuple[Stage, ...], issues: list[ValidationIssu
                 break  # missing_reference already reported
 
 
-def _validate_condition(condition: Condition, where: str, issues: list[ValidationIssue]) -> None:
+def _validate_condition(
+    condition: Condition,
+    where: str,
+    issues: list[ValidationIssue],
+    feature_stage_ids: Optional[frozenset] = None,
+) -> None:
     _add = issues.append
     if not registry.is_known_operator(condition.op):
         _add(
@@ -466,8 +492,8 @@ def _validate_condition(condition: Condition, where: str, issues: list[Validatio
         )
     if condition.op == "within":
         _validate_within_bounds(condition, where, issues)
-    _validate_operand(condition.left, f"{where}.left", issues)
-    _validate_operand(condition.right, f"{where}.right", issues)
+    _validate_operand(condition.left, f"{where}.left", issues, feature_stage_ids)
+    _validate_operand(condition.right, f"{where}.right", issues, feature_stage_ids)
     if condition.op not in ("breaks_prev_high", "breaks_prev_low"):
         for side, operand in (("left", condition.left), ("right", condition.right)):
             if operand.kind == "field" and registry.is_context_field(operand.name or ""):
@@ -517,7 +543,12 @@ def _validate_within_bounds(condition: Condition, where: str, issues: list[Valid
         )
 
 
-def _validate_operand(operand: Operand, where: str, issues: list[ValidationIssue]) -> None:
+def _validate_operand(
+    operand: Operand,
+    where: str,
+    issues: list[ValidationIssue],
+    feature_stage_ids: Optional[frozenset] = None,
+) -> None:
     _add = issues.append
     if operand.kind == "field":
         if not operand.name:
@@ -548,10 +579,15 @@ def _validate_operand(operand: Operand, where: str, issues: list[ValidationIssue
         elif not math.isfinite(operand.value):
             _add(ValidationIssue(where, "bad_value", f"value operand must be finite, got {operand.value}"))
     elif operand.kind == "indicator":
-        _validate_indicator_operand(operand, where, issues)
+        _validate_indicator_operand(operand, where, issues, feature_stage_ids)
 
 
-def _validate_indicator_operand(operand: Operand, where: str, issues: list[ValidationIssue]) -> None:
+def _validate_indicator_operand(
+    operand: Operand,
+    where: str,
+    issues: list[ValidationIssue],
+    feature_stage_ids: Optional[frozenset] = None,
+) -> None:
     """Validate inline indicator references and bounded arithmetic trees."""
     _add = issues.append
     if operand.kind == "value":
@@ -562,6 +598,26 @@ def _validate_indicator_operand(operand: Operand, where: str, issues: list[Valid
         return
     if operand.kind == "field":
         _validate_operand(operand, where, issues)
+        return
+    if operand.name is not None and operand.name.startswith("stage:"):
+        # F8 stage reference: resolves to a declared feature stage's snapshot
+        # (canonical feature id aliased at dispatch). Validated, not ignored.
+        ref_id = operand.name[len("stage:"):]
+        if not ref_id:
+            _add(ValidationIssue(where, "bad_value", "stage reference must name a feature stage (stage:<id>)"))
+        elif feature_stage_ids is None or ref_id not in feature_stage_ids:
+            _add(
+                ValidationIssue(
+                    where,
+                    "missing_reference",
+                    f"stage reference '{operand.name}' does not resolve to a "
+                    "declared feature stage (type: feature with a function)",
+                )
+            )
+        if operand.source is not None:
+            _add(ValidationIssue(f"{where}.source", "bad_value", "a stage reference takes no source override"))
+        if operand.offset:
+            _add(ValidationIssue(f"{where}.offset", "bad_value", "a stage reference takes no offset"))
         return
     if operand.name is not None:
         if not registry.is_known_feature_function(operand.name):
@@ -666,7 +722,7 @@ def _validate_indicator_operand(operand: Operand, where: str, issues: list[Valid
                     )
                 )
                 continue
-            _validate_indicator_operand(child, f"{where}.params.{op_name}[{index}]", issues)
+            _validate_indicator_operand(child, f"{where}.params.{op_name}[{index}]", issues, feature_stage_ids)
 
 
 def _coerce_expression_arg(arg: Any) -> Optional[Operand]:
@@ -719,6 +775,15 @@ def _validate_universe(universe, issues: list[ValidationIssue]) -> None:
                     f"document.universe.exclude[{index}].name",
                     "bad_value",
                     "universe exclusion name must not be empty",
+                )
+            )
+    for index, ref in enumerate(universe.intersect):
+        if not ref.name:
+            issues.append(
+                ValidationIssue(
+                    f"document.universe.intersect[{index}].name",
+                    "bad_value",
+                    "universe intersection name must not be empty",
                 )
             )
 

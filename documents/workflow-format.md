@@ -52,13 +52,15 @@ Boolean shorthand `repeat: true/false` maps to `on_transition`/`once` and confli
 
 ### Universe membership (F7)
 
-A document may declare a membership expression instead of (or in addition to) explicit `instruments`. References combine by UNION and are deduplicated exchange-qualified:
+A document may declare a membership expression instead of (or in addition to) explicit `instruments`. References combine by UNION and are deduplicated exchange-qualified; `intersect` restricts the union to names present in EVERY listed reference:
 
 ```yaml
 universe:
   union:
     - universe: my-watchlist   # a saved universe (API-managed; owner-scoped)
     - index: nifty50           # an index constituent source list
+  intersect:
+    - universe: liquid-names   # membership := union ∩ liquid-names
   exclude:
     - universe: illiquid-names
   deduplicate: true            # default true
@@ -66,7 +68,7 @@ universe:
 
 `EXCHANGE:SYMBOL` identity is preserved throughout: the same text on NSE and BSE stays distinct. Membership resolves against the published catalog; non-active members are reported in coverage (`rejected` with reasons), never silently dropped. New members are admitted with a fresh observation epoch — warmup gates their first signal; departed members are paused (history retained) and their subscriptions released. Every event records the membership revision in force at evaluation time. A failed membership resolution keeps the last valid membership (degraded, visible in worker health) and never materializes an empty union.
 
-Universes are managed (and previews resolved without side effects) via `/api/worker/universes`; portfolio-derived universes are owner-scoped and read-only.
+Universes are managed (and previews resolved without side effects) via `/api/worker/universes` (mounted under the `/api/worker/` bearer-token boundary); portfolio-derived universes are owner-scoped and read-only.
 
 ### Shared features and layered stages (F8)
 
@@ -101,11 +103,12 @@ stages:
 
 - **Inline indicators**: `{indicator: <function>, period: ..., source: <field>, offset: <bars>, output: <key>}`. Supported functions: `sma ema wma rsi macd atr bollinger supertrend vwap_session volume_sma volume_ratio` (see `capabilities`). Numerics match the worker SDK fixtures (verified to ≤1e-9).
 - **Feature identity**: (instrument, timeframe, function, canonical parameters, source field, offset, output, calculation version). Identical dependencies compute ONCE per market event in the engine and fan out to every dependent rule; rule-specific trigger state stays in checkpoints.
-- **Stage references**: `{indicator: "stage:<feature-stage-id>"}` use a feature stage's value/timeframe.
+- **Stage references**: `{indicator: "stage:<feature-stage-id>"}` use a declared feature stage's value; the reference resolves to the referenced stage's own-timeframe snapshot and validates at compile time (a reference to a non-feature or unknown stage fails validation).
 - **Bounded arithmetic**: `add subtract multiply divide` over operands (depth ≤ 3); division by zero/unknown is **unknown** (E-26), never an error.
 - **Three-valued groups**: `all` AND, `any` OR, `not` negation with unknown propagation — unknown AND true = unknown; a rule with any unknown group never fires (E-15).
 - **Warmup and confirmations**: features compute over COMPLETED candles only; a `day`-timeframe feature never sees a forming daily candle (E-16). Insufficient history is unknown with warmup progress in health. VWAP resets per session using the worker session policy — MCX/currency VWAP never silently uses NSE boundaries.
-- **Layered clocks**: an ancestor filter evaluated on a different timeframe consumes that timeframe's latest COMPLETED bar snapshot (never a forming candle); fundamentals conditions use the latest snapshot with acquisition metadata evaluated on candle events (documented scope decision — there is no fundamentals event stream).
+- **Layered clocks**: an ancestor filter evaluated on a different timeframe consumes that timeframe's latest COMPLETED bar snapshot (never a forming candle).
+- **Fundamentals** (spec §5.8): `fundamentals.*` conditions read the LATEST stored snapshot from `public.fundamentals_features` (Screener.in sync — nightly scheduler plus on-demand `POST /algo-workers/worker/fundamentals/sync`), keyed by bare symbol with NSE-listing coverage: `NSE:SYMBOL` resolves, other exchanges are unavailable (unknown, never false). `evaluate_on: fundamentals_refresh` is an **alias for `candle_close`** — there is no dedicated fundamentals stream; a fundamentals-only stage therefore REQUIRES a `timeframe` (the candle clock dispatches it) and validation rejects one without. Fired events record the freshness the evaluation actually used (`fundamentals_acquired_at`, `fundamentals_as_of_date` in event evidence); worker health counts `fundamentals_hits`/`fundamentals_misses`/`fundamentals_stale` (staleness threshold `ALERTS_FUNDAMENTALS_STALE_HOURS`, default 168). Replay evaluates the same current snapshot — current fundamentals are never presented as historical truth.
 
 ### Delivery storm controls (E-25)
 

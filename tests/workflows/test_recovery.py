@@ -929,7 +929,7 @@ def test_build_renewal_uses_same_client_on_interval(session_factory, notif_repo)
 
     async def scenario():
         task = asyncio.create_task(worker.run())
-        await asyncio.sleep(0.08)
+        await asyncio.sleep(0.25)
         task.cancel()
         try:
             await task
@@ -974,7 +974,7 @@ def test_renewal_failure_does_not_crash_worker(session_factory, notif_repo):
 
     async def scenario():
         task = asyncio.create_task(worker.run())
-        await asyncio.sleep(0.08)
+        await asyncio.sleep(0.25)
         assert not task.done()  # renewal outage must not crash the loop
         task.cancel()
         try:

@@ -121,7 +121,7 @@ def _client(actions=None, *, catalog=None):
     factory = sessionmaker(bind=engine, expire_on_commit=False)
 
     app = FastAPI()
-    app.include_router(worker_universes_router.router, prefix="/api/worker")
+    app.include_router(worker_universes_router.router, prefix="/api")
     app.dependency_overrides[worker_universes_router._universes_db] = lambda: factory
     app.state.algo_worker_repository = _StubWorkerTokenRepository(_token(actions))
     app.state.universe_service = UniverseService(factory, catalog=catalog)
@@ -416,3 +416,25 @@ def test_portfolio_universe_rejected_without_provider():
     )
     assert response.status_code == 422, response.text
     assert "provider" in response.json()["detail"].lower()
+
+
+def test_production_mount_keeps_paths_under_worker_auth_exemption():
+    """Production mounts this router at '/api' (ALL_ROUTERS). The app auth
+    middleware only exempts '/api/worker/...' paths for worker tokens, so a
+    production-style mount must still produce '/api/worker/universes' paths —
+    otherwise the middleware 401s every worker-token call before the router
+    runs (regression: router prefix was '/universes', unreachable in prod)."""
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(worker_universes_router.router, prefix="/api")
+    universe_paths = {
+        route.path
+        for route in app.routes
+        if getattr(route, "path", "").startswith("/api/universes")
+        or "/universes" in getattr(route, "path", "")
+    }
+    assert universe_paths, "universe routes not registered"
+    assert all(
+        path.startswith("/api/worker/universes") for path in universe_paths
+    ), sorted(universe_paths)

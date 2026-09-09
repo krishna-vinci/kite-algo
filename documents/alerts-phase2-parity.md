@@ -53,7 +53,7 @@ repository root; commands assume `.venv/bin/python -m pytest`.
 - Live `kite-postgres` migrated 20260909_000012 → 20260909_000013 (additive).
 - Bootstrap import via the production code path inside `kite-app`: status
   `published`, generation `48d56789-9ee2-4ca6-bf83-b536368d6fb1`, accepted
-  exchanges BCD/BFO/BSE/CDS/MCX/NFO/NFO/NSE (7/7), record_count 88,769,
+  exchanges BCD/BFO/BSE/CDS/MCX/NFO/NSE (7/7), record_count 88,769,
   zero validation errors.
 - Go reload ack: `{"count":88769,"generation":"48d56789…","status":"ok"}` —
   matches the published generation exactly.

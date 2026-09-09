@@ -136,6 +136,22 @@ class FeatureEngine:
                 if key == instrument_key
             )
 
+    def release(self, instrument_key: str, timeframe: Optional[str] = None) -> None:
+        """Drop windows/specs/cached values for an instrument (or one of its
+        timeframes). Called when a binding is retired/replaced so a removed
+        instrument cannot leak memory or serve stale values."""
+        with self._lock:
+            doomed = [
+                window_key
+                for window_key in list(self._windows)
+                if window_key[0] == instrument_key
+                and (timeframe is None or window_key[1] == timeframe)
+            ]
+            for window_key in doomed:
+                self._windows.pop(window_key, None)
+                self._specs.pop(window_key, None)
+                self._latest.pop(window_key, None)
+
     def has_declarations(self, instrument_key: str, timeframe: str) -> bool:
         with self._lock:
             return bool(self._specs.get((instrument_key, timeframe)))

@@ -11,6 +11,7 @@ stages:
     type: filter
     input: universe
     evaluate_on: fundamentals_refresh
+    timeframe: 1d
     conditions:
       all:
         - field: fundamentals.quarterly_revenue_yoy_pct

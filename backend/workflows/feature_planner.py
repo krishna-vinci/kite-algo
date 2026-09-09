@@ -33,6 +33,10 @@ class SubscriptionPlan:
     layers: Tuple[Tuple[Stage, Optional[str]], ...] = ()  # (ancestor stage, timeframe)
     feature_timeframes: Tuple[str, ...] = ()  # timeframes to merge into features
     specs: Tuple[Tuple[str, FeatureSpec], ...] = field(default=())  # (timeframe, spec)
+    # (alias "stage:<id>", timeframe, canonical feature id): dispatch features
+    # are keyed by canonical ids, so predicates resolving "stage:<id>" read
+    # the referenced stage's own-timeframe snapshot through these aliases.
+    stage_aliases: Tuple[Tuple[str, str, str], ...] = field(default=())
 
     @property
     def has_features(self) -> bool:
@@ -113,6 +117,7 @@ def build_subscription_plan(document: WorkflowDocument, stage_id: str) -> Subscr
     ]
 
     needs: Set[Tuple[str, str, FeatureSpec]] = set()
+    aliases: Set[Tuple[str, str, str]] = set()
     own_tf = stage.timeframe
     for stage_or_layer in [stage] + ancestors:
         _operand_specs(stage_or_layer, needs)
@@ -154,20 +159,25 @@ def build_subscription_plan(document: WorkflowDocument, stage_id: str) -> Subscr
                 output=feature_stage.stage_params.get("output"),
             )
             needs.add((tf, f"stage:{feature_stage.id}", spec))
+            aliases.add((f"stage:{feature_stage.id}", tf, spec.feature_id))
 
     for feature_stage in document.stages:
         if feature_stage.type == "feature" and feature_stage.function:
+            spec = FeatureSpec(
+                function=feature_stage.function,
+                params=dict(feature_stage.stage_params or {}),
+                source=feature_stage.source_field or "close",
+                offset=0,
+                output=(feature_stage.stage_params or {}).get("output"),
+            )
             needs.add(
+                (feature_stage.timeframe or "day", f"stage:{feature_stage.id}", spec)
+            )
+            aliases.add(
                 (
-                    feature_stage.timeframe or "day",
                     f"stage:{feature_stage.id}",
-                    FeatureSpec(
-                        function=feature_stage.function,
-                        params=dict(feature_stage.stage_params or {}),
-                        source=feature_stage.source_field or "close",
-                        offset=0,
-                        output=(feature_stage.stage_params or {}).get("output"),
-                    ),
+                    feature_stage.timeframe or "day",
+                    spec.feature_id,
                 )
             )
     _scan_refs(stage)
@@ -191,4 +201,5 @@ def build_subscription_plan(document: WorkflowDocument, stage_id: str) -> Subscr
         layers=tuple(layers),
         feature_timeframes=tuple(sorted(feature_timeframes)),
         specs=tuple((tf, spec) for (tf, _), spec in merged.items()),
+        stage_aliases=tuple(sorted(aliases)),
     )

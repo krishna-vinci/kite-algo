@@ -514,6 +514,7 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
 
     from backend.notifications.repository import SqlAlchemyNotificationRepository
     from backend.notifications.worker import DeliveryWorker
+    from backend.workflows.fundamentals_context import FundamentalsLoader
     from backend.workflows.instrument_bindings import InstrumentBindingRegistry
     from backend.workflows.repository import SqlAlchemyWorkflowRepository
     from backend.workflows.runtime import (
@@ -642,6 +643,10 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
             keys,
             session_factory,
             fallback_tokens=configured_tokens,
+        ),
+        fundamentals_loader=FundamentalsLoader(session_factory),
+        fundamentals_stale_hours=float(
+            os.environ.get("ALERTS_FUNDAMENTALS_STALE_HOURS", "168")
         ),
     )
 

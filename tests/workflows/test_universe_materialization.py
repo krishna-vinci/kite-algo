@@ -243,3 +243,28 @@ from datetime import datetime, timedelta, timezone
 
 def T0(offset_minutes=0):
     return datetime(2026, 9, 9, 10, 0, tzinfo=timezone.utc) + timedelta(minutes=offset_minutes)
+
+
+def _intersect_document():
+    doc = _universe_document()
+    doc["universe"] = {
+        "union": [{"universe": "core-list"}],
+        "intersect": [{"universe": "liquid-list"}],
+        "deduplicate": True,
+    }
+    return doc
+
+
+def test_intersect_restricts_union_membership(session_factory):
+    """F7: union ∩ intersect — members of the intersection ref that are not
+    in the union are not admitted, and vice versa."""
+    fake = _FakeUniverseService({
+        "core-list": {"NSE:A", "NSE:B"},
+        "liquid-list": {"NSE:B", "NSE:C"},  # C not in union, A not in intersect
+    })
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    _activate(repo, session_factory, "uni-intersect", _intersect_document())
+    worker = _make_worker(session_factory, fake)
+    asyncio.run(worker.start())
+    assert {s.instrument_key for s in worker._subscriptions} == {"NSE:B"}
+    asyncio.run(worker.stop())

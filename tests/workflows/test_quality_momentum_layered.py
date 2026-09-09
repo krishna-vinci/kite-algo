@@ -70,6 +70,7 @@ def _layered_document(name, symbols, trigger="on_transition"):
                 "id": "quality",
                 "type": "filter",
                 "evaluate_on": "fundamentals_refresh",
+                "timeframe": "1d",
                 "input": "universe",
                 "conditions": {
                     "all": [
@@ -220,8 +221,13 @@ def test_unknown_upstream_layer_blocks_firing(session_factory):
     assert result.fired is False
 
     # with fundamentals satisfied AND upstream snapshots known, a genuine
-    # breakout fires
-    fundamentals = {"fundamentals.quarterly_revenue_yoy_pct": 22.0}
+    # breakout fires. Acquisition metadata rides the context so the event
+    # evidence records the freshness the evaluation actually used (§5.8).
+    fundamentals = {
+        "fundamentals.quarterly_revenue_yoy_pct": 22.0,
+        "fundamentals.acquired_at": "2026-09-01T18:30:00+00:00",
+        "fundamentals.as_of_date": "2026-08-31",
+    }
     daily = {"field:close": 130.0, "ema:{\"period\":200}:close": 100.0}
     warm = service.handle_observation(
         sub,
@@ -254,6 +260,10 @@ def test_unknown_upstream_layer_blocks_firing(session_factory):
     assert fired.emitted is True
     events = repo.list_events([sub.id], limit=5)
     assert len(events) == 1
+    evidence = events[0].evidence
+    assert evidence, "event must carry evidence"
+    assert evidence.get("fundamentals_acquired_at") == "2026-09-01T18:30:00+00:00"
+    assert evidence.get("fundamentals_as_of_date") == "2026-08-31"
 
 
 def test_storm_budget_bounds_emissions_and_is_reported(session_factory, monkeypatch):

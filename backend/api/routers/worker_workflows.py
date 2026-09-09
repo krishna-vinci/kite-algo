@@ -395,7 +395,28 @@ async def workflow_capabilities(request: Request):
             "operators": {name: spec.get("kind") for name, spec in sorted(wf_registry.OPERATORS.items())},
             "fields": sorted(wf_registry.FIELDS),
             "fundamentals_fields": sorted(wf_registry.FUNDAMENTALS_FIELDS),
-            "clocks": sorted(wf_registry.CLOCKS),
+            "fundamentals_source": {
+                "table": "public.fundamentals_features",
+                "description": (
+                    "Latest stored snapshot per bare symbol (Screener.in "
+                    "nightly sync, NSE-listing coverage); NSE:SYMBOL keys "
+                    "resolve, other exchanges are unavailable. Missing rows "
+                    "leave fields unknown, never false. Refreshed by the "
+                    "nightly fundamentals scheduler; on-demand via "
+                    "POST /algo-workers/worker/fundamentals/sync."
+                ),
+                "freshness_keys": [
+                    "fundamentals.acquired_at",
+                    "fundamentals.as_of_date",
+                    "fundamentals.statement_scope",
+                ],
+                "columns": dict(sorted(wf_registry.FUNDAMENTALS_COLUMN_MAP.items())),
+            },
+            "clocks": {
+                name: spec
+                for name, spec in sorted(wf_registry.CLOCK_METADATA.items())
+            },
+            "clock_aliases": dict(sorted(wf_registry.CLOCK_ALIASES.items())),
             "triggers": sorted(wf_registry.TRIGGERS),
             "timeframes": sorted(wf_registry.TIMEFRAMES),
             "sessions": sorted(wf_registry.SESSIONS),

@@ -89,7 +89,11 @@ from zoneinfo import ZoneInfo
 
 from backend.alerts.predicates import Observation
 from backend.workflows.feature_engine import FeatureEngine, FeatureSpec  # noqa: F401 (re-export)
-from backend.workflows.feature_planner import SubscriptionPlan, build_subscription_plan
+from backend.workflows.feature_planner import (
+    SubscriptionPlan,
+    build_subscription_plan,
+    stage_chain,
+)
 from backend.workflows.instrument_bindings import BindingChange, InstrumentBindingRegistry
 from backend.workflows.models import Stage, WorkflowDocument
 from backend.workflows.parser import WorkflowParseError, parse_workflow_dict
@@ -131,6 +135,19 @@ MARKET_RUNTIME_OWNER_LEASE_TTL_S = 90.0
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _age_hours(acquired_at_iso: str, *, now: Optional[datetime] = None) -> float:
+    """Hours since an ISO-8601 acquisition timestamp; ``inf`` when unparseable
+    (stale-by-default: absent/legacy metadata never reads as fresh)."""
+    try:
+        acquired = datetime.fromisoformat(str(acquired_at_iso))
+    except (TypeError, ValueError):
+        return float("inf")
+    if acquired.tzinfo is None:
+        acquired = acquired.replace(tzinfo=timezone.utc)
+    reference = now or _utcnow()
+    return max(0.0, (reference - acquired).total_seconds() / 3600.0)
 
 
 def _parse_ts(raw: Any) -> Optional[datetime]:
@@ -658,6 +675,8 @@ class EvaluationWorker:
         instrument_resolver: Optional[Callable[[set[str]], Any]] = None,
         binding_registry: Optional[InstrumentBindingRegistry] = None,
         bindings_changed: Optional[Callable[[BindingChange], Any]] = None,
+        fundamentals_loader: Optional[Any] = None,
+        fundamentals_stale_hours: float = 168.0,
     ) -> None:
         self.workflow_repo = workflow_repo
         self.session_factory = session_factory
@@ -683,6 +702,11 @@ class EvaluationWorker:
         self.bindings = binding_registry or InstrumentBindingRegistry(instrument_tokens)
         self.instrument_resolver = instrument_resolver
         self._bindings_changed = bindings_changed
+        # Phase 2 closure: production fundamentals context (latest stored
+        # snapshot from public.fundamentals_features; missing data unknown).
+        self.fundamentals_loader = fundamentals_loader
+        self.fundamentals_stale_hours = max(0.0, float(fundamentals_stale_hours))
+        self._stage_fundamentals_cache: Dict[Tuple[str, str], bool] = {}
 
         self.health: Dict[str, Any] = {
             "started_at": None,
@@ -701,6 +725,9 @@ class EvaluationWorker:
             "context_misses": 0,
             "unresolved_instruments": 0,
             "binding_revisions": 0,
+            "fundamentals_hits": 0,
+            "fundamentals_misses": 0,
+            "fundamentals_stale": 0,
         }
 
         if service is not None:
@@ -864,7 +891,9 @@ class EvaluationWorker:
             try:
                 obs = await source.next_observation()
             except Exception:
-                await self._handle_source_failure("candle", key, source)
+                # Distinct kind: a feature-source failure must not pop from
+                # (or rebuild into) the dispatch candle-source table.
+                await self._handle_source_failure("feature", key, source)
                 continue
             if obs is None:
                 continue
@@ -1011,10 +1040,41 @@ class EvaluationWorker:
                 await source.start()
                 self._candle_sources[key] = source
 
+        feature_keys = [(k, tf) for (k, tf) in list(self._feature_sources) if k in affected]
+        for key in feature_keys:
+            old = self._feature_sources.pop(key, None)
+            if old is not None:
+                await self._safe_stop_source(old)
+            if (
+                key[0] not in change.removed
+                and self.bindings.get(key[0]) is not None
+            ):
+                if key in change.changed:
+                    # A replaced token changes the instrument identity the
+                    # window was built from: drop and re-warm from history so
+                    # the old token's bars can never contaminate features.
+                    self.feature_engine.release(key[0], key[1])
+                    self._feature_warmed.discard(key)
+                self.feature_engine.warm(key[0], key[1], self.candle_history)
+                self._feature_warmed.add(key)
+                source = self.candle_source_factory(*key)
+                await source.start()
+                self._feature_sources[key] = source
+
         for key in change.removed:
             self._ltp_subs.pop(key, None)
             for candle_key in [k for k in list(self._candle_subs) if k[0] == key]:
                 self._candle_subs.pop(candle_key, None)
+            # Release engine windows/specs and any surviving feature source so
+            # a retired instrument stops consuming feeds and holding memory.
+            for feature_key in [k for k in list(self._feature_sources) if k[0] == key]:
+                old = self._feature_sources.pop(feature_key, None)
+                if old is not None:
+                    await self._safe_stop_source(old)
+            self.feature_engine.release(key)
+            self._feature_warmed = {
+                wk for wk in self._feature_warmed if wk[0] != key
+            }
 
         logger.info(
             "instrument bindings updated: %d added, %d replaced, %d removed (revision %d)",
@@ -1134,6 +1194,55 @@ class EvaluationWorker:
                         skip_sync = True
                         break
                     degraded = True
+            # F7 intersection: restrict the union to members present in EVERY
+            # intersect reference (resolved with the same cache/freshness
+            # semantics as union refs).
+            for ref in document.universe.intersect:
+                cache_key = f"{owner_id}:intersect:{ref.kind}:{ref.name}"
+                cached = self._universe_cache.get(cache_key)
+                try:
+                    if ref.kind in ("universe", "watchlist"):
+                        latest = self.universe_service.latest_revision(owner_id, ref.name)
+                        if latest is None:
+                            logger.warning(
+                                "intersect universe %s referenced by workflow %s has no "
+                                "resolved membership",
+                                ref.name, revision.id,
+                            )
+                            self._universe_health["stale_universes"] += 1
+                            degraded = True
+                            continue
+                        resolved = set(latest.get("members") or ())
+                        try:
+                            universe_revision = max(
+                                universe_revision or 0, int(latest.get("revision") or 0)
+                            ) or None
+                        except (TypeError, ValueError):
+                            pass
+                    else:  # index source list
+                        preview = self.universe_service.preview_membership(
+                            owner_id, "index", {"source_list": ref.name}
+                        )
+                        resolved = set(preview.get("members") or ())
+                    self._universe_cache[cache_key] = (now, resolved)
+                except Exception as exc:
+                    self._universe_health["resolution_failures"] += 1
+                    if cached is not None:
+                        resolved = cached[1]
+                        logger.warning(
+                            "intersect universe resolution failed for %s (%s); "
+                            "using last cached membership",
+                            ref.name, exc,
+                        )
+                    else:
+                        logger.warning(
+                            "intersect universe resolution failed for %s (%s); "
+                            "keeping last materialized state unchanged",
+                            ref.name, exc,
+                        )
+                        skip_sync = True
+                        break
+                members &= resolved
             for ref in document.universe.exclude:
                 try:
                     if ref.kind in ("universe", "watchlist"):
@@ -1183,11 +1292,16 @@ class EvaluationWorker:
             for timeframe in plan.feature_timeframes:
                 needed.setdefault((sub.instrument_key, timeframe), True)
         for (key, timeframe) in sorted(needed):
-            if (key, timeframe) in self._feature_sources or (key, timeframe) in self._candle_sources:
-                continue
+            # Warm the engine window from durable history whenever it has not
+            # been warmed yet — including the dispatch timeframe itself, whose
+            # feed source may already exist (start() opens dispatch sources
+            # before this sync). Skipping warm for existing sources left the
+            # dispatch timeframe's feature window empty after every restart.
             if (key, timeframe) not in self._feature_warmed:
                 self._feature_warmed.add((key, timeframe))
                 self.feature_engine.warm(key, timeframe, self.candle_history)
+            if (key, timeframe) in self._feature_sources or (key, timeframe) in self._candle_sources:
+                continue
             source = self.candle_source_factory(key, timeframe)
             await source.start()
             self._feature_sources[(key, timeframe)] = source
@@ -1209,6 +1323,12 @@ class EvaluationWorker:
             for source_map in (engine.snapshot(key, timeframe), engine.field_snapshot(key, timeframe)):
                 for feature_id, value in source_map.items():
                     merged.setdefault(feature_id, value)
+        # Stage references read the referenced feature stage's OWN-timeframe
+        # snapshot under its "stage:<id>" alias.
+        for alias, timeframe, feature_id in plan.stage_aliases:
+            value = engine.snapshot(key, timeframe).get(feature_id)
+            if value is not None:
+                merged.setdefault(alias, value)
         layers = []
         for layer_stage, layer_tf in plan.layers:
             if layer_tf:
@@ -1360,7 +1480,13 @@ class EvaluationWorker:
             kind, key, self.health["gaps"], self.source_rebuild_backoff_s,
             exc_info=True,
         )
-        table = self._tick_sources if kind == "tick" else self._candle_sources
+        table = (
+            self._tick_sources
+            if kind == "tick"
+            else self._feature_sources
+            if kind == "feature"
+            else self._candle_sources
+        )
         table.pop(key, None)
         self._pending_rebuilds.pop((kind, key), None)
         try:
@@ -1394,6 +1520,15 @@ class EvaluationWorker:
                     source = self.tick_source_factory(key)
                     await source.start()
                     self._tick_sources[key] = source
+                elif kind == "feature":
+                    # Backfill the engine window from stored completed candles
+                    # BEFORE the rebuilt source is exposed: bars missed during
+                    # the outage are recoverable from Postgres (the aggregator
+                    # keeps persisting), so windows must not go silently stale.
+                    self.feature_engine.warm(key[0], key[1], self.candle_history)
+                    source = self.candle_source_factory(*key)
+                    await source.start()
+                    self._feature_sources[key] = source
                 else:
                     source = self.candle_source_factory(*key)
                     # History replay must complete before the rebuilt live
@@ -1553,6 +1688,24 @@ class EvaluationWorker:
         self._document_cache[sub.revision_id] = document
         return document
 
+    def _stage_needs_fundamentals(self, sub: ActiveSubscription) -> bool:
+        """Whether this subscription's stage — or any ancestor stage of its
+        layer chain — can reference fundamentals fields (cached per
+        revision+stage)."""
+        cache_key = (sub.revision_id, sub.stage_id)
+        cached = self._stage_fundamentals_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        needed = False
+        document = self._document_for(sub)
+        if document is not None:
+            stage = next((s for s in document.stages if s.id == sub.stage_id), None)
+            if stage is not None:
+                chain = [stage, *stage_chain(document, sub.stage_id)]
+                needed = any(registry.stage_uses_fundamentals(s) for s in chain)
+        self._stage_fundamentals_cache[cache_key] = needed
+        return needed
+
     def _stage_for(self, sub: ActiveSubscription) -> Optional[Stage]:
         document = self._document_for(sub)
         if document is None:
@@ -1583,6 +1736,24 @@ class EvaluationWorker:
                     "previous-session context unavailable for %s", sub.instrument_key,
                     exc_info=True,
                 )
+        if self.fundamentals_loader is not None and self._stage_needs_fundamentals(sub):
+            try:
+                fundamentals = self.fundamentals_loader.context_for(sub.instrument_key)
+            except Exception:
+                fundamentals = None
+                logger.warning(
+                    "fundamentals context unavailable for %s", sub.instrument_key,
+                    exc_info=True,
+                )
+            if fundamentals:
+                context = dict(context) if context else {}
+                context.update(fundamentals)
+                self.health["fundamentals_hits"] += 1
+                acquired_at = fundamentals.get("fundamentals.acquired_at")
+                if acquired_at and _age_hours(acquired_at) > self.fundamentals_stale_hours:
+                    self.health["fundamentals_stale"] += 1
+            else:
+                self.health["fundamentals_misses"] += 1
         supports_context = False
         supports_features = False
         supports_layers = False
