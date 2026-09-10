@@ -43,6 +43,12 @@ FIELDS: Mapping[str, dict] = {
     # context (previous trading day's levels), not from the observation bar.
     "prev_day_high": {"unit": "price", "warmup_bars": 0, "context_resolved": True},
     "prev_day_low": {"unit": "price", "warmup_bars": 0, "context_resolved": True},
+    # Screener-only stored-data fields (Phase 3): computed by the screener
+    # pipeline from the latest completed daily candles — % change vs the
+    # previous close and traded turnover (close x volume). Rejected for
+    # regular alert documents, which have no stored-scan data path.
+    "change_pct": {"unit": "percent", "warmup_bars": 2, "screener_only": True},
+    "turnover": {"unit": "currency_volume", "warmup_bars": 1, "screener_only": True},
 }
 
 CLOCKS: Mapping[str, dict] = {

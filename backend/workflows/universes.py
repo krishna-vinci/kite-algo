@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import (
@@ -76,7 +76,7 @@ __all__ = [
     "SUPPORTED_UNIVERSE_KINDS",
 ]
 
-SUPPORTED_UNIVERSE_KINDS = ("explicit", "index", "portfolio")
+SUPPORTED_UNIVERSE_KINDS = ("explicit", "index", "portfolio", "screener")
 
 # Index source lists whose constituents were ingested into
 # public.kite_ticker_tickers. Validated against the ingestion module lazily
@@ -417,6 +417,25 @@ class UniverseService:
             config["members"] = self._normalize_explicit_members(config.get("members"))
         elif kind == "index":
             config["source_list"] = self._normalize_index_source_list(config.get("source_list"))
+        elif kind == "screener":
+            workflow_ref = str(config.get("workflow") or "").strip()
+            if not workflow_ref:
+                raise UniverseValidationError(
+                    "screener universes require source_config.workflow: the "
+                    "owning screener workflow's name (owner-scoped)"
+                )
+            top_n = config.get("top_n")
+            if top_n is not None and (
+                isinstance(top_n, bool) or not isinstance(top_n, int) or not (1 <= top_n <= 1000)
+            ):
+                raise UniverseValidationError("source_config.top_n must be an integer in [1, 1000]")
+            limit = config.get("freshness_limit_s")
+            if limit is not None and (
+                isinstance(limit, bool) or not isinstance(limit, int) or not (300 <= limit <= 30 * 24 * 3600)
+            ):
+                raise UniverseValidationError(
+                    "source_config.freshness_limit_s must be an integer in [300, 2592000]"
+                )
         else:  # portfolio
             if self._portfolio_provider is None:
                 raise UniverseValidationError(
@@ -502,6 +521,25 @@ class UniverseService:
                 raise UniverseExistsError(
                     f"universe {universe_name!r} already exists for owner {owner!r}"
                 )
+            if universe_kind == "screener":
+                # Fail fast at authoring: reject a screener source whose
+                # dependency chain loops back to this universe (including a
+                # direct reference to the universe being created).
+                from sqlalchemy import or_ as _or
+
+                from backend.workflows.repository import Workflow
+
+                source_ref = str(validated_config.get("workflow") or "").strip()
+                source_workflow = session.execute(
+                    select(Workflow).where(
+                        Workflow.owner_id == owner,
+                        _or(Workflow.name == source_ref, Workflow.id == source_ref),
+                    )
+                ).scalar_one_or_none()
+                if source_workflow is not None:
+                    self._assert_no_screener_universe_cycle(
+                        session, owner, source_workflow, origin_name=universe_name
+                    )
             row = Universe(
                 owner_id=owner,
                 name=universe_name,
@@ -544,7 +582,14 @@ class UniverseService:
     # -- membership resolution -----------------------------------------------
 
     def _candidate_members(
-        self, session: Session, owner_id: str, kind: str, config: Dict[str, Any], now: datetime
+        self,
+        session: Session,
+        owner_id: str,
+        kind: str,
+        config: Dict[str, Any],
+        now: datetime,
+        *,
+        origin_name: Optional[str] = None,
     ) -> Tuple[List[str], Optional[Dict[str, Any]]]:
         """Raw (pre-catalog) member candidates plus source freshness info.
 
@@ -577,6 +622,11 @@ class UniverseService:
                 ) from exc
             return candidates, self._index_source_freshness(session, source_list)
 
+        if kind == "screener":
+            return self._screener_candidates(
+                session, owner_id, config, now, origin_name=origin_name
+            )
+
         # portfolio: owner-scoped, read-only, provider injected.
         provider = self._portfolio_provider
         if provider is None:  # defensive; creation already rejects this
@@ -599,6 +649,180 @@ class UniverseService:
             "owner_id": owner_id,
             "last_refreshed_at": _iso(now),
         }
+
+    def _screener_candidates(
+        self,
+        session: Session,
+        owner_id: str,
+        config: Dict[str, Any],
+        now: datetime,
+        *,
+        origin_name: Optional[str] = None,
+    ) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+        """Members from the owning screener workflow's latest COMPLETE run.
+
+        Ownership: the source workflow must belong to the same owner.
+        Freshness: the run's scheduled_for must be within
+        ``freshness_limit_s`` (default 3d) or the source is unavailable —
+        dependent alerts then see degraded universes instead of stale
+        membership silently going stale (E-18).
+        Cycle prevention: the source workflow's document must not reference
+        a screener-sourced universe that resolves back to it (bounded walk).
+        """
+        from sqlalchemy import or_ as _or
+
+        from backend.workflows.repository import Workflow, WorkflowRevision
+        from backend.workflows.screener_repository import ScreenerRun, ScreenerRunMember
+
+        workflow_ref = str(config.get("workflow") or "").strip()
+        top_n = config.get("top_n")
+        limit_s = int(config.get("freshness_limit_s") or 3 * 24 * 3600)
+        workflow = session.execute(
+            select(Workflow).where(
+                Workflow.owner_id == owner_id,
+                _or(Workflow.name == workflow_ref, Workflow.id == workflow_ref),
+            )
+        ).scalar_one_or_none()
+        if workflow is None:
+            raise UniverseSourceUnavailable(
+                f"screener workflow {workflow_ref!r} not found for this owner"
+            )
+        self._assert_no_screener_universe_cycle(
+            session, owner_id, workflow, origin_name=origin_name
+        )
+        run = session.execute(
+            select(ScreenerRun)
+            .where(
+                ScreenerRun.owner_id == owner_id,
+                ScreenerRun.workflow_id == workflow.id,
+                ScreenerRun.status == "complete",
+            )
+            .order_by(ScreenerRun.scheduled_for.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if run is None:
+            raise UniverseSourceUnavailable(
+                f"screener workflow {workflow_ref!r} has no complete run yet"
+            )
+        scheduled = run.scheduled_for
+        if scheduled is not None and scheduled.tzinfo is None:
+            scheduled = scheduled.replace(tzinfo=timezone.utc)
+        if scheduled is not None and (now - scheduled) > timedelta(seconds=limit_s):
+            raise UniverseSourceUnavailable(
+                f"screener workflow {workflow_ref!r} result is stale: last "
+                f"complete run {scheduled.isoformat()} exceeds the "
+                f"freshness limit ({limit_s}s); dependent alerts stay silent "
+                "until a fresh complete run"
+            )
+        rows = session.execute(
+            select(ScreenerRunMember).where(
+                ScreenerRunMember.run_id == run.id,
+                ScreenerRunMember.passed.is_(True),
+            )
+        ).scalars().all()
+        members = [
+            row.instrument_key
+            for row in rows
+            if top_n is None or (row.rank is not None and int(row.rank) <= int(top_n))
+        ]
+        freshness = {
+            "source": "screener",
+            "source_workflow_id": str(workflow.id),
+            "source_run_id": str(run.id),
+            "source_run_scheduled_for": _iso(scheduled),
+            "source_run_universe_revision": run.universe_revision,
+        }
+        return sorted(set(members)), freshness
+
+    def _assert_no_screener_universe_cycle(
+        self,
+        session: Session,
+        owner_id: str,
+        source_workflow,
+        depth: int = 0,
+        origin_name: Optional[str] = None,
+    ) -> None:
+        """Reject U(source=W) when W's document references a screener
+        universe that (transitively) sources W — bounded, owner-scoped.
+
+        ``origin_name`` is the universe currently being created/resolved: a
+        document referencing it directly closes a cycle even though its row
+        may not exist yet at creation time."""
+        from backend.workflows.repository import Workflow, WorkflowRevision
+        from sqlalchemy import or_ as _or
+
+        if depth > 8:
+            raise UniverseValidationError(
+                "screener universe dependency chain exceeds the maximum depth"
+            )
+        revision = session.execute(
+            select(WorkflowRevision)
+            .where(
+                WorkflowRevision.workflow_id == source_workflow.id,
+                WorkflowRevision.status == "active",
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        document = (revision.document or {}) if revision is not None else {}
+        universe_expr = document.get("universe") or {}
+
+        def _universe_ref_name(ref: Any) -> Optional[str]:
+            # refs are stored either typed ({kind, name}) or as shorthand
+            # ({universe: name}); index refs cannot close a universe cycle.
+            if not isinstance(ref, dict):
+                return None
+            kind = str(ref.get("kind") or "")
+            name = str(ref.get("name") or "")
+            if kind in ("universe", "watchlist") and name:
+                return name
+            for key in ("universe", "watchlist"):
+                if key in ref and isinstance(ref[key], str) and ref[key]:
+                    return ref[key]
+            return None
+
+        ref_names = [
+            name
+            for name in (
+                _universe_ref_name(ref)
+                for ref in (universe_expr.get("union") or [])
+                + (universe_expr.get("intersect") or [])
+                + (universe_expr.get("exclude") or [])
+            )
+            if name
+        ]
+        for name in ref_names:
+            if origin_name is not None and name == origin_name:
+                raise UniverseValidationError(
+                    f"dependency cycle: screener workflow "
+                    f"{source_workflow.name!r} references universe {name!r}, "
+                    "which (transitively) consumes this workflow's own results"
+                )
+            universe = session.execute(
+                select(Universe).where(Universe.owner_id == owner_id, Universe.name == name)
+            ).scalar_one_or_none()
+            if universe is None or str(universe.kind) != "screener":
+                continue
+            next_ref = str((universe.source_config or {}).get("workflow") or "").strip()
+            if not next_ref:
+                continue
+            next_workflow = session.execute(
+                select(Workflow).where(
+                    Workflow.owner_id == owner_id,
+                    _or(Workflow.name == next_ref, Workflow.id == next_ref),
+                )
+            ).scalar_one_or_none()
+            if next_workflow is None:
+                continue
+            if str(next_workflow.id) == str(source_workflow.id):
+                raise UniverseValidationError(
+                    f"dependency cycle: screener workflow "
+                    f"{source_workflow.name!r} consumes its own screener results "
+                    "through universe "
+                    f"{name!r}"
+                )
+            self._assert_no_screener_universe_cycle(
+                session, owner_id, next_workflow, depth + 1, origin_name=origin_name
+            )
 
     def _index_source_freshness(
         self, session: Session, source_list: str
@@ -737,7 +961,7 @@ class UniverseService:
             kind = str(universe.kind)
             config = dict(universe.source_config or {})
             candidates, freshness = self._candidate_members(
-                session, owner_id, kind, config, now
+                session, owner_id, kind, config, now, origin_name=str(name)
             )
             catalog = self._catalog_for(catalog_session_factory)
             members, rejected, source_generation = self._resolve_through_catalog(

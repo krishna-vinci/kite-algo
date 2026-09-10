@@ -401,13 +401,18 @@ async def supervise(
     *,
     stop: Any,
     delivery_poll_interval_s: float = 2.0,
+    screener_scheduler: Any = None,
 ) -> list:
-    """Run the evaluation (and delivery) tasks until ``stop`` is set.
+    """Run the evaluation (and delivery, and screener) tasks until ``stop``.
 
-    Both tasks are cancelled cleanly on shutdown; a task that crashes before
+    All tasks are cancelled cleanly on shutdown; a task that crashes before
     the stop signal also triggers shutdown and its error is logged.
     """
     tasks = [asyncio.create_task(worker.run(), name="evaluation-worker")]
+    if screener_scheduler is not None:
+        tasks.append(
+            asyncio.create_task(screener_scheduler.run(), name="screener-scheduler")
+        )
     if delivery_worker is not None and delivery_enabled():
         tasks.append(
             asyncio.create_task(
@@ -662,6 +667,43 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
     except Exception:
         logger.warning("universe service unavailable; universe workflows inert", exc_info=True)
 
+    # Phase 3 (F9): scheduled screener execution. Shares the universe
+    # service, fundamentals loader and catalog-aware candle history with the
+    # evaluation worker; occurrences are claimed in Postgres so concurrent
+    # workers never duplicate a logical run.
+    screener_scheduler = None
+    try:
+        from backend.screeners.runner import ScreenerPipeline
+        from backend.screeners.scheduler import ScreenerScheduler
+        from backend.workflows.screener_repository import ScreenerRunRepository
+
+        fundamentals_loader = FundamentalsLoader(session_factory)
+        screener_scheduler = ScreenerScheduler(
+            session_factory=session_factory,
+            workflow_repo=workflow_repo,
+            run_repo=ScreenerRunRepository(session_factory),
+            pipeline=ScreenerPipeline(
+                candle_history=PgCandleHistory(engine, bindings),
+                window_bars=int(os.environ.get("ALERTS_SCREENER_WINDOW_BARS", "120")),
+            ),
+            universe_service=worker.universe_service,
+            fundamentals_loader=fundamentals_loader,
+            channel_resolver=channel_resolver,
+            session_gate=(
+                lambda at, _provider=build_market_session_provider(engine): _provider(
+                    "nse_equity", "NSE:SCREENER", at
+                )
+            ),
+            owner_id=f"{runtime_owner_id}:screener",
+            poll_interval_s=float(os.environ.get("ALERTS_SCREENER_POLL_INTERVAL_S", "30")),
+            lease_ttl_s=float(os.environ.get("ALERTS_SCREENER_LEASE_TTL_S", "300")),
+            max_events_per_attachment=int(
+                os.environ.get("ALERTS_SCREENER_MAX_ATTACHMENT_EVENTS", "100")
+            ),
+        )
+    except Exception:
+        logger.warning("screener scheduler unavailable; screeners inert", exc_info=True)
+
     # Supervised delivery task: drains the signal outbox so emitted alerts
     # actually reach their channels (default-on; env kill-switch).
     delivery_worker = None
@@ -704,6 +746,7 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         delivery_worker,
         stop=stop_signal,
         delivery_poll_interval_s=float(os.environ.get("ALERTS_DELIVERY_POLL_INTERVAL_S", "2.0")),
+        screener_scheduler=screener_scheduler,
     )
     await _sync_market_runtime_subscriptions_runtime_cleanup(runtime_owner_id)
     engine.dispose()

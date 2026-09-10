@@ -1,0 +1,73 @@
+# Phase 3 reference screener: daily quality-momentum top-N with attachments.
+# Same schema/lifecycle as alert workflows (draft -> active -> paused ->
+# archived); executes as a scheduled stored-data scan, never live ticks.
+version: 1
+name: nifty-quality-momentum
+session: nse_equity
+
+universe:
+  union:
+    - index: nifty50
+  exclude:
+    - universe: illiquid-names
+  deduplicate: true
+
+stages:
+  # quality layer: latest stored fundamentals snapshot on the daily clock
+  - id: quality
+    type: filter
+    input: universe
+    evaluate_on: fundamentals_refresh   # alias of candle_close
+    timeframe: 1d
+    conditions:
+      all:
+        - field: fundamentals.quarterly_revenue_yoy_pct
+          op: gt
+          value: 15
+        - field: fundamentals.latest_roce_pct
+          op: gt
+          value: 18
+  # momentum filter over completed daily candles
+  - id: trend
+    type: filter
+    input: quality
+    evaluate_on: candle_close
+    timeframe: 1d
+    conditions:
+      all:
+        - left: {field: close}
+          op: gt
+          right: {indicator: ema, period: 200}
+        - left: {field: change_pct}
+          op: gt
+          right: {value: 0}
+
+screener:
+  schedule:
+    every: 1d
+    calendar: nse_equity       # only nse_equity is calendar-backed
+    at: session_close          # 15:30 IST; buckets skip non-session days
+  rank:
+    by: {field: change_pct}    # deterministic: ties break by EXCHANGE:SYMBOL
+    direction: desc
+  top_n: 20
+  freshness_limit: 3d          # downstream dynamic-universe TTL
+  attachments:
+    - id: top10-entrants
+      trigger: top_n
+      top_n: 10
+      entry_rank: 10           # enter at rank <= 10 ...
+      exit_rank: 15            # ... exit only past rank 15 (E-17 hysteresis)
+      initial_match: false     # first complete run is a silent baseline
+      channels: [telegram_primary]
+    - id: rank-movers
+      trigger: rank_delta
+      rank_delta: 5
+      channels: [telegram_primary]
+
+alerts: []                     # screeners notify through attachments only
+
+data_policy:
+  missing: exclude_and_report
+  insufficient_history: wait
+  require_closed_candles: true

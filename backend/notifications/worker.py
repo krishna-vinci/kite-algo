@@ -69,7 +69,11 @@ from backend.notifications.adapters import (
     merge_secret_env,
     truncate_text,
 )
-from backend.notifications.message import build_message
+from backend.notifications.message import (
+    build_message,
+    build_screener_message,
+    format_event_time,
+)
 from backend.notifications.repository import Delivery, SqlAlchemyNotificationRepository
 from backend.workflows.repository import LeaseConflict, SignalEvent
 
@@ -161,22 +165,41 @@ def make_resolver(
         if event is None:
             return None
 
-        subscription = subscription_loader(event.subscription_id)
-        if not subscription:
-            return None
-
-        workflow_name = subscription.get("workflow_name")
-        alert_id = subscription.get("alert_id")
-        rule_name = f"{workflow_name}:{alert_id}" if workflow_name else alert_id
-
-        subject, body = build_message(
-            rule_name=str(rule_name or "alert"),
-            instrument_key=str(subscription.get("instrument_key") or "-"),
-            evidence=dict(event.evidence or {}),
-            fired_at=event.fired_at,
-            template=subscription.get("message"),
-            event_id=event.id,
-        )
+        if event.subscription_id is not None:
+            subscription = subscription_loader(event.subscription_id)
+            if not subscription:
+                return None
+            workflow_name = subscription.get("workflow_name")
+            alert_id = subscription.get("alert_id")
+            rule_name = f"{workflow_name}:{alert_id}" if workflow_name else alert_id
+            instrument_key = str(subscription.get("instrument_key") or "-")
+            template = subscription.get("message")
+            expires_at = subscription.get("expires_at")
+            evidence = dict(event.evidence or {})
+            subject, body = build_message(
+                rule_name=str(rule_name or "alert"),
+                instrument_key=instrument_key,
+                evidence=evidence,
+                fired_at=event.fired_at,
+                template=template,
+                event_id=event.id,
+            )
+        else:
+            # Phase 3 screener attachment event: workflow-level context lives
+            # in the evidence itself (no alert subscription exists).
+            evidence = dict(event.evidence or {})
+            if evidence.get("message_kind") != "screener_attachment":
+                return None
+            screener_name = str(evidence.get("screener") or "screener")
+            ist_str, utc_str = format_event_time(event.fired_at)
+            subject, body = build_screener_message(
+                screener_name=screener_name,
+                evidence=evidence,
+                event_id=event.id,
+                ist_str=ist_str,
+                utc_str=utc_str,
+                instrument_key=str(evidence.get("instrument_key") or "-"),
+            )
         return {
             "provider": channel.provider,
             "destination": merge_secret_env(
@@ -184,7 +207,7 @@ def make_resolver(
             ),
             "subject": subject,
             "body": body,
-            "expires_at": subscription.get("expires_at"),
+            "expires_at": expires_at if event.subscription_id is not None else None,
         }
 
     return resolve

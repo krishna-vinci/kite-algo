@@ -433,6 +433,23 @@ async def workflow_capabilities(request: Request):
             },
             "stage_types": ["signal", "filter", "feature"],
             "universe_ref_kinds": ["universe", "index", "watchlist"],
+            "screener": {
+                "attachment_triggers": ["entry", "exit", "top_n", "rank_delta"],
+                "attachment_hysteresis": {
+                    "top_n": "enter at rank <= entry_rank, exit only when rank > exit_rank",
+                    "entry_exit": "exit_after consecutive absent complete runs (default 1)",
+                },
+                "schedule_calendars": ["nse_equity"],
+                "schedule_note": (
+                    "only nse_equity is calendar-backed; MCX/currency "
+                    "eligibility is feed-driven and provides no session "
+                    "calendar for scheduled scans"
+                ),
+                "stored_data_fields": ["change_pct", "turnover"],
+                "run_statuses": ["running", "complete", "partial", "failed"],
+                "tie_break": "instrument identity (EXCHANGE:SYMBOL) ascending",
+            },
+            "universe_source_kinds": ["explicit", "index", "portfolio", "screener"],
         },
     }
 

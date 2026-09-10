@@ -197,7 +197,11 @@ class SignalEvent(Base):
     __tablename__ = "signal_events"
 
     id = Column(String(36), primary_key=True, default=_uuid)
-    subscription_id = Column(String(36), ForeignKey("alert_subscriptions.id"), nullable=False)
+    # Nullable for Phase 3 screener attachment events: those are workflow-
+    # level (no alert subscription); their delivery context comes from
+    # event.evidence keyed by workflow_id.
+    subscription_id = Column(String(36), ForeignKey("alert_subscriptions.id"), nullable=True)
+    workflow_id = Column(String(36), nullable=True, index=True)
     occurrence_key = Column(String(512), nullable=False, unique=True, index=True)
     fired_at = Column(DateTime(timezone=True), nullable=False)
     evidence = Column(JSON, nullable=False, default=dict)

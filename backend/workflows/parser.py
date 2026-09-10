@@ -29,10 +29,14 @@ import yaml
 
 from .models import (
     AlertSpec,
+    AttachmentSpec,
     Condition,
     DataPolicy,
     InstrumentRef,
     Operand,
+    RankSpec,
+    ScheduleSpec,
+    ScreenerSpec,
     Stage,
     UniverseRef,
     UniverseSpec,
@@ -244,8 +248,8 @@ def _parse_document(obj: dict) -> WorkflowDocument:
     _check_keys(
         obj,
         {"version", "name", "instruments", "stages", "alerts", "data_policy",
-         "session", "timezone", "universe"},  # timezone stays reserved;
-        "document",                           # universe is typed below
+         "session", "timezone", "universe", "screener"},  # timezone reserved;
+        "document",                                        # universe/screener typed below
     )
 
     version = obj.get("version")
@@ -289,6 +293,12 @@ def _parse_document(obj: dict) -> WorkflowDocument:
         else None
     )
 
+    screener = (
+        _screener_spec(obj["screener"])
+        if "screener" in obj and obj["screener"] not in (None, {})
+        else None
+    )
+
     document = WorkflowDocument(
         version=1,
         name=name,
@@ -298,6 +308,7 @@ def _parse_document(obj: dict) -> WorkflowDocument:
         alerts=alerts,
         data_policy=data_policy,
         universe=universe,
+        screener=screener,
     )
     # Reserved top-level keys are outside the frozen dataclass model but must
     # still reach the compiler so unsupported values fail *validation* (issue
@@ -371,6 +382,178 @@ def _universe_spec(raw: Any) -> UniverseSpec:
         raise _fail("document.universe.deduplicate", "must be a boolean")
 
     return UniverseSpec(refs=refs, exclude=exclude, intersect=intersect, deduplicate=deduplicate)
+
+
+_SCREENER_TRIGGER_TYPES = ("entry", "exit", "top_n", "rank_delta")
+
+
+def _screener_spec(raw: Any) -> ScreenerSpec:
+    """Parse the ``screener`` block (Phase 3 F9): schedule, optional ranking,
+    optional top-N cut, and result attachments."""
+    if not isinstance(raw, dict):
+        raise _fail("document.screener", "must be a mapping")
+    _check_keys(
+        raw,
+        {"schedule", "rank", "top_n", "attachments", "freshness_limit",
+         "freshness_limit_s"},  # _s is the canonical-JSON (seconds) form
+        "document.screener",
+    )
+    if "schedule" not in raw:
+        raise _fail("document.screener.schedule", "is required")
+    schedule = _schedule_spec(raw["schedule"])
+
+    rank: Optional[RankSpec] = None
+    if raw.get("rank") is not None:
+        rank_raw = raw["rank"]
+        if not isinstance(rank_raw, dict):
+            raise _fail("document.screener.rank", "must be a mapping")
+        _check_keys(rank_raw, {"by", "direction"}, "document.screener.rank")
+        direction = rank_raw.get("direction", "desc")
+        if direction not in ("desc", "asc"):
+            raise _fail(
+                "document.screener.rank.direction",
+                f"must be 'desc' or 'asc', got {direction!r}",
+            )
+        rank = RankSpec(by=_operand(rank_raw["by"], "document.screener.rank.by"), direction=direction)
+
+    top_n = raw.get("top_n")
+    if top_n is not None:
+        if isinstance(top_n, bool) or not isinstance(top_n, int) or not (1 <= top_n <= 1000):
+            raise _fail("document.screener.top_n", "must be an integer in [1, 1000]")
+
+    if "freshness_limit_s" in raw and raw.get("freshness_limit_s") is not None:
+        freshness_limit_s = raw["freshness_limit_s"]
+        if isinstance(freshness_limit_s, bool) or not isinstance(freshness_limit_s, int):
+            raise _fail("document.screener.freshness_limit_s", "must be an integer number of seconds")
+    else:
+        freshness_limit = raw.get("freshness_limit", "3d")
+        freshness_limit_s = _duration_seconds(freshness_limit, "document.screener.freshness_limit")
+    if freshness_limit_s < 300 or freshness_limit_s > 30 * 24 * 3600:
+        raise _fail(
+            "document.screener.freshness_limit",
+            "must be between 5m and 30d",
+        )
+
+    attachments_raw = raw.get("attachments", [])
+    if not isinstance(attachments_raw, list):
+        raise _fail("document.screener.attachments", "must be a list")
+    attachments = tuple(
+        _attachment_spec(item, f"document.screener.attachments[{i}]")
+        for i, item in enumerate(attachments_raw)
+    )
+
+    return ScreenerSpec(
+        schedule=schedule,
+        rank=rank,
+        top_n=top_n,
+        attachments=attachments,
+        freshness_limit_s=freshness_limit_s,
+    )
+
+
+def _schedule_spec(raw: Any) -> ScheduleSpec:
+    if not isinstance(raw, dict):
+        raise _fail("document.screener.schedule", "must be a mapping")
+    _check_keys(raw, {"every", "calendar", "at"}, "document.screener.schedule")
+    every = _duration_seconds(_require_str(raw, "every", "document.screener.schedule"), "document.screener.schedule.every")
+    if every < 300 or every > 31 * 24 * 3600:
+        raise _fail("document.screener.schedule.every", "must be between 5m and 31d")
+    calendar = raw.get("calendar", "nse_equity")
+    if calendar != "nse_equity":
+        # MCX/currency eligibility is feed-driven: no session calendar exists
+        # for scheduled scans. Reject instead of applying NSE hours.
+        raise _fail(
+            "document.screener.schedule.calendar",
+            f"unsupported schedule calendar {calendar!r}: only 'nse_equity' is "
+            "calendar-backed; MCX/currency have no session calendar for "
+            "scheduled scans",
+        )
+    at = raw.get("at")
+    if at is not None:
+        at = str(at)
+        if at != "session_close":
+            try:
+                hours, minutes = at.split(":")
+                if not (0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59):
+                    raise ValueError
+            except (ValueError, AttributeError):
+                raise _fail(
+                    "document.screener.schedule.at",
+                    "must be 'HH:MM' (IST) or 'session_close'",
+                )
+    return ScheduleSpec(every=f"{every}s", calendar=calendar, at=at)
+
+
+def _attachment_spec(raw: Any, path: str) -> AttachmentSpec:
+    if not isinstance(raw, dict):
+        raise _fail(path, "attachment must be a mapping")
+    _check_keys(
+        raw,
+        {"id", "trigger", "channels", "top_n", "rank_delta", "entry_rank",
+         "exit_rank", "exit_after", "initial_match", "message"},
+        path,
+    )
+    att_id = _require_str(raw, "id", path)
+    trigger = _require_str(raw, "trigger", path)
+    if trigger not in _SCREENER_TRIGGER_TYPES:
+        raise _fail(f"{path}.trigger", f"unknown attachment trigger '{trigger}' (supported: {list(_SCREENER_TRIGGER_TYPES)})")
+    channels_raw = raw.get("channels", [])
+    if not isinstance(channels_raw, list) or not channels_raw:
+        raise _fail(f"{path}.channels", "must be a non-empty list of channel names")
+    channels = tuple(_require_str(raw, "channels", path) if False else str(c) for c in channels_raw)
+
+    def _int_field(key: str) -> Optional[int]:
+        value = raw.get(key)
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > 1000:
+            raise _fail(f"{path}.{key}", "must be an integer in [1, 1000]")
+        return value
+
+    top_n = _int_field("top_n")
+    rank_delta = _int_field("rank_delta")
+    entry_rank = _int_field("entry_rank")
+    exit_rank = _int_field("exit_rank")
+    exit_after = _int_field("exit_after")
+    initial_match = raw.get("initial_match", False)
+    if not isinstance(initial_match, bool):
+        raise _fail(f"{path}.initial_match", "must be a boolean")
+    message = _optional_str(raw, "message", path)
+    if trigger == "top_n" and top_n is None:
+        raise _fail(f"{path}.top_n", "is required for trigger 'top_n'")
+    if trigger == "rank_delta" and rank_delta is None:
+        raise _fail(f"{path}.rank_delta", "is required for trigger 'rank_delta'")
+    if (entry_rank is not None or exit_rank is not None) and trigger not in ("top_n", "entry", "exit"):
+        raise _fail(f"{path}.entry_rank", f"hysteresis ranks only apply to top_n/entry/exit triggers, not '{trigger}'")
+    if entry_rank is not None and exit_rank is not None and exit_rank <= entry_rank:
+        raise _fail(
+            f"{path}.exit_rank",
+            f"exit_rank ({exit_rank}) must be greater than entry_rank ({entry_rank}) "
+            "so a boundary symbol cannot oscillate between states (E-17)",
+        )
+    if trigger == "top_n" and top_n is not None:
+        if entry_rank is None:
+            entry_rank = top_n
+        if exit_rank is None:
+            # default exit buffer: 1.5x the entry band (at least entry + 1)
+            exit_rank = top_n + max(1, top_n // 2)
+        if exit_rank <= entry_rank:
+            raise _fail(
+                f"{path}.exit_rank",
+                f"exit_rank ({exit_rank}) must be greater than entry_rank ({entry_rank})",
+            )
+    return AttachmentSpec(
+        id=att_id,
+        trigger=trigger,
+        channels=channels,
+        top_n=top_n,
+        rank_delta=rank_delta,
+        entry_rank=entry_rank,
+        exit_rank=exit_rank,
+        exit_after=exit_after,
+        initial_match=initial_match,
+        message=message,
+    )
 
 
 def _instrument(item: Any, path: str) -> InstrumentRef:

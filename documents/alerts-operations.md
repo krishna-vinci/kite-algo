@@ -85,6 +85,47 @@ Migration `20260908_000011_alerts_platform_phase1` plus `20260909_000012_alerts_
   [workflow-format.md](workflow-format.md); full parity in
   [alerts-phase2-parity.md](alerts-phase2-parity.md).
 
+## Phase 3 additions (scheduled screeners, attachments, dynamic universes)
+
+- **Authoring:** a document with a `screener:` block is a screener workflow
+  (same validation/lifecycle/authorization; YAML + `/api/worker/workflows`
+  CRUD). The reference example is
+  `tests/fixtures/workflows/nifty-quality-momentum-screener.yaml`. Screeners
+  run over STORED completed candles; live-tick stages and per-rule alerts
+  are rejected in screener documents — attachments are the notification
+  surface.
+- **Schedules:** IST-anchored buckets on the NSE calendar only
+  (`calendar: nse_equity`). MCX/currency have feed-driven eligibility and no
+  session calendar, so such schedules are REJECTED at validation rather than
+  silently applying NSE hours. Non-session days (holidays) produce no runs.
+  Missed schedules coalesce to the latest due occurrence — a day of downtime
+  yields one catch-up run, never a backlog (E-19).
+- **Manual run:** `POST /api/worker/screeners/{id}/runs?idempotency_key=...`
+  executes immediately through the same pipeline; the same key returns the
+  original run instead of duplicating it.
+- **Inspection:** `GET .../runs` (history), `GET .../runs/{run_id}` (members,
+  ranks, exclusion reasons, coverage, freshness), `GET .../events`
+  (attachment events). A `partial` run lists which members were excluded and
+  why; `failed` carries a `failure_reason`.
+- **Attachments:** entry/exit/top-N/rank-delta triggers with persisted
+  state — restart never resets baselines or hysteresis bands. Events flow
+  through the same signal event + outbox + delivery-worker machinery as
+  alerts (same Telegram/ntfy channels; no new bot). Events are idempotent
+  per (run, attachment, instrument); a per-run emission cap bounds storms.
+  Partial runs never emit events and never advance baselines (E-18).
+- **Downstream universes:** create a universe of kind `screener` with
+  `source_config: {"workflow": "<screener name>", "top_n": 10}`. The worker
+  re-materializes it after each complete run; members added warm up before
+  they may signal; if the screener has no COMPLETE run within
+  `freshness_limit_s`, resolution fails visibly and dependent alerts stay
+  silent (unknown) instead of scanning stale membership.
+- **Health:** the worker exposes no separate screener health file; run
+  history is the record. `data_freshness` per run carries the max completed
+  candle timestamp and fundamentals acquisition metadata per §5.8.
+- **Env knobs:** `ALERTS_SCREENER_POLL_INTERVAL_S` (30),
+  `ALERTS_SCREENER_LEASE_TTL_S` (300), `ALERTS_SCREENER_WINDOW_BARS` (120),
+  `ALERTS_SCREENER_MAX_ATTACHMENT_EVENTS` (100).
+
 ## Known Phase 1 limitations
 
 - Delivery attempts and lease claims are tested on SQLite; true multi-process Postgres concurrency (`FOR UPDATE SKIP LOCKED`) is exercised in production Postgres only — Phase 1.5 follow-up adds a Postgres-based fault-injection suite (spec E-1…E-3).

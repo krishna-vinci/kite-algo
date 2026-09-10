@@ -1,4 +1,4 @@
-# Workflow format — authoring contract (Phase 1 + Phase 2)
+# Workflow format — authoring contract (Phase 1 + Phase 2 + Phase 3)
 
 The canonical definition is a JSON document; YAML is its human-editable representation. Files describe **what to monitor**; the API decides **what runs** (import always creates a draft; activation is an explicit API call). Any capability listed as unsupported fails validation with a named issue instead of being partially interpreted.
 
@@ -113,6 +113,55 @@ stages:
 ### Delivery storm controls (E-25)
 
 Per (workflow, alert) rolling emissions budget (`ALERTS_DELIVERY_BUDGET_PER_WINDOW`, default 60 per 60 s). Excess emissions are suppressed with reason `storm_budget` and reported; admitted members start silent until warmed, so membership expansion cannot manufacture an alert storm.
+
+## Phase 3 — scheduled screeners and attachments (F9)
+
+A document with a `screener` block is a **screener workflow**: same schema, revisions, lifecycle and authorization as alerts (worker scopes `workflows:read`/`workflows:write`; no new permission), but it executes as a SCHEDULED SCAN over stored completed candles — never live ticks.
+
+```yaml
+screener:
+  schedule:
+    every: 1d                     # 15m..31d; buckets are IST-anchored
+    calendar: nse_equity          # ONLY nse_equity (calendar-backed)
+    at: session_close             # "HH:MM" IST or session_close (15:30 IST)
+  rank:
+    by: {field: change_pct}       # field/indicator/expression
+    direction: desc
+  top_n: 20
+  freshness_limit: 3d             # downstream dynamic-universe TTL
+  attachments:
+    - id: top10-entrants
+      trigger: top_n              # entry | exit | top_n | rank_delta
+      top_n: 10
+      entry_rank: 10              # enter at rank <= 10 ...
+      exit_rank: 15               # ... exit only when rank > 15 (hysteresis, E-17)
+      initial_match: false        # first complete run is a silent baseline
+      channels: [telegram_primary]
+      message: "optional override template"
+    - id: rank-movers
+      trigger: rank_delta         # |rank - prev_complete_rank| >= threshold
+      rank_delta: 5
+      channels: [telegram_primary]
+```
+
+### Execution semantics
+
+- **Pipeline**: universe resolution (union/intersect/exclude, catalog-qualified) → stored daily candles per member → staged conditions (same 3VL, layered chains, features and fundamentals as alerts) → deterministic ranking. Ties break by instrument identity (`EXCHANGE:SYMBOL` ascending) regardless of direction; null scores never rank; top-N truncation records the rank even beyond the cut (`beyond_top_n`).
+- **Data fields**: `close/open/high/low/volume` from the latest completed daily candle, plus screener-only `change_pct` (vs previous completed close) and `turnover` (close × volume). These two are rejected in alert documents — there is no live path for them. A coherent `as_of` cutoff is applied to every member: a run never consumes future candles.
+- **Missing data is not a failed match** (§5.3): a member with no candles, insufficient history or missing fundamentals is EXCLUDED with a typed reason (`no_data`, `insufficient_history`, `fundamentals_unknown`, `condition_unknown`, `rank_value_missing`) and counted in coverage.
+- **Run statuses**: `complete` (every expected member evaluated, every condition resolved, every passing member ranked) / `partial` (results exist but at least one member excluded for a data reason) / `failed` (pipeline or universe-resolution error, with `failure_reason`). Coverage records `expected/evaluated/unavailable/unknown_conditions/rank_value_missing/qualifying` plus data freshness (max candle timestamp, fundamentals acquisition).
+- **Scheduling**: buckets are computed in IST on the NSE calendar (session-gated — non-session days are skipped, so holidays produce no runs). Missed schedules COALESCE to the latest due occurrence (E-19: no backlog replay). Occurrence identity = `workflow_id:bucket_epoch`; concurrent workers race a unique constraint so one logical run wins (E-2), and leases (default 300 s) fence running executions — a crashed run is taken over after expiry and the stale owner cannot finalize (compare-and-swap).
+- **Attachments**: evaluated only on COMPLETE runs. The first complete run of each (revision, attachment) initializes a silent baseline unless `initial_match: true`; `entry`/`exit` fire on the qualifying set with `exit_after` consecutive-absence buffering (default 1); `top_n` uses entry/exit rank bands (E-17 hysteresis); `rank_delta` compares against the PREVIOUS COMPLETE run's rank. Attachment events go through the existing signal event + outbox + delivery-worker machinery (idempotent per `run+attachment+instrument`; per-run emission cap `ALERTS_SCREENER_MAX_ATTACHMENT_EVENTS`, default 100, excess recorded in run coverage). State persists in `screener_attachment_state` — restart never resets baselines or hysteresis.
+- **Partial runs** (E-18): visible with coverage and reasons; NEVER emit attachment events (no exits), never advance the comparison baseline, and never replace a downstream universe.
+- **Downstream universes**: universe kind `screener` (`source_config: {workflow: <name>, top_n: ..., freshness_limit_s: ...}`) resolves to the latest COMPLETE run's qualifiers. Staleness past `freshness_limit_s` raises source-unavailable — dependent alerts go silent (unknown) instead of scanning a stale list. The scheduler re-materializes dependent universes after each complete run. Dependency cycles (a screener consuming its own results transitively) are rejected at authoring and resolution; ownership is enforced on every referenced resource.
+
+### API mapping (screeners)
+
+- `GET /api/worker/screeners/{id}/runs` — paginated run history
+- `GET /api/worker/screeners/runs/{run_id}` — run detail + members (paginated)
+- `POST /api/worker/screeners/{id}/runs` — manual run (`Idempotency-Key` query param honored; same key returns the original run)
+- `GET /api/worker/screeners/{id}/events` — attachment event history
+- `POST /api/worker/screeners/preview` — pure dry-run over stored data: no run rows, no state, no subscriptions, no outbox, no provider calls
 
 ## Operators
 

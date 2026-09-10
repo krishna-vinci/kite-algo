@@ -105,6 +105,45 @@ def _default_body(
     return "\n".join(lines)
 
 
+def build_screener_message(
+    *,
+    screener_name: str,
+    evidence: dict,
+    event_id: Optional[str],
+    ist_str: str,
+    utc_str: str,
+    instrument_key: str,
+) -> Tuple[str, str]:
+    """Screener attachment notification: explains the screener, the trigger
+    and action, the symbol's ranks/values, the run time and data freshness."""
+    subject = _cap_subject(f"[Screener] {screener_name}: {instrument_key}")
+    lines = [
+        f"screener: {screener_name}",
+        f"trigger: {evidence.get('trigger', '-')} ({evidence.get('action', '-')})",
+        f"symbol: {instrument_key}",
+    ]
+    rank = evidence.get("rank")
+    prev_rank = evidence.get("prev_rank")
+    if rank is not None:
+        rank_line = f"rank: {rank}"
+        if prev_rank is not None:
+            rank_line += f" (prev {prev_rank}"
+            if evidence.get("rank_delta") is not None:
+                rank_line += f", delta {evidence['rank_delta']}"
+            rank_line += ")"
+        lines.append(rank_line)
+    values = evidence.get("values") or {}
+    if isinstance(values, dict) and values:
+        rendered = ", ".join(f"{k}={v}" for k, v in sorted(values.items()))
+        lines.append(f"values: {rendered}")
+    scheduled_for = evidence.get("scheduled_for")
+    if scheduled_for:
+        lines.append(f"run_as_of: {scheduled_for}")
+    lines.append(f"time: {ist_str} ({utc_str})")
+    lines.append(f"event_id: {event_id if event_id is not None else '-'}")
+    return subject, _cap_body("\n".join(lines), event_id=event_id)
+
+
 def _render_template(
     template: str,
     *,

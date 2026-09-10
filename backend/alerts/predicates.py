@@ -214,6 +214,12 @@ def _resolve_operand(
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     return float(value)
             return None
+        if features:
+            # Computed-field fallback (screener stored-data fields such as
+            # change_pct/turnover are delivered through the features map).
+            value = features.get(f"field:{operand.name}")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
         return None  # unknown field / missing context entry
     # indicator operand: stage reference or inline feature / expression
     if operand.name and operand.name.startswith(_STAGE_REF_PREFIX):

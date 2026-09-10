@@ -190,6 +190,119 @@ def _validate(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:
     _validate_stages(doc.stages, stage_ids, issues, doc_ref=doc)
     alert_ids = _collect_ids(doc.alerts, "alerts", issues)
     _validate_alerts(doc.alerts, alert_ids, stage_ids, issues)
+    _validate_screener(doc, stage_ids, issues)
+    _validate_screener_only_fields(doc, issues)
+
+
+def _validate_screener_only_fields(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:
+    """``change_pct``/``turnover`` exist only on the screener stored-data
+    path; in an alert document they would silently never resolve."""
+    if doc.screener is not None:
+        return
+    screener_only = {
+        name
+        for name, spec in registry.FIELDS.items()
+        if isinstance(spec, dict) and spec.get("screener_only")
+    }
+    if not screener_only:
+        return
+    for stage in doc.stages:
+        for group in (stage.conditions, stage.any_conditions, stage.not_conditions):
+            for cond in group:
+                for operand in (cond.left, cond.right):
+                    if (
+                        getattr(operand, "kind", None) == "field"
+                        and getattr(operand, "name", None) in screener_only
+                    ):
+                        issues.append(
+                            ValidationIssue(
+                                f"stages.{stage.id}.conditions",
+                                "unknown_capability",
+                                f"field '{operand.name}' is only available in "
+                                "screener documents (stored-data scans)",
+                            )
+                        )
+
+
+
+def _validate_screener(doc: WorkflowDocument, stage_ids: set[str], issues: list[ValidationIssue]) -> None:
+    """Validate the screener block (Phase 3 F9).
+
+    A screener document runs SCHEDULED STORED-DATA scans over a universe:
+    live-tick stages and per-rule alerts do not apply (attachments are the
+    notification surface). MCX/currency have no session calendar, so only
+    nse_equity schedules validate (the parser already rejects others).
+    """
+    _add = issues.append
+    screener = doc.screener
+    if screener is None:
+        return
+    if doc.universe is None and not doc.instruments:
+        _add(
+            ValidationIssue(
+                "document.screener",
+                "missing_reference",
+                "a screener document must declare a universe expression or "
+                "an explicit instruments list to scan",
+            )
+        )
+    if not doc.stages:
+        _add(
+            ValidationIssue(
+                "document.stages",
+                "bad_value",
+                "a screener document requires at least one filter/signal stage",
+            )
+        )
+    for stage in doc.stages:
+        if stage.clock == "ltp":
+            _add(
+                ValidationIssue(
+                    f"stages.{stage.id}.clock",
+                    "unknown_capability",
+                    "screener scans run over stored completed candles; a "
+                    "live-tick stage is not valid in a screener document",
+                )
+            )
+    referenced_inputs = {stage.input for stage in doc.stages if stage.input}
+    terminals = [s.id for s in doc.stages if s.id not in referenced_inputs]
+    if len(terminals) > 1:
+        _add(
+            ValidationIssue(
+                "document.stages",
+                "bad_value",
+                "a screener document must have exactly one terminal stage "
+                f"(the ranked pipeline output); found {sorted(terminals)}",
+            )
+        )
+    if doc.alerts:
+        _add(
+            ValidationIssue(
+                "document.alerts",
+                "bad_value",
+                "a screener document notifies through screener attachments, "
+                "not per-rule alerts",
+            )
+        )
+    rank = screener.rank
+    if rank is not None:
+        where = "document.screener.rank.by"
+        operand = rank.by
+        if operand.kind == "field":
+            _validate_operand(operand, where, issues)
+        elif operand.kind == "indicator":
+            _validate_indicator_operand(operand, where, issues)
+        else:
+            _add(ValidationIssue(where, "bad_value", "rank.by must be a field or indicator expression"))
+    for index, att in enumerate(screener.attachments):
+        if not att.channels:
+            _add(
+                ValidationIssue(
+                    f"document.screener.attachments[{index}].channels",
+                    "bad_value",
+                    "attachment requires at least one channel",
+                )
+            )
 
 
 def _validate_reserved(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:

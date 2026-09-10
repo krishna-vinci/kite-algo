@@ -121,6 +121,110 @@ class DataPolicy:
 
 
 @dataclass(frozen=True)
+class ScheduleSpec:
+    """Screener schedule (Phase 3 F9).
+
+    Buckets are computed in IST on the named calendar. Only ``nse_equity``
+    (calendar-backed) is supported: MCX/currency eligibility is feed-driven
+    and provides no session calendar, so such schedules are rejected at
+    validation instead of silently applying NSE hours.
+    """
+
+    every: str  # e.g. "1d", "60m", "15m"
+    calendar: str = "nse_equity"
+    at: Optional[str] = None  # "HH:MM" IST (required for 1d) or "session_close"
+
+    def to_document_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"every": self.every, "calendar": self.calendar}
+        if self.at is not None:
+            payload["at"] = self.at
+        return payload
+
+
+@dataclass(frozen=True)
+class RankSpec:
+    """Deterministic ranking over qualifying members.
+
+    Ties break by stable instrument identity (``EXCHANGE:SYMBOL`` ascending)
+    regardless of direction; null scores never rank.
+    """
+
+    by: Operand
+    direction: Literal["desc", "asc"] = "desc"
+
+    def to_document_dict(self) -> dict[str, Any]:
+        return {"by": _operand_dict(self.by), "direction": self.direction}
+
+
+@dataclass(frozen=True)
+class AttachmentSpec:
+    """Alert behavior attached to screener results (Phase 3 F9).
+
+    ``trigger``: entry | exit | top_n | rank_delta. Hysteresis ranks
+    (``entry_rank``/``exit_rank``) buffer boundary oscillation for ``top_n``
+    (E-17); they are distinct from ``rank_delta`` thresholds. The first
+    complete run is a silent baseline unless ``initial_match`` is set.
+    """
+
+    id: str
+    trigger: Literal["entry", "exit", "top_n", "rank_delta"]
+    channels: tuple[str, ...] = ()
+    top_n: Optional[int] = None
+    rank_delta: Optional[int] = None
+    entry_rank: Optional[int] = None
+    exit_rank: Optional[int] = None
+    exit_after: Optional[int] = None  # consecutive absent complete runs before exit (default 1)
+    initial_match: bool = False
+    message: Optional[str] = None
+
+    def to_document_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "id": self.id,
+            "trigger": self.trigger,
+            "channels": list(self.channels),
+            "initial_match": self.initial_match,
+        }
+        for key in ("top_n", "rank_delta", "entry_rank", "exit_rank", "exit_after"):
+            value = getattr(self, key)
+            if value is not None:
+                payload[key] = value
+        if self.message is not None:
+            payload["message"] = self.message
+        return payload
+
+
+@dataclass(frozen=True)
+class ScreenerSpec:
+    """Scheduled ranked scan over a universe (Phase 3 F9).
+
+    A document with a ``screener`` block is a screener workflow: lifecycle,
+    revisions and authorization are the workflow's; execution is the
+    scheduler's; results persist as screener runs.
+    """
+
+    schedule: ScheduleSpec
+    rank: Optional[RankSpec] = None
+    top_n: Optional[int] = None
+    attachments: tuple[AttachmentSpec, ...] = ()
+    freshness_limit_s: int = 3 * 24 * 3600  # downstream dynamic-universe TTL
+
+    def to_document_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schedule": self.schedule.to_document_dict(),
+            "freshness_limit_s": self.freshness_limit_s,
+        }
+        if self.rank is not None:
+            payload["rank"] = self.rank.to_document_dict()
+        if self.top_n is not None:
+            payload["top_n"] = self.top_n
+        if self.attachments:
+            payload["attachments"] = [
+                att.to_document_dict() for att in self.attachments
+            ]
+        return payload
+
+
+@dataclass(frozen=True)
 class WorkflowDocument:
     version: int
     name: str
@@ -130,6 +234,7 @@ class WorkflowDocument:
     data_policy: DataPolicy = DataPolicy()
     session: str = "nse_equity"
     universe: Optional[UniverseSpec] = None
+    screener: Optional[ScreenerSpec] = None
 
     def to_document_dict(self) -> dict[str, Any]:
         """Full-fidelity plain-dict form.
@@ -186,6 +291,8 @@ class WorkflowDocument:
         }
         if self.universe is not None:
             payload["universe"] = self.universe.to_document_dict()
+        if self.screener is not None:
+            payload["screener"] = self.screener.to_document_dict()
         return payload
 
 
