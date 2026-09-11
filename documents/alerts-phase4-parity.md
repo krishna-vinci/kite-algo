@@ -133,6 +133,22 @@ component-only suite would have missed.
 | `service._handle_breadth_observation` | Treated ANY non-null reason as a refusal, so a crossing minted by an out-of-order contribution (`fired=True` with `breadth_stale_observation`) was suppressed while its state committed as satisfied — and because a crossing is never re-minted, the notification was lost permanently | Reasons are classified blocking vs informational; `BreadthOutcome.blocking` decides, `fired` publishes, and the reason is recorded as provenance |
 | `service._handle_breadth_observation` | `max_per_session` was enforced only on the signal path, so a breadth alert could notify without limit | The shared logical-notification slot is reserved in the breadth transaction; a capped crossing advances state, writes no event, and records a durable `session_cap` suppression |
 
+### Defects found by the LIVE validation (all fixed)
+
+A live deployment exercises wiring that no unit test reaches. Each of these was
+found by driving real workflows against real feeds and real candles, and each
+is now covered by a regression test.
+
+| Where | Defect | Fix |
+| --- | --- | --- |
+| `CandleAggregator._refresh_subscriptions` | Candles were built ONLY for `user_watchlists` plus in-process external tokens, while the alerts worker subscribes under its own market-runtime owner. The two sources are disjoint, so with an empty watchlist NOTHING the alerts platform watched ever had a candle built — no `historical_candles` row, no live completion. Every `clock: candle_close` rule (all Phase 4 breadth and advanced conditions, which validation restricts to that clock) was therefore UNEVALUABLE in production, and the worker reported a healthy, idle platform rather than an error | The aggregator additionally tracks the broker tokens of ACTIVE candle-close subscriptions (active only, candle-clock only, catalog-resolved); the full-set sync releases what is no longer needed |
+| `worker_workflows.activate_workflow` | Activation carried its OWN copy of the subscription-materialization loop, which drifted from `EvaluationService.ensure_subscriptions` and omitted the catalog binding. Subscriptions created through the API evaluated with no catalog provenance, so their events carried no `instrument_binding` — the C6 contract was silently weaker for exactly the rows a user creates | Activation delegates to `ensure_subscriptions`; the duplicated helper is deleted |
+| worker refresh path | `_ensure_subscription_rows` ran only at STARTUP, so a token/generation replaced while the worker was running was never re-persisted — events would then report the generation they were no longer evaluated under | `_resolve_instrument_tokens` returns its `BindingChange`; the refresh path re-binds moved subscriptions (added/changed keys only) and reloads, since evidence is copied from the in-memory config |
+| `InstrumentBindingRegistry` | `apply` removes a binding only when the catalog explicitly REJECTS it, so a key whose subscription was archived/paused/deleted was retained forever, and the renewal callback publishes the snapshot — the runtime kept streaming a token nothing evaluated. Observed live: ONE active subscription but THREE tokens held, with `renewal_failures: 0` (the staleness was actively renewed) | `retain_only` releases keys absent from the complete required set; a failed pass still releases nothing |
+| `_resolve_instrument_tokens` | The release did not run when the FINAL subscription went away, because the empty key set short-circuited before it — the case where the release matters most | The empty case falls through to the release; verified live down to `owners: 0, tokens: 0` |
+| `runtime._resolve_pairs` | Called `pair_operand_id` without importing it. Severity is far worse than "pairs do not work": that first dispatch happens during STARTUP warmup, so activating ONE pair workflow crash-looped the ENTIRE worker and stopped EVERY alert. Shipped with Phase 4; component tests passed throughout because they call `resolve_pair` directly and never dispatch | Import added; the regression test runs `worker.start()` on a pair workflow and asserts the condition resolved |
+| `parser._conditions` | A `conditions` block naming no `all` group (`{any: [...]}`, `{not: [...]}`) was rejected. The requirement was an accident of calling the parser with `group="all"` unconditionally: an absent group is empty and an empty AND group is true, the sibling group parser has always accepted any subset, and no documentation requires `all` | Any non-empty subset is accepted; `conditions: {}` still fails, with a message that says what is actually wrong |
+
 ### Defect D-2 — from-zero installation was blocked (REPAIRED)
 
 **Was:** `alembic upgrade head` ran `20260330_000001_baseline_schema`, which
@@ -174,7 +190,7 @@ demonstrated at a level is marked as such rather than implied.
 
 | Level | Suite | Command | Result |
 | --- | --- | --- | --- |
-| Component + integration | Alerts-platform suites | `.venv/bin/python -m pytest tests/alerts tests/workflows tests/screeners tests/notifications tests/fundamentals tests/api/test_worker_signals.py tests/api/test_worker_screeners.py -q` | `592 passed` |
+| Component + integration | Alerts-platform suites | `.venv/bin/python -m pytest tests/alerts tests/workflows tests/screeners tests/notifications tests/fundamentals tests/api/test_worker_signals.py tests/api/test_worker_screeners.py -q` | `781 passed` |
 | Component + integration | SDK | `.venv/bin/python -m pytest tests/sdk -q` | `255 passed, 1 skipped` |
 | Component | SDK version guard | `.venv/bin/python scripts/check_worker_sdk_version_refs.py` | `All worker SDK version references match 0.10.0` |
 | Component (real PG) | Phase 4 component suite | `ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_alerts_phase4_postgres.py -q` | `17 passed`, stable over 3 consecutive runs |
@@ -284,9 +300,9 @@ This is a workload OBSERVATION at modest scale — **NOT** the Phase 6
 | Item | Value |
 | --- | --- |
 | Branch | `development` |
-| Deployed commit | **`89c9fef`** — `kite-alerts-worker` and `kite-app` rebuilt and recreated from it |
+| Deployed commit | **`69050ef`** — `kite-alerts-worker` and `kite-app` rebuilt and recreated from it |
 | Phase 4 commits | `05cbfc5`, `aa2c1ad`, `5ba407c`, `a1359d9`, `087c1f0`, `af7eeee`, `22db69d`, `d295216`, `cfb49db`, `1e69def`, `2754f52` |
-| Closure commits | `e4a1495` (breadth production wiring), `9c7d046` (frozen migration baseline, D-2), `6c718e9` (report correction), `7ce08ee` (auth boundary), `89c9fef` (out-of-order publication + breadth session cap) |
+| Closure commits | `e4a1495`, `9c7d046`, `6c718e9`, `7ce08ee`, `89c9fef` (breadth), then from the live validation: `fb45767` (candle tokens for active alerts), `de004cd` (external dispatch regression), `7511ae1` (one materialization path + re-bind), `4628772` + `61a712a` (binding release), `5c931de` (any-only conditions), `69050ef` (pair import — worker crash-loop) |
 | Migration head | **`20260911_000016_alerts_phase4` — applied to the live `kite-postgres`** |
 | Live Phase 4 tables | 7/7 present |
 | Live CHECK | `universes_kind_check` now admits `'screener'`; a screener-kind universe was INSERTed and DELETEd successfully on the live database, so **defect D-1 is fixed in production** |
@@ -336,7 +352,32 @@ insert/delete; no workflow, producer, value or notification was created there.
 6. **Only after explicit destination authorization**, point one alert at a test
    channel and confirm a single delivery.
 
-## 8. Out of scope / deferred
+## 8. Live validation results (post-fix)
+
+Run against the deployed stack with real feeds. Every row is an observation from
+the live system, not a component test.
+
+| Scenario | Instrument | Result | Evidence |
+| --- | --- | --- | --- |
+| External value below the level is inert, then a valid value crosses on a completed candle | MCX:GOLD26OCTFUT | **PASS** | `prev=50.0` recorded from the producer value (proving the value was sampled, not the price), then ONE event at the 12:57 candle with `prev_ltp: 50.0`, value `90.0`, level `80.0`. Value IDs `fc19fe3d…` (50), `aac2a609…` (90) |
+| A crossing never duplicates | — | **PASS** | exactly one event for the crossing |
+| Binding provenance on an API-created workflow | MCX:GOLD26OCTFUT | **PASS** | `instrument_binding` persisted at activation with `instrument_id`, `broker_token: 123668231` and `catalog_generation: 48d56789-…`, and copied into the event's evidence |
+| A-then-B across separate completed bars | MCX:GOLD26OCTFUT | **PASS** | armed at `13:23:00`, fired at `13:24:00` — strictly the NEXT bar, so one observation cannot satisfy both legs; `armed_bar_ts` durable in the checkpoint |
+| Pair inputs, both legs subscribed and warmed | MCX:GOLD + MCX:SILVERM | **PASS** | `pair_ratio` computed live as `0.6444913171174427` (GOLD/SILVERM), both legs' candles aligned at `13:32`, binding in evidence. **Found and fixed the crash-looping `NameError` on the way** |
+| Currency eligibility | CDS:USDINR26SEPFUT | **PENDING — session ended** | The instrument resolves, binds (token 452867, generation `48d56789-…`), subscribes, and the runtime streams it in `full` mode. It is NOT a binding/subscription/entitlement failure: the tick's `exchange_timestamp` is frozen at `12:01:04Z` and `last_trade_time` is `11:29:52Z` (16:59:52 IST — the last trade before a 17:00 IST close), while MCX's `exchange_timestamp` on the SAME worker at the SAME moment was 1 second old. Run during 09:00–17:00 IST to complete it |
+
+### Observation, NOT fixed: LTP alerts evaluate a stale after-hours snapshot
+
+With the CDS session closed, the runtime keeps re-publishing the last snapshot
+and the LTP path evaluates it; a `reminder` alert emitted on it. The platform is
+honest about WHICH moment it represents — the event's `fired_at` is the tick's
+own `12:01:04Z` exchange timestamp, not wall-clock — but nothing gates evaluation
+on tick freshness, so an after-hours alert on a frozen price is possible. This
+is a behavior change rather than a bug fix (it needs an agreed freshness bound
+and its own validation), so it is recorded here instead of being smuggled into
+this scope.
+
+## 9. Out of scope / deferred
 
 - **Phase 5 (MCP)**: deferred, requires a separately agreed scope.
 - **Phase 6**: the visual/canvas editor and the 500-symbol/5,000-rule
