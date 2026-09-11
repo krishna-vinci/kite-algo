@@ -67,6 +67,15 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc(moment: Optional[datetime]) -> datetime:
+    """SQLite round-trips datetimes naive; treat naive as UTC for compares."""
+    if moment is None:
+        return datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
 def _is_postgres(session: Any) -> bool:
     bind = getattr(session, "bind", None)
     return getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
@@ -98,12 +107,19 @@ class AlertBreadthState(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
+# BIGSERIAL on PostgreSQL, INTEGER on SQLite: only an INTEGER PRIMARY KEY is a
+# rowid alias there, so a bare BigInteger primary key would require an explicit
+# id and fail on insert (the dialect split the GUID/StringArray decorators
+# already handle).
+_BigIntPK = BigInteger().with_variant(Integer, "sqlite")
+
+
 class AlertBreadthTrigger(Base):
     """One contribution row per (stage, instrument): latest qualifying trigger."""
 
     __tablename__ = "alert_breadth_triggers"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_BigIntPK, primary_key=True, autoincrement=True)
     owner_id = Column(String(255), nullable=False)
     workflow_id = Column(GUID, nullable=False)
     revision_id = Column(GUID, nullable=False)
@@ -342,7 +358,9 @@ def upsert_breadth_contribution(
         )
         session.flush()
         return True
-    if existing.last_trigger_ts is not None and existing.last_trigger_ts >= trigger_ts:
+    # Normalized before comparing: SQLite round-trips datetimes naive.
+    stored = _as_utc(existing.last_trigger_ts) if existing.last_trigger_ts else None
+    if stored is not None and stored >= _as_utc(trigger_ts):
         return False
     existing.last_trigger_ts = trigger_ts
     existing.last_bar_ts = bar_ts

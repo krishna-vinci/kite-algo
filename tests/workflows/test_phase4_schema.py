@@ -68,16 +68,23 @@ def _message_text(doc):
 
 
 def _breadth(**overrides):
+    """A breadth document WITH the alert that makes it actionable.
+
+    A breadth stage no alert references can never be dispatched, so the
+    compiler rejects it; these tests are about the spec itself, so they
+    always include the referencing alert.
+    """
     spec = {
         "condition": {"all": [{"field": "close", "op": "gt", "value": 50}]},
         "distinct_instruments": 5,
         "window": "30m",
     }
     spec.update(overrides)
-    return _doc(stages=[{
+    stage = {
         "id": "b", "type": "breadth", "clock": "candle_close",
         "timeframe": "5minute", "breadth": spec,
-    }])
+    }
+    return _doc(stages=[stage], alerts=[{"id": "ba", "source": "b"}])
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +109,8 @@ def test_phase4_document_round_trips_exactly():
                          "distinct_instruments": 5, "window": "30m"}},
         ],
         alerts=[{"id": "a", "source": "s", "max_per_session": 5,
-                 "session_cap_reset": "session"}],
+                 "session_cap_reset": "session"},
+                {"id": "breadth-alert", "source": "b"}],
     )
     parsed = parse_workflow_dict(doc)
     again = parse_workflow_dict(parsed.to_document_dict())
@@ -243,6 +251,37 @@ def test_breadth_limits_are_enforced():
     assert "distinct_instruments" in _message_text(_breadth(distinct_instruments=1))
     assert "window" in _message_text(_breadth(window="10s"))
     assert "window" in _message_text(_breadth(window="48h"))
+
+
+def test_unreferenced_breadth_stage_is_rejected_as_silently_dead():
+    """A breadth stage no alert references would never be dispatched.
+
+    Accepting it would leave the operator with configuration that can never
+    notify and no error explaining why, so it is rejected with an actionable
+    message naming the fix.
+    """
+    doc = _doc(stages=[{
+        "id": "b", "type": "breadth", "clock": "candle_close",
+        "timeframe": "5minute",
+        "breadth": {"condition": {"all": [{"field": "close", "op": "gt", "value": 50}]},
+                    "distinct_instruments": 5, "window": "30m"},
+    }])
+    text = _message_text(doc)
+    assert "not referenced by any alert" in text
+    assert "source: b" in text
+
+
+def test_referenced_breadth_stage_compiles():
+    doc = _doc(
+        stages=[{
+            "id": "b", "type": "breadth", "clock": "candle_close",
+            "timeframe": "5minute",
+            "breadth": {"condition": {"all": [{"field": "close", "op": "gt", "value": 50}]},
+                        "distinct_instruments": 5, "window": "30m"},
+        }],
+        alerts=[{"id": "ba", "source": "b"}],
+    )
+    compile_document(parse_workflow_dict(doc))
 
 
 def test_breadth_requires_the_candle_clock():

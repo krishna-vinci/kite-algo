@@ -144,6 +144,51 @@ def build_screener_message(
     return subject, _cap_body("\n".join(lines), event_id=event_id)
 
 
+def build_breadth_message(
+    *,
+    workflow_name: str,
+    stage_id: str,
+    evidence: dict,
+    event_id: Optional[str],
+    ist_str: str,
+    utc_str: str,
+) -> Tuple[str, str]:
+    """Workflow-level breadth notification (Phase 4 F10).
+
+    Deliberately has NO instrument line: a breadth crossing is an aggregate
+    fact about the workflow, and presenting it as a per-symbol alert would
+    misdescribe what happened. The contributing instruments are listed so the
+    operator can see which names produced it.
+    """
+    threshold = evidence.get("threshold")
+    count = evidence.get("count")
+    subject = _cap_subject(
+        f"[Breadth] {workflow_name}: {count}/{threshold} instruments"
+    )
+    contributors = evidence.get("instruments") or []
+    lines = [
+        f"workflow: {workflow_name}",
+        f"stage: {stage_id}",
+        f"mode: {evidence.get('mode', '-')}",
+        f"trigger: {evidence.get('trigger', '-')} ({evidence.get('action', '-')})",
+        f"count: {count} of {threshold} distinct instruments",
+    ]
+    if contributors:
+        lines.append("instruments: " + ", ".join(str(name) for name in contributors))
+    window_start = evidence.get("window_start")
+    if window_start:
+        lines.append(f"window_start: {window_start}")
+    members = evidence.get("members")
+    if members is not None:
+        lines.append(f"members_evaluated: {members}")
+    universe_revision = evidence.get("universe_revision")
+    if universe_revision is not None:
+        lines.append(f"universe_revision: {universe_revision}")
+    lines.append(f"time: {ist_str} ({utc_str})")
+    lines.append(f"event_id: {event_id if event_id is not None else '-'}")
+    return subject, _cap_body("\n".join(lines), event_id=event_id)
+
+
 def _render_template(
     template: str,
     *,

@@ -814,6 +814,10 @@ class EvaluationWorker:
             or (os.environ.get("ALERTS_HEALTH_FILE", "").strip() or None)
         )
         self.health["started_at"] = _utcnow().isoformat()
+        # Booting materializes the member set from the database, so it counts
+        # as a membership resolution: breadth freshness must be measured from
+        # a real timestamp even before the first refresh pass.
+        self.health["last_refresh_at"] = self.health["started_at"]
         self._running = True
         logger.info(
             "evaluation worker started: %d subscriptions (%d ltp instruments, %d candle groups)",
@@ -1263,7 +1267,11 @@ class EvaluationWorker:
                 continue
             try:
                 self.service.sync_universe_members(
-                    revision, sorted(members), universe_revision=universe_revision
+                    revision, sorted(members),
+                    universe_revision=universe_revision,
+                    # owner_id keys the breadth advisory lock so a re-admission
+                    # eviction serializes against a concurrent aggregate.
+                    owner_id=owner_id,
                 )
             except Exception:
                 logger.warning(
@@ -1705,6 +1713,39 @@ class EvaluationWorker:
         self._document_cache[sub.revision_id] = document
         return document
 
+    def _is_breadth_stage(self, sub: ActiveSubscription) -> bool:
+        """Whether this subscription's stage is a breadth aggregate (F10)."""
+        stage = self._stage_for(sub)
+        return stage is not None and stage.breadth is not None
+
+    def _breadth_membership_for(self, sub: ActiveSubscription) -> Dict[str, Any]:
+        """The member context a breadth aggregate evaluates over.
+
+        The member set is the instrument keys materialized for this stage and
+        revision — the very rows the worker is dispatching from, so the
+        aggregate can never count an instrument the worker is not observing.
+        ``resolved_at`` is when membership was last materialized (the
+        subscription refresh, which is also when universes re-resolve), which
+        is what the freshness bound measures against.
+        """
+        members = sorted(
+            {
+                candidate.instrument_key
+                for candidate in self._subscriptions
+                if candidate.revision_id == sub.revision_id
+                and candidate.stage_id == sub.stage_id
+            }
+        )
+        universe_revision = None
+        raw = (sub.config or {}).get("universe_revision")
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            universe_revision = raw
+        return {
+            "members": members,
+            "universe_revision": universe_revision,
+            "resolved_at": self.health.get("last_refresh_at") or _utcnow().isoformat(),
+        }
+
     def _external_references_for(self, sub: ActiveSubscription) -> list:
         """``external.*`` field names this stage (or an ancestor layer) reads."""
         cache_key = (sub.revision_id, sub.stage_id, "external")
@@ -1881,14 +1922,24 @@ class EvaluationWorker:
             if pairs:
                 context = dict(context) if context else {}
                 context["pairs"] = pairs
+        # Phase 4 F10: a breadth stage aggregates its member subscriptions, so
+        # it needs the member set (and when that set was materialized) at
+        # dispatch time. The set is the instrument keys materialized for THIS
+        # stage in THIS revision — the same rows the worker is dispatching
+        # from — and the timestamp is the last membership materialization.
+        breadth_membership = None
+        if self._is_breadth_stage(sub):
+            breadth_membership = self._breadth_membership_for(sub)
         supports_context = False
         supports_features = False
         supports_layers = False
+        supports_breadth = False
         try:
             params = inspect.signature(self.service.handle_observation).parameters
             supports_context = "context" in params
             supports_features = "features" in params
             supports_layers = "layers" in params
+            supports_breadth = "breadth_membership" in params
         except (TypeError, ValueError):
             supports_context = False
         try:
@@ -1898,6 +1949,8 @@ class EvaluationWorker:
                     kwargs["features"] = features
                 if supports_layers:
                     kwargs["layers"] = layers
+                if supports_breadth and breadth_membership is not None:
+                    kwargs["breadth_membership"] = breadth_membership
                 result = self.service.handle_observation(sub, obs, **kwargs)
             else:
                 kwargs = {"allow_emit": False}
@@ -1907,6 +1960,8 @@ class EvaluationWorker:
                     kwargs["features"] = features
                 if supports_layers:
                     kwargs["layers"] = layers
+                if supports_breadth and breadth_membership is not None:
+                    kwargs["breadth_membership"] = breadth_membership
                 result = self.service.handle_observation(sub, obs, **kwargs)
         except TypeError:
             logger.error(

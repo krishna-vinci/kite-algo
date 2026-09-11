@@ -200,6 +200,32 @@ def _validate(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:
     _validate_alerts(doc.alerts, alert_ids, stage_ids, issues)
     _validate_screener(doc, stage_ids, issues)
     _validate_screener_only_fields(doc, issues)
+    _validate_breadth_referenced(doc, issues)
+
+
+def _validate_breadth_referenced(
+    doc: WorkflowDocument, issues: list[ValidationIssue]
+) -> None:
+    """A breadth stage must be referenced by an alert to have any effect.
+
+    The aggregate is evaluated by the member subscriptions an ALERT
+    materializes; without one the stage is never dispatched, so the workflow
+    would be silently dead. Reject it with an actionable message instead of
+    accepting configuration that can never notify.
+    """
+    referenced = {alert.source for alert in doc.alerts}
+    for stage in doc.stages:
+        if stage.breadth is None or stage.id in referenced:
+            continue
+        issues.append(
+            ValidationIssue(
+                f"stages.{stage.id}",
+                "missing_reference",
+                f"breadth stage '{stage.id}' is not referenced by any alert, so "
+                "nothing would ever be dispatched or notified; add an alert with "
+                f"'source: {stage.id}'",
+            )
+        )
 
 
 def _validate_screener_only_fields(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:

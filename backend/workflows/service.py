@@ -62,8 +62,14 @@ from sqlalchemy.orm import Session
 
 from backend.alerts.engine import decide
 from backend.alerts.predicates import Observation, PredicateResult, evaluate_stage
-from backend.workflows import advanced_repository
-from backend.workflows.models import AlertSpec, Stage, WorkflowDocument
+from backend.workflows import advanced_repository, breadth
+from backend.workflows.models import (
+    AlertSpec,
+    Condition,
+    ConditionGroup,
+    Stage,
+    WorkflowDocument,
+)
 from backend.workflows.parser import WorkflowParseError, parse_workflow_dict
 from backend.workflows.registry import stage_uses_fundamentals
 from backend.workflows.repository import (
@@ -120,6 +126,57 @@ class HandleResult:
 _NOOP = HandleResult(fired=False, emitted=False, suppression_reason=None, rule_completed=False)
 
 
+def _parse_ts(raw: Any) -> Optional[datetime]:
+    """Normalize an already-validated timestamp; never fabricate one.
+
+    Mirrors the runtime's parser so the service can read timestamps the
+    runtime put into the membership context (which arrives as ISO text).
+    """
+    if isinstance(raw, datetime):
+        dt = raw
+    elif isinstance(raw, str):
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00").replace("z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+# Breadth member conditions are evaluated through the ordinary predicate
+# machinery, so they need a Stage-shaped view. The synthesized stage carries
+# only the member-level groups: no clock, timeframe, input or alerts, because
+# none of those participate in "does this member satisfy the condition now".
+_BREADTH_MEMBER_STAGE_ID = "__breadth_member__"
+
+
+def _breadth_member_stage(stage: Stage) -> Stage:
+    """A Stage view over a breadth spec's member condition groups."""
+    spec = stage.breadth
+    groups = list(spec.condition or ())
+    all_conditions = tuple(
+        cond for group in groups if group.kind == "all" for cond in group.conditions
+    )
+    any_conditions = tuple(
+        cond for group in groups if group.kind == "any" for cond in group.conditions
+    )
+    not_conditions = tuple(
+        cond for group in groups if group.kind == "not" for cond in group.conditions
+    )
+    return Stage(
+        id=f"{_BREADTH_MEMBER_STAGE_ID}:{stage.id}",
+        type="signal",
+        clock=stage.clock,
+        timeframe=stage.timeframe,
+        conditions=all_conditions,
+        any_conditions=any_conditions,
+        not_conditions=not_conditions,
+    )
+
+
 def _stage_current_value(stage: Stage, obs: Observation) -> Optional[float]:
     """The stage operand's current value (rearm input); observation fields only."""
     for cond in stage.conditions:
@@ -144,6 +201,8 @@ class EvaluationService:
         session_provider: Optional[SessionProvider] = None,
         owner_id: Optional[str] = None,
         ownership_lease_s: float = 120.0,
+        breadth_max_instruments: int = 1000,
+        breadth_membership_max_age_s: float = 900.0,
     ) -> None:
         self.workflow_repo = workflow_repo
         self.session_factory = session_factory
@@ -164,6 +223,11 @@ class EvaluationService:
             self.delivery_budget_per_window = 60
         self.delivery_budget_window_s = 60.0
         self._emission_windows: dict = {}
+        # Phase 4 F10 breadth bounds. Capacity is reported as unknown rather
+        # than resolved by pruning a still-valid contribution, and a stale
+        # membership snapshot never supports a signal.
+        self.breadth_max_instruments = max(1, int(breadth_max_instruments))
+        self.breadth_membership_max_age_s = max(1.0, float(breadth_membership_max_age_s))
 
     # ------------------------------------------------------------------
     # subscriptions
@@ -266,14 +330,23 @@ class EvaluationService:
         members: Sequence[str],
         *,
         universe_revision: Optional[int] = None,
+        owner_id: Optional[str] = None,
         db: Optional[Session] = None,
     ) -> dict:
         """Materialize one subscription per (alert, universe member) (F7).
 
         New members are admitted with a fresh checkpoint (the initialization
         guard keeps them silent until warmed); departed members are PAUSED
-        with a visible reason — their event history is retained. Returns
-        ``{"created": n, "departed": m}``.
+        with a visible reason — their event history is retained.
+
+        A member that REJOINS is resumed, and its retained breadth
+        contribution is cleared (Phase 4 F10): re-entry must not restore
+        participation from before the departure, so the rule is honestly
+        "an instrument contributes after admission". That eviction happens
+        under the same advisory lock the aggregate takes, so it cannot race a
+        concurrent count.
+
+        Returns ``{"created": n, "departed": m, "readmitted": k}``.
         """
         try:
             document = parse_workflow_dict(revision.document)
@@ -302,9 +375,37 @@ class EvaluationService:
             ]
             known_pairs = {(r.alert_id, r.instrument_key) for r in member_rows}
             created = 0
+            readmitted = 0
+            # (stage_id, instrument_key) pairs whose breadth contribution must
+            # be cleared because the member is only now (re)joining.
+            breadth_resets: list = []
+            breadth_stage_ids = {
+                stage.id for stage in document.stages if stage.breadth is not None
+            }
             for alert in document.alerts:
                 for (_alert_id, member), (symbol, exchange) in wanted.items():
                     if (alert.id, member) in known_pairs:
+                        # Already materialized. A row that had DEPARTED is
+                        # rejoining: resume it and clear its retained
+                        # participation, or the member would stay paused
+                        # forever and a stale contribution could count.
+                        row = next(
+                            (
+                                r for r in member_rows
+                                if r.alert_id == alert.id and r.instrument_key == member
+                            ),
+                            None,
+                        )
+                        if row is not None and row.config.get("universe_departed"):
+                            config = dict(row.config or {})
+                            config.pop("universe_departed", None)
+                            if universe_revision is not None:
+                                config["universe_revision"] = universe_revision
+                            row.config = config
+                            row.state = "active"
+                            readmitted += 1
+                            if alert.source in breadth_stage_ids:
+                                breadth_resets.append((alert.source, member))
                         continue
                     config = self._alert_config(alert)
                     binding = self._resolve_catalog_binding(member, session)
@@ -313,6 +414,8 @@ class EvaluationService:
                     config["universe_member"] = True
                     if universe_revision is not None:
                         config["universe_revision"] = universe_revision
+                    if alert.source in breadth_stage_ids:
+                        breadth_resets.append((alert.source, member))
                     session.add(
                         AlertSubscription(
                             id=str(uuid.uuid4()),
@@ -340,18 +443,26 @@ class EvaluationService:
                     row.config = config
                     row.state = "paused"
                     departed += 1
+            if breadth_resets:
+                self._clear_breadth_contributions(
+                    session,
+                    revision=revision,
+                    owner_id=owner_id,
+                    pairs=breadth_resets,
+                )
             if owned:
                 session.commit()
-            if created or departed:
+            if created or departed or readmitted:
                 logger.info(
-                    "universe membership sync for revision %s: %d admitted, %d departed",
-                    revision.id, created, departed,
+                    "universe membership sync for revision %s: %d admitted, "
+                    "%d departed, %d re-admitted",
+                    revision.id, created, departed, readmitted,
                 )
-            return {"created": created, "departed": departed}
+            return {"created": created, "departed": departed, "readmitted": readmitted}
         except IntegrityError:
             if owned:
                 session.rollback()
-            return {"created": 0, "departed": 0}
+            return {"created": 0, "departed": 0, "readmitted": 0}
         except Exception:
             if owned:
                 session.rollback()
@@ -359,6 +470,41 @@ class EvaluationService:
         finally:
             if owned:
                 session.close()
+
+    def _clear_breadth_contributions(
+        self,
+        session: Session,
+        *,
+        revision: Any,
+        owner_id: Optional[str],
+        pairs: Sequence[tuple],
+    ) -> None:
+        """Drop retained breadth contributions for (re)admitted members.
+
+        Serialized against concurrent aggregation by taking the SAME advisory
+        transaction lock the aggregate takes, for every affected stage, before
+        touching a row. Without that, a count running on another worker could
+        observe a member's contribution being inserted or removed mid-window
+        and produce a count that never existed at any instant.
+        """
+        stage_ids = list(dict.fromkeys(stage_id for stage_id, _member in pairs))
+        for stage_id in stage_ids:
+            advanced_repository.lock_breadth_stage(
+                session,
+                owner_id=owner_id or "",
+                workflow_id=revision.workflow_id,
+                revision_id=revision.id,
+                stage_id=stage_id,
+            )
+        for stage_id, member in pairs:
+            advanced_repository.evict_breadth_contribution(
+                session,
+                owner_id=owner_id or "",
+                workflow_id=revision.workflow_id,
+                revision_id=revision.id,
+                stage_id=stage_id,
+                instrument_key=member,
+            )
 
     @staticmethod
     def _alert_config(alert: AlertSpec) -> dict:
@@ -413,6 +559,7 @@ class EvaluationService:
         context: Optional[dict] = None,
         features: Optional[dict] = None,
         layers: Optional[list] = None,
+        breadth_membership: Optional[dict] = None,
     ) -> HandleResult:
         """Evaluate one observation for one active subscription.
 
@@ -437,16 +584,47 @@ class EvaluationService:
         ``(stage, features_dict)``. Their conditions are ANDed with the
         stage's own conditions under three-valued logic; unknown upstream
         never manufactures a firing. Evidence is recorded per layer.
+
+        ``breadth_membership``: for a breadth stage, the member context this
+        observation contributes to — ``{"members": [...],
+        "universe_revision": int|None, "resolved_at": iso8601|None}``. A
+        breadth observation is dispatch from ONE member instrument but the
+        crossing it may mint is a WORKFLOW-level fact, so the event carries no
+        instrument and exactly one is published per crossing.
         """
         document = self._parse_document(sub)
         if document is None:
             return _NOOP
         stage = next((s for s in document.stages if s.id == sub.stage_id), None)
         alert = next((a for a in document.alerts if a.id == sub.alert_id), None)
-        if stage is None or alert is None:
+        if stage is None:
             logger.warning(
-                "subscription %s references missing stage/alert %s/%s in revision document",
-                sub.id, sub.stage_id, sub.alert_id,
+                "subscription %s references missing stage %s in revision document",
+                sub.id, sub.stage_id,
+            )
+            return _NOOP
+        # Phase 4 F10: a breadth stage is a different kind of rule — it
+        # aggregates its member subscriptions into one workflow-level event —
+        # so it takes its own path through the same fence and transaction.
+        if stage.breadth is not None:
+            if alert is None:
+                logger.warning(
+                    "breadth subscription %s references missing alert %s",
+                    sub.id, sub.alert_id,
+                )
+                return _NOOP
+            return self._handle_breadth_observation(
+                sub, obs, stage, alert, document,
+                allow_emit=allow_emit,
+                context=context,
+                features=features,
+                membership=breadth_membership,
+                db=db,
+            )
+        if alert is None:
+            logger.warning(
+                "subscription %s references missing alert %s in revision document",
+                sub.id, sub.alert_id,
             )
             return _NOOP
 
@@ -958,6 +1136,274 @@ class EvaluationService:
         if last_ts.tzinfo is None:
             last_ts = last_ts.replace(tzinfo=obs.ts.tzinfo)
         return obs.ts <= last_ts
+
+    def _handle_breadth_observation(
+        self,
+        sub: ActiveSubscription,
+        obs: Observation,
+        stage: Stage,
+        alert: AlertSpec,
+        document: WorkflowDocument,
+        *,
+        allow_emit: bool,
+        context: Optional[dict],
+        features: Optional[dict],
+        membership: Optional[dict],
+        db: Optional[Session],
+    ) -> HandleResult:
+        """Evaluate one member's bar against a breadth stage (Phase 4 F10).
+
+        A different kind of rule from a signal alert: the observation comes
+        from ONE member instrument, but what the rule reports is an AGGREGATE
+        fact about the workflow revision, so a crossing publishes exactly ONE
+        workflow-level event (``subscription_id`` NULL,
+        ``evidence.message_kind == "breadth"``) no matter how many members
+        crossed. Per-instrument notifications are structurally impossible
+        because the occurrence key carries the crossing number, not an
+        instrument.
+
+        Everything runs inside the ordinary publication boundary — the same
+        ownership claim/assert fence and the same single commit as a signal
+        alert — so a stale owner or an injected failure rolls the checkpoint,
+        the contribution, the aggregate state, the event and the outbox rows
+        back together.
+        """
+        channel_ids = self._resolve_channels(sub.owner_id, alert.channels)
+        owned = db is None
+        session = db if db is not None else self.session_factory()
+        try:
+            ownership_now = self.clock() if self.clock is not None else obs.ts
+            owner_epoch = self.workflow_repo.claim_evaluation(
+                sub.id,
+                sub.instrument_key,
+                self.owner_id,
+                lease_seconds=self.ownership_lease_s,
+                now=ownership_now,
+                db=session,
+            )
+            if owner_epoch is None:
+                self._log_suppression(sub, "not_owner")
+                return HandleResult(False, False, "not_owner", False)
+
+            checkpoint = self.workflow_repo.load_checkpoint(
+                sub.id, sub.instrument_key, obs.epoch_id, db=session,
+            )
+            if checkpoint is None:
+                state, stored_epoch = {}, 0
+            else:
+                state, stored_epoch = checkpoint
+
+            # The member's own condition, evaluated through the shared
+            # predicate layer. Its state is per (subscription, instrument) and
+            # epoch-scoped, exactly like any other condition state.
+            member_matched = evaluate_stage(
+                _breadth_member_stage(stage), obs, state, context, features
+            )
+
+            member_context = membership or {}
+            outcome = breadth.evaluate_breadth(
+                session,
+                owner_id=sub.owner_id,
+                workflow_id=sub.workflow_id,
+                revision_id=sub.revision_id,
+                stage_id=sub.stage_id,
+                spec=stage.breadth,
+                member_keys=list(member_context.get("members") or ()),
+                member_universe_revision=member_context.get("universe_revision"),
+                membership_resolved_at=_parse_ts(member_context.get("resolved_at")),
+                # A contribution is recorded only when the member's condition
+                # ACTUALLY held; unknown is not true (spec 5.3).
+                triggering=(
+                    sub.instrument_key if member_matched.matched is True else None
+                ),
+                observed_at=obs.ts,
+                max_instruments=self.breadth_max_instruments,
+                membership_max_age_s=self.breadth_membership_max_age_s,
+                # Freshness is a WALL-CLOCK property of the resolution (how
+                # long ago membership was materialized), so it is compared
+                # against the service clock / real time — never against a
+                # bar's event time, which says nothing about membership age.
+                membership_now=(
+                    self.clock() if self.clock is not None
+                    else datetime.now(timezone.utc)
+                ),
+            )
+
+            emitted = False
+            suppression: Optional[str] = None
+            if outcome.reason is not None:
+                suppression = outcome.reason
+                self._log_suppression(sub, outcome.reason)
+            elif outcome.fired:
+                if not allow_emit:
+                    # Warmup replays history to establish window continuity. A
+                    # crossing found there updates the aggregate state (so a
+                    # live crossing is never double-reported) but does not
+                    # notify — the activation baseline, by design.
+                    suppression = "warmup"
+                else:
+                    emitted = self._publish_breadth_crossing(
+                        sub, obs, stage, alert, outcome, channel_ids,
+                        owner_epoch, ownership_now, session,
+                        workflow_name=document.name,
+                        universe_revision=member_context.get("universe_revision"),
+                    )
+                    if not emitted:
+                        suppression = "duplicate_occurrence"
+
+            # The member's checkpoint rides the same commit as the aggregate,
+            # so a failure rolls both back together.
+            new_state = dict(member_matched.state)
+            new_state["epoch_id"] = obs.epoch_id
+            if obs.final:
+                new_state["last_bar_ts"] = obs.ts.isoformat()
+            try:
+                self.workflow_repo.assert_evaluation_owner(
+                    sub.id,
+                    sub.instrument_key,
+                    self.owner_id,
+                    owner_epoch,
+                    now=ownership_now,
+                    db=session,
+                )
+                self.workflow_repo.save_checkpoint(
+                    sub.id,
+                    sub.instrument_key,
+                    obs.epoch_id,
+                    new_state,
+                    stored_epoch,
+                    db=session,
+                )
+            except LeaseConflict:
+                session.rollback()
+                self._log_suppression(sub, "lease_lost")
+                return HandleResult(False, False, "lease_lost", False)
+
+            if owned:
+                session.commit()
+            return HandleResult(
+                fired=bool(outcome.fired or emitted),
+                emitted=emitted,
+                suppression_reason=suppression,
+                rule_completed=False,
+            )
+        except Exception:
+            if owned:
+                session.rollback()
+            raise
+        finally:
+            if owned:
+                session.close()
+
+    def _publish_breadth_crossing(
+        self,
+        sub: ActiveSubscription,
+        obs: Observation,
+        stage: Stage,
+        alert: AlertSpec,
+        outcome,
+        channel_ids: Sequence[str],
+        owner_epoch: int,
+        ownership_now,
+        session: Session,
+        *,
+        workflow_name: str,
+        universe_revision: Optional[int],
+    ) -> bool:
+        """Insert the ONE workflow-level breadth event plus its outbox rows.
+
+        The occurrence key is ``...:<stage>:breadth:<crossing_seq>``: it carries
+        the durable crossing identity and NO instrument, so a second member
+        reaching the same crossing cannot create a second event even if it
+        publishes concurrently (the unique key rejects it and this returns
+        False).
+        """
+        evidence = {
+            "message_kind": "breadth",
+            "workflow_id": str(sub.workflow_id),
+            # The workflow NAME is what an operator recognises in a message;
+            # resolved from the parsed document the caller already holds.
+            "workflow_name": workflow_name or "workflow",
+            "stage_id": stage.id,
+            "mode": stage.breadth.mode,
+            "action": "breadth_crossing",
+            "trigger": "on_transition",
+            "count": outcome.count,
+            "threshold": int(stage.breadth.distinct_instruments),
+            "members": outcome.members,
+            "instruments": list(outcome.contributors),
+            "window_start": (
+                outcome.window_start.isoformat() if outcome.window_start else None
+            ),
+            "event_time": obs.ts.isoformat(),
+            "crossing_seq": outcome.crossing_seq,
+            "universe_revision": universe_revision,
+            "message": alert.message,
+        }
+        self.workflow_repo.assert_evaluation_owner(
+            sub.id,
+            sub.instrument_key,
+            self.owner_id,
+            owner_epoch,
+            now=ownership_now,
+            db=session,
+        )
+        occurrence_key = (
+            f"{sub.workflow_id}:{sub.revision_id}:{stage.id}:"
+            f"breadth:{outcome.crossing_seq}"
+        )
+        try:
+            with session.begin_nested():
+                event = self._record_workflow_event(
+                    sub, occurrence_key, fired_at=obs.ts, evidence=evidence,
+                    channel_ids=channel_ids, now=obs.ts, db=session,
+                )
+        except IntegrityError:
+            # Another member published this same crossing first: exactly one
+            # logical event exists, which is the required outcome.
+            return False
+        return event is not None
+
+    def _record_workflow_event(
+        self,
+        sub: ActiveSubscription,
+        occurrence_key: str,
+        *,
+        fired_at: datetime,
+        evidence: dict,
+        channel_ids: Sequence[str],
+        now: datetime,
+        db: Session,
+    ):
+        """Insert a workflow-level signal event (no subscription) + deliveries."""
+        from backend.notifications.repository import Delivery
+        from backend.workflows.repository import SignalEvent
+
+        event = SignalEvent(
+            id=str(uuid.uuid4()),
+            subscription_id=None,
+            workflow_id=str(sub.workflow_id),
+            occurrence_key=occurrence_key,
+            fired_at=fired_at,
+            evidence=dict(evidence or {}),
+            created_at=now,
+        )
+        db.add(event)
+        db.flush()
+        for channel_id in dict.fromkeys(channel_ids or ()):
+            db.add(
+                Delivery(
+                    id=str(uuid.uuid4()),
+                    event_id=event.id,
+                    channel_id=channel_id,
+                    status="pending",
+                    attempts=0,
+                    next_attempt_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        return event
 
     @staticmethod
     def _fallback_session_id(obs: Observation) -> str:

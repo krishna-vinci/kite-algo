@@ -71,6 +71,7 @@ from backend.notifications.adapters import (
 )
 from backend.notifications.message import (
     build_message,
+    build_breadth_message,
     build_screener_message,
     format_event_time,
 )
@@ -185,21 +186,40 @@ def make_resolver(
                 event_id=event.id,
             )
         else:
-            # Phase 3 screener attachment event: workflow-level context lives
-            # in the evidence itself (no alert subscription exists).
+            # Workflow-level event (no alert subscription exists): the context
+            # lives entirely in the evidence, discriminated by message_kind.
             evidence = dict(event.evidence or {})
-            if evidence.get("message_kind") != "screener_attachment":
-                return None
-            screener_name = str(evidence.get("screener") or "screener")
+            kind = evidence.get("message_kind")
             ist_str, utc_str = format_event_time(event.fired_at)
-            subject, body = build_screener_message(
-                screener_name=screener_name,
-                evidence=evidence,
-                event_id=event.id,
-                ist_str=ist_str,
-                utc_str=utc_str,
-                instrument_key=str(evidence.get("instrument_key") or "-"),
-            )
+            if kind == "breadth":
+                # Phase 4 F10: an aggregate crossing. Presenting it with a
+                # symbol line would misdescribe it, so the breadth builder
+                # lists the contributing instruments instead.
+                workflow_name = str(
+                    evidence.get("workflow_name")
+                    or evidence.get("screener")
+                    or "workflow"
+                )
+                subject, body = build_breadth_message(
+                    workflow_name=workflow_name,
+                    stage_id=str(evidence.get("stage_id") or "-"),
+                    evidence=evidence,
+                    event_id=event.id,
+                    ist_str=ist_str,
+                    utc_str=utc_str,
+                )
+            elif kind == "screener_attachment":
+                screener_name = str(evidence.get("screener") or "screener")
+                subject, body = build_screener_message(
+                    screener_name=screener_name,
+                    evidence=evidence,
+                    event_id=event.id,
+                    ist_str=ist_str,
+                    utc_str=utc_str,
+                    instrument_key=str(evidence.get("instrument_key") or "-"),
+                )
+            else:
+                return None
         return {
             "provider": channel.provider,
             "destination": merge_secret_env(

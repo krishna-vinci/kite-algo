@@ -15,7 +15,7 @@ commits everything in its own transaction.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy.orm import Session
@@ -23,6 +23,15 @@ from sqlalchemy.orm import Session
 from backend.workflows import advanced_repository as repo
 
 __all__ = ["BreadthOutcome", "evaluate_breadth"]
+
+
+def _as_utc(moment: Optional[datetime]) -> Optional[datetime]:
+    """SQLite round-trips datetimes naive; treat naive as UTC for compares."""
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -61,6 +70,7 @@ def evaluate_breadth(
     observed_at: datetime,
     max_instruments: int,
     membership_max_age_s: int,
+    membership_now: Optional[datetime] = None,
 ) -> BreadthOutcome:
     """Evaluate one breadth stage for one observation.
 
@@ -104,6 +114,12 @@ def evaluate_breadth(
 
     # Membership freshness (D16): a stale membership snapshot must not support
     # a signal, so the stage is unknown rather than silently counting.
+    #
+    # Age is measured against the RESOLUTION wall clock (``membership_now``),
+    # not against the observation's event time: membership is materialized in
+    # real time, so an old bar does not make the membership stale — the age of
+    # the resolution is what matters. Defaults to the observation time so a
+    # caller that supplies neither still gets a coherent (conservative) answer.
     if membership_resolved_at is None:
         return BreadthOutcome(
             matched=None,
@@ -113,7 +129,10 @@ def evaluate_breadth(
             reason="membership_unavailable",
             crossing_seq=int(state.crossing_seq) if state else 0,
         )
-    membership_age_s = (observed_at - membership_resolved_at).total_seconds()
+    age_reference = _as_utc(membership_now) or observed_at
+    membership_age_s = (
+        age_reference - (_as_utc(membership_resolved_at) or age_reference)
+    ).total_seconds()
     if membership_age_s > membership_max_age_s:
         return BreadthOutcome(
             matched=None,
@@ -124,7 +143,9 @@ def evaluate_breadth(
             crossing_seq=int(state.crossing_seq) if state else 0,
         )
 
-    watermark = state.aggregation_watermark if state else None
+    # Normalized before any comparison: SQLite returns naive datetimes while
+    # PostgreSQL returns aware ones, and comparing the two raises.
+    watermark = _as_utc(state.aggregation_watermark) if state else None
     # The aggregate is evaluated at the LATEST logical time seen, never
     # backwards. A contribution that arrives late still participates, because
     # the count that matters is the count as of the watermark — otherwise a
