@@ -531,3 +531,75 @@ def test_phase4_fixtures_compile_and_round_trip(fixture):
     assert compile_document(again).canonical_hash == compiled.canonical_hash
     # Re-parsing the exported document reproduces the same document.
     assert again == parsed
+
+
+# ---------------------------------------------------------------------------
+# the frozen migration baseline
+# ---------------------------------------------------------------------------
+
+
+def test_frozen_baseline_does_not_contain_later_migrations_schema():
+    """The Alembic baseline must not create what later migrations own.
+
+    The baseline migration executes ``backend/alembic/baseline_schema.sql``
+    instead of the evolving ``backend/schema.sql`` precisely because the latter
+    grew to contain blocks owned by later migrations — which made a from-zero
+    ``alembic upgrade head`` abort. This guards the invariant that keeps that
+    repair working: if anyone adds a later migration's table to the frozen
+    snapshot, the from-zero install breaks again, and the PostgreSQL suite
+    would only catch it when that database happens to be available.
+    """
+    from pathlib import Path
+
+    baseline = Path("backend/alembic/baseline_schema.sql").read_text(encoding="utf-8")
+    owned_by_later_migrations = (
+        "universes",
+        "universe_revisions",
+        "screener_run",
+        "screener_run_member",
+        "screener_attachment_state",
+        "alert_breadth_state",
+        "alert_breadth_triggers",
+        "alert_session_counters",
+        "alert_suppression_counters",
+        "external_signal_producers",
+        "external_signal_producer_credentials",
+        "external_signal_values",
+        "workflows",
+        "workflow_revisions",
+        "alert_subscriptions",
+        "signal_events",
+        "deliveries",
+        "evaluation_checkpoints",
+        "evaluation_ownership",
+    )
+    present = [
+        name for name in owned_by_later_migrations
+        if f"CREATE TABLE IF NOT EXISTS public.{name} " in baseline
+    ]
+    assert present == [], (
+        "the frozen baseline must not create migration-owned tables: "
+        f"{present}. Add schema changes to a NEW migration (and schema.sql), "
+        "never to backend/alembic/baseline_schema.sql."
+    )
+
+
+def test_evolving_schema_snapshot_still_documents_the_phase4_tables():
+    """``backend/schema.sql`` stays the evolving reference DDL.
+
+    It is what a from-scratch deployment reads, so the Phase 4 tables must be
+    present there even though the migration chain creates them too.
+    """
+    from pathlib import Path
+
+    schema = Path("backend/schema.sql").read_text(encoding="utf-8")
+    for table in (
+        "alert_breadth_state",
+        "alert_breadth_triggers",
+        "alert_session_counters",
+        "alert_suppression_counters",
+        "external_signal_producers",
+        "external_signal_producer_credentials",
+        "external_signal_values",
+    ):
+        assert f"CREATE TABLE IF NOT EXISTS public.{table} " in schema
