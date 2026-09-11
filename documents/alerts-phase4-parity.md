@@ -33,6 +33,8 @@ Baseline: HEAD `ae98218` — 457 alerts-platform unit tests, 18 screener-PG,
 | Requirement | Status | Where | Evidence |
 | --- | --- | --- | --- |
 | Distinct-symbol aggregation within a window | Closed | `service._handle_breadth_observation` (dispatched from `handle_observation`) + `breadth.py` + `alert_breadth_state`/`alert_breadth_triggers` | **Worker path:** `test_k_distinct_contributors_publish_one_workflow_level_event`. **Component (PG):** `test_first_crossing_notifies_because_satisfied_starts_false` |
+| Out-of-order contributions still publish a permitted crossing | Closed | `breadth.Blocking/INFORMATIONAL_REASONS` + `BreadthOutcome.blocking`/`evaluated_at`; the handler publishes on `fired` and records the reason as provenance | **Worker path:** `test_out_of_order_contribution_completing_k_still_publishes`, `test_out_of_order_crossing_repeat_and_restart_do_not_duplicate`. **Component (PG):** `test_blocking_and_informational_reasons_are_distinguished` |
+| Breadth alerts honour the per-session cap | Closed | the handler reserves the shared logical-notification slot in its own transaction, then either publishes or records a durable `session_cap` suppression | **Worker path:** `test_breadth_session_cap_advances_state_and_records_durable_suppression`, `test_a_new_session_permits_another_breadth_notification`, `test_injected_publication_failure_rolls_back_the_cap_and_aggregate` |
 | Windowed participation ≠ simultaneous breadth | Closed | labeled windowed; `mode: simultaneous` reserved and REJECTED as not implemented | `test_simultaneous_breadth_is_rejected_as_not_implemented`, capabilities `breadth_modes` |
 | One instrument counts once per window | Closed | one contribution row per instrument, latest trigger wins | PG `test_older_observation_never_rewrites_a_newer_contribution`, `test_concurrent_stages_cannot_interleave_the_windows` |
 | Event-time ordering / arrival-order independence | Closed | monotonic contribution upsert + aggregation watermark; evaluated at the watermark | PG `test_reversed_arrival_order_converges_to_the_same_crossing` |
@@ -127,6 +129,8 @@ component-only suite would have missed.
 | membership freshness reference | Age was measured against the OBSERVATION's event time, so any replayed or late bar looked like stale membership and the aggregate went unknown | Measured against the wall clock (how long ago membership was materialized), which is what freshness actually means; the worker also records `last_refresh_at` at boot, since booting is itself a materialization |
 | re-admission | A departed universe member was never resumed: re-joining left the subscription paused forever, so re-admission silently had no effect | Re-admission resumes the row, clears `universe_departed`, updates the membership revision, and clears the retained breadth contribution under the aggregate's advisory lock |
 | breadth stages with no alert | Accepted at validation but never dispatched, so the workflow was silently dead | Rejected at compile time with a message naming the fix |
+| `service._handle_breadth_observation` | Treated ANY non-null reason as a refusal, so a crossing minted by an out-of-order contribution (`fired=True` with `breadth_stale_observation`) was suppressed while its state committed as satisfied — and because a crossing is never re-minted, the notification was lost permanently | Reasons are classified blocking vs informational; `BreadthOutcome.blocking` decides, `fired` publishes, and the reason is recorded as provenance |
+| `service._handle_breadth_observation` | `max_per_session` was enforced only on the signal path, so a breadth alert could notify without limit | The shared logical-notification slot is reserved in the breadth transaction; a capped crossing advances state, writes no event, and records a durable `session_cap` suppression |
 
 ### Defect D-2 — from-zero installation was blocked (REPAIRED)
 
@@ -169,17 +173,17 @@ demonstrated at a level is marked as such rather than implied.
 
 | Level | Suite | Command | Result |
 | --- | --- | --- | --- |
-| Component + integration | Alerts-platform suites | `.venv/bin/python -m pytest tests/alerts tests/workflows tests/screeners tests/notifications tests/fundamentals tests/api/test_worker_signals.py tests/api/test_worker_screeners.py -q` | `587 passed` |
+| Component + integration | Alerts-platform suites | `.venv/bin/python -m pytest tests/alerts tests/workflows tests/screeners tests/notifications tests/fundamentals tests/api/test_worker_signals.py tests/api/test_worker_screeners.py -q` | `592 passed` |
 | Component + integration | SDK | `.venv/bin/python -m pytest tests/sdk -q` | `255 passed, 1 skipped` |
 | Component | SDK version guard | `.venv/bin/python scripts/check_worker_sdk_version_refs.py` | `All worker SDK version references match 0.10.0` |
-| Component (real PG) | Phase 4 component suite | `ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_alerts_phase4_postgres.py -q` | `16 passed`, stable over 3 consecutive runs |
+| Component (real PG) | Phase 4 component suite | `ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_alerts_phase4_postgres.py -q` | `17 passed`, stable over 3 consecutive runs |
 | **Integration (real PG)** | **Three installation lifecycles** | `ALERTS_TEST_DATABASE_URL=... ALERTS_FRESH_DATABASE_URL=... ALERTS_SCHEMA_DATABASE_URL=... pytest tests/integration/test_universe_kind_postgres.py -q` | **`3 passed`, 0 skipped** — the previous D-2 skip is now an executed assertion |
 | Component (real PG) | Phase 3 screener regression | `ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_screener_postgres.py -q` | `18 passed` |
 | Component (real PG) | Phase 1.5 hardening regression | `DATABASE_URL=... ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_alerts_postgres_hardening.py -q` | `6 passed` |
 
 ### Worker-path acceptance detail (breadth, Phase 4 F10)
 
-`tests/screeners/test_breadth_worker_acceptance.py` (9 tests). None of these
+`tests/screeners/test_breadth_worker_acceptance.py` (14 tests). None of these
 call `evaluate_breadth` or any other component directly: each authors a
 canonical breadth workflow, ACTIVATES it through `EvaluationService`,
 materializes subscriptions, and then drives completed bars through
@@ -198,6 +202,11 @@ the publication transaction.
 | A second worker cannot evaluate a live-owned subscription | `test_a_second_worker_cannot_evaluate_a_live_owned_subscription` | `not_owner` recorded; state and events unmoved |
 | Injected failure rolls back checkpoint + contribution + aggregate + event + outbox together | `test_injected_failure_rolls_back_the_whole_publication` | all five empty after the failure; retry publishes exactly once |
 | The delivery renders as an aggregate, not a per-symbol alert | `test_breadth_delivery_renders_as_an_aggregate_message` | `[Breadth]` subject, contributor list, no `symbol:` line |
+| A newer contribution arriving first, then older ones completing K, publishes exactly one notification | `test_out_of_order_contribution_completing_k_still_publishes` | 1 event; `aggregate_note="breadth_stale_observation"`; `event_time` and `evaluated_at` recorded separately and different |
+| That out-of-order crossing never duplicates on repeat or restart | `test_out_of_order_crossing_repeat_and_restart_do_not_duplicate` | 1 event / 1 delivery across replays and a fresh worker |
+| `max_per_session=1` crosses, rearms, crosses again: state advances, nothing is sent | `test_breadth_session_cap_advances_state_and_records_durable_suppression` | `crossing_seq` 1 → 2, `satisfied` true, still 1 event, durable `session_cap` counter, slot not consumed |
+| A new session permits the next notification | `test_a_new_session_permits_another_breadth_notification` | 2 events, one counter row per session |
+| A failure after the cap is reserved rolls the slot back with the aggregate | `test_injected_publication_failure_rolls_back_the_cap_and_aggregate` | no event/outbox/counter; contribution, aggregate and checkpoint unchanged; retry publishes once |
 
 Lease EXPIRY and takeover (as opposed to a live lease) remain covered against
 real PostgreSQL, where the lease clock is real:
@@ -274,9 +283,9 @@ This is a workload OBSERVATION at modest scale — **NOT** the Phase 6
 | Item | Value |
 | --- | --- |
 | Branch | `development` |
-| Deployed commit | **`7ce08ee`** — `kite-alerts-worker` and `kite-app` rebuilt and recreated from it |
+| Deployed commit | **`89c9fef`** — `kite-alerts-worker` and `kite-app` rebuilt and recreated from it |
 | Phase 4 commits | `05cbfc5`, `aa2c1ad`, `5ba407c`, `a1359d9`, `087c1f0`, `af7eeee`, `22db69d`, `d295216`, `cfb49db`, `1e69def`, `2754f52` |
-| Closure commits | `e4a1495` (breadth production wiring), `9c7d046` (frozen migration baseline, D-2), `6c718e9` (report correction), `7ce08ee` (auth boundary) |
+| Closure commits | `e4a1495` (breadth production wiring), `9c7d046` (frozen migration baseline, D-2), `6c718e9` (report correction), `7ce08ee` (auth boundary), `89c9fef` (out-of-order publication + breadth session cap) |
 | Migration head | **`20260911_000016_alerts_phase4` — applied to the live `kite-postgres`** |
 | Live Phase 4 tables | 7/7 present |
 | Live CHECK | `universes_kind_check` now admits `'screener'`; a screener-kind universe was INSERTed and DELETEd successfully on the live database, so **defect D-1 is fixed in production** |
@@ -301,7 +310,7 @@ Live verification performed (read-only, no evaluation driven):
 | Phase 4 tables on live | 7/7 present |
 | Repaired `universes.kind` CHECK | exercised by an insert **and delete** of a screener-kind universe on the live database |
 | Container health | `kite-alerts-worker` and `kite-app` both Up (healthy) |
-| Deployed code | `sha256sum` of the seven changed files inside the worker matches `7ce08ee` |
+| Deployed code | `sha256sum` of the eight changed files inside the worker matches `89c9fef` |
 | API surface | all 7 signals paths mounted; uniform 401 without a credential |
 | Worker boot | no errors; health loop renewing and refreshing; `external_signals` block present |
 
