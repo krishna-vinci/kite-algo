@@ -6,6 +6,10 @@
 - entry/exit use exit_after consecutive absences; top_n uses rank-band
   hysteresis; rank_delta compares against the previous complete rank;
 - partial runs never evaluate attachments (no exits, no baseline advance).
+
+Attachment transitions are PREPARED by ``prepare_attachments`` (no writes)
+and published by ``finalize_run`` inside the run's single fenced
+transaction — the ``_evaluate`` helper below drives that exact pair.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from sqlalchemy.pool import StaticPool
 
 from backend.notifications.repository import Delivery  # noqa: F401
 from backend.workflows.repository import SignalEvent  # noqa: F401
-from backend.screeners.scheduler import ScreenerScheduler, evaluate_attachments
+from backend.screeners.scheduler import ScreenerScheduler, prepare_attachments
 from backend.workflows.compiler import compile_document
 from backend.workflows.models import AttachmentSpec, ScreenerSpec, ScheduleSpec
 from backend.workflows.parser import parse_workflow_dict
@@ -199,19 +203,45 @@ def _workflow_objects(workflow, revision):
 
 
 def _evaluate(session_factory, workflow, revision, doc, run, results, now=T0):
+    """prepare_attachments + the fenced finalize_run publication pair.
+
+    Returns the prepared summary; the run is published as ``complete`` with
+    the transitions applied inside the publication transaction."""
     repo = ScreenerRunRepository(session_factory)
-    return evaluate_attachments(
+    summary, transitions = prepare_attachments(
         workflow=workflow,
         revision=revision,
         document=parse_workflow_dict(doc),
         run=run,
         results=results,
         run_repo=repo,
-        session_factory=session_factory,
         channel_resolver=_channels,
         owner_id="owner-1",
         now=now,
     )
+    published = repo.finalize_run(
+        run.id,
+        run.lease_owner,
+        status="complete",
+        as_of=run.scheduled_for,
+        coverage={"expected": len(results)},
+        data_freshness={},
+        members=[
+            {
+                "instrument_key": m.instrument_key,
+                "passed": m.passed,
+                "exclusion_reason": m.exclusion_reason,
+                "values": m.values,
+                "rank": m.rank,
+                "score": m.score,
+            }
+            for m in results
+        ],
+        attachments=transitions,
+        now=now,
+    )
+    assert published is True
+    return summary
 
 
 def _events(session_factory):
@@ -328,8 +358,26 @@ def test_attachment_occurrence_key_is_idempotent_on_replay(session_factory):
     run = _run_row(session_factory, workflow, revision)
     results = [_member("NSE:A", rank=1)]
     _evaluate(session_factory, workflow, revision, doc, run, results)
-    # replay of the SAME run (crash between events and finalize) emits nothing new
-    _evaluate(session_factory, workflow, revision, doc, run, results)
+    # a full replay of the SAME run (stale recovery attempt) publishes
+    # nothing: the fenced CAS rejects the already-finalized run outright
+    repo = ScreenerRunRepository(session_factory)
+    _summary, transitions = prepare_attachments(
+        workflow=workflow,
+        revision=revision,
+        document=parse_workflow_dict(doc),
+        run=run,
+        results=results,
+        run_repo=repo,
+        channel_resolver=_channels,
+        owner_id="owner-1",
+    )
+    assert all(t.events == () for t in transitions)  # baseline advanced: nothing to fire
+    assert repo.finalize_run(
+        run.id, run.lease_owner,
+        status="complete", as_of=run.scheduled_for,
+        coverage={}, data_freshness={}, members=[],
+        attachments=transitions,
+    ) is False
     assert len(_events(session_factory)) == 1
 
 

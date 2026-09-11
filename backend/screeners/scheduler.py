@@ -8,8 +8,16 @@ Duties (one poll pass):
    gated, coalesced — E-19: only the latest due occurrence is ever run);
 3. claim the occurrence (unique occurrence_key + lease; concurrent workers
    produce exactly one logical run, stale owners are fenced);
-4. resolve universe membership, run the stored-data pipeline, evaluate
-   attachments on COMPLETE runs, publish atomically.
+4. resolve universe membership, run the stored-data pipeline, PREPARE
+   attachment transitions on COMPLETE runs, then publish everything — run
+   status/results, baseline changes, signal events, outbox deliveries — in
+   ONE fenced transaction via ``ScreenerRunRepository.finalize_run``.
+
+Publication semantics: attachment evaluation happens BEFORE finalization
+(its output feeds the publication transaction), but nothing it computes is
+written outside ``finalize_run`` — a crash mid-publication or a stale-owner
+rejection rolls back the entire batch, and a lease takeover re-runs the
+occurrence to produce exactly one logical publication.
 
 Failure semantics: any pipeline error finalizes the run as ``failed`` with
 the reason (visible, never silent); the claim's unique key prevents the same
@@ -30,14 +38,16 @@ from sqlalchemy import select
 
 from backend.workflows.repository import Workflow, WorkflowRevision
 from backend.workflows.screener_repository import (
+    AttachmentEvent,
+    AttachmentStateUpdate,
+    AttachmentTransition,
     ScreenerRun,
     ScreenerRunRepository,
-    record_attachment_event,
 )
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ScreenerScheduler", "evaluate_attachments"]
+__all__ = ["ScreenerScheduler", "prepare_attachments"]
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -290,22 +300,20 @@ class ScreenerScheduler:
 
         results = outcome["members"]
         coverage = outcome["coverage"]
-        attachment_summary: Dict[str, Any] = {}
+        transitions: List[AttachmentTransition] = []
         if outcome["status"] == "complete":
-            attachment_summary = evaluate_attachments(
+            attachment_summary, transitions = prepare_attachments(
                 workflow=workflow,
                 revision=revision,
                 document=document,
                 run=run,
                 results=results,
                 run_repo=self.run_repo,
-                session_factory=self._sessions,
                 channel_resolver=self._channel_resolver or _no_channels,
                 owner_id=workflow.owner_id,
                 max_events=self.max_events_per_attachment,
                 now=now,
             )
-            self.health["attachment_events"] += attachment_summary.get("events", 0)
             if attachment_summary.get("suppressed_events"):
                 coverage["attachment_events_suppressed"] = attachment_summary["suppressed_events"]
         member_payloads = [
@@ -319,6 +327,8 @@ class ScreenerScheduler:
             }
             for m in results
         ]
+        # Single fenced publication: run status/results, attachment baselines,
+        # signal events and outbox entries commit together or not at all.
         published = self.run_repo.finalize_run(
             run.id,
             self.owner_id,
@@ -328,10 +338,14 @@ class ScreenerScheduler:
             data_freshness=outcome["data_freshness"],
             members=member_payloads,
             universe_revision=universe_revision if isinstance(universe_revision, int) else None,
+            attachments=transitions,
             now=now,
         )
         if published:
             self.health["runs_executed"] += 1
+            published_run = self.run_repo.get_run(run.id)
+            published_events = int((published_run.coverage or {}).get("attachment_events_published", 0)) if published_run else 0
+            self.health["attachment_events"] += published_events
             if outcome["status"] == "complete":
                 self._refresh_dependent_universes(workflow, now)
 
@@ -445,7 +459,7 @@ class ScreenerScheduler:
 # ---------------------------------------------------------------------------
 
 
-def evaluate_attachments(
+def prepare_attachments(
     *,
     workflow: Workflow,
     revision: WorkflowRevision,
@@ -453,13 +467,20 @@ def evaluate_attachments(
     run,
     results: Sequence,
     run_repo: ScreenerRunRepository,
-    session_factory: Callable[[], Any],
     channel_resolver: Callable[[str, Sequence[str]], Dict[str, str]],
     owner_id: str,
     max_events: int = 100,
     now: Optional[datetime] = None,
-) -> Dict[str, Any]:
-    """Entry/exit/top-N/rank-delta attachment evaluation for a COMPLETE run.
+) -> Tuple[Dict[str, Any], List[AttachmentTransition]]:
+    """Entry/exit/top-N/rank-delta attachment PREPARATION for a COMPLETE run.
+
+    Computes the transitions this run would publish WITHOUT writing
+    anything: the caller passes the returned ``AttachmentTransition`` list
+    into ``run_repo.finalize_run(attachments=...)`` so baseline changes,
+    signal events and outbox entries commit inside the run's single fenced
+    publication transaction. ``summary`` reports the prepared counts
+    (``events``, ``suppressed_events``); what actually publishes is decided
+    inside ``finalize_run`` (fence + chronology gate).
 
     Baseline semantics: the first complete run of a (revision, attachment)
     initializes state silently unless ``initial_match`` is set. Partial runs
@@ -474,8 +495,9 @@ def evaluate_attachments(
     """
     timestamp = now or _utcnow()
     summary: Dict[str, Any] = {"events": 0, "suppressed_events": 0}
+    transitions: List[AttachmentTransition] = []
     if document.screener is None:
-        return summary
+        return summary, transitions
     screener_name = document.name
     for attachment in document.screener.attachments:
         states = run_repo.attachment_states(
@@ -566,6 +588,7 @@ def evaluate_attachments(
             ]
             events = []
 
+        prepared_events: List[AttachmentEvent] = []
         emitted = 0
         suppressed = 0
         for key, payload in events:
@@ -594,34 +617,39 @@ def evaluate_attachments(
             occurrence_key = (
                 f"{workflow.id}:{revision.id}:{attachment.id}:{run.id}:{key}"
             )
-            event = record_attachment_event(
-                session_factory,
-                workflow_id=workflow.id,
-                occurrence_key=occurrence_key,
-                fired_at=run.scheduled_for or timestamp,
-                evidence=evidence,
-                channel_ids=list(channel_ids.values()),
-                now=timestamp,
+            prepared_events.append(
+                AttachmentEvent(
+                    attachment_id=attachment.id,
+                    occurrence_key=occurrence_key,
+                    fired_at=run.scheduled_for or timestamp,
+                    evidence=evidence,
+                    channel_ids=tuple(dict.fromkeys(channel_ids.values())),
+                )
             )
-            if event is not None:
-                summary["events"] += 1
+            summary["events"] += 1
             emitted += 1
         summary["suppressed_events"] += suppressed
 
-        for key, present, rank, absent_streak in state_updates:
-            run_repo.upsert_attachment_state(
+        transitions.append(
+            AttachmentTransition(
                 owner_id=owner_id,
                 workflow_id=workflow.id,
                 revision_id=revision.id,
                 attachment_id=attachment.id,
-                instrument_key=key,
-                present=present,
-                run_id=run.id,
-                rank=rank,
-                consecutive_absent=absent_streak,
-                now=timestamp,
+                events=tuple(prepared_events),
+                state_updates=tuple(
+                    AttachmentStateUpdate(
+                        attachment_id=attachment.id,
+                        instrument_key=key,
+                        present=present,
+                        rank=rank,
+                        consecutive_absent=absent_streak,
+                    )
+                    for key, present, rank, absent_streak in state_updates
+                ),
             )
-    return summary
+        )
+    return summary, transitions
 
 
 def parse_duration_seconds(value: str) -> int:

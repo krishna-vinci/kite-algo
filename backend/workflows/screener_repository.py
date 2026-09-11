@@ -15,6 +15,18 @@ Tables (migration 20260910_000015):
   (owner, workflow, revision, attachment, instrument) so restart never
   resets baselines or hysteresis (E-17).
 
+Publication protocol: run status + members + attachment signal events +
+outbox deliveries + attachment baseline upserts are written by
+:meth:`ScreenerRunRepository.finalize_run` in ONE transaction that opens
+with the ownership compare-and-swap — a rejected or stale owner publishes
+nothing at all. Attachment baseline transitions are serialized per
+(owner, workflow, revision, attachment) with a PostgreSQL advisory
+transaction lock and chronologically gated: a run may only advance a
+baseline whose stored ``last_complete_run`` is not strictly newer than
+itself, so an older overlapping run can never overwrite newer comparison
+state — even when the baseline is still empty and there are no rows to
+lock.
+
 Runs are never deleted by the scheduler; history stays attributable to the
 exact workflow revision and universe revision that produced it.
 """
@@ -22,8 +34,9 @@ exact workflow revision and universe revision that produced it.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import (
     JSON,
@@ -38,6 +51,7 @@ from sqlalchemy import (
     UniqueConstraint,
     delete,
     select,
+    text,
     update,
 )
 from sqlalchemy.exc import IntegrityError
@@ -50,6 +64,9 @@ __all__ = [
     "ScreenerRun",
     "ScreenerRunMember",
     "ScreenerAttachmentState",
+    "AttachmentEvent",
+    "AttachmentStateUpdate",
+    "AttachmentTransition",
     "ScreenerRunRepository",
 ]
 
@@ -60,6 +77,56 @@ def _uuid() -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _as_utc(moment: datetime) -> datetime:
+    """SQLite round-trips datetimes naive; treat naive as UTC for compares."""
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def _is_postgres(session: Any) -> bool:
+    bind = getattr(session, "bind", None)
+    return getattr(getattr(bind, "dialect", None), "name", "") == "postgresql"
+
+
+@dataclass(frozen=True)
+class AttachmentEvent:
+    """One prepared attachment signal event + outbox fan-out (not yet written)."""
+
+    attachment_id: str
+    occurrence_key: str
+    fired_at: datetime
+    evidence: dict
+    channel_ids: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AttachmentStateUpdate:
+    """One prepared baseline row upsert (not yet written)."""
+
+    attachment_id: str
+    instrument_key: str
+    present: bool
+    rank: Optional[int]
+    consecutive_absent: int
+
+
+@dataclass(frozen=True)
+class AttachmentTransition:
+    """Everything one attachment would publish for a run.
+
+    Prepared by the scheduler BEFORE finalization and applied inside
+    ``finalize_run``'s fenced transaction — never written earlier.
+    """
+
+    owner_id: str
+    workflow_id: str
+    revision_id: str
+    attachment_id: str
+    events: Tuple[AttachmentEvent, ...] = ()
+    state_updates: Tuple[AttachmentStateUpdate, ...] = ()
 
 
 class ScreenerRun(Base):
@@ -245,13 +312,33 @@ class ScreenerRunRepository:
         members: Sequence[dict],
         failure_reason: Optional[str] = None,
         universe_revision: Optional[int] = None,
+        attachments: Sequence[AttachmentTransition] = (),
         now: Optional[datetime] = None,
     ) -> bool:
-        """Publish status + all members + freshness in ONE transaction.
+        """Publish the run and ALL its side effects in ONE fenced transaction.
 
-        The compare-and-swap on ``lease_owner`` guarantees a stale owner
-        (whose lease was taken over) cannot finalize anything: rowcount 0
-        aborts the whole transaction.
+        Order inside the transaction:
+
+        1. compare-and-swap ``screener_run`` (id + ``lease_owner`` +
+           ``status='running'``): rowcount 0 — stale owner whose lease was
+           taken over, or an already-finalized run — aborts the WHOLE
+           publication before anything becomes visible;
+        2. delete + insert the member rows;
+        3. per attachment transition: acquire the attachment's advisory
+           transaction lock (serializes every overlapping publication of the
+           same attachment — including the first one, when there are no
+           baseline rows to lock), apply the chronology gate (a stored
+           ``last_complete_run`` strictly newer than this run suppresses the
+           whole transition — an older run never overwrites newer comparison
+           state), then insert the signal events + pending deliveries
+           (occurrence-key pre-checked) and upsert the baseline rows;
+        4. fold the published attachment summary into ``coverage``.
+
+        Fence semantics vs lease expiry: the fence is OWNERSHIP, not time.
+        A lease that expired but was never taken over still finalizes (the
+        worker is still the sole owner; blocking it would lose a completed
+        run's notifications). Once another worker takes the run over, the
+        original owner is permanently fenced by the CAS.
         """
         timestamp = now or _utcnow()
         session = self._sessions()
@@ -292,6 +379,22 @@ class ScreenerRunRepository:
                         score=member.get("score"),
                     )
                 )
+
+            summary: Dict[str, int] = {}
+            for transition in attachments:
+                applied = self._apply_attachment_transition(
+                    session, transition, run_id, as_of, timestamp
+                )
+                for key, value in applied.items():
+                    summary[key] = summary.get(key, 0) + value
+            if summary:
+                coverage = dict(coverage or {})
+                coverage.update(summary)
+                session.execute(
+                    update(ScreenerRun)
+                    .where(ScreenerRun.id == run_id)
+                    .values(coverage=coverage, updated_at=timestamp)
+                )
             session.commit()
             return True
         except Exception:
@@ -299,6 +402,120 @@ class ScreenerRunRepository:
             raise
         finally:
             session.close()
+
+    def _apply_attachment_transition(
+        self,
+        session: Session,
+        transition: AttachmentTransition,
+        run_id: str,
+        run_scheduled_for: datetime,
+        timestamp: datetime,
+    ) -> Dict[str, int]:
+        """Apply one attachment's prepared transitions inside the publication
+        transaction. Returns the published/suppressed counters.
+
+        - A PostgreSQL advisory transaction lock keyed on
+          (owner, workflow, revision, attachment) serializes every
+          overlapping publication of the same baseline, taken BEFORE the
+          baseline read. Unlike a row lock it also covers the first
+          publication, when no baseline rows exist yet. SQLite (tests) is a
+          single writer.
+        - chronology gate: if any baseline row was last written by a run
+          with a strictly newer ``scheduled_for``, this transition is
+          entirely suppressed — its events would describe transitions away
+          from a baseline that no longer exists, and its state writes would
+          overwrite newer comparison state.
+        """
+        from backend.notifications.repository import Delivery
+
+        from backend.workflows.repository import SignalEvent
+
+        applied: Dict[str, int] = {
+            "attachment_events_published": 0,
+        }
+        if _is_postgres(session):
+            session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtext('screener-attachment:' || :lock_key))"
+                ),
+                {
+                    "lock_key": (
+                        f"{transition.owner_id}/{transition.workflow_id}/"
+                        f"{transition.revision_id}/{transition.attachment_id}"
+                    )
+                },
+            )
+        lock_rows = session.execute(
+            select(ScreenerAttachmentState.last_complete_run_id)
+            .where(
+                ScreenerAttachmentState.owner_id == transition.owner_id,
+                ScreenerAttachmentState.workflow_id == transition.workflow_id,
+                ScreenerAttachmentState.workflow_revision_id == transition.revision_id,
+                ScreenerAttachmentState.attachment_id == transition.attachment_id,
+            )
+        ).scalars().all()
+        baseline_run_ids = {value for value in lock_rows if value}
+        if baseline_run_ids:
+            stored = session.execute(
+                select(ScreenerRun.scheduled_for).where(
+                    ScreenerRun.id.in_(baseline_run_ids)
+                )
+            ).scalars().all()
+            newest_baseline = max(_as_utc(value) for value in stored)
+            if _as_utc(run_scheduled_for) < newest_baseline:
+                applied["attachment_events_stale_suppressed"] = 1
+                return applied
+
+        for event in transition.events:
+            duplicate = session.execute(
+                select(SignalEvent.id).where(
+                    SignalEvent.occurrence_key == event.occurrence_key
+                )
+            ).scalar_one_or_none()
+            if duplicate is not None:
+                continue  # replay: this logical event already exists
+            signal = SignalEvent(
+                id=_uuid(),
+                subscription_id=None,
+                workflow_id=str(transition.workflow_id),
+                occurrence_key=event.occurrence_key,
+                fired_at=event.fired_at,
+                evidence=dict(event.evidence or {}),
+                created_at=timestamp,
+            )
+            session.add(signal)
+            session.flush()
+            for channel_id in dict.fromkeys(event.channel_ids or ()):
+                session.add(
+                    Delivery(
+                        id=_uuid(),
+                        event_id=signal.id,
+                        channel_id=channel_id,
+                        status="pending",
+                        attempts=0,
+                        next_attempt_at=timestamp,
+                        created_at=timestamp,
+                        updated_at=timestamp,
+                    )
+                )
+            applied["attachment_events_published"] += 1
+
+        for update in transition.state_updates:
+            _upsert_attachment_state_row(
+                session,
+                owner_id=transition.owner_id,
+                workflow_id=transition.workflow_id,
+                revision_id=transition.revision_id,
+                attachment_id=update.attachment_id,
+                instrument_key=update.instrument_key,
+                present=update.present,
+                run_id=run_id,
+                rank=update.rank,
+                consecutive_absent=update.consecutive_absent,
+                now=timestamp,
+            )
+        return applied
 
     # -- reads --------------------------------------------------------------
 
@@ -412,126 +629,63 @@ class ScreenerRunRepository:
         finally:
             session.close()
 
-    def upsert_attachment_state(
-        self,
-        *,
-        owner_id: str,
-        workflow_id: str,
-        revision_id: str,
-        attachment_id: str,
-        instrument_key: str,
-        present: bool,
-        run_id: str,
-        rank: Optional[int],
-        consecutive_absent: int,
-        db: Optional[Session] = None,
-        now: Optional[datetime] = None,
-    ) -> None:
-        timestamp = now or _utcnow()
 
-        def _write(session: Session) -> None:
-            existing = session.execute(
-                select(ScreenerAttachmentState).where(
-                    ScreenerAttachmentState.owner_id == owner_id,
-                    ScreenerAttachmentState.workflow_id == workflow_id,
-                    ScreenerAttachmentState.workflow_revision_id == revision_id,
-                    ScreenerAttachmentState.attachment_id == attachment_id,
-                    ScreenerAttachmentState.instrument_key == instrument_key,
-                )
-            ).scalar_one_or_none()
-            if existing is None:
-                session.add(
-                    ScreenerAttachmentState(
-                        owner_id=owner_id,
-                        workflow_id=workflow_id,
-                        workflow_revision_id=revision_id,
-                        attachment_id=attachment_id,
-                        instrument_key=instrument_key,
-                        present=present,
-                        last_complete_run_id=run_id,
-                        last_rank=rank,
-                        consecutive_absent=consecutive_absent,
-                        updated_at=timestamp,
-                    )
-                )
-            else:
-                existing.present = present
-                existing.last_complete_run_id = run_id
-                existing.last_rank = rank
-                existing.consecutive_absent = consecutive_absent
-                existing.updated_at = timestamp
-            session.flush()
-
-        if db is not None:
-            _write(db)
-            return
-        session = self._sessions()
-        try:
-            _write(session)
-            session.commit()
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
-
-
-def record_attachment_event(
-    session_factory: Any,
+def _upsert_attachment_state_row(
+    session: Session,
     *,
+    owner_id: str,
     workflow_id: str,
-    occurrence_key: str,
-    fired_at: datetime,
-    evidence: dict,
-    channel_ids: Sequence[str],
-    now: Optional[datetime] = None,
-):
-    """Atomically insert a screener attachment signal event + one pending
-    delivery per channel (subscription_id NULL; delivery context comes from
-    evidence). Returns None when the occurrence already exists (idempotent
-    retry / duplicate attachment evaluation can never double-send).
+    revision_id: str,
+    attachment_id: str,
+    instrument_key: str,
+    present: bool,
+    run_id: str,
+    rank: Optional[int],
+    consecutive_absent: int,
+    now: datetime,
+) -> None:
+    """Insert-or-update one baseline row in the caller's transaction.
+
+    Uses a dialect ``ON CONFLICT DO UPDATE`` upsert so two overlapping
+    publications of the same attachment can never collide on the unique
+    constraint (the collision would poison a PostgreSQL transaction).
     """
-    from backend.notifications.repository import Delivery
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-    from backend.workflows.repository import SignalEvent
-
-    timestamp = now or _utcnow()
-    session = session_factory()
-    try:
-        event = SignalEvent(
-            id=_uuid(),
-            subscription_id=None,
-            workflow_id=str(workflow_id),
-            occurrence_key=occurrence_key,
-            fired_at=fired_at,
-            evidence=dict(evidence or {}),
-            created_at=timestamp,
+    values = dict(
+        owner_id=owner_id,
+        workflow_id=workflow_id,
+        workflow_revision_id=revision_id,
+        attachment_id=attachment_id,
+        instrument_key=instrument_key,
+        present=bool(present),
+        last_complete_run_id=run_id,
+        last_rank=rank,
+        consecutive_absent=int(consecutive_absent),
+        updated_at=now,
+    )
+    insert = pg_insert if _is_postgres(session) else sqlite_insert
+    session.execute(
+        insert(ScreenerAttachmentState)
+        .values(**values)
+        .on_conflict_do_update(
+            index_elements=[
+                ScreenerAttachmentState.owner_id,
+                ScreenerAttachmentState.workflow_id,
+                ScreenerAttachmentState.workflow_revision_id,
+                ScreenerAttachmentState.attachment_id,
+                ScreenerAttachmentState.instrument_key,
+            ],
+            set_={
+                "present": values["present"],
+                "last_complete_run_id": values["last_complete_run_id"],
+                "last_rank": values["last_rank"],
+                "consecutive_absent": values["consecutive_absent"],
+                "updated_at": values["updated_at"],
+            },
         )
-        session.add(event)
-        session.flush()
-        for channel_id in dict.fromkeys(channel_ids or ()):
-            session.add(
-                Delivery(
-                    id=_uuid(),
-                    event_id=event.id,
-                    channel_id=channel_id,
-                    status="pending",
-                    attempts=0,
-                    next_attempt_at=timestamp,
-                    created_at=timestamp,
-                    updated_at=timestamp,
-                )
-            )
-        session.commit()
-        return event
-    except IntegrityError:
-        session.rollback()
-        return None
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+    )
 
 
 def list_workflow_events(
