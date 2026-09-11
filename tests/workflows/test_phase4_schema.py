@@ -339,6 +339,42 @@ def test_pair_rejects_mixing_with_other_operand_keys():
     assert "cannot be combined" in str(excinfo.value)
 
 
+def test_groups_inside_conditions_are_preserved_not_silently_dropped():
+    """Regression: ``conditions: {all, any, not}`` used to lose any/not.
+
+    The documented authoring form puts all three groups inside ``conditions``.
+    The parser validated the keys and then used only the AND group, silently
+    turning an OR/NOT rule into an AND-only rule — a semantic change with no
+    error. All three groups must survive parsing and the hash round trip.
+    """
+    doc = _stage(conditions={
+        "all": [{"field": "close", "op": "gt", "value": 100}],
+        "any": [{"field": "volume", "op": "gt", "value": 500}],
+        "not": [{"field": "close", "op": "lt", "value": 50}],
+    })
+    stage = parse_workflow_dict(doc).stages[0]
+    assert len(stage.conditions) == 1
+    assert len(stage.any_conditions) == 1
+    assert len(stage.not_conditions) == 1
+    # the semantic content, not just the counts
+    assert stage.any_conditions[0].left.name == "volume"
+    assert stage.not_conditions[0].op == "lt"
+    # and it survives the canonical round trip that hashing relies on
+    assert parse_workflow_dict(
+        parse_workflow_dict(doc).to_document_dict()
+    ) == parse_workflow_dict(doc)
+
+
+def test_top_level_group_alias_still_wins_over_the_inline_form():
+    doc = _stage(
+        conditions={"all": [{"field": "close", "op": "gt", "value": 100}]},
+        any=[{"field": "volume", "op": "gt", "value": 500}],
+    )
+    stage = parse_workflow_dict(doc).stages[0]
+    assert len(stage.any_conditions) == 1
+    assert stage.any_conditions[0].left.name == "volume"
+
+
 # ---------------------------------------------------------------------------
 # session caps
 # ---------------------------------------------------------------------------

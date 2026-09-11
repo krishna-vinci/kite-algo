@@ -519,6 +519,7 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
 
     from backend.notifications.repository import SqlAlchemyNotificationRepository
     from backend.notifications.worker import DeliveryWorker
+    from backend.workflows.external_context import ExternalSignalLoader
     from backend.workflows.fundamentals_context import FundamentalsLoader
     from backend.workflows.instrument_bindings import InstrumentBindingRegistry
     from backend.workflows.repository import SqlAlchemyWorkflowRepository
@@ -652,6 +653,12 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         fundamentals_loader=FundamentalsLoader(session_factory),
         fundamentals_stale_hours=float(
             os.environ.get("ALERTS_FUNDAMENTALS_STALE_HOURS", "168")
+        ),
+        # Phase 4 F10: registered external producer values, sampled at each
+        # observation's event time (never pushed).
+        external_loader=ExternalSignalLoader(session_factory),
+        pair_max_bar_age_s=float(
+            os.environ.get("ALERTS_PAIR_MAX_BAR_AGE_S", "0")
         ),
     )
 

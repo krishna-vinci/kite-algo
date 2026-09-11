@@ -94,6 +94,7 @@ from backend.workflows.feature_planner import (
     build_subscription_plan,
     stage_chain,
 )
+from backend.workflows import external_context, pairs
 from backend.workflows.instrument_bindings import BindingChange, InstrumentBindingRegistry
 from backend.workflows.models import Stage, WorkflowDocument
 from backend.workflows.parser import WorkflowParseError, parse_workflow_dict
@@ -677,6 +678,8 @@ class EvaluationWorker:
         bindings_changed: Optional[Callable[[BindingChange], Any]] = None,
         fundamentals_loader: Optional[Any] = None,
         fundamentals_stale_hours: float = 168.0,
+        external_loader=None,
+        pair_max_bar_age_s: float = 0.0,
     ) -> None:
         self.workflow_repo = workflow_repo
         self.session_factory = session_factory
@@ -706,7 +709,12 @@ class EvaluationWorker:
         # snapshot from public.fundamentals_features; missing data unknown).
         self.fundamentals_loader = fundamentals_loader
         self.fundamentals_stale_hours = max(0.0, float(fundamentals_stale_hours))
+        # Phase 4 F10: external producer values and cross-instrument pairs.
+        self.external_loader = external_loader
+        self.pair_max_bar_age_s = max(0.0, float(pair_max_bar_age_s))
         self._stage_fundamentals_cache: Dict[Tuple[str, str], bool] = {}
+        self._stage_external_cache: Dict[Tuple[str, str, str], list] = {}
+        self._stage_pair_cache: Dict[Tuple[str, str, str], list] = {}
 
         self.health: Dict[str, Any] = {
             "started_at": None,
@@ -1688,6 +1696,86 @@ class EvaluationWorker:
         self._document_cache[sub.revision_id] = document
         return document
 
+    def _external_references_for(self, sub: ActiveSubscription) -> list:
+        """``external.*`` field names this stage (or an ancestor layer) reads."""
+        cache_key = (sub.revision_id, sub.stage_id, "external")
+        cached = self._stage_external_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        names: list = []
+        document = self._document_for(sub)
+        if document is not None:
+            stage = next((s for s in document.stages if s.id == sub.stage_id), None)
+            if stage is not None:
+                for candidate in (stage, *stage_chain(document, sub.stage_id)):
+                    names.extend(
+                        external_context.collect_external_references(
+                            [(candidate.id, list(candidate.conditions)
+                              + list(candidate.any_conditions)
+                              + list(candidate.not_conditions))]
+                        )
+                    )
+        names = list(dict.fromkeys(names))
+        self._stage_external_cache[cache_key] = names
+        return names
+
+    def _pair_operands_for(self, sub: ActiveSubscription) -> list:
+        """Pair operands this stage (or an ancestor layer) references."""
+        cache_key = (sub.revision_id, sub.stage_id, "pairs")
+        cached = self._stage_pair_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        operands: list = []
+        document = self._document_for(sub)
+        if document is not None:
+            stage = next((s for s in document.stages if s.id == sub.stage_id), None)
+            if stage is not None:
+                for candidate in (stage, *stage_chain(document, sub.stage_id)):
+                    operands.extend(
+                        pairs.collect_pair_operands(
+                            list(candidate.conditions)
+                            + list(candidate.any_conditions)
+                            + list(candidate.not_conditions)
+                        )
+                    )
+        self._stage_pair_cache[cache_key] = operands
+        return operands
+
+    def _resolve_pairs(self, sub: ActiveSubscription, obs, operands: list) -> dict:
+        """Compute every pair operand for this observation.
+
+        The stage's own timeframe identifies the bar grid; a pair on a stage
+        without one cannot be placed on a bar grid and is reported unknown.
+        """
+        stage = self._stage_for(sub)
+        timeframe = getattr(stage, "timeframe", None) if stage is not None else None
+        out: dict = {}
+        for operand in operands:
+            key = pair_operand_id(operand)
+            if key in out:
+                continue
+            if timeframe is None or self.candle_history is None:
+                out[key] = {"reason": "pair_missing"}
+                continue
+            limit = self.pair_max_bar_age_s or (2 * registry.timeframe_seconds(timeframe))
+            result = pairs.resolve_pair(
+                operand,
+                history=self.candle_history,
+                timeframe=timeframe,
+                cutoff=obs.ts,
+                bar_age_limit_s=limit,
+            )
+            if result.value is None:
+                entry = {"reason": result.reason}
+                if result.head_ts is not None:
+                    entry["head_ts"] = result.head_ts.isoformat()
+                if result.anchor_ts is not None:
+                    entry["anchor_ts"] = result.anchor_ts.isoformat()
+                out[key] = entry
+            else:
+                out[key] = {"value": result.value, "head_ts": result.head_ts.isoformat()}
+        return out
+
     def _stage_needs_fundamentals(self, sub: ActiveSubscription) -> bool:
         """Whether this subscription's stage — or any ancestor stage of its
         layer chain — can reference fundamentals fields (cached per
@@ -1754,6 +1842,36 @@ class EvaluationWorker:
                     self.health["fundamentals_stale"] += 1
             else:
                 self.health["fundamentals_misses"] += 1
+        # Phase 4 F10: registered external producer values, sampled at this
+        # observation's event time. Absent/expired/late/future/revoked inputs
+        # resolve to unknown with a named reason; nothing here can manufacture
+        # a signal.
+        if self.external_loader is not None:
+            references = self._external_references_for(sub)
+            if references:
+                try:
+                    external = self.external_loader.context_for(
+                        sub.owner_id,
+                        references,
+                        cutoff=obs.ts,
+                        instrument_key=sub.instrument_key,
+                    )
+                except Exception:
+                    external = None
+                    logger.warning(
+                        "external signal context unavailable for %s",
+                        sub.instrument_key, exc_info=True,
+                    )
+                if external:
+                    context = dict(context) if context else {}
+                    context.update(external)
+        # Phase 4 F10: cross-instrument pair values for this observation.
+        pair_specs = self._pair_operands_for(sub)
+        if pair_specs:
+            pairs = self._resolve_pairs(sub, obs, pair_specs)
+            if pairs:
+                context = dict(context) if context else {}
+                context["pairs"] = pairs
         supports_context = False
         supports_features = False
         supports_layers = False

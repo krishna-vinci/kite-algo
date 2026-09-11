@@ -684,14 +684,26 @@ def _stage(raw: Any, index: int) -> Stage:
     not_conditions: tuple[Condition, ...] = ()
     if has_conditions:
         conditions = _conditions(raw["conditions"], f"{path}.conditions", group="all")
+    # Groups declared INSIDE `conditions` are merged with the top-level
+    # aliases. They used to be silently dropped, which reduced an OR/NOT rule
+    # to AND-only without any error.
+    inline_groups = (
+        _condition_groups_from_block(raw["conditions"], f"{path}.conditions")
+        if has_conditions
+        else {}
+    )
     if "any" in raw or "any_conditions" in raw:
         items = raw.get("any", raw.get("any_conditions"))
         any_conditions = _condition_list(items, f"{path}.any")
+    elif inline_groups.get("any"):
+        any_conditions = inline_groups["any"]
     if "not" in raw or "not_conditions" in raw:
         items = raw.get("not", raw.get("not_conditions"))
         if isinstance(items, dict) or isinstance(items, Condition):
             items = [items]
         not_conditions = _condition_list(items, f"{path}.not")
+    elif inline_groups.get("not"):
+        not_conditions = inline_groups["not"]
 
     return Stage(
         id=sid,
@@ -817,6 +829,13 @@ def _is_group_list(items: list) -> bool:
 
 
 def _conditions(raw: Any, path: str, *, group: str = "all") -> tuple[Condition, ...]:
+    """Parse a ``conditions`` block into the ``all`` conditions.
+
+    The block may name a single group (``{all: [...]}``) or all three
+    (``{all: [...], any: [...], not: [...]}``) — the documented form. The
+    ``any``/``not`` groups are parsed by :func:`_condition_groups_from_block`
+    so a layered rule is never silently reduced to its AND group.
+    """
     if isinstance(raw, dict):
         for key in raw:
             if not isinstance(key, str) or key not in ("all", "any", "not"):
@@ -830,6 +849,25 @@ def _conditions(raw: Any, path: str, *, group: str = "all") -> tuple[Condition, 
     else:
         raise _fail(path, "must be a mapping with 'all'/'any'/'not' or a list of conditions")
     return _condition_list(items, path)
+
+
+def _condition_groups_from_block(raw: Any, path: str) -> dict:
+    """The optional ``any``/``not`` groups declared INSIDE ``conditions``.
+
+    These used to be validated and then dropped, which silently turned an
+    OR/NOT rule into an AND-only rule. They are returned here so the stage can
+    merge them with the top-level aliases instead of ignoring them.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key in ("any", "not"):
+        if key in raw:
+            items = raw[key]
+            if key == "not" and isinstance(items, dict):
+                items = [items]
+            out[key] = _condition_list(items, f"{path}.{key}")
+    return out
 
 
 def _condition_list(items: Any, path: str) -> tuple[Condition, ...]:
