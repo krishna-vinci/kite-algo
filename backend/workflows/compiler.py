@@ -19,7 +19,15 @@ from datetime import datetime
 from typing import Any, Optional
 
 from . import registry
-from .models import Condition, Operand, Stage, WorkflowDocument
+from .models import (
+    BreadthSpec,
+    Condition,
+    ConditionGroup,
+    Operand,
+    SequenceSpec,
+    Stage,
+    WorkflowDocument,
+)
 
 __all__ = [
     "ValidationIssue",
@@ -348,13 +356,13 @@ def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: lis
             continue  # already reported
         where = f"stages.{stage.id}"
 
-        if stage.type not in ("signal", "filter", "feature"):
+        if not registry.is_known_stage_type(stage.type):
             _add(
                 ValidationIssue(
                     where,
                     "unknown_capability",
                     f"stage type '{stage.type}' is not available "
-                    "(supported: 'signal', 'filter', 'feature')",
+                    f"(supported: {sorted(registry.STAGE_TYPES)})",
                 )
             )
 
@@ -369,6 +377,8 @@ def _validate_stages(stages: tuple[Stage, ...], stage_ids: set[str], issues: lis
                         "'function' is only valid on feature stages",
                     )
                 )
+
+        _validate_advanced_stage(stage, where, issues)
 
         if not registry.is_known_clock(stage.clock):
             _add(
@@ -588,6 +598,240 @@ def _validate_chain_depth(stages: tuple[Stage, ...], issues: list[ValidationIssu
                 break  # missing_reference already reported
 
 
+def _validate_advanced_stage(stage: Stage, where: str, issues: list[ValidationIssue]) -> None:
+    """Validate Phase 4 F10 stage-level advanced conditions.
+
+    Covers ``consecutive_bars``, ``sequence``, ``breadth`` and their clock and
+    exclusivity rules. Bounds come from ``registry`` so validation and the
+    advertised capabilities cannot drift apart.
+    """
+    has_sequence = stage.sequence is not None
+    has_breadth = stage.breadth is not None
+    has_conditions = bool(stage.conditions or stage.any_conditions or stage.not_conditions)
+
+    if stage.consecutive_bars is not None:
+        if stage.type != "signal":
+            issues.append(
+                ValidationIssue(
+                    f"{where}.consecutive_bars",
+                    "bad_value",
+                    "'consecutive_bars' is only valid on signal stages",
+                )
+            )
+        if stage.clock != "candle_close":
+            # Ticks carry no bar identity: an ltp stage would never fire.
+            issues.append(
+                ValidationIssue(
+                    f"{where}.consecutive_bars",
+                    "bad_value",
+                    "'consecutive_bars' requires clock 'candle_close' "
+                    "(consecutive bars are counted over completed candles)",
+                )
+            )
+        if not has_conditions or has_sequence or has_breadth:
+            issues.append(
+                ValidationIssue(
+                    f"{where}.consecutive_bars",
+                    "bad_value",
+                    "'consecutive_bars' applies to the stage's own conditions and "
+                    "cannot be combined with 'sequence' or 'breadth'",
+                )
+            )
+        value = stage.consecutive_bars
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not registry.MIN_CONSECUTIVE_BARS <= value <= registry.MAX_CONSECUTIVE_BARS
+        ):
+            issues.append(
+                ValidationIssue(
+                    f"{where}.consecutive_bars",
+                    "bad_value",
+                    f"must be an integer between {registry.MIN_CONSECUTIVE_BARS} and "
+                    f"{registry.MAX_CONSECUTIVE_BARS}, got {value!r}",
+                )
+            )
+
+    if has_sequence:
+        if stage.type != "signal":
+            issues.append(
+                ValidationIssue(
+                    f"{where}.sequence", "bad_value", "'sequence' is only valid on signal stages"
+                )
+            )
+        if stage.clock != "candle_close":
+            issues.append(
+                ValidationIssue(
+                    f"{where}.sequence",
+                    "bad_value",
+                    "'sequence' requires clock 'candle_close' "
+                    "(A-then-B progress is counted over completed bars)",
+                )
+            )
+        if has_conditions or has_breadth or stage.consecutive_bars is not None:
+            issues.append(
+                ValidationIssue(
+                    f"{where}.sequence",
+                    "bad_value",
+                    "'sequence' replaces the stage's own conditions and cannot be "
+                    "combined with 'conditions', 'consecutive_bars' or 'breadth'",
+                )
+            )
+        _validate_sequence(stage.sequence, where, issues)
+
+    if has_breadth:
+        if stage.type != "breadth":
+            issues.append(
+                ValidationIssue(
+                    f"{where}.breadth",
+                    "bad_value",
+                    "a 'breadth' block requires stage type 'breadth'",
+                )
+            )
+        if stage.clock != "candle_close":
+            issues.append(
+                ValidationIssue(
+                    f"{where}.breadth", "bad_value", "'breadth' requires clock 'candle_close'"
+                )
+            )
+        if has_conditions or has_sequence or stage.consecutive_bars is not None:
+            issues.append(
+                ValidationIssue(
+                    f"{where}.breadth",
+                    "bad_value",
+                    "'breadth' cannot be combined with 'conditions', 'sequence' or "
+                    "'consecutive_bars'",
+                )
+            )
+        _validate_breadth(stage.breadth, where, issues)
+    elif stage.type == "breadth":
+        issues.append(
+            ValidationIssue(
+                where, "bad_value", "stage type 'breadth' requires a 'breadth' block"
+            )
+        )
+
+
+def _validate_sequence(sequence: SequenceSpec, where: str, issues: list[ValidationIssue]) -> None:
+    path = f"{where}.sequence"
+    if not sequence.first:
+        issues.append(ValidationIssue(f"{path}.first", "bad_value", "'first' must not be empty"))
+    if not sequence.then:
+        issues.append(ValidationIssue(f"{path}.then", "bad_value", "'then' must not be empty"))
+    if sequence.within_bars is None and sequence.within_s is None:
+        issues.append(
+            ValidationIssue(
+                path,
+                "bad_value",
+                "a sequence requires at least one bound: 'within_bars' or 'within'",
+            )
+        )
+    if sequence.within_bars is not None and not (
+        registry.MIN_SEQUENCE_WITHIN_BARS
+        <= sequence.within_bars
+        <= registry.MAX_SEQUENCE_WITHIN_BARS
+    ):
+        issues.append(
+            ValidationIssue(
+                f"{path}.within_bars",
+                "bad_value",
+                f"must be between {registry.MIN_SEQUENCE_WITHIN_BARS} and "
+                f"{registry.MAX_SEQUENCE_WITHIN_BARS}, got {sequence.within_bars!r}",
+            )
+        )
+    if sequence.within_s is not None and not (
+        60 <= sequence.within_s <= registry.MAX_SEQUENCE_WITHIN_S
+    ):
+        issues.append(
+            ValidationIssue(
+                f"{path}.within",
+                "bad_value",
+                f"must be between 60s and {registry.MAX_SEQUENCE_WITHIN_S}s, "
+                f"got {sequence.within_s}s",
+            )
+        )
+    for group_name, groups in (("first", sequence.first), ("then", sequence.then)):
+        for index, group in enumerate(groups):
+            _validate_condition_group(
+                group, f"{path}.{group_name}[{index}].{group.kind}", issues
+            )
+
+
+def _validate_breadth(breadth: BreadthSpec, where: str, issues: list[ValidationIssue]) -> None:
+    path = f"{where}.breadth"
+    if not registry.is_known_breadth_mode(breadth.mode):
+        issues.append(
+            ValidationIssue(
+                f"{path}.mode",
+                "unknown_capability",
+                f"breadth mode '{breadth.mode}' is not available "
+                f"(supported: {sorted(registry.BREADTH_MODES)})",
+            )
+        )
+    elif not registry.is_implemented_breadth_mode(breadth.mode):
+        # Reserved name, deliberately unimplemented: "K symbols on the same
+        # bar" needs its own alignment and partial-bar semantics.
+        issues.append(
+            ValidationIssue(
+                f"{path}.mode",
+                "unknown_capability",
+                f"breadth mode '{breadth.mode}' is not implemented (windowed "
+                "distinct-symbol participation is the only supported form; "
+                "simultaneous breadth is deferred until separately specified)",
+            )
+        )
+    if not (
+        registry.MIN_BREADTH_INSTRUMENTS
+        <= breadth.distinct_instruments
+        <= registry.MAX_BREADTH_INSTRUMENTS
+    ):
+        issues.append(
+            ValidationIssue(
+                f"{path}.distinct_instruments",
+                "bad_value",
+                f"must be between {registry.MIN_BREADTH_INSTRUMENTS} and "
+                f"{registry.MAX_BREADTH_INSTRUMENTS}, got {breadth.distinct_instruments!r}",
+            )
+        )
+    if not registry.MIN_BREADTH_WINDOW_S <= breadth.window_s <= registry.MAX_BREADTH_WINDOW_S:
+        issues.append(
+            ValidationIssue(
+                f"{path}.window",
+                "bad_value",
+                f"must be between {registry.MIN_BREADTH_WINDOW_S}s and "
+                f"{registry.MAX_BREADTH_WINDOW_S}s, got {breadth.window_s}s",
+            )
+        )
+    if not breadth.condition:
+        issues.append(ValidationIssue(f"{path}.condition", "bad_value", "must contain conditions"))
+    for index, group in enumerate(breadth.condition):
+        _validate_condition_group(group, f"{path}.condition[{index}].{group.kind}", issues)
+
+
+def _validate_condition_group(
+    group: ConditionGroup, where: str, issues: list[ValidationIssue]
+) -> None:
+    if group.kind not in ("all", "any", "not"):
+        issues.append(ValidationIssue(where, "bad_value", f"unknown group '{group.kind}'"))
+        return
+    if group.kind == "not" and len(group.conditions) != 1:
+        issues.append(
+            ValidationIssue(where, "bad_value", "a 'not' group takes exactly one condition")
+        )
+    if len(group.conditions) > registry.MAX_CONDITIONS_PER_GROUP:
+        issues.append(
+            ValidationIssue(
+                where,
+                "bad_value",
+                f"at most {registry.MAX_CONDITIONS_PER_GROUP} conditions per group",
+            )
+        )
+    if not group.conditions:
+        issues.append(ValidationIssue(where, "bad_value", "group must contain conditions"))
+    for index, cond in enumerate(group.conditions):
+        _validate_condition(cond, f"{where}[{index}]", issues)
+
+
 def _validate_condition(
     condition: Condition,
     where: str,
@@ -618,6 +862,56 @@ def _validate_condition(
                         "as the right operand of breaks_prev_high/breaks_prev_low",
                     )
                 )
+    if condition.hysteresis is not None:
+        _validate_hysteresis(condition, where, issues)
+
+
+def _validate_hysteresis(cond: Condition, where: str, issues: list[ValidationIssue]) -> None:
+    """Validate explicit condition hysteresis (Phase 4 F10, D14).
+
+    Only a level operator on a CONSTANT threshold is supported: the release
+    bound must be comparable to the level at compile time, and an
+    indicator/expression/pair/context threshold has no such constant.
+    """
+    hysteresis = cond.hysteresis
+    path = f"{where}.hysteresis"
+    if cond.op not in registry.HYSTERESIS_OPS:
+        issues.append(
+            ValidationIssue(
+                path,
+                "bad_value",
+                f"hysteresis is valid on {sorted(registry.HYSTERESIS_OPS)}, got '{cond.op}'",
+            )
+        )
+        return
+    if cond.right.kind != "value" or cond.right.value is None:
+        issues.append(
+            ValidationIssue(
+                path,
+                "bad_value",
+                "hysteresis requires a constant threshold (right: {value: <number>}); "
+                "dynamic release operands are not implemented",
+            )
+        )
+        return
+    level = cond.right.value
+    release = hysteresis.release
+    if cond.op in ("gt", "gte") and not release < level:
+        issues.append(
+            ValidationIssue(
+                f"{path}.release",
+                "bad_value",
+                f"release ({release}) must be below the threshold ({level}) for '{cond.op}'",
+            )
+        )
+    if cond.op in ("lt", "lte") and not release > level:
+        issues.append(
+            ValidationIssue(
+                f"{path}.release",
+                "bad_value",
+                f"release ({release}) must be above the threshold ({level}) for '{cond.op}'",
+            )
+        )
 
 
 def _validate_within_bounds(condition: Condition, where: str, issues: list[ValidationIssue]) -> None:
@@ -693,6 +987,119 @@ def _validate_operand(
             _add(ValidationIssue(where, "bad_value", f"value operand must be finite, got {operand.value}"))
     elif operand.kind == "indicator":
         _validate_indicator_operand(operand, where, issues, feature_stage_ids)
+    elif operand.kind == "pair":
+        _validate_pair_operand(operand, where, issues)
+
+
+def _validate_pair_operand(
+    operand: Operand, where: str, issues: list[ValidationIssue]
+) -> None:
+    """Validate a cross-instrument pair operand (Phase 4 F10).
+
+    Both legs use the STAGE's timeframe and the same completed-bar store, so
+    basis compatibility is structural (``historical_candles`` carries no
+    adjustment column). What is validated here is identity, required
+    parameters and bounds; alignment/freshness are runtime concerns and
+    resolve to ``unknown`` with a named reason.
+    """
+    _add = issues.append
+    kind = operand.name or ""
+    spec = registry.PAIR_COMPUTATIONS.get(kind)
+    if spec is None:
+        _add(
+            ValidationIssue(
+                where,
+                "unknown_capability",
+                f"unknown pair computation '{kind}' "
+                f"(supported: {sorted(registry.PAIR_COMPUTATIONS)})",
+            )
+        )
+        return
+    params = dict(operand.params or {})
+    for key in spec["requires"]:
+        if params.get(key) is None:
+            _add(
+                ValidationIssue(
+                    f"{where}.{key}",
+                    "bad_value",
+                    f"pair computation '{kind}' requires '{key}'",
+                )
+            )
+    allowed = set(spec["requires"]) | set(spec.get("optional", ()))
+    for key in params:
+        if key not in allowed:
+            _add(
+                ValidationIssue(
+                    f"{where}.{key}",
+                    "bad_value",
+                    f"unknown key '{key}' for pair computation '{kind}' "
+                    f"(supported: {sorted(allowed)})",
+                )
+            )
+    for side in ("instrument", "reference"):
+        value = params.get(side)
+        if value is None:
+            continue
+        if not isinstance(value, str) or ":" not in value:
+            _add(
+                ValidationIssue(
+                    f"{where}.{side}",
+                    "bad_value",
+                    f"pair '{side}' must be an exchange-qualified instrument key "
+                    f"like 'NSE:INFY', got {value!r}",
+                )
+            )
+    instrument = params.get("instrument")
+    reference = params.get("reference")
+    if isinstance(instrument, str) and isinstance(reference, str) and instrument == reference:
+        _add(
+            ValidationIssue(
+                where,
+                "bad_value",
+                "a pair operand needs two DIFFERENT instruments "
+                f"(both were '{instrument}')",
+            )
+        )
+    field = params.get("field")
+    if field is not None:
+        if field not in spec["fields"]:
+            _add(
+                ValidationIssue(
+                    f"{where}.field",
+                    "bad_value",
+                    f"pair computation '{kind}' reads {sorted(spec['fields'])}, got {field!r}",
+                )
+            )
+    if kind == "relative_strength":
+        lookback = params.get("lookback")
+        low, high = registry.PAIR_LOOKBACK_BOUNDS
+        if (
+            isinstance(lookback, bool)
+            or not isinstance(lookback, int)
+            or not low <= lookback <= high
+        ):
+            _add(
+                ValidationIssue(
+                    f"{where}.lookback",
+                    "bad_value",
+                    f"lookback must be an integer between {low} and {high}, got {lookback!r}",
+                )
+            )
+    if "max_skew_bars" in params:
+        skew = params["max_skew_bars"]
+        if (
+            isinstance(skew, bool)
+            or not isinstance(skew, int)
+            or not 0 <= skew <= registry.PAIR_MAX_SKEW_BARS
+        ):
+            _add(
+                ValidationIssue(
+                    f"{where}.max_skew_bars",
+                    "bad_value",
+                    f"max_skew_bars must be between 0 and {registry.PAIR_MAX_SKEW_BARS}, "
+                    f"got {skew!r}",
+                )
+            )
 
 
 def _validate_indicator_operand(
@@ -700,6 +1107,7 @@ def _validate_indicator_operand(
     where: str,
     issues: list[ValidationIssue],
     feature_stage_ids: Optional[frozenset] = None,
+    _depth: int = 0,
 ) -> None:
     """Validate inline indicator references and bounded arithmetic trees."""
     _add = issues.append
@@ -708,6 +1116,9 @@ def _validate_indicator_operand(
             _add(ValidationIssue(where, "bad_value", "value operand has no value"))
         elif not math.isfinite(operand.value):
             _add(ValidationIssue(where, "bad_value", f"value operand must be finite, got {operand.value}"))
+        return
+    if operand.kind == "pair":
+        _validate_pair_operand(operand, where, issues)
         return
     if operand.kind == "field":
         _validate_operand(operand, where, issues)
@@ -815,6 +1226,18 @@ def _validate_indicator_operand(
         op_name = expression_ops[0]
         arity = registry.ARITHMETIC_OPS[op_name]["arity"]
         args = operand.params[op_name]
+        # MAX_ARITHMETIC_DEPTH is advertised in /capabilities but was never
+        # enforced; a deep tree is bounded here as the spec requires.
+        if _depth + 1 > registry.MAX_ARITHMETIC_DEPTH:
+            _add(
+                ValidationIssue(
+                    where,
+                    "bad_value",
+                    f"arithmetic nesting exceeds the maximum depth of "
+                    f"{registry.MAX_ARITHMETIC_DEPTH}",
+                )
+            )
+            return
         if not isinstance(args, list) or len(args) != arity:
             _add(
                 ValidationIssue(
@@ -835,7 +1258,10 @@ def _validate_indicator_operand(
                     )
                 )
                 continue
-            _validate_indicator_operand(child, f"{where}.params.{op_name}[{index}]", issues, feature_stage_ids)
+            _validate_indicator_operand(
+                child, f"{where}.params.{op_name}[{index}]", issues, feature_stage_ids,
+                _depth + 1,
+            )
 
 
 def _coerce_expression_arg(arg: Any) -> Optional[Operand]:
@@ -938,6 +1364,54 @@ def _detect_cycles(stages: tuple[Stage, ...], issues: list[ValidationIssue]) -> 
             visit(sid, [])
 
 
+def _validate_session_cap(alert, where: str, issues: list[ValidationIssue]) -> None:
+    """Validate the per-session notification cap (Phase 4 F10).
+
+    The cap is scoped to (owner, workflow, revision, alert) and counts
+    LOGICAL notifications across every instrument. ``session_cap_reset``
+    accepts only ``session``: any value implying exchange market hours is
+    rejected rather than silently applying NSE hours to feed-driven segments,
+    which have no session calendar.
+    """
+    if alert.max_per_session is None:
+        if alert.session_cap_reset is not None:
+            issues.append(
+                ValidationIssue(
+                    f"{where}.session_cap_reset",
+                    "bad_value",
+                    "'session_cap_reset' requires 'max_per_session'",
+                )
+            )
+        return
+    value = alert.max_per_session
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not registry.MIN_PER_SESSION <= value <= registry.MAX_PER_SESSION
+    ):
+        issues.append(
+            ValidationIssue(
+                f"{where}.max_per_session",
+                "bad_value",
+                f"must be an integer between {registry.MIN_PER_SESSION} and "
+                f"{registry.MAX_PER_SESSION}, got {value!r}",
+            )
+        )
+    reset = alert.session_cap_reset
+    if reset is not None and reset not in registry.SESSION_CAP_RESETS:
+        issues.append(
+            ValidationIssue(
+                f"{where}.session_cap_reset",
+                "bad_value",
+                f"unsupported reset '{reset}' (supported: "
+                f"{sorted(registry.SESSION_CAP_RESETS)}). Exchange-hours resets are "
+                "not available: MCX/currency sessions are feed-driven and have no "
+                "session calendar, so the boundary is the resolved session id "
+                "(the IST date for those segments)",
+            )
+        )
+
+
 def _validate_alerts(
     alerts: tuple,
     alert_ids: set[str],
@@ -987,6 +1461,7 @@ def _validate_alerts(
                     "rearm_level and rearm_direction must be set together",
                 )
             )
+        _validate_session_cap(alert, where, issues)
         if alert.rearm_direction is not None and alert.rearm_direction not in ("above", "below"):
             _add(
                 ValidationIssue(

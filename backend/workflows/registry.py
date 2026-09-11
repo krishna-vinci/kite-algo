@@ -190,6 +190,95 @@ MAX_CONDITIONS_PER_GROUP = 32
 MAX_FEATURE_STAGES = 8
 MAX_INPUT_CHAIN_DEPTH = 8
 
+# ---------------------------------------------------------------------------
+# Phase 4 F10: advanced conditions. Stage types, bounded advanced-condition
+# limits, cross-instrument pair computations and their freshness rules. The
+# compiler validates against these maps and /capabilities is derived from the
+# same source, so validation and discovery can never disagree.
+# ---------------------------------------------------------------------------
+STAGE_TYPES: Mapping[str, dict] = {
+    "signal": {"requires_conditions": True},
+    "filter": {"requires_conditions": True},
+    "feature": {"requires_conditions": False},
+    "breadth": {"requires_conditions": False, "requires_breadth": True},
+}
+
+# Seconds per timeframe — used for pair freshness bounds and (documented)
+# bar/time equivalence. Values are the Kite interval names' nominal length.
+TIMEFRAME_SECONDS: Mapping[str, int] = {
+    "minute": 60,
+    "3minute": 180,
+    "5minute": 300,
+    "10minute": 600,
+    "15minute": 900,
+    "30minute": 1800,
+    "60minute": 3600,
+    "day": 86400,
+}
+
+# Cross-instrument operand kinds (F10 relative strength / pair ratios).
+# ``fields`` lists the bar fields each computation reads; both legs must read
+# the SAME store on the same timeframe, so basis compatibility is structural.
+PAIR_COMPUTATIONS: Mapping[str, dict] = {
+    "pair_ratio": {
+        "fields": ("close",),
+        "requires": ("instrument", "reference"),
+        "optional": ("field",),
+        "formula": "close_A(bar) / close_B(bar) on the same completed bar",
+        "unknown_reasons": (
+            "pair_misaligned", "pair_stale", "pair_missing",
+            "pair_zero_denominator",
+        ),
+    },
+    "relative_strength": {
+        "fields": ("close",),
+        "requires": ("instrument", "reference", "lookback"),
+        "optional": ("max_skew_bars",),
+        "formula": (
+            "((close_A(bar)/close_A(anchor)) - (close_B(bar)/close_B(anchor))) * 100 "
+            "where anchor = bar - lookback bars on the stage timeframe; both legs "
+            "must have a completed bar at BOTH endpoints"
+        ),
+        "unknown_reasons": (
+            "pair_misaligned", "pair_lookback_misaligned", "pair_stale",
+            "pair_missing", "pair_insufficient_history", "pair_zero_denominator",
+        ),
+    },
+}
+
+PAIR_LOOKBACK_BOUNDS = (1, 500)
+PAIR_MAX_SKEW_BARS = 2  # 0 = exact head alignment (default)
+
+# Advanced-condition bounds.
+MAX_CONSECUTIVE_BARS = 50
+MIN_CONSECUTIVE_BARS = 1
+MAX_SEQUENCE_WITHIN_BARS = 500
+MIN_SEQUENCE_WITHIN_BARS = 1
+MAX_SEQUENCE_WITHIN_S = 30 * 24 * 3600
+MAX_BREADTH_INSTRUMENTS = 1000
+MIN_BREADTH_INSTRUMENTS = 2
+MAX_BREADTH_WINDOW_S = 24 * 3600
+MIN_BREADTH_WINDOW_S = 60
+
+# Breadth modes. ``simultaneous`` is reserved in the schema but NOT
+# implemented: "K symbols on the same bar" has its own alignment and
+# partial-bar semantics and is deferred rather than half-specified.
+BREADTH_MODES: Mapping[str, dict] = {
+    "triggers_within": {"implemented": True},
+    "simultaneous": {"implemented": False},
+}
+
+# Per-session cap bounds and the only supported reset boundary. Any value
+# implying exchange market hours is rejected rather than silently applying
+# NSE hours to feed-driven segments (MCX/currency have no session calendar).
+MAX_PER_SESSION = 1000
+MIN_PER_SESSION = 1
+SESSION_CAP_RESETS: frozenset[str] = frozenset({"session"})
+
+# Operators that may carry explicit hysteresis (level predicates on a
+# CONSTANT threshold only — dynamic release operands are not implemented).
+HYSTERESIS_OPS: frozenset[str] = frozenset({"gt", "gte", "lt", "lte"})
+
 # Fundamentals observation fields (latest snapshot with acquisition metadata).
 # Values are carried as context; replay never treats them as historical truth.
 FUNDAMENTALS_FIELDS: frozenset[str] = frozenset(
@@ -210,7 +299,40 @@ CAPABILITIES: Mapping[str, object] = {
     "sessions": SESSIONS,
     "features": FEATURE_FUNCTIONS,
     "arithmetic": ARITHMETIC_OPS,
+    # Phase 4 F10
+    "stage_types": STAGE_TYPES,
+    "pairs": PAIR_COMPUTATIONS,
+    "breadth_modes": BREADTH_MODES,
+    "limits": {
+        "max_consecutive_bars": MAX_CONSECUTIVE_BARS,
+        "max_sequence_within_bars": MAX_SEQUENCE_WITHIN_BARS,
+        "max_breadth_instruments": MAX_BREADTH_INSTRUMENTS,
+        "max_breadth_window_s": MAX_BREADTH_WINDOW_S,
+        "max_per_session": MAX_PER_SESSION,
+        "max_arithmetic_depth": MAX_ARITHMETIC_DEPTH,
+    },
 }
+
+
+def is_known_stage_type(name: object) -> bool:
+    return isinstance(name, str) and name in STAGE_TYPES
+
+
+def is_known_breadth_mode(name: object) -> bool:
+    return isinstance(name, str) and name in BREADTH_MODES
+
+
+def is_implemented_breadth_mode(name: object) -> bool:
+    return bool(BREADTH_MODES.get(str(name), {}).get("implemented"))
+
+
+def is_known_pair_computation(name: object) -> bool:
+    return isinstance(name, str) and name in PAIR_COMPUTATIONS
+
+
+def timeframe_seconds(name: object) -> int:
+    """Nominal length of a supported timeframe in seconds (0 when unknown)."""
+    return int(TIMEFRAME_SECONDS.get(str(name), 0))
 
 
 def is_known_feature_function(name: object) -> bool:

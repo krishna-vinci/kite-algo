@@ -30,13 +30,17 @@ import yaml
 from .models import (
     AlertSpec,
     AttachmentSpec,
+    BreadthSpec,
     Condition,
+    ConditionGroup,
     DataPolicy,
+    HysteresisSpec,
     InstrumentRef,
     Operand,
     RankSpec,
     ScheduleSpec,
     ScreenerSpec,
+    SequenceSpec,
     Stage,
     UniverseRef,
     UniverseSpec,
@@ -211,6 +215,15 @@ def _optional_str(raw: dict, key: str, path: str) -> Any:
     if key not in raw or raw[key] is None:
         return None
     return _require_str(raw, key, path)
+
+
+def _optional_int(raw: dict, key: str, path: str) -> Any:
+    if key not in raw or raw[key] is None:
+        return None
+    value = raw[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _fail(f"{path}.{key}", f"must be an integer, got {value!r}")
+    return value
 
 
 def _number(value: Any, path: str) -> float:
@@ -615,6 +628,8 @@ def _stage(raw: Any, index: int) -> Stage:
             "id", "type", "clock", "timeframe", "conditions", "input", "evaluate_on",
             "any", "not", "any_conditions", "not_conditions",
             "function", "params", "stage_params", "source", "source_field",
+            # Phase 4 F10
+            "consecutive_bars", "sequence", "breadth",
         },
         path,
     )
@@ -653,7 +668,15 @@ def _stage(raw: Any, index: int) -> Stage:
 
     has_conditions = "conditions" in raw
     has_groups = any(key in raw for key in ("any", "not", "any_conditions", "not_conditions"))
-    if not has_conditions and not has_groups and stage_type != "feature":
+    consecutive_bars = _optional_int(raw, "consecutive_bars", path)
+    sequence = _sequence(raw.get("sequence"), f"{path}.sequence") if "sequence" in raw else None
+    breadth = _breadth(raw.get("breadth"), f"{path}.breadth") if "breadth" in raw else None
+    if (
+        not has_conditions
+        and not has_groups
+        and stage_type not in ("feature", "breadth")
+        and sequence is None
+    ):
         raise _fail(path, "stage requires 'conditions'")
 
     conditions: tuple[Condition, ...] = ()
@@ -682,6 +705,114 @@ def _stage(raw: Any, index: int) -> Stage:
         function=function,
         stage_params=stage_params,
         source_field=source_field,
+        consecutive_bars=consecutive_bars,
+        sequence=sequence,
+        breadth=breadth,
+    )
+
+
+_SEQUENCE_KEYS = {"first", "then", "within_bars", "within"}
+_BREADTH_KEYS = {"condition", "distinct_instruments", "window", "mode"}
+
+
+def _sequence(raw: Any, path: str) -> SequenceSpec:
+    """Parse a bounded A-then-B sequence (Phase 4 F10)."""
+    if not isinstance(raw, dict):
+        raise _fail(path, "sequence must be a mapping")
+    _check_keys(raw, _SEQUENCE_KEYS, path)
+    for required in ("first", "then"):
+        if required not in raw:
+            raise _fail(path, f"sequence requires '{required}'")
+    within_bars = _optional_int(raw, "within_bars", path)
+    within_s = None
+    if "within" in raw:
+        within_s = _duration_seconds(raw["within"], f"{path}.within")
+    if within_bars is None and within_s is None:
+        raise _fail(
+            path,
+            "sequence requires at least one bound: 'within_bars' (completed bars) "
+            "or 'within' (elapsed time)",
+        )
+    return SequenceSpec(
+        first=_condition_groups(raw["first"], f"{path}.first"),
+        then=_condition_groups(raw["then"], f"{path}.then"),
+        within_bars=within_bars,
+        within_s=within_s,
+    )
+
+
+def _breadth(raw: Any, path: str) -> BreadthSpec:
+    """Parse windowed distinct-symbol participation (Phase 4 F10)."""
+    if not isinstance(raw, dict):
+        raise _fail(path, "breadth must be a mapping")
+    _check_keys(raw, _BREADTH_KEYS, path)
+    if "condition" not in raw:
+        raise _fail(path, "breadth requires 'condition'")
+    if "distinct_instruments" not in raw:
+        raise _fail(path, "breadth requires 'distinct_instruments'")
+    distinct = raw["distinct_instruments"]
+    if isinstance(distinct, bool) or not isinstance(distinct, int) or distinct < 2:
+        raise _fail(f"{path}.distinct_instruments", "must be an integer >= 2")
+    if "window" not in raw:
+        raise _fail(path, "breadth requires 'window'")
+    window_s = _duration_seconds(raw["window"], f"{path}.window")
+    mode = _optional_str(raw, "mode", path) or "triggers_within"
+    return BreadthSpec(
+        condition=_condition_groups(raw["condition"], f"{path}.condition"),
+        distinct_instruments=distinct,
+        window_s=window_s,
+        mode=mode,
+    )
+
+
+def _condition_groups(raw: Any, path: str) -> tuple[ConditionGroup, ...]:
+    """Parse a condition block into named 3VL groups (all/any/not).
+
+    Three accepted forms, in order of preference:
+
+    - **mapping** — ``{all: [...], any: [...]}`` (authoring shorthand);
+    - **list of single-group mappings** — ``[{any: [...]}, {all: [...]}]``,
+      which is the canonical serialized form (``to_document_dict``) and is
+      what makes parse → serialize → parse an identity;
+    - **bare condition list** — ``[...]``, shorthand for one ``all`` group.
+    """
+    if isinstance(raw, list):
+        if _is_group_list(raw):
+            groups = []
+            for item in raw:
+                (key, items), = item.items()
+                if key == "not" and isinstance(items, dict):
+                    items = [items]
+                groups.append(
+                    ConditionGroup(kind=key, conditions=_condition_list(items, f"{path}.{key}"))
+                )
+            return tuple(groups)
+        return (ConditionGroup(kind="all", conditions=_condition_list(raw, path)),)
+    if not isinstance(raw, dict):
+        raise _fail(path, "must be a mapping with 'all'/'any'/'not' or a list of conditions")
+    groups = []
+    for key, items in raw.items():
+        if not isinstance(key, str) or key not in ("all", "any", "not"):
+            raise _unknown_field(path, key)
+        if key == "not" and isinstance(items, dict):
+            items = [items]
+        groups.append(
+            ConditionGroup(kind=key, conditions=_condition_list(items, f"{path}.{key}"))
+        )
+    if not groups:
+        raise _fail(path, "must name at least one of 'all'/'any'/'not'")
+    return tuple(groups)
+
+
+def _is_group_list(items: list) -> bool:
+    """True when every element names exactly one 3VL group (canonical form)."""
+    if not items:
+        return False
+    return all(
+        isinstance(item, dict)
+        and len(item) == 1
+        and next(iter(item)) in ("all", "any", "not")
+        for item in items
     )
 
 
@@ -712,11 +843,16 @@ def _condition_list(items: Any, path: str) -> tuple[Condition, ...]:
 def _condition(raw: Any, path: str) -> Condition:
     if not isinstance(raw, dict):
         raise _fail(path, f"condition must be a mapping, got {raw!r}")
-    _check_keys(raw, {"left", "op", "right", "field", "value"}, path)
+    _check_keys(raw, {"left", "op", "right", "field", "value", "hysteresis"}, path)
 
     if "op" not in raw:
         raise _fail(f"{path}.op", "condition requires an operator 'op'")
     op = _require_str(raw, "op", path)
+    hysteresis = (
+        _hysteresis(raw["hysteresis"], f"{path}.hysteresis")
+        if "hysteresis" in raw
+        else None
+    )
 
     if "left" in raw or "right" in raw:
         if "left" not in raw or "right" not in raw:
@@ -725,6 +861,7 @@ def _condition(raw: Any, path: str) -> Condition:
             left=_operand(raw["left"], f"{path}.left"),
             op=op,
             right=_operand(raw["right"], f"{path}.right"),
+            hysteresis=hysteresis,
         )
 
     if "field" in raw:
@@ -737,9 +874,53 @@ def _condition(raw: Any, path: str) -> Condition:
             left=Operand(kind="field", name=field_name),
             op=op,
             right=value_operand,
+            hysteresis=hysteresis,
         )
 
     raise _fail(path, "condition must define either left/op/right or field/op/value")
+
+
+def _hysteresis(raw: Any, path: str) -> HysteresisSpec:
+    """Parse a hysteresis block: ``{release: <level>}``."""
+    if not isinstance(raw, dict):
+        raise _fail(path, "hysteresis must be a mapping with a 'release' level")
+    _check_keys(raw, {"release"}, path)
+    if "release" not in raw or raw["release"] is None:
+        raise _fail(path, "hysteresis requires a 'release' level")
+    return HysteresisSpec(release=_number(raw["release"], f"{path}.release"))
+
+
+_PAIR_KINDS = ("pair_ratio", "relative_strength")
+_PAIR_KEYS = {"instrument", "reference", "field", "lookback", "max_skew_bars"}
+
+
+def _pair_operand(raw: Any, path: str) -> Optional[Operand]:
+    """Recognize a cross-instrument pair operand (Phase 4 F10).
+
+    ``{pair_ratio: {...}}`` / ``{relative_strength: {...}}`` are captured here
+    rather than falling through to the unnamed-indicator branch, so the
+    compiler sees a typed ``kind="pair"`` operand with named parameters.
+    """
+    present = [key for key in _PAIR_KINDS if key in raw]
+    if not present:
+        return None
+    if len(present) > 1:
+        raise _fail(path, f"operand mixes pair kinds: {', '.join(sorted(present))}")
+    if len(raw) != 1:
+        extra = sorted(set(raw) - {present[0]})
+        raise _fail(
+            f"{path}.{present[0]}",
+            f"pair operand cannot be combined with other keys: {', '.join(extra)}",
+        )
+    kind = present[0]
+    spec = raw[kind]
+    if not isinstance(spec, dict):
+        raise _fail(f"{path}.{kind}", "pair operand must be a mapping")
+    _check_keys(spec, _PAIR_KEYS, f"{path}.{kind}")
+    ignored = sorted(set(spec) - _PAIR_KEYS)
+    if ignored:  # _check_keys already raised; defensive
+        raise _fail(f"{path}.{kind}", f"unknown keys: {', '.join(ignored)}")
+    return Operand(kind="pair", name=kind, params=dict(spec))
 
 
 def _operand(raw: Any, path: str) -> Operand:
@@ -758,7 +939,7 @@ def _operand(raw: Any, path: str) -> Operand:
         # explicit (serialized) form: {kind, name, value, params, source, offset}
         _check_keys(raw, {"kind", "name", "value", "params", "source", "offset"}, path)
         kind = _require_str(raw, "kind", path)
-        if kind not in ("field", "value", "indicator"):
+        if kind not in ("field", "value", "indicator", "pair"):
             raise _fail(f"{path}.kind", f"unknown operand kind '{kind}'")
         name = _optional_str(raw, "name", path)
         value: Any = None
@@ -785,6 +966,9 @@ def _operand(raw: Any, path: str) -> Operand:
     field_name = raw.get("field")
     indicator = raw.get("indicator")
     value = raw.get("value")
+    pair = _pair_operand(raw, path)
+    if pair is not None:
+        return pair
     extras = {k: v for k, v in raw.items() if k not in ("field", "indicator", "value")}
     params: dict = {}
     if "params" in extras:
@@ -836,6 +1020,8 @@ def _alert(raw: Any, index: int) -> AlertSpec:
             "cooldown", "cooldown_s", "rearm_above", "rearm_below", "rearm_level",
             "rearm_direction", "notify_if_already_true",
             "expires", "expires_at", "channels", "message", "scope",  # scope: reserved
+            # Phase 4 F10
+            "max_per_session", "session_cap_reset",
         },
         path,
     )
@@ -923,6 +1109,9 @@ def _alert(raw: Any, index: int) -> AlertSpec:
 
     message = _optional_str(raw, "message", path)
 
+    max_per_session = _optional_int(raw, "max_per_session", path)
+    session_cap_reset = _optional_str(raw, "session_cap_reset", path)
+
     return AlertSpec(
         id=aid,
         source=source,
@@ -935,4 +1124,6 @@ def _alert(raw: Any, index: int) -> AlertSpec:
         expires_at=expires_at,
         channels=tuple(channels),
         message=message,
+        max_per_session=max_per_session,
+        session_cap_reset=session_cap_reset,
     )
