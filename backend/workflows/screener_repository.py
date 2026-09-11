@@ -19,13 +19,20 @@ Publication protocol: run status + members + attachment signal events +
 outbox deliveries + attachment baseline upserts are written by
 :meth:`ScreenerRunRepository.finalize_run` in ONE transaction that opens
 with the ownership compare-and-swap — a rejected or stale owner publishes
-nothing at all. Attachment baseline transitions are serialized per
-(owner, workflow, revision, attachment) with a PostgreSQL advisory
-transaction lock and chronologically gated: a run may only advance a
-baseline whose stored ``last_complete_run`` is not strictly newer than
-itself, so an older overlapping run can never overwrite newer comparison
-state — even when the baseline is still empty and there are no rows to
-lock.
+nothing at all.
+
+Attachment transitions are not precomputed. The caller supplies an
+:class:`AttachmentPlan` (the run's ranked results plus the attachment
+specifications — everything the pipeline already produced); ``finalize_run``
+acquires the per-attachment PostgreSQL advisory transaction lock, reads the
+baseline UNDER that lock, and only then derives the events and state updates
+from the current baseline, publishing them in the same transaction. A stale
+baseline snapshot can therefore never reach publication: whatever the
+baseline is at lock time is what the transitions are computed against, even
+when the baseline is still empty and there are no rows to lock. The
+chronology gate remains as a second guard — a run whose ``scheduled_for`` is
+strictly older than the run owning the locked baseline is suppressed whole,
+because its transitions describe a moment that has already been superseded.
 
 Runs are never deleted by the scheduler; history stays attributable to the
 exact workflow revision and universe revision that produced it.
@@ -36,7 +43,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import (
     JSON,
@@ -66,7 +73,8 @@ __all__ = [
     "ScreenerAttachmentState",
     "AttachmentEvent",
     "AttachmentStateUpdate",
-    "AttachmentTransition",
+    "AttachmentTask",
+    "AttachmentPlan",
     "ScreenerRunRepository",
 ]
 
@@ -93,7 +101,11 @@ def _is_postgres(session: Any) -> bool:
 
 @dataclass(frozen=True)
 class AttachmentEvent:
-    """One prepared attachment signal event + outbox fan-out (not yet written)."""
+    """One computed attachment signal event + outbox fan-out.
+
+    Derived inside the publication transaction, from the baseline read under
+    the attachment lock — never carried in from outside.
+    """
 
     attachment_id: str
     occurrence_key: str
@@ -104,7 +116,7 @@ class AttachmentEvent:
 
 @dataclass(frozen=True)
 class AttachmentStateUpdate:
-    """One prepared baseline row upsert (not yet written)."""
+    """One computed baseline row upsert."""
 
     attachment_id: str
     instrument_key: str
@@ -114,19 +126,39 @@ class AttachmentStateUpdate:
 
 
 @dataclass(frozen=True)
-class AttachmentTransition:
-    """Everything one attachment would publish for a run.
+class AttachmentTask:
+    """One attachment to evaluate inside the publication transaction.
 
-    Prepared by the scheduler BEFORE finalization and applied inside
-    ``finalize_run``'s fenced transaction — never written earlier.
+    ``spec`` is the parsed attachment (trigger, thresholds, channels, message,
+    ``initial_match``); ``results`` is this run's ranked pipeline output.
+    Both are produced OUTSIDE the transaction — the expensive screener
+    evaluation never runs under the attachment lock.
+    """
+
+    attachment_id: str
+    spec: Any
+    results: Tuple[Any, ...] = ()
+
+
+@dataclass(frozen=True)
+class AttachmentPlan:
+    """What ``finalize_run`` needs to derive and publish attachment side effects.
+
+    Carries no baseline state: the baseline is read inside the publication
+    transaction, after the per-attachment lock is held, so the transitions
+    reflect the current baseline rather than a snapshot taken during
+    preparation.
     """
 
     owner_id: str
     workflow_id: str
     revision_id: str
-    attachment_id: str
-    events: Tuple[AttachmentEvent, ...] = ()
-    state_updates: Tuple[AttachmentStateUpdate, ...] = ()
+    run_id: str
+    scheduled_for: datetime
+    screener_name: str
+    tasks: Tuple[AttachmentTask, ...] = ()
+    channel_resolver: Optional[Callable[[str, Sequence[str]], Dict[str, str]]] = None
+    max_events: int = 100
 
 
 class ScreenerRun(Base):
@@ -312,7 +344,7 @@ class ScreenerRunRepository:
         members: Sequence[dict],
         failure_reason: Optional[str] = None,
         universe_revision: Optional[int] = None,
-        attachments: Sequence[AttachmentTransition] = (),
+        attachment_plan: Optional[AttachmentPlan] = None,
         now: Optional[datetime] = None,
     ) -> bool:
         """Publish the run and ALL its side effects in ONE fenced transaction.
@@ -324,15 +356,18 @@ class ScreenerRunRepository:
            taken over, or an already-finalized run — aborts the WHOLE
            publication before anything becomes visible;
         2. delete + insert the member rows;
-        3. per attachment transition: acquire the attachment's advisory
-           transaction lock (serializes every overlapping publication of the
-           same attachment — including the first one, when there are no
-           baseline rows to lock), apply the chronology gate (a stored
-           ``last_complete_run`` strictly newer than this run suppresses the
-           whole transition — an older run never overwrites newer comparison
-           state), then insert the signal events + pending deliveries
-           (occurrence-key pre-checked) and upsert the baseline rows;
-        4. fold the published attachment summary into ``coverage``.
+        3. per attachment task: acquire the attachment's advisory transaction
+           lock, read the baseline UNDER the lock, derive the events and
+           state updates from that baseline, then insert the signal events +
+           pending deliveries (occurrence-key pre-checked) and upsert the
+           baseline rows. A task whose ``scheduled_for`` is older than the
+           run owning the locked baseline is suppressed whole;
+        4. fold the published attachment counters into ``coverage``.
+
+        The only attachment work done before this method is the ranked
+        pipeline evaluation (``AttachmentPlan.tasks[*].results``); the
+        baseline-dependent reasoning happens here, under the lock, so no
+        baseline snapshot can go stale between preparation and publication.
 
         Fence semantics vs lease expiry: the fence is OWNERSHIP, not time.
         A lease that expired but was never taken over still finalizes (the
@@ -381,12 +416,8 @@ class ScreenerRunRepository:
                 )
 
             summary: Dict[str, int] = {}
-            for transition in attachments:
-                applied = self._apply_attachment_transition(
-                    session, transition, run_id, as_of, timestamp
-                )
-                for key, value in applied.items():
-                    summary[key] = summary.get(key, 0) + value
+            if attachment_plan is not None:
+                summary = self._publish_attachments(session, attachment_plan, timestamp)
             if summary:
                 coverage = dict(coverage or {})
                 coverage.update(summary)
@@ -403,118 +434,74 @@ class ScreenerRunRepository:
         finally:
             session.close()
 
-    def _apply_attachment_transition(
+    def _publish_attachments(
         self,
         session: Session,
-        transition: AttachmentTransition,
-        run_id: str,
-        run_scheduled_for: datetime,
+        plan: AttachmentPlan,
         timestamp: datetime,
     ) -> Dict[str, int]:
-        """Apply one attachment's prepared transitions inside the publication
-        transaction. Returns the published/suppressed counters.
+        """Derive and publish every attachment task's side effects.
 
-        - A PostgreSQL advisory transaction lock keyed on
-          (owner, workflow, revision, attachment) serializes every
-          overlapping publication of the same baseline, taken BEFORE the
-          baseline read. Unlike a row lock it also covers the first
-          publication, when no baseline rows exist yet. SQLite (tests) is a
-          single writer.
-        - chronology gate: if any baseline row was last written by a run
-          with a strictly newer ``scheduled_for``, this transition is
-          entirely suppressed — its events would describe transitions away
-          from a baseline that no longer exists, and its state writes would
-          overwrite newer comparison state.
+        Per task, in order:
+
+        1. acquire the PostgreSQL advisory transaction lock keyed on
+           (owner, workflow, revision, attachment) — this is what serializes
+           overlapping publications of the same baseline, including the first
+           one, which has no baseline rows for a row lock to hold;
+        2. read the baseline rows through THIS transaction, under the lock;
+        3. chronology gate: if the baseline is owned by a run with a strictly
+           newer ``scheduled_for``, this occurrence has been superseded — the
+           task is suppressed whole (no events, no state writes);
+        4. compute the transitions against the just-read baseline, insert the
+           signal events + pending deliveries (occurrence-key deduplicated),
+           then upsert the baseline rows.
+
+        Returns the counters folded into the run's coverage.
         """
-        from backend.notifications.repository import Delivery
-
-        from backend.workflows.repository import SignalEvent
-
-        applied: Dict[str, int] = {
-            "attachment_events_published": 0,
-        }
-        if _is_postgres(session):
-            session.execute(
-                text(
-                    "SELECT pg_advisory_xact_lock("
-                    "hashtext('screener-attachment:' || :lock_key))"
-                ),
-                {
-                    "lock_key": (
-                        f"{transition.owner_id}/{transition.workflow_id}/"
-                        f"{transition.revision_id}/{transition.attachment_id}"
-                    )
-                },
-            )
-        lock_rows = session.execute(
-            select(ScreenerAttachmentState.last_complete_run_id)
-            .where(
-                ScreenerAttachmentState.owner_id == transition.owner_id,
-                ScreenerAttachmentState.workflow_id == transition.workflow_id,
-                ScreenerAttachmentState.workflow_revision_id == transition.revision_id,
-                ScreenerAttachmentState.attachment_id == transition.attachment_id,
-            )
-        ).scalars().all()
-        baseline_run_ids = {value for value in lock_rows if value}
-        if baseline_run_ids:
-            stored = session.execute(
-                select(ScreenerRun.scheduled_for).where(
-                    ScreenerRun.id.in_(baseline_run_ids)
-                )
-            ).scalars().all()
-            newest_baseline = max(_as_utc(value) for value in stored)
-            if _as_utc(run_scheduled_for) < newest_baseline:
-                applied["attachment_events_stale_suppressed"] = 1
-                return applied
-
-        for event in transition.events:
-            duplicate = session.execute(
-                select(SignalEvent.id).where(
-                    SignalEvent.occurrence_key == event.occurrence_key
-                )
-            ).scalar_one_or_none()
-            if duplicate is not None:
-                continue  # replay: this logical event already exists
-            signal = SignalEvent(
-                id=_uuid(),
-                subscription_id=None,
-                workflow_id=str(transition.workflow_id),
-                occurrence_key=event.occurrence_key,
-                fired_at=event.fired_at,
-                evidence=dict(event.evidence or {}),
-                created_at=timestamp,
-            )
-            session.add(signal)
-            session.flush()
-            for channel_id in dict.fromkeys(event.channel_ids or ()):
-                session.add(
-                    Delivery(
-                        id=_uuid(),
-                        event_id=signal.id,
-                        channel_id=channel_id,
-                        status="pending",
-                        attempts=0,
-                        next_attempt_at=timestamp,
-                        created_at=timestamp,
-                        updated_at=timestamp,
-                    )
-                )
-            applied["attachment_events_published"] += 1
-
-        for update in transition.state_updates:
-            _upsert_attachment_state_row(
+        applied: Dict[str, int] = {"attachment_events_published": 0}
+        for task in plan.tasks:
+            _lock_attachment_baseline(
                 session,
-                owner_id=transition.owner_id,
-                workflow_id=transition.workflow_id,
-                revision_id=transition.revision_id,
-                attachment_id=update.attachment_id,
-                instrument_key=update.instrument_key,
-                present=update.present,
-                run_id=run_id,
-                rank=update.rank,
-                consecutive_absent=update.consecutive_absent,
-                now=timestamp,
+                owner_id=plan.owner_id,
+                workflow_id=plan.workflow_id,
+                revision_id=plan.revision_id,
+                attachment_id=task.attachment_id,
             )
+            states = _read_attachment_states(
+                session,
+                owner_id=plan.owner_id,
+                workflow_id=plan.workflow_id,
+                revision_id=plan.revision_id,
+                attachment_id=task.attachment_id,
+            )
+            if _baseline_supersedes(session, states, plan.scheduled_for):
+                applied["attachment_events_stale_suppressed"] = (
+                    applied.get("attachment_events_stale_suppressed", 0) + 1
+                )
+                continue
+            events, state_updates, suppressed = _compute_attachment_transitions(
+                plan=plan, task=task, states=states, timestamp=timestamp
+            )
+            applied["attachment_events_suppressed"] = (
+                applied.get("attachment_events_suppressed", 0) + suppressed
+            )
+            applied["attachment_events_published"] += _insert_attachment_events(
+                session, plan, events, timestamp
+            )
+            for update in state_updates:
+                _upsert_attachment_state_row(
+                    session,
+                    owner_id=plan.owner_id,
+                    workflow_id=plan.workflow_id,
+                    revision_id=plan.revision_id,
+                    attachment_id=update.attachment_id,
+                    instrument_key=update.instrument_key,
+                    present=update.present,
+                    run_id=plan.run_id,
+                    rank=update.rank,
+                    consecutive_absent=update.consecutive_absent,
+                    now=timestamp,
+                )
         return applied
 
     # -- reads --------------------------------------------------------------
@@ -615,19 +602,308 @@ class ScreenerRunRepository:
     def attachment_states(
         self, owner_id: str, workflow_id: str, revision_id: str, attachment_id: str
     ) -> Dict[str, ScreenerAttachmentState]:
+        """Committed baseline for one attachment (read-only inspection)."""
         session = self._sessions()
         try:
-            rows = session.execute(
-                select(ScreenerAttachmentState).where(
-                    ScreenerAttachmentState.owner_id == owner_id,
-                    ScreenerAttachmentState.workflow_id == workflow_id,
-                    ScreenerAttachmentState.workflow_revision_id == revision_id,
-                    ScreenerAttachmentState.attachment_id == attachment_id,
-                )
-            ).scalars().all()
-            return {row.instrument_key: row for row in rows}
+            return _read_attachment_states(
+                session,
+                owner_id=owner_id,
+                workflow_id=workflow_id,
+                revision_id=revision_id,
+                attachment_id=attachment_id,
+            )
         finally:
             session.close()
+
+
+def _read_attachment_states(
+    session: Session,
+    *,
+    owner_id: str,
+    workflow_id: str,
+    revision_id: str,
+    attachment_id: str,
+) -> Dict[str, ScreenerAttachmentState]:
+    """Read one attachment's baseline through the caller's transaction."""
+    rows = session.execute(
+        select(ScreenerAttachmentState).where(
+            ScreenerAttachmentState.owner_id == owner_id,
+            ScreenerAttachmentState.workflow_id == workflow_id,
+            ScreenerAttachmentState.workflow_revision_id == revision_id,
+            ScreenerAttachmentState.attachment_id == attachment_id,
+        )
+    ).scalars().all()
+    return {row.instrument_key: row for row in rows}
+
+
+def _lock_attachment_baseline(
+    session: Session,
+    *,
+    owner_id: str,
+    workflow_id: str,
+    revision_id: str,
+    attachment_id: str,
+) -> None:
+    """Serialize overlapping publications of one attachment's baseline.
+
+    A PostgreSQL advisory transaction lock (same pattern as universe
+    resolution) rather than a row lock: the FIRST publication of an
+    attachment has no baseline rows to lock, and two first publications
+    racing on an empty baseline are exactly the interleaving that must not
+    interleave. SQLite (unit tests) is a single writer.
+    """
+    if not _is_postgres(session):
+        return
+    session.execute(
+        text(
+            "SELECT pg_advisory_xact_lock("
+            "hashtext('screener-attachment:' || :lock_key))"
+        ),
+        {
+            "lock_key": (
+                f"{owner_id}/{workflow_id}/{revision_id}/{attachment_id}"
+            )
+        },
+    )
+
+
+def _baseline_supersedes(
+    session: Session,
+    states: Dict[str, ScreenerAttachmentState],
+    scheduled_for: datetime,
+) -> bool:
+    """True when the baseline was written by a strictly newer occurrence.
+
+    With the transitions computed under the lock this is a pure ordering
+    guard: a superseded occurrence would derive its "current" state from a
+    moment that no longer exists, so it publishes nothing for the attachment
+    (its run results still publish) and never overwrites newer state.
+    """
+    baseline_run_ids = {
+        state.last_complete_run_id for state in states.values() if state.last_complete_run_id
+    }
+    if not baseline_run_ids:
+        return False
+    stored = session.execute(
+        select(ScreenerRun.scheduled_for).where(ScreenerRun.id.in_(baseline_run_ids))
+    ).scalars().all()
+    newest_baseline = max(_as_utc(value) for value in stored)
+    return _as_utc(scheduled_for) < newest_baseline
+
+
+def _insert_attachment_events(
+    session: Session,
+    plan: AttachmentPlan,
+    events: Sequence[AttachmentEvent],
+    timestamp: datetime,
+) -> int:
+    """Insert signal events + their pending deliveries; returns how many fired.
+
+    The occurrence key makes a replay a no-op: the same logical event can
+    never produce a second notification.
+    """
+    from backend.notifications.repository import Delivery
+
+    from backend.workflows.repository import SignalEvent
+
+    published = 0
+    for event in events:
+        duplicate = session.execute(
+            select(SignalEvent.id).where(
+                SignalEvent.occurrence_key == event.occurrence_key
+            )
+        ).scalar_one_or_none()
+        if duplicate is not None:
+            continue  # replay: this logical event already exists
+        signal = SignalEvent(
+            id=_uuid(),
+            subscription_id=None,
+            workflow_id=str(plan.workflow_id),
+            occurrence_key=event.occurrence_key,
+            fired_at=event.fired_at,
+            evidence=dict(event.evidence or {}),
+            created_at=timestamp,
+        )
+        session.add(signal)
+        session.flush()
+        for channel_id in dict.fromkeys(event.channel_ids or ()):
+            session.add(
+                Delivery(
+                    id=_uuid(),
+                    event_id=signal.id,
+                    channel_id=channel_id,
+                    status="pending",
+                    attempts=0,
+                    next_attempt_at=timestamp,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                )
+            )
+        published += 1
+    return published
+
+
+def _compute_attachment_transitions(
+    *,
+    plan: AttachmentPlan,
+    task: AttachmentTask,
+    states: Dict[str, ScreenerAttachmentState],
+    timestamp: datetime,
+) -> Tuple[List[AttachmentEvent], List[AttachmentStateUpdate], int]:
+    """Derive one attachment's events and baseline upserts from a locked baseline.
+
+    Pure: ``states`` is the baseline as read under the lock, ``task.results``
+    is this run's ranked pipeline output. Returns
+    ``(events, state_updates, suppressed_event_count)``.
+
+    Baseline semantics: the first complete run of a (revision, attachment)
+    initializes state silently unless ``initial_match`` is set. Partial runs
+    never reach this function (no exits, no baseline advance — E-18).
+
+    Hysteresis: ``top_n`` enters at rank <= entry_rank and only exits when
+    rank > exit_rank (entry_rank < exit_rank by validation, E-17);
+    ``entry``/``exit`` triggers use ``exit_after`` consecutive absences
+    (default 1). ``rank_delta`` fires on |current_rank - last_rank| >=
+    threshold using the previous complete run's rank (a distinct concept
+    from hysteresis bands — it compares ranks, it does not gate presence).
+    """
+    spec = task.spec
+    results = task.results
+    run_id = plan.run_id
+    baseline = not states
+    current = {m.instrument_key: m for m in results}
+    raw_events: List[Tuple[str, dict]] = []
+    state_updates: List[AttachmentStateUpdate] = []
+
+    for key, member in sorted(current.items()):
+        previous = states.get(key)
+        prev_rank = previous.last_rank if previous is not None else None
+        was_present = bool(previous.present) if previous is not None else False
+
+        if spec.trigger == "top_n":
+            enters = member.passed and member.rank is not None and member.rank <= (spec.entry_rank or 0)
+            if was_present and (not member.passed or member.rank is None or member.rank > (spec.exit_rank or 0)):
+                # still inside the hysteresis band: neither exit nor entry
+                stays = member.passed and member.rank is not None and member.rank <= (spec.exit_rank or 0)
+                if stays:
+                    state_updates.append(_state_update(spec, key, True, member.rank, 0))
+                    continue
+                state_updates.append(_state_update(spec, key, False, member.rank, 0))
+                raw_events.append((key, {"action": "exit", "rank": member.rank, "prev_rank": prev_rank}))
+                continue
+            if enters and not was_present:
+                state_updates.append(_state_update(spec, key, True, member.rank, 0))
+                raw_events.append((key, {"action": "entry", "rank": member.rank, "prev_rank": prev_rank}))
+                continue
+            state_updates.append(_state_update(spec, key, bool(enters or was_present), member.rank, 0))
+            continue
+
+        if spec.trigger in ("entry", "exit"):
+            present = bool(member.passed)
+            absent_streak = 0 if present else ((previous.consecutive_absent if previous else 0) + 1)
+            threshold = spec.exit_after or 1
+            if present and not was_present:
+                raw_events.append((key, {"action": "entry", "rank": member.rank, "prev_rank": prev_rank}))
+            if was_present and not present and absent_streak >= threshold:
+                raw_events.append((key, {"action": "exit", "rank": member.rank, "prev_rank": prev_rank}))
+            state_updates.append(_state_update(spec, key, present, member.rank, absent_streak))
+            continue
+
+        if spec.trigger == "rank_delta":
+            if member.passed and member.rank is not None and prev_rank is not None:
+                delta = abs(member.rank - prev_rank)
+                if delta >= (spec.rank_delta or 0):
+                    raw_events.append((
+                        key,
+                        {
+                            "action": "rank_change",
+                            "rank": member.rank,
+                            "prev_rank": prev_rank,
+                            "delta": delta,
+                            "direction": "up" if member.rank < prev_rank else "down",
+                        },
+                    ))
+            state_updates.append(_state_update(spec, key, bool(member.passed), member.rank, 0))
+            continue
+
+    # instruments present in prior state but absent from this run's
+    # results (universe departure): they cannot be ranked any more —
+    # treat as absent for entry/exit triggers, exited for top_n bands.
+    for key in sorted(set(states) - set(current)):
+        previous = states[key]
+        if spec.trigger == "top_n":
+            if previous.present:
+                # a departed instrument can no longer hold a rank band
+                raw_events.append((key, {"action": "exit", "rank": None, "prev_rank": previous.last_rank}))
+                state_updates.append(_state_update(spec, key, False, None, 0))
+            continue
+        if spec.trigger in ("entry", "exit"):
+            # streak advances once per complete run; the exit fires at
+            # the exact crossing (streak == threshold), never repeats
+            streak = (previous.consecutive_absent or 0) + 1
+            threshold = spec.exit_after or 1
+            if streak == threshold:
+                raw_events.append((key, {"action": "exit", "rank": None, "prev_rank": previous.last_rank}))
+            state_updates.append(_state_update(spec, key, False, None, streak))
+
+    if baseline and not spec.initial_match:
+        # first complete run: initialize state, notify nothing
+        state_updates = [
+            _state_update(spec, key, bool(current[key].passed), current[key].rank, 0)
+            for key in current
+        ]
+        raw_events = []
+
+    events: List[AttachmentEvent] = []
+    suppressed = 0
+    for key, payload in raw_events:
+        if len(events) >= plan.max_events:
+            suppressed += 1
+            continue
+        member = current.get(key)
+        member_values = dict(member.values) if member is not None else {}
+        channel_ids = (
+            plan.channel_resolver(plan.owner_id, list(spec.channels)) or {}
+            if plan.channel_resolver is not None
+            else {}
+        )
+        events.append(
+            AttachmentEvent(
+                attachment_id=spec.id,
+                occurrence_key=f"{plan.workflow_id}:{plan.revision_id}:{spec.id}:{run_id}:{key}",
+                fired_at=plan.scheduled_for or timestamp,
+                evidence={
+                    "screener": plan.screener_name,
+                    "attachment_id": spec.id,
+                    "trigger": spec.trigger,
+                    "action": payload.get("action"),
+                    "instrument_key": key,
+                    "rank": payload.get("rank"),
+                    "prev_rank": payload.get("prev_rank"),
+                    "rank_delta": payload.get("delta"),
+                    "direction": payload.get("direction"),
+                    "run_id": run_id,
+                    "scheduled_for": plan.scheduled_for.isoformat() if plan.scheduled_for else None,
+                    "message": spec.message,
+                    "values": {k: v for k, v in member_values.items() if k in ("close", "change_pct", "turnover", "score", "candle_ts")},
+                    "message_kind": "screener_attachment",
+                },
+                channel_ids=tuple(dict.fromkeys(channel_ids.values())),
+            )
+        )
+    return events, state_updates, suppressed
+
+
+def _state_update(
+    spec: Any, key: str, present: bool, rank: Optional[int], absent_streak: int
+) -> AttachmentStateUpdate:
+    return AttachmentStateUpdate(
+        attachment_id=spec.id,
+        instrument_key=key,
+        present=present,
+        rank=rank,
+        consecutive_absent=absent_streak,
+    )
 
 
 def _upsert_attachment_state_row(

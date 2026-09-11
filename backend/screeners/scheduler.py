@@ -8,16 +8,20 @@ Duties (one poll pass):
    gated, coalesced — E-19: only the latest due occurrence is ever run);
 3. claim the occurrence (unique occurrence_key + lease; concurrent workers
    produce exactly one logical run, stale owners are fenced);
-4. resolve universe membership, run the stored-data pipeline, PREPARE
-   attachment transitions on COMPLETE runs, then publish everything — run
-   status/results, baseline changes, signal events, outbox deliveries — in
-   ONE fenced transaction via ``ScreenerRunRepository.finalize_run``.
+4. resolve universe membership, run the stored-data pipeline, then publish
+   everything — run status/results, attachment baselines, signal events,
+   outbox deliveries — in ONE fenced transaction via
+   ``ScreenerRunRepository.finalize_run``.
 
-Publication semantics: attachment evaluation happens BEFORE finalization
-(its output feeds the publication transaction), but nothing it computes is
-written outside ``finalize_run`` — a crash mid-publication or a stale-owner
-rejection rolls back the entire batch, and a lease takeover re-runs the
-occurrence to produce exactly one logical publication.
+Publication semantics: the expensive ranked evaluation runs outside the
+transaction; what crosses into it is an ``AttachmentPlan`` (the ranked
+results plus the attachment specs, carrying NO baseline state). Attachment
+transitions are derived inside ``finalize_run`` after the per-attachment lock
+is taken and the baseline is read under it, so an occurrence that published
+in between cannot leave this run reasoning about a stale baseline. A crash
+mid-publication or a stale-owner rejection rolls back the entire batch, and a
+lease takeover re-runs the occurrence to produce exactly one logical
+publication.
 
 Failure semantics: any pipeline error finalizes the run as ``failed`` with
 the reason (visible, never silent); the claim's unique key prevents the same
@@ -38,16 +42,15 @@ from sqlalchemy import select
 
 from backend.workflows.repository import Workflow, WorkflowRevision
 from backend.workflows.screener_repository import (
-    AttachmentEvent,
-    AttachmentStateUpdate,
-    AttachmentTransition,
+    AttachmentPlan,
+    AttachmentTask,
     ScreenerRun,
     ScreenerRunRepository,
 )
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ScreenerScheduler", "prepare_attachments"]
+__all__ = ["ScreenerScheduler"]
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -300,22 +303,18 @@ class ScreenerScheduler:
 
         results = outcome["members"]
         coverage = outcome["coverage"]
-        transitions: List[AttachmentTransition] = []
+        attachment_plan = None
         if outcome["status"] == "complete":
-            attachment_summary, transitions = prepare_attachments(
+            attachment_plan = _build_attachment_plan(
                 workflow=workflow,
                 revision=revision,
                 document=document,
                 run=run,
                 results=results,
-                run_repo=self.run_repo,
                 channel_resolver=self._channel_resolver or _no_channels,
                 owner_id=workflow.owner_id,
                 max_events=self.max_events_per_attachment,
-                now=now,
             )
-            if attachment_summary.get("suppressed_events"):
-                coverage["attachment_events_suppressed"] = attachment_summary["suppressed_events"]
         member_payloads = [
             {
                 "instrument_key": m.instrument_key,
@@ -328,7 +327,9 @@ class ScreenerScheduler:
             for m in results
         ]
         # Single fenced publication: run status/results, attachment baselines,
-        # signal events and outbox entries commit together or not at all.
+        # signal events and outbox entries commit together or not at all. The
+        # attachment transitions are derived inside this call, from the
+        # baseline read under the attachment lock.
         published = self.run_repo.finalize_run(
             run.id,
             self.owner_id,
@@ -338,7 +339,7 @@ class ScreenerScheduler:
             data_freshness=outcome["data_freshness"],
             members=member_payloads,
             universe_revision=universe_revision if isinstance(universe_revision, int) else None,
-            attachments=transitions,
+            attachment_plan=attachment_plan,
             now=now,
         )
         if published:
@@ -459,197 +460,50 @@ class ScreenerScheduler:
 # ---------------------------------------------------------------------------
 
 
-def prepare_attachments(
+def _build_attachment_plan(
     *,
     workflow: Workflow,
     revision: WorkflowRevision,
     document,
     run,
     results: Sequence,
-    run_repo: ScreenerRunRepository,
     channel_resolver: Callable[[str, Sequence[str]], Dict[str, str]],
     owner_id: str,
     max_events: int = 100,
-    now: Optional[datetime] = None,
-) -> Tuple[Dict[str, Any], List[AttachmentTransition]]:
-    """Entry/exit/top-N/rank-delta attachment PREPARATION for a COMPLETE run.
+) -> Optional[AttachmentPlan]:
+    """Describe the attachment work a COMPLETE run must publish.
 
-    Computes the transitions this run would publish WITHOUT writing
-    anything: the caller passes the returned ``AttachmentTransition`` list
-    into ``run_repo.finalize_run(attachments=...)`` so baseline changes,
-    signal events and outbox entries commit inside the run's single fenced
-    publication transaction. ``summary`` reports the prepared counts
-    (``events``, ``suppressed_events``); what actually publishes is decided
-    inside ``finalize_run`` (fence + chronology gate).
+    Deliberately carries NO baseline state: the ranked ``results`` come from
+    the pipeline run outside the transaction, while every baseline-dependent
+    decision (entry/exit/rank-delta, hysteresis counters) is derived inside
+    ``finalize_run`` after the attachment lock is held. Deriving them here
+    would reintroduce exactly the race this plan exists to remove — an
+    occurrence publishing between this call and finalization would leave the
+    transitions describing a superseded baseline.
 
-    Baseline semantics: the first complete run of a (revision, attachment)
-    initializes state silently unless ``initial_match`` is set. Partial runs
-    never reach this function (no exits, no baseline advance — E-18).
-
-    Hysteresis: ``top_n`` enters at rank <= entry_rank and only exits when
-    rank > exit_rank (entry_rank < exit_rank by validation, E-17);
-    ``entry``/``exit`` triggers use ``exit_after`` consecutive absences
-    (default 1). ``rank_delta`` fires on |current_rank - last_rank| >=
-    threshold using the previous complete run's rank (a distinct concept
-    from hysteresis bands — it compares ranks, it does not gate presence).
+    Returns ``None`` for documents without a screener block or without
+    attachments. Partial runs never build a plan (E-18).
     """
-    timestamp = now or _utcnow()
-    summary: Dict[str, Any] = {"events": 0, "suppressed_events": 0}
-    transitions: List[AttachmentTransition] = []
-    if document.screener is None:
-        return summary, transitions
-    screener_name = document.name
-    for attachment in document.screener.attachments:
-        states = run_repo.attachment_states(
-            owner_id, workflow.id, revision.id, attachment.id
-        )
-        baseline = not states
-        current = {m.instrument_key: m for m in results}
-        events: List[Tuple[str, dict]] = []
-        state_updates: List[Tuple[str, bool, Optional[int], int]] = []
-
-        for key, member in sorted(current.items()):
-            previous = states.get(key)
-            prev_rank = previous.last_rank if previous is not None else None
-            was_present = bool(previous.present) if previous is not None else False
-
-            if attachment.trigger == "top_n":
-                enters = member.passed and member.rank is not None and member.rank <= (attachment.entry_rank or 0)
-                if was_present and (not member.passed or member.rank is None or member.rank > (attachment.exit_rank or 0)):
-                    # still inside the hysteresis band: neither exit nor entry
-                    stays = member.passed and member.rank is not None and member.rank <= (attachment.exit_rank or 0)
-                    if stays:
-                        state_updates.append((key, True, member.rank, 0))
-                        continue
-                    state_updates.append((key, False, member.rank, 0))
-                    events.append((key, {"action": "exit", "rank": member.rank, "prev_rank": prev_rank}))
-                    continue
-                if enters and not was_present:
-                    state_updates.append((key, True, member.rank, 0))
-                    events.append((key, {"action": "entry", "rank": member.rank, "prev_rank": prev_rank}))
-                    continue
-                state_updates.append((key, bool(enters or was_present), member.rank, 0))
-                continue
-
-            if attachment.trigger in ("entry", "exit"):
-                present = bool(member.passed)
-                absent_streak = 0 if present else ((previous.consecutive_absent if previous else 0) + 1)
-                threshold = attachment.exit_after or 1
-                if present and not was_present:
-                    events.append((key, {"action": "entry", "rank": member.rank, "prev_rank": prev_rank}))
-                if was_present and not present and absent_streak >= threshold:
-                    events.append((key, {"action": "exit", "rank": member.rank, "prev_rank": prev_rank}))
-                state_updates.append((key, present, member.rank, absent_streak))
-                continue
-
-            if attachment.trigger == "rank_delta":
-                if member.passed and member.rank is not None and prev_rank is not None:
-                    delta = abs(member.rank - prev_rank)
-                    if delta >= (attachment.rank_delta or 0):
-                        events.append((
-                            key,
-                            {
-                                "action": "rank_change",
-                                "rank": member.rank,
-                                "prev_rank": prev_rank,
-                                "delta": delta,
-                                "direction": "up" if member.rank < prev_rank else "down",
-                            },
-                        ))
-                state_updates.append((key, bool(member.passed), member.rank, 0))
-                continue
-
-        # instruments present in prior state but absent from this run's
-        # results (universe departure): they cannot be ranked any more —
-        # treat as absent for entry/exit triggers, exited for top_n bands.
-        for key in sorted(set(states) - set(current)):
-            previous = states[key]
-            if attachment.trigger == "top_n":
-                if previous.present:
-                    # a departed instrument can no longer hold a rank band
-                    events.append((key, {"action": "exit", "rank": None, "prev_rank": previous.last_rank}))
-                    state_updates.append((key, False, None, 0))
-                continue
-            if attachment.trigger in ("entry", "exit"):
-                # streak advances once per complete run; the exit fires at
-                # the exact crossing (streak == threshold), never repeats
-                streak = (previous.consecutive_absent or 0) + 1
-                threshold = attachment.exit_after or 1
-                if streak == threshold:
-                    events.append((key, {"action": "exit", "rank": None, "prev_rank": previous.last_rank}))
-                state_updates.append((key, False, None, streak))
-
-        if baseline and not attachment.initial_match:
-            # first complete run: initialize state, notify nothing
-            summary["events"] += 0
-            state_updates = [
-                (key, bool(current[key].passed), current[key].rank, 0)
-                for key in current
-            ]
-            events = []
-
-        prepared_events: List[AttachmentEvent] = []
-        emitted = 0
-        suppressed = 0
-        for key, payload in events:
-            if emitted >= max_events:
-                suppressed += 1
-                continue
-            member = current.get(key)
-            member_values = dict(member.values) if member is not None else {}
-            channel_ids = channel_resolver(owner_id, list(attachment.channels)) or {}
-            evidence = {
-                "screener": screener_name,
-                "attachment_id": attachment.id,
-                "trigger": attachment.trigger,
-                "action": payload.get("action"),
-                "instrument_key": key,
-                "rank": payload.get("rank"),
-                "prev_rank": payload.get("prev_rank"),
-                "rank_delta": payload.get("delta"),
-                "direction": payload.get("direction"),
-                "run_id": run.id,
-                "scheduled_for": run.scheduled_for.isoformat() if run.scheduled_for else None,
-                "message": attachment.message,
-                "values": {k: v for k, v in member_values.items() if k in ("close", "change_pct", "turnover", "score", "candle_ts")},
-                "message_kind": "screener_attachment",
-            }
-            occurrence_key = (
-                f"{workflow.id}:{revision.id}:{attachment.id}:{run.id}:{key}"
-            )
-            prepared_events.append(
-                AttachmentEvent(
-                    attachment_id=attachment.id,
-                    occurrence_key=occurrence_key,
-                    fired_at=run.scheduled_for or timestamp,
-                    evidence=evidence,
-                    channel_ids=tuple(dict.fromkeys(channel_ids.values())),
-                )
-            )
-            summary["events"] += 1
-            emitted += 1
-        summary["suppressed_events"] += suppressed
-
-        transitions.append(
-            AttachmentTransition(
-                owner_id=owner_id,
-                workflow_id=workflow.id,
-                revision_id=revision.id,
+    if document.screener is None or not document.screener.attachments:
+        return None
+    return AttachmentPlan(
+        owner_id=owner_id,
+        workflow_id=workflow.id,
+        revision_id=revision.id,
+        run_id=run.id,
+        scheduled_for=run.scheduled_for,
+        screener_name=document.name,
+        tasks=tuple(
+            AttachmentTask(
                 attachment_id=attachment.id,
-                events=tuple(prepared_events),
-                state_updates=tuple(
-                    AttachmentStateUpdate(
-                        attachment_id=attachment.id,
-                        instrument_key=key,
-                        present=present,
-                        rank=rank,
-                        consecutive_absent=absent_streak,
-                    )
-                    for key, present, rank, absent_streak in state_updates
-                ),
+                spec=attachment,
+                results=tuple(results),
             )
-        )
-    return summary, transitions
+            for attachment in document.screener.attachments
+        ),
+        channel_resolver=channel_resolver,
+        max_events=max_events,
+    )
 
 
 def parse_duration_seconds(value: str) -> int:

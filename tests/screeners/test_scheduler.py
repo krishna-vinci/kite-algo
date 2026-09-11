@@ -7,9 +7,10 @@
   hysteresis; rank_delta compares against the previous complete rank;
 - partial runs never evaluate attachments (no exits, no baseline advance).
 
-Attachment transitions are PREPARED by ``prepare_attachments`` (no writes)
-and published by ``finalize_run`` inside the run's single fenced
-transaction — the ``_evaluate`` helper below drives that exact pair.
+Attachment transitions are DERIVED INSIDE ``finalize_run`` (after the
+per-attachment lock, from the baseline read under it) and published in the
+run's single fenced transaction — the ``_evaluate`` helper below drives that
+path exactly as the scheduler does.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from sqlalchemy.pool import StaticPool
 
 from backend.notifications.repository import Delivery  # noqa: F401
 from backend.workflows.repository import SignalEvent  # noqa: F401
-from backend.screeners.scheduler import ScreenerScheduler, prepare_attachments
+from backend.screeners.scheduler import ScreenerScheduler, _build_attachment_plan
 from backend.workflows.compiler import compile_document
 from backend.workflows.models import AttachmentSpec, ScreenerSpec, ScheduleSpec
 from backend.workflows.parser import parse_workflow_dict
@@ -202,22 +203,22 @@ def _workflow_objects(workflow, revision):
     return workflow, revision
 
 
-def _evaluate(session_factory, workflow, revision, doc, run, results, now=T0):
-    """prepare_attachments + the fenced finalize_run publication pair.
+def _evaluate(session_factory, workflow, revision, doc, run, results, now=T0, max_events=100):
+    """Build the attachment plan, then publish the run through ``finalize_run``.
 
-    Returns the prepared summary; the run is published as ``complete`` with
-    the transitions applied inside the publication transaction."""
+    Returns the published counters; transitions are derived inside the
+    publication transaction, from the baseline read under the attachment lock."""
     repo = ScreenerRunRepository(session_factory)
-    summary, transitions = prepare_attachments(
+    document = parse_workflow_dict(doc)
+    plan = _build_attachment_plan(
         workflow=workflow,
         revision=revision,
-        document=parse_workflow_dict(doc),
+        document=document,
         run=run,
         results=results,
-        run_repo=repo,
         channel_resolver=_channels,
         owner_id="owner-1",
-        now=now,
+        max_events=max_events,
     )
     published = repo.finalize_run(
         run.id,
@@ -237,11 +238,16 @@ def _evaluate(session_factory, workflow, revision, doc, run, results, now=T0):
             }
             for m in results
         ],
-        attachments=transitions,
+        attachment_plan=plan,
         now=now,
     )
     assert published is True
-    return summary
+    finished = repo.get_run(run.id)
+    coverage = finished.coverage or {}
+    return {
+        "events": int(coverage.get("attachment_events_published", 0)),
+        "suppressed_events": int(coverage.get("attachment_events_suppressed", 0)),
+    }
 
 
 def _events(session_factory):
@@ -359,26 +365,25 @@ def test_attachment_occurrence_key_is_idempotent_on_replay(session_factory):
     results = [_member("NSE:A", rank=1)]
     _evaluate(session_factory, workflow, revision, doc, run, results)
     # a full replay of the SAME run (stale recovery attempt) publishes
-    # nothing: the fenced CAS rejects the already-finalized run outright
+    # nothing: the fenced CAS rejects the already-finalized run outright, and
+    # the same occurrence keys could not duplicate an event anyway
     repo = ScreenerRunRepository(session_factory)
-    _summary, transitions = prepare_attachments(
-        workflow=workflow,
-        revision=revision,
-        document=parse_workflow_dict(doc),
-        run=run,
-        results=results,
-        run_repo=repo,
-        channel_resolver=_channels,
-        owner_id="owner-1",
-    )
-    assert all(t.events == () for t in transitions)  # baseline advanced: nothing to fire
     assert repo.finalize_run(
         run.id, run.lease_owner,
         status="complete", as_of=run.scheduled_for,
         coverage={}, data_freshness={}, members=[],
-        attachments=transitions,
+        attachment_plan=_build_attachment_plan(
+            workflow=workflow,
+            revision=revision,
+            document=parse_workflow_dict(doc),
+            run=run,
+            results=results,
+            channel_resolver=_channels,
+            owner_id="owner-1",
+        ),
     ) is False
     assert len(_events(session_factory)) == 1
+    assert _states(session_factory, workflow, revision, "en")["NSE:A"].last_complete_run_id == run.id
 
 
 def test_attachment_event_cap_bounds_storms(session_factory):

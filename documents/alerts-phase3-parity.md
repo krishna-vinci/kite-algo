@@ -5,10 +5,13 @@ Status as of 2026-09-11, branch `development`. Phase 3 scope per
 F9 (scheduled screeners, result snapshots, attachments), E-17/E-18/E-19.
 
 Publication hardening (2026-09-11): attachment evaluation no longer writes
-anything before the run's fenced finalization. Prepared transitions — run
-status/results, baselines, signal events, outbox entries — commit in ONE
-transaction inside `finalize_run`, serialized per attachment and
-chronologically gated; see "Publication transaction boundary" below.
+anything before the run's fenced finalization, and — after a second pass —
+no longer precomputes transitions either. The scheduler hands
+`finalize_run` an `AttachmentPlan` carrying only the ranked results and the
+attachment specs (NO baseline state); the per-attachment lock is taken first,
+the baseline is read under it, and the entry/exit/top-N/rank-delta decisions
+are derived from that locked baseline inside the same transaction. See
+"Publication transaction boundary" below.
 
 ## Requirement parity
 
@@ -27,19 +30,20 @@ chronologically gated; see "Publication transaction boundary" below.
 | Stale owners cannot finalize | Closed | `finalize_run` compare-and-swap on `lease_owner` + `status='running'` is the FIRST statement of the publication transaction; rowcount 0 aborts members, baselines, events and outbox together | PG: `test_takeover_during_evaluation_fences_stale_worker`, `test_attachment_events_idempotent_and_fenced_after_takeover` |
 | Restart/crash recovery | Closed | crashed claim is taken over after lease expiry; the SAME logical run completes; replays are idempotent | PG: `test_crash_after_claim_recovers_via_lease_takeover` |
 | Missed schedules coalesce (E-19) | Closed | scheduler evaluates only the LATEST due bucket; older buckets never replay; session gate walk-back is bounded (`max_walkback=40`) | `test_bucket_gate_never_active_returns_none`; scheduler double-pass test (second pass → 0 runs) |
-| Attachments: entry/exit/top-N/rank-delta with explicit baseline | Closed | `screeners/scheduler.py::prepare_attachments` (pure preparation — computes transitions, writes nothing) → `ScreenerRunRepository.finalize_run(attachments=...)` (single fenced publication); state persisted per (owner, workflow, revision, attachment, instrument) | baseline-silent, `initial_match`, `exit_after`, rank-band hysteresis, rank-delta tests (SQLite) + PG idempotency and atomicity |
-| Overlapping occurrences cannot invert baseline chronology | Closed | per-attachment PostgreSQL advisory transaction lock (`pg_advisory_xact_lock(hashtext('screener-attachment:' \|\| owner/workflow/revision/attachment))`) taken before the baseline read — covers the empty-baseline first run — plus a gate: a baseline owned by a strictly newer `scheduled_for` suppresses the whole transition (reported as `attachment_events_stale_suppressed`) | PG: `test_newer_occurrence_publishing_first_suppresses_stale_older_run`, `test_older_occurrence_publishing_first_cannot_clobber_newer_state`, `test_concurrent_occurrences_never_interleave_baseline_state`, `test_concurrent_first_runs_never_invert_empty_baseline` |
+| Attachments: entry/exit/top-N/rank-delta with explicit baseline | Closed | `scheduler.py::_build_attachment_plan` (baseline-free plan) → `ScreenerRunRepository.finalize_run(attachment_plan=...)`, which locks, reads the baseline and derives the transitions; state persisted per (owner, workflow, revision, attachment, instrument) | baseline-silent, `initial_match`, `exit_after`, rank-band hysteresis, rank-delta tests (SQLite) + PG idempotency and atomicity |
+| Overlapping occurrences cannot invert baseline state | Closed | per-attachment PostgreSQL advisory transaction lock (`pg_advisory_xact_lock(hashtext('screener-attachment:' \|\| owner/workflow/revision/attachment))`) taken BEFORE the baseline read, with the transitions derived from that locked baseline — so a run can never publish transitions computed against a snapshot an earlier publication has superseded. Covers the empty-baseline first run, which has no rows for a row lock. The `scheduled_for` chronology gate remains as a second guard: a strictly superseded occurrence is suppressed whole (`attachment_events_stale_suppressed`) | PG: `test_two_runs_planned_on_empty_baseline_publish_one_entry_each`, `test_exit_after_counter_advances_from_locked_baseline`, `test_rank_delta_compares_against_locked_baseline`, `test_newer_occurrence_publishing_first_suppresses_stale_older_run`, `test_older_occurrence_publishing_first_applies_over_locked_baseline`, `test_concurrent_occurrences_never_interleave_baseline_state`, `test_concurrent_first_runs_never_invert_empty_baseline` |
+| Precomputed-transition race (regression) | Closed | Before this fix a run planned its transitions from a baseline snapshot read outside the transaction: two runs planning on an empty baseline both emitted an entry for the same instrument. Verified failing at `3728f06` (`NSE:A` entered twice), passing after | PG: `test_two_runs_planned_on_empty_baseline_publish_one_entry_each` |
 | Lease-expiry behavior is explicit | Closed | the fence is OWNERSHIP, not wall time: an expired-but-never-taken-over lease still finalizes (a completed run must not lose its notifications); once taken over, the original owner is permanently fenced by the CAS | PG: `test_expired_lease_without_takeover_still_publishes`, `test_takeover_during_evaluation_fences_stale_worker` |
-| Crash before/inside publication leaves no side effects | Closed | everything a run publishes is one transaction; failure injected after preparation and failure injected mid-publication (delivery FK violation) both leave no run result, member, baseline row, event or delivery behind, and the retry publishes exactly once | PG: `test_failure_before_publication_leaves_zero_side_effects`, `test_mid_publication_failure_rolls_back_entire_transaction`, `test_retry_after_failure_publishes_exactly_once` |
+| Crash before/inside publication leaves no side effects | Closed | everything a run publishes is one transaction; a failure injected before publication and one injected mid-publication (second attachment's delivery FK violation, after the first attachment's events, deliveries and baseline rows were written) both leave no run result, member, baseline row, event or delivery behind, and the retry publishes exactly once | PG: `test_failure_before_publication_leaves_zero_side_effects`, `test_mid_publication_failure_rolls_back_entire_transaction`, `test_retry_after_failure_publishes_exactly_once` |
 | E-17 hysteresis survives restart, distinct from rank-delta | Closed | `entry_rank` < `exit_rank` validated; bands stored in `screener_attachment_state`; `rank_delta` compares previous COMPLETE ranks only | `test_top_n_hysteresis_buffers_boundary_oscillation`, `test_rank_delta_fires_on_threshold_cross` |
-| E-18 partial runs: no exits, no baseline advance, no universe replacement | Closed | attachments are prepared only on `status == 'complete'`; dependent-universe refresh only after complete runs; stale source → `UniverseSourceUnavailable` | scheduler code path; `test_stale_complete_run_expires_visibly`; PG: `test_partial_run_publishes_without_attachment_effects` |
+| E-18 partial runs: no exits, no baseline advance, no universe replacement | Closed | an attachment plan is built only for `status == 'complete'` runs; dependent-universe refresh only after complete runs; stale source → `UniverseSourceUnavailable` | scheduler code path; `test_stale_complete_run_expires_visibly`; PG: `test_partial_run_publishes_without_attachment_effects` |
 | Dynamic universes from screener results | Closed | universe kind `screener` (`workflow`/`top_n`/`freshness_limit_s`); scheduler re-materializes dependents after each complete run | `tests/screeners/test_universe_screener_kind.py` |
 | Cycle prevention + ownership on referenced resources | Closed | `_assert_no_screener_universe_cycle` bounded walk (depth 8, owner-scoped, origin-name aware) at authoring AND resolution | `test_dependency_cycle_rejected`, `test_cross_owner_workflow_reference_rejected` |
 | API: run history, detail, events, manual runs, preview | Closed | `backend/api/routers/worker_screeners.py` under `/api/worker/screeners` (worker-token boundary; scopes reused — no new permission) | `tests/api/test_worker_screeners.py` (owner isolation 404, permission 403, idempotent manual trigger) |
 | Preview purity (no persistent changes / notifications) | Closed | preview runs the production pipeline in-memory; asserts no run rows and no deliveries | `test_preview_is_pure_dry_run` |
 | Reuse of the notification outbox | Closed | attachment signal events (subscription NULL, workflow-scoped) and their pending deliveries are written inside `finalize_run`'s publication transaction, occurrence-key deduplicated; delivery worker renders screener context from evidence (`build_screener_message`) | PG: `test_retry_after_failure_publishes_exactly_once` (3 events / 3 deliveries, no duplicates), FK-true fan-out in `test_attachment_events_idempotent_and_fenced_after_takeover` |
 | Notification content explains screener/trigger/symbol/ranks/freshness | Closed | `build_screener_message`: screener name, trigger+action, symbol, rank/prev/delta, values, run as-of, event time, event id | unit-covered via delivery resolver tests; provider exactly-once explicitly NOT promised (E-22/E-23 carry over) |
-| Existing Phase 1/2 behavior intact | Closed | 457 Python tests (screeners, workflows, alerts, notifications, fundamentals, worker screener API) + 21 real-PostgreSQL integration tests | commands and results in "Test evidence" below |
+| Existing Phase 1/2 behavior intact | Closed | 457 Python tests (screeners, workflows, alerts, notifications, fundamentals, worker screener API) + 24 real-PostgreSQL integration tests | commands and results in "Test evidence" below |
 
 ## Acceptance scenarios (assignment items 1–16)
 
@@ -54,7 +58,8 @@ chronologically gated; see "Publication transaction boundary" below.
 | 7 | Last complete results expire visibly; recovery restores | Pass — freshness limit → source-unavailable; new run refreshes |
 | 8 | Downtime coalesces missed schedules, no backlog storm | Pass — latest-due-only scheduling |
 | 9 | Concurrent workers / stale-owner takeover → one logical run + event | Pass — real-PG concurrency + fencing tests (takeover during evaluation publishes nothing) |
-| 10 | Crash injection → atomic publication of result/event/outbox | Pass — preparation-then-publication fault injection, mid-transaction rollback and retry-exactly-once tests; events idempotent by occurrence key |
+| 10 | Crash injection → atomic publication of result/event/outbox | Pass — preparation-then-publication fault injection, mid-transaction rollback (first attachment fully written, second fails) and retry-exactly-once tests; events idempotent by occurrence key |
+| 10b | Overlapping occurrences → one notification per transition | Pass — absence-baseline interleaving, exit_after counter and rank_delta deltas all derived from the locked baseline |
 | 11 | Dynamic universe additions warm up; removals release | Pass — universe revisions flow through the Phase 2 warmup/pause machinery |
 | 12 | Workflow/universe revisions historically attributable | Pass — run rows pin `workflow_revision_id` + `universe_revision` |
 | 13 | Cross-owner references and cycles rejected | Pass — 404/typed errors, bounded cycle walk |
@@ -64,41 +69,57 @@ chronologically gated; see "Publication transaction boundary" below.
 
 ## Publication transaction boundary
 
-`ScreenerScheduler._run_pipeline` prepares attachment transitions
-(`prepare_attachments`: a pure function over the run's results and the stored
-baseline — it writes nothing) and hands them to
-`ScreenerRunRepository.finalize_run`, whose single transaction is ordered:
+`ScreenerScheduler._run_pipeline` runs the ranked pipeline (the expensive
+part) outside the transaction and passes `finalize_run` an `AttachmentPlan`:
+the attachment specs plus the ranked results, carrying **no baseline state**.
+The single transaction is ordered:
 
 1. ownership compare-and-swap (`id` + `lease_owner` + `status='running'`) —
    rowcount 0 aborts before anything becomes visible;
 2. member rows (delete + insert);
 3. per attachment: advisory transaction lock keyed on
-   (owner, workflow, revision, attachment) → chronology gate → signal events
-   and pending deliveries (occurrence-key deduplicated) → baseline upserts;
-4. fold the published counters into `coverage`
-   (`attachment_events_published`, `attachment_events_stale_suppressed`).
+   (owner, workflow, revision, attachment) → **read the baseline under that
+   lock** → chronology gate → derive the entry/exit/top-N/rank-delta events
+   and baseline upserts from that baseline → insert signal events and pending
+   deliveries (occurrence-key deduplicated) → upsert baseline rows;
+4. fold the published counters into `coverage` (`attachment_events_published`,
+   `attachment_events_suppressed`, `attachment_events_stale_suppressed`).
+
+Why the baseline is read in step 3 rather than before the transaction: a
+baseline snapshot taken outside it is invalidated the moment another
+occurrence publishes. Two occurrences planned against an empty baseline both
+compute "first run"; whichever publishes second would then replay an entry
+for an instrument the first one already notified, and its absence counters
+and rank deltas would be measured against a baseline that never existed.
+Deriving the transitions under the lock makes the published transitions a
+function of the baseline as it is at publication time.
+
+The `scheduled_for` chronology gate is kept as a second, independent guard:
+when the locked baseline belongs to a strictly newer occurrence, the older
+run's attachment publication is suppressed whole and counted as stale — its
+results still publish, its comparison state never overwrites newer state.
 
 Consequences: a crash at any point, a stale-owner rejection, or a failure
 inside step 3 rolls back the WHOLE batch — a takeover re-runs the occurrence
-to produce exactly one logical publication, and an older overlapping
-occurrence cannot overwrite newer comparison state (its transition is
-suppressed wholesale and reported in coverage, so results still publish).
-Attachment evaluation is NOT serialized after `finalize_run`: preparation
-happens before it, which is what keeps a crash window from losing a completed
-run's notifications.
+to produce exactly one logical publication. Attachment work is NOT deferred
+after `finalize_run`, so there is no window in which a completed run's
+notifications can be lost.
 
 ## Test evidence (executed 2026-09-11)
 
 | Suite | Command | Result |
 | --- | --- | --- |
 | Alerts-platform unit suites | `.venv/bin/python -m pytest tests/screeners tests/workflows tests/alerts tests/notifications tests/fundamentals tests/api/test_worker_screeners.py -q` | `457 passed` |
-| Screener PostgreSQL fault injection (15 tests) | `ALERTS_TEST_DATABASE_URL='postgresql://postgres:testonly@127.0.0.1:15433/kite_test' .venv/bin/python -m pytest tests/integration/test_screener_postgres.py -q` | `15 passed` (stable over 3 consecutive runs) |
+| Screener PostgreSQL fault injection (18 tests) | `ALERTS_TEST_DATABASE_URL='postgresql://postgres:testonly@127.0.0.1:15433/kite_test' .venv/bin/python -m pytest tests/integration/test_screener_postgres.py -q` | `18 passed`, stable over 8 consecutive runs |
 | Phase 1.5 PostgreSQL hardening (6 tests) | `DATABASE_URL='postgresql+psycopg2://postgres:testonly@127.0.0.1:15433/kite_test' ALERTS_TEST_DATABASE_URL='postgresql://postgres:testonly@127.0.0.1:15433/kite_test' .venv/bin/python -m pytest tests/integration/test_alerts_postgres_hardening.py -q` | `6 passed` |
+| Pre-fix regression probe | same race scenario executed against commit `3728f06` in a detached worktree | `FAILED — NSE:A entered 2 times: ['NSE:A', 'NSE:B', 'NSE:A', 'NSE:C']`; the same scenario passes after the fix |
 
 These counts replace the stale `447` / `11` figures of the previous revision.
 The PostgreSQL suites run against the isolated disposable database only
 (`kite-test-postgres`, port 15433, migrations at `20260910_000015`); without
-`ALERTS_TEST_DATABASE_URL` the module skips cleanly.
+`ALERTS_TEST_DATABASE_URL` the module skips cleanly. Fault-injection suites
+must not share the database with a live worker, and test workflows must be
+named `pg-*` (the `clean_runs` fixture only reclaims that namespace).
 
 ## Measured workload (no certification claim)
 
