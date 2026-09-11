@@ -389,8 +389,25 @@ def session_accepts_exchange(session: object, exchange: object) -> bool:
     return exchange.upper() in SESSION_EXCHANGES.get(session, frozenset())
 
 
+# External producer references (Phase 4 F10): ``external.<producer>.<field>``.
+# The producer is registered at runtime through the signals API, so the
+# compiler validates the SHAPE (a resolvable producer/field pair) rather than
+# the existence of a row it cannot see; an absent, expired, late or revoked
+# producer resolves to unknown at evaluation, never to a signal.
+EXTERNAL_REFERENCE_PATTERN = r"^external\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_]+$"
+EXTERNAL_NAMESPACE = "external"
+
+
+def is_external_field(name: object) -> bool:
+    """True for a well-formed ``external.<producer>.<field>`` reference."""
+    import re
+
+    return isinstance(name, str) and re.match(EXTERNAL_REFERENCE_PATTERN, name) is not None
+
+
 def is_namespaced_field(name: object) -> bool:
-    """True for dotted names that belong to a future capability domain
-    (e.g. ``fundamentals.latest_roce_pct``). These are reported as
-    ``unknown_capability`` rather than ``unknown_field``."""
+    """True for dotted names that belong to a capability domain
+    (e.g. ``fundamentals.latest_roce_pct``, ``external.myproducer.score``).
+    Unknown domains are reported as ``unknown_capability`` rather than
+    ``unknown_field``."""
     return isinstance(name, str) and "." in name

@@ -276,6 +276,15 @@ def _resolve_operand(
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     return float(value)
             return None
+        if isinstance(operand.name, str) and operand.name.startswith("external."):
+            # Phase 4 F10: value from a registered external producer. Absent,
+            # expired, late, future or revoked inputs resolve to unknown, never
+            # to a signal — the loader records the reason for evidence/health.
+            if context:
+                value = context.get(operand.name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return float(value)
+            return None
         if features:
             # Computed-field fallback (screener stored-data fields such as
             # change_pct/turnover are delivered through the features map).

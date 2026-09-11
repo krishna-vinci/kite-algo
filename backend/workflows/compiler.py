@@ -964,6 +964,21 @@ def _validate_operand(
             domain = operand.name.split(".", 1)[0]
             if domain == "fundamentals" and operand.name in registry.FUNDAMENTALS_FIELDS:
                 return  # Phase 2: latest-snapshot fundamentals observation
+            if registry.is_external_field(operand.name):
+                # Phase 4 F10: registered external producer value. The producer
+                # row is created at runtime, so only the shape is checked here;
+                # an unresolvable reference is unknown at evaluation.
+                return
+            if domain == "external":
+                _add(
+                    ValidationIssue(
+                        where,
+                        "bad_value",
+                        f"'{operand.name}' is not a valid external reference; use "
+                        "external.<producer>.<field> with a registered producer name",
+                    )
+                )
+                return
             _add(
                 ValidationIssue(
                     where,

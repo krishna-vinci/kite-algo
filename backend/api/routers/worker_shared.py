@@ -92,6 +92,13 @@ DEFAULT_WORKER_ACTIONS = {
     "workflows:write",
     "workflows:activate",
     "notifications:test",
+    # Phase 4 F10 external producers. Present in the allow-list so a token CAN
+    # be granted them, but deliberately absent from the schema's default set
+    # (backend/api/schemas/worker.py), so no existing token silently gains
+    # producer administration. Submitting values needs the separate producer
+    # credential, never these.
+    "signals:read",
+    "signals:admin",
 }
 _OPTION_PROTECTION_STATE_UNAVAILABLE = "__options_protection_state_unavailable__"
 ALLOWED_V1_MODES = {"paper", "dry_run", "live"}
