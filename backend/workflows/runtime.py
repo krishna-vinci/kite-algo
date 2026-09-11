@@ -945,7 +945,17 @@ class EvaluationWorker:
         # THIS pass's added set so they are indexed and warmed before dispatch.
         await self._sync_universe_memberships()
         current = list(self.workflow_repo.list_active_subscriptions())
-        await self._resolve_instrument_tokens({sub.instrument_key for sub in current})
+        change = await self._resolve_instrument_tokens(
+            {sub.instrument_key for sub in current}
+        )
+        if change is not None and (change.added or change.changed):
+            # A token moved: re-persist the catalog provenance, then RELOAD so
+            # the objects dispatch actually uses carry it. Evidence is copied
+            # from ``sub.config`` in memory, so a database-only update would not
+            # reach this pass's events. The reload costs one query and happens
+            # only when the catalog genuinely moved.
+            await self._rebind_moved_subscriptions(change)
+            current = list(self.workflow_repo.list_active_subscriptions())
         current_by_id = {sub.id: sub for sub in current}
         known_ids = {sub.id for sub in self._subscriptions}
 
@@ -981,9 +991,13 @@ class EvaluationWorker:
         refresh pass retries); a successful pass applies additions, token
         replacements, and authoritative removals to the shared registry and
         rebuilds only the affected feed sources.
+
+        Returns the applied ``BindingChange`` (or None when nothing was
+        resolved), so the caller can re-persist catalog provenance for exactly
+        the subscriptions whose binding moved.
         """
         if self.instrument_resolver is None or not instrument_keys:
-            return
+            return None
         try:
             outcome = self.instrument_resolver(set(instrument_keys))
             if inspect.isawaitable(outcome):
@@ -995,13 +1009,51 @@ class EvaluationWorker:
                 exc_info=True,
             )
             self.health["refresh_failures"] += 1
-            return
+            return None
         try:
             change = self.bindings.apply(resolved or {}, rejected or set())
         except (TypeError, ValueError):
             logger.warning("catalog returned invalid bindings; ignoring pass", exc_info=True)
-            return
+            return None
         await self._apply_binding_change(change)
+        return change
+
+    async def _rebind_moved_subscriptions(self, change: BindingChange) -> None:
+        """Re-persist catalog provenance for subscriptions whose token moved.
+
+        ``sub.config["instrument_binding"]`` is what a new event copies into its
+        immutable evidence (C6), so it must describe the binding the evaluation
+        ACTUALLY used. The registry above tracks tokens for feed construction,
+        but the descriptor — identity and catalog generation — is written by
+        ``ensure_subscriptions``. Without this pass, a token replaced while the
+        worker is running would keep reporting the old generation in the
+        evidence of events evaluated under the new one, which is worse than
+        reporting nothing: it is confidently wrong.
+
+        Only added/changed keys are re-bound, so the cost tracks real catalog
+        movement rather than every refresh, and the single implementation is
+        reused instead of a second binding writer. Existing events are never
+        touched: their snapshot was copied at publication time and stays as it
+        was.
+        """
+        moved = set(change.added) | set(change.changed)
+        if not moved:
+            return
+        revision_ids = sorted({
+            sub.revision_id for sub in self._subscriptions
+            if sub.instrument_key in moved
+        })
+        for revision_id in revision_ids:
+            try:
+                with self.session_factory() as session:
+                    revision = session.get(WorkflowRevision, revision_id)
+                if revision is not None:
+                    self.service.ensure_subscriptions(revision)
+            except Exception:
+                logger.warning(
+                    "failed to re-bind moved subscriptions for revision %s",
+                    revision_id, exc_info=True,
+                )
 
     async def _apply_binding_change(self, change: BindingChange) -> None:
         """Rebuild feed sources after an accepted binding change (C1).

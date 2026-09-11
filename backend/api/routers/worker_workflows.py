@@ -49,7 +49,7 @@ from backend.notifications.repository import Delivery, SqlAlchemyNotificationRep
 from backend.alerts.engine import decide
 from backend.alerts.predicates import Observation, evaluate_stage
 from backend.workflows.compiler import CompiledWorkflow, WorkflowValidationError, compile_document
-from backend.workflows.models import AlertSpec, WorkflowDocument
+from backend.workflows.models import WorkflowDocument
 from backend.workflows.parser import WorkflowParseError, parse_workflow_dict, parse_workflow_yaml
 from backend.workflows.repository import (
     AlertSubscription,
@@ -228,19 +228,6 @@ def _workflow_summary(session: Session, workflow: WorkflowModel) -> WorkflowSumm
         latest_revision=_revision_summary(latest),
         active_revision=_revision_summary(active),
     )
-
-
-def _subscription_config(alert: AlertSpec) -> Dict[str, Any]:
-    return {
-        "cooldown_s": alert.cooldown_s,
-        "rearm_level": alert.rearm_level,
-        "rearm_direction": alert.rearm_direction,
-        "reminder_interval_s": alert.reminder_interval_s,
-        "notify_if_already_true": alert.notify_if_already_true,
-        "expires_at": alert.expires_at,
-        "channels": list(alert.channels),
-        "message": alert.message,
-    }
 
 
 def _workflow_subscription_ids(session: Session, workflow_id: str) -> List[str]:
@@ -815,39 +802,21 @@ async def activate_workflow(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     # Materialize one subscription per (alert, instrument) for the revision.
-    created = 0
-    session = session_factory()
-    try:
-        existing = set(
-            session.execute(
-                select(AlertSubscription.alert_id, AlertSubscription.instrument_key)
-                .where(AlertSubscription.revision_id == revision.id)
-            ).all()
-        )
-        for alert in doc.alerts:
-            for instrument in doc.instruments:
-                key = (alert.id, instrument.key())
-                if key in existing:
-                    continue
-                session.add(
-                    AlertSubscription(
-                        revision_id=revision.id,
-                        alert_id=alert.id,
-                        stage_id=alert.source,
-                        instrument_symbol=instrument.symbol,
-                        instrument_exchange=instrument.exchange,
-                        instrument_key=instrument.key(),
-                        trigger=alert.trigger,
-                        config=_subscription_config(alert),
-                    )
-                )
-                created += 1
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+    #
+    # This delegates to the SAME service call the worker's startup refresh and
+    # the universe-membership path use. Activation previously carried its own
+    # inline copy of this loop, which drifted: it omitted the catalog binding,
+    # so subscriptions created by the API were evaluated without catalog
+    # provenance and their events went out with no `instrument_binding` in
+    # evidence — the C6 contract silently weakened for exactly the rows a user
+    # creates through the API. Sharing one implementation also means re-binding
+    # (a replaced token or a moved catalog generation) happens on activation
+    # too, not only on the worker's next pass.
+    from backend.workflows.service import EvaluationService
+
+    created = EvaluationService(workflow_repo, session_factory).ensure_subscriptions(
+        revision
+    )
 
     return WorkflowMutationResponse(
         workflow_id=workflow_id,
