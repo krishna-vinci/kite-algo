@@ -21,6 +21,8 @@ from ._shared import (
     run_list_params,
     session_headers,
     split_instruments,
+    document_payload,
+    page_params,
 )
 from .fundamentals import (
     FundamentalFeatures,
@@ -69,6 +71,9 @@ _build_historical_date_params = build_historical_date_params
 _fundamentals_scope_params = fundamentals_scope_params
 _normalize_calendar_date_params = normalize_calendar_date_params
 _require_identity_param = require_identity_param
+# Alerts-platform payload helpers (shared byte-for-byte with the async client).
+_document_payload = document_payload
+_page_params = page_params
 
 
 @dataclass(frozen=True)
@@ -79,6 +84,11 @@ class AlgoWorkerConfig:
     token: str
     timeout: float = 10.0
     api_prefix: str = "/api/algo-workers"
+    # The alerts-platform authoring surface lives under a DIFFERENT mount
+    # (`/api/worker/...`), not beneath ``api_prefix``. Keeping it explicit
+    # means the existing worker methods cannot accidentally target the wrong
+    # family, and the platform methods cannot silently 404.
+    platform_prefix: str = "/api"
 
 
 class KiteAlgoWorkerClient:
@@ -968,6 +978,276 @@ class KiteAlgoWorkerClient:
         prefix = "/" + self.config.api_prefix.strip("/")
         suffix = "/" + path.strip("/")
         return f"{base}{prefix}{suffix}"
+
+    def _platform_url(self, path: str) -> str:
+        """URL for the alerts-platform family mounted at ``platform_prefix``."""
+        base = self.config.base_url.rstrip("/")
+        prefix = "/" + self.config.platform_prefix.strip("/")
+        suffix = "/" + path.strip("/")
+        return f"{base}{prefix}{suffix}"
+
+    def _platform_request(self, method: str, path: str, **kwargs: Any) -> JsonDict:
+        return self._request_url(method, self._platform_url(path), **kwargs)
+
+    # -- alerts platform: capabilities / validate / preview -----------------
+
+    def workflow_capabilities(self) -> JsonDict:
+        """Exactly the capabilities the server can evaluate (registry-derived)."""
+        return self._platform_request("GET", "/worker/workflows/capabilities")
+
+    def validate_workflow(self, *, yaml_text: Optional[str] = None,
+                          document: Optional[JsonDict] = None) -> JsonDict:
+        """Validate without persisting. Returns issues rather than raising."""
+        return self._platform_request(
+            "POST", "/worker/workflows/validate",
+            json=_document_payload(yaml_text=yaml_text, document=document),
+        )
+
+    def preview_workflow(self, *, yaml_text: Optional[str] = None,
+                         document: Optional[JsonDict] = None,
+                         observations: Optional[list] = None) -> JsonDict:
+        """Dry-run. Writes nothing, sends nothing, schedules nothing."""
+        payload = _document_payload(yaml_text=yaml_text, document=document)
+        if observations is not None:
+            payload["observations"] = observations
+        return self._platform_request("POST", "/worker/workflows/preview", json=payload)
+
+    # -- alerts platform: workflow CRUD and lifecycle -----------------------
+
+    def create_workflow(self, *, document: Optional[JsonDict] = None,
+                        yaml_text: Optional[str] = None,
+                        idempotency_key: Optional[str] = None) -> JsonDict:
+        """Create a workflow revision.
+
+        Supply ``idempotency_key`` to make a retry safe: the same key returns
+        the original resource instead of creating a duplicate.
+        """
+        payload = _document_payload(yaml_text=yaml_text, document=document)
+        if idempotency_key is not None:
+            payload["idempotency_key"] = require_idempotency_key(idempotency_key)
+        return self._platform_request("POST", "/worker/workflows", json=payload)
+
+    def import_workflow(self, *, yaml_text: str,
+                        idempotency_key: Optional[str] = None) -> JsonDict:
+        payload: JsonDict = {"yaml_text": yaml_text}
+        if idempotency_key is not None:
+            payload["idempotency_key"] = require_idempotency_key(idempotency_key)
+        return self._platform_request("POST", "/worker/workflows/import", json=payload)
+
+    def list_workflows(self, *, limit: int = 50, offset: int = 0) -> JsonDict:
+        return self._platform_request(
+            "GET", "/worker/workflows", params=_page_params(limit, offset)
+        )
+
+    def get_workflow(self, workflow_id: str) -> JsonDict:
+        return self._platform_request("GET", f"/worker/workflows/{workflow_id}")
+
+    def update_workflow(self, workflow_id: str, *, document: Optional[JsonDict] = None,
+                        yaml_text: Optional[str] = None,
+                        expected_revision: Optional[int] = None) -> JsonDict:
+        """Update a workflow.
+
+        ``expected_revision`` guards against lost updates: a mismatch fails with
+        ``REVISION_CONFLICT`` rather than overwriting a concurrent edit.
+        """
+        payload = _document_payload(yaml_text=yaml_text, document=document)
+        if expected_revision is not None:
+            payload["expected_revision"] = int(expected_revision)
+        return self._platform_request(
+            "PATCH", f"/worker/workflows/{workflow_id}", json=payload
+        )
+
+    def activate_workflow(self, workflow_id: str, *, revision: Optional[int] = None) -> JsonDict:
+        payload: JsonDict = {}
+        if revision is not None:
+            payload["revision"] = int(revision)
+        return self._platform_request(
+            "POST", f"/worker/workflows/{workflow_id}/activate", json=payload
+        )
+
+    def pause_workflow(self, workflow_id: str) -> JsonDict:
+        return self._platform_request("POST", f"/worker/workflows/{workflow_id}/pause")
+
+    def resume_workflow(self, workflow_id: str) -> JsonDict:
+        return self._platform_request("POST", f"/worker/workflows/{workflow_id}/resume")
+
+    def archive_workflow(self, workflow_id: str) -> JsonDict:
+        return self._platform_request("POST", f"/worker/workflows/{workflow_id}/archive")
+
+    def workflow_events(self, workflow_id: str, *, limit: int = 50,
+                        offset: int = 0) -> JsonDict:
+        return self._platform_request(
+            "GET", f"/worker/workflows/{workflow_id}/events",
+            params=_page_params(limit, offset),
+        )
+
+    def workflow_health(self, workflow_id: str) -> JsonDict:
+        return self._platform_request("GET", f"/worker/workflows/{workflow_id}/health")
+
+    def export_workflow(self, workflow_id: str, *, revision: Optional[int] = None) -> JsonDict:
+        """Export a revision's canonical document (the round-trippable form)."""
+        params = {} if revision is None else {"revision": int(revision)}
+        return self._platform_request(
+            "GET", f"/worker/workflows/{workflow_id}/export", params=params
+        )
+
+    # -- alerts platform: universes ----------------------------------------
+
+    def create_universe(self, *, name: str, kind: str,
+                        source_config: Optional[JsonDict] = None) -> JsonDict:
+        payload: JsonDict = {"name": name, "kind": kind}
+        if source_config is not None:
+            payload["source_config"] = source_config
+        return self._platform_request("POST", "/worker/universes", json=payload)
+
+    def list_universes(self) -> JsonDict:
+        return self._platform_request("GET", "/worker/universes")
+
+    def get_universe(self, name: str) -> JsonDict:
+        return self._platform_request("GET", f"/worker/universes/{name}")
+
+    def resolve_universe(self, name: str) -> JsonDict:
+        """Resolve and PERSIST a new membership revision."""
+        return self._platform_request("POST", f"/worker/universes/{name}/resolve")
+
+    def universe_revisions(self, name: str, *, limit: int = 50) -> JsonDict:
+        return self._platform_request(
+            "GET", f"/worker/universes/{name}/revisions", params={"limit": int(limit)}
+        )
+
+    def preview_universe(self, *, kind: str, source_config: JsonDict) -> JsonDict:
+        """Resolve membership in memory; nothing is persisted."""
+        return self._platform_request(
+            "POST", "/worker/universes/preview",
+            json={"kind": kind, "source_config": source_config},
+        )
+
+    # -- alerts platform: screeners ----------------------------------------
+
+    def screener_runs(self, workflow_id: str, *, limit: int = 50,
+                      offset: int = 0) -> JsonDict:
+        return self._platform_request(
+            "GET", f"/worker/screeners/{workflow_id}/runs",
+            params=_page_params(limit, offset),
+        )
+
+    def screener_run(self, run_id: str, *, limit: int = 50, offset: int = 0) -> JsonDict:
+        return self._platform_request(
+            "GET", f"/worker/screeners/runs/{run_id}",
+            params=_page_params(limit, offset),
+        )
+
+    def run_screener(self, workflow_id: str, *,
+                     idempotency_key: Optional[str] = None) -> JsonDict:
+        """Trigger a manual run; the same key returns the original run."""
+        params = {}
+        if idempotency_key is not None:
+            params["idempotency_key"] = require_idempotency_key(idempotency_key)
+        return self._platform_request(
+            "POST", f"/worker/screeners/{workflow_id}/runs", params=params
+        )
+
+    def screener_events(self, workflow_id: str, *, limit: int = 50,
+                        offset: int = 0) -> JsonDict:
+        return self._platform_request(
+            "GET", f"/worker/screeners/{workflow_id}/events",
+            params=_page_params(limit, offset),
+        )
+
+    def preview_screener(self, *, document: Optional[JsonDict] = None,
+                         yaml_text: Optional[str] = None) -> JsonDict:
+        """Dry-run over stored data: no run rows, no state, no deliveries."""
+        return self._platform_request(
+            "POST", "/worker/screeners/preview",
+            json=_document_payload(yaml_text=yaml_text, document=document),
+        )
+
+    # -- alerts platform: notification channels -----------------------------
+
+    def list_notification_channels(self) -> JsonDict:
+        return self._platform_request("GET", "/worker/notification-channels")
+
+    def upsert_notification_channel(self, *, name: str, provider: str,
+                                    destination: JsonDict,
+                                    secret_env: Optional[str] = None) -> JsonDict:
+        payload: JsonDict = {"name": name, "provider": provider,
+                             "destination": destination}
+        if secret_env is not None:
+            payload["secret_env"] = secret_env
+        return self._platform_request(
+            "POST", "/worker/notification-channels", json=payload
+        )
+
+    def test_notification_channel(self, channel_id: str) -> JsonDict:
+        """Send a real test message. Requires the notifications:test action."""
+        return self._platform_request(
+            "POST", f"/worker/notification-channels/{channel_id}/test"
+        )
+
+    # -- alerts platform: external signal producers -------------------------
+
+    def list_signal_producers(self) -> JsonDict:
+        return self._platform_request("GET", "/worker/signals/producers")
+
+    def create_signal_producer(self, *, name: str,
+                               value_schema: Optional[JsonDict] = None,
+                               default_ttl_s: int = 3600) -> JsonDict:
+        payload: JsonDict = {"name": name, "default_ttl_s": int(default_ttl_s)}
+        if value_schema is not None:
+            payload["value_schema"] = value_schema
+        return self._platform_request("POST", "/worker/signals/producers", json=payload)
+
+    def get_signal_producer(self, name: str) -> JsonDict:
+        return self._platform_request("GET", f"/worker/signals/producers/{name}")
+
+    def revoke_signal_producer(self, name: str) -> JsonDict:
+        return self._platform_request("POST", f"/worker/signals/producers/{name}/revoke")
+
+    def issue_signal_credential(self, name: str) -> JsonDict:
+        """Issue a producer credential.
+
+        The returned ``secret`` is the ONLY time it is ever shown: it is stored
+        as a hash, so it cannot be retrieved again, and the SDK never logs it.
+        """
+        return self._platform_request(
+            "POST", f"/worker/signals/producers/{name}/credentials"
+        )
+
+    def revoke_signal_credential(self, name: str, token_id: str) -> JsonDict:
+        return self._platform_request(
+            "POST", f"/worker/signals/producers/{name}/credentials/{token_id}/revoke"
+        )
+
+    def submit_signal_value(self, secret: str, *, value: JsonDict, event_time: str,
+                            instrument_key: Optional[str] = None,
+                            expires_at: Optional[str] = None,
+                            idempotency_key: Optional[str] = None) -> JsonDict:
+        """Submit a value as a PRODUCER (its own credential, not a worker token).
+
+        Committed server-side before the response, so a successful return means
+        the value is stored. Supplying ``idempotency_key`` makes a retry safe.
+        """
+        payload: JsonDict = {"value": value, "event_time": event_time}
+        if instrument_key is not None:
+            payload["instrument_key"] = instrument_key
+        if expires_at is not None:
+            payload["expires_at"] = expires_at
+        if idempotency_key is not None:
+            payload["idempotency_key"] = require_idempotency_key(idempotency_key)
+        return self._request_url(
+            "POST", self._platform_url("/worker/signals/values"),
+            json=payload, headers={"Authorization": f"Bearer {secret}"},
+        )
+
+    def list_signal_values(self, producer: str, *, limit: int = 50,
+                           offset: int = 0) -> JsonDict:
+        return self._platform_request(
+            "GET", "/worker/signals/values",
+            params={"producer": producer, **_page_params(limit, offset)},
+        )
+
+    def signals_health(self) -> JsonDict:
+        return self._platform_request("GET", "/worker/signals/health")
 
     def _request(self, method: str, path: str, **kwargs: Any) -> JsonDict:
         return self._request_url(method, self._url(path), **kwargs)

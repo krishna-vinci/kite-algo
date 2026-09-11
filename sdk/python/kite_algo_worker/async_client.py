@@ -19,6 +19,8 @@ from ._shared import (
     session_headers,
     split_instruments,
     require_identity_param,
+    document_payload,
+    page_params,
 )
 from .client import AlgoWorkerConfig, JsonDict
 from .exceptions import KiteAlgoWorkerError, error_for_status
@@ -927,6 +929,257 @@ class AsyncKiteAlgoWorkerClient:
                     return
                 yield decoded
                 current_event = "message"
+
+
+    def _platform_url(self, path: str) -> str:
+        """URL for the alerts-platform family mounted at ``platform_prefix``."""
+        base = self.config.base_url.rstrip("/")
+        prefix = "/" + self.config.platform_prefix.strip("/")
+        suffix = "/" + path.strip("/")
+        return f"{base}{prefix}{suffix}"
+
+    async def _platform_request(self, method: str, path: str, **kwargs: Any) -> JsonDict:
+        return await self._request_url(method, self._platform_url(path), **kwargs)
+
+    # -- alerts platform: capabilities / validate / preview -----------------
+
+    async def workflow_capabilities(self) -> JsonDict:
+        return await self._platform_request("GET", "/worker/workflows/capabilities")
+
+    async def validate_workflow(self, *, yaml_text: Optional[str] = None,
+                                document: Optional[JsonDict] = None) -> JsonDict:
+        return await self._platform_request(
+            "POST", "/worker/workflows/validate",
+            json=_document_payload(yaml_text=yaml_text, document=document),
+        )
+
+    async def preview_workflow(self, *, yaml_text: Optional[str] = None,
+                               document: Optional[JsonDict] = None,
+                               observations: Optional[list] = None) -> JsonDict:
+        payload = _document_payload(yaml_text=yaml_text, document=document)
+        if observations is not None:
+            payload["observations"] = observations
+        return await self._platform_request("POST", "/worker/workflows/preview", json=payload)
+
+    # -- alerts platform: workflow CRUD and lifecycle -----------------------
+
+    async def create_workflow(self, *, document: Optional[JsonDict] = None,
+                              yaml_text: Optional[str] = None,
+                              idempotency_key: Optional[str] = None) -> JsonDict:
+        payload = _document_payload(yaml_text=yaml_text, document=document)
+        if idempotency_key is not None:
+            payload["idempotency_key"] = require_idempotency_key(idempotency_key)
+        return await self._platform_request("POST", "/worker/workflows", json=payload)
+
+    async def import_workflow(self, *, yaml_text: str,
+                              idempotency_key: Optional[str] = None) -> JsonDict:
+        payload: JsonDict = {"yaml_text": yaml_text}
+        if idempotency_key is not None:
+            payload["idempotency_key"] = require_idempotency_key(idempotency_key)
+        return await self._platform_request("POST", "/worker/workflows/import", json=payload)
+
+    async def list_workflows(self, *, limit: int = 50, offset: int = 0) -> JsonDict:
+        return await self._platform_request(
+            "GET", "/worker/workflows", params=_page_params(limit, offset)
+        )
+
+    async def get_workflow(self, workflow_id: str) -> JsonDict:
+        return await self._platform_request("GET", f"/worker/workflows/{workflow_id}")
+
+    async def update_workflow(self, workflow_id: str, *,
+                              document: Optional[JsonDict] = None,
+                              yaml_text: Optional[str] = None,
+                              expected_revision: Optional[int] = None) -> JsonDict:
+        payload = _document_payload(yaml_text=yaml_text, document=document)
+        if expected_revision is not None:
+            payload["expected_revision"] = int(expected_revision)
+        return await self._platform_request(
+            "PATCH", f"/worker/workflows/{workflow_id}", json=payload
+        )
+
+    async def activate_workflow(self, workflow_id: str, *,
+                                revision: Optional[int] = None) -> JsonDict:
+        payload: JsonDict = {}
+        if revision is not None:
+            payload["revision"] = int(revision)
+        return await self._platform_request(
+            "POST", f"/worker/workflows/{workflow_id}/activate", json=payload
+        )
+
+    async def pause_workflow(self, workflow_id: str) -> JsonDict:
+        return await self._platform_request("POST", f"/worker/workflows/{workflow_id}/pause")
+
+    async def resume_workflow(self, workflow_id: str) -> JsonDict:
+        return await self._platform_request("POST", f"/worker/workflows/{workflow_id}/resume")
+
+    async def archive_workflow(self, workflow_id: str) -> JsonDict:
+        return await self._platform_request("POST", f"/worker/workflows/{workflow_id}/archive")
+
+    async def workflow_events(self, workflow_id: str, *, limit: int = 50,
+                             offset: int = 0) -> JsonDict:
+        return await self._platform_request(
+            "GET", f"/worker/workflows/{workflow_id}/events",
+            params=_page_params(limit, offset),
+        )
+
+    async def workflow_health(self, workflow_id: str) -> JsonDict:
+        return await self._platform_request("GET", f"/worker/workflows/{workflow_id}/health")
+
+    async def export_workflow(self, workflow_id: str, *,
+                             revision: Optional[int] = None) -> JsonDict:
+        params = {} if revision is None else {"revision": int(revision)}
+        return await self._platform_request(
+            "GET", f"/worker/workflows/{workflow_id}/export", params=params
+        )
+
+    # -- alerts platform: universes ----------------------------------------
+
+    async def create_universe(self, *, name: str, kind: str,
+                              source_config: Optional[JsonDict] = None) -> JsonDict:
+        payload: JsonDict = {"name": name, "kind": kind}
+        if source_config is not None:
+            payload["source_config"] = source_config
+        return await self._platform_request("POST", "/worker/universes", json=payload)
+
+    async def list_universes(self) -> JsonDict:
+        return await self._platform_request("GET", "/worker/universes")
+
+    async def get_universe(self, name: str) -> JsonDict:
+        return await self._platform_request("GET", f"/worker/universes/{name}")
+
+    async def resolve_universe(self, name: str) -> JsonDict:
+        return await self._platform_request("POST", f"/worker/universes/{name}/resolve")
+
+    async def universe_revisions(self, name: str, *, limit: int = 50) -> JsonDict:
+        return await self._platform_request(
+            "GET", f"/worker/universes/{name}/revisions", params={"limit": int(limit)}
+        )
+
+    async def preview_universe(self, *, kind: str, source_config: JsonDict) -> JsonDict:
+        return await self._platform_request(
+            "POST", "/worker/universes/preview",
+            json={"kind": kind, "source_config": source_config},
+        )
+
+    # -- alerts platform: screeners ----------------------------------------
+
+    async def screener_runs(self, workflow_id: str, *, limit: int = 50,
+                            offset: int = 0) -> JsonDict:
+        return await self._platform_request(
+            "GET", f"/worker/screeners/{workflow_id}/runs",
+            params=_page_params(limit, offset),
+        )
+
+    async def screener_run(self, run_id: str, *, limit: int = 50,
+                           offset: int = 0) -> JsonDict:
+        return await self._platform_request(
+            "GET", f"/worker/screeners/runs/{run_id}",
+            params=_page_params(limit, offset),
+        )
+
+    async def run_screener(self, workflow_id: str, *,
+                           idempotency_key: Optional[str] = None) -> JsonDict:
+        params = {}
+        if idempotency_key is not None:
+            params["idempotency_key"] = require_idempotency_key(idempotency_key)
+        return await self._platform_request(
+            "POST", f"/worker/screeners/{workflow_id}/runs", params=params
+        )
+
+    async def screener_events(self, workflow_id: str, *, limit: int = 50,
+                              offset: int = 0) -> JsonDict:
+        return await self._platform_request(
+            "GET", f"/worker/screeners/{workflow_id}/events",
+            params=_page_params(limit, offset),
+        )
+
+    async def preview_screener(self, *, document: Optional[JsonDict] = None,
+                               yaml_text: Optional[str] = None) -> JsonDict:
+        return await self._platform_request(
+            "POST", "/worker/screeners/preview",
+            json=_document_payload(yaml_text=yaml_text, document=document),
+        )
+
+    # -- alerts platform: notification channels -----------------------------
+
+    async def list_notification_channels(self) -> JsonDict:
+        return await self._platform_request("GET", "/worker/notification-channels")
+
+    async def upsert_notification_channel(self, *, name: str, provider: str,
+                                          destination: JsonDict,
+                                          secret_env: Optional[str] = None) -> JsonDict:
+        payload: JsonDict = {"name": name, "provider": provider,
+                            "destination": destination}
+        if secret_env is not None:
+            payload["secret_env"] = secret_env
+        return await self._platform_request(
+            "POST", "/worker/notification-channels", json=payload
+        )
+
+    async def test_notification_channel(self, channel_id: str) -> JsonDict:
+        return await self._platform_request(
+            "POST", f"/worker/notification-channels/{channel_id}/test"
+        )
+
+    # -- alerts platform: external signal producers -------------------------
+
+    async def list_signal_producers(self) -> JsonDict:
+        return await self._platform_request("GET", "/worker/signals/producers")
+
+    async def create_signal_producer(self, *, name: str,
+                                     value_schema: Optional[JsonDict] = None,
+                                     default_ttl_s: int = 3600) -> JsonDict:
+        payload: JsonDict = {"name": name, "default_ttl_s": int(default_ttl_s)}
+        if value_schema is not None:
+            payload["value_schema"] = value_schema
+        return await self._platform_request(
+            "POST", "/worker/signals/producers", json=payload
+        )
+
+    async def get_signal_producer(self, name: str) -> JsonDict:
+        return await self._platform_request("GET", f"/worker/signals/producers/{name}")
+
+    async def revoke_signal_producer(self, name: str) -> JsonDict:
+        return await self._platform_request(
+            "POST", f"/worker/signals/producers/{name}/revoke"
+        )
+
+    async def issue_signal_credential(self, name: str) -> JsonDict:
+        return await self._platform_request(
+            "POST", f"/worker/signals/producers/{name}/credentials"
+        )
+
+    async def revoke_signal_credential(self, name: str, token_id: str) -> JsonDict:
+        return await self._platform_request(
+            "POST", f"/worker/signals/producers/{name}/credentials/{token_id}/revoke"
+        )
+
+    async def submit_signal_value(self, secret: str, *, value: JsonDict,
+                                 event_time: str,
+                                 instrument_key: Optional[str] = None,
+                                 expires_at: Optional[str] = None,
+                                 idempotency_key: Optional[str] = None) -> JsonDict:
+        payload: JsonDict = {"value": value, "event_time": event_time}
+        if instrument_key is not None:
+            payload["instrument_key"] = instrument_key
+        if expires_at is not None:
+            payload["expires_at"] = expires_at
+        if idempotency_key is not None:
+            payload["idempotency_key"] = require_idempotency_key(idempotency_key)
+        return await self._request_url(
+            "POST", self._platform_url("/worker/signals/values"),
+            json=payload, headers={"Authorization": f"Bearer {secret}"},
+        )
+
+    async def list_signal_values(self, producer: str, *, limit: int = 50,
+                                 offset: int = 0) -> JsonDict:
+        return await self._platform_request(
+            "GET", "/worker/signals/values",
+            params={"producer": producer, **_page_params(limit, offset)},
+        )
+
+    async def signals_health(self) -> JsonDict:
+        return await self._platform_request("GET", "/worker/signals/health")
 
     def _url(self, path: str) -> str:
         base = self.config.base_url.rstrip("/")

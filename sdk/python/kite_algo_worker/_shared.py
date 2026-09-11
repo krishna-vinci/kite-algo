@@ -220,10 +220,39 @@ def normalize_calendar_date_params(
     }
 
 
+
+
+def document_payload(
+    *, yaml_text: Optional[str] = None, document: Optional[JsonDict] = None
+) -> JsonDict:
+    """Build a validate/preview/create payload from exactly one document form.
+
+    The canonical definition may be supplied as YAML text or as a JSON
+    document; supplying both (or neither) is rejected here rather than being
+    sent for the server to guess at.
+    """
+    if (yaml_text is None) == (document is None):
+        raise ValueError("supply exactly one of yaml_text or document")
+    if yaml_text is not None:
+        return {"yaml_text": yaml_text}
+    return {"document": document}
+
+
+def page_params(limit: int, offset: int) -> JsonDict:
+    """Offset/limit pagination parameters with the platform's bounds applied."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
+        raise ValueError("limit must be an integer between 1 and 500")
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    return {"limit": int(limit), "offset": int(offset)}
+
+
 __all__ = [
     "JsonDict",
     "build_create_run_payload",
     "build_heartbeat_payload",
+    "document_payload",
+    "page_params",
     "build_historical_date_params",
     "build_intent_payload",
     "fundamentals_scope_params",

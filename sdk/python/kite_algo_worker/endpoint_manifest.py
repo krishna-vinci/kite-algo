@@ -133,3 +133,70 @@ WORKER_WEBSOCKET_PATHS = (
 )
 
 __all__ = ["EndpointContract", "WORKER_HTTP_ENDPOINTS", "WORKER_WEBSOCKET_PATHS"]
+
+
+# ---------------------------------------------------------------------------
+# Alerts-platform authoring surface (Phase 4 F6/SDK).
+#
+# A CURATED list, deliberately separate from WORKER_HTTP_ENDPOINTS: it covers
+# the operations an operator or a Phase 4 example actually needs, so the SDK
+# obligation is bounded and reviewable rather than "wrap every mounted route".
+# Paths are relative to the platform mount (``AlgoWorkerConfig.platform_prefix``,
+# default ``/api``), NOT to the worker prefix used above.
+#
+# Not wrapped here on purpose: internal/worker-only routes with no authoring
+# story (evaluation-ownership internals, catalog publication, journal, paper
+# runtime). Adding one means adding an entry and both client methods.
+# ---------------------------------------------------------------------------
+
+PLATFORM_OPERATIONS = (
+    # capability discovery + dry runs (read-only, no persistence)
+    _e("GET", "/worker/workflows/capabilities", "workflow_capabilities"),
+    _e("POST", "/worker/workflows/validate", "validate_workflow"),
+    _e("POST", "/worker/workflows/preview", "preview_workflow"),
+    # workflow CRUD and lifecycle
+    _e("POST", "/worker/workflows", "create_workflow", mutates=True),
+    _e("POST", "/worker/workflows/import", "import_workflow", mutates=True),
+    _e("GET", "/worker/workflows", "list_workflows"),
+    _e("GET", "/worker/workflows/{workflow_id}", "get_workflow"),
+    _e("PATCH", "/worker/workflows/{workflow_id}", "update_workflow", mutates=True),
+    _e("POST", "/worker/workflows/{workflow_id}/activate", "activate_workflow", mutates=True),
+    _e("POST", "/worker/workflows/{workflow_id}/pause", "pause_workflow", mutates=True),
+    _e("POST", "/worker/workflows/{workflow_id}/resume", "resume_workflow", mutates=True),
+    _e("POST", "/worker/workflows/{workflow_id}/archive", "archive_workflow", mutates=True),
+    _e("GET", "/worker/workflows/{workflow_id}/events", "workflow_events"),
+    _e("GET", "/worker/workflows/{workflow_id}/health", "workflow_health"),
+    _e("GET", "/worker/workflows/{workflow_id}/export", "export_workflow"),
+    # universes
+    _e("POST", "/worker/universes", "create_universe", mutates=True),
+    _e("GET", "/worker/universes", "list_universes"),
+    _e("GET", "/worker/universes/{name}", "get_universe"),
+    _e("POST", "/worker/universes/{name}/resolve", "resolve_universe", mutates=True),
+    _e("GET", "/worker/universes/{name}/revisions", "universe_revisions"),
+    _e("POST", "/worker/universes/preview", "preview_universe"),
+    # screeners
+    _e("GET", "/worker/screeners/{workflow_id}/runs", "screener_runs"),
+    _e("GET", "/worker/screeners/runs/{run_id}", "screener_run"),
+    _e("POST", "/worker/screeners/{workflow_id}/runs", "run_screener", mutates=True),
+    _e("GET", "/worker/screeners/{workflow_id}/events", "screener_events"),
+    _e("POST", "/worker/screeners/preview", "preview_screener"),
+    # notification channels
+    _e("GET", "/worker/notification-channels", "list_notification_channels"),
+    _e("POST", "/worker/notification-channels", "upsert_notification_channel", mutates=True),
+    _e("POST", "/worker/notification-channels/{channel_id}/test", "test_notification_channel", mutates=True),
+    # external signal producers (Phase 4 F10)
+    _e("GET", "/worker/signals/producers", "list_signal_producers"),
+    _e("POST", "/worker/signals/producers", "create_signal_producer", mutates=True),
+    _e("GET", "/worker/signals/producers/{name}", "get_signal_producer"),
+    _e("POST", "/worker/signals/producers/{name}/revoke", "revoke_signal_producer", mutates=True),
+    _e("POST", "/worker/signals/producers/{name}/credentials", "issue_signal_credential", mutates=True),
+    _e(
+        "POST",
+        "/worker/signals/producers/{name}/credentials/{token_id}/revoke",
+        "revoke_signal_credential",
+        mutates=True,
+    ),
+    _e("POST", "/worker/signals/values", "submit_signal_value", mutates=True),
+    _e("GET", "/worker/signals/values", "list_signal_values"),
+    _e("GET", "/worker/signals/health", "signals_health"),
+)
