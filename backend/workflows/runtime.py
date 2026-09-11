@@ -87,7 +87,7 @@ from typing import (
 )
 from zoneinfo import ZoneInfo
 
-from backend.alerts.predicates import Observation
+from backend.alerts.predicates import Observation, pair_operand_id
 from backend.workflows.feature_engine import FeatureEngine, FeatureSpec  # noqa: F401 (re-export)
 from backend.workflows.feature_planner import (
     SubscriptionPlan,

@@ -286,3 +286,195 @@ def test_collect_pair_operands_finds_nested_references():
     )
     assert len(operands) == 2
     assert {operand.name for operand in operands} == {"pair_ratio", "relative_strength"}
+
+
+# ---------------------------------------------------------------------------
+# worker dispatch path
+# ---------------------------------------------------------------------------
+
+
+def _pair_workflow_document():
+    """A stage whose only condition reads a cross-instrument pair ratio."""
+    return {
+        "version": 1,
+        "name": "pair-dispatch",
+        "session": "nse_equity",
+        "instruments": ["NSE:AAA", "NSE:BBB"],
+        "stages": [
+            {
+                "id": "px",
+                "type": "signal",
+                "clock": "candle_close",
+                "timeframe": "minute",
+                "conditions": {
+                    "all": [
+                        {
+                            "left": {"pair_ratio": {"instrument": "NSE:AAA",
+                                                    "reference": "NSE:BBB"}},
+                            "op": "crosses_above",
+                            "right": {"value": 1.0},
+                        }
+                    ]
+                },
+            }
+        ],
+        "alerts": [
+            {"id": "a", "source": "px", "trigger": "on_transition", "channels": []}
+        ],
+    }
+
+
+class _FullBar:
+    """A complete bar: feature warmup reads OHLCV, not just the close."""
+
+    def __init__(self, ts, close):
+        self.ts = ts
+        self.open = close
+        self.high = close
+        self.low = close
+        self.close = close
+        self.volume = 1.0
+        self.oi = None
+
+
+class _StubHistory:
+    """Bars keyed by instrument, as ``PgCandleHistory`` presents them."""
+
+    def __init__(self, series):
+        self.series = series
+
+    def recent_bars(self, instrument_key, timeframe, limit):
+        bars = sorted(self.series.get(instrument_key, {}).items())[-limit:]
+        return [_FullBar(ts, close) for ts, close in bars]
+
+    def previous_session_levels(self, instrument_key, at):
+        return None
+
+
+class _FakeSource:
+    def __init__(self):
+        self.stopped = False
+
+    async def start(self):
+        return None
+
+    async def stop(self):
+        self.stopped = True
+
+    async def next_observation(self):
+        return None
+
+
+@pytest.fixture()
+def session_factory():
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from backend.notifications.repository import Delivery  # noqa: F401
+    from backend.workflows import advanced_repository  # noqa: F401
+    from backend.workflows.repository import Base
+
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _attach_public_schema(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("ATTACH DATABASE ':memory:' AS public")
+        cursor.close()
+
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    yield factory
+    engine.dispose()
+
+
+def test_worker_dispatch_resolves_a_pair_operand(session_factory):
+    """A pair stage must survive worker startup and dispatch.
+
+    Regression: ``_resolve_pairs`` called ``pair_operand_id``, which
+    ``runtime.py`` never imported, so the FIRST dispatch of a stage with a pair
+    operand raised ``NameError``. That first dispatch happens during STARTUP
+    warmup, so activating a single pair workflow crash-looped the whole worker
+    and stopped EVERY alert — not just the pair one. Component tests passed
+    throughout because they call ``resolve_pair`` directly and never went
+    through dispatch.
+    """
+    import asyncio
+
+    from backend.workflows.compiler import compile_document
+    from backend.workflows.repository import SqlAlchemyWorkflowRepository
+    from backend.workflows.runtime import EvaluationWorker
+    from backend.workflows.service import EvaluationService
+
+    repo = SqlAlchemyWorkflowRepository(session_factory)
+    doc = _pair_workflow_document()
+    compiled = compile_document(parse_workflow_dict(doc))
+    workflow, revision = repo.create_workflow(
+        "owner-1", doc["name"], compiled.document.to_document_dict(),
+        compiled.canonical_hash,
+    )
+    repo.activate_revision(workflow.id, revision.id)
+    active = repo.get_active_revision(workflow.id)
+    EvaluationService(repo, session_factory).ensure_subscriptions(active)
+
+    # AAA/BBB = 90/100 = 0.90 on the completed bar being dispatched.
+    history = _StubHistory({
+        "NSE:AAA": {T0: 90.0},
+        "NSE:BBB": {T0: 100.0},
+    })
+    worker = EvaluationWorker(
+        repo,
+        session_factory,
+        channel_resolver=None,
+        tick_source_factory=lambda key: _FakeSource(),
+        candle_source_factory=lambda key, tf: _FakeSource(),
+        candle_history=history,
+        poll_interval_s=0.01,
+        instrument_resolver=lambda keys: ({k: 1 for k in keys}, set()),
+        renewal=None,
+        owner_id="worker-1",
+    )
+
+    # This is the call that used to raise NameError during warmup.
+    asyncio.run(worker.start())
+
+    from datetime import timezone as _tz
+
+    from backend.alerts.predicates import Observation
+
+    sub = next(s for s in worker._subscriptions if s.stage_id == "px")
+    obs = Observation(
+        ts=T0, epoch_id="candle", ltp=90.0, open=90.0, high=90.0, low=90.0,
+        close=90.0, volume=1.0, final=True,
+    )
+    worker._dispatch(sub, obs)
+
+    # The pair resolved: `crosses_above` records `prev` ONLY when its left
+    # operand produced a number, so an unresolved (unknown) pair would leave
+    # the condition's substate empty — the same way it does for a missing
+    # external value.
+    from sqlalchemy import text
+
+    with session_factory() as session:
+        rows = session.execute(text("select state from evaluation_checkpoints")).scalars().all()
+    assert rows, "dispatch must checkpoint"
+    import json as _json
+
+    state = _json.loads(rows[0]) if isinstance(rows[0], str) else rows[0]
+    conds = state.get("conds") or {}
+    # The canonical key for a pair operand carries the operand's identity, so
+    # this also pins that identity through the dispatch path.
+    keys = [k for k in conds if k.startswith("crosses_above:indicator:pair_ratio:")]
+    assert keys, (
+        f"the pair condition must have been evaluated, not unknown; conds={conds}"
+    )
+    assert "NSE:AAA" in keys[0] and "NSE:BBB" in keys[0]
+    assert conds[keys[0]].get("prev") == pytest.approx(0.9), (
+        "prev must be the computed pair ratio AAA/BBB"
+    )
+    asyncio.run(worker.stop())
