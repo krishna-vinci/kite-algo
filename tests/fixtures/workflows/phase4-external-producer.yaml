@@ -1,0 +1,26 @@
+# Phase 4 example: a registered external producer's value, plus a breadth
+# stage. The producer and its credential are created through
+# /api/worker/signals (see documents/alerts-operations.md); the value is
+# SAMPLED at this stage's candle clock and expires on its own schedule.
+version: 1
+name: phase4-external-producer
+session: nse_equity
+instruments: ["NSE:INFY"]
+stages:
+  - id: model-score
+    type: signal
+    clock: candle_close
+    timeframe: day
+    conditions:
+      all:
+        - left:  {field: external.my-model.score}
+          op: gte
+          right: {value: 80}
+        - left:  {field: close}
+          op: gt
+          right: {value: 1400}
+alerts:
+  - id: model-bullish
+    source: model-score
+    trigger: on_transition
+    channels: []

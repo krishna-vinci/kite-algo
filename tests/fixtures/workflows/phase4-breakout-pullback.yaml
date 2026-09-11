@@ -1,0 +1,25 @@
+# Phase 4 example: a breakout followed by a bounded pullback, measured in
+# ELAPSED EVENT TIME (no exchange calendar is consulted) and capped in bars.
+version: 1
+name: phase4-breakout-pullback
+session: nse_equity
+instruments: ["NSE:RELIANCE"]
+stages:
+  - id: breakout-pullback
+    type: signal
+    clock: candle_close
+    timeframe: 15minute
+    sequence:
+      first:
+        all:
+          - {field: close, op: crosses_above, value: 2900}
+      then:
+        any:
+          - {field: close, op: lt, value: 2850}
+      within: 2h
+      within_bars: 8
+alerts:
+  - id: pullback
+    source: breakout-pullback
+    trigger: once
+    channels: []

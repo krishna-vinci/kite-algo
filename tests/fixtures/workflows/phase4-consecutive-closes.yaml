@@ -1,0 +1,25 @@
+# Phase 4 example: three consecutive finished daily closes above a constant
+# threshold, with hysteresis so a boundary oscillation does not re-fire.
+version: 1
+name: phase4-consecutive-closes
+session: nse_equity
+instruments: ["NSE:INFY", "NSE:TCS"]
+stages:
+  - id: momentum3
+    type: signal
+    clock: candle_close
+    timeframe: day
+    conditions:
+      all:
+        - left:  {field: close}
+          op: gt
+          right: {value: 1500}
+          hysteresis: {release: 1485}
+    consecutive_bars: 3
+alerts:
+  - id: momentum
+    source: momentum3
+    trigger: on_transition
+    max_per_session: 5
+    session_cap_reset: session
+    channels: []

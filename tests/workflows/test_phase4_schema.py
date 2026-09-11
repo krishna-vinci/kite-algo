@@ -464,3 +464,31 @@ def test_capabilities_endpoint_matches_the_registry():
     ):
         assert caps["limits"][key] == value
     assert caps["limits"]["max_instruments"] == 1000
+
+
+# ---------------------------------------------------------------------------
+# shipped Phase 4 fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        "phase4-consecutive-closes.yaml",
+        "phase4-breakout-pullback.yaml",
+        "phase4-breadth-window.yaml",
+        "phase4-pair-ratio.yaml",
+        "phase4-external-producer.yaml",
+    ],
+)
+def test_phase4_fixtures_compile_and_round_trip(fixture):
+    """Every shipped example must compile AND survive the hash round trip."""
+    from backend.workflows.parser import parse_workflow_yaml
+
+    text = open(f"tests/fixtures/workflows/{fixture}").read()
+    parsed = parse_workflow_yaml(text)
+    compiled = compile_document(parsed)
+    again = parse_workflow_dict(parsed.to_document_dict())
+    assert compile_document(again).canonical_hash == compiled.canonical_hash
+    # Re-parsing the exported document reproduces the same document.
+    assert again == parsed

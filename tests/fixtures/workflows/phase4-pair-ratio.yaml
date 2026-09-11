@@ -1,0 +1,25 @@
+# Phase 4 example: an aligned pair ratio and a relative-strength comparison.
+# Both legs use the stage timeframe; the lookback anchor is derived from the
+# head bar, so each return spans the same period.
+version: 1
+name: phase4-pair-ratio
+session: nse_equity
+instruments: ["NSE:TCS"]
+stages:
+  - id: pair
+    type: signal
+    clock: candle_close
+    timeframe: day
+    conditions:
+      all:
+        - left:  {pair_ratio: {instrument: "NSE:TCS", reference: "NSE:INFY"}}
+          op: gt
+          right: {value: 1.05}
+        - left:  {relative_strength: {instrument: "NSE:TCS", reference: "NSE:INFY", lookback: 20}}
+          op: gt
+          right: {value: 2.0}
+alerts:
+  - id: relative
+    source: pair
+    trigger: on_transition
+    channels: []
