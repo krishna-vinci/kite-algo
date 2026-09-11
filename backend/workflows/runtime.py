@@ -806,6 +806,12 @@ class EvaluationWorker:
             "context_misses": 0,
             "unresolved_instruments": 0,
             "binding_revisions": 0,
+            # Phase 6 6A.0 failure isolation.
+            "subscription_failures": 0,
+            "quarantined": 0,
+            "startup_errors": 0,
+            "evaluation_errors": 0,
+            "evaluations_skipped_quarantined": 0,
             "fundamentals_hits": 0,
             "fundamentals_misses": 0,
             "fundamentals_stale": 0,
@@ -845,6 +851,23 @@ class EvaluationWorker:
         # durable checkpoints at startup so a restart does not look like a
         # fleet-wide feed outage.
         self._last_accepted_tick: Dict[str, datetime] = {}
+        # Phase 6 6A.0: per-subscription failure accounting + quarantine, and
+        # the supervisor's task-liveness view.
+        self._sub_failures: Dict[str, Dict[str, Any]] = {}
+        self._quarantined: Dict[str, datetime] = {}
+        self._task_state: Dict[str, Any] = {}
+        try:
+            self.workflow_quarantine_after = max(
+                1, int(os.environ.get("ALERTS_WORKFLOW_QUARANTINE_AFTER", "3"))
+            )
+        except ValueError:
+            self.workflow_quarantine_after = 3
+        try:
+            self.workflow_quarantine_cooldown_s = max(
+                1.0, float(os.environ.get("ALERTS_WORKFLOW_QUARANTINE_COOLDOWN_S", "300"))
+            )
+        except ValueError:
+            self.workflow_quarantine_cooldown_s = 300.0
         self._document_cache: Dict[str, Optional[WorkflowDocument]] = {}
         self._pending_rebuilds: Dict[Tuple[str, Any], datetime] = {}
         self._bg_tasks: List[asyncio.Task] = []
@@ -857,17 +880,33 @@ class EvaluationWorker:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Materialize subscriptions, warm candle rules, open feed sources."""
+        """Materialize subscriptions, warm candle rules, open feed sources.
+
+        Every PER-ITEM step below is individually guarded (Phase 6 6A.0). A
+        single malformed workflow must not be able to abort startup and take
+        down every unrelated alert — that is what happened when one pair stage
+        raised during warmup and crash-looped the whole worker. The pattern is
+        the screener scheduler's: contain the item, count it, keep going.
+        """
         self._ensure_subscription_rows()
         await self._sync_universe_memberships()
-        self._subscriptions = list(self.workflow_repo.list_active_subscriptions())
+        try:
+            self._subscriptions = list(self.workflow_repo.list_active_subscriptions())
+        except Exception:
+            # Nothing was ever going to be evaluated; report and let the
+            # supervisor restart with backoff rather than starting half-blind.
+            logger.error("could not load active subscriptions", exc_info=True)
+            raise
         await self._resolve_instrument_tokens({sub.instrument_key for sub in self._subscriptions})
         self._refresh_unresolved_instruments()
 
         self._ltp_subs = {}
         self._candle_subs = {}
         for sub in self._subscriptions:
-            self._index_subscription(sub)
+            try:
+                self._index_subscription(sub)
+            except Exception as exc:
+                self._note_subscription_failure(sub, "index", exc)
 
         # Warmup-before-live (spec F2): rebuild candle rule state from durable
         # history so the first live bar can fire on a real crossing. The
@@ -875,17 +914,33 @@ class EvaluationWorker:
         # covered by the checkpoint, so warming can never emit historical
         # notifications.
         for (instrument_key, timeframe), group in list(self._candle_subs.items()):
-            await self._warm_candle_group(instrument_key, timeframe, group)
+            try:
+                await self._warm_candle_group(instrument_key, timeframe, group)
+            except Exception as exc:
+                for sub in group:
+                    self._note_subscription_failure(sub, "warmup", exc)
 
         for instrument_key in sorted(self._ltp_subs):
-            source = self.tick_source_factory(instrument_key)
-            await source.start()
-            self._tick_sources[instrument_key] = source
+            try:
+                source = self.tick_source_factory(instrument_key)
+                await source.start()
+                self._tick_sources[instrument_key] = source
+            except Exception as exc:
+                self._note_instrument_failure(instrument_key, "tick_source", exc)
         for (instrument_key, timeframe) in sorted(self._candle_subs):
-            source = self.candle_source_factory(instrument_key, timeframe)
-            await source.start()
-            self._candle_sources[(instrument_key, timeframe)] = source
-        await self._sync_feature_sources()
+            try:
+                source = self.candle_source_factory(instrument_key, timeframe)
+                await source.start()
+                self._candle_sources[(instrument_key, timeframe)] = source
+            except Exception as exc:
+                self._note_instrument_failure(
+                    instrument_key, "candle_source", exc, timeframe=timeframe
+                )
+        try:
+            await self._sync_feature_sources()
+        except Exception as exc:
+            logger.error("feature source sync failed during startup", exc_info=exc)
+            self.health["startup_errors"] += 1
 
         self._resolved_health_file = (
             self.health_file
@@ -1616,6 +1671,123 @@ class EvaluationWorker:
                 return
             self._write_health()
 
+    # ------------------------------------------------------------------
+    # per-subscription failure isolation (Phase 6 6A.0)
+    # ------------------------------------------------------------------
+
+    def _note_subscription_failure(
+        self,
+        sub: ActiveSubscription,
+        stage: str,
+        exc: BaseException,
+        *,
+        quarantine: bool = True,
+    ) -> None:
+        """Record one per-subscription failure and quarantine when it repeats.
+
+        Containment alone would hide a permanently broken workflow behind a log
+        line, so failures are counted per subscription and the subscription is
+        QUARANTINED after ``workflow_quarantine_after`` consecutive failures:
+        it stops being dispatched for ``workflow_quarantine_cooldown_s`` and is
+        then re-probed once, which clears the quarantine if it succeeds. The
+        error stays visible in health (``failures``, ``last_error``,
+        ``last_failure_at``, ``quarantined_until``) — the requirement is
+        bounded blast radius WITH a visible error, not silence.
+
+        Quarantine is deliberately in-memory: a restart re-probes once, which is
+        the right behavior for a transient cause, and the bound is a handful of
+        failed evaluations for one subscription.
+        """
+        sub_id = getattr(sub, "id", None) or str(getattr(sub, "instrument_key", "?"))
+        record = self._sub_failures.setdefault(
+            sub_id, {"failures": 0, "last_error": None, "last_failure_at": None}
+        )
+        record["failures"] = int(record["failures"]) + 1
+        record["last_error"] = f"{stage}: {type(exc).__name__}: {exc}"[:500]
+        record["last_failure_at"] = _utcnow().isoformat()
+        self.health["subscription_failures"] += 1
+        logger.error(
+            "subscription %s failed during %s (failures=%d)",
+            sub_id, stage, record["failures"], exc_info=exc,
+        )
+        if quarantine and record["failures"] >= self.workflow_quarantine_after:
+            until = _utcnow() + timedelta(seconds=self.workflow_quarantine_cooldown_s)
+            record["quarantined_until"] = until.isoformat()
+            self._quarantined[sub_id] = until
+            self.health["quarantined"] += 1
+            logger.error(
+                "subscription %s quarantined until %s after %d consecutive failures",
+                sub_id, until.isoformat(), record["failures"],
+            )
+
+    def _note_instrument_failure(
+        self,
+        instrument_key: str,
+        stage: str,
+        exc: BaseException,
+        *,
+        timeframe: Optional[str] = None,
+    ) -> None:
+        """Record a failure that belongs to an instrument, not one subscription."""
+        for sub in self._subscriptions:
+            if sub.instrument_key != instrument_key:
+                continue
+            if timeframe is not None and getattr(self._stage_for(sub), "timeframe", None) != timeframe:
+                continue
+            self._note_subscription_failure(sub, stage, exc)
+
+    def _note_subscription_success(self, sub: ActiveSubscription) -> None:
+        """Clear failure history and quarantine after a successful evaluation."""
+        sub_id = getattr(sub, "id", None)
+        if sub_id is None:
+            return
+        record = self._sub_failures.get(sub_id)
+        if record is not None and record.get("failures"):
+            record["failures"] = 0
+            record["last_error"] = None
+        if self._quarantined.pop(sub_id, None) is not None:
+            logger.info("subscription %s released from quarantine", sub_id)
+
+    def _is_quarantined(self, sub: ActiveSubscription) -> bool:
+        """Whether this subscription is currently being skipped."""
+        sub_id = getattr(sub, "id", None)
+        if sub_id is None:
+            return False
+        until = self._quarantined.get(sub_id)
+        if until is None:
+            return False
+        if _utcnow() >= until:
+            # Cooldown elapsed: re-probe once and let the outcome decide.
+            self._quarantined.pop(sub_id, None)
+            record = self._sub_failures.get(sub_id)
+            if record is not None:
+                record.pop("quarantined_until", None)
+            logger.info("re-probing previously quarantined subscription %s", sub_id)
+            return False
+        return True
+
+    def failure_snapshot(self) -> Dict[str, Any]:
+        """Per-subscription failure view for health (bounded)."""
+        quarantined = {
+            sub_id: until.isoformat()
+            for sub_id, until in self._quarantined.items()
+            if until > _utcnow()
+        }
+        failing = {
+            sub_id: {
+                "failures": record.get("failures", 0),
+                "last_error": record.get("last_error"),
+                "last_failure_at": record.get("last_failure_at"),
+                "quarantined_until": record.get("quarantined_until"),
+            }
+            for sub_id, record in self._sub_failures.items()
+            if record.get("failures")
+        }
+        return {
+            "subscription_failures": dict(sorted(failing.items())[:20]),
+            "quarantined": dict(sorted(quarantined.items())[:20]),
+        }
+
     def _rejected_tick_counters(self) -> Dict[str, int]:
         """Sum the per-source tick rejections (stale/future/untimed)."""
         totals: Dict[str, int] = {}
@@ -1734,6 +1906,12 @@ class EvaluationWorker:
         snapshot.update(self._ltp_freshness_health())
         # Ticks the source refused before they ever became observations.
         snapshot["rejected_ticks"] = self._rejected_tick_counters()
+        # Phase 6 6A.0: which subscriptions are failing and which are parked, so
+        # a contained failure is still an OPERATOR-VISIBLE one.
+        snapshot.update(self.failure_snapshot())
+        # Required-task liveness as reported by the supervisor.
+        if self._task_state:
+            snapshot["tasks"] = dict(self._task_state)
         # Phase 4 F10: external-producer resolution counters, so "why is this
         # condition unknown" is answerable from health rather than logs. The
         # reasons are counted by name (external_missing, _expired, _late,
@@ -1754,6 +1932,9 @@ class EvaluationWorker:
 
     def _write_health(self) -> None:
         snapshot = self.health_snapshot()
+        # Stamped so a healthcheck can tell a live writer from a stale file on a
+        # persistent container filesystem (Phase 6 6A.0).
+        snapshot["last_health_at"] = _utcnow().isoformat()
         logger.info("worker health: %s", json.dumps(snapshot, default=str))
         path = self._resolved_health_file
         if not path:
@@ -2137,8 +2318,40 @@ class EvaluationWorker:
         features: Optional[dict] = None,
         layers: Optional[list] = None,
     ) -> None:
+        # Quarantine gate first: a subscription that has already failed
+        # repeatedly is skipped entirely until its cooldown elapses, so one
+        # broken workflow cannot keep burning evaluation capacity or flooding
+        # logs. It stays visible in health the whole time.
+        if self._is_quarantined(sub):
+            self.health["evaluations_skipped_quarantined"] += 1
+            return
         self.health["evaluations"] += 1
         self.health["last_evaluated_at"] = _utcnow().isoformat()
+        try:
+            self._dispatch_inner(
+                sub, obs, allow_emit=allow_emit, features=features, layers=layers
+            )
+        except Exception as exc:
+            # Phase 6 6A.0: evaluation-time failures are contained and counted.
+            # Previously the pre-call resolution (pairs/external/breadth) sat
+            # OUTSIDE this guard, so a raising resolver escaped dispatch — and
+            # during startup warmup it escaped start() entirely and crash-looped
+            # the whole worker.
+            self.health["evaluation_errors"] += 1
+            self._note_subscription_failure(sub, "dispatch", exc)
+            return
+        # A completed dispatch means the subscription is working again.
+        self._note_subscription_success(sub)
+
+    def _dispatch_inner(
+        self,
+        sub: ActiveSubscription,
+        obs: Observation,
+        *,
+        allow_emit: bool = True,
+        features: Optional[dict] = None,
+        layers: Optional[list] = None,
+    ) -> None:
         context = None
         levels_loader = getattr(self.candle_history, "previous_session_levels", None)
         if callable(levels_loader):

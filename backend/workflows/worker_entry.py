@@ -37,17 +37,26 @@ inside :func:`main`. Compose/service wiring is deliberately deferred.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import signal
 import sys
 import uuid
-from typing import Any, Callable, Dict, Optional
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional
+
 
 from backend.database_url import resolve_database_url as _resolve_database_url
 
 logger = logging.getLogger("backend.workflows.worker_entry")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
 
 # ``make_resolver`` is a PINNED contract being added to
 # backend.notifications.worker by a parallel change. Import it when present;
@@ -395,6 +404,16 @@ def build_renewal(client: Any, owner_id: str, bindings: Any) -> Callable[[], Any
     return renew
 
 
+@dataclass
+class _SupervisedTask:
+    """One required long-running task under supervision."""
+
+    name: str
+    factory: Any                      # () -> awaitable
+    teardown: Any = None              # () -> awaitable, run before a restart
+    required: bool = True
+
+
 async def supervise(
     worker: Any,
     delivery_worker: Any,
@@ -402,22 +421,62 @@ async def supervise(
     stop: Any,
     delivery_poll_interval_s: float = 2.0,
     screener_scheduler: Any = None,
+    restart_backoff_s: Optional[float] = None,
+    max_consecutive_failures: Optional[int] = None,
+    release_owner: Any = None,
 ) -> list:
-    """Run the evaluation (and delivery, and screener) tasks until ``stop``.
+    """Run the required tasks until ``stop``, restarting crashes with backoff.
 
-    All tasks are cancelled cleanly on shutdown; a task that crashes before
-    the stop signal also triggers shutdown and its error is logged.
+    Phase 6 6A.0 replaces the previous behavior, which cancelled EVERY task as
+    soon as any one finished and only logged the error. That meant a single
+    malformed workflow could stop evaluation, delivery and screeners together,
+    and the process still exited 0 — so the crash looked like a clean shutdown.
+
+    Now a crashed task is contained: its failure is recorded, its resources are
+    torn down (the worker's own ``stop()`` plus the market-runtime owner
+    release, so the replacement does not leave a second owner streaming the
+    same tokens), and a replacement starts after capped exponential backoff.
+    Restarts stop only after ``max_consecutive_failures`` in a row, at which
+    point the task is reported as failed and the caller can exit non-zero.
+    Required-task liveness is published into worker health throughout.
     """
-    tasks = [asyncio.create_task(worker.run(), name="evaluation-worker")]
+    if restart_backoff_s is None:
+        try:
+            restart_backoff_s = float(os.environ.get("ALERTS_TASK_RESTART_BACKOFF_S", "5"))
+        except ValueError:
+            restart_backoff_s = 5.0
+    if max_consecutive_failures is None:
+        try:
+            max_consecutive_failures = int(
+                os.environ.get("ALERTS_TASK_MAX_CONSECUTIVE_FAILURES", "3")
+            )
+        except ValueError:
+            max_consecutive_failures = 3
+
+    specs: List[_SupervisedTask] = [
+        _SupervisedTask(
+            "evaluation-worker",
+            worker.run,
+            getattr(worker, "stop", None),
+            required=True,
+        )
+    ]
     if screener_scheduler is not None:
-        tasks.append(
-            asyncio.create_task(screener_scheduler.run(), name="screener-scheduler")
+        specs.append(
+            _SupervisedTask(
+                "screener-scheduler",
+                screener_scheduler.run,
+                getattr(screener_scheduler, "stop", None),
+                required=True,
+            )
         )
     if delivery_worker is not None and delivery_enabled():
-        tasks.append(
-            asyncio.create_task(
-                delivery_worker.run_forever(delivery_poll_interval_s),
-                name="delivery-worker",
+        specs.append(
+            _SupervisedTask(
+                "delivery-worker",
+                lambda: delivery_worker.run_forever(delivery_poll_interval_s),
+                getattr(delivery_worker, "stop", None),
+                required=True,
             )
         )
     elif delivery_worker is not None:
@@ -425,24 +484,150 @@ async def supervise(
             "ALERTS_DELIVERY_ENABLED is off: delivery task not started; "
             "pending deliveries will NOT be sent"
         )
+
+    live: Dict[asyncio.Task, _SupervisedTask] = {}
+    failures: Dict[str, int] = {spec.name: 0 for spec in specs}
+    exit_reasons: Dict[str, Any] = {}
+
+    def _launch(spec: _SupervisedTask) -> None:
+        _schedule_liveness(
+            worker, spec.name,
+            alive=True,
+            state="running",
+            last_started_at=_utcnow().isoformat(),
+            restarts=failures[spec.name],
+        )
+        task = asyncio.create_task(spec.factory(), name=spec.name)
+        live[task] = spec
+
+    for spec in specs:
+        _launch(spec)
+
     if hasattr(stop, "wait"):
         watcher = asyncio.create_task(stop.wait(), name="stop-watcher")
     else:  # Future-like (tests): already scheduled on the loop
         watcher = asyncio.ensure_future(stop)
+
+    stopping = False
     try:
-        await asyncio.wait(tasks + [watcher], return_when=asyncio.FIRST_COMPLETED)
+        while not stopping and live:
+            done, _pending = await asyncio.wait(
+                list(live.keys()) + [watcher], return_when=asyncio.FIRST_COMPLETED
+            )
+            if watcher in done:
+                stopping = True
+                break
+            # Snapshot before mutating: a restart adds a new task to ``live``.
+            for task in [t for t in done if t in live]:
+                spec = live.pop(task)
+                if task.cancelled():
+                    reason = "cancelled"
+                    exc: Optional[BaseException] = None
+                else:
+                    exc = task.exception()
+                    reason = (
+                        f"{type(exc).__name__}: {exc}" if exc else "ended unexpectedly"
+                    )
+                exit_reasons[spec.name] = reason
+                failures[spec.name] += 1
+                logger.error(
+                    "worker task %s ended (%s); failure %d of %d",
+                    spec.name, reason, failures[spec.name], max_consecutive_failures,
+                    exc_info=exc,
+                )
+                # Tear the failed instance down BEFORE any replacement starts:
+                # stop its feed sources and release the market-runtime owner,
+                # so a restart never leaves the previous owner streaming the
+                # same tokens for the remainder of its lease.
+                for teardown in (
+                    spec.teardown,
+                    release_owner if spec.name == "evaluation-worker" else None,
+                ):
+                    if teardown is None:
+                        continue
+                    try:
+                        result = teardown()
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception:
+                        logger.warning(
+                            "teardown for %s failed", spec.name, exc_info=True
+                        )
+                if failures[spec.name] > max_consecutive_failures:
+                    logger.error(
+                        "worker task %s exceeded %d consecutive failures; not restarting",
+                        spec.name, max_consecutive_failures,
+                    )
+                    _schedule_liveness(
+                        worker, spec.name,
+                        alive=False, state="failed",
+                        restarts=failures[spec.name],
+                        last_exit_reason=reason,
+                    )
+                    continue
+                backoff = min(
+                    restart_backoff_s * (2 ** (failures[spec.name] - 1)), 300.0
+                )
+                _schedule_liveness(
+                    worker, spec.name,
+                    alive=False, state="backing_off",
+                    backoff_s=backoff,
+                    restarts=failures[spec.name],
+                    last_exit_reason=reason,
+                )
+                logger.warning(
+                    "restarting %s in %.1fs", spec.name, backoff
+                )
+                try:
+                    # Interruptible: a stop during backoff must not wait it out.
+                    await asyncio.wait_for(asyncio.shield(watcher), timeout=backoff)
+                    stopping = True
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    raise
+                _launch(spec)
     finally:
         watcher.cancel()
-        for task in tasks:
+        for task in list(live.keys()):
             task.cancel()
-        results = await asyncio.gather(watcher, *tasks, return_exceptions=True)
-    for name, result in zip(["stop-watcher"] + [t.get_name() for t in tasks], results):
-        if isinstance(result, asyncio.CancelledError):
-            continue
-        if isinstance(result, BaseException):
-            logger.error("worker task %s ended with error", name, exc_info=result)
+        await asyncio.gather(watcher, *list(live.keys()), return_exceptions=True)
+        for spec in specs:
+            _schedule_liveness(
+                worker, spec.name,
+                alive=False,
+                state="stopped" if not exit_reasons.get(spec.name) else "failed",
+                restarts=failures[spec.name],
+                last_exit_reason=exit_reasons.get(spec.name),
+            )
     logger.info("all worker tasks stopped")
-    return results
+    return [
+        (spec.name, exit_reasons.get(spec.name)) for spec in specs
+    ]
+
+
+def _schedule_liveness(worker: Any, name: str, **fields: Any) -> None:
+    """Best-effort synchronous publish of task liveness into health."""
+    state = getattr(worker, "_task_state", None)
+    if not isinstance(state, dict):
+        return
+    entry = dict(state.get(name) or {})
+    entry.update(fields)
+    state[name] = entry
+
+
+def task_failures(results: Any) -> List[str]:
+    """Names of supervised tasks that ended with a failure (for the exit code)."""
+    failed: List[str] = []
+    for item in results or ():
+        try:
+            name, reason = item
+        except (TypeError, ValueError):
+            continue
+        if reason:
+            failed.append(str(name))
+    return failed
 
 
 async def _sync_market_runtime_subscriptions(owner_id: str, tokens: Dict[str, int]) -> None:
@@ -784,15 +969,28 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         except (NotImplementedError, RuntimeError):
             pass  # non-main loop / platform without signal handlers
 
-    await supervise(
+    results = await supervise(
         worker,
         delivery_worker,
         stop=stop_signal,
         delivery_poll_interval_s=float(os.environ.get("ALERTS_DELIVERY_POLL_INTERVAL_S", "2.0")),
         screener_scheduler=screener_scheduler,
+        # A restart must release this worker's market-runtime owner before the
+        # replacement subscribes: otherwise the old owner keeps streaming the
+        # same tokens until its lease expires (~90 s), doubling feed load.
+        release_owner=lambda: _sync_market_runtime_subscriptions_runtime_cleanup(
+            runtime_owner_id
+        ),
     )
     await _sync_market_runtime_subscriptions_runtime_cleanup(runtime_owner_id)
     engine.dispose()
+    # Phase 6 6A.0: a task that ended in failure must NOT look like a clean
+    # shutdown. Exiting 0 here is what let a crash-looping worker be reported as
+    # healthy by an orchestrator that only inspects the exit code.
+    failed = task_failures(results)
+    if failed:
+        logger.error("evaluation worker stopped with failed task(s): %s", ", ".join(failed))
+        return 1
     logger.info("evaluation worker stopped")
     return 0
 
