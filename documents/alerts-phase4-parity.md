@@ -169,7 +169,7 @@ demonstrated at a level is marked as such rather than implied.
 
 | Level | Suite | Command | Result |
 | --- | --- | --- | --- |
-| Component + integration | Alerts-platform suites | `.venv/bin/python -m pytest tests/alerts tests/workflows tests/screeners tests/notifications tests/fundamentals tests/api/test_worker_signals.py tests/api/test_worker_screeners.py -q` | `585 passed` |
+| Component + integration | Alerts-platform suites | `.venv/bin/python -m pytest tests/alerts tests/workflows tests/screeners tests/notifications tests/fundamentals tests/api/test_worker_signals.py tests/api/test_worker_screeners.py -q` | `587 passed` |
 | Component + integration | SDK | `.venv/bin/python -m pytest tests/sdk -q` | `255 passed, 1 skipped` |
 | Component | SDK version guard | `.venv/bin/python scripts/check_worker_sdk_version_refs.py` | `All worker SDK version references match 0.10.0` |
 | Component (real PG) | Phase 4 component suite | `ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_alerts_phase4_postgres.py -q` | `16 passed`, stable over 3 consecutive runs |
