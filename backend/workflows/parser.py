@@ -829,19 +829,31 @@ def _is_group_list(items: list) -> bool:
 
 
 def _conditions(raw: Any, path: str, *, group: str = "all") -> tuple[Condition, ...]:
-    """Parse a ``conditions`` block into the ``all`` conditions.
+    """Parse one named group from a ``conditions`` block.
 
-    The block may name a single group (``{all: [...]}``) or all three
-    (``{all: [...], any: [...], not: [...]}``) — the documented form. The
-    ``any``/``not`` groups are parsed by :func:`_condition_groups_from_block`
-    so a layered rule is never silently reduced to its AND group.
+    The block may name ANY non-empty subset of the three groups:
+    ``{all: [...]}``, the fully layered ``{all: [...], any: [...], not: [...]}``
+    (the documented form), or a group-only rule such as ``{any: [...]}``.
+
+    An absent ``all`` group is simply empty, and an empty AND group is True, so
+    an ``any``-only rule evaluates to exactly the OR the author wrote. Requiring
+    ``all`` was an accident of calling this with ``group="all"`` unconditionally:
+    it made a legitimate OR-only rule unauthorable with no semantic reason, even
+    though the sibling group parser (:func:`_condition_groups`) has always
+    accepted any subset. The ``any``/``not`` groups themselves are parsed by
+    :func:`_condition_groups_from_block`, so a layered rule is never silently
+    reduced to its AND group.
     """
     if isinstance(raw, dict):
         for key in raw:
             if not isinstance(key, str) or key not in ("all", "any", "not"):
                 raise _unknown_field(path, key)
+        if not raw:
+            raise _fail(path, "must name at least one of 'all'/'any'/'not'")
         if group not in raw:
-            # `conditions: {}` and friends must name the path, not KeyError.
+            if group == "all" and ("any" in raw or "not" in raw):
+                # OR/NOT-only rule: the AND group is empty (and therefore true).
+                return ()
             raise _fail(path, f"must be a mapping with an '{group}' list of conditions")
         items = raw[group]
     elif isinstance(raw, list):

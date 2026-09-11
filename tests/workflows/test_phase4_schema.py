@@ -603,3 +603,86 @@ def test_evolving_schema_snapshot_still_documents_the_phase4_tables():
         "external_signal_values",
     ):
         assert f"CREATE TABLE IF NOT EXISTS public.{table} " in schema
+
+
+def test_any_only_rule_is_authorable():
+    """An OR-only rule must be authorable, not silently impossible.
+
+    Requiring an `all` group was an accident of parsing stage conditions with
+    ``group="all"`` unconditionally: it made a legitimate ``{any: [...]}`` rule
+    impossible to write, even though the sibling group parser has always
+    accepted any subset and an empty AND group is True (so the semantics were
+    never in question). The rule must parse, compile, and keep the OR group
+    intact through the canonical round trip that hashing relies on.
+    """
+    doc = _stage(conditions={
+        "any": [
+            {"field": "close", "op": "crosses_above", "value": 100},
+            {"field": "close", "op": "crosses_below", "value": 50},
+        ]
+    })
+    stage = parse_workflow_dict(doc).stages[0]
+    assert stage.conditions == (), "the absent AND group is simply empty"
+    assert len(stage.any_conditions) == 2
+    # The semantic content, not just the counts.
+    assert stage.any_conditions[0].left.name == "close"
+    assert stage.any_conditions[1].op == "crosses_below"
+
+    compiled = compile_document(parse_workflow_dict(doc))
+    again = parse_workflow_dict(compiled.document.to_document_dict())
+    assert compile_document(again).canonical_hash == compiled.canonical_hash, (
+        "an OR-only rule must round-trip to the same canonical hash"
+    )
+
+
+def test_not_only_rule_is_authorable():
+    """The same applies to a NOT-only rule."""
+    doc = _stage(conditions={"not": [{"field": "close", "op": "gt", "value": 100}]})
+    stage = parse_workflow_dict(doc).stages[0]
+    assert stage.conditions == ()
+    assert len(stage.not_conditions) == 1
+    assert stage.not_conditions[0].left.name == "close"
+    compile_document(parse_workflow_dict(doc))
+
+
+def test_a_group_block_naming_no_group_is_still_rejected():
+    """`conditions: {}` names nothing — that stays an error, with a true message."""
+    issues = _issues(_stage(conditions={}))
+    assert any("at least one of 'all'/'any'/'not'" in i.message for i in issues), issues
+
+
+def test_any_only_rule_evaluates_as_or_not_and():
+    """Through evaluation, an OR-only rule is satisfied by EITHER condition.
+
+    Both directions are asserted, because only one of them discriminates: an
+    empty AND group is TRUE, so a rule whose OR group were silently IGNORED
+    would still report matched=True. The failing case is what proves the OR
+    group is really evaluated.
+    """
+    from datetime import datetime, timezone
+
+    from backend.alerts.predicates import Observation, evaluate_stage
+
+    def _matched(close):
+        doc = _stage(conditions={
+            "any": [
+                {"field": "close", "op": "crosses_above", "value": 100},
+                {"field": "close", "op": "crosses_above", "value": 50},
+            ]
+        })
+        stage = parse_workflow_dict(doc).stages[0]
+        obs = Observation(
+            ts=datetime(2026, 9, 11, 10, 0, tzinfo=timezone.utc),
+            epoch_id="candle", close=close, ltp=close,
+        )
+        result = evaluate_stage(stage, obs, {"epoch_id": "candle", "conds": {}})
+        return result.matched
+
+    # 75 satisfies the 50 leg only: the OR holds although the 100 leg does
+    # not, which an AND-combined reading would miss.
+    assert _matched(75.0) is True
+    # 25 satisfies neither leg: the OR is FALSE. If the `any` group were
+    # ignored, the empty (TRUE) AND group would have made this True instead.
+    assert _matched(25.0) is False, (
+        "the OR group must actually be evaluated, not ignored"
+    )
