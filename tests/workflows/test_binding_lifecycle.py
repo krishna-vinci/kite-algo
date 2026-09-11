@@ -395,3 +395,46 @@ def test_transient_resolution_failure_does_not_release_bindings(session_factory)
     )
     assert set(worker._tick_sources) == {"NSE:A"}
     asyncio.run(worker.stop())
+
+
+def test_last_subscription_removed_releases_everything(session_factory):
+    """Zero subscriptions must release bindings too, not just a smaller set.
+
+    Guards a subtle shape: the resolution pass skips the catalog call when
+    nothing is required, so an early return placed before the release would
+    leave the LAST binding retained — the worker keeps a live feed for an
+    instrument it no longer evaluates, and the lease keeps it alive, until the
+    process restarts. The empty request is exactly when the release matters
+    most.
+    """
+    harness = _Harness(session_factory)
+    harness.catalog_answers = {"NSE:A": 111}
+    worker = harness.build_worker()
+    harness.worker = worker
+    harness.activate("solo", ["NSE:A"], trigger="on_transition")
+    asyncio.run(worker.start())
+    assert worker.instrument_tokens == {"NSE:A": 111}
+
+    # The only subscription goes away.
+    with session_factory() as session:
+        row = (
+            session.query(AlertSubscription)
+            .filter(AlertSubscription.instrument_key == "NSE:A")
+            .first()
+        )
+        row.state = "archived"
+        session.commit()
+
+    asyncio.run(worker.refresh_subscriptions())
+
+    assert worker.instrument_tokens == {}, (
+        "the last binding must be released, not retained until a restart"
+    )
+    # An empty snapshot makes the renewal a no-op, so the market-runtime lease
+    # is no longer refreshed and its own TTL janitor releases the owner.
+    harness.renewal_snapshots.clear()
+    asyncio.run(harness._renewal())
+    assert harness.renewal_snapshots[-1] == {}
+    released = [s for s in harness.built_sources if s.token == 111]
+    assert released and all(s.stopped for s in released)
+    asyncio.run(worker.stop())

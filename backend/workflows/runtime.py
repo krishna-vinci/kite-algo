@@ -996,31 +996,43 @@ class EvaluationWorker:
         resolved), so the caller can re-persist catalog provenance for exactly
         the subscriptions whose binding moved.
         """
-        if self.instrument_resolver is None or not instrument_keys:
+        if self.instrument_resolver is None:
             return None
-        try:
-            outcome = self.instrument_resolver(set(instrument_keys))
-            if inspect.isawaitable(outcome):
-                outcome = await outcome
-            resolved, rejected = outcome
-        except Exception:
-            logger.warning(
-                "catalog instrument resolution failed; keeping current bindings",
-                exc_info=True,
+        if instrument_keys:
+            try:
+                outcome = self.instrument_resolver(set(instrument_keys))
+                if inspect.isawaitable(outcome):
+                    outcome = await outcome
+                resolved, rejected = outcome
+            except Exception:
+                logger.warning(
+                    "catalog instrument resolution failed; keeping current bindings",
+                    exc_info=True,
+                )
+                self.health["refresh_failures"] += 1
+                return None
+            try:
+                change = self.bindings.apply(resolved or {}, rejected or set())
+            except (TypeError, ValueError):
+                logger.warning(
+                    "catalog returned invalid bindings; ignoring pass", exc_info=True
+                )
+                return None
+        else:
+            # No instrument is required this pass. There is nothing to resolve,
+            # but the release below still has to run: it is the only thing that
+            # stops the lease paying for feeds nothing evaluates any more.
+            change = BindingChange(
+                previous_revision=self.bindings.revision,
+                revision=self.bindings.revision,
             )
-            self.health["refresh_failures"] += 1
-            return None
-        try:
-            change = self.bindings.apply(resolved or {}, rejected or set())
-        except (TypeError, ValueError):
-            logger.warning("catalog returned invalid bindings; ignoring pass", exc_info=True)
-            return None
         # `instrument_keys` is the COMPLETE set of instruments still required
-        # this pass, so anything else in the registry belongs to a subscription
-        # that no longer exists. Releasing it here is what stops a removed
-        # dependency from keeping a market-runtime feed open forever: the
-        # renewal callback publishes the registry snapshot, so a retained key
-        # would be re-subscribed on every lease refresh.
+        # this pass (both call sites pass every active subscription), so
+        # anything else in the registry belongs to a subscription that no
+        # longer exists. Releasing it here is what stops a removed dependency
+        # from keeping a market-runtime feed open: the renewal callback
+        # publishes the registry snapshot, so a retained key would be
+        # re-subscribed on every lease refresh.
         stale = self.bindings.retain_only(instrument_keys)
         if stale:
             logger.info(
@@ -1034,7 +1046,8 @@ class EvaluationWorker:
                 previous_revision=change.previous_revision,
                 revision=self.bindings.revision,
             )
-        await self._apply_binding_change(change)
+        if change.has_changes:
+            await self._apply_binding_change(change)
         return change
 
     async def _rebind_moved_subscriptions(self, change: BindingChange) -> None:
