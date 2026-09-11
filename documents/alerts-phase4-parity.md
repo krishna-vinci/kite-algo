@@ -274,15 +274,15 @@ This is a workload OBSERVATION at modest scale — **NOT** the Phase 6
 | Item | Value |
 | --- | --- |
 | Branch | `development` |
-| Deployed commit | `2754f52` → rebuilt at `DEPLOY_COMMIT` (see "Rebuild" below) |
+| Deployed commit | **`7ce08ee`** — `kite-alerts-worker` and `kite-app` rebuilt and recreated from it |
 | Phase 4 commits | `05cbfc5`, `aa2c1ad`, `5ba407c`, `a1359d9`, `087c1f0`, `af7eeee`, `22db69d`, `d295216`, `cfb49db`, `1e69def`, `2754f52` |
-| Closure commits | `e4a1495` (breadth production wiring), `9c7d046` (frozen migration baseline, D-2) |
+| Closure commits | `e4a1495` (breadth production wiring), `9c7d046` (frozen migration baseline, D-2), `6c718e9` (report correction), `7ce08ee` (auth boundary) |
 | Migration head | **`20260911_000016_alerts_phase4` — applied to the live `kite-postgres`** |
 | Live Phase 4 tables | 7/7 present |
 | Live CHECK | `universes_kind_check` now admits `'screener'`; a screener-kind universe was INSERTed and DELETEd successfully on the live database, so **defect D-1 is fixed in production** |
 | Containers | `kite-alerts-worker` Up (healthy); `kite-app` Up (healthy), serving the new routes |
 | Code verification | `sha256sum` of `runtime.py`, `predicates.py`, `breadth.py`, `external_signals.py`, `pairs.py`, `worker_signals.py` inside the containers matches the checked-out tree |
-| API routes | all 7 `/api/worker/signals/*` paths present in the live OpenAPI document; they and `/api/worker/workflows/capabilities` return **401** without a token, so the auth boundary is enforced rather than open |
+| API routes | all 7 `/api/worker/signals/*` paths present in the live OpenAPI document, and **every** one of them returns **401** without a credential — including the routes with a required query parameter and an incomplete POST body, so the auth boundary is uniform and independent of request shape (verified live after `7ce08ee`) |
 | Worker health | boots with no errors; the new `external_signals` block reports `{hits, misses, unknown_reasons}` |
 | Unit tests run | 572 alerts-platform + 255 SDK |
 | Isolated PostgreSQL | upgrade path, concurrency, fencing, rollback, ingestion durability |
@@ -293,12 +293,22 @@ is healthy and doing nothing because nothing is configured. **No Phase 4
 evaluation has been demonstrated live**, and no notification was sent because
 destination authorization has not been given.
 
-Read-only live verification performed: the migration head, the seven Phase 4
-tables, the repaired universes CHECK (exercised by an insert/delete of a
-screener-kind universe), container health, the seven `/api/worker/signals`
-routes in the live OpenAPI document, and `401` on those routes without a token.
-The from-zero and intermediate-upgrade paths were verified on the isolated
-disposable PostgreSQL, not live.
+Live verification performed (read-only, no evaluation driven):
+
+| Check | Result |
+| --- | --- |
+| Migration head | `20260911_000016` |
+| Phase 4 tables on live | 7/7 present |
+| Repaired `universes.kind` CHECK | exercised by an insert **and delete** of a screener-kind universe on the live database |
+| Container health | `kite-alerts-worker` and `kite-app` both Up (healthy) |
+| Deployed code | `sha256sum` of the seven changed files inside the worker matches `7ce08ee` |
+| API surface | all 7 signals paths mounted; uniform 401 without a credential |
+| Worker boot | no errors; health loop renewing and refreshing; `external_signals` block present |
+
+The from-zero install, the intermediate-revision upgrade, and all fault
+injection were verified on the ISOLATED disposable PostgreSQL, not live. The
+live database was verified read-only plus the reversible universes
+insert/delete; no workflow, producer, value or notification was created there.
 
 ### Outstanding live procedure (for the operator)
 
