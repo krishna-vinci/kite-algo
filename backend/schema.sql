@@ -234,7 +234,10 @@ CREATE TABLE IF NOT EXISTS public.universes (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   owner_id VARCHAR(255) NOT NULL,
   name VARCHAR(255) NOT NULL,
-  kind VARCHAR(16) NOT NULL CHECK (kind IN ('explicit', 'index', 'portfolio')),
+  -- 'screener' is admitted since migration 20260911_000016 (Phase 4): the
+  -- Phase 3 dynamic-universe code path already supported it, but the original
+  -- CHECK rejected it on real PostgreSQL.
+  kind VARCHAR(16) NOT NULL CHECK (kind IN ('explicit', 'index', 'portfolio', 'screener')),
   source_config JSONB NOT NULL DEFAULT '{}'::jsonb,
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -2086,3 +2089,145 @@ CREATE TABLE IF NOT EXISTS public.screener_attachment_state (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (owner_id, workflow_id, workflow_revision_id, attachment_id, instrument_key)
 );
+
+-- =========================================
+-- Alerts Phase 4 F10 — advanced conditions, breadth, session caps and
+-- external signal producers.
+-- Mirrors migration 20260911_000016_alerts_phase4.
+--
+-- Two classes of object: COMPUTED state (breadth threshold/contributions,
+-- session and suppression counters, expiring external values) which rebuilds
+-- on the next evaluation, and USER-AUTHORED configuration (external producer
+-- definitions, their schemas, their credentials) which does not.
+-- =========================================
+
+-- One breadth threshold row per (owner, workflow, revision, stage). Breadth
+-- state is deliberately NOT kept in per-subscription checkpoints: a
+-- workflow-level event cannot be governed by N per-instrument copies.
+CREATE TABLE IF NOT EXISTS public.alert_breadth_state (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id TEXT NOT NULL,
+  workflow_id UUID NOT NULL,
+  revision_id UUID NOT NULL,
+  stage_id TEXT NOT NULL,
+  -- Starts FALSE so the first legitimate crossing notifies.
+  satisfied BOOLEAN NOT NULL DEFAULT false,
+  crossing_seq BIGINT NOT NULL DEFAULT 0,
+  satisfied_since_ts TIMESTAMPTZ,
+  last_fired_ts TIMESTAMPTZ,
+  last_count INTEGER,
+  member_count INTEGER,
+  -- Never moves backwards; excludes future contributions from a count.
+  aggregation_watermark TIMESTAMPTZ,
+  membership_resolved_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (owner_id, workflow_id, revision_id, stage_id)
+);
+
+-- One row per contributing instrument holding its LATEST qualifying trigger,
+-- written with a guarded upsert so a late observation can never overwrite a
+-- newer contribution for the same instrument.
+CREATE TABLE IF NOT EXISTS public.alert_breadth_triggers (
+  id BIGSERIAL PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  workflow_id UUID NOT NULL,
+  revision_id UUID NOT NULL,
+  stage_id TEXT NOT NULL,
+  instrument_key TEXT NOT NULL,
+  last_trigger_ts TIMESTAMPTZ NOT NULL,
+  last_bar_ts TIMESTAMPTZ,
+  universe_revision INTEGER,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (owner_id, workflow_id, revision_id, stage_id, instrument_key)
+);
+CREATE INDEX IF NOT EXISTS idx_breadth_triggers_window
+    ON public.alert_breadth_triggers
+    (workflow_id, revision_id, stage_id, last_trigger_ts);
+
+-- Per-session notification cap, shared atomically across every instrument of
+-- one alert and counting LOGICAL notifications (one per signal event, never
+-- per channel delivery).
+CREATE TABLE IF NOT EXISTS public.alert_session_counters (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id TEXT NOT NULL,
+  workflow_id UUID NOT NULL,
+  revision_id UUID NOT NULL,
+  alert_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  first_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (owner_id, workflow_id, revision_id, alert_id, session_id)
+);
+
+-- Durable record of what was suppressed, so a skipped notification is
+-- inspectable rather than silent.
+CREATE TABLE IF NOT EXISTS public.alert_suppression_counters (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id TEXT NOT NULL,
+  workflow_id UUID NOT NULL,
+  revision_id UUID NOT NULL,
+  alert_id TEXT NOT NULL,
+  session_id TEXT,
+  reason TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  first_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_instrument_key TEXT,
+  last_stage_id TEXT,
+  UNIQUE (owner_id, workflow_id, revision_id, alert_id, session_id, reason)
+);
+CREATE INDEX IF NOT EXISTS idx_suppression_counters_workflow
+    ON public.alert_suppression_counters (workflow_id, reason);
+
+-- USER-AUTHORED configuration: producer identity, owner and value schema.
+CREATE TABLE IF NOT EXISTS public.external_signal_producers (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT true,
+  value_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
+  default_ttl_s INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  revoked_at TIMESTAMPTZ,
+  UNIQUE (owner_id, name)
+);
+
+-- Hash only: the raw secret is returned exactly once at issuance and is never
+-- retrievable, echoed in another response, or logged.
+CREATE TABLE IF NOT EXISTS public.external_signal_producer_credentials (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  producer_id UUID NOT NULL REFERENCES public.external_signal_producers(id) ON DELETE CASCADE,
+  token_id TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_producer_credentials_producer
+    ON public.external_signal_producer_credentials (producer_id, status);
+
+-- Expiring typed values. Durable acceptance precedes the 2xx response; the
+-- consuming stage samples them at its own candle clock, so a value can expire
+-- between evaluations (disclosed, never implied away).
+CREATE TABLE IF NOT EXISTS public.external_signal_values (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  producer_id UUID NOT NULL REFERENCES public.external_signal_producers(id) ON DELETE CASCADE,
+  owner_id TEXT NOT NULL,
+  instrument_key TEXT,
+  event_time TIMESTAMPTZ NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('accepted', 'late')),
+  value JSONB NOT NULL,
+  content_hash TEXT NOT NULL,
+  idempotency_key TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (producer_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_external_values_lookup
+    ON public.external_signal_values (producer_id, instrument_key, event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_external_values_expiry
+    ON public.external_signal_values (expires_at);
