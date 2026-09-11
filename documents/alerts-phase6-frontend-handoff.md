@@ -37,6 +37,7 @@ Backend commits on this assignment:
 | `c2f2ca0` | Canvas layout storage, migration `20260912_000018`, namespaced node identities |
 | `df7bb29` | Operator health, scope-aligned tokens, revision-addressed YAML, `schema.sql` mirrors |
 | `8112ecc` | Operator universes, screeners with attachment baselines, external producers |
+| `b44c388` | Fix: the workflow list declared freshness fields but never populated them |
 | `e422078` | (earlier, same phase) Operator API: workflows CRUD, deliveries + attempts, channels, instrument search, YAML renderer, operator auth |
 | `4d91792`, `d7d5193`, `2ba510f` | (earlier) LTP freshness, failure isolation, level-vs-crossing validation |
 
@@ -44,7 +45,7 @@ Migrations: `20260912_000017` (`delivery_attempts.provider_id`, nullable) and
 `20260912_000018` (`workflow_canvas_layout`). Both additive, both applied from
 zero-to-head on real PostgreSQL, both mirrored in `backend/schema.sql`.
 
-Test evidence: 975 pass in `tests/{workflows,alerts,screeners,notifications,api}`
+Test evidence: 981 pass in `tests/{workflows,alerts,screeners,notifications,api}`
 (20 pre-existing failures, unchanged, in four unrelated auth/control-plane modules —
 they are not caused by this work and are not yours to fix).
 
@@ -1023,8 +1024,8 @@ absolute backend URL.
 
 | Variable | Purpose | Default if unset |
 | --- | --- | --- |
-| `ALERTS_OPERATOR_SCOPES` | comma-separated allowlist of scopes the operator may act as | falls back to `app:<username>` |
-| `ALERTS_OPERATOR_OWNER` | which authorized scope is the default selection | first authorized scope |
+| `ALERTS_OPERATOR_SCOPES` | comma-separated allowlist of scopes the operator may act as | falls back to `app:<username>` (least privilege: reading SDK-created alerts under a token scope needs an explicit config decision) |
+| `ALERTS_OPERATOR_OWNER` | which authorized scope is the default selection | first authorized scope. A configured default that is **not** in the allowlist is ignored rather than honoured, so a misconfiguration cannot widen access |
 | `ALERTS_WORKER_HEALTH_FILE` | path to the alerts worker's health JSON, for the runtime section | `/app/alerts-health.json` |
 | `APP_ALLOWED_CORS_ORIGINS` | origins permitted on unsafe methods | `localhost/127.0.0.1` on `:3000` and `:13000` |
 
@@ -1147,8 +1148,17 @@ started: **there are currently zero alerts references in `frontend-next/`.**
 Test commands used for the claims above:
 
 ```
+# full backend regression for this area: 981 pass, 20 pre-existing failures
 .venv/bin/python -m pytest tests/workflows tests/alerts tests/screeners tests/notifications tests/api -q
-.venv/bin/python -m pytest tests/api/test_alerts_operator.py tests/api/test_alerts_operator_ops.py tests/api/test_alerts_operator_platform.py tests/workflows/test_canvas_layout.py -q
+
+# the operator surface + canvas layout on their own: 115 pass
+.venv/bin/python -m pytest tests/api/test_alerts_operator.py \
+    tests/api/test_alerts_operator_ops.py \
+    tests/api/test_alerts_operator_platform.py \
+    tests/workflows/test_canvas_layout.py -q
+
+# frontend
+cd frontend-next && npm run typecheck && npm run lint && npm run test
 ```
 
 Behavior changes in this assignment were checked by mutation: for every guarantee
