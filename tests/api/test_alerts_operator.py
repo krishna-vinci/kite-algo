@@ -134,6 +134,16 @@ def _app(session_factory, *, authenticated=True, monkeypatch=None):
     return TestClient(app)
 
 
+def _activate(session_factory, workflow, revision):
+    """Activate AND materialize subscriptions, as the activate route does."""
+    from backend.workflows.service import EvaluationService
+
+    repository = SqlAlchemyWorkflowRepository(session_factory)
+    activated = repository.activate_revision(workflow.id, revision.id)
+    EvaluationService(repository, session_factory).ensure_subscriptions(activated)
+    return activated
+
+
 def _seed_workflow(session_factory, owner, name="wf-1", document=None):
     repository = SqlAlchemyWorkflowRepository(session_factory)
     compiled = compile_document(
@@ -767,3 +777,164 @@ def test_yaml_round_trips_to_the_same_canonical_hash(document):
         compile_document(reparsed).canonical_hash
         == compile_document(document_obj).canonical_hash
     )
+
+
+# ---------------------------------------------------------------------------
+# list freshness
+# ---------------------------------------------------------------------------
+
+
+def test_the_list_always_carries_a_populated_freshness_block(session_factory, monkeypatch):
+    """A null freshness is indistinguishable from 'not computed'.
+
+    The list must never report null for freshness: an operator reading the list
+    has to be able to tell "evaluated recently" from "we did not look".
+    """
+    _seed_workflow(session_factory, OPERATOR_SCOPE, name="no-subs")
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    row = client.get(f"{BASE}/workflows").json()["workflows"][0]
+    freshness = row["freshness"]
+    assert freshness is not None
+    assert set(freshness) >= {
+        "last_evaluated_at",
+        "evaluation_age_s",
+        "subscription_count",
+        "stale_subscriptions",
+        "stale",
+        "stale_after_seconds",
+    }
+
+
+def test_a_workflow_with_no_subscriptions_reports_unknown_not_fresh(session_factory, monkeypatch):
+    """Nothing has been evaluated, so 'not stale' would be a claim about nothing."""
+    _seed_workflow(session_factory, OPERATOR_SCOPE, name="draft-only")
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    freshness = client.get(f"{BASE}/workflows").json()["workflows"][0]["freshness"]
+    assert freshness["subscription_count"] == 0
+    assert freshness["stale"] is None, "unknown must not read as 'fresh'"
+    assert freshness["last_evaluated_at"] is None
+
+
+def test_the_list_marks_a_workflow_stale_from_checkpoint_age(session_factory, monkeypatch):
+    """Recency comes from the checkpoint, which advances on every evaluation."""
+    from datetime import datetime, timedelta, timezone as _tz
+
+    from sqlalchemy import select as _select
+
+    from backend.workflows.repository import AlertSubscription, EvaluationCheckpoint
+
+    workflow, revision = _seed_workflow(session_factory, OPERATOR_SCOPE, name="stale-one")
+    _activate(session_factory, workflow, revision)
+    with session_factory() as session:
+        subscription = session.execute(
+            _select(AlertSubscription).where(AlertSubscription.revision_id == revision.id)
+        ).scalars().first()
+        old = datetime.now(_tz.utc) - timedelta(seconds=900)
+        session.add(
+            EvaluationCheckpoint(
+                subscription_id=subscription.id,
+                instrument_key=subscription.instrument_key,
+                epoch_id="e1",
+                state={"last_tick_received_at": old.isoformat()},
+                owner_epoch=1,
+                updated_at=old,
+            )
+        )
+        session.commit()
+
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    freshness = client.get(f"{BASE}/workflows").json()["workflows"][0]["freshness"]
+    assert freshness["subscription_count"] == 1
+    assert freshness["stale"] is True
+    assert freshness["stale_subscriptions"] == 1
+    assert freshness["evaluation_age_s"] >= 800
+    assert freshness["last_evaluated_at"] is not None
+
+
+def test_a_recent_evaluation_is_not_stale(session_factory, monkeypatch):
+    from datetime import datetime, timezone as _tz
+
+    from sqlalchemy import select as _select
+
+    from backend.workflows.repository import AlertSubscription, EvaluationCheckpoint
+
+    workflow, revision = _seed_workflow(session_factory, OPERATOR_SCOPE, name="fresh-one")
+    _activate(session_factory, workflow, revision)
+    with session_factory() as session:
+        subscription = session.execute(
+            _select(AlertSubscription).where(AlertSubscription.revision_id == revision.id)
+        ).scalars().first()
+        session.add(
+            EvaluationCheckpoint(
+                subscription_id=subscription.id,
+                instrument_key=subscription.instrument_key,
+                epoch_id="e1",
+                state={},
+                owner_epoch=1,
+                updated_at=datetime.now(_tz.utc),
+            )
+        )
+        session.commit()
+
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    freshness = client.get(f"{BASE}/workflows").json()["workflows"][0]["freshness"]
+    assert freshness["stale"] is False
+    assert freshness["stale_subscriptions"] == 0
+
+
+def test_freshness_is_computed_per_workflow_not_shared(session_factory, monkeypatch):
+    """One workflow's staleness must not leak onto another's row."""
+    from datetime import datetime, timedelta, timezone as _tz
+
+    from sqlalchemy import select as _select
+
+    from backend.workflows.repository import AlertSubscription, EvaluationCheckpoint
+
+    stale_wf, stale_rev = _seed_workflow(session_factory, OPERATOR_SCOPE, name="wf-stale")
+    fresh_wf, fresh_rev = _seed_workflow(session_factory, OPERATOR_SCOPE, name="wf-fresh")
+    _activate(session_factory, stale_wf, stale_rev)
+    _activate(session_factory, fresh_wf, fresh_rev)
+    with session_factory() as session:
+        for revision, moment in (
+            (stale_rev, datetime.now(_tz.utc) - timedelta(seconds=900)),
+            (fresh_rev, datetime.now(_tz.utc)),
+        ):
+            subscription = session.execute(
+                _select(AlertSubscription).where(AlertSubscription.revision_id == revision.id)
+            ).scalars().first()
+            session.add(
+                EvaluationCheckpoint(
+                    subscription_id=subscription.id,
+                    instrument_key=subscription.instrument_key,
+                    epoch_id="e1",
+                    state={},
+                    owner_epoch=1,
+                    updated_at=moment,
+                )
+            )
+        session.commit()
+
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    by_name = {
+        row["name"]: row["freshness"]
+        for row in client.get(f"{BASE}/workflows").json()["workflows"]
+    }
+    assert by_name["wf-stale"]["stale"] is True
+    assert by_name["wf-fresh"]["stale"] is False
+
+
+def test_a_just_activated_workflow_reports_unknown_freshness(session_factory, monkeypatch):
+    """Subscriptions exist but nothing has evaluated them yet.
+
+    This is the realistic "I just activated it" state. It must read as UNKNOWN,
+    not as fresh: reporting `stale: false` here would tell the operator the feed
+    is fine when no observation has ever been processed.
+    """
+    workflow, revision = _seed_workflow(session_factory, OPERATOR_SCOPE, name="just-activated")
+    _activate(session_factory, workflow, revision)
+
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    freshness = client.get(f"{BASE}/workflows").json()["workflows"][0]["freshness"]
+    assert freshness["subscription_count"] == 1, "subscriptions were materialized"
+    assert freshness["last_evaluated_at"] is None
+    assert freshness["stale"] is None, "never evaluated must not read as fresh"

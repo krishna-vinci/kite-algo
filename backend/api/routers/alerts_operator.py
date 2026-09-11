@@ -174,8 +174,6 @@ def _enrich_workflow(
     workflow whose rule can never emit (e.g. level-only with a transition
     trigger) without the operator opening it.
     """
-    from backend.workflows.repository import AlertSubscription
-
     revisions = session.execute(
         select(WorkflowRevision)
         .where(WorkflowRevision.workflow_id == workflow.id)
@@ -199,11 +197,13 @@ def _enrich_workflow(
         "has_universe": False,
         "alerts": [],
         "channels": [],
-        "last_evaluated_at": None,
-        "last_tick_age_s": None,
-        "stale": None,
         "warnings": [],
         "subscription_count": 0,
+        # Freshness is ALWAYS a populated object, never null: a null here was
+        # indistinguishable from "not computed", which is the same failure mode
+        # as reporting an unknown state as healthy. The detail endpoint refines
+        # this per subscription with tick-level precision.
+        "freshness": _empty_freshness(),
     }
     if latest is None:
         return summary
@@ -246,15 +246,79 @@ def _enrich_workflow(
     except Exception:
         summary["warnings"] = []
 
-    if active is not None:
-        rows = session.execute(
-            select(
-                func.count(AlertSubscription.id),
-                func.max(AlertSubscription.created_at),
-            ).where(AlertSubscription.revision_id == active.id)
-        ).one()
-        summary["subscription_count"] = int(rows[0] or 0)
     return summary
+
+
+def _empty_freshness() -> Dict[str, Any]:
+    return {
+        "last_evaluated_at": None,
+        "evaluation_age_s": None,
+        "subscription_count": 0,
+        "stale_subscriptions": 0,
+        "stale": None,
+        "stale_after_seconds": STALE_AFTER_SECONDS,
+    }
+
+
+def _freshness_for_workflows(
+    session: Any, workflow_ids: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    """Evaluation recency per workflow, in ONE query for the whole page.
+
+    Derived from ``evaluation_checkpoints.updated_at``, which advances on EVERY
+    accepted observation (the service persists a checkpoint even for suppressed
+    evaluations). So for an LTP subscription it doubles as "when did we last
+    receive a usable tick", and for a candle subscription as "when did the last
+    bar complete" — which is why one query can answer the list page's question
+    without reading per-subscription state.
+
+    A workflow with no subscriptions yet reports ``stale: None`` and a zero
+    count, not ``False``: nothing has been evaluated, so "not stale" would be a
+    claim about data that does not exist.
+    """
+    if not workflow_ids:
+        return {}
+    from backend.workflows.repository import (
+        AlertSubscription,
+        EvaluationCheckpoint,
+        WorkflowRevision,
+    )
+
+    rows = session.execute(
+        select(
+            WorkflowRevision.workflow_id,
+            func.count(AlertSubscription.id),
+            func.max(EvaluationCheckpoint.updated_at),
+        )
+        .join(AlertSubscription, AlertSubscription.revision_id == WorkflowRevision.id)
+        .outerjoin(
+            EvaluationCheckpoint,
+            EvaluationCheckpoint.subscription_id == AlertSubscription.id,
+        )
+        .where(WorkflowRevision.workflow_id.in_(workflow_ids))
+        .group_by(WorkflowRevision.workflow_id)
+    ).all()
+
+    now = datetime.now(timezone.utc)
+    result: Dict[str, Dict[str, Any]] = {}
+    for workflow_id, count, latest in rows:
+        total = int(count or 0)
+        entry = _empty_freshness()
+        entry["subscription_count"] = total
+        if latest is not None:
+            moment = latest if latest.tzinfo else latest.replace(tzinfo=timezone.utc)
+            age = max(0.0, (now - moment).total_seconds())
+            entry["last_evaluated_at"] = _iso(latest)
+            entry["evaluation_age_s"] = round(age, 3)
+            if age > STALE_AFTER_SECONDS:
+                # Every subscription is at least this old, because `latest` is
+                # the newest checkpoint across the workflow.
+                entry["stale_subscriptions"] = total
+                entry["stale"] = True
+            else:
+                entry["stale"] = False
+        result[str(workflow_id)] = entry
+    return result
 
 
 def _revision_summary(revision: Optional[WorkflowRevision]) -> Optional[Dict[str, Any]]:
@@ -314,6 +378,11 @@ async def list_workflows(
             _enrich_workflow(session, workflow, session_factory)
             for workflow in workflows
         ]
+        freshness = _freshness_for_workflows(
+            session, [workflow.id for workflow in workflows]
+        )
+    for row in rows:
+        row["freshness"] = freshness.get(row["workflow_id"], _empty_freshness())
     return {"ok": True, "scope": scope, "workflows": rows}
 
 
