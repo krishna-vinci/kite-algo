@@ -201,17 +201,27 @@ This is a workload OBSERVATION at modest scale — **NOT** the Phase 6
 
 ## 7. Deployment status
 
-**Local and isolated only. NOT deployed.**
+**Migrated and deployed on this host (2026-09-11). No live notification sent.**
 
 | Item | Value |
 | --- | --- |
 | Branch | `development` |
-| Phase 4 commits | `05cbfc5`, `aa2c1ad`, `5ba407c`, `a1359d9`, `087c1f0`, `af7eeee`, `22db69d`, `d295216`, `cfb49db` |
-| Migration head | `20260911_000016_alerts_phase4` (applied to the ISOLATED test database only) |
+| Deployed commit | `2754f52` (worker and API built from the same tree) |
+| Phase 4 commits | `05cbfc5`, `aa2c1ad`, `5ba407c`, `a1359d9`, `087c1f0`, `af7eeee`, `22db69d`, `d295216`, `cfb49db`, `1e69def`, `2754f52` |
+| Migration head | **`20260911_000016_alerts_phase4` — applied to the live `kite-postgres`** |
+| Live Phase 4 tables | 7/7 present |
+| Live CHECK | `universes_kind_check` now admits `'screener'`; a screener-kind universe was INSERTed and DELETEd successfully on the live database, so **defect D-1 is fixed in production** |
+| Containers | `kite-alerts-worker` Up (healthy); `kite-app` Up (healthy), serving the new routes |
+| Code verification | `sha256sum` of `runtime.py`, `predicates.py`, `breadth.py`, `external_signals.py`, `pairs.py`, `worker_signals.py` inside the containers matches the checked-out tree |
+| API routes | all 7 `/api/worker/signals/*` paths present in the live OpenAPI document; they and `/api/worker/workflows/capabilities` return **401** without a token, so the auth boundary is enforced rather than open |
+| Worker health | boots with no errors; the new `external_signals` block reports `{hits, misses, unknown_reasons}` |
 | Unit tests run | 572 alerts-platform + 255 SDK |
 | Isolated PostgreSQL | upgrade path, concurrency, fencing, rollback, ingestion durability |
-| Live `kite-postgres` | still at `20260910_000015` — **the Phase 4 migration has NOT been applied** |
-| Live `kite-alerts-worker` | still at `3ce7303` — **not rebuilt** |
+
+**An idle healthy worker is NOT proof of live end-to-end evaluation.** The live
+database has no Phase 4 workflows, so the worker reports `evaluations: 0` — it
+is healthy and doing nothing because nothing is configured. No Phase 4
+evaluation has been demonstrated live.
 
 No live Telegram/ntfy notification was sent: destination authorization for a
 Phase 4 smoke test has not been given.
