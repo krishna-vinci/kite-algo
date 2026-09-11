@@ -9,6 +9,9 @@ from backend.api.routers.worker_screeners import router as worker_screeners_rout
 from backend.api.routers.worker_signals import router as worker_signals_router
 from backend.api.routers.worker_workflows import router as worker_workflows_router
 from backend.api.routers.alerts_operator import router as alerts_operator_router
+from backend.api.routers.alerts_operator_platform import (
+    router as alerts_operator_platform_router,
+)
 from backend.api.routers.analytics import router as analytics_router
 from backend.api.routers.auth import router as auth_router
 from backend.api.routers.control import router as control_router
@@ -45,6 +48,7 @@ ALL_ROUTERS = [
     (worker_universes_router, "/api"),
     (worker_signals_router, "/api"),
     (alerts_operator_router, "/api"),
+    (alerts_operator_platform_router, "/api"),
     (control_router, "/api"),
     (journal_router, "/api"),
     (analytics_router, "/api"),

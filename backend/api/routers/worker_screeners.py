@@ -280,6 +280,19 @@ async def preview_screener(request: Request, payload: ScreenerPreviewRequest):
     """
     token, owner_id = await _authorize(request, "workflows:read")
     _ = token
+    return preview_screener_for(request, owner_id, payload)
+
+
+def preview_screener_for(request: Request, owner_id: str, payload: ScreenerPreviewRequest):
+    """The dry-run itself, with the owner supplied by the caller.
+
+    Split from the route so the app-cookie operator surface can run the SAME
+    preview for its authorized scope instead of a second implementation that
+    could disagree with this one. The worker route passes the owner derived
+    from its token; the operator route passes the owner the server authorized.
+    Taking the owner as an argument (rather than reading it from the request)
+    is what keeps the two from being able to differ.
+    """
     if (payload.yaml_text is None) == (payload.document is None):
         raise HTTPException(
             status_code=422,
