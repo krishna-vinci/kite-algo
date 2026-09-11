@@ -367,14 +367,14 @@ def _preview_evaluate(doc: WorkflowDocument, rows: List[Dict[str, Any]]) -> dict
     }
 
 
-async def workflow_capabilities(request: Request):
-    """Phase 2 discovery: only EXECUTABLE capabilities are exposed (F6/P2-D).
+def capabilities_payload() -> dict:
+    """Build the discovery payload from the SAME registry the compiler uses.
 
-    Compiler validation and this discovery endpoint read the same registry,
-    so a capability listed here is exactly one the worker can evaluate.
+    Kept as a pure function (no request, no auth) so a test can prove that
+    discovery and validation cannot drift: every advertised capability comes
+    from ``backend.workflows.registry``, which is also what
+    ``compile_document`` validates against.
     """
-    token, _ = await _authorize(request, "workflows:read")
-    _ = token
     from backend.workflows import registry as wf_registry
 
     features = {
@@ -389,69 +389,117 @@ async def workflow_capabilities(request: Request):
         }
         for name, spec in sorted(wf_registry.FEATURE_FUNCTIONS.items())
     }
-    return {
-        "ok": True,
-        "capabilities": {
-            "operators": {name: spec.get("kind") for name, spec in sorted(wf_registry.OPERATORS.items())},
-            "fields": sorted(wf_registry.FIELDS),
-            "fundamentals_fields": sorted(wf_registry.FUNDAMENTALS_FIELDS),
-            "fundamentals_source": {
-                "table": "public.fundamentals_features",
-                "description": (
-                    "Latest stored snapshot per bare symbol (Screener.in "
-                    "nightly sync, NSE-listing coverage); NSE:SYMBOL keys "
-                    "resolve, other exchanges are unavailable. Missing rows "
-                    "leave fields unknown, never false. Refreshed by the "
-                    "nightly fundamentals scheduler; on-demand via "
-                    "POST /algo-workers/worker/fundamentals/sync."
-                ),
-                "freshness_keys": [
-                    "fundamentals.acquired_at",
-                    "fundamentals.as_of_date",
-                    "fundamentals.statement_scope",
-                ],
-                "columns": dict(sorted(wf_registry.FUNDAMENTALS_COLUMN_MAP.items())),
-            },
-            "clocks": {
-                name: spec
-                for name, spec in sorted(wf_registry.CLOCK_METADATA.items())
-            },
-            "clock_aliases": dict(sorted(wf_registry.CLOCK_ALIASES.items())),
-            "triggers": sorted(wf_registry.TRIGGERS),
-            "timeframes": sorted(wf_registry.TIMEFRAMES),
-            "sessions": sorted(wf_registry.SESSIONS),
-            "features": features,
-            "arithmetic": sorted(wf_registry.ARITHMETIC_OPS),
-            "limits": {
-                "max_stages": 64,
-                "max_alerts": 256,
-                "max_instruments": 1000,
-                "max_feature_stages": wf_registry.MAX_FEATURE_STAGES,
-                "max_conditions_per_group": wf_registry.MAX_CONDITIONS_PER_GROUP,
-                "max_arithmetic_depth": wf_registry.MAX_ARITHMETIC_DEPTH,
-                "max_input_chain_depth": wf_registry.MAX_INPUT_CHAIN_DEPTH,
-            },
-            "stage_types": ["signal", "filter", "feature"],
-            "universe_ref_kinds": ["universe", "index", "watchlist"],
-            "screener": {
-                "attachment_triggers": ["entry", "exit", "top_n", "rank_delta"],
-                "attachment_hysteresis": {
-                    "top_n": "enter at rank <= entry_rank, exit only when rank > exit_rank",
-                    "entry_exit": "exit_after consecutive absent complete runs (default 1)",
-                },
-                "schedule_calendars": ["nse_equity"],
-                "schedule_note": (
-                    "only nse_equity is calendar-backed; MCX/currency "
-                    "eligibility is feed-driven and provides no session "
-                    "calendar for scheduled scans"
-                ),
-                "stored_data_fields": ["change_pct", "turnover"],
-                "run_statuses": ["running", "complete", "partial", "failed"],
-                "tie_break": "instrument identity (EXCHANGE:SYMBOL) ascending",
-            },
-            "universe_source_kinds": ["explicit", "index", "portfolio", "screener"],
-        },
+    pairs = {
+        name: {
+            "formula": spec["formula"],
+            "fields": list(spec["fields"]),
+            "requires": list(spec["requires"]),
+            "optional": list(spec.get("optional", ())),
+            "unknown_reasons": list(spec["unknown_reasons"]),
+        }
+        for name, spec in sorted(wf_registry.PAIR_COMPUTATIONS.items())
     }
+    return {
+        "operators": {name: spec.get("kind") for name, spec in sorted(wf_registry.OPERATORS.items())},
+        "fields": sorted(wf_registry.FIELDS),
+        "fundamentals_fields": sorted(wf_registry.FUNDAMENTALS_FIELDS),
+        "fundamentals_source": {
+            "table": "public.fundamentals_features",
+            "description": (
+                "Latest stored snapshot per bare symbol (Screener.in "
+                "nightly sync, NSE-listing coverage); NSE:SYMBOL keys "
+                "resolve, other exchanges are unavailable. Missing rows "
+                "leave fields unknown, never false. Refreshed by the "
+                "nightly fundamentals scheduler; on-demand via "
+                "POST /algo-workers/worker/fundamentals/sync."
+            ),
+            "freshness_keys": [
+                "fundamentals.acquired_at",
+                "fundamentals.as_of_date",
+                "fundamentals.statement_scope",
+            ],
+            "columns": dict(sorted(wf_registry.FUNDAMENTALS_COLUMN_MAP.items())),
+        },
+        "clocks": {
+            name: spec
+            for name, spec in sorted(wf_registry.CLOCK_METADATA.items())
+        },
+        "clock_aliases": dict(sorted(wf_registry.CLOCK_ALIASES.items())),
+        "triggers": sorted(wf_registry.TRIGGERS),
+        "timeframes": sorted(wf_registry.TIMEFRAMES),
+        "sessions": sorted(wf_registry.SESSIONS),
+        "features": features,
+        "arithmetic": sorted(wf_registry.ARITHMETIC_OPS),
+        "limits": {
+            "max_stages": 64,
+            "max_alerts": 256,
+            "max_instruments": 1000,
+            "max_feature_stages": wf_registry.MAX_FEATURE_STAGES,
+            "max_conditions_per_group": wf_registry.MAX_CONDITIONS_PER_GROUP,
+            "max_arithmetic_depth": wf_registry.MAX_ARITHMETIC_DEPTH,
+            "max_input_chain_depth": wf_registry.MAX_INPUT_CHAIN_DEPTH,
+            # Phase 4 F10 — derived from the registry, never hard-coded here.
+            "max_consecutive_bars": wf_registry.MAX_CONSECUTIVE_BARS,
+            "max_sequence_within_bars": wf_registry.MAX_SEQUENCE_WITHIN_BARS,
+            "max_breadth_instruments": wf_registry.MAX_BREADTH_INSTRUMENTS,
+            "max_breadth_window_s": wf_registry.MAX_BREADTH_WINDOW_S,
+            "max_per_session": wf_registry.MAX_PER_SESSION,
+        },
+        # Phase 4 F10 surface (registry-derived, so it cannot drift).
+        "stage_types": sorted(wf_registry.STAGE_TYPES),
+        "pairs": pairs,
+        "pair_lookback_bounds": list(wf_registry.PAIR_LOOKBACK_BOUNDS),
+        "pair_max_skew_bars": wf_registry.PAIR_MAX_SKEW_BARS,
+        "breadth_modes": {
+            name: {"implemented": bool(spec.get("implemented"))}
+            for name, spec in sorted(wf_registry.BREADTH_MODES.items())
+        },
+        "breadth_semantics": (
+            "windowed distinct-symbol participation: at least K different "
+            "instruments triggered during the last W. This is NOT simultaneous "
+            "breadth — that mode is reserved and not implemented."
+        ),
+        "hysteresis": {
+            "operators": sorted(wf_registry.HYSTERESIS_OPS),
+            "threshold": "constant only (right: {value: X}); dynamic release operands are not implemented",
+        },
+        "session_cap_resets": sorted(wf_registry.SESSION_CAP_RESETS),
+        "session_cap_note": (
+            "the per-session cap is scoped to (workflow, alert), counts LOGICAL "
+            "notifications (one per signal event, never per channel delivery), "
+            "and resets when the resolved session id changes; MCX/currency "
+            "sessions are feed-driven, so their boundary is the IST date"
+        ),
+        "universe_ref_kinds": ["universe", "index", "watchlist"],
+        "screener": {
+            "attachment_triggers": ["entry", "exit", "top_n", "rank_delta"],
+            "attachment_hysteresis": {
+                "top_n": "enter at rank <= entry_rank, exit only when rank > exit_rank",
+                "entry_exit": "exit_after consecutive absent complete runs (default 1)",
+            },
+            "schedule_calendars": ["nse_equity"],
+            "schedule_note": (
+                "only nse_equity is calendar-backed; MCX/currency "
+                "eligibility is feed-driven and provides no session "
+                "calendar for scheduled scans"
+            ),
+            "stored_data_fields": ["change_pct", "turnover"],
+            "run_statuses": ["running", "complete", "partial", "failed"],
+            "tie_break": "instrument identity (EXCHANGE:SYMBOL) ascending",
+        },
+        "universe_source_kinds": ["explicit", "index", "portfolio", "screener"],
+    }
+
+
+async def workflow_capabilities(request: Request):
+    """Phase 2 discovery (+ Phase 4 F10): only EXECUTABLE capabilities.
+
+    Compiler validation and this discovery endpoint read the same registry,
+    so a capability listed here is exactly one the worker can evaluate.
+    """
+    token, _ = await _authorize(request, "workflows:read")
+    _ = token
+    return {"ok": True, "capabilities": capabilities_payload()}
 
 
 async def validate_workflow(request: Request, payload: WorkflowValidateRequest):

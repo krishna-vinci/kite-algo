@@ -82,6 +82,10 @@ _EPOCH_KEYS = (
     "prev_day_high_broken",
     "prev_day_low_seen",
     "prev_day_low_broken",
+    "hyst_matched",
+    # Phase 4 F10 advanced-condition state lives under its own key and is
+    # cleared with the rest of the epoch.
+    "advanced_stage",
 )
 
 _LEVEL_OPS = ("gt", "gte", "lt", "lte")
@@ -178,6 +182,62 @@ def cond_key(cond: Condition) -> str:
     return f"{cond.op}:{_operand_key(cond.left)}:{_operand_key(cond.right)}"
 
 
+def pair_operand_id(operand: Operand) -> str:
+    """Canonical identity of a cross-instrument pair operand (Phase 4 F10).
+
+    Identity covers the computation, both legs, the lookback and the skew
+    tolerance, so two textually different operands resolving to the same
+    computation share one context entry, and any change to period/legs is a
+    different pair (the value is compared over a different window).
+    """
+    params = dict(operand.params or {})
+    parts = [str(operand.name or "")]
+    for key in ("instrument", "reference", "field", "lookback", "max_skew_bars"):
+        if params.get(key) is not None:
+            parts.append(f"{key}={params[key]}")
+    return "pair:" + ":".join(parts)
+
+
+def _resolve_pair_operand(
+    operand: Operand,
+    obs: Observation,
+    context: Optional[dict],
+) -> Optional[float]:
+    """Resolve a cross-instrument pair value from the caller-supplied context.
+
+    The runtime reads each leg's completed bars and puts the computed value in
+    ``context["pairs"][pair_operand_id(operand)]`` together with a reason when
+    it is unavailable (misaligned, stale, missing, insufficient history,
+    zero denominator). Unknown propagates: a pair that cannot be computed
+    never matches and never fires.
+    """
+    if not context:
+        return None
+    pairs = context.get("pairs")
+    if not isinstance(pairs, dict):
+        return None
+    entry = pairs.get(pair_operand_id(operand))
+    if entry is None:
+        return None
+    value = entry.get("value") if isinstance(entry, dict) else entry
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def pair_unknown_reason(operand: Operand, context: Optional[dict]) -> Optional[str]:
+    """Why a pair operand is unknown (for evidence), or None when it resolved."""
+    if not context:
+        return "pair_missing"
+    pairs = context.get("pairs")
+    if not isinstance(pairs, dict):
+        return "pair_missing"
+    entry = pairs.get(pair_operand_id(operand))
+    if isinstance(entry, dict):
+        return entry.get("reason") or "pair_missing"
+    return None if isinstance(entry, (int, float)) else "pair_missing"
+
+
 def _resolve_operand(
     operand: Operand,
     obs: Observation,
@@ -189,6 +249,8 @@ def _resolve_operand(
         return None
     if operand.kind == "value":
         return operand.value
+    if operand.kind == "pair":
+        return _resolve_pair_operand(operand, obs, context)
     if operand.kind == "field":
         if operand.name in _OBSERVATION_FIELDS:
             value = getattr(obs, operand.name)
@@ -300,9 +362,41 @@ def _evaluate_level_op(cond, obs, sub, context, features):
     if level is None:
         return None
     cur = _resolve_operand(cond.left, obs, context, features)
+    if cur is None:
+        # Left operand unavailable is unknown (state unchanged by the caller).
+        return None
     matched = _compare(cond.op, cur, level)
     evidence = {_left_key(cond.left): cur, "level": level}
+    hysteresis = getattr(cond, "hysteresis", None)
+    if hysteresis is not None:
+        matched = _apply_hysteresis(cond, sub, cur, level, matched)
+        evidence["hysteresis_release"] = hysteresis.release
     return matched, False, evidence, sub
+
+
+def _apply_hysteresis(cond, sub, cur: float, level: float, matched: bool) -> bool:
+    """Explicit condition hysteresis (Phase 4 F10).
+
+    Once matched, the condition stays matched until the value passes back
+    beyond the release level, which buffers boundary oscillation. ``matched``
+    is the raw comparison for this observation; the release bound was
+    validated against the constant threshold at compile time, and an
+    inconsistent bound that somehow reaches evaluation is treated as unknown
+    rather than producing a sticky wrong answer.
+    """
+    release = cond.hysteresis.release
+    if cond.op in ("gt", "gte"):
+        if not release < level:
+            return matched
+        was_matched = bool(sub.get("hyst_matched"))
+        now_matched = matched or (was_matched and cur > release)
+    else:
+        if not release > level:
+            return matched
+        was_matched = bool(sub.get("hyst_matched"))
+        now_matched = matched or (was_matched and cur < release)
+    sub["hyst_matched"] = now_matched
+    return now_matched
 
 
 def _evaluate_cross_op(cond, obs, sub, context, features):
@@ -470,6 +564,174 @@ def _combine_not(matched_list):
     return not m
 
 
+def _evaluate_groups(
+    groups,
+    obs: Observation,
+    working: dict,
+    context: Optional[dict],
+    features: Optional[dict],
+) -> tuple:
+    """Evaluate a list of 3VL condition groups against one observation.
+
+    ``groups`` is a sequence of ``(kind, conditions)`` pairs where kind is
+    ``all``/``any``/``not``. Returns ``(matched, any_fired, evidence, state)``
+    with the same unknown propagation as the stage-level groups: unknown AND
+    true = unknown, unknown OR true = true, NOT unknown = unknown.
+    """
+    evidence: dict = {}
+    matched_list = []
+    any_fired = False
+    for kind, conditions in groups:
+        results = []
+        for cond in conditions:
+            result = evaluate_condition(cond, obs, working, context, features)
+            results.append(result)
+            working = result.state
+            evidence.update(result.evidence)  # keys are cond keys: no clobbering
+        flags = [r.matched for r in results]
+        if any(r.fired for r in results if r.matched is not None):
+            any_fired = True
+        if kind == "all":
+            matched_list.append(_combine_all(flags))
+        elif kind == "any":
+            matched_list.append(_combine_any(flags))
+        else:
+            matched_list.append(_combine_not(flags))
+    return _combine_all(matched_list), any_fired, evidence, working
+
+
+def _group_pairs(stage: Stage) -> list:
+    """The stage's own condition groups as ``(kind, conditions)`` pairs."""
+    groups = [("all", stage.conditions)]
+    if stage.any_conditions:
+        groups.append(("any", stage.any_conditions))
+    if stage.not_conditions:
+        groups.append(("not", stage.not_conditions))
+    return groups
+
+
+def _spec_group_pairs(groups) -> list:
+    """A sequence/breadth ``ConditionGroup`` tuple as ``(kind, conditions)``."""
+    return [(group.kind, group.conditions) for group in groups]
+
+
+def _advanced_state(state: dict, stage_id: str, obs: Observation) -> dict:
+    """Copy a stage's advanced-condition sub-state, resetting on epoch change."""
+    store = state.get("stage_advanced")
+    raw = store.get(stage_id) if isinstance(store, dict) else None
+    sub = dict(raw) if isinstance(raw, dict) else {}
+    prev_epoch = sub.get("epoch_id")
+    if prev_epoch is not None and prev_epoch != obs.epoch_id:
+        return {}
+    return sub
+
+
+def _commit_advanced_state(state: dict, stage_id: str, sub: dict, obs: Observation) -> dict:
+    sub["epoch_id"] = obs.epoch_id
+    out = dict(state)
+    store = dict(out.get("stage_advanced") or {})
+    store[stage_id] = sub
+    out["stage_advanced"] = store
+    return out
+
+
+def _apply_consecutive_bars(
+    required: int, matched: Optional[bool], sub: dict, evidence: dict
+) -> tuple:
+    """N consecutive completed bars where the stage's conditions hold.
+
+    Unknown is NOT true (spec §5.3), so an unknown bar resets the streak — a
+    data gap must never extend a streak. Fires once, on the bar that reaches
+    ``required``; further bars keep the condition matched without re-firing,
+    exactly like a level predicate that was already true.
+    """
+    previous = int(sub.get("streak") or 0)
+    streak = previous + 1 if matched is True else 0
+    sub["streak"] = streak
+    fired = streak >= required and previous < required
+    evidence["consecutive_bars"] = required
+    evidence["consecutive_count"] = streak
+    return (streak >= required), fired, sub
+
+
+def _apply_sequence(
+    stage: Stage,
+    obs: Observation,
+    sub: dict,
+    context: Optional[dict],
+    features: Optional[dict],
+    working: dict,
+) -> tuple:
+    """Bounded A-then-B sequence (Phase 4 F10).
+
+    ``A`` arms on a completed bar; ``B`` may only complete on a bar STRICTLY
+    AFTER the arming bar, so one observation can never satisfy both legs.
+    Bounds are independent and both are enforced when both are supplied:
+    ``within_bars`` counts completed bars consumed since arming (the arming
+    bar itself is 0) and ``within`` compares ELAPSED EVENT TIME, so no
+    exchange calendar is consulted and feed-driven segments stay honest.
+    Unknown bars consume the bar bound but do not invalidate an armed
+    sequence. Firing disarms, so the next A observable can start a new one.
+    """
+    sequence = stage.sequence
+    armed = bool(sub.get("armed"))
+    bars = int(sub.get("bars_since_arm") or 0)
+    armed_ts = sub.get("armed_ts_epoch")
+
+    evidence: dict = {"sequence_within_bars": sequence.within_bars,
+                      "sequence_within_s": sequence.within_s}
+
+    # 1. Expire an armed sequence whose bound has already elapsed.
+    if armed:
+        if sequence.within_bars is not None and bars + 1 > sequence.within_bars:
+            armed = False
+        if (
+            armed
+            and sequence.within_s is not None
+            and armed_ts is not None
+            and (obs.ts.timestamp() - float(armed_ts)) > sequence.within_s
+        ):
+            armed = False
+        if not armed:
+            sub.pop("armed", None)
+            sub.pop("armed_ts_epoch", None)
+            sub.pop("bars_since_arm", None)
+            evidence["sequence_expired"] = True
+
+    current = dict(working)
+    if armed:
+        bars += 1
+        sub["bars_since_arm"] = bars
+        second_matched, _second_fired, second_evidence, current = _evaluate_groups(
+            _spec_group_pairs(sequence.then), obs, current, context, features
+        )
+        evidence.update(second_evidence)
+        evidence["sequence_bars_elapsed"] = bars
+        if second_matched is True:
+            # Completed: disarm so a later A can arm a fresh sequence.
+            sub.pop("armed", None)
+            sub.pop("armed_ts_epoch", None)
+            sub.pop("bars_since_arm", None)
+            return True, True, sub, current
+        # Not yet: the pullback leg simply has not happened on this bar, so the
+        # sequence keeps waiting until its bound expires. A bounded A-then-B
+        # describes "B within the window", not "B on the very next bar", and
+        # an unknown bar consumes the bound without invalidating the sequence.
+        return False, False, sub, current
+
+    first_matched, _first_fired, first_evidence, current = _evaluate_groups(
+        _spec_group_pairs(sequence.first), obs, current, context, features
+    )
+    evidence.update(first_evidence)
+    if first_matched is True:
+        sub["armed"] = True
+        sub["armed_ts_epoch"] = obs.ts.timestamp()
+        sub["armed_bar_ts"] = _iso_ts(obs.ts)
+        sub["bars_since_arm"] = 0
+        evidence["sequence_armed"] = _iso_ts(obs.ts)
+    return False, False, sub, current
+
+
 def evaluate_stage(
     stage: Stage,
     obs: Observation,
@@ -484,6 +746,12 @@ def evaluate_stage(
     with any unknown group result never fires. Every condition is partitioned
     by its canonical key, so evaluating one condition can never leak its
     updated state into another condition's ``prev``/``baseline``/guard keys.
+
+    Phase 4 F10 stage-level machines (``consecutive_bars``, ``sequence``)
+    replace the stage's own ``fired`` signal: their state lives under
+    ``state["stage_advanced"][stage.id]``, is epoch-scoped, and is returned in
+    the same ``PredicateResult.state`` so it rides the existing checkpoint and
+    publication transaction.
     """
     working = dict(state)
     evidence: dict = {}
@@ -510,7 +778,28 @@ def evaluate_stage(
         group_matched.append(_combine_not(_run(stage.not_conditions)))
 
     matched = _combine_all(group_matched)
+
+    # Advanced machines run BEFORE the unknown short-circuit: an unknown bar
+    # must still advance their state (it resets an N-consecutive streak and
+    # consumes a sequence's bar bound), which an early return would skip.
+    if stage.consecutive_bars is not None:
+        sub = _advanced_state(working, stage.id, obs)
+        matched, fired, sub = _apply_consecutive_bars(
+            stage.consecutive_bars, matched, sub, evidence
+        )
+        working = _commit_advanced_state(working, stage.id, sub, obs)
+        return PredicateResult(matched, fired, evidence, working)
+
+    if stage.sequence is not None:
+        sub = _advanced_state(working, stage.id, obs)
+        matched, fired, sub, working = _apply_sequence(
+            stage, obs, sub, context, features, working
+        )
+        working = _commit_advanced_state(working, stage.id, sub, obs)
+        return PredicateResult(matched, fired, evidence, working)
+
     if matched is None:
         return PredicateResult(matched=None, fired=False, evidence=evidence, state=working)
+
     fired = bool(matched) and any_fired
     return PredicateResult(matched, fired, evidence, working)

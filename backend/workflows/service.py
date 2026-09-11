@@ -62,6 +62,7 @@ from sqlalchemy.orm import Session
 
 from backend.alerts.engine import decide
 from backend.alerts.predicates import Observation, PredicateResult, evaluate_stage
+from backend.workflows import advanced_repository
 from backend.workflows.models import AlertSpec, Stage, WorkflowDocument
 from backend.workflows.parser import WorkflowParseError, parse_workflow_dict
 from backend.workflows.registry import stage_uses_fundamentals
@@ -622,7 +623,41 @@ class EvaluationService:
                     session.rollback()
                 self._log_suppression(sub, suppression)
                 return engine_result
-            if engine.emit and allow_emit:
+            # Per-session notification cap (Phase 4 F10). Unlike the storm
+            # budget above, this SKIPS THE NOTIFICATION BUT ADVANCES STATE:
+            # the checkpoint, streak/sequence progress and the counter all
+            # commit, and only the signal event + outbox rows are skipped — a
+            # capped bar must not silently drop out of a consecutive-bar
+            # streak or an armed sequence. The slot is claimed with one guarded
+            # upsert shared across every instrument of the alert, so concurrent
+            # workers cannot both take the last slot.
+            session_capped = False
+            if engine.emit and allow_emit and alert.max_per_session:
+                session_capped = not advanced_repo.reserve_session_slot(
+                    session,
+                    owner_id=sub.owner_id,
+                    workflow_id=sub.workflow_id,
+                    revision_id=sub.revision_id,
+                    alert_id=sub.alert_id,
+                    session_id=session_id or "default",
+                    maximum=int(alert.max_per_session),
+                    now=now,
+                )
+                if session_capped:
+                    advanced_repo.record_suppression(
+                        session,
+                        owner_id=sub.owner_id,
+                        workflow_id=sub.workflow_id,
+                        revision_id=sub.revision_id,
+                        alert_id=sub.alert_id,
+                        session_id=session_id,
+                        reason="session_cap",
+                        instrument_key=sub.instrument_key,
+                        stage_id=sub.stage_id,
+                        now=now,
+                    )
+                    self._log_suppression(sub, "session_cap")
+            if engine.emit and allow_emit and not session_capped:
                 self._record_emission(sub, now)
                 self.workflow_repo.assert_evaluation_owner(
                     sub.id,
@@ -785,6 +820,9 @@ class EvaluationService:
                 suppression_reason = "candle_correction"
             elif not allow_emit and engine.emit:
                 suppression_reason: Optional[str] = "warmup"
+            elif session_capped:
+                # Notification suppressed, state advanced (see the cap above).
+                suppression_reason = "session_cap"
             elif engine.emit:
                 suppression_reason = None if emitted else "duplicate_occurrence"
             elif gap:
