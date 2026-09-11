@@ -44,6 +44,25 @@ async def _authorize(request: Request, action: str) -> tuple[Any, str]:
     return token, _owner_id_for_token(token)
 
 
+# Authorization is a FastAPI DEPENDENCY on every route, not a step inside the
+# handler body: dependencies are solved before the endpoint's own parameters
+# and payload are validated, so an unauthenticated request always gets 401/403
+# rather than a 422 that describes the request shape it should have sent.
+async def _require_signals_read(request: Request) -> tuple[Any, str]:
+    return await _authorize(request, "signals:read")
+
+
+async def _require_signals_admin(request: Request) -> tuple[Any, str]:
+    return await _authorize(request, "signals:admin")
+
+
+async def _require_producer_credential(
+    request: Request, session_factory: Any = Depends(_alerts_db)
+) -> dict:
+    """Producer-credential dependency: resolved before payload validation."""
+    return _resolve_producer(request, session_factory)
+
+
 def _resolve_producer(request: Request, session_factory: Any) -> dict:
     """Resolve a producer credential (never a worker token)."""
     header = request.headers.get("Authorization", "")
@@ -96,8 +115,12 @@ def _producer_payload(producer) -> dict:
 
 
 @router.get("/producers")
-async def list_producers(request: Request, session_factory: Any = Depends(_alerts_db)):
-    _, owner_id = await _authorize(request, "signals:read")
+async def list_producers(
+    request: Request,
+    auth: tuple = Depends(_require_signals_read),
+    session_factory: Any = Depends(_alerts_db),
+):
+    _, owner_id = auth
     session = session_factory()
     try:
         producers = signals.list_producers(session, owner_id=owner_id)
@@ -113,9 +136,10 @@ async def list_producers(request: Request, session_factory: Any = Depends(_alert
 async def create_producer(
     request: Request,
     payload: ProducerCreateRequest,
+    auth: tuple = Depends(_require_signals_admin),
     session_factory: Any = Depends(_alerts_db),
 ):
-    _, owner_id = await _authorize(request, "signals:admin")
+    _, owner_id = auth
     session = session_factory()
     try:
         producer = signals.register_producer(
@@ -136,9 +160,12 @@ async def create_producer(
 
 @router.get("/producers/{name}")
 async def get_producer(
-    request: Request, name: str, session_factory: Any = Depends(_alerts_db)
+    request: Request,
+    name: str,
+    auth: tuple = Depends(_require_signals_read),
+    session_factory: Any = Depends(_alerts_db),
 ):
-    _, owner_id = await _authorize(request, "signals:read")
+    _, owner_id = auth
     session = session_factory()
     try:
         producer = signals.get_producer(session, owner_id=owner_id, name=name)
@@ -151,9 +178,12 @@ async def get_producer(
 
 @router.post("/producers/{name}/revoke")
 async def revoke_producer(
-    request: Request, name: str, session_factory: Any = Depends(_alerts_db)
+    request: Request,
+    name: str,
+    auth: tuple = Depends(_require_signals_admin),
+    session_factory: Any = Depends(_alerts_db),
 ):
-    _, owner_id = await _authorize(request, "signals:admin")
+    _, owner_id = auth
     session = session_factory()
     try:
         producer = signals.revoke_producer(session, owner_id=owner_id, name=name)
@@ -167,10 +197,13 @@ async def revoke_producer(
 
 @router.post("/producers/{name}/credentials", status_code=201)
 async def issue_credential(
-    request: Request, name: str, session_factory: Any = Depends(_alerts_db)
+    request: Request,
+    name: str,
+    auth: tuple = Depends(_require_signals_admin),
+    session_factory: Any = Depends(_alerts_db),
 ):
     """Issue a credential. The secret is returned EXACTLY ONCE, here."""
-    _, owner_id = await _authorize(request, "signals:admin")
+    _, owner_id = auth
     session = session_factory()
     try:
         producer = signals.get_producer(session, owner_id=owner_id, name=name)
@@ -196,9 +229,10 @@ async def revoke_credential(
     request: Request,
     name: str,
     token_id: str,
+    auth: tuple = Depends(_require_signals_admin),
     session_factory: Any = Depends(_alerts_db),
 ):
-    _, owner_id = await _authorize(request, "signals:admin")
+    _, owner_id = auth
     session = session_factory()
     try:
         producer = signals.get_producer(session, owner_id=owner_id, name=name)
@@ -219,13 +253,13 @@ async def revoke_credential(
 async def submit_value(
     request: Request,
     payload: ValueSubmitRequest,
+    producer_ref: dict = Depends(_require_producer_credential),
     session_factory: Any = Depends(_alerts_db),
 ):
     """Submit a typed value as an authorized producer.
 
     The value is committed before this returns, so 2xx means stored.
     """
-    producer_ref = _resolve_producer(request, session_factory)
     session = session_factory()
     try:
         producer = signals.get_producer_by_id(session, producer_ref["id"])
@@ -279,9 +313,10 @@ async def list_values(
     producer: str = Query(..., min_length=1),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    auth: tuple = Depends(_require_signals_read),
     session_factory: Any = Depends(_alerts_db),
 ):
-    _, owner_id = await _authorize(request, "signals:read")
+    _, owner_id = auth
     session = session_factory()
     try:
         record = signals.get_producer(session, owner_id=owner_id, name=producer)
@@ -327,10 +362,11 @@ async def list_values(
 async def signals_health(
     request: Request,
     purge: bool = Query(False, description="Also purge retained expired values"),
+    auth: tuple = Depends(_require_signals_read),
     session_factory: Any = Depends(_alerts_db),
 ):
     """Per-producer counters, including expired/late/unusable state."""
-    _, owner_id = await _authorize(request, "signals:read")
+    _, owner_id = auth
     session = session_factory()
     try:
         if purge:

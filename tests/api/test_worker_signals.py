@@ -322,3 +322,36 @@ def test_health_reports_state_without_secrets(app_and_factory):
     assert entry["accepted"] == 1
     assert "secret" not in entry and "token_hash" not in entry
     assert secret not in response.text
+
+
+def test_unauthenticated_requests_always_get_401_not_a_validation_error(app_and_factory):
+    """The auth boundary must not depend on the request's shape.
+
+    Authorization is a FastAPI dependency, which is solved BEFORE the
+    endpoint's own query/body validation. Without that, a caller sending an
+    incomplete request would get a 422 describing the request shape instead of
+    a 401 — leaking the expected parameters and making the auth boundary
+    inconsistent across routes.
+    """
+    _app, _factory, client = app_and_factory
+    cases = [
+        ("GET", f"{SIGNALS}/producers", None),
+        ("POST", f"{SIGNALS}/producers", {"name": "x"}),      # admin-only
+        ("GET", f"{SIGNALS}/values", None),                    # required query param
+        ("POST", f"{SIGNALS}/values", {"value": {}}),          # incomplete body
+        ("GET", f"{SIGNALS}/health", None),
+    ]
+    for method, url, body in cases:
+        response = client.request(method, url, json=body)
+        assert response.status_code == 401, (
+            f"{method} {url} without a credential returned "
+            f"{response.status_code}, expected 401"
+        )
+
+
+def test_an_authenticated_but_incomplete_request_still_validates(app_and_factory):
+    """Once authorized, ordinary validation applies (401 is not masking it)."""
+    _app, _factory, client = app_and_factory
+    response = client.get(f"{SIGNALS}/values", headers=ADMIN)
+    assert response.status_code == 422
+    assert "producer" in response.text
