@@ -32,7 +32,7 @@ Baseline: HEAD `ae98218` — 457 alerts-platform unit tests, 18 screener-PG,
 
 | Requirement | Status | Where | Evidence |
 | --- | --- | --- | --- |
-| Distinct-symbol aggregation within a window | Closed | `breadth.py` + `alert_breadth_state`/`alert_breadth_triggers` | PG `test_first_crossing_notifies_because_satisfied_starts_false` |
+| Distinct-symbol aggregation within a window | Closed | `service._handle_breadth_observation` (dispatched from `handle_observation`) + `breadth.py` + `alert_breadth_state`/`alert_breadth_triggers` | **Worker path:** `test_k_distinct_contributors_publish_one_workflow_level_event`. **Component (PG):** `test_first_crossing_notifies_because_satisfied_starts_false` |
 | Windowed participation ≠ simultaneous breadth | Closed | labeled windowed; `mode: simultaneous` reserved and REJECTED as not implemented | `test_simultaneous_breadth_is_rejected_as_not_implemented`, capabilities `breadth_modes` |
 | One instrument counts once per window | Closed | one contribution row per instrument, latest trigger wins | PG `test_older_observation_never_rewrites_a_newer_contribution`, `test_concurrent_stages_cannot_interleave_the_windows` |
 | Event-time ordering / arrival-order independence | Closed | monotonic contribution upsert + aggregation watermark; evaluated at the watermark | PG `test_reversed_arrival_order_converges_to_the_same_crossing` |
@@ -114,27 +114,95 @@ Baseline: HEAD `ae98218` — 457 alerts-platform unit tests, 18 screener-PG,
 | `worker_workflows.workflow_capabilities` | `stage_types` and limits were hard-coded literals that could drift from the registry | Extracted to a pure `capabilities_payload()` derived from the registry (`test_capabilities_endpoint_matches_the_registry`) |
 | `external_signals.ingest_value` | Losing an idempotency race rolled back the caller's whole transaction and reported a conflict even for identical content | Uses a savepoint and converges on the winner when the content matches (PG `test_concurrent_duplicate_ingestion_produces_one_row`) |
 
-### Open defect (not Phase 4, not repaired)
+### Defects found by the production-path acceptance tests
 
-**D-2 — from-zero installation is blocked.** `alembic upgrade head` runs
-`20260330_000001_baseline_schema`, which executes `backend/schema.sql`. That
-file ALTERs `signal_events` (Phase 3 section) but the table is created by
-migration `20260908_000011` — later in the same chain. The chain aborts at the
-first statement, so no from-zero install is possible today. Present at
-`ae98218`; pinning test: `test_fresh_database_lifecycle_is_recorded_not_assumed`
-(skips with this reason, so a repair flips it to a real assertion).
+These were invisible to the component tests — which is precisely why the
+worker-path tests were required. Both are recorded because they show what a
+component-only suite would have missed.
+
+| Where | Defect | Fix |
+| --- | --- | --- |
+| `advanced_repository.AlertBreadthTrigger.id` | A bare `BigInteger` primary key, which SQLite cannot autoincrement (only an `INTEGER PRIMARY KEY` is a rowid alias). The ENTIRE SQLite path failed on insert, so breadth was exercised only against PostgreSQL — including in the unit suites that were supposed to cover it | Dialect variant (`BIGSERIAL` on PostgreSQL, `INTEGER` on SQLite), matching the existing `GUID`/`StringArray` decorators |
+| `breadth.evaluate_breadth`, `advanced_repository.upsert_breadth_contribution` | SQLite round-trips datetimes naive, so the watermark comparison and the guarded contribution upsert raised on naive-vs-aware comparison | Normalize through a local `_as_utc` before every comparison |
+| membership freshness reference | Age was measured against the OBSERVATION's event time, so any replayed or late bar looked like stale membership and the aggregate went unknown | Measured against the wall clock (how long ago membership was materialized), which is what freshness actually means; the worker also records `last_refresh_at` at boot, since booting is itself a materialization |
+| re-admission | A departed universe member was never resumed: re-joining left the subscription paused forever, so re-admission silently had no effect | Re-admission resumes the row, clears `universe_departed`, updates the membership revision, and clears the retained breadth contribution under the aggregate's advisory lock |
+| breadth stages with no alert | Accepted at validation but never dispatched, so the workflow was silently dead | Rejected at compile time with a message naming the fix |
+
+### Defect D-2 — from-zero installation was blocked (REPAIRED)
+
+**Was:** `alembic upgrade head` ran `20260330_000001_baseline_schema`, which
+executed `backend/schema.sql` verbatim. Because that file keeps evolving, it
+had grown to contain blocks owned by LATER migrations in the same chain
+(universes 000014, screener runs + `signal_events` workflow columns 000015,
+Phase 4 tables 000016). A from-zero install executed those statements before
+their tables existed and aborted at the first one. Present at `ae98218`.
+
+**Repair:** `backend/alembic/baseline_schema.sql` is a FROZEN snapshot of the
+baseline's own schema with every later migration's blocks removed and a header
+stating new work never belongs there; the baseline migration executes that
+file, while `backend/schema.sql` remains the evolving reference DDL for direct
+from-scratch installs. An already-migrated database is unaffected because the
+baseline revision is already applied there.
+
+**Executed evidence (real PostgreSQL):** from-zero `upgrade head` completes
+(head `20260911_000016`, all 7 Phase 4 tables, all 9 alerts core tables, the
+repaired universes CHECK) — asserted by
+`test_fresh_database_upgrade_to_head_creates_the_full_schema`, which replaces
+the previous skip; an existing database at `20260905_000010` **with rows in it**
+upgrades to head with the rows preserved; and the live database re-upgrades as
+a clean no-op with its data intact. Two guards prevent silent regression
+(`test_frozen_baseline_does_not_contain_later_migrations_schema`,
+`test_evolving_schema_snapshot_still_documents_the_phase4_tables`).
 
 ## 3. Executed evidence
 
-| Suite | Command | Result |
+Evidence is reported at three levels, and they are NOT interchangeable. A
+component test proves a unit behaves; a worker/API test proves the production
+wiring reaches it; only a live run proves the deployment. Anything not
+demonstrated at a level is marked as such rather than implied.
+
+| Level | What it proves | Where |
 | --- | --- | --- |
-| Alerts-platform unit suites | `.venv/bin/python -m pytest tests/alerts tests/workflows tests/screeners tests/notifications tests/fundamentals tests/api/test_worker_signals.py tests/api/test_worker_screeners.py -q` | `572 passed` |
-| SDK | `.venv/bin/python -m pytest tests/sdk -q` | `255 passed, 1 skipped` |
-| SDK version guard | `.venv/bin/python scripts/check_worker_sdk_version_refs.py` | `All worker SDK version references match 0.10.0` |
-| Phase 4 PostgreSQL | `ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_alerts_phase4_postgres.py -q` | `16 passed`, stable over 3 consecutive runs |
-| Universe-kind lifecycles | `ALERTS_TEST_DATABASE_URL=... ALERTS_FRESH_DATABASE_URL=... ALERTS_SCHEMA_DATABASE_URL=... pytest tests/integration/test_universe_kind_postgres.py -q -rs` | `2 passed, 1 skipped` (skip = D-2, reason recorded) |
-| Phase 3 screener PG regression | `ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_screener_postgres.py -q` | `18 passed` |
-| Phase 1.5 PG regression | `DATABASE_URL=... ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_alerts_postgres_hardening.py -q` | `6 passed` |
+| **Component** | The engine/predicate/repository contract, in isolation | `tests/workflows/test_phase4_schema.py`, `tests/workflows/test_pairs.py`, `tests/workflows/test_external_signals.py`, `tests/alerts/test_advanced_conditions.py`, `tests/integration/test_alerts_phase4_postgres.py` |
+| **Worker / API integration** | An authored + ACTIVATED workflow, driven through the real dispatch path, produces the required observable outcome | `tests/screeners/test_breadth_worker_acceptance.py`, `tests/api/test_worker_signals.py`, `tests/sdk/test_worker_sdk_platform.py` |
+| **Live** | The deployed services actually behave | Section 7 — read-only checks only; **no Phase 4 evaluation has been run live** |
+
+| Level | Suite | Command | Result |
+| --- | --- | --- | --- |
+| Component + integration | Alerts-platform suites | `.venv/bin/python -m pytest tests/alerts tests/workflows tests/screeners tests/notifications tests/fundamentals tests/api/test_worker_signals.py tests/api/test_worker_screeners.py -q` | `585 passed` |
+| Component + integration | SDK | `.venv/bin/python -m pytest tests/sdk -q` | `255 passed, 1 skipped` |
+| Component | SDK version guard | `.venv/bin/python scripts/check_worker_sdk_version_refs.py` | `All worker SDK version references match 0.10.0` |
+| Component (real PG) | Phase 4 component suite | `ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_alerts_phase4_postgres.py -q` | `16 passed`, stable over 3 consecutive runs |
+| **Integration (real PG)** | **Three installation lifecycles** | `ALERTS_TEST_DATABASE_URL=... ALERTS_FRESH_DATABASE_URL=... ALERTS_SCHEMA_DATABASE_URL=... pytest tests/integration/test_universe_kind_postgres.py -q` | **`3 passed`, 0 skipped** — the previous D-2 skip is now an executed assertion |
+| Component (real PG) | Phase 3 screener regression | `ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_screener_postgres.py -q` | `18 passed` |
+| Component (real PG) | Phase 1.5 hardening regression | `DATABASE_URL=... ALERTS_TEST_DATABASE_URL=... pytest tests/integration/test_alerts_postgres_hardening.py -q` | `6 passed` |
+
+### Worker-path acceptance detail (breadth, Phase 4 F10)
+
+`tests/screeners/test_breadth_worker_acceptance.py` (9 tests). None of these
+call `evaluate_breadth` or any other component directly: each authors a
+canonical breadth workflow, ACTIVATES it through `EvaluationService`,
+materializes subscriptions, and then drives completed bars through
+`EvaluationWorker._dispatch` — the same entry point a live candle completion
+uses, which exercises indexing, membership assembly, the ownership fence and
+the publication transaction.
+
+| Assertion | Test | Result |
+| --- | --- | --- |
+| K distinct contributors produce ONE workflow-level event + one outbox row per channel | `test_k_distinct_contributors_publish_one_workflow_level_event` | event `subscription_id IS NULL`, `message_kind="breadth"`, count 2, delivery count 1 |
+| Non-matching members never contribute | `test_non_matching_members_do_not_contribute` | no event, no contribution, `satisfied=false` |
+| Repeated contributions do not duplicate the crossing | `test_repeated_contributions_do_not_duplicate_the_crossing` | still 1 event / 1 delivery over 12 further bars |
+| A genuine re-crossing after the window lapses notifies again, with a distinct identity | `test_rearming_after_the_window_lapses_notifies_again` | 2 events, 2 distinct occurrence keys, `crossing_seq` 1 and 2 |
+| Removal + re-entry does not restore an old contribution | `test_removal_and_reentry_does_not_restore_an_old_contribution` | driven through the universe refresh pass; stale contribution cleared, count stays 2 until the member triggers again |
+| Restart preserves aggregate state and does not re-notify | `test_restart_preserves_aggregate_state_and_does_not_re_notify` | 1 event across a fresh worker instance |
+| A second worker cannot evaluate a live-owned subscription | `test_a_second_worker_cannot_evaluate_a_live_owned_subscription` | `not_owner` recorded; state and events unmoved |
+| Injected failure rolls back checkpoint + contribution + aggregate + event + outbox together | `test_injected_failure_rolls_back_the_whole_publication` | all five empty after the failure; retry publishes exactly once |
+| The delivery renders as an aggregate, not a per-symbol alert | `test_breadth_delivery_renders_as_an_aggregate_message` | `[Breadth]` subject, contributor list, no `symbol:` line |
+
+Lease EXPIRY and takeover (as opposed to a live lease) remain covered against
+real PostgreSQL, where the lease clock is real:
+`tests/integration/test_alerts_phase4_postgres.py` and
+`test_alerts_postgres_hardening.py`.
 
 ### Pre-existing failures (separately identified, NOT caused by Phase 4)
 
@@ -206,8 +274,9 @@ This is a workload OBSERVATION at modest scale — **NOT** the Phase 6
 | Item | Value |
 | --- | --- |
 | Branch | `development` |
-| Deployed commit | `2754f52` (worker and API built from the same tree) |
+| Deployed commit | `2754f52` → rebuilt at `DEPLOY_COMMIT` (see "Rebuild" below) |
 | Phase 4 commits | `05cbfc5`, `aa2c1ad`, `5ba407c`, `a1359d9`, `087c1f0`, `af7eeee`, `22db69d`, `d295216`, `cfb49db`, `1e69def`, `2754f52` |
+| Closure commits | `e4a1495` (breadth production wiring), `9c7d046` (frozen migration baseline, D-2) |
 | Migration head | **`20260911_000016_alerts_phase4` — applied to the live `kite-postgres`** |
 | Live Phase 4 tables | 7/7 present |
 | Live CHECK | `universes_kind_check` now admits `'screener'`; a screener-kind universe was INSERTed and DELETEd successfully on the live database, so **defect D-1 is fixed in production** |
@@ -220,11 +289,16 @@ This is a workload OBSERVATION at modest scale — **NOT** the Phase 6
 
 **An idle healthy worker is NOT proof of live end-to-end evaluation.** The live
 database has no Phase 4 workflows, so the worker reports `evaluations: 0` — it
-is healthy and doing nothing because nothing is configured. No Phase 4
-evaluation has been demonstrated live.
+is healthy and doing nothing because nothing is configured. **No Phase 4
+evaluation has been demonstrated live**, and no notification was sent because
+destination authorization has not been given.
 
-No live Telegram/ntfy notification was sent: destination authorization for a
-Phase 4 smoke test has not been given.
+Read-only live verification performed: the migration head, the seven Phase 4
+tables, the repaired universes CHECK (exercised by an insert/delete of a
+screener-kind universe), container health, the seven `/api/worker/signals`
+routes in the live OpenAPI document, and `401` on those routes without a token.
+The from-zero and intermediate-upgrade paths were verified on the isolated
+disposable PostgreSQL, not live.
 
 ### Outstanding live procedure (for the operator)
 
