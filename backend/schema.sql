@@ -2231,3 +2231,34 @@ CREATE INDEX IF NOT EXISTS idx_external_values_lookup
     ON public.external_signal_values (producer_id, instrument_key, event_time DESC);
 CREATE INDEX IF NOT EXISTS idx_external_values_expiry
     ON public.external_signal_values (expires_at);
+
+-- Mirrors migration 20260912_000017_delivery_attempt_provider_id.
+-- Nullable and additive: the adapters already return a provider
+-- acknowledgement (Telegram message_id / ntfy X-Ntfy-Id) but it was discarded
+-- at write time, so "did the provider accept this, and under which id" could
+-- not be answered. Rows recorded before this column exists stay NULL rather
+-- than being backfilled with an invented value.
+ALTER TABLE public.delivery_attempts ADD COLUMN IF NOT EXISTS provider_id VARCHAR(128);
+
+-- Mirrors migration 20260912_000018_workflow_canvas_layout.
+-- Canvas node POSITIONS only, never node semantics: the canvas is another
+-- editor of the same canonical document, so nothing here can reach the
+-- canonical hash and a cosmetic move provably creates no revision.
+-- node_id is a namespaced identity ('stage:'/'alert:'/'channel:') because
+-- stage ids, alert ids and channel names are separate id spaces that may
+-- legally collide -- keyed bare, two different nodes could share one position.
+CREATE TABLE IF NOT EXISTS public.workflow_canvas_layout (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  workflow_id TEXT NOT NULL REFERENCES public.workflows(id) ON DELETE CASCADE,
+  node_id TEXT NOT NULL,
+  x DOUBLE PRECISION NOT NULL,
+  y DOUBLE PRECISION NOT NULL,
+  collapsed BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_canvas_layout_owner_workflow_node
+    UNIQUE (owner_id, workflow_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_canvas_layout_workflow
+    ON public.workflow_canvas_layout (owner_id, workflow_id);

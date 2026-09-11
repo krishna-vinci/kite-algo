@@ -24,6 +24,9 @@ Design constraints, all deliberate:
 
 from __future__ import annotations
 
+import secrets
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -1006,6 +1009,611 @@ async def search_instruments(
             "operator never needs one and they change when the catalog moves."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# health
+# ---------------------------------------------------------------------------
+
+
+@router.get("/health")
+async def platform_health(
+    request: Request,
+    scope: str = Depends(require_operator_scope),
+    session_factory: Any = Depends(_alerts_db),
+):
+    """Worker-runtime health: the part the API cannot derive from the database.
+
+    Reports ``available: false`` with a reason rather than zeros when the
+    worker's health file cannot be read, so "nothing is quarantined" is never
+    confused with "quarantine state is unknown".
+    """
+    from backend.api.services.alerts_runtime_health import runtime_health_view
+
+    _ = scope
+    return {"ok": True, "runtime": runtime_health_view()}
+
+
+@router.get("/workflows/{workflow_id}/health")
+async def workflow_health(
+    request: Request,
+    workflow_id: str,
+    scope: str = Depends(require_operator_scope),
+    session_factory: Any = Depends(_alerts_db),
+):
+    """Per-workflow health: durable facts merged with runtime facts.
+
+    The durable half (tick age, stale reason, continuity invalidation,
+    last evaluation, delivery counters) comes from the database, so it works
+    across the API/worker process split and survives a worker restart. The
+    runtime half (quarantine, failure counts) is merged from the worker's
+    published health when reachable and otherwise reported as unknown.
+
+    Lifecycle and data-freshness are reported as SEPARATE fields on purpose: a
+    workflow can be ``active`` (lifecycle) while ``stale`` (no fresh data), and
+    collapsing them into one status is how a stale alert gets mistaken for a
+    working one.
+    """
+    from backend.api.services.alerts_runtime_health import (
+        derive_subscription_freshness,
+        runtime_health_view,
+    )
+    from backend.workflows.repository import AlertSubscription, EvaluationCheckpoint
+
+    with session_factory() as session:
+        workflow = session.get(WorkflowModel, workflow_id)
+        if workflow is None or workflow.owner_id != scope:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        active = session.execute(
+            select(WorkflowRevision)
+            .where(
+                WorkflowRevision.workflow_id == workflow_id,
+                WorkflowRevision.status == "active",
+            )
+            .order_by(WorkflowRevision.activated_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        subscriptions = []
+        if active is not None:
+            subscriptions = list(
+                session.execute(
+                    select(AlertSubscription)
+                    .where(AlertSubscription.revision_id == active.id)
+                    .order_by(AlertSubscription.created_at.asc(), AlertSubscription.id.asc())
+                ).scalars().all()
+            )
+
+        all_ids = _workflow_subscription_ids(session, workflow_id)
+        last_evaluated: Dict[str, Any] = {}
+        states: Dict[str, Any] = {}
+        if all_ids:
+            for subscription_id, updated, state in session.execute(
+                select(
+                    EvaluationCheckpoint.subscription_id,
+                    func.max(EvaluationCheckpoint.updated_at),
+                    func.max(EvaluationCheckpoint.state),
+                )
+                .where(EvaluationCheckpoint.subscription_id.in_(all_ids))
+                .group_by(EvaluationCheckpoint.subscription_id)
+            ).all():
+                last_evaluated[str(subscription_id)] = updated
+                states[str(subscription_id)] = state
+
+        document = None
+        if active is not None:
+            try:
+                document = parse_workflow_dict(active.document)
+            except (WorkflowParseError, ValueError, TypeError):
+                document = None
+        clock_by_stage = (
+            {stage.id: stage.clock for stage in document.stages} if document else {}
+        )
+        alert_stage = (
+            {alert.id: alert.source for alert in document.alerts} if document else {}
+        )
+
+    now = datetime.now(timezone.utc)
+    runtime = runtime_health_view()
+    quarantined = runtime.get("quarantined") or {}
+    failures = runtime.get("subscription_failures") or {}
+
+    rows = []
+    for sub in subscriptions:
+        freshness = derive_subscription_freshness(
+            state=states.get(sub.id),
+            clock=clock_by_stage.get(alert_stage.get(sub.alert_id, "")),
+            now=now,
+            stale_after_s=STALE_AFTER_SECONDS,
+        )
+        evaluated_at = last_evaluated.get(sub.id)
+        evaluated_age = None
+        if evaluated_at is not None:
+            moment = evaluated_at if evaluated_at.tzinfo else evaluated_at.replace(tzinfo=timezone.utc)
+            evaluated_age = round(max(0.0, (now - moment).total_seconds()), 3)
+        rows.append(
+            {
+                "subscription_id": sub.id,
+                "alert_id": sub.alert_id,
+                "instrument_key": sub.instrument_key,
+                "state": str(sub.state),
+                "last_evaluated_at": _iso(evaluated_at),
+                "evaluation_age_s": evaluated_age,
+                **freshness,
+                "quarantined_until": quarantined.get(sub.id),
+                "failures": (failures.get(sub.id) or {}).get("failures", 0),
+                "last_error": (failures.get(sub.id) or {}).get("last_error"),
+                "last_failure_at": (failures.get(sub.id) or {}).get("last_failure_at"),
+            }
+        )
+
+    return {
+        "ok": True,
+        "workflow_id": workflow_id,
+        "lifecycle": {
+            "active": workflow.archived_at is None and active is not None,
+            "archived": workflow.archived_at is not None,
+            "archived_at": _iso(workflow.archived_at),
+            "active_revision": _revision_summary(active),
+        },
+        "subscriptions": rows,
+        "runtime": runtime,
+        "note": (
+            "'lifecycle.active' is whether this workflow is switched on; the "
+            "per-subscription 'stale'/'stale_reason' fields are whether fresh "
+            "data is arriving. They are different questions — an active "
+            "workflow can be receiving nothing, and the tick age is derived "
+            "from a stored receipt timestamp so it grows without any tick."
+        ),
+    }
+
+
+def _workflow_subscription_ids(session: Any, workflow_id: str) -> List[str]:
+    from backend.workflows.repository import AlertSubscription
+
+    return list(
+        session.execute(
+            select(AlertSubscription.id)
+            .join(WorkflowRevision, AlertSubscription.revision_id == WorkflowRevision.id)
+            .where(WorkflowRevision.workflow_id == workflow_id)
+        ).scalars().all()
+    )
+
+
+# ---------------------------------------------------------------------------
+# worker tokens (scope-aligned)
+# ---------------------------------------------------------------------------
+
+#: The alerts-platform actions a token minted from this surface may carry.
+#: Deliberately excludes every execution action (`intents:submit`,
+#: `risk:update`, `runs:*`, `gtt:*`): the alerts feature must not become a way
+#: to obtain an order-placing credential, and a preset that could would be a
+#: privilege escalation dressed as a convenience.
+ALERTS_TOKEN_ACTIONS = frozenset(
+    {
+        "workflows:read",
+        "workflows:write",
+        "workflows:activate",
+        "notifications:test",
+        "signals:read",
+        "signals:admin",
+    }
+)
+
+#: Presets mirroring §7's least-privilege list. The server owns this mapping so
+#: the UI cannot invent a broader preset than the backend will honour.
+TOKEN_PRESETS: Dict[str, List[str]] = {
+    "alerts_authoring": ["workflows:read", "workflows:write", "workflows:activate"],
+    "alerts_read_only": ["workflows:read"],
+    "notifications": ["workflows:read", "notifications:test"],
+    "external_producers": ["signals:read", "signals:admin"],
+}
+
+#: Modes a token minted here may carry. `live` is excluded because alerts never
+#: place orders, so an alerts token has no reason to be live-capable — and
+#: excluding it means a leaked alerts credential cannot reach a broker account.
+ALERTS_TOKEN_MODES = ("paper", "dry_run")
+
+
+@router.get("/tokens/presets")
+async def token_presets(
+    request: Request,
+    scope: str = Depends(require_operator_scope),
+):
+    """The presets and their exact action sets, from the server.
+
+    Returned by the API rather than duplicated in the client so a preset can
+    never drift from what the backend will actually grant.
+    """
+    from backend.api.services.alerts_operator import default_scope
+    from backend.app.auth import require_app_user
+
+    _ = scope
+    user = require_app_user(request)
+    return {
+        "ok": True,
+        "presets": [
+            {
+                "id": preset_id,
+                "actions": actions,
+                "description": _PRESET_DESCRIPTIONS.get(preset_id, ""),
+            }
+            for preset_id, actions in TOKEN_PRESETS.items()
+        ],
+        "all_actions": sorted(ALERTS_TOKEN_ACTIONS),
+        "modes": list(ALERTS_TOKEN_MODES),
+        "account_scope": default_scope(user),
+        "note": (
+            "the account scope is fixed server-side to the authorized scope and "
+            "is not accepted from the client; a token's scope IS the alerts "
+            "owner_id, so a token minted for another scope would read a "
+            "different owner's alerts. No execution action is offered here."
+        ),
+    }
+
+
+_PRESET_DESCRIPTIONS = {
+    "alerts_authoring": "create, edit and switch alerts on or off",
+    "alerts_read_only": "read alerts, events and delivery history",
+    "notifications": "read alerts and send a channel test message",
+    "external_producers": "register producers and issue their credentials",
+}
+
+
+@router.get("/tokens")
+async def list_operator_tokens(
+    request: Request,
+    scope: str = Depends(require_operator_scope),
+):
+    """Worker tokens with their scope, and whether it matches this operator's."""
+    from backend.api.services.alerts_operator import allowed_scopes
+    from backend.app.auth import require_app_user
+    from backend.api.routers.worker_shared import _repo
+
+    _ = scope
+    user = require_app_user(request)
+    tokens = await _repo(request).list_tokens()
+    authorized = set(allowed_scopes(user))
+    return {
+        "ok": True,
+        "tokens": [
+            {
+                "token_id": token.get("token_id"),
+                "label": token.get("name"),
+                "account_scope": token.get("account_scope"),
+                "allowed_actions": list(token.get("allowed_actions") or []),
+                "allowed_modes": list(token.get("allowed_modes") or []),
+                "status": token.get("status"),
+                "created_at": token.get("created_at"),
+                "last_used_at": token.get("last_used_at"),
+                "expires_at": token.get("expires_at"),
+                # Surfaced as a warning rather than hidden: a token pointing at
+                # another scope silently sees an empty alerts view, which reads
+                # as "nothing is configured" instead of "wrong scope".
+                "scope_matches_operator": token.get("account_scope") in authorized,
+            }
+            for token in tokens
+        ],
+        "authorized_scopes": sorted(authorized),
+    }
+
+
+@router.post("/tokens")
+async def create_operator_token(
+    request: Request,
+    payload: Dict[str, Any],
+    scope: str = Depends(require_operator_scope),
+):
+    """Mint a worker token for the AUTHORIZED scope. One-time reveal.
+
+    ``account_scope`` is taken from the authorization result, never the body: a
+    body-supplied scope is ignored outright rather than validated, so there is
+    no path on which a client value reaches the token row.
+    """
+    from backend.api.routers.worker_shared import _repo
+    from backend.api.schemas.worker import WorkerTokenCreateRequest
+
+    enforce_same_origin(request)
+
+    preset = payload.get("preset")
+    if preset is not None:
+        if preset not in TOKEN_PRESETS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown preset {preset!r}; known: {', '.join(sorted(TOKEN_PRESETS))}",
+            )
+        actions = list(TOKEN_PRESETS[preset])
+    else:
+        actions = list(payload.get("allowed_actions") or [])
+        if not actions:
+            raise HTTPException(
+                status_code=422,
+                detail="provide either a 'preset' or an explicit 'allowed_actions' list",
+            )
+    unsupported = sorted(set(actions) - ALERTS_TOKEN_ACTIONS)
+    if unsupported:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "unsupported_actions",
+                "unsupported": unsupported,
+                "message": (
+                    "this surface mints alerts tokens only; execution actions "
+                    "are not offered here"
+                ),
+            },
+        )
+
+    modes = [str(mode).strip().lower() for mode in (payload.get("allowed_modes") or ["paper"])]
+    unsupported_modes = sorted(set(modes) - set(ALERTS_TOKEN_MODES))
+    if unsupported_modes:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "unsupported_modes",
+                "unsupported": unsupported_modes,
+                "message": (
+                    "alerts tokens may only carry paper or dry_run: alerts never "
+                    "place orders, so a live-capable alerts token would be "
+                    "capability the feature does not need"
+                ),
+            },
+        )
+
+    label = str(payload.get("label") or "").strip()
+    if not label:
+        raise HTTPException(status_code=422, detail="a label is required so the token is identifiable later")
+
+    create_payload = WorkerTokenCreateRequest(
+        name=label,
+        account_scope=scope,
+        allowed_actions=sorted(set(actions)),
+        allowed_modes=modes,
+    )
+    raw_token = f"kwa_{secrets.token_urlsafe(32)}"
+    token_id = f"worker_{uuid.uuid4().hex[:16]}"
+    record = await _repo(request).create_token(
+        create_payload, raw_token=raw_token, token_id=token_id
+    )
+    return {
+        "ok": True,
+        "token": raw_token,
+        "token_id": record.get("token_id"),
+        "account_scope": record.get("account_scope"),
+        "allowed_actions": list(record.get("allowed_actions") or []),
+        "allowed_modes": list(record.get("allowed_modes") or []),
+        "reveal_once": True,
+        "note": (
+            "this is the only time the token value is returned; it is not "
+            "stored in readable form and cannot be shown again. Its scope is "
+            "the authorized alerts scope, so it sees exactly the workflows this "
+            "operator sees."
+        ),
+    }
+
+
+@router.post("/tokens/{token_id}/revoke")
+async def revoke_operator_token(
+    request: Request,
+    token_id: str,
+    scope: str = Depends(require_operator_scope),
+):
+    from backend.api.routers.worker_shared import _repo
+
+    enforce_same_origin(request)
+    record = await _repo(request).revoke_token(token_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Worker token not found")
+    return {"ok": True, "token": record}
+
+
+# ---------------------------------------------------------------------------
+# yaml (revision addressed)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/workflows/{workflow_id}/yaml")
+async def workflow_yaml(
+    request: Request,
+    workflow_id: str,
+    scope: str = Depends(require_operator_scope),
+    session_factory: Any = Depends(_alerts_db),
+    revision: Optional[int] = Query(None, ge=1),
+):
+    """The readable YAML for one revision (latest when unspecified).
+
+    ``revision`` addresses history explicitly, which is what a rollback or a
+    diff view needs — the detail route can only render the definition in force.
+    """
+    with session_factory() as session:
+        _workflow, stored = _owned_revision(session, workflow_id, scope, revision)
+        document = parse_workflow_dict(stored.document)
+        return {
+            "ok": True,
+            "workflow_id": workflow_id,
+            "revision": int(stored.revision),
+            "revision_id": stored.id,
+            "revision_status": stored.status,
+            "canonical_hash": stored.canonical_hash,
+            "yaml": document_to_yaml(document),
+            "round_trip": (
+                "this YAML parses back to the same canonical hash shown above; "
+                "the structured editor, the canvas and this text are views of "
+                "one definition"
+            ),
+        }
+
+
+# ---------------------------------------------------------------------------
+# canvas layout
+# ---------------------------------------------------------------------------
+
+
+def _layout_repo(request: Request, session_factory: Any = Depends(_alerts_db)):
+    """Injectable so tests can swap it, mirroring the other repositories."""
+    repository = getattr(request.app.state, "canvas_layout_repository", None)
+    if repository is not None:
+        return repository
+    from backend.workflows.canvas_layout import CanvasLayoutRepository
+
+    return CanvasLayoutRepository(session_factory)
+
+
+def _owned_workflow_or_404(session: Any, workflow_id: str, scope: str) -> Any:
+    workflow = session.get(WorkflowModel, workflow_id)
+    if workflow is None or workflow.owner_id != scope:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return workflow
+
+
+@router.get("/workflows/{workflow_id}/layout")
+async def get_canvas_layout(
+    request: Request,
+    workflow_id: str,
+    scope: str = Depends(require_operator_scope),
+    session_factory: Any = Depends(_alerts_db),
+    repo: Any = Depends(_layout_repo),
+):
+    """Saved canvas positions for this workflow, plus the node-id contract.
+
+    Positions are returned independent of the document, and the contract is
+    included so the canvas never has to hard-code the namespace rules — the
+    server that validates writes is the same one that documents them.
+    """
+    with session_factory() as session:
+        _owned_workflow_or_404(session, workflow_id, scope)
+    entries = repo.list_layout(scope, workflow_id)
+    return {
+        "ok": True,
+        "workflow_id": workflow_id,
+        "nodes": [
+            {
+                "node_id": entry.node_id,
+                "x": entry.x,
+                "y": entry.y,
+                "collapsed": entry.collapsed,
+                "updated_at": entry.updated_at,
+            }
+            for entry in entries
+        ],
+        "contract": _layout_contract(),
+    }
+
+
+def _layout_contract() -> Dict[str, Any]:
+    from backend.workflows.canvas_layout import (
+        CANVAS_NAMESPACES,
+        MAX_ABS_COORDINATE,
+        MAX_NODE_ID_LENGTH,
+    )
+
+    return {
+        "namespaces": list(CANVAS_NAMESPACES),
+        "node_id_format": "<namespace>:<id>",
+        "max_abs_coordinate": MAX_ABS_COORDINATE,
+        "max_node_id_length": MAX_NODE_ID_LENGTH,
+        "note": (
+            "Layout is stored separately from the definition and can never "
+            "change a canonical hash: saving positions creates no revision. "
+            "Node ids are namespaced because stage ids, alert ids and channel "
+            "names are separate id spaces that can legally collide, so a bare "
+            "id would let two different nodes share one saved position."
+        ),
+    }
+
+
+@router.put("/workflows/{workflow_id}/layout")
+async def put_canvas_layout(
+    request: Request,
+    workflow_id: str,
+    payload: Dict[str, Any],
+    scope: str = Depends(require_operator_scope),
+    session_factory: Any = Depends(_alerts_db),
+    repo: Any = Depends(_layout_repo),
+):
+    """Merge node positions. Cosmetic: no revision, no hash change.
+
+    Deliberately NOT a PATCH on the workflow document. A layout-only change must
+    not create a draft revision, so it does not participate in
+    ``expected_revision`` conflict handling at all — two operators moving nodes
+    is not a definition conflict.
+    """
+    from backend.workflows.canvas_layout import CanvasNodeIdError
+
+    enforce_same_origin(request)
+    with session_factory() as session:
+        _owned_workflow_or_404(session, workflow_id, scope)
+
+    raw_nodes = payload.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "error": "no_nodes",
+                "message": "provide a non-empty 'nodes' list of {node_id, x, y[, collapsed]}",
+            },
+        )
+    try:
+        entries = repo.upsert_layout(scope, workflow_id, raw_nodes)
+    except CanvasNodeIdError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "error": "invalid_node", "message": str(exc)},
+        ) from exc
+    return {
+        "ok": True,
+        "workflow_id": workflow_id,
+        "saved": len(raw_nodes),
+        "nodes": [
+            {
+                "node_id": entry.node_id,
+                "x": entry.x,
+                "y": entry.y,
+                "collapsed": entry.collapsed,
+                "updated_at": entry.updated_at,
+            }
+            for entry in entries
+        ],
+        "note": (
+            "positions saved; the workflow definition was not modified, so no "
+            "revision was created and the canonical hash is unchanged"
+        ),
+    }
+
+
+@router.post("/workflows/{workflow_id}/layout/delete")
+async def delete_canvas_layout(
+    request: Request,
+    workflow_id: str,
+    payload: Dict[str, Any],
+    scope: str = Depends(require_operator_scope),
+    session_factory: Any = Depends(_alerts_db),
+    repo: Any = Depends(_layout_repo),
+):
+    """Forget positions for nodes that left the document (explicit delete).
+
+    POST rather than DELETE-with-body so the operation is a JSON mutation like
+    every other one here and goes through the same origin assertion.
+    """
+    from backend.workflows.canvas_layout import CanvasNodeIdError
+
+    enforce_same_origin(request)
+    with session_factory() as session:
+        _owned_workflow_or_404(session, workflow_id, scope)
+    node_ids = payload.get("node_ids")
+    if not isinstance(node_ids, list) or not node_ids:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "error": "no_nodes", "message": "provide 'node_ids'"},
+        )
+    try:
+        removed = repo.delete_layout(scope, workflow_id, node_ids)
+    except CanvasNodeIdError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "error": "invalid_node", "message": str(exc)},
+        ) from exc
+    return {"ok": True, "workflow_id": workflow_id, "removed": removed}
 
 
 # ---------------------------------------------------------------------------
