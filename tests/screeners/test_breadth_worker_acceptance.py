@@ -133,7 +133,17 @@ def _activate(session_factory, doc, *, name=None):
     return repo, active
 
 
-def _make_worker(session_factory, *, owner_id="worker-1"):
+class _FixedSession:
+    """A session provider that returns one identity (tests set the boundary)."""
+
+    def __init__(self, session_id):
+        self.session_id = session_id
+
+    def __call__(self, session_name, instrument_key, ts):
+        return True, self.session_id
+
+
+def _make_worker(session_factory, *, owner_id="worker-1", session_provider=None):
     repo = SqlAlchemyWorkflowRepository(session_factory)
     return EvaluationWorker(
         repo,
@@ -145,6 +155,7 @@ def _make_worker(session_factory, *, owner_id="worker-1"):
         poll_interval_s=0.01,
         instrument_resolver=lambda keys: ({k: 1 for k in keys}, set()),
         renewal=None,
+        session_provider=session_provider,
         owner_id=owner_id,
     )
 
@@ -193,6 +204,20 @@ def _breadth_state(session_factory):
         return session.execute(text(
             "select satisfied, crossing_seq, last_count, member_count "
             "from alert_breadth_state"
+        )).fetchall()
+
+
+def _session_counters(session_factory):
+    with session_factory() as session:
+        return session.execute(text(
+            "select session_id, count from alert_session_counters order by session_id"
+        )).fetchall()
+
+
+def _suppression_counters(session_factory):
+    with session_factory() as session:
+        return session.execute(text(
+            "select reason, count from alert_suppression_counters order by reason"
         )).fetchall()
 
 
@@ -547,3 +572,208 @@ def test_breadth_delivery_renders_as_an_aggregate_message(session_factory):
     assert "distinct instruments" in resolved["body"]
     # It is an aggregate: there is no single-symbol line describing it.
     assert "symbol: NSE:A" not in resolved["body"]
+
+
+# ---------------------------------------------------------------------------
+# 7. out-of-order contributions, session caps, and their rollback
+# ---------------------------------------------------------------------------
+
+
+def test_out_of_order_contribution_completing_k_still_publishes(session_factory):
+    """A permitted crossing publishes even when a contribution arrived late.
+
+    The newest observation arrives FIRST, setting the aggregation watermark;
+    two older eligible contributions then complete the threshold. The aggregate
+    is evaluated against the watermark, so this is a legitimate crossing — an
+    informational reason must not suppress it. (Suppressing would be
+    unrecoverable: the state commits as satisfied, and a crossing is never
+    re-minted, so the notification would be lost forever.)
+    """
+    _repo, _revision = _activate(session_factory, _breadth_document(threshold=3))
+    worker = _make_worker(session_factory)
+    asyncio.run(_start(worker))
+
+    # Both inside the 30-minute window: the newer at +20m, the older at +5m.
+    newer = T0 + timedelta(minutes=20)
+    older = T0 + timedelta(minutes=5)
+
+    # The newest contribution lands first and opens the window at its time.
+    _dispatch_bar(worker, "NSE:B", newer, 150.0)
+    assert _events(session_factory) == []
+    assert _breadth_state(session_factory)[0][2] == 1
+
+    # Older contributions now complete the threshold. Each is evaluated
+    # against the watermark (the newer time), not against its own bar time.
+    _dispatch_bar(worker, "NSE:A", older, 150.0)
+    assert _events(session_factory) == []
+    _dispatch_bar(worker, "NSE:C", older, 150.0)
+
+    events = _events(session_factory)
+    assert len(events) == 1, "the crossing must publish, not be suppressed"
+    event = events[0]
+    assert event.subscription_id is None
+    assert event.evidence["message_kind"] == "breadth"
+    assert event.evidence["count"] == 3
+    assert sorted(event.evidence["instruments"]) == ["NSE:A", "NSE:B", "NSE:C"]
+    # The out-of-order participation is recorded as provenance, never as a
+    # reason to drop the notification.
+    assert event.evidence["aggregate_note"] == "breadth_stale_observation"
+    # Both times are recorded separately and they genuinely differ.
+    assert event.evidence["event_time"] == older.isoformat()
+    assert event.evidence["evaluated_at"] == newer.isoformat()
+    assert event.evidence["evaluated_at"] != event.evidence["event_time"]
+    assert event.evidence["contributing_instrument"] == "NSE:C"
+
+    assert len(_deliveries(session_factory)) == 1
+    assert _breadth_state(session_factory)[0][1] == 1
+
+
+def test_out_of_order_crossing_repeat_and_restart_do_not_duplicate(session_factory):
+    """The out-of-order crossing is published exactly once, ever."""
+    _repo, _revision = _activate(session_factory, _breadth_document(threshold=3))
+    worker = _make_worker(session_factory)
+    asyncio.run(_start(worker))
+    # Both inside the 30-minute window: the newer at +20m, the older at +5m.
+    newer = T0 + timedelta(minutes=20)
+    older = T0 + timedelta(minutes=5)
+    for key, when in (("NSE:B", newer), ("NSE:A", older), ("NSE:C", older)):
+        _dispatch_bar(worker, key, when, 150.0)
+    assert len(_events(session_factory)) == 1
+
+    # Replaying the same bars must not re-mint the crossing...
+    for key, when in (("NSE:B", newer), ("NSE:A", older), ("NSE:C", older)):
+        _dispatch_bar(worker, key, when, 150.0)
+    assert len(_events(session_factory)) == 1
+
+    # ...and neither must a restart, which rebuilds dispatch state from the
+    # durable aggregate.
+    restarted = _make_worker(session_factory)
+    asyncio.run(_start(restarted))
+    for key, when in (("NSE:A", older), ("NSE:C", older)):
+        _dispatch_bar(restarted, key, when, 150.0)
+    assert len(_events(session_factory)) == 1
+    assert len(_deliveries(session_factory)) == 1
+
+
+def test_breadth_session_cap_advances_state_and_records_durable_suppression(
+    session_factory,
+):
+    """A capped crossing advances the aggregate but creates no event or outbox."""
+    doc = _breadth_document(threshold=2)
+    doc["alerts"][0]["max_per_session"] = 1
+    doc["alerts"][0]["session_cap_reset"] = "session"
+    _repo, _revision = _activate(session_factory, doc)
+    worker = _make_worker(session_factory)
+    asyncio.run(_start(worker))
+
+    # First crossing: the single permitted notification.
+    for key in ("NSE:A", "NSE:B"):
+        _dispatch_bar(worker, key, T0 + FIVEMIN, 150.0)
+    assert len(_events(session_factory)) == 1
+    assert _session_counters(session_factory)[0][1] == 1
+
+    # The window lapses, which re-arms the threshold; a genuine second
+    # crossing then arrives.
+    later = T0 + timedelta(hours=2)
+    _dispatch_bar(worker, "NSE:A", later, 150.0)  # observed count < K -> rearm
+    assert _breadth_state(session_factory)[0][0] == 0  # satisfied = False
+    for key in ("NSE:B",):
+        _dispatch_bar(worker, key, later, 150.0)
+
+    # The crossing MUST still advance state; only the notification is capped.
+    state = _breadth_state(session_factory)
+    assert state[0][0] == 1, "state advances even when the cap suppresses"
+    assert state[0][1] == 2, "crossing_seq advances to the new crossing"
+
+    assert len(_events(session_factory)) == 1, "no second event was created"
+    assert len(_deliveries(session_factory)) == 1, "no second outbox row"
+    # The skip is durably inspectable, not silent.
+    assert _suppression_counters(session_factory) == [("session_cap", 1)]
+    # A capped attempt does not consume a slot, so the cap cannot drift.
+    assert _session_counters(session_factory)[0][1] == 1
+
+
+def test_a_new_session_permits_another_breadth_notification(session_factory):
+    """The cap is per session: a new session boundary resets it."""
+    doc = _breadth_document(threshold=2)
+    doc["alerts"][0]["max_per_session"] = 1
+    doc["alerts"][0]["session_cap_reset"] = "session"
+    _repo, _revision = _activate(session_factory, doc)
+    session = _FixedSession("NSE:CM:2026-09-11")
+    worker = _make_worker(session_factory, session_provider=session)
+    asyncio.run(_start(worker))
+
+    for key in ("NSE:A", "NSE:B"):
+        _dispatch_bar(worker, key, T0 + FIVEMIN, 150.0)
+    assert len(_events(session_factory)) == 1
+
+    # Same session: capped.
+    later = T0 + timedelta(hours=2)
+    _dispatch_bar(worker, "NSE:A", later, 150.0)
+    for key in ("NSE:B",):
+        _dispatch_bar(worker, key, later, 150.0)
+    assert len(_events(session_factory)) == 1
+    assert _suppression_counters(session_factory) == [("session_cap", 1)]
+
+    # A NEW session id re-arms the cap, so the next crossing notifies again.
+    session.session_id = "NSE:CM:2026-09-12"
+    for key in ("NSE:A", "NSE:B"):
+        _dispatch_bar(worker, key, later + timedelta(hours=2), 150.0)
+    assert len(_events(session_factory)) == 2
+    counters = dict(_session_counters(session_factory))
+    assert counters == {"NSE:CM:2026-09-11": 1, "NSE:CM:2026-09-12": 1}
+
+
+def test_injected_publication_failure_rolls_back_the_cap_and_aggregate(
+    session_factory, monkeypatch
+):
+    """A failure after the cap is reserved rolls the slot back with the aggregate.
+
+    The slot is claimed BEFORE the event is written, so a crash between the two
+    must not leave a consumed slot: otherwise a failed crossing would silently
+    expend one of the session's notifications while publishing nothing.
+    """
+    doc = _breadth_document(threshold=2)
+    doc["alerts"][0]["max_per_session"] = 1
+    _repo, _revision = _activate(session_factory, doc)
+    worker = _make_worker(session_factory)
+    asyncio.run(_start(worker))
+
+    # First contribution commits normally: the crossing is not reached yet, so
+    # no publication is attempted and this is a legitimate, completed write.
+    _dispatch_bar(worker, "NSE:A", T0 + FIVEMIN, 150.0)
+    state_before = _breadth_state(session_factory)
+    contributions_before = _contributions(session_factory)
+    assert state_before == [(0, 0, 1, len(MEMBERS))]
+    assert contributions_before == ["NSE:A"]
+
+    # The second contribution completes the threshold, so the publication is
+    # attempted — and fails AFTER the cap slot has been reserved.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("injected: publication failed after the slot was reserved")
+
+    monkeypatch.setattr(worker.service, "_publish_breadth_crossing", _boom, raising=True)
+    _dispatch_bar(worker, "NSE:B", T0 + FIVEMIN, 150.0)
+    monkeypatch.undo()
+
+    # The failed transaction left NOTHING behind: not the second contribution,
+    # not the advanced aggregate, not the cap slot, and no event or outbox row.
+    assert _breadth_state(session_factory) == state_before
+    assert _contributions(session_factory) == contributions_before
+    assert _events(session_factory) == []
+    assert _deliveries(session_factory) == []
+    assert _session_counters(session_factory) == []
+    assert _suppression_counters(session_factory) == []
+    with session_factory() as session:
+        checkpoints = session.execute(text(
+            "select instrument_key from evaluation_checkpoints order by 1"
+        )).scalars().all()
+    assert checkpoints == ["NSE:A"], "the failed member's checkpoint rolled back too"
+
+    # The session's notification is therefore still available, and the
+    # crossing publishes exactly once on the retry.
+    for key in ("NSE:A", "NSE:B"):
+        _dispatch_bar(worker, key, T0 + FIVEMIN, 150.0)
+    assert len(_events(session_factory)) == 1
+    assert _session_counters(session_factory)[0][1] == 1
+    assert _breadth_state(session_factory)[0][1] == 1

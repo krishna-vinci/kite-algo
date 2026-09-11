@@ -22,7 +22,19 @@ from sqlalchemy.orm import Session
 
 from backend.workflows import advanced_repository as repo
 
-__all__ = ["BreadthOutcome", "evaluate_breadth"]
+__all__ = ["BreadthOutcome", "evaluate_breadth", "BLOCKING_REASONS", "INFORMATIONAL_REASONS"]
+
+# Reasons that mean the aggregate could NOT be evaluated: the stage is unknown,
+# so nothing can fire and nothing may be published. Every one of these is
+# returned with ``matched=None``.
+BLOCKING_REASONS = frozenset(
+    {"membership_stale", "membership_unavailable", "breadth_capacity_exceeded"}
+)
+
+# Reasons that ACCOMPANY a real evaluation. They are provenance, not refusal:
+# the crossing is legitimate and must publish, with the reason recorded so an
+# operator can see that the contribution arrived out of order.
+INFORMATIONAL_REASONS = frozenset({"breadth_stale_observation"})
 
 
 def _as_utc(moment: Optional[datetime]) -> Optional[datetime]:
@@ -40,9 +52,23 @@ class BreadthOutcome:
 
     ``matched`` is always truthful (downstream filters see ``count >= K`` even
     while an already-satisfied threshold suppresses a repeat notification);
-    ``fired`` is True only on the bar that mints a new crossing.
-    ``unknown_reason`` is set when the stage could not be evaluated at all
-    (stale or unavailable membership, capacity exceeded, a stale observation).
+    ``fired`` is True only when a new crossing was minted.
+
+    ``reason`` needs its two kinds kept apart, because conflating them loses
+    notifications:
+
+    - a BLOCKING reason (see ``BLOCKING_REASONS``) means the aggregate could not
+      be evaluated at all; ``matched`` is None and ``fired`` is False, so there
+      is nothing to publish;
+    - an INFORMATIONAL reason (see ``INFORMATIONAL_REASONS``) accompanies a real
+      evaluation. ``fired`` may be True, and the crossing MUST publish — the
+      reason only says the contributing observation arrived out of order.
+
+    ``evaluated_at`` is the effective AGGREGATE evaluation time, which is the
+    watermark and therefore may be later than ``observed_at`` of the
+    contributing bar. Both are recorded so evidence distinguishes "when this
+    contribution happened" from "the aggregate state this was evaluated
+    against".
     """
 
     matched: Optional[bool]
@@ -53,6 +79,23 @@ class BreadthOutcome:
     crossing_seq: int
     contributors: Tuple[str, ...] = ()
     window_start: Optional[datetime] = None
+    evaluated_at: Optional[datetime] = None
+
+    @property
+    def blocking(self) -> bool:
+        """True when the aggregate could not be evaluated (the stage is unknown).
+
+        A blocking outcome can never publish: claiming a crossing requires an
+        evaluation to have actually happened.
+        """
+        return self.matched is None
+
+    @property
+    def informational_reason(self) -> Optional[str]:
+        """The reason when it accompanies a real evaluation, else None."""
+        if self.blocking or self.reason is None:
+            return None
+        return self.reason
 
 
 def evaluate_breadth(
@@ -110,6 +153,7 @@ def evaluate_breadth(
             members=member_count,
             reason="breadth_capacity_exceeded",
             crossing_seq=int(state.crossing_seq) if state else 0,
+            evaluated_at=observed_at,
         )
 
     # Membership freshness (D16): a stale membership snapshot must not support
@@ -128,6 +172,7 @@ def evaluate_breadth(
             members=member_count,
             reason="membership_unavailable",
             crossing_seq=int(state.crossing_seq) if state else 0,
+            evaluated_at=observed_at,
         )
     age_reference = _as_utc(membership_now) or observed_at
     membership_age_s = (
@@ -141,6 +186,7 @@ def evaluate_breadth(
             members=member_count,
             reason="membership_stale",
             crossing_seq=int(state.crossing_seq) if state else 0,
+            evaluated_at=observed_at,
         )
 
     # Normalized before any comparison: SQLite returns naive datetimes while
@@ -237,4 +283,5 @@ def evaluate_breadth(
         crossing_seq=crossing_seq,
         contributors=tuple(k for k, _ in contributors),
         window_start=window_start,
+        evaluated_at=effective_at,
     )

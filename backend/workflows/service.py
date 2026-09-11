@@ -153,6 +153,22 @@ def _parse_ts(raw: Any) -> Optional[datetime]:
 _BREADTH_MEMBER_STAGE_ID = "__breadth_member__"
 
 
+def _breadth_session_id(resolved: tuple) -> str:
+    """The session identity from ``_resolve_session``.
+
+    Session TOKENS are keyed by the resolved id — the same contract the signal
+    path uses through ``decide(..., session_id=...)`` — so a breadth cap and a
+    signal cap for the same session agree on the boundary. Feed-driven
+    segments resolve to their IST date, which is the documented boundary there.
+    """
+    try:
+        _active, session_id = resolved
+    except (TypeError, ValueError):
+        return "default"
+    text = str(session_id or "").strip()
+    return text or "default"
+
+
 def _breadth_member_stage(stage: Stage) -> Stage:
     """A Stage view over a breadth spec's member condition groups."""
     spec = stage.breadth
@@ -1231,10 +1247,19 @@ class EvaluationService:
 
             emitted = False
             suppression: Optional[str] = None
-            if outcome.reason is not None:
+            if outcome.blocking:
+                # The aggregate could not be evaluated (stale/unavailable
+                # membership, capacity exceeded): the stage is unknown and
+                # there is no crossing to publish. Recorded, never silent.
                 suppression = outcome.reason
                 self._log_suppression(sub, outcome.reason)
             elif outcome.fired:
+                # A crossing is the authority for publishing. An INFORMATIONAL
+                # reason ("the contributing observation arrived out of order")
+                # must NOT suppress it: the aggregate was evaluated against the
+                # watermark and the crossing is legitimate. Suppressing here
+                # would commit satisfied state and lose the notification
+                # permanently, because a crossing is never re-minted.
                 if not allow_emit:
                     # Warmup replays history to establish window continuity. A
                     # crossing found there updates the aggregate state (so a
@@ -1242,14 +1267,56 @@ class EvaluationService:
                     # notify — the activation baseline, by design.
                     suppression = "warmup"
                 else:
-                    emitted = self._publish_breadth_crossing(
-                        sub, obs, stage, alert, outcome, channel_ids,
-                        owner_epoch, ownership_now, session,
-                        workflow_name=document.name,
-                        universe_revision=member_context.get("universe_revision"),
+                    # Per-session cap (Phase 4 F10): the same shared slot the
+                    # signal path uses, reserved inside THIS transaction so a
+                    # capped crossing advances the aggregate/checkpoint state
+                    # (already written above) while creating no event or outbox
+                    # rows, and the skip is durably recorded.
+                    session_id = _breadth_session_id(
+                        self._resolve_session(sub, document, obs)
                     )
-                    if not emitted:
-                        suppression = "duplicate_occurrence"
+                    capped = False
+                    if alert.max_per_session:
+                        capped = not advanced_repository.reserve_session_slot(
+                            session,
+                            owner_id=sub.owner_id,
+                            workflow_id=sub.workflow_id,
+                            revision_id=sub.revision_id,
+                            alert_id=sub.alert_id,
+                            session_id=session_id,
+                            maximum=int(alert.max_per_session),
+                            now=obs.ts,
+                        )
+                    if capped:
+                        advanced_repository.record_suppression(
+                            session,
+                            owner_id=sub.owner_id,
+                            workflow_id=sub.workflow_id,
+                            revision_id=sub.revision_id,
+                            alert_id=sub.alert_id,
+                            session_id=session_id,
+                            reason="session_cap",
+                            instrument_key=sub.instrument_key,
+                            stage_id=sub.stage_id,
+                            now=obs.ts,
+                        )
+                        suppression = "session_cap"
+                        self._log_suppression(sub, "session_cap")
+                    else:
+                        emitted = self._publish_breadth_crossing(
+                            sub, obs, stage, alert, outcome, channel_ids,
+                            owner_epoch, ownership_now, session,
+                            workflow_name=document.name,
+                            universe_revision=member_context.get("universe_revision"),
+                        )
+                        if not emitted:
+                            suppression = "duplicate_occurrence"
+            elif outcome.informational_reason is not None:
+                # Evaluated, but no crossing this time. The reason is still
+                # worth surfacing (an out-of-order contribution that did not
+                # complete the threshold).
+                suppression = outcome.informational_reason
+                self._log_suppression(sub, outcome.informational_reason)
 
             # The member's checkpoint rides the same commit as the aggregate,
             # so a failure rolls both back together.
@@ -1335,11 +1402,27 @@ class EvaluationService:
             "window_start": (
                 outcome.window_start.isoformat() if outcome.window_start else None
             ),
+            # Two distinct times, never conflated:
+            #   event_time  — when the CONTRIBUTING observation happened;
+            #   evaluated_at — the effective AGGREGATE time this crossing was
+            #                  evaluated against (the watermark), which is
+            #                  later whenever the contribution arrived out of
+            #                  order or the window was still open.
             "event_time": obs.ts.isoformat(),
+            "evaluated_at": (
+                outcome.evaluated_at.isoformat() if outcome.evaluated_at else None
+            ),
+            "contributing_instrument": sub.instrument_key,
             "crossing_seq": outcome.crossing_seq,
             "universe_revision": universe_revision,
             "message": alert.message,
         }
+        # Provenance: the aggregate was evaluated against the watermark rather
+        # than this bar's own time. Recorded, because the notification is
+        # published anyway — an informational reason never suppresses.
+        informative = outcome.informational_reason
+        if informative is not None:
+            evidence["aggregate_note"] = informative
         self.workflow_repo.assert_evaluation_owner(
             sub.id,
             sub.instrument_key,

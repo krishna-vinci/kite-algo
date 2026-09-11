@@ -147,6 +147,61 @@ def test_first_crossing_notifies_because_satisfied_starts_false(clean):
         session.close()
 
 
+def test_blocking_and_informational_reasons_are_distinguished(clean):
+    """The reason taxonomy is what keeps a published crossing from being lost.
+
+    A BLOCKING reason means the aggregate could not be evaluated: matched is
+    None and fired is False, so there is nothing to publish. An INFORMATIONAL
+    reason accompanies a real evaluation — and when an out-of-order
+    contribution completes the threshold it is returned TOGETHER WITH
+    fired=True, which the caller must publish rather than suppress. Conflating
+    the two silently loses the notification, because a crossing is never
+    re-minted.
+    """
+    session = clean()
+    try:
+        # Blocking: a stale membership snapshot cannot be evaluated at all.
+        stale = _evaluate(
+            session, members=["NSE:A", "NSE:B"], triggering="NSE:A",
+            resolved_at=T0 - timedelta(hours=2),
+        )
+        assert stale.blocking is True
+        assert stale.matched is None and stale.fired is False
+        assert stale.reason in breadth_engine.BLOCKING_REASONS
+
+        # A newer contribution lands first, opening the watermark...
+        fresh = _evaluate(
+            session, spec=_breadth_spec(threshold=3), members=["NSE:A", "NSE:B", "NSE:C"],
+            triggering="NSE:B", observed_at=T0 + timedelta(minutes=20),
+            resolved_at=T0 + timedelta(minutes=20),
+        )
+        assert fresh.blocking is False and fresh.fired is False
+
+        # ...then older eligible contributions complete the threshold. The
+        # outcome carries BOTH the informational reason and fired=True.
+        _evaluate(
+            session, spec=_breadth_spec(threshold=3), members=["NSE:A", "NSE:B", "NSE:C"],
+            triggering="NSE:A", observed_at=T0 + timedelta(minutes=5),
+            resolved_at=T0 + timedelta(minutes=20),
+        )
+        crossing = _evaluate(
+            session, spec=_breadth_spec(threshold=3), members=["NSE:A", "NSE:B", "NSE:C"],
+            triggering="NSE:C", observed_at=T0 + timedelta(minutes=5),
+            resolved_at=T0 + timedelta(minutes=20),
+        )
+        assert crossing.blocking is False
+        assert crossing.fired is True
+        assert crossing.reason == "breadth_stale_observation"
+        assert crossing.reason in breadth_engine.INFORMATIONAL_REASONS
+        assert crossing.informational_reason == "breadth_stale_observation"
+        # The aggregate time is recorded separately from the contribution time.
+        assert crossing.evaluated_at == T0 + timedelta(minutes=20)
+        assert crossing.evaluated_at > T0 + timedelta(minutes=5)
+        session.commit()
+    finally:
+        session.close()
+
+
 def test_reversed_arrival_order_converges_to_the_same_crossing(clean):
     """Order independence: the same contributions yield the same crossing."""
     factory = clean
