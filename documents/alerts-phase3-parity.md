@@ -140,10 +140,20 @@ and concurrency fault injection) completes in ~6 s.
 
 ## Live deployment status
 
-Read-only verification on 2026-09-11: live `kite-postgres` is at migration
-`20260910_000015` and carries `screener_run`, `screener_run_member` and
-`screener_attachment_state` (3/3 tables), so no schema change accompanies this
-hardening pass. The running `kite-alerts-worker` container still carries the
-pre-hardening build (`evaluate_attachments` in
-`backend/screeners/scheduler.py`); this pass was verified against the
-disposable test database only and has NOT been rebuilt or redeployed.
+Deployed 2026-09-11 on this host:
+
+| Item | Value |
+| --- | --- |
+| Deployed commit | `3ce7303` — "fix(alerts): derive screener attachment transitions from the locked baseline" |
+| Image | `kite-algo-alerts-worker`, built from `compose.yml` + `compose.worker.yml` |
+| Command | `docker compose -f compose.yml -f compose.worker.yml up -d --build --no-deps alerts-worker` |
+| Container | `kite-alerts-worker` — `Up (healthy)` after restart |
+| Code verification | `sha256sum` of `/app/backend/screeners/scheduler.py` and `/app/backend/workflows/screener_repository.py` in the container match the checked-out `3ce7303` tree exactly |
+| Schema | live `kite-postgres` at migration `20260910_000015`; `screener_run`, `screener_run_member`, `screener_attachment_state` present — no schema change in this pass |
+| Runtime | worker booted with no errors; health file written; 0 active screener workflows on the live database, so the scheduler is idle rather than exercised |
+
+Only the `alerts-worker` service was rebuilt/recreated (`--no-deps`); the
+database, Redis, market-runtime and API containers were left untouched. The
+end-to-end verification of this fix was executed against the isolated
+disposable PostgreSQL (`kite-test-postgres`, port 15433), not against live
+data.
