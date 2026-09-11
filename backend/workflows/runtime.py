@@ -1015,6 +1015,25 @@ class EvaluationWorker:
         except (TypeError, ValueError):
             logger.warning("catalog returned invalid bindings; ignoring pass", exc_info=True)
             return None
+        # `instrument_keys` is the COMPLETE set of instruments still required
+        # this pass, so anything else in the registry belongs to a subscription
+        # that no longer exists. Releasing it here is what stops a removed
+        # dependency from keeping a market-runtime feed open forever: the
+        # renewal callback publishes the registry snapshot, so a retained key
+        # would be re-subscribed on every lease refresh.
+        stale = self.bindings.retain_only(instrument_keys)
+        if stale:
+            logger.info(
+                "released %d binding(s) with no remaining subscription: %s",
+                len(stale), ", ".join(sorted(stale)),
+            )
+            change = BindingChange(
+                added=change.added,
+                changed=change.changed,
+                removed=set(change.removed) | stale,
+                previous_revision=change.previous_revision,
+                revision=self.bindings.revision,
+            )
         await self._apply_binding_change(change)
         return change
 

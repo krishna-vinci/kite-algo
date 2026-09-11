@@ -297,3 +297,101 @@ def test_pg_history_reads_current_binding_not_snapshot():
     assert history._token_for("NSE:A") is None
     registry.apply({"NSE:A": 4242}, set())
     assert history._token_for("NSE:A") == 4242
+
+
+def test_registry_retain_only_releases_unneeded_bindings():
+    """A binding nobody requires any more must not be retained.
+
+    ``apply`` removes a key ONLY when the catalog explicitly rejects it, so
+    without an explicit release the registry keeps the binding of an archived
+    subscription forever. That leaks market-data quota: the renewal callback
+    publishes the registry snapshot, so a retained key is re-subscribed to the
+    market-runtime on every lease refresh for an instrument nothing evaluates.
+    """
+    registry = InstrumentBindingRegistry({"NSE:A": 1, "NSE:B": 2, "NSE:C": 3})
+    assert registry.snapshot() == {"NSE:A": 1, "NSE:B": 2, "NSE:C": 3}
+
+    # Nothing to release: the required set is unchanged.
+    assert registry.retain_only({"NSE:A", "NSE:B", "NSE:C"}) == set()
+    assert registry.revision == 0
+
+    released = registry.retain_only({"NSE:B"})
+    assert released == {"NSE:A", "NSE:C"}
+    assert registry.snapshot() == {"NSE:B": 2}, "only the required key survives"
+    assert registry.revision == 1, "consumers must see the binding set moved"
+
+    # Idempotent, and case/whitespace-insensitive like the rest of the class.
+    assert registry.retain_only({" nse:b "}) == set()
+    assert registry.snapshot() == {"NSE:B": 2}
+
+
+def test_removed_subscription_releases_its_token_from_the_lease(session_factory):
+    """Dropping a subscription must stop paying for its feed.
+
+    Drives the production refresh path: after a subscription goes away the
+    released instrument must disappear from the renewal snapshot (which is what
+    the market-runtime lease is built from) and its feed source must be stopped
+    — otherwise the runtime keeps streaming a token nothing consumes until the
+    worker restarts.
+    """
+    harness = _Harness(session_factory)
+    harness.catalog_answers = {"NSE:A": 111, "NSE:B": 222}
+    worker = harness.build_worker()
+    harness.worker = worker
+    harness.activate("pair", ["NSE:A", "NSE:B"], trigger="on_transition")
+    asyncio.run(worker.start())
+    assert worker.instrument_tokens == {"NSE:A": 111, "NSE:B": 222}
+
+    # A+B -> B: pause A, exactly as archiving or a paused workflow does.
+    with session_factory() as session:
+        row = (
+            session.query(AlertSubscription)
+            .filter(AlertSubscription.instrument_key == "NSE:A")
+            .first()
+        )
+        row.state = "paused"
+        session.commit()
+
+    harness.renewal_snapshots.clear()
+    asyncio.run(worker.refresh_subscriptions())
+
+    # The released binding is gone from the registry...
+    assert worker.instrument_tokens == {"NSE:B": 222}, (
+        "a released instrument must not stay bound"
+    )
+    # ...so the renewal payload — the market-runtime lease — no longer includes
+    # its token. This is the assertion that fails if teardown is missing.
+    asyncio.run(harness._renewal())
+    assert harness.renewal_snapshots[-1] == {"NSE:B": 222}
+    assert 111 not in harness.renewal_snapshots[-1].values()
+
+    released = [s for s in harness.built_sources if s.token == 111]
+    assert released and all(s.stopped for s in released)
+    asyncio.run(worker.stop())
+
+
+def test_transient_resolution_failure_does_not_release_bindings(session_factory):
+    """A failed catalog pass must never be read as "no longer required".
+
+    Releasing on a transient resolver error would stop feeds for instruments
+    that are still subscribed, so the pass must leave bindings untouched.
+    """
+    harness = _Harness(session_factory)
+    harness.catalog_answers = {"NSE:A": 111}
+    worker = harness.build_worker()
+    harness.worker = worker
+    harness.activate("solo", ["NSE:A"], trigger="on_transition")
+    asyncio.run(worker.start())
+    assert worker.instrument_tokens == {"NSE:A": 111}
+
+    def _explode(keys):
+        raise RuntimeError("catalog temporarily unavailable")
+
+    worker.instrument_resolver = _explode
+    asyncio.run(worker.refresh_subscriptions())
+
+    assert worker.instrument_tokens == {"NSE:A": 111}, (
+        "bindings must survive a transient resolution failure"
+    )
+    assert set(worker._tick_sources) == {"NSE:A"}
+    asyncio.run(worker.stop())

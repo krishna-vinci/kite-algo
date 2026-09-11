@@ -61,6 +61,32 @@ class InstrumentBindingRegistry:
         with self._lock:
             return self._tokens.get(str(instrument_key).strip().upper())
 
+    def retain_only(self, keys: Set[str]) -> Set[str]:
+        """Drop bindings for instruments that are no longer required.
+
+        :meth:`apply` only removes a binding the catalog explicitly REJECTS, so
+        a key that simply stops being needed — its subscription was archived,
+        paused or deleted — would otherwise stay here forever. That is not a
+        cosmetic leak: the market-runtime renewal callback publishes
+        :meth:`snapshot`, so a retained key keeps a live feed subscription open
+        for an instrument nothing evaluates, consuming market-data quota until
+        the process restarts.
+
+        ``keys`` must be the COMPLETE set of instruments still required. The
+        dropped keys are returned so the caller can tear down their sources and
+        dispatch groups, and the revision is bumped so consumers can see that
+        the accepted binding set moved.
+        """
+        wanted = {str(key).strip().upper() for key in keys}
+        with self._lock:
+            stale = {key for key in self._tokens if key not in wanted}
+            if not stale:
+                return set()
+            for key in stale:
+                self._tokens.pop(key, None)
+            self._revision += 1
+            return stale
+
     def apply(
         self,
         resolved: Dict[str, int],
