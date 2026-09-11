@@ -111,6 +111,12 @@ class DeliveryAttempt(Base):
     attempt_no = Column(Integer, nullable=False)
     outcome = Column(String(32), nullable=False)  # accepted|retryable|permanent|unknown
     detail = Column(Text, nullable=False, default="")
+    # Provider acknowledgement (Telegram message_id / ntfy X-Ntfy-Id), captured
+    # from the adapter outcome so "did the provider accept this, and under which
+    # id" is answerable (Phase 6 6A). NULL for attempts recorded before the
+    # column existed — deliberately not backfilled, because the value was never
+    # captured and inventing one would be worse than an honest gap.
+    provider_id = Column(String(128), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
@@ -347,6 +353,7 @@ class SqlAlchemyNotificationRepository:
         delivered_at: Optional[datetime] = None,
         last_error: Optional[str] = None,
         lease_until: Optional[datetime] = None,
+        provider_id: Optional[str] = None,
         db: Optional[Session] = None,
         now: Optional[datetime] = None,
     ):
@@ -368,13 +375,15 @@ class SqlAlchemyNotificationRepository:
         if db is not None:
             return self._record_attempt(
                 db, delivery_id, attempt_no, outcome, detail, new_status,
-                next_attempt_at, delivered_at, last_error, lease_until, now,
+                next_attempt_at, delivered_at, last_error, lease_until,
+                provider_id, now,
             )
         session = self._session()
         try:
             delivery = self._record_attempt(
                 session, delivery_id, attempt_no, outcome, detail, new_status,
-                next_attempt_at, delivered_at, last_error, lease_until, now,
+                next_attempt_at, delivered_at, last_error, lease_until,
+                provider_id, now,
             )
             session.commit()
             return delivery
@@ -385,7 +394,8 @@ class SqlAlchemyNotificationRepository:
             session.close()
 
     def _record_attempt(self, session, delivery_id, attempt_no, outcome, detail, new_status,
-                        next_attempt_at, delivered_at, last_error, expected_lease_until, now):
+                        next_attempt_at, delivered_at, last_error, expected_lease_until,
+                        provider_id, now):
         delivery = session.get(Delivery, delivery_id)
         if delivery is None:
             raise KeyError(delivery_id)
@@ -432,6 +442,7 @@ class SqlAlchemyNotificationRepository:
                 attempt_no=int(attempt_no),
                 outcome=str(outcome),
                 detail=str(detail or ""),
+                provider_id=(str(provider_id)[:128] if provider_id else None),
                 created_at=timestamp,
             )
         )

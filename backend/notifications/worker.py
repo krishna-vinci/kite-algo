@@ -475,6 +475,10 @@ class DeliveryWorker:
             delivered_at=delivered_at,
             last_error=last_error,
             lease_until=delivery.lease_until,
+            # Provider acknowledgement, captured from the adapter outcome
+            # (Telegram message_id / ntfy X-Ntfy-Id). Previously discarded, so
+            # "which message did the provider accept" was unanswerable.
+            provider_id=getattr(outcome, "provider_id", None),
             now=now,
         )
         return new_status

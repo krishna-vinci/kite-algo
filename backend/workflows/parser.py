@@ -47,7 +47,12 @@ from .models import (
     WorkflowDocument,
 )
 
-__all__ = ["WorkflowParseError", "parse_workflow_yaml", "parse_workflow_dict"]
+__all__ = [
+    "WorkflowParseError",
+    "parse_workflow_yaml",
+    "parse_workflow_dict",
+    "document_to_yaml",
+]
 
 MAX_DOCUMENT_BYTES = 256 * 1024
 _MAX_NODES = 50_000
@@ -144,6 +149,210 @@ def parse_workflow_yaml(text: str) -> WorkflowDocument:
     except yaml.YAMLError as exc:
         raise WorkflowParseError(f"invalid YAML: {exc}") from exc
     return parse_workflow_dict(root)
+
+
+_PAIR_KINDS_FOR_RENDER = ("pair_ratio", "relative_strength")
+
+
+def _operand_yaml(operand: Any) -> Any:
+    """Render one operand in the readable authoring shorthand.
+
+    Shorthand when it is faithful, the explicit ``{kind, name, value, params,
+    source, offset}`` form when it is not. Faithfulness is what matters: a
+    shorter rendering that parses back to a DIFFERENT operand would be a silent
+    corruption, so anything the shorthand cannot express exactly falls back.
+    """
+    kind = getattr(operand, "kind", None)
+    name = getattr(operand, "name", None)
+    value = getattr(operand, "value", None)
+    params = dict(getattr(operand, "params", None) or {})
+    source = getattr(operand, "source", None)
+    offset = getattr(operand, "offset", None)
+
+    if kind == "value" and source is None and offset is None:
+        if not params and value is not None:
+            # The parser accepts a bare number, which is the most readable form.
+            return value
+        if not params:
+            return {"value": value}
+
+    if kind == "field" and name and not params and source is None and offset is None:
+        return {"field": name}
+
+    if kind == "indicator" and name:
+        rendered: dict = {"indicator": name}
+        rendered.update(params)
+        # The parser pops these two back out of the param mapping, so emitting
+        # them as keys is the exact inverse of how they were read.
+        if source is not None:
+            rendered["source"] = source
+        if offset is not None:
+            rendered["offset"] = offset
+        return rendered
+
+    if kind == "pair" and name in _PAIR_KINDS_FOR_RENDER:
+        # The pair form takes the spec mapping as its only key (the parser
+        # rejects any sibling key), so this is faithful whenever params is a
+        # plain mapping.
+        return {name: dict(params)}
+
+    # Explicit form: always faithful.
+    return {
+        "kind": kind,
+        "name": name,
+        "value": value,
+        "params": params,
+        "source": source,
+        "offset": offset,
+    }
+
+
+def _condition_yaml(condition: Any) -> dict:
+    """One condition in readable form (hysteresis only when set)."""
+    item: dict = {
+        "left": _operand_yaml(condition.left),
+        "op": condition.op,
+        "right": _operand_yaml(condition.right),
+    }
+    if getattr(condition, "hysteresis", None) is not None:
+        item["hysteresis"] = condition.hysteresis.to_document_dict()
+    return item
+
+
+def _document_yaml_payload(document: Any) -> dict:
+    """The readable authoring view of a document.
+
+    Built from the model (not from the canonical dict) so fields the shorthand
+    can express are rendered readably, while every value still comes from the
+    parsed document — the renderer never invents data.
+    """
+    payload: dict = {
+        "version": document.version,
+        "name": document.name,
+        "session": document.session,
+    }
+    if document.universe is not None:
+        payload["universe"] = document.universe.to_document_dict()
+    payload["instruments"] = [
+        instrument.key() for instrument in document.instruments
+    ]
+
+    stages: list = []
+    for stage in document.stages:
+        item: dict = {
+            "id": stage.id,
+            "type": stage.type,
+            "clock": stage.clock,
+        }
+        if stage.timeframe is not None:
+            item["timeframe"] = stage.timeframe
+        if stage.input is not None:
+            item["input"] = stage.input
+        if stage.conditions or stage.any_conditions or stage.not_conditions:
+            conditions: dict = {}
+            if stage.conditions:
+                conditions["all"] = [_condition_yaml(c) for c in stage.conditions]
+            if stage.any_conditions:
+                conditions["any"] = [_condition_yaml(c) for c in stage.any_conditions]
+            if stage.not_conditions:
+                conditions["not"] = [_condition_yaml(c) for c in stage.not_conditions]
+            item["conditions"] = conditions
+        for key in ("function", "source_field"):
+            value = getattr(stage, key, None)
+            if value is not None:
+                item[key] = value
+        if getattr(stage, "stage_params", None):
+            item["params"] = dict(stage.stage_params)
+        if stage.consecutive_bars is not None:
+            item["consecutive_bars"] = stage.consecutive_bars
+        if stage.sequence is not None:
+            item["sequence"] = stage.sequence.to_document_dict()
+        if stage.breadth is not None:
+            item["breadth"] = stage.breadth.to_document_dict()
+        stages.append(item)
+    payload["stages"] = stages
+
+    alerts: list = []
+    for alert in document.alerts:
+        item = {"id": alert.id, "source": alert.source}
+        if alert.trigger:
+            item["trigger"] = alert.trigger
+        if alert.channels:
+            item["channels"] = list(alert.channels)
+        for key in (
+            "cooldown_s",
+            "rearm_level",
+            "rearm_direction",
+            "reminder_interval_s",
+            "message",
+            "expires_at",
+        ):
+            value = getattr(alert, key, None)
+            if value is not None:
+                item[key] = value
+        if alert.notify_if_already_true:
+            item["notify_if_already_true"] = True
+        if getattr(alert, "max_per_session", None) is not None:
+            item["max_per_session"] = alert.max_per_session
+        if getattr(alert, "session_cap_reset", None) is not None:
+            item["session_cap_reset"] = alert.session_cap_reset
+        alerts.append(item)
+    payload["alerts"] = alerts
+
+    if getattr(document, "screener", None) is not None:
+        payload["screener"] = document.screener.to_document_dict()
+    return payload
+
+
+def document_to_yaml(document: Any) -> str:
+    """Render a document as READABLE YAML, with a guaranteed round trip.
+
+    Two properties are required and they pull in opposite directions:
+
+    1. **Readable** — operators read and hand-edit this, so conditions render in
+       the documented authoring shorthand (`{field: close}`) rather than the
+       internal normalized form (`{kind: field, value: null, params: {}}`).
+    2. **Lossless** — the text must parse back to the SAME document and the same
+       canonical hash, because the canvas, the structured editor and YAML are
+       all views of one canonical definition (spec §10.2).
+
+    Readability is best-effort; losslessness is not. So this renders the
+    shorthand and then VERIFIES it: if the text does not parse back to an
+    identical canonical hash, it falls back to the canonical serialization
+    (verbose but exactly faithful). That makes the guarantee a property of the
+    function rather than a hope pinned by tests alone — a future field the
+    shorthand cannot express degrades to verbose YAML instead of silently
+    dropping data.
+    """
+    import hashlib
+    import json as _json
+
+    def _hash(doc: Any) -> str:
+        canonical = _json.dumps(
+            doc.to_document_dict(), sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    readable = yaml.safe_dump(
+        _document_yaml_payload(document),
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+        width=100,
+    )
+    try:
+        if _hash(parse_workflow_yaml(readable)) == _hash(document):
+            return readable
+    except WorkflowParseError:
+        pass
+    return yaml.safe_dump(
+        document.to_document_dict(),
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+        width=100,
+    )
 
 
 def parse_workflow_dict(obj: Any) -> WorkflowDocument:
