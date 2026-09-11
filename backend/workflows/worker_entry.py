@@ -590,12 +590,44 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
 
     await sync_market_runtime_snapshot()
 
+    # Phase 6 6A.0 LTP freshness bounds. Defaults live HERE (not in the source)
+    # so a directly-constructed RedisTickSource keeps its historical behavior,
+    # while production always gets the bounds. ALERTS_LTP_FRESHNESS_ENABLED=false
+    # is the kill switch: it disables the tick-level bounds AND the service-side
+    # silence-gap invalidation without a redeploy.
+    ltp_freshness_enabled = (
+        os.environ.get("ALERTS_LTP_FRESHNESS_ENABLED", "true").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+    try:
+        ltp_max_tick_age_s = float(os.environ.get("ALERTS_LTP_MAX_TICK_AGE_S", "300"))
+    except ValueError:
+        ltp_max_tick_age_s = 300.0
+    try:
+        ltp_max_future_skew_s = float(
+            os.environ.get("ALERTS_LTP_MAX_FUTURE_SKEW_S", "300")
+        )
+    except ValueError:
+        ltp_max_future_skew_s = 300.0
+    try:
+        ltp_max_gap_s = float(os.environ.get("ALERTS_LTP_MAX_GAP_S", "300"))
+    except ValueError:
+        ltp_max_gap_s = 300.0
+    if not ltp_freshness_enabled:
+        ltp_max_tick_age_s = 0.0
+        ltp_max_future_skew_s = 0.0
+
     def tick_source_factory(instrument_key: str) -> RedisTickSource:
         token = bindings.get(instrument_key)
         mapping = {token: instrument_key} if token is not None else {}
         # each call returns a NEW source (fresh uuid epoch): the worker
         # relies on that to re-initialize ltp rules after a feed outage (D2)
-        return RedisTickSource(redis_client, mapping)
+        return RedisTickSource(
+            redis_client,
+            mapping,
+            max_tick_age_s=ltp_max_tick_age_s or None,
+            max_future_skew_s=ltp_max_future_skew_s or None,
+        )
 
     def candle_source_factory(instrument_key: str, timeframe: str) -> RedisCandleSource:
         token = bindings.get(instrument_key)
@@ -660,6 +692,10 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         pair_max_bar_age_s=float(
             os.environ.get("ALERTS_PAIR_MAX_BAR_AGE_S", "0")
         ),
+        # Phase 6 6A.0: service-side half of the LTP freshness policy (the
+        # silence-gap continuity invalidation).
+        ltp_freshness_enabled=ltp_freshness_enabled,
+        ltp_max_gap_s=ltp_max_gap_s,
     )
 
     # Phase 2 (F7): universe membership resolution wired into the refresh

@@ -240,3 +240,35 @@ configuration is not recoverable by re-upgrading.
 | `ALERTS_BREADTH_MAX_INSTRUMENTS` | `1000` | Member count above which breadth reports `breadth_capacity_exceeded` |
 | `ALERTS_EXTERNAL_RETENTION_S` | `604800` (7d) | How long past expiry an unusable value is retained |
 | `ALERTS_EXTERNAL_MAX_ROWS_PER_PRODUCER` | `100000` | Per-producer value cap (rejects; never evicts a valid value) |
+
+### Phase 6 additions (LTP freshness)
+
+The market runtime keeps re-publishing the last tick after a session closes. Before these bounds
+existed, that frozen snapshot was evaluated as if it were live, so an after-hours or illiquid
+instrument could alert on a price that had not traded for hours. A receive-age check cannot catch
+it (the snapshot carries a **fresh** receipt with a **stale** exchange timestamp), so the age
+bound compares the two.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ALERTS_LTP_FRESHNESS_ENABLED` | `true` | Master switch. `false` disables BOTH the tick bounds and the silence-gap rule below, restoring pre-Phase-6 behavior without a redeploy |
+| `ALERTS_LTP_MAX_TICK_AGE_S` | `300` | A tick whose exchange timestamp is older than this — measured at RECEIPT, and against `received_at` when present — is dropped (`stale_tick`), never evaluated |
+| `ALERTS_LTP_MAX_FUTURE_SKEW_S` | `300` | A tick stamped further ahead than this is dropped (`future_tick`): clock skew must not authorise a "fresh" tick |
+| `ALERTS_LTP_MAX_GAP_S` | `300` | Silence longer than this between accepted ticks invalidates crossing continuity (`ltp_gap`) before the next tick is evaluated, so no crossing is fabricated across the gap |
+
+Behavior notes:
+
+- **Staleness is visible without a tick arriving.** Health reports `ltp_freshness_enabled`,
+  `ltp_max_gap_s`, `stale_tick_instruments`, `never_ticked_instruments` and a bounded
+  `stale_tick_detail` map, computed on the health timer from each instrument's last accepted
+  receipt (seeded from checkpoints at startup, so a restart does not look like a feed outage).
+  Refused ticks are counted in `rejected_ticks` (`stale_tick`/`future_tick`/`untimed`).
+- **Continuity invalidation is durable and committed on its own.** It is written before
+  evaluation in a separate transaction, so a failing evaluation cannot roll it back. Durable
+  trigger bookkeeping (`fired_once`, session, cooldown, rearm) is retained — a stale interval can
+  never re-arm a completed rule.
+- **No fabricated crossing.** The first tick after a gap re-initializes condition state and
+  cannot fire; the operator sees `ltp_gap` as the suppression reason.
+- **Missing timestamps** are dropped and counted (`untimed`), as before.
+- Observations that carry no receipt time (synthetic/replayed) never have a gap inferred: the
+  rule reports only what it can actually measure.

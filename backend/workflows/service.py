@@ -219,6 +219,8 @@ class EvaluationService:
         ownership_lease_s: float = 120.0,
         breadth_max_instruments: int = 1000,
         breadth_membership_max_age_s: float = 900.0,
+        ltp_freshness_enabled: bool = True,
+        ltp_max_gap_s: float = 300.0,
     ) -> None:
         self.workflow_repo = workflow_repo
         self.session_factory = session_factory
@@ -244,6 +246,11 @@ class EvaluationService:
         # membership snapshot never supports a signal.
         self.breadth_max_instruments = max(1, int(breadth_max_instruments))
         self.breadth_membership_max_age_s = max(1.0, float(breadth_membership_max_age_s))
+        # Phase 6 6A.0 LTP freshness. The kill switch disables the silence-gap
+        # continuity invalidation without a redeploy; the tick-level age/future
+        # bounds live on the tick source (see RedisTickSource).
+        self.ltp_freshness_enabled = bool(ltp_freshness_enabled)
+        self.ltp_max_gap_s = max(1.0, float(ltp_max_gap_s))
 
     # ------------------------------------------------------------------
     # subscriptions
@@ -719,6 +726,21 @@ class EvaluationService:
             if stage.clock == "ltp" and observation_epoch_changed:
                 state = dict(state)
 
+            # LTP silence gap (Phase 6 6A.0): the feed may stay connected while
+            # publishing nothing (a frozen session, a stalled upstream). Ticks
+            # arriving after such a silence must not be evaluated against the
+            # continuity from before it, or a "crossing" could be manufactured
+            # across the gap. The invalidation is committed in its OWN
+            # transaction, before evaluation, so a later evaluation failure
+            # cannot roll it back and resurrect the pre-gap continuity.
+            ltp_gap = False
+            if stage.clock == "ltp" and self.ltp_freshness_enabled:
+                ltp_gap = self._ltp_gap_detected(state, obs)
+                if ltp_gap:
+                    state, stored_epoch = self._persist_continuity_invalidation(
+                        sub, obs, state, stored_epoch, session
+                    )
+
             session_active, session_id = self._resolve_session(sub, document, obs)
 
             pred = evaluate_stage(stage, obs, state, context, features)
@@ -956,6 +978,12 @@ class EvaluationService:
                             "cooldown_until", "armed"):
                     new_state.pop(key, None)
             new_state["epoch_id"] = obs.epoch_id
+            if stage.clock == "ltp" and obs.received_at is not None:
+                # Durable receipt bookkeeping: this is what lets a later
+                # evaluation (or a fresh process) measure how long the feed has
+                # been silent WITHOUT waiting for another tick to arrive.
+                new_state["last_tick_received_at"] = obs.received_at.isoformat()
+                new_state["last_tick_ts"] = obs.ts.isoformat()
             if obs.final:
                 prior_bar_state = dict(state)
                 prior_bar_state.pop("last_bar_state", None)
@@ -1021,6 +1049,10 @@ class EvaluationService:
                 suppression_reason = None if emitted else "duplicate_occurrence"
             elif gap:
                 suppression_reason = "feed_gap"
+            elif ltp_gap:
+                # Continuity was invalidated (the tick itself was fresh and was
+                # evaluated), so the operator sees WHY nothing fired.
+                suppression_reason = "ltp_gap"
             else:
                 suppression_reason = engine.suppression_reason
 
@@ -1069,6 +1101,79 @@ class EvaluationService:
         reset.pop("last_bar_state", None)
         reset.pop("last_bar_payload", None)
         return reset
+
+    def _ltp_gap_detected(self, state: dict, obs: Observation) -> bool:
+        """Whether the feed was silent longer than the bound before this tick.
+
+        Measured on RECEIPT time (``received_at``), not event time: the question
+        is how long the worker went without data, which event timestamps cannot
+        answer (a frozen snapshot is exactly a stale event time with an ongoing
+        receipt). When either side lacks a receipt timestamp the check is
+        skipped rather than guessed — an honest "unknown" instead of inventing a
+        gap from synthetic observations that never carried receive times.
+        """
+        if obs.received_at is None:
+            return False
+        previous_raw = (state or {}).get("last_tick_received_at")
+        previous = _parse_ts(previous_raw)
+        if previous is None:
+            return False
+        gap_s = (obs.received_at - previous).total_seconds()
+        if gap_s < 0:
+            # Out-of-order receipt: not a silence, and not something to reason
+            # about. The predicate layer's own monotonicity handles ordering.
+            return False
+        return gap_s > self.ltp_max_gap_s
+
+    def _persist_continuity_invalidation(
+        self,
+        sub: ActiveSubscription,
+        obs: Observation,
+        state: dict,
+        stored_epoch: int,
+        session: Session,
+    ) -> tuple:
+        """Commit an LTP continuity reset on its own, then continue evaluating.
+
+        Deliberately a separate, immediately-committed transaction that touches
+        ONLY the continuity keys: durable trigger bookkeeping (``fired_once``,
+        ``last_session``, cooldown, rearm) is retained by
+        :meth:`_reset_observation_state`, and no event, delivery or lifecycle
+        change can be produced here. Committing before evaluation means a later
+        evaluation failure cannot roll the invalidation back and leave the next
+        tick to be judged against pre-silence continuity — the fabricated-
+        crossing hazard the reset exists to prevent.
+
+        The checkpoint CAS advances the stored ``owner_epoch``, so the new value
+        is returned and threaded into the caller's own save; otherwise the
+        caller's CAS would compare against a stale epoch and lose the lease.
+        """
+        reset = self._reset_observation_state(state)
+        reset["last_tick_received_at"] = (
+            obs.received_at.isoformat() if obs.received_at else None
+        )
+        reset["last_tick_ts"] = obs.ts.isoformat()
+        reset["continuity_invalidated_at"] = obs.ts.isoformat()
+        reset["continuity_invalidation_reason"] = "ltp_gap"
+        self._log_suppression(sub, "ltp_gap")
+        try:
+            row = self.workflow_repo.save_checkpoint(
+                sub.id,
+                sub.instrument_key,
+                obs.epoch_id,
+                reset,
+                stored_epoch,
+                now=self.clock() if self.clock is not None else obs.ts,
+            )
+        except LeaseConflict:
+            # The fence moved while we were about to invalidate; the caller's
+            # own assertion will report lease_lost, so keep the state unchanged.
+            logger.info(
+                "continuity invalidation lost the checkpoint lease for %s (%s)",
+                sub.id, sub.instrument_key,
+            )
+            return state, stored_epoch
+        return reset, int(getattr(row, "owner_epoch", 0) or 0)
 
     @staticmethod
     def _bar_payload(obs: Observation) -> dict:

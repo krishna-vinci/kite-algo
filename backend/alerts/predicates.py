@@ -105,6 +105,14 @@ class Observation:
     close: Optional[float] = None
     volume: Optional[float] = None
     final: bool = False     # True only for completed candles
+    # LTP freshness (Phase 6 6A.0): the RECEIVE-time facts a tick carries. They
+    # are separate from ``ts`` on purpose — ``ts`` is the exchange's event time,
+    # and a frozen snapshot re-published by the market runtime has a stale
+    # ``ts`` with a fresh ``received_at``, so only the comparison between the
+    # two can tell "live" from "frozen". Absent for candles and for synthetic
+    # observations, in which case no receipt-based freshness claim is made.
+    received_at: Optional[datetime] = None
+    last_trade_time: Optional[datetime] = None
 
 
 @dataclass(frozen=True)

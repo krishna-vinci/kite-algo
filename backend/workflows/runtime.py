@@ -221,6 +221,17 @@ class RedisTickSource:
     The ``token_to_instrument`` dict restricts which ticks this source emits:
     ``{instrument_token: instrument_key}``. The epoch id is a per-construction
     uuid, so every worker boot opens a fresh ltp epoch (E-5).
+
+    Freshness (Phase 6 6A.0): a tick whose exchange timestamp is far older than
+    its receipt — or implausibly in the future — is DROPPED here rather than
+    evaluated, because the market runtime re-publishes the last snapshot after a
+    session closes, and evaluating that would alert on a frozen price as if it
+    were live. The bounds are enforced at RECEIPT on purpose: a tick delayed in
+    the pub/sub queue must not be judged against a later wall clock, and the
+    comparison is only meaningful at the instant we accepted the message. Bounds
+    are opt-in configuration (``worker_entry`` supplies the production defaults
+    and the kill switch), so a source constructed without them behaves exactly
+    as before.
     """
 
     def __init__(
@@ -229,6 +240,9 @@ class RedisTickSource:
         token_to_instrument: Optional[Dict[int, str]] = None,
         *,
         channel: str = MARKET_TICKS_CHANNEL,
+        max_tick_age_s: Optional[float] = None,
+        max_future_skew_s: Optional[float] = None,
+        clock: Optional[Callable[[], datetime]] = None,
     ) -> None:
         if redis_client is None:
             redis_client = _default_redis_client()
@@ -240,6 +254,23 @@ class RedisTickSource:
         self._epoch_id = str(uuid.uuid4())
         self._pubsub: Any = None
         self._started = False
+        self._max_tick_age_s = (
+            float(max_tick_age_s) if max_tick_age_s and max_tick_age_s > 0 else None
+        )
+        self._max_future_skew_s = (
+            float(max_future_skew_s)
+            if max_future_skew_s and max_future_skew_s > 0
+            else None
+        )
+        self._clock = clock or _utcnow
+        # Rejected-tick counters, aggregated into worker health. They live on
+        # the source because only the source sees a tick that never became an
+        # observation.
+        self.rejected: Dict[str, int] = {
+            "stale_tick": 0,
+            "future_tick": 0,
+            "untimed": 0,
+        }
 
     @property
     def epoch_id(self) -> str:
@@ -251,6 +282,35 @@ class RedisTickSource:
         self._pubsub = self._redis.pubsub()
         await self._pubsub.subscribe(self._channel)
         self._started = True
+
+    def _freshness_reject(
+        self, ts: datetime, received_at: Optional[datetime]
+    ) -> Optional[str]:
+        """The rejection reason for one tick, or None when it may be evaluated.
+
+        Returns ``None`` when no bound is configured, so an unconfigured source
+        makes no freshness claim at all rather than guessing.
+        """
+        if self._max_future_skew_s is None and self._max_tick_age_s is None:
+            return None
+        now = self._clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        if self._max_future_skew_s is not None:
+            lead = (ts - now).total_seconds()
+            if lead > self._max_future_skew_s:
+                # A timestamp that cannot describe an observation of the past is
+                # not trusted: clock skew must never authorise a "fresh" tick.
+                return "future_tick"
+        if self._max_tick_age_s is not None:
+            age = (now - ts).total_seconds()
+            if received_at is not None:
+                # A stale exchange timestamp with a fresh receipt is exactly the
+                # frozen-snapshot signature, so the WORSE of the two ages wins.
+                age = max(age, (received_at - ts).total_seconds())
+            if age > self._max_tick_age_s:
+                return "stale_tick"
+        return None
 
     async def next_observation(self) -> Optional[Observation]:
         if not self._started or self._pubsub is None:
@@ -278,14 +338,27 @@ class RedisTickSource:
             if ltp is None:
                 continue
             ts = _parse_ts(payload.get("exchange_timestamp", payload.get("ts")))
+            received_at = _parse_ts(payload.get("received_at"))
+            last_trade_time = _parse_ts(payload.get("last_trade_time"))
             try:
                 ltp_value = float(ltp)
             except (TypeError, ValueError):
                 continue
             if ts is None or not math.isfinite(ltp_value):
+                self.rejected["untimed"] += 1
                 logger.warning("discarding tick with missing/invalid exchange timestamp or ltp")
                 continue
-            return Observation(ts=ts, epoch_id=self._epoch_id, ltp=ltp_value)
+            reason = self._freshness_reject(ts, received_at)
+            if reason is not None:
+                self.rejected[reason] += 1
+                continue
+            return Observation(
+                ts=ts,
+                epoch_id=self._epoch_id,
+                ltp=ltp_value,
+                received_at=received_at,
+                last_trade_time=last_trade_time,
+            )
 
     async def stop(self) -> None:
         if self._pubsub is not None:
@@ -767,6 +840,11 @@ class EvaluationWorker:
         self.universe_resolve_interval_s = 300.0
         self._universe_cache: Dict[str, Tuple[float, set]] = {}
         self._universe_health = {"stale_universes": 0, "resolution_failures": 0}
+        # Phase 6 6A.0: last ACCEPTED LTP tick receipt per instrument, used by
+        # the health loop to age staleness with no tick arriving. Seeded from
+        # durable checkpoints at startup so a restart does not look like a
+        # fleet-wide feed outage.
+        self._last_accepted_tick: Dict[str, datetime] = {}
         self._document_cache: Dict[str, Optional[WorkflowDocument]] = {}
         self._pending_rebuilds: Dict[Tuple[str, Any], datetime] = {}
         self._bg_tasks: List[asyncio.Task] = []
@@ -818,6 +896,8 @@ class EvaluationWorker:
         # as a membership resolution: breadth freshness must be measured from
         # a real timestamp even before the first refresh pass.
         self.health["last_refresh_at"] = self.health["started_at"]
+        # Seed LTP tick ages from durable checkpoints (see _seed_ltp_freshness).
+        self._seed_ltp_freshness()
         self._running = True
         logger.info(
             "evaluation worker started: %d subscriptions (%d ltp instruments, %d candle groups)",
@@ -877,6 +957,9 @@ class EvaluationWorker:
             if obs is None:
                 continue
             saw_any = True
+            # Phase 6 6A.0: an accepted LTP tick resets the staleness clock for
+            # this instrument, so health ages from real receipts.
+            self._remember_accepted_tick(instrument_key, obs)
             for sub in self._ltp_subs.get(instrument_key, ()):
                 features, layers = self._plan_dispatch(sub)
                 self._dispatch(sub, obs, features=features, layers=layers)
@@ -1533,6 +1616,110 @@ class EvaluationWorker:
                 return
             self._write_health()
 
+    def _rejected_tick_counters(self) -> Dict[str, int]:
+        """Sum the per-source tick rejections (stale/future/untimed)."""
+        totals: Dict[str, int] = {}
+        for source in list(self._tick_sources.values()):
+            rejected = getattr(source, "rejected", None)
+            if not isinstance(rejected, dict):
+                continue
+            for reason, count in rejected.items():
+                totals[reason] = totals.get(reason, 0) + int(count or 0)
+        return totals
+
+    def _ltp_freshness_health(self) -> Dict[str, Any]:
+        """Tick-age view over every LTP instrument we are supposed to monitor.
+
+        ``stale_tick_instruments`` counts instruments whose last accepted tick
+        is older than the bound — reported even when no tick has arrived since,
+        which is precisely when an operator needs to see it. The per-instrument
+        map is bounded so a large universe cannot make the health file grow
+        without limit.
+        """
+        enabled = getattr(self.service, "ltp_freshness_enabled", True)
+        bound_s = float(getattr(self.service, "ltp_max_gap_s", 300.0))
+        now = _utcnow()
+        ages: Dict[str, float] = {}
+        for instrument_key in sorted(self._ltp_subs):
+            accepted = self._last_accepted_tick.get(instrument_key)
+            if accepted is None:
+                # Never seen a tick for this instrument at all. That is a stale
+                # state, not an absent one: the subscription exists and the
+                # operator asked to be told about it.
+                ages[instrument_key] = None
+                continue
+            ages[instrument_key] = max(0.0, (now - accepted).total_seconds())
+        stale = [
+            key for key, age in ages.items()
+            if age is None or (enabled and age > bound_s)
+        ]
+        view = {
+            "ltp_freshness_enabled": enabled,
+            "ltp_max_gap_s": bound_s,
+            "stale_tick_instruments": len(stale) if enabled else 0,
+            "never_ticked_instruments": sum(1 for age in ages.values() if age is None),
+            # Always present (possibly empty) so consumers get a stable schema.
+            "stale_tick_detail": {},
+        }
+        if enabled and stale:
+            # Bounded detail: the oldest few, which are the ones worth looking
+            # at, plus the count of the rest.
+            ordered = sorted(
+                stale,
+                key=lambda key: float("inf") if ages[key] is None else ages[key],
+                reverse=True,
+            )
+            view["stale_tick_detail"] = {
+                key: (None if ages[key] is None else round(ages[key], 1))
+                for key in ordered[:20]
+            }
+        return view
+
+    def _remember_accepted_tick(self, instrument_key: str, obs: Observation) -> None:
+        """Record the receipt of an accepted LTP tick for health aging.
+
+        Uses the tick's own ``received_at`` when present (the source's view of
+        receipt) and falls back to now, so a source that carries no receive time
+        still ages from the moment we accepted it.
+        """
+        accepted = obs.received_at or _utcnow()
+        if accepted.tzinfo is None:
+            accepted = accepted.replace(tzinfo=timezone.utc)
+        current = self._last_accepted_tick.get(instrument_key)
+        if current is not None and current > accepted:
+            return  # out-of-order receipt never makes us look fresher
+        self._last_accepted_tick[instrument_key] = accepted
+
+    def _seed_ltp_freshness(self) -> None:
+        """Seed tick ages from durable checkpoints at startup.
+
+        Without this a restart would report every instrument as "never ticked"
+        until the first tick arrived, which would look like a fleet-wide feed
+        failure on every deploy. The checkpoint's ``last_tick_received_at`` is
+        the durable record the service writes on each accepted tick.
+        """
+        for sub in self._subscriptions:
+            if not self._ltp_subs.get(sub.instrument_key):
+                continue
+            try:
+                latest = self.workflow_repo.load_latest_checkpoint(
+                    sub.id, sub.instrument_key
+                )
+            except Exception:
+                continue
+            if latest is None:
+                continue
+            _epoch, state, _owner_epoch = latest
+            if not isinstance(state, dict):
+                continue
+            raw = state.get("last_tick_received_at")
+            parsed = _parse_ts(raw) if raw else None
+            if parsed is None:
+                continue
+            current = self._last_accepted_tick.get(sub.instrument_key)
+            if current is None or parsed > current:
+                self._last_accepted_tick[sub.instrument_key] = parsed
+
     def health_snapshot(self) -> Dict[str, Any]:
         """JSON-safe view of the health counters plus any extra providers."""
         snapshot: Dict[str, Any] = {}
@@ -1540,6 +1727,13 @@ class EvaluationWorker:
             snapshot[key] = dict(value) if isinstance(value, Counter) else value
         snapshot["universe_membership"] = dict(self._universe_health)
         snapshot["feature_windows"] = len(self._feature_sources) + len(self._candle_sources)
+        # Phase 6 6A.0: LTP staleness is observable with NO tick arriving. The
+        # age is computed on the health TIMER from the last accepted receipt, so
+        # the failure mode that matters most — silence — is reported by a clock
+        # rather than by a counter that only advances when data shows up.
+        snapshot.update(self._ltp_freshness_health())
+        # Ticks the source refused before they ever became observations.
+        snapshot["rejected_ticks"] = self._rejected_tick_counters()
         # Phase 4 F10: external-producer resolution counters, so "why is this
         # condition unknown" is answerable from health rather than logs. The
         # reasons are counted by name (external_missing, _expired, _late,
