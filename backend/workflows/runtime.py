@@ -1448,6 +1448,15 @@ class EvaluationWorker:
             snapshot[key] = dict(value) if isinstance(value, Counter) else value
         snapshot["universe_membership"] = dict(self._universe_health)
         snapshot["feature_windows"] = len(self._feature_sources) + len(self._candle_sources)
+        # Phase 4 F10: external-producer resolution counters, so "why is this
+        # condition unknown" is answerable from health rather than logs. The
+        # reasons are counted by name (external_missing, _expired, _late,
+        # _future, _revoked, ...).
+        if self.external_loader is not None:
+            try:
+                snapshot["external_signals"] = self.external_loader.health()
+            except Exception:
+                logger.warning("external loader health failed", exc_info=True)
         if self.health_extra is not None:
             try:
                 extra = self.health_extra()
