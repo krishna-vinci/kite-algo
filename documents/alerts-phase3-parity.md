@@ -37,7 +37,7 @@ are derived from that locked baseline inside the same transaction. See
 | Crash before/inside publication leaves no side effects | Closed | everything a run publishes is one transaction; a failure injected before publication and one injected mid-publication (second attachment's delivery FK violation, after the first attachment's events, deliveries and baseline rows were written) both leave no run result, member, baseline row, event or delivery behind, and the retry publishes exactly once | PG: `test_failure_before_publication_leaves_zero_side_effects`, `test_mid_publication_failure_rolls_back_entire_transaction`, `test_retry_after_failure_publishes_exactly_once` |
 | E-17 hysteresis survives restart, distinct from rank-delta | Closed | `entry_rank` < `exit_rank` validated; bands stored in `screener_attachment_state`; `rank_delta` compares previous COMPLETE ranks only | `test_top_n_hysteresis_buffers_boundary_oscillation`, `test_rank_delta_fires_on_threshold_cross` |
 | E-18 partial runs: no exits, no baseline advance, no universe replacement | Closed | an attachment plan is built only for `status == 'complete'` runs; dependent-universe refresh only after complete runs; stale source → `UniverseSourceUnavailable` | scheduler code path; `test_stale_complete_run_expires_visibly`; PG: `test_partial_run_publishes_without_attachment_effects` |
-| Dynamic universes from screener results | Closed | universe kind `screener` (`workflow`/`top_n`/`freshness_limit_s`); scheduler re-materializes dependents after each complete run | `tests/screeners/test_universe_screener_kind.py` |
+| Dynamic universes from screener results | **Defective at release — repaired in Phase 4** | universe kind `screener` (`workflow`/`top_n`/`freshness_limit_s`); scheduler re-materializes dependents after each complete run | `tests/screeners/test_universe_screener_kind.py` covers the CODE path on SQLite only. The PostgreSQL CHECK constraint rejected `kind='screener'`, so creation failed on a real database — see "Acknowledged defects" below. Fixed by migration `20260911_000016` and covered by `tests/integration/test_universe_kind_postgres.py` |
 | Cycle prevention + ownership on referenced resources | Closed | `_assert_no_screener_universe_cycle` bounded walk (depth 8, owner-scoped, origin-name aware) at authoring AND resolution | `test_dependency_cycle_rejected`, `test_cross_owner_workflow_reference_rejected` |
 | API: run history, detail, events, manual runs, preview | Closed | `backend/api/routers/worker_screeners.py` under `/api/worker/screeners` (worker-token boundary; scopes reused — no new permission) | `tests/api/test_worker_screeners.py` (owner isolation 404, permission 403, idempotent manual trigger) |
 | Preview purity (no persistent changes / notifications) | Closed | preview runs the production pipeline in-memory; asserts no run rows and no deliveries | `test_preview_is_pure_dry_run` |
@@ -157,3 +157,50 @@ database, Redis, market-runtime and API containers were left untouched. The
 end-to-end verification of this fix was executed against the isolated
 disposable PostgreSQL (`kite-test-postgres`, port 15433), not against live
 data.
+
+## Acknowledged defects (identified after release)
+
+### D-1 — `universes.kind` rejected `screener` on PostgreSQL
+
+**Defect.** The dynamic-universe code path has supported `kind='screener'`
+since Phase 3 (`universes.py::SUPPORTED_UNIVERSE_KINDS`), but migration
+`20260909_000014` declared
+`CHECK (kind IN ('explicit','index','portfolio'))` and `backend/schema.sql`
+mirrored it. The SQLAlchemy model declared no CHECK at all, so
+`Base.metadata.create_all` — and therefore every SQLite unit test — never
+enforced or noticed it.
+
+**Blast radius.** Creating or resolving a screener-backed universe failed on
+real PostgreSQL. The feature was unusable in production while its parity row
+read "Closed", because the evidence behind that row was SQLite-only. The
+PostgreSQL suite did not cover it either: `test_screener_postgres.py` exercises
+the screener RUN tables, not the `universes` constraint.
+
+**Repair (Phase 4).** Migration `20260911_000016` alters the constraint to admit
+`screener` — an `ALTER`, not a table rebuild, so an existing database is fixed
+in place; `backend/schema.sql` is corrected for fresh installs; and the ORM
+model now declares the same `CheckConstraint`, so SQLite tests enforce the rule
+and the drift cannot silently return.
+
+**Evidence.** `tests/integration/test_universe_kind_postgres.py` asserts, on
+real PostgreSQL, that `pg_get_constraintdef` admits `'screener'` and that a
+screener-backed universe can be created and resolved. It covers the upgraded
+database and the `schema.sql` path separately; the from-zero Alembic path is
+blocked by defect D-2 below and is recorded as such.
+
+## Acknowledged defects (open)
+
+### D-2 — from-zero installation is blocked
+
+`alembic upgrade head` runs `20260330_000001_baseline_schema`, which executes
+`backend/schema.sql`. That file ALTERs `signal_events` (the Phase 3 screener
+section) but the table is only created by migration `20260908_000011` — later
+in the same chain — and the file likewise assumes an alerts-platform baseline
+it never creates. The chain therefore aborts at the first statement and no
+from-zero install is possible.
+
+This predates Phase 4 (present at `ae98218`) and is **not** repaired here:
+the fix is a restructure of `schema.sql` so every statement is ordered after
+its dependencies. The condition is pinned by a test that skips with this reason
+rather than passing silently, so repairing it flips that test to a real
+assertion.

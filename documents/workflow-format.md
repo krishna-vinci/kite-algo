@@ -225,3 +225,220 @@ The response reports `evaluation: dry_run`, `evaluated_observations`,
 `dry_run_no_data`. Samples need a real timestamp; the API never substitutes
 server wall-clock time. Preview does not persist checkpoints, signal events, or
 deliveries.
+
+## Phase 4 — advanced conditions, cross-symbol logic, external signals
+
+Status: F10 implemented. Phase 5 (MCP) is deferred; Phase 6 (editor,
+certification) is not started.
+
+### N consecutive completed bars
+
+```yaml
+  - id: momentum3
+    type: signal
+    clock: candle_close            # required: ticks carry no bar identity
+    timeframe: day
+    conditions: {all: [{field: close, op: gt, right: {value: 100}}]}
+    consecutive_bars: 3            # 1..50
+```
+
+The stage fires once, on the bar that reaches N consecutive satisfied bars.
+**Unknown is not `true`** (§5.3), so a bar with missing data RESETS the streak —
+a data gap never extends a run. A false bar resets it too. The streak is
+checkpointed, so a restart resumes it rather than restarting it.
+
+### Bounded A-then-B sequences
+
+```yaml
+  - id: breakout-pullback
+    type: signal
+    clock: candle_close
+    timeframe: 15minute
+    sequence:                      # replaces the stage's own conditions
+      first: {all: [{field: close, op: crosses_above, right: {value: 100}}]}
+      then:  {any: [{field: close, op: lt, right: {value: 99}}]}
+      within_bars: 8               # at most 8 completed bars after A
+      within: 2h                   # and at most 2h of ELAPSED TIME
+```
+
+- `A` arms the sequence; `B` may only complete on a bar **strictly after** the
+  arming bar, so one observation can never satisfy both legs.
+- `within_bars` counts completed bars; `within` compares **elapsed event time**.
+  No exchange calendar is consulted, so MCX/currency sequences are honest. At
+  least one is required; when both are present **both** are enforced.
+- A `B` that is merely not-yet-true leaves the sequence waiting until the bound
+  expires — a bounded A-then-B means "B within the window", not "B next bar".
+- An unknown bar consumes the bar bound without invalidating the sequence.
+- Sequencing progress is durable: it survives restart and lease takeover.
+
+### Explicit condition hysteresis
+
+```yaml
+      conditions:
+        all:
+          - left:  {field: close}
+            op: gt
+            right: {value: 100}
+            hysteresis: {release: 99}   # stays matched until close < 99
+```
+
+Buffers boundary oscillation: once matched, the condition stays matched until
+the value passes back beyond `release`. Requires a level operator
+(`gt/gte/lt/lte`) on a **constant threshold**; dynamic release operands are not
+implemented and are rejected with an actionable issue. For `gt`/`gte` the
+release must be below the threshold; for `lt`/`lte` above it.
+
+### Windowed distinct-symbol participation (breadth)
+
+```yaml
+  - id: breadth-5
+    type: breadth                  # stage type
+    clock: candle_close
+    timeframe: 5minute
+    breadth:
+      condition: {all: [{field: close, op: gt, right: {value: 50}}]}
+      distinct_instruments: 5      # K, 2..1000
+      window: 30m                  # rolling, 60s..24h
+      mode: triggers_within
+```
+
+Means precisely **"at least K different instruments triggered during the last
+W"** — windowed *participation*, counted over the workflow's own member set.
+This is **not** simultaneous breadth; `mode: simultaneous` is reserved and
+rejected until separately specified.
+
+- One workflow-level event per crossing (`evidence.message_kind = "breadth"`),
+  listing the contributing instruments.
+- Each instrument contributes **once** per window (its latest qualifying
+  trigger), and repeated triggers update that one contribution.
+- The threshold is a durable state machine: `satisfied` starts `false`, so the
+  first legitimate crossing notifies. A crossing is only minted when the count
+  reaches K **while unsatisfied**; rearming requires observing `count < K`
+  (contributions aged out, or membership contracted) — time passing alone never
+  rearms.
+- The event identity is a monotonic crossing number, so two transitions sharing
+  an event timestamp cannot collide.
+- Cross-instrument arrival order does not matter: the aggregate is evaluated at
+  the latest logical time seen (its watermark), an older observation never
+  rewrites a newer contribution, and a late observation is recorded with
+  reason `breadth_stale_observation` rather than being dropped.
+- Membership is filtered to the **current** member set without clearing the
+  window; departed instruments keep their rows as history but stop counting,
+  and a **re-admitted** instrument starts fresh (it must trigger again).
+- Unknown rather than a partial answer: `breadth_capacity_exceeded` when the
+  member set exceeds `ALERTS_BREADTH_MAX_INSTRUMENTS`, `membership_stale` when
+  the membership snapshot is older than `ALERTS_BREADTH_MEMBERSHIP_MAX_AGE_S`
+  (default 900s), `membership_unavailable` when nothing resolves.
+
+### Relative strength and pair ratios
+
+```yaml
+      conditions:
+        all:
+          - left:  {pair_ratio:        {instrument: "NSE:TCS", reference: "NSE:INFY"}}
+            op: gt
+            right: {value: 1.05}
+          - left:  {relative_strength: {instrument: "NSE:TCS", reference: "NSE:INFY",
+                                        lookback: 20}}
+            op: gt
+            right: {value: 2.0}
+```
+
+- `pair_ratio(A, B)` = `close_A / close_B` on the **same** completed bar.
+- `relative_strength(A, B, N)` =
+  `((close_A(head)/close_A(anchor)) - (close_B(head)/close_B(anchor))) * 100`,
+  where `anchor = head - N bars` on the stage's timeframe. The anchor is derived
+  from the **head bar and the timeframe**, never from each leg's own
+  availability, so both returns always describe the same period; a leg missing
+  a bar at either endpoint is `pair_lookback_misaligned`, never a silently
+  shortened window. Missing bars *between* the endpoints are harmless (the
+  formula reads only the endpoints).
+- Both legs use the stage's timeframe (no per-leg timeframes) and read
+  `historical_candles`, which carries no adjustment column — there is no
+  split/dividend-adjusted series in the system to mix with an unadjusted one.
+- Same-session legs only: a calendar-backed `NSE` leg cannot be paired with a
+  feed-driven `MCX`/`CDS` leg, because they have different continuity
+  guarantees.
+- A halted instrument's last close is not paired against a live one: each head
+  must be within `ALERTS_PAIR_MAX_BAR_AGE_S` of the evaluation time
+  (`pair_stale`), defaulting to `2 × timeframe`.
+- Unknown reasons: `pair_misaligned`, `pair_lookback_misaligned`, `pair_stale`,
+  `pair_missing`, `pair_insufficient_history`, `pair_zero_denominator`.
+  `max_skew_bars` (0..2, default 0) tolerates a bounded head difference and is
+  recorded in evidence.
+
+### Per-session notification caps
+
+```yaml
+  alerts:
+    - id: momentum
+      source: momentum3
+      max_per_session: 5          # 1..1000, scope (workflow, alert)
+      session_cap_reset: session  # the only supported value
+```
+
+- The cap is **workflow-wide and shared across instruments**: a 5-per-session
+  alert on a 200-member universe sends at most 5 notifications, not 5 per
+  symbol. It counts **logical notifications** (one per event, regardless of how
+  many channels fan out).
+- Reaching the cap **suppresses the notification but advances state**: the
+  checkpoint, streak/sequence progress and the counter all commit, so a capped
+  bar still counts toward a consecutive-bar streak. The skip is durably
+  recorded in `alert_suppression_counters` with reason `session_cap`.
+- The counter is keyed by the resolved `session_id`, so a new session starts a
+  fresh row — no reset job. For feed-driven `mcx_commodity`/`currency` the
+  session id is the IST date, so the boundary is "per IST day" there. Any
+  `session_cap_reset` implying exchange market hours is rejected rather than
+  silently applying NSE hours.
+
+### External signals from registered producers
+
+Conditions may read `external.<producer>.<field>`:
+
+```yaml
+      conditions:
+        all:
+          - left:  {field: external.my-model.score}
+            op: gte
+            right: {value: 80}
+```
+
+Producers are registered through `/api/worker/signals/producers` (see
+[alerts-operations.md](alerts-operations.md) for credential setup). Values are
+typed scalars declared by the producer's `value_schema`; there is no expression,
+script or executable payload anywhere in the path.
+
+**Accepted values are SAMPLED, never pushed.** They do not trigger evaluation;
+the consuming stage reads them when it evaluates on its own `candle_close`
+clock, so a value can expire between two evaluations. Durable acceptance
+guarantees the value is stored and visible to any evaluation while it is valid —
+it does not guarantee that a processing step observes every value.
+
+Lookup is deterministic and replay-safe: only values at or before the
+observation's event time are candidates (`external_future` otherwise), the
+newest available wins, and expiry is evaluated **at that cutoff**, not at the
+wall clock — so replaying an old bar yields the value that was in force then. An
+expired newest value does **not** fall back to an older valid one
+(`external_expired`), because that would pair a bar with an input that had
+already lapsed. Other unknown reasons: `external_missing`,
+`external_revoked` (producer disabled or revoked),
+`external_missing_field`, `external_non_numeric`, `external_late`.
+
+### Validation limits (Phase 4)
+
+| Limit | Value |
+| --- | --- |
+| `consecutive_bars` | 1..50 |
+| `within_bars` | 1..500 |
+| `within` | 60s..30d |
+| `distinct_instruments` | 2..1000 |
+| breadth `window` | 60s..24h |
+| breadth `mode` | `triggers_within` only (`simultaneous` reserved, rejected) |
+| pair `lookback` | 1..500 |
+| pair `max_skew_bars` | 0..2 |
+| `max_per_session` | 1..1000 |
+| arithmetic nesting | 3 (now enforced; previously advertised but unchecked) |
+
+Advanced conditions (`consecutive_bars`, `sequence`, `breadth`) are
+`candle_close` only — ticks carry no bar identity, and an `ltp` stage would
+never fire.

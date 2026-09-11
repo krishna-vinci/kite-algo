@@ -131,3 +131,112 @@ Migration `20260908_000011_alerts_platform_phase1` plus `20260909_000012_alerts_
 - Delivery attempts and lease claims are tested on SQLite; true multi-process Postgres concurrency (`FOR UPDATE SKIP LOCKED`) is exercised in production Postgres only — Phase 1.5 follow-up adds a Postgres-based fault-injection suite (spec E-1…E-3).
 - The API preview dry-run accepts caller-supplied, exchange-timestamped samples; it does not fetch a hidden live-data snapshot. It never writes checkpoints, events, or deliveries.
 - Indicators, universes, screeners, quiet hours/digest: later phases (schema reserves the names).
+
+## Phase 4 additions (advanced conditions, external producers, SDK)
+
+### Authoring
+
+Advanced conditions are ordinary document fields (see
+[workflow-format.md](workflow-format.md)): `consecutive_bars`, a bounded
+`sequence` (`within_bars` and/or `within`), condition `hysteresis`, a `breadth`
+stage, `pair_ratio`/`relative_strength` operands and `max_per_session`. They
+are authored through the same YAML/REST/SDK paths as everything else and
+execute with the same lifecycle and authorization.
+
+SDK: `KiteAlgoWorkerClient` / `AsyncKiteAlgoWorkerClient` (package
+`kite-algo-worker` 0.10.0) expose the platform surface — capabilities,
+validate, preview, CRUD, activate/pause/resume/archive, YAML import/export,
+events, health, universes, screeners, channels, and the producer/value surface.
+The platform mount is `/api/worker/...`, configured by
+`AlgoWorkerConfig.platform_prefix` (default `/api`).
+
+### External signal producers
+
+Producers are **not** authorized by worker tokens; they have their own
+credential, so neither side can do the other's job.
+
+```bash
+# 1. Register (needs a worker token holding signals:admin — NOT a default grant)
+curl -X POST "$API/api/worker/signals/producers" \
+  -H "Authorization: Bearer $WORKER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"my-model","value_schema":{"fields":{"score":"number"}},"default_ttl_s":900}'
+
+# 2. Issue a credential. The SECRET IS SHOWN ONCE — store it now.
+curl -X POST "$API/api/worker/signals/producers/my-model/credentials" \
+  -H "Authorization: Bearer $WORKER_TOKEN"
+# {"ok":true,"token_id":"producer_...","secret":"kas_...","note":"store this now; it cannot be retrieved"}
+
+# 3. Submit a value as the PRODUCER
+curl -X POST "$API/api/worker/signals/values" \
+  -H "Authorization: Bearer kas_..." -H 'Content-Type: application/json' \
+  -d '{"value":{"score":82.5},"event_time":"2026-09-11T09:55:00Z","idempotency_key":"run-42"}'
+
+# 4. Revoke when done (disables the producer and all its credentials)
+curl -X POST "$API/api/worker/signals/producers/my-model/revoke" \
+  -H "Authorization: Bearer $WORKER_TOKEN"
+```
+
+**Operations**
+
+- **Credential storage**: the secret is stored only as a hash. It cannot be
+  retrieved, is echoed in no other response and is never logged. Losing it means
+  issuing a new credential and revoking the old one. Multiple credentials can
+  exist at once (rotation): issuing a second does not invalidate the first;
+  revoke individually or revoke the whole producer.
+- **Ingestion guards**: a value stamped more than 300s in the future is
+  rejected; one later than 3600s is stored with `status='late'` — recorded for
+  the audit trail but permanently unusable; an already-past `expires_at` is
+  rejected; the payload is bounded (8 KiB, 32 fields, 512-char strings, finite
+  numbers only).
+- **Idempotency**: `idempotency_key` is unique per producer. Submitting the same
+  key with identical content returns the original value with
+  `deduplicated: true`; with different content it is refused (409
+  `IDEMPOTENCY_CONFLICT`) rather than overwritten. A retry is therefore safe.
+  Keys age out with their row, so a replay older than the retention window is
+  treated as new work.
+- **Capacity**: a producer at its row limit (100,000) is refused with 429 rather
+  than having a still-valid value evicted. Expired values are purged
+  automatically once past `ALERTS_EXTERNAL_RETENTION_S`.
+
+**Restart recovery.** A value is committed before the endpoint responds, so a
+2xx means stored — a restart between acceptance and evaluation loses nothing.
+There is no per-value consumption queue to lose: a value that is still
+unexpired is visible to the first evaluation after the restart.
+
+**Stale inputs.** `GET /api/worker/signals/health` reports, per producer,
+accepted/late counts, `expired_now`, the last receipt time, and whether it is
+disabled or revoked. A consuming condition is `unknown` (never `false`) for an
+absent, expired, late, future or revoked value, with the reason recorded in
+event evidence.
+
+**Rollback.** `POST /api/worker/signals/producers/{name}/revoke` disables
+ingestion and makes stored values unusable immediately, without deleting them.
+
+### Database migration
+
+Migration `20260911_000016_alerts_phase4` adds the Phase 4 tables and repairs
+the `universes.kind` CHECK so `screener`-backed universes work (a Phase 3
+defect: the constraint admitted only `explicit`/`index`/`portfolio`, so creating
+one failed on PostgreSQL even though the code supported it).
+
+**Downgrade is conditional.** It refuses while user-authored configuration
+exists — external producers, their credentials, or `screener`-kind universes —
+and every refusal check runs BEFORE any DDL, so a refused downgrade leaves the
+schema exactly as it was. To drop that configuration deliberately:
+
+```bash
+alembic -c backend/alembic.ini -x drop_phase4_config=true downgrade 20260910_000015
+```
+
+Export first (`GET /api/worker/signals/producers` plus a database backup): the
+configuration is not recoverable by re-upgrading.
+
+### Environment additions
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ALERTS_PAIR_MAX_BAR_AGE_S` | `0` (derive `2 × timeframe`) | Max age of a pair leg's head bar before the pair is unknown |
+| `ALERTS_BREADTH_MEMBERSHIP_MAX_AGE_S` | `900` | Age at which a breadth stage's membership becomes `membership_stale` |
+| `ALERTS_BREADTH_MAX_INSTRUMENTS` | `1000` | Member count above which breadth reports `breadth_capacity_exceeded` |
+| `ALERTS_EXTERNAL_RETENTION_S` | `604800` (7d) | How long past expiry an unusable value is retained |
+| `ALERTS_EXTERNAL_MAX_ROWS_PER_PRODUCER` | `100000` | Per-producer value cap (rejects; never evicts a valid value) |
