@@ -58,8 +58,18 @@ class ValidationIssue:
     where: str  # e.g. "stages.px.conditions[0]" or "alerts.breakout"
     code: str  # unknown_operator | unknown_field | unknown_capability |
     # missing_reference | cycle | duplicate_id | timeframe_missing |
-    # timeframe_unsupported | bad_value
+    # timeframe_unsupported | bad_value | level_only_never_fires
     message: str
+    # "error" rejects the document (unchanged behavior, and the default so every
+    # existing issue keeps its meaning). "warning" reports a rule that will
+    # plausibly never do what its author expects while still being VALID — a
+    # level-only rule with a `reminder` trigger is perfectly meaningful, so the
+    # combination cannot be a hard error (Phase 6 6A.0).
+    severity: str = "error"
+
+    @property
+    def is_error(self) -> bool:
+        return self.severity == "error"
 
 
 class WorkflowValidationError(Exception):
@@ -96,14 +106,32 @@ def compile_document(doc: WorkflowDocument) -> CompiledWorkflow:
 
     Raises WorkflowValidationError with .issues naming every offending
     location when validation fails.
+
+    Only ``error``-severity issues reject a document; ``warning`` issues are
+    returned for reporting but never block compilation, and they are not part of
+    the canonical hash — so adding a warning changes no stored revision's
+    identity (Phase 6 6A.0).
     """
     issues: list[ValidationIssue] = []
     _validate(doc, issues)
-    if issues:
-        raise WorkflowValidationError(issues)
+    blocking = [issue for issue in issues if issue.is_error]
+    if blocking:
+        raise WorkflowValidationError(blocking)
     canonical = canonical_json(doc)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return CompiledWorkflow(document=doc, canonical_hash=digest)
+
+
+def collect_warnings(doc: WorkflowDocument) -> list[ValidationIssue]:
+    """Non-blocking issues for a document that is otherwise valid.
+
+    Callers that surface authoring feedback (the API validate/preview routes,
+    the workflow list enrichment) use this so a warning reaches the operator
+    without changing whether the document compiles.
+    """
+    issues: list[ValidationIssue] = []
+    _validate(doc, issues)
+    return [issue for issue in issues if not issue.is_error]
 
 
 # --------------------------------------------------------------------------
@@ -201,6 +229,76 @@ def _validate(doc: WorkflowDocument, issues: list[ValidationIssue]) -> None:
     _validate_screener(doc, stage_ids, issues)
     _validate_screener_only_fields(doc, issues)
     _validate_breadth_referenced(doc, issues)
+    _warn_level_only_rules(doc, issues)
+
+
+def _warn_level_only_rules(
+    doc: WorkflowDocument, issues: list[ValidationIssue]
+) -> None:
+    """Warn about rules that cannot emit under the engine's own semantics.
+
+    A LEVEL operator (``gt``/``gte``/``lt``/``lte``) reports ``matched`` and
+    never ``fired``; the engine's emission gate is
+    ``due = fired or (trigger == "reminder" and matched is True)``. So a stage
+    whose conditions are ALL level, feeding a non-``reminder`` trigger with
+    ``notify_if_already_true`` off, can emit ONLY via the E-9 activation opt-in
+    — it will never notify on a later crossing of that level.
+
+    This is a WARNING, not an error: a level rule with a ``reminder`` trigger is
+    perfectly meaningful, and ``notify_if_already_true`` is a legitimate
+    opt-in. Rejecting the document would invalidate working workflows; the
+    operator needs the information, not a block. It is also exactly the mistake
+    that produced the Phase 4 live failure — a ``gte`` rule authored where a
+    crossing was intended, which could never notify.
+    """
+    alert_by_stage: dict = {}
+    for alert in doc.alerts:
+        alert_by_stage.setdefault(alert.source, []).append(alert)
+
+    for stage in doc.stages:
+        alerts = alert_by_stage.get(stage.id)
+        if not alerts:
+            continue
+        # Stage-level constructs that DO produce a transition.
+        if stage.sequence is not None or stage.consecutive_bars is not None:
+            continue
+        if stage.breadth is not None:
+            continue
+        conditions = (
+            list(stage.conditions) + list(stage.any_conditions) + list(stage.not_conditions)
+        )
+        if not conditions:
+            continue
+        if not all(
+            registry.OPERATORS.get(getattr(cond, "op", None), {}).get("kind") == "level"
+            for cond in conditions
+        ):
+            continue
+        # A reminder emits while a level merely HOLDS, so the rule is fine.
+        if any(
+            alert.trigger == "reminder" or alert.notify_if_already_true
+            for alert in alerts
+        ):
+            continue
+        issues.append(
+            ValidationIssue(
+                f"stages.{stage.id}",
+                "level_only_never_fires",
+                (
+                    f"stage '{stage.id}' uses only level operators "
+                    f"(gt/gte/lt/lte) and feeds alert(s) "
+                    f"{', '.join(a.id for a in alerts)} with trigger "
+                    f"'{alerts[0].trigger}': a level condition reports a match but "
+                    "never a transition, so this rule can only notify through the "
+                    "activation opt-in and will not fire when the level is crossed "
+                    "later. Use a crossing operator (crosses_above/crosses_below), "
+                    "or set the alert trigger to 'reminder' to notify while the "
+                    "level holds, or set notify_if_already_true to opt in at "
+                    "activation"
+                ),
+                severity="warning",
+            )
+        )
 
 
 def _validate_breadth_referenced(

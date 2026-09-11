@@ -16,6 +16,9 @@ class ValidationIssueModel(BaseModel):
     where: str
     code: str
     message: str
+    # "error" blocks the document; "warning" is advisory. Defaults to "error" so
+    # existing clients keep their interpretation (Phase 6 6A.0).
+    severity: str = "error"
 
 
 class IssueEnvelope(BaseModel):
@@ -25,8 +28,12 @@ class IssueEnvelope(BaseModel):
     issues: List[ValidationIssueModel] = []
 
 
-def issue(where: str, code: str, message: str) -> ValidationIssueModel:
-    return ValidationIssueModel(where=where, code=code, message=message)
+def issue(
+    where: str, code: str, message: str, severity: str = "error"
+) -> ValidationIssueModel:
+    return ValidationIssueModel(
+        where=where, code=code, message=message, severity=severity
+    )
 
 
 class WorkflowValidateRequest(BaseModel):

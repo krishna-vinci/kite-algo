@@ -159,7 +159,20 @@ def _parse_issues(exc: WorkflowParseError) -> List[ValidationIssueModel]:
 
 
 def _validation_issues(exc: WorkflowValidationError) -> List[ValidationIssueModel]:
-    return [issue(item.where, item.code, item.message) for item in exc.issues]
+    return [
+        issue(item.where, item.code, item.message, getattr(item, "severity", "error"))
+        for item in exc.issues
+    ]
+
+
+def _warning_issues(doc: WorkflowDocument) -> List[ValidationIssueModel]:
+    """Advisory (non-blocking) issues for an otherwise valid document."""
+    from backend.workflows.compiler import collect_warnings
+
+    return [
+        issue(item.where, item.code, item.message, getattr(item, "severity", "warning"))
+        for item in collect_warnings(doc)
+    ]
 
 
 def _compile_or_422(doc: WorkflowDocument) -> CompiledWorkflow:
@@ -509,7 +522,9 @@ async def validate_workflow(request: Request, payload: WorkflowValidateRequest):
         compile_document(doc)
     except WorkflowValidationError as exc:
         return IssueEnvelope(ok=False, issues=_validation_issues(exc))
-    return IssueEnvelope(ok=True, issues=[])
+    # Valid, but advisory issues (e.g. a rule that cannot emit under engine
+    # semantics) are still reported so the operator sees them before saving.
+    return IssueEnvelope(ok=True, issues=_warning_issues(doc))
 
 
 async def preview_workflow(request: Request, payload: WorkflowValidateRequest):
