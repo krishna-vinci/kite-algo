@@ -553,12 +553,24 @@ def ingest_value(
         idempotency_key=key,
         created_at=timestamp,
     )
-    session.add(value)
     try:
-        session.flush()
+        # A savepoint, so losing the race rolls back only this insert and never
+        # the caller's surrounding transaction.
+        with session.begin_nested():
+            session.add(value)
+            session.flush()
     except IntegrityError:
-        # Lost a concurrent race on the same key: fall back to the winner.
-        session.rollback()
+        if key is None:
+            raise
+        winner = session.execute(
+            select(ExternalSignalValue).where(
+                ExternalSignalValue.producer_id == producer.id,
+                ExternalSignalValue.idempotency_key == key,
+            )
+        ).scalar_one_or_none()
+        if winner is not None and winner.content_hash == content_hash:
+            # Identical content raced us: the winner IS this logical value.
+            return winner, True
         raise ExternalSignalIdempotencyConflict(
             "idempotency_key was used concurrently with different content"
         )

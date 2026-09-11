@@ -369,9 +369,12 @@ def count_breadth_contributions(
     Both bounds are inclusive and the UPPER bound is what excludes a
     contribution stamped after this evaluation (only reachable when bars
     arrive out of order across instruments). Rows from instruments outside
-    ``members`` are history: retained, never counted. Returns the count and
-    the contributing (instrument, trigger_ts) pairs, oldest first, bounded by
-    ``limit``.
+    ``members`` are history: retained, never counted.
+
+    The member filter is applied IN SQL, before the LIMIT. Filtering in Python
+    after the LIMIT would let non-member rows consume the row budget and
+    silently drop valid contributions — and because contributions commonly
+    share a timestamp, which rows survived would be nondeterministic.
     """
     stmt = (
         select(
@@ -389,10 +392,15 @@ def count_breadth_contributions(
         .order_by(AlertBreadthTrigger.last_trigger_ts.asc())
         .limit(max(1, int(limit)))
     )
-    rows = session.execute(stmt).all()
     if members is not None:
-        allowed = set(members)
-        rows = [row for row in rows if row[0] in allowed]
+        allowed = list(dict.fromkeys(members))
+        if not allowed:
+            return 0, []
+        stmt = stmt.where(AlertBreadthTrigger.instrument_key.in_(allowed))
+        # Concrete bound: an overflow would mean more members than the
+        # configured capacity, which the caller already reports as unknown.
+        stmt = stmt.limit(max(1, min(int(limit), len(allowed))))
+    rows = session.execute(stmt).all()
     return len(rows), [(row[0], row[1]) for row in rows]
 
 

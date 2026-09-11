@@ -125,36 +125,20 @@ def evaluate_breadth(
         )
 
     watermark = state.aggregation_watermark if state else None
+    # The aggregate is evaluated at the LATEST logical time seen, never
+    # backwards. A contribution that arrives late still participates, because
+    # the count that matters is the count as of the watermark — otherwise a
+    # crossing could be missed entirely when the newest-timestamped
+    # observation happened to be evaluated before its peers committed. This is
+    # not a retroactive notification: the crossing is minted at the watermark,
+    # which is the current logical time, not at the late bar's time.
+    effective_at = observed_at if watermark is None else max(observed_at, watermark)
+    stale_observation = watermark is not None and observed_at < watermark
 
-    # Late for aggregation (E-13): the checkpoint still commits (the
-    # instrument's own state machine stays correct) and a newer contribution
-    # is still recorded, but the threshold is NOT re-evaluated and no crossing
-    # is minted — late data is recorded, never retroactively notified.
-    if watermark is not None and observed_at < watermark:
-        count, contributors = repo.count_breadth_contributions(
-            session,
-            owner_id=owner_id,
-            workflow_id=workflow_id,
-            revision_id=revision_id,
-            stage_id=stage_id,
-            window_start=watermark - timedelta(seconds=int(spec.window_s)),
-            evaluated_at=watermark,
-            members=current,
-            limit=max(1, min(member_count or max_instruments, max_instruments)),
-        )
-        satisfied = bool(state.satisfied) if state else False
-        return BreadthOutcome(
-            matched=satisfied,
-            fired=False,
-            count=count,
-            members=member_count,
-            reason="breadth_stale_observation",
-            crossing_seq=int(state.crossing_seq) if state else 0,
-            contributors=tuple(k for k, _ in contributors),
-        )
-
-    # Record this instrument's contribution (monotonic: an older observation
-    # can never rewind a newer one).
+    # Record this instrument's contribution unconditionally. The write is
+    # monotonic, so a late observation records its own (older) trigger without
+    # rewinding a newer one — recording it before anything else is what makes
+    # the aggregate independent of arrival order.
     if triggering is not None:
         repo.upsert_breadth_contribution(
             session,
@@ -168,7 +152,7 @@ def evaluate_breadth(
             universe_revision=member_universe_revision,
         )
 
-    window_start = observed_at - timedelta(seconds=int(spec.window_s))
+    window_start = effective_at - timedelta(seconds=int(spec.window_s))
     count, contributors = repo.count_breadth_contributions(
         session,
         owner_id=owner_id,
@@ -176,7 +160,7 @@ def evaluate_breadth(
         revision_id=revision_id,
         stage_id=stage_id,
         window_start=window_start,
-        evaluated_at=observed_at,
+        evaluated_at=effective_at,
         members=current,
         limit=max(1, min(member_count or max_instruments, max_instruments)),
     )
@@ -194,8 +178,8 @@ def evaluate_breadth(
         # collide (the sequence number, never the timestamp, is the identity).
         crossing_seq += 1
         satisfied = True
-        satisfied_since = observed_at
-        last_fired = observed_at
+        satisfied_since = effective_at
+        last_fired = effective_at
         fired = True
     elif count < threshold and satisfied:
         # Rearm only on an OBSERVED count below the threshold: triggers aged
@@ -216,7 +200,7 @@ def evaluate_breadth(
         last_fired_ts=last_fired,
         count=count,
         member_count=member_count,
-        aggregation_watermark=observed_at,
+        aggregation_watermark=effective_at,
         membership_resolved_at=membership_resolved_at,
     )
 
@@ -225,7 +209,10 @@ def evaluate_breadth(
         fired=fired,
         count=count,
         members=member_count,
-        reason=None,
+        # Informational: the observation was older than the watermark, so the
+        # evaluation happened at the watermark instead. Recorded for evidence
+        # and health, never a silent skip.
+        reason="breadth_stale_observation" if stale_observation else None,
         crossing_seq=crossing_seq,
         contributors=tuple(k for k, _ in contributors),
         window_start=window_start,
