@@ -5,6 +5,8 @@ import {
   buildScreenerDocument,
   defaultRankBand,
   documentToScreenerDraft,
+  durationFromSeconds,
+  DURATION_CHOICES,
   emptyScreenerDraft,
   screenerDraftIssues,
   type ScreenerDraft,
@@ -274,6 +276,67 @@ describe("documentToScreenerDraft", () => {
 
   it("returns false for a null document", () => {
     expect(documentToScreenerDraft(null).ok).toBe(false);
+  });
+});
+
+describe("schedule range and canonical parse", () => {
+  it("offers the backend's full 5m..31d range", () => {
+    const values = DURATION_CHOICES.map((choice) => choice.value);
+    expect(values).toContain("5m");
+    expect(values).toContain("31d");
+    // Nothing beyond the server's documented bound.
+    expect(values).not.toContain("60d");
+  });
+
+  it("renders the stored seconds form back to a friendly unit", () => {
+    expect(durationFromSeconds("86400s")).toBe("1d");
+    expect(durationFromSeconds("900s")).toBe("15m");
+    expect(durationFromSeconds("3600s")).toBe("1h");
+    expect(durationFromSeconds("123s")).toBe("123s");
+    expect(durationFromSeconds(undefined)).toBe("1d");
+  });
+
+  it("opens a canonical stored screener (list conditions, dict instruments)", () => {
+    const canonical = {
+      version: 1,
+      name: "canonical-screener",
+      session: "nse_equity",
+      instruments: [{ symbol: "S0001", exchange: "NSE" }],
+      stages: [
+        {
+          id: "scan",
+          type: "signal",
+          clock: "candle_close",
+          timeframe: "day",
+          input: null,
+          conditions: [
+            {
+              left: { kind: "field", name: "change_pct", value: null, params: {}, source: null, offset: null },
+              op: "gt",
+              right: { kind: "value", name: null, value: 2, params: {}, source: null, offset: null },
+            },
+          ],
+          any_conditions: [],
+          not_conditions: [],
+          function: null,
+          stage_params: {},
+          source_field: null,
+        },
+      ],
+      alerts: [],
+      screener: {
+        schedule: { every: "86400s", calendar: "nse_equity", at: "session_close" },
+        rank: { by: { field: "change_pct" }, direction: "desc" },
+        top_n: 20,
+        freshness_limit_s: 259200,
+      },
+    };
+    const result = documentToScreenerDraft(canonical);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.draft.instruments).toEqual(["NSE:S0001"]);
+    expect(result.draft.schedule.every).toBe("1d");
+    expect(result.draft.conditions).toHaveLength(1);
   });
 });
 

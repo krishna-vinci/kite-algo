@@ -16,6 +16,7 @@ import {
   conditionFromDocument,
   conditionToDocument,
   emptyUniverseDraft,
+  instrumentKeyFromDocument,
   operandFromDocument,
   refsFromDocument,
   universeDraftIssues,
@@ -78,6 +79,11 @@ export function defaultRankBand(topN: number): { entry_rank: number; exit_rank: 
   return { entry_rank: bounded, exit_rank: bounded + Math.max(1, Math.floor(bounded / 2)) };
 }
 
+/**
+ * The backend's supported schedule range is 5m..31d (`_schedule_spec`). The
+ * list stops at 31d deliberately — offering a longer interval would produce a
+ * document the server rejects.
+ */
 export const DURATION_CHOICES = [
   { label: "5 minutes", value: "5m" },
   { label: "15 minutes", value: "15m" },
@@ -86,7 +92,29 @@ export const DURATION_CHOICES = [
   { label: "4 hours", value: "4h" },
   { label: "1 day", value: "1d" },
   { label: "1 week", value: "7d" },
+  { label: "2 weeks", value: "14d" },
+  { label: "31 days", value: "31d" },
 ] as const;
+
+/**
+ * The stored canonical `every` is a seconds string (e.g. `"86400s"`). Render it
+ * back to a friendly unit when it divides cleanly, so the edit path can select
+ * the value it loaded instead of showing an empty box.
+ */
+export function durationFromSeconds(every: unknown): string {
+  if (typeof every !== "string") return "1d";
+  const match = /^(\d+)s$/.exec(every.trim());
+  if (!match) return every;
+  const seconds = Number(match[1]);
+  for (const [unit, divisor] of [
+    ["d", 86400],
+    ["h", 3600],
+    ["m", 60],
+  ] as const) {
+    if (seconds % divisor === 0 && seconds >= divisor) return `${seconds / divisor}${unit}`;
+  }
+  return `${seconds}s`;
+}
 
 export const FRESHNESS_CHOICES = [
   { label: "5 minutes", seconds: 300 },
@@ -153,10 +181,7 @@ function attachmentToDocument(attachment: ScreenerAttachmentDraft): Record<strin
   return payload;
 }
 
-export function buildScreenerDocument(draft: ScreenerDraft): Record<string, unknown> {
-  const useUniverse =
-    draft.targeting === "universe" && draft.universe.union.some((ref) => ref.name.trim() !== "");
-
+function screenerBlock(draft: ScreenerDraft): Record<string, unknown> {
   const screener: Record<string, unknown> = {
     schedule: {
       every: draft.schedule.every,
@@ -176,24 +201,66 @@ export function buildScreenerDocument(draft: ScreenerDraft): Record<string, unkn
   if (draft.attachments.length > 0) {
     screener.attachments = draft.attachments.map(attachmentToDocument);
   }
+  return screener;
+}
 
-  return {
-    version: 1,
-    name: draft.name,
-    session: draft.session,
-    instruments: useUniverse ? [] : draft.instruments,
-    universe: useUniverse ? universeRefsToDocument(draft.universe) : null,
-    stages: [
-      {
-        id: "scan",
-        type: draft.stageKind,
-        clock: draft.clock,
-        timeframe: draft.timeframe,
-        conditions: { all: draft.conditions.map(conditionToDocument) },
-      },
-    ],
-    screener,
-  };
+/**
+ * Build the screener document.
+ *
+ * With a `base` (the edit path) the modeled fields are merged onto a deep clone
+ * of the loaded document, so keys this editor does not model survive. Without a
+ * base the canonical skeleton is emitted.
+ */
+export function buildScreenerDocument(
+  draft: ScreenerDraft,
+  base?: Record<string, unknown> | null,
+): Record<string, unknown> {
+  const useUniverse =
+    draft.targeting === "universe" && draft.universe.union.some((ref) => ref.name.trim() !== "");
+
+  if (!base) {
+    return {
+      version: 1,
+      name: draft.name,
+      session: draft.session,
+      instruments: useUniverse ? [] : draft.instruments,
+      universe: useUniverse ? universeRefsToDocument(draft.universe) : null,
+      stages: [
+        {
+          id: "scan",
+          type: draft.stageKind,
+          clock: draft.clock,
+          timeframe: draft.timeframe,
+          conditions: { all: draft.conditions.map(conditionToDocument) },
+        },
+      ],
+      screener: screenerBlock(draft),
+    };
+  }
+
+  const document = JSON.parse(JSON.stringify(base)) as Record<string, unknown>;
+  document.name = draft.name;
+  document.session = draft.session;
+  document.instruments = useUniverse ? [] : draft.instruments;
+  document.universe = useUniverse ? universeRefsToDocument(draft.universe) : null;
+
+  const stages = Array.isArray(document.stages)
+    ? (document.stages as Array<Record<string, unknown>>)
+    : [];
+  const stage = stages[0] ?? { id: "scan" };
+  stage.type = draft.stageKind;
+  stage.clock = draft.clock;
+  stage.timeframe = draft.timeframe;
+  stage.conditions = { all: draft.conditions.map(conditionToDocument) };
+  if (stages.length === 0) {
+    document.stages = [stage];
+  } else {
+    stages[0] = stage;
+    document.stages = stages;
+  }
+
+  document.screener = { ...(document.screener as Record<string, unknown> | undefined), ...screenerBlock(draft) };
+  return document;
 }
 
 function universeRefsToDocument(universe: UniverseDraft): Record<string, unknown> {
@@ -316,7 +383,11 @@ export function documentToScreenerDraft(
     };
   }
   const stage = stages[0] as Record<string, unknown>;
-  if (stage.sequence || stage.breadth || stage.consecutive_bars || stage.any_conditions || stage.not_conditions) {
+  // Canonical documents carry empty `any_conditions`/`not_conditions` arrays even
+  // when unused, so only a POPULATED group is outside this editor.
+  const anyRaw = Array.isArray(stage.any_conditions) ? stage.any_conditions : [];
+  const notRaw = Array.isArray(stage.not_conditions) ? stage.not_conditions : [];
+  if (stage.sequence || stage.breadth || stage.consecutive_bars || anyRaw.length || notRaw.length) {
     return {
       ok: false,
       reason: "This scan stage uses advanced conditions the structured editor does not model.",
@@ -329,13 +400,22 @@ export function documentToScreenerDraft(
     };
   }
 
-  const stageConditions = stage.conditions as Record<string, unknown> | undefined;
-  if (!stageConditions || !Array.isArray(stageConditions.all) || "any" in stageConditions || "not" in stageConditions) {
+  // Canonical conditions are a list; a form-shaped fixture may wrap them in
+  // `{all: [...]}`. Accept both, as the alert editor does.
+  const stageConditions = stage.conditions as unknown;
+  let allConditions: unknown[] | null = null;
+  if (Array.isArray(stageConditions)) {
+    allConditions = stageConditions;
+  } else if (stageConditions && typeof stageConditions === "object") {
+    const groups = stageConditions as Record<string, unknown>;
+    if (Array.isArray(groups.all)) allConditions = groups.all;
+  }
+  if (allConditions === null) {
     return { ok: false, reason: "Conditions must be a single 'all' group for this editor." };
   }
 
   const conditions: Condition[] = [];
-  for (const raw of stageConditions.all as unknown[]) {
+  for (const raw of allConditions) {
     const parsed = conditionFromDocument(raw);
     if (!parsed.ok) return { ok: false, reason: parsed.reason };
     conditions.push(parsed.condition);
@@ -390,7 +470,9 @@ export function documentToScreenerDraft(
       clock: String(stage.clock ?? "candle_close"),
       timeframe: String(stage.timeframe ?? "day"),
       targeting,
-      instruments: Array.isArray(document.instruments) ? document.instruments.map(String) : [],
+      instruments: Array.isArray(document.instruments)
+        ? document.instruments.map(instrumentKeyFromDocument).filter((key) => key !== "")
+        : [],
       universe: {
         union: union.length > 0 ? union : emptyUniverseDraft().union,
         exclude: rawUniverse ? refsFromDocument(rawUniverse.exclude) : [],
@@ -399,7 +481,7 @@ export function documentToScreenerDraft(
       stageKind: stage.type === "filter" ? "filter" : "signal",
       conditions: conditions.length > 0 ? conditions : emptyScreenerDraft().conditions,
       schedule: {
-        every: String(schedule.every ?? "1d"),
+        every: durationFromSeconds(schedule.every),
         calendar: String(schedule.calendar ?? "nse_equity"),
         at: typeof schedule.at === "string" ? schedule.at : "session_close",
       },

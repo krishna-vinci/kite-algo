@@ -31,34 +31,91 @@ import {
   useAlertsCapabilities,
   useAlertsUniverseMutations,
   useAlertsUniverses,
+  useAlertsWorkflows,
 } from "@/features/alerts/hooks/use-alerts-queries";
 import { formatTimestamp } from "@/features/alerts/lib/format";
+
+const KIND_HELP: Record<string, string> = {
+  explicit: "A hand-picked list of EXCHANGE:SYMBOL keys.",
+  index: "The constituents of a supported index list this install can resolve.",
+  portfolio: "Owner-scoped holdings. Read-only and provider-driven — no configuration.",
+  screener: "The ranked members of a screener workflow, feeding downstream alerts.",
+};
 
 export function UniversesPage({ scope }: Readonly<{ scope: string | null }>) {
   const universesQuery = useAlertsUniverses(scope);
   const capabilitiesQuery = useAlertsCapabilities(scope);
+  const workflowsQuery = useAlertsWorkflows(scope, false);
   const { create, preview } = useAlertsUniverseMutations(scope);
 
   const [name, setName] = useState("");
   const [kind, setKind] = useState("explicit");
-  const [sourceConfig, setSourceConfig] = useState("{}");
+  const [membersText, setMembersText] = useState("");
+  const [indexSourceList, setIndexSourceList] = useState("");
+  const [screenerWorkflow, setScreenerWorkflow] = useState("");
+  const [screenerTopN, setScreenerTopN] = useState("");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [advancedConfig, setAdvancedConfig] = useState("{}");
   const [configError, setConfigError] = useState<string | null>(null);
 
-  const kinds = capabilitiesQuery.data?.capabilities.universe_source_kinds ?? ["explicit"];
+  const capabilities = capabilitiesQuery.data?.capabilities;
+  const kinds = capabilities?.universe_source_kinds ?? ["explicit"];
+  const indexOptions = capabilities?.universe_index_source_lists ?? [];
+  const screenerOptions = (workflowsQuery.data?.workflows ?? []).filter(
+    (workflow) => workflow.kind === "screener" && !workflow.archived,
+  );
+  const effectiveIndex = indexSourceList || indexOptions[0] || "";
+  const effectiveScreener = screenerWorkflow || screenerOptions[0]?.name || "";
   const universes = universesQuery.data?.universes ?? [];
 
-  const parseConfig = (): Record<string, unknown> | null => {
-    try {
-      const parsed = JSON.parse(sourceConfig || "{}");
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-        throw new Error("source_config must be a JSON object");
+  const buildConfig = (): Record<string, unknown> | null => {
+    if (advancedOpen) {
+      try {
+        const parsed = JSON.parse(advancedConfig || "{}");
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          throw new Error("source_config must be a JSON object");
+        }
+        setConfigError(null);
+        return parsed as Record<string, unknown>;
+      } catch (error) {
+        setConfigError(error instanceof Error ? error.message : "invalid JSON");
+        return null;
+      }
+    }
+
+    if (kind === "explicit") {
+      const members = membersText
+        .split(/[\s,]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (members.length === 0) {
+        setConfigError("Explicit universes need at least one EXCHANGE:SYMBOL member.");
+        return null;
       }
       setConfigError(null);
-      return parsed as Record<string, unknown>;
-    } catch (error) {
-      setConfigError(error instanceof Error ? error.message : "invalid JSON");
-      return null;
+      return { members };
     }
+    if (kind === "index") {
+      if (!effectiveIndex) {
+        setConfigError("No supported index source list is available in this install.");
+        return null;
+      }
+      setConfigError(null);
+      return { source_list: effectiveIndex };
+    }
+    if (kind === "screener") {
+      if (!effectiveScreener) {
+        setConfigError("Create a screener first; a screener universe references one by name.");
+        return null;
+      }
+      const config: Record<string, unknown> = { workflow: effectiveScreener };
+      if (screenerTopN.trim() !== "") config.top_n = Number(screenerTopN);
+      setConfigError(null);
+      return config;
+    }
+    // portfolio
+    setConfigError(null);
+    return {};
   };
 
   return (
@@ -92,25 +149,135 @@ export function UniversesPage({ scope }: Readonly<{ scope: string | null }>) {
             </Select>
           </div>
         </div>
+        <p className="text-xs text-muted-foreground">{KIND_HELP[kind] ?? ""}</p>
 
-        <div className="flex flex-col gap-1">
-          <Label htmlFor="universe-config">source_config (JSON)</Label>
-          <Textarea
-            id="universe-config"
-            rows={3}
-            className="font-mono text-xs"
-            value={sourceConfig}
-            onChange={(event) => setSourceConfig(event.target.value)}
+        {!advancedOpen ? (
+          <>
+            {kind === "explicit" ? (
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="universe-members">Members (EXCHANGE:SYMBOL, one per line)</Label>
+                <Textarea
+                  id="universe-members"
+                  rows={4}
+                  className="font-mono text-xs"
+                  placeholder={"NSE:RELIANCE\nNSE:INFY"}
+                  value={membersText}
+                  onChange={(event) => setMembersText(event.target.value)}
+                />
+              </div>
+            ) : null}
+
+            {kind === "index" ? (
+              <div className="flex flex-col gap-1 sm:max-w-sm">
+                <Label htmlFor="universe-index">Index source list</Label>
+                {indexOptions.length > 0 ? (
+                  <Select value={effectiveIndex} onValueChange={setIndexSourceList}>
+                    <SelectTrigger id="universe-index">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {indexOptions.map((option) => (
+                        <SelectItem key={option} value={option}>
+                          {option}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Input
+                    id="universe-index"
+                    value={indexSourceList}
+                    placeholder="Nifty50"
+                    onChange={(event) => setIndexSourceList(event.target.value)}
+                  />
+                )}
+                <p className="text-xs text-muted-foreground">
+                  Only lists this install can resolve are offered; a value it cannot resolve is
+                  rejected at validation.
+                </p>
+              </div>
+            ) : null}
+
+            {kind === "portfolio" ? (
+              <p className="text-sm text-muted-foreground">
+                Portfolio membership is derived from the authorized holdings and is read-only. There
+                is nothing to configure — resolve it to snapshot current members.
+              </p>
+            ) : null}
+
+            {kind === "screener" ? (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="flex flex-col gap-1">
+                  <Label htmlFor="universe-screener">Screener workflow</Label>
+                  {screenerOptions.length > 0 ? (
+                    <Select value={effectiveScreener} onValueChange={setScreenerWorkflow}>
+                      <SelectTrigger id="universe-screener">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {screenerOptions.map((workflow) => (
+                          <SelectItem key={workflow.workflow_id} value={workflow.name}>
+                            {workflow.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <Input
+                      id="universe-screener"
+                      value={screenerWorkflow}
+                      placeholder="screener-name"
+                      onChange={(event) => setScreenerWorkflow(event.target.value)}
+                    />
+                  )}
+                </div>
+                <div className="flex flex-col gap-1">
+                  <Label htmlFor="universe-screener-topn">Top N (optional)</Label>
+                  <Input
+                    id="universe-screener-topn"
+                    type="number"
+                    min={1}
+                    max={1000}
+                    value={screenerTopN}
+                    onChange={(event) => setScreenerTopN(event.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Leave blank to use the screener&apos;s own top_n.
+                  </p>
+                </div>
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <div className="flex flex-col gap-1">
+            <Label htmlFor="universe-config">source_config (advanced JSON)</Label>
+            <Textarea
+              id="universe-config"
+              rows={3}
+              className="font-mono text-xs"
+              value={advancedConfig}
+              onChange={(event) => setAdvancedConfig(event.target.value)}
+            />
+          </div>
+        )}
+
+        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={advancedOpen}
+            onChange={(event) => setAdvancedOpen(event.target.checked)}
           />
-          {configError ? <p className="text-xs text-rose-300">{configError}</p> : null}
-        </div>
+          Advanced: edit raw source_config JSON instead
+        </label>
+
+        {configError ? <p className="text-xs text-rose-300">{configError}</p> : null}
 
         <div className="flex flex-wrap gap-2">
           <Button
             variant="outline"
             disabled={preview.isPending}
             onClick={() => {
-              const config = parseConfig();
+              const config = buildConfig();
               if (config) preview.mutate({ kind, source_config: config });
             }}
           >
@@ -119,7 +286,7 @@ export function UniversesPage({ scope }: Readonly<{ scope: string | null }>) {
           <Button
             disabled={!name || create.isPending}
             onClick={() => {
-              const config = parseConfig();
+              const config = buildConfig();
               if (config) create.mutate({ name, kind, source_config: config });
             }}
           >

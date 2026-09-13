@@ -1,13 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
-import { AlertCircleIcon, FileWarningIcon } from "lucide-react";
+import { useParams, useSearchParams } from "next/navigation";
+import { AlertCircleIcon } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { SectionLabel } from "@/components/operator/section-label";
+import { AdvancedDefinitionEditor } from "@/features/alerts/components/advanced-definition-editor";
 import { ScreenerEditor } from "@/features/alerts/components/screener-editor";
 import { useAlertsScope, useAlertsWorkflow } from "@/features/alerts/hooks/use-alerts-queries";
 import { documentToScreenerDraft } from "@/features/alerts/lib/screener-authoring";
@@ -15,14 +14,18 @@ import { documentToScreenerDraft } from "@/features/alerts/lib/screener-authorin
 /**
  * Screener edit path.
  *
- * Like the alert editor, this refuses to open a form it cannot fully represent
- * rather than saving a document with fields quietly missing.
+ * Two lossless routes, never a lossy one: the structured form (which merges on
+ * the loaded document so unmodeled fields survive), or — when the definition
+ * is not representable — the advanced YAML/JSON editor, rather than a form that
+ * would silently drop a field on save.
  */
 export default function EditScreenerPage() {
   const params = useParams<{ workflowId: string }>();
+  const searchParams = useSearchParams();
   const { scope, isLoading } = useAlertsScope();
   const workflowId = typeof params?.workflowId === "string" ? params.workflowId : "";
-  const workflowQuery = useAlertsWorkflow(workflowId, scope, { includeYaml: false });
+  const workflowQuery = useAlertsWorkflow(workflowId, scope);
+  const forceAdvanced = searchParams?.get("advanced") === "1";
 
   if (isLoading || workflowQuery.isLoading) return <Skeleton className="h-96 w-full rounded-xl" />;
 
@@ -42,37 +45,37 @@ export default function EditScreenerPage() {
   }
 
   const conversion = documentToScreenerDraft(workflow.document);
-
-  if (!conversion.ok) {
-    return (
-      <div className="flex flex-col gap-4 pb-8">
-        <SectionLabel eyebrow="Screeners" title={`Edit ${workflow.name}`} />
-        <Alert>
-          <FileWarningIcon />
-          <AlertTitle>This screener is not editable in the structured form</AlertTitle>
-          <AlertDescription>
-            <p>{conversion.reason}</p>
-            <p className="mt-2">
-              Nothing has been changed. The read-only view shows the full canonical document, where
-              no field can be dropped.
-            </p>
-            <Button asChild variant="outline" size="sm" className="mt-3">
-              <Link href={`/alerts/screeners/${workflowId}`}>Open the read-only view</Link>
-            </Button>
-          </AlertDescription>
-        </Alert>
-      </div>
-    );
-  }
-
   const expectedRevision =
     workflow.latest_revision?.revision ?? workflow.active_revision?.revision ?? 1;
 
+  if (!conversion.ok || forceAdvanced) {
+    return (
+      <AdvancedDefinitionEditor
+        workflowId={workflowId}
+        scope={scope}
+        name={workflow.name}
+        expectedRevision={expectedRevision}
+        initialYaml={workflow.yaml ?? null}
+        initialDocument={workflow.document}
+        reason={conversion.ok ? undefined : conversion.reason}
+      />
+    );
+  }
+
   return (
-    <ScreenerEditor
-      scope={scope}
-      initialDraft={conversion.draft}
-      edit={{ workflowId, expectedRevision }}
-    />
+    <div className="flex flex-col gap-3">
+      <p className="text-xs text-muted-foreground">
+        Editing in the structured form. It keeps every field the form does not model.{" "}
+        <Link href={`/alerts/screeners/${workflowId}/edit?advanced=1`} className="underline">
+          Edit as YAML/JSON instead
+        </Link>
+      </p>
+      <ScreenerEditor
+        scope={scope}
+        initialDraft={conversion.draft}
+        baseDocument={workflow.document}
+        edit={{ workflowId, expectedRevision }}
+      />
+    </div>
   );
 }

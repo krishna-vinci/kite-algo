@@ -52,10 +52,15 @@ const STEPS = ["Coverage", "Clock", "Who qualifies", "Schedule", "Notifications"
 type ScreenerEditorProps = Readonly<{
   scope: string | null;
   initialDraft?: ScreenerDraft;
+  /**
+   * The loaded document on the edit path. The form merges the fields it models
+   * onto a clone of this, so unmodeled keys survive a save.
+   */
+  baseDocument?: Record<string, unknown> | null;
   edit?: { workflowId: string; expectedRevision: number };
 }>;
 
-export function ScreenerEditor({ scope, initialDraft, edit }: ScreenerEditorProps) {
+export function ScreenerEditor({ scope, initialDraft, baseDocument, edit }: ScreenerEditorProps) {
   const router = useRouter();
   const capabilitiesQuery = useAlertsCapabilities(scope);
   const channelsQuery = useAlertsChannels(scope);
@@ -68,7 +73,10 @@ export function ScreenerEditor({ scope, initialDraft, edit }: ScreenerEditorProp
   const channels = channelsQuery.data?.channels ?? [];
   const isEditing = Boolean(edit);
 
-  const document = useMemo(() => buildScreenerDocument(draft), [draft]);
+  const document = useMemo(
+    () => buildScreenerDocument(draft, baseDocument),
+    [draft, baseDocument],
+  );
   const issues = useMemo(() => screenerDraftIssues(draft), [draft]);
 
   const saveMutation = useMutation({
