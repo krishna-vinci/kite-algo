@@ -3,6 +3,7 @@
 import { PlusIcon, Trash2Icon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -124,16 +125,29 @@ type ConditionEditorProps = Readonly<{
   conditions: Condition[];
   onChange: (next: Condition[]) => void;
   capabilities: AlertsCapabilities;
+  /** Shown above the list, e.g. "Any of" / "None of". */
+  title?: string;
+  /** A group may be empty when it is optional (any/not); the `all` group may not. */
+  allowEmpty?: boolean;
+  addLabel?: string;
 }>;
 
 /**
- * Flat `all` group editor.
+ * Condition group editor.
  *
  * The operator list is grouped by the backend's own classification, and each
  * option is labelled with whether it reports a *level* or a *crossing* — the
- * distinction that caused a live Phase 4 failure (handoff §7).
+ * distinction that caused a live Phase 4 failure (handoff §7). The same editor
+ * backs the `all`, `any` and `not` groups so their wording cannot drift.
  */
-export function ConditionEditor({ conditions, onChange, capabilities }: ConditionEditorProps) {
+export function ConditionEditor({
+  conditions,
+  onChange,
+  capabilities,
+  title,
+  allowEmpty = false,
+  addLabel = "Add condition",
+}: ConditionEditorProps) {
   const operatorEntries = Object.entries(capabilities.operators);
 
   const updateAt = (index: number, next: Condition) => {
@@ -144,8 +158,13 @@ export function ConditionEditor({ conditions, onChange, capabilities }: Conditio
 
   return (
     <div className="flex flex-col gap-3">
+      {title ? (
+        <p className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground/60">{title}</p>
+      ) : null}
+
       {conditions.map((condition, index) => {
         const group = operatorGroup(condition.op, capabilities.operators);
+        const hysteresisAllowed = group === "level" && condition.right.kind === "constant";
         return (
           <div
             key={index}
@@ -206,7 +225,7 @@ export function ConditionEditor({ conditions, onChange, capabilities }: Conditio
                 variant="ghost"
                 size="icon-sm"
                 aria-label={`Remove condition ${index + 1}`}
-                disabled={conditions.length === 1}
+                disabled={!allowEmpty && conditions.length === 1}
                 onClick={() => onChange(conditions.filter((_, i) => i !== index))}
               >
                 <Trash2Icon className="size-4" />
@@ -219,9 +238,49 @@ export function ConditionEditor({ conditions, onChange, capabilities }: Conditio
                 it <em>became</em> true.
               </p>
             ) : null}
+
+            {hysteresisAllowed ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <Checkbox
+                  id={`condition-hysteresis-${index}`}
+                  checked={Boolean(condition.hysteresis)}
+                  onCheckedChange={(checked) =>
+                    updateAt(index, {
+                      ...condition,
+                      hysteresis: checked === true ? { release: 0 } : null,
+                    })
+                  }
+                />
+                <Label htmlFor={`condition-hysteresis-${index}`} className="text-xs">
+                  Hold until it passes back beyond a release level
+                </Label>
+                {condition.hysteresis ? (
+                  <Input
+                    type="number"
+                    step="any"
+                    aria-label={`condition ${index + 1} hysteresis release`}
+                    className="w-[9rem]"
+                    value={condition.hysteresis.release}
+                    onChange={(event) =>
+                      updateAt(index, {
+                        ...condition,
+                        hysteresis: { release: Number(event.target.value) },
+                      })
+                    }
+                  />
+                ) : null}
+                <span className="text-[10px] text-muted-foreground">
+                  Constant release only — {capabilities.hysteresis.threshold}
+                </span>
+              </div>
+            ) : null}
           </div>
         );
       })}
+
+      {conditions.length === 0 && !allowEmpty ? (
+        <p className="text-xs text-muted-foreground">A condition is required.</p>
+      ) : null}
 
       <Button
         type="button"
@@ -237,7 +296,7 @@ export function ConditionEditor({ conditions, onChange, capabilities }: Conditio
         }
       >
         <PlusIcon className="size-4" />
-        Add condition
+        {addLabel}
       </Button>
       {conditions.length >= capabilities.limits.max_conditions_per_group ? (
         <p className="text-xs text-muted-foreground">

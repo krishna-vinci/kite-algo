@@ -81,11 +81,21 @@ describe("documentToDraft", () => {
     if (!result.ok) expect(result.reason).toMatch(/sequence|advanced/i);
   });
 
-  it("refuses per-condition hysteresis", () => {
+  it("reads a constant per-condition hysteresis release", () => {
     const document = buildDocument(DRAFT);
     const stages = document.stages as Array<Record<string, unknown>>;
     const conditions = stages[0].conditions as { all: Array<Record<string, unknown>> };
     conditions.all[0] = { ...conditions.all[0], hysteresis: { release: 2900 } };
+    const result = documentToDraft(document);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.draft.conditions[0].hysteresis).toEqual({ release: 2900 });
+  });
+
+  it("refuses dynamic hysteresis, which is not implemented", () => {
+    const document = buildDocument(DRAFT);
+    const stages = document.stages as Array<Record<string, unknown>>;
+    const conditions = stages[0].conditions as { all: Array<Record<string, unknown>> };
+    conditions.all[0] = { ...conditions.all[0], hysteresis: { release: { indicator: "rsi" } } };
     const result = documentToDraft(document);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toMatch(/hysteresis/i);
@@ -112,12 +122,29 @@ describe("documentToDraft", () => {
     expect(result.ok).toBe(false);
   });
 
-  it("refuses 'any'/'not' groups", () => {
+  it("reads 'any'/'not' groups instead of refusing them", () => {
     const document = buildDocument(DRAFT);
     const stages = document.stages as Array<Record<string, unknown>>;
-    stages[0] = { ...stages[0], any_conditions: [{ op: "gt", left: { field: "close" }, right: 1 }] };
+    stages[0] = {
+      ...stages[0],
+      any_conditions: [{ op: "gt", left: { field: "close" }, right: 1 }],
+      not_conditions: [{ op: "lt", left: { field: "volume" }, right: 100 }],
+    };
     const result = documentToDraft(document);
-    expect(result.ok).toBe(false);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.draft.anyConditions).toHaveLength(1);
+      expect(result.draft.notConditions).toHaveLength(1);
+    }
+  });
+
+  it("reads consecutive_bars into the draft", () => {
+    const document = buildDocument(DRAFT);
+    const stages = document.stages as Array<Record<string, unknown>>;
+    stages[0] = { ...stages[0], consecutive_bars: 3 };
+    const result = documentToDraft(document);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.draft.consecutiveBars).toBe(3);
   });
 
   it("handles a null document", () => {

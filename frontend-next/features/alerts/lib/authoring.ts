@@ -28,6 +28,12 @@ export type Condition = {
   left: Operand;
   op: string;
   right: Operand;
+  /**
+   * Constant-threshold condition hysteresis (Phase 4 F10): after matching, the
+   * condition stays matched until the value passes back beyond `release`.
+   * Dynamic/indicator thresholds are not implemented and are not modelled.
+   */
+  hysteresis?: { release: number } | null;
 };
 
 /** The document's shorthand operand form (handoff §11). */
@@ -45,11 +51,16 @@ export function operandToDocument(operand: Operand): unknown {
 }
 
 export function conditionToDocument(condition: Condition): Record<string, unknown> {
-  return {
+  const document: Record<string, unknown> = {
     left: operandToDocument(condition.left),
     op: condition.op,
     right: operandToDocument(condition.right),
   };
+  // Emitted only when set, so a condition without hysteresis cannot move a hash.
+  if (condition.hysteresis && Number.isFinite(condition.hysteresis.release)) {
+    document.hysteresis = { release: condition.hysteresis.release };
+  }
+  return document;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +308,12 @@ export type AlertDraft = {
   instruments: string[];
   universe: UniverseDraft;
   conditions: Condition[];
+  /** OR-combined with three-valued "unknown" propagation. */
+  anyConditions: Condition[];
+  /** Negated with three-valued "unknown" propagation. */
+  notConditions: Condition[];
+  /** N consecutive completed bars the `all` group must hold; null = not used. */
+  consecutiveBars: number | null;
   /** The stage the edited conditions live on. Captured so an edit through the
    * form cannot silently rename a stage (`px` -> whatever) and move the hash. */
   stageId: string;
@@ -313,6 +330,9 @@ export function emptyDraft(): AlertDraft {
     instruments: [],
     universe: emptyUniverseDraft(),
     conditions: [{ left: { kind: "field", name: "close" }, op: "crosses_above", right: { kind: "constant", value: 0 } }],
+    anyConditions: [],
+    notConditions: [],
+    consecutiveBars: null,
     stageId: "px",
     alert: {
       id: "a1",
@@ -356,13 +376,32 @@ function alertToDocument(alert: AlertTriggerDraft, stageId: string): Record<stri
 }
 
 function stageToDocument(draft: AlertDraft): Record<string, unknown> {
-  return {
+  const stage: Record<string, unknown> = {
     id: draft.stageId || "px",
     type: "signal",
     clock: draft.clock,
     timeframe: draft.timeframe,
     conditions: { all: draft.conditions.map(conditionToDocument) },
   };
+  if (draft.anyConditions.length > 0) {
+    stage.any_conditions = draft.anyConditions.map(conditionToDocument);
+  }
+  if (draft.notConditions.length > 0) {
+    stage.not_conditions = draft.notConditions.map(conditionToDocument);
+  }
+  if (draft.consecutiveBars != null) stage.consecutive_bars = draft.consecutiveBars;
+  return stage;
+}
+
+/** Apply the modeled stage fields onto a stage inside an existing document. */
+function applyStageFields(stage: Record<string, unknown>, draft: AlertDraft): void {
+  stage.clock = draft.clock;
+  stage.timeframe = draft.timeframe;
+  stage.conditions = { all: draft.conditions.map(conditionToDocument) };
+  stage.any_conditions = draft.anyConditions.map(conditionToDocument);
+  stage.not_conditions = draft.notConditions.map(conditionToDocument);
+  if (draft.consecutiveBars != null) stage.consecutive_bars = draft.consecutiveBars;
+  else delete stage.consecutive_bars;
 }
 
 /**
@@ -415,9 +454,7 @@ export function buildDocument(
     stages.push(stage);
   }
   document.stages = stages;
-  stage.clock = draft.clock;
-  stage.timeframe = draft.timeframe;
-  stage.conditions = { all: draft.conditions.map(conditionToDocument) };
+  applyStageFields(stage, draft);
 
   const alerts = Array.isArray(document.alerts)
     ? (document.alerts as Array<Record<string, unknown>>)
@@ -511,8 +548,18 @@ export function conditionFromDocument(
     return { ok: false, reason: "A condition is not in a form this editor understands." };
   }
   const record = raw as Record<string, unknown>;
+  let hysteresis: { release: number } | null = null;
   if (record.hysteresis) {
-    return { ok: false, reason: "This condition uses hysteresis, which this editor does not model yet." };
+    const rawHysteresis = record.hysteresis as Record<string, unknown>;
+    if (typeof rawHysteresis.release === "number") {
+      hysteresis = { release: rawHysteresis.release };
+    } else {
+      return {
+        ok: false,
+        reason:
+          "This condition uses dynamic hysteresis (an operand release), which is not implemented; only a constant release is supported.",
+      };
+    }
   }
   const left = operandFromDocument(record.left);
   const right = operandFromDocument(record.right);
@@ -522,7 +569,15 @@ export function conditionFromDocument(
       reason: "This condition uses a pair or expression operand, which this editor does not model yet.",
     };
   }
-  return { ok: true, condition: { left, op: String(record.op ?? ""), right } };
+  return {
+    ok: true,
+    condition: {
+      left,
+      op: String(record.op ?? ""),
+      right,
+      ...(hysteresis ? { hysteresis } : {}),
+    },
+  };
 }
 
 /**
@@ -550,20 +605,33 @@ export function documentToDraft(document: Record<string, unknown> | null): Draft
   if (stage.type !== "signal") {
     return { ok: false, reason: `Stage type '${String(stage.type)}' is not editable here.` };
   }
-  if (stage.sequence || stage.breadth || stage.consecutive_bars) {
+  if (stage.sequence || stage.breadth) {
     return {
       ok: false,
       reason:
-        "This stage uses advanced conditions (sequence, breadth or consecutive_bars) that the structured editor does not model.",
+        "This stage uses a sequence or a breadth condition, which the structured editor does not model. Use the advanced editor.",
     };
   }
-  // Canonical documents carry these as empty arrays even when unused, so only a
-  // POPULATED group is outside the editor.
-  const anyConditions = Array.isArray(stage.any_conditions) ? stage.any_conditions : [];
-  const notConditions = Array.isArray(stage.not_conditions) ? stage.not_conditions : [];
-  if (anyConditions.length > 0 || notConditions.length > 0) {
-    return { ok: false, reason: "This stage uses 'any'/'not' groups, which this editor does not model." };
+  // Canonical documents carry these as empty arrays even when unused.
+  const anyRaw = Array.isArray(stage.any_conditions) ? stage.any_conditions : [];
+  const notRaw = Array.isArray(stage.not_conditions) ? stage.not_conditions : [];
+  const anyConditions: Condition[] = [];
+  for (const raw of anyRaw) {
+    const parsed = conditionFromDocument(raw);
+    if (!parsed.ok) return { ok: false, reason: parsed.reason };
+    anyConditions.push(parsed.condition);
   }
+  const notConditions: Condition[] = [];
+  for (const raw of notRaw) {
+    const parsed = conditionFromDocument(raw);
+    if (!parsed.ok) return { ok: false, reason: parsed.reason };
+    notConditions.push(parsed.condition);
+  }
+
+  const consecutiveBars =
+    typeof stage.consecutive_bars === "number"
+      ? stage.consecutive_bars
+      : null;
 
   // The backend stores `conditions` in the canonical list form
   // (`[{left, op, right}, ...]`), while a form-shaped fixture may wrap it as
@@ -575,10 +643,14 @@ export function documentToDraft(document: Record<string, unknown> | null): Draft
     allConditions = stageConditions;
   } else if (stageConditions && typeof stageConditions === "object") {
     const groups = stageConditions as Record<string, unknown>;
-    const inlineAny = Array.isArray(groups.any) ? groups.any : [];
-    const inlineNot = Array.isArray(groups.not) ? groups.not : [];
-    if (inlineAny.length > 0 || inlineNot.length > 0) {
-      return { ok: false, reason: "This stage uses 'any'/'not' groups, which this editor does not model." };
+    for (const key of ["any", "not"] as const) {
+      if (!Array.isArray(groups[key])) continue;
+      for (const raw of groups[key] as unknown[]) {
+        const parsed = conditionFromDocument(raw);
+        if (!parsed.ok) return { ok: false, reason: parsed.reason };
+        if (key === "any") anyConditions.push(parsed.condition);
+        else notConditions.push(parsed.condition);
+      }
     }
     if (Array.isArray(groups.all)) allConditions = groups.all;
   }
@@ -643,6 +715,9 @@ export function documentToDraft(document: Record<string, unknown> | null): Draft
         deduplicate: rawUniverse ? rawUniverse.deduplicate !== false : true,
       },
       conditions,
+      anyConditions,
+      notConditions,
+      consecutiveBars,
       stageId: String(stage.id ?? "px"),
       alert: {
         id: String(alert.id ?? "a1"),

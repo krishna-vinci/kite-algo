@@ -372,10 +372,68 @@ export function AlertWizard({ scope, initialDraft, baseDocument, edit }: AlertWi
           <div className="flex flex-col gap-4">
             <h3 className="text-sm font-semibold">3. Conditions</h3>
             <ConditionEditor
+              title="All of these (AND)"
               conditions={draft.conditions}
               onChange={(conditions) => setDraft({ ...draft, conditions })}
               capabilities={capabilities}
             />
+
+            <details className="rounded-lg border border-border/60 p-3">
+              <summary className="cursor-pointer text-sm">
+                Any of / none of (optional)
+                {draft.anyConditions.length + draft.notConditions.length > 0 ? (
+                  <span className="ml-2 text-xs text-muted-foreground">
+                    {draft.anyConditions.length} any, {draft.notConditions.length} none
+                  </span>
+                ) : null}
+              </summary>
+              <div className="mt-3 flex flex-col gap-4">
+                <p className="text-xs text-muted-foreground">
+                  These groups use three-valued logic: an unavailable value makes the condition
+                  UNKNOWN, not false. A rule can therefore not trigger without being false.
+                </p>
+                <ConditionEditor
+                  title="Any of these (OR)"
+                  allowEmpty
+                  addLabel="Add any condition"
+                  conditions={draft.anyConditions}
+                  onChange={(anyConditions) => setDraft({ ...draft, anyConditions })}
+                  capabilities={capabilities}
+                />
+                <ConditionEditor
+                  title="None of these (NOT)"
+                  allowEmpty
+                  addLabel="Add excluded condition"
+                  conditions={draft.notConditions}
+                  onChange={(notConditions) => setDraft({ ...draft, notConditions })}
+                  capabilities={capabilities}
+                />
+              </div>
+            </details>
+
+            <div className="flex flex-col gap-1 sm:max-w-xs">
+              <Label htmlFor="consecutive-bars">Require consecutive completed bars (optional)</Label>
+              <Input
+                id="consecutive-bars"
+                type="number"
+                min={1}
+                max={capabilities.limits.max_consecutive_bars}
+                value={draft.consecutiveBars ?? ""}
+                onChange={(event) =>
+                  setDraft({
+                    ...draft,
+                    consecutiveBars:
+                      event.target.value === "" ? null : Number(event.target.value),
+                  })
+                }
+              />
+              <p className="text-xs text-muted-foreground">
+                The whole “all of these” group must hold for N consecutive completed bars. Valid
+                only on the candle-close clock, and not with a sequence or breadth condition.
+                Server-validated.
+              </p>
+            </div>
+
             <details className="rounded-lg border border-border/60 p-3">
               <summary className="cursor-pointer text-xs text-muted-foreground">
                 Not available in this editor

@@ -172,6 +172,43 @@ describe("buildDocument", () => {
     }
   });
 
+  it("emits any/not groups and consecutive_bars only when used", () => {
+    const bare = buildDocument(draft);
+    const bareStage = (bare.stages as Array<Record<string, unknown>>)[0];
+    expect(bareStage).not.toHaveProperty("any_conditions");
+    expect(bareStage).not.toHaveProperty("not_conditions");
+    expect(bareStage).not.toHaveProperty("consecutive_bars");
+
+    const rich = buildDocument({
+      ...draft,
+      anyConditions: [
+        { left: { kind: "field", name: "close" }, op: "gt", right: { kind: "constant", value: 1 } },
+      ],
+      notConditions: [
+        { left: { kind: "field", name: "volume" }, op: "lt", right: { kind: "constant", value: 5 } },
+      ],
+      consecutiveBars: 3,
+    });
+    const stage = (rich.stages as Array<Record<string, unknown>>)[0];
+    expect(stage.any_conditions).toHaveLength(1);
+    expect(stage.not_conditions).toHaveLength(1);
+    expect(stage.consecutive_bars).toBe(3);
+  });
+
+  it("emits a constant hysteresis release only when set", () => {
+    const condition = {
+      left: { kind: "field" as const, name: "close" },
+      op: "gt",
+      right: { kind: "constant" as const, value: 100 },
+      hysteresis: { release: 90 },
+    };
+    const stage = (buildDocument({ ...draft, conditions: [condition] }).stages as Array<
+      Record<string, unknown>
+    >)[0];
+    const emitted = (stage.conditions as { all: Array<Record<string, unknown>> }).all[0];
+    expect(emitted.hysteresis).toEqual({ release: 90 });
+  });
+
   it("includes optional alert keys once set, including max_per_session", () => {
     const alert = (
       buildDocument({
