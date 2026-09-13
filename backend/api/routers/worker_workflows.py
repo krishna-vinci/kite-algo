@@ -376,6 +376,7 @@ def capabilities_payload() -> dict:
     ``compile_document`` validates against.
     """
     from backend.workflows import registry as wf_registry
+    from backend.workflows import universes as wf_universes
 
     features = {
         name: {
@@ -428,6 +429,15 @@ def capabilities_payload() -> dict:
         "triggers": sorted(wf_registry.TRIGGERS),
         "timeframes": sorted(wf_registry.TIMEFRAMES),
         "sessions": sorted(wf_registry.SESSIONS),
+        # session -> accepted exchanges, straight from `SESSION_EXCHANGES`, so
+        # the authoring UI can reject a session/instrument pair that cannot
+        # exist using the SAME rule the compiler enforces
+        # (`registry.session_accepts_exchange`) instead of a hard-coded copy
+        # that would drift the moment a provider is added.
+        "session_exchanges": {
+            name: sorted(exchanges)
+            for name, exchanges in sorted(wf_registry.SESSION_EXCHANGES.items())
+        },
         "features": features,
         "arithmetic": sorted(wf_registry.ARITHMETIC_OPS),
         "limits": {
@@ -488,6 +498,10 @@ def capabilities_payload() -> dict:
             "tie_break": "instrument identity (EXCHANGE:SYMBOL) ascending",
         },
         "universe_source_kinds": ["explicit", "index", "portfolio", "screener"],
+        # Derived from the same registry function the universe validator uses,
+        # so the authoring UI offers exactly the index lists that will be
+        # accepted instead of a hard-coded copy that drifts.
+        "universe_index_source_lists": wf_universes.supported_index_source_lists(),
     }
 
 

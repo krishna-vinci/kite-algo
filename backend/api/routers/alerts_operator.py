@@ -1480,6 +1480,41 @@ async def revoke_operator_token(
 # ---------------------------------------------------------------------------
 
 
+@router.get("/workflows/{workflow_id}/revisions")
+async def list_workflow_revisions(
+    request: Request,
+    workflow_id: str,
+    scope: str = Depends(require_operator_scope),
+    session_factory: Any = Depends(_alerts_db),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """Revision history, newest first — what a rollback can roll back TO.
+
+    ``POST /activate?revision=N`` accepts a revision number, but until this
+    route existed nothing told the operator WHICH revisions existed: the detail
+    payload carries only the latest and the active one, so a rollback would have
+    meant guessing a number. Read-only and owner-scoped, like every other route
+    here.
+    """
+    _ = request
+    with session_factory() as session:
+        workflow = session.get(WorkflowModel, workflow_id)
+        if workflow is None or workflow.owner_id != scope:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        revisions = session.execute(
+            select(WorkflowRevision)
+            .where(WorkflowRevision.workflow_id == workflow_id)
+            .order_by(WorkflowRevision.revision.desc())
+            .limit(limit)
+        ).scalars().all()
+    return {
+        "ok": True,
+        "workflow_id": workflow_id,
+        "limit": limit,
+        "revisions": [_revision_summary(revision) for revision in revisions],
+    }
+
+
 @router.get("/workflows/{workflow_id}/yaml")
 async def workflow_yaml(
     request: Request,

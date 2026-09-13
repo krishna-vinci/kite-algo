@@ -677,18 +677,36 @@ class SqlAlchemyWorkflowRepository:
         row = session.execute(stmt).scalar_one_or_none()
         lease_until = timestamp + timedelta(seconds=max(1.0, float(lease_seconds)))
         if row is None:
-            session.add(
-                EvaluationOwnership(
-                    subscription_id=subscription_id,
-                    instrument_key=instrument_key,
-                    owner_id=owner_id,
-                    owner_epoch=1,
-                    lease_until=lease_until,
-                    updated_at=timestamp,
-                )
-            )
-            session.flush()
-            return 1
+            try:
+                with session.begin_nested():
+                    session.add(
+                        EvaluationOwnership(
+                            subscription_id=subscription_id,
+                            instrument_key=instrument_key,
+                            owner_id=owner_id,
+                            owner_epoch=1,
+                            lease_until=lease_until,
+                            updated_at=timestamp,
+                        )
+                    )
+                    session.flush()
+                return 1
+            except IntegrityError:
+                # `SELECT ... FOR UPDATE` locks no row when the row does not
+                # exist, so two claimers racing for a BRAND-NEW subscription
+                # both reach this INSERT and one must lose. Losing is the fence
+                # working, not a failure: re-read the winner's row and fall
+                # through to the ordinary lease comparison, which returns None
+                # while the winner's lease is still held. Letting the
+                # IntegrityError escape made a first-claim race surface as
+                # "evaluation crashed for subscription ..." and abort the
+                # transaction — the opposite of what a fence should do.
+                row = session.execute(stmt).scalar_one_or_none()
+                if row is None:
+                    # The winner has not committed yet, so its claim is not
+                    # visible to us. Report the race as lost; the caller
+                    # re-claims on the next dispatch.
+                    return None
         stored_lease = row.lease_until
         if stored_lease is not None and stored_lease.tzinfo is None:
             stored_lease = stored_lease.replace(tzinfo=timezone.utc)

@@ -555,18 +555,37 @@ class EvaluationService:
                 InstrumentCatalog,
                 InstrumentNotFoundError,
             )
-
-            descriptor = InstrumentCatalog(db=session).resolve_public_key(instrument_key)
-            return {
-                "instrument_id": descriptor.instrument_id,
-                "public_key": descriptor.public_key,
-                "broker": descriptor.broker,
-                "broker_token": descriptor.broker_token,
-                "catalog_generation": descriptor.catalog_generation,
-                "lifecycle_status": descriptor.lifecycle_status,
-            }
-        except (CatalogUnavailableError, InstrumentNotFoundError):
+        except Exception:
+            # The catalog module pulls broker clients; without it there is
+            # simply no provenance to record.
             return None
+
+        # The SAVEPOINT is required, not defensive noise. On PostgreSQL a
+        # failed statement aborts the surrounding transaction even when the
+        # Python exception is handled, so catching CatalogUnavailableError and
+        # carrying on would leave the caller's transaction poisoned and the
+        # next INSERT would fail with "current transaction is aborted" — the
+        # exact opposite of the guarantee above, on precisely the pre-migration
+        # deployment this branch exists to support. SQLite never exposed it
+        # because it does not abort a transaction on error.
+        savepoint = session.begin_nested()
+        try:
+            descriptor = InstrumentCatalog(db=session).resolve_public_key(instrument_key)
+        except (CatalogUnavailableError, InstrumentNotFoundError):
+            savepoint.rollback()
+            return None
+        except Exception:
+            savepoint.rollback()
+            raise
+        savepoint.commit()
+        return {
+            "instrument_id": descriptor.instrument_id,
+            "public_key": descriptor.public_key,
+            "broker": descriptor.broker,
+            "broker_token": descriptor.broker_token,
+            "catalog_generation": descriptor.catalog_generation,
+            "lifecycle_status": descriptor.lifecycle_status,
+        }
 
     # ------------------------------------------------------------------
     # evaluation
@@ -916,6 +935,26 @@ class EvaluationService:
                     # E-2/E-7: a racing writer (or a re-delivered bar) already
                     # committed this occurrence key; the whole transaction
                     # rolls back and the loser skips without crashing.
+                    #
+                    # But an IntegrityError is NOT proof of a duplicate — a
+                    # missing FK (a channel name that resolves to nothing, for
+                    # instance) raises the same class. Blanket-labelling every
+                    # integrity failure as `duplicate_occurrence` made a real
+                    # write failure look like a harmless replay: the event was
+                    # silently lost, the checkpoint did not advance (this branch
+                    # returns early, so the rule re-fired and re-failed forever),
+                    # and health reported only `duplicate_occurrence`. Re-read the
+                    # key to tell the two apart and let anything else surface.
+                    existing = self.workflow_repo.get_signal_by_occurrence(
+                        occurrence_key, db=session
+                    )
+                    if existing is None:
+                        logger.error(
+                            "event write failed for subscription %s occurrence %s "
+                            "and the occurrence does not exist — not a duplicate",
+                            sub.id, occurrence_key, exc_info=True,
+                        )
+                        raise
                     logger.info(
                         "occurrence %s already recorded for subscription %s; skipping",
                         occurrence_key, sub.id,

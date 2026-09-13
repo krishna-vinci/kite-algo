@@ -83,6 +83,28 @@ SUPPORTED_UNIVERSE_KINDS = ("explicit", "index", "portfolio", "screener")
 # (backend.broker_api is never imported at module import time).
 _DEFAULT_INDEX_SOURCE_LISTS = ("Nifty50", "Nifty500", "NiftyBank")
 
+
+def supported_index_source_lists() -> List[str]:
+    """Index source lists this install can actually resolve.
+
+    Public because two callers need the SAME answer: universe validation here,
+    and the capabilities endpoint that tells the authoring UI which index lists
+    to offer. A hard-coded copy in either place would drift the moment the
+    ingestion registry gains a list, and the UI would then offer a value the
+    validator rejects.
+    """
+    try:
+        from backend.broker_api.instruments.index_ingestion import (
+            list_supported_index_source_lists,
+        )
+
+        return list(list_supported_index_source_lists())
+    except Exception:
+        # The ingestion module pulls redis/kite clients; fall back to the
+        # pinned list when it cannot even be imported in this process.
+        return list(_DEFAULT_INDEX_SOURCE_LISTS)
+
+
 _NAME_MAX_LENGTH = 255
 
 # "EXCHANGE:SYMBOL" — exactly one colon, both parts non-empty. Uppercased by
@@ -360,16 +382,7 @@ class UniverseService:
         return keys
 
     def _supported_index_source_lists(self) -> List[str]:
-        try:
-            from backend.broker_api.instruments.index_ingestion import (
-                list_supported_index_source_lists,
-            )
-
-            return list(list_supported_index_source_lists())
-        except Exception:
-            # The ingestion module pulls redis/kite clients; fall back to the
-            # pinned list when it cannot even be imported in this process.
-            return list(_DEFAULT_INDEX_SOURCE_LISTS)
+        return supported_index_source_lists()
 
     def _normalize_index_source_list(self, value: Any) -> str:
         raw = str(value or "").strip()

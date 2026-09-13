@@ -27,7 +27,14 @@ from backend.workflows.universes import (
     UniverseValidationError,
 )
 
-T0 = datetime(2026, 9, 9, 10, 0, tzinfo=timezone.utc)
+#: Seed time for a "recent" complete run, expressed RELATIVE to the moment the
+#: suite runs. It was previously pinned to a literal date, which made the
+#: freshness assertions date-dependent: the screener freshness check compares
+#: against wall-clock now, so a fixed seed silently became "stale" once the
+#: calendar moved past `seed + freshness_limit` and the happy-path test began
+#: failing with no code change at all. Anchoring to now is what these tests
+#: actually mean — "a run that just completed" versus "a run from long ago".
+T0 = datetime.now(timezone.utc) - timedelta(hours=1)
 
 
 @pytest.fixture()
