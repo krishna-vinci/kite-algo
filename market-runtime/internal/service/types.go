@@ -105,6 +105,8 @@ type RuntimeStatus struct {
 	LastTokenRotateAt   *time.Time           `json:"last_token_rotate_at,omitempty"`
 	Shards              []ShardRuntimeStatus `json:"shards"`
 	Exhausted           bool                 `json:"exhausted"`
+	TicksPublished      uint64               `json:"ticks_published"`
+	LastTickAt          *time.Time           `json:"last_tick_at,omitempty"`
 	UpdatedAt           time.Time            `json:"updated_at"`
 }
 

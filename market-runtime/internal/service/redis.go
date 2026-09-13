@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -19,6 +20,9 @@ const (
 type RedisPublisher struct {
 	client     *redis.Client
 	tickKeyTTL time.Duration
+
+	ticksPublished   atomic.Uint64
+	lastTickUnixNano atomic.Int64
 }
 
 func NewRedisPublisher(redisURL string, tickKeyTTL time.Duration) (*RedisPublisher, error) {
@@ -42,8 +46,23 @@ func (p *RedisPublisher) PublishTick(ctx context.Context, tick NormalizedTick) e
 	pipe := p.client.Pipeline()
 	pipe.Set(ctx, fmt.Sprintf("market:tick:%d", tick.InstrumentToken), payload, p.tickKeyTTL)
 	pipe.Publish(ctx, ticksChannel, payload)
-	_, err = pipe.Exec(ctx)
-	return err
+	if _, err := pipe.Exec(ctx); err != nil {
+		return err
+	}
+	p.ticksPublished.Add(1)
+	p.lastTickUnixNano.Store(time.Now().UnixNano())
+	return nil
+}
+
+// TickStats reports how many ticks were successfully published to the
+// ``market:ticks`` channel and the wall-clock time of the latest one. Both are
+// atomics, so callers need no lock.
+func (p *RedisPublisher) TickStats() (uint64, time.Time) {
+	var last time.Time
+	if nano := p.lastTickUnixNano.Load(); nano != 0 {
+		last = time.Unix(0, nano).UTC()
+	}
+	return p.ticksPublished.Load(), last
 }
 
 func (p *RedisPublisher) PublishOrderUpdate(ctx context.Context, update OrderUpdateEnvelope) error {

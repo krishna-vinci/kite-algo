@@ -187,6 +187,11 @@ func (s *Service) Status() RuntimeStatus {
 	if s.exhausted {
 		overall = "exhausted"
 	}
+	ticksPublished, lastTickAt := s.publisher.TickStats()
+	var lastTickAtPtr *time.Time
+	if !lastTickAt.IsZero() {
+		lastTickAtPtr = &lastTickAt
+	}
 	return RuntimeStatus{
 		Status:              overall,
 		SystemSessionID:     s.config.SystemSessionID,
@@ -199,6 +204,8 @@ func (s *Service) Status() RuntimeStatus {
 		LastTokenRotateAt:   s.lastRotateAt,
 		Shards:              shards,
 		Exhausted:           s.exhausted,
+		TicksPublished:      ticksPublished,
+		LastTickAt:          lastTickAtPtr,
 		UpdatedAt:           time.Now().UTC(),
 	}
 }
