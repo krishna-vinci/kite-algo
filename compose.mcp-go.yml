@@ -1,7 +1,8 @@
-# Phase 1 parity service: Go MCP adapter beside the Python one.
+# Go MCP adapter — the active MCP service since the Phase 3 cutover (2026-09-11).
+# The Python `mcp` service in compose.yml is retired (zero requests in 48h before
+# retirement); do not start both — they would fight over KITE_MCP_HOST_PORT.
 # Usage:
 #   docker compose -f compose.yml -f compose.mcp-go.yml --profile mcp up -d mcp-go
-# At Phase 3 cutover this merges into compose.yml and the Python service retires.
 services:
   mcp-go:
     profiles: [mcp]
@@ -20,7 +21,7 @@ services:
       KITE_MCP_HTTP_TOKEN: ${KITE_MCP_HTTP_TOKEN:-}
       KITE_MCP_ALLOW_DATA_REFRESH: ${KITE_MCP_ALLOW_DATA_REFRESH:-false}
     ports:
-      - "${KITE_MCP_BIND_ADDRESS:-0.0.0.0}:18789:8788"
+      - "${KITE_MCP_BIND_ADDRESS:-0.0.0.0}:${KITE_MCP_HOST_PORT:-18789}:8788"
     depends_on:
       finance-app:
         condition: service_healthy
