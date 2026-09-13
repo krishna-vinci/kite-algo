@@ -16,11 +16,13 @@ import {
   fetchAlertsCapabilities,
   fetchAlertsChannels,
   fetchAlertsPlatformHealth,
+  fetchAlertsProducerCredentials,
   fetchAlertsProducers,
   fetchAlertsScopes,
   fetchAlertsScreenerAttachments,
   fetchAlertsScreenerRun,
   fetchAlertsScreenerRuns,
+  fetchAlertsSignalValues,
   fetchAlertsSignalsHealth,
   fetchAlertsTokenPresets,
   fetchAlertsTokens,
@@ -371,8 +373,12 @@ export function useAlertsTokenMutations(scope: string | null) {
     void queryClient.invalidateQueries({ queryKey: alertsKeys.tokens(scope) });
   return {
     create: useMutation({
-      mutationFn: (payload: { label: string; preset?: string; allowed_actions?: string[] }) =>
-        createAlertsToken(payload, scope),
+      mutationFn: (payload: {
+        label: string;
+        preset?: string;
+        allowed_actions?: string[];
+        allowed_modes?: string[];
+      }) => createAlertsToken(payload, scope),
       onSuccess: invalidate,
     }),
     revoke: useMutation({
@@ -390,6 +396,26 @@ export function useAlertsProducers(scope: string | null) {
   });
 }
 
+export function useAlertsProducerCredentials(producer: string | null, scope: string | null) {
+  return useQuery({
+    queryKey: alertsKeys.producerCredentials(producer ?? "", scope),
+    queryFn: () => fetchAlertsProducerCredentials(producer as string, scope),
+    enabled: Boolean(producer && scope),
+  });
+}
+
+export function useAlertsSignalValues(
+  producer: string | null,
+  scope: string | null,
+  limit = 20,
+) {
+  return useQuery({
+    queryKey: [...alertsKeys.signalValues(producer ?? "", scope), limit] as const,
+    queryFn: () => fetchAlertsSignalValues(producer as string, { scope, limit }),
+    enabled: Boolean(producer && scope),
+  });
+}
+
 export function useAlertsSignalsHealth(scope: string | null) {
   return useQuery({
     queryKey: alertsKeys.signalsHealth(scope),
@@ -400,9 +426,14 @@ export function useAlertsSignalsHealth(scope: string | null) {
 
 export function useAlertsProducerMutations(scope: string | null) {
   const queryClient = useQueryClient();
-  const invalidate = () => {
+  const invalidate = (producer?: string) => {
     void queryClient.invalidateQueries({ queryKey: alertsKeys.producers(scope) });
     void queryClient.invalidateQueries({ queryKey: alertsKeys.signalsHealth(scope) });
+    if (producer) {
+      void queryClient.invalidateQueries({
+        queryKey: alertsKeys.producerCredentials(producer, scope),
+      });
+    }
   };
   return {
     create: useMutation({
@@ -411,19 +442,20 @@ export function useAlertsProducerMutations(scope: string | null) {
         value_schema?: Record<string, unknown> | null;
         default_ttl_s?: number | null;
       }) => createAlertsProducer(payload, scope),
-      onSuccess: invalidate,
+      onSuccess: () => invalidate(),
     }),
     revoke: useMutation({
       mutationFn: (name: string) => revokeAlertsProducer(name, scope),
-      onSuccess: invalidate,
+      onSuccess: (_data, name) => invalidate(name),
     }),
     issueCredential: useMutation({
       mutationFn: (name: string) => issueAlertsProducerCredential(name, scope),
+      onSuccess: (_data, name) => invalidate(name),
     }),
     revokeCredential: useMutation({
       mutationFn: ({ name, tokenId }: { name: string; tokenId: string }) =>
         revokeAlertsProducerCredential(name, tokenId, scope),
-      onSuccess: invalidate,
+      onSuccess: (_data, { name }) => invalidate(name),
     }),
   };
 }

@@ -1127,6 +1127,7 @@ async def workflow_health(
         derive_subscription_freshness,
         runtime_health_view,
     )
+    from backend.workflows.advanced_repository import suppression_summary
     from backend.workflows.repository import AlertSubscription, EvaluationCheckpoint
 
     with session_factory() as session:
@@ -1180,6 +1181,11 @@ async def workflow_health(
         alert_stage = (
             {alert.id: alert.source for alert in document.alerts} if document else {}
         )
+        # Durable, per-workflow suppression counts. Unlike the runtime-only
+        # counters these are PERSISTED in the same transaction that skipped the
+        # event, so they survive a worker restart and need no health-file mount —
+        # the API reads them from the database directly.
+        suppressions = suppression_summary(session, workflow_id=workflow_id)
 
     now = datetime.now(timezone.utc)
     runtime = runtime_health_view()
@@ -1226,7 +1232,13 @@ async def workflow_health(
         },
         "subscriptions": rows,
         "runtime": runtime,
+        "suppressions": suppressions,
         "note": (
+            "'suppressions' are DURABLE per-reason counts (for example "
+            "'session_cap'), persisted when the notification was skipped, so "
+            "they are available without the worker health file; the counters "
+            "inside 'runtime' are in-memory worker facts and are UNKNOWN — not "
+            "zero — when that file is unreadable. "
             "'lifecycle.active' is whether this workflow is switched on; the "
             "per-subscription 'stale'/'stale_reason' fields are whether fresh "
             "data is arriving. They are different questions — an active "

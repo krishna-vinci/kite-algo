@@ -6,6 +6,7 @@ import { useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Panel } from "@/components/operator/panel";
@@ -23,8 +24,10 @@ import {
   useAlertsChannelMutations,
   useAlertsChannels,
   useAlertsPlatformHealth,
+  useAlertsProducerCredentials,
   useAlertsProducerMutations,
   useAlertsProducers,
+  useAlertsSignalValues,
   useAlertsSignalsHealth,
   useAlertsTokenMutations,
   useAlertsTokenPresets,
@@ -211,12 +214,23 @@ export function TokensPanel({ scope }: Readonly<{ scope: string | null }>) {
 
   const [label, setLabel] = useState("");
   const [preset, setPreset] = useState<string | null>(null);
+  // Advanced: individual actions for the supported alerts-platform surface.
+  const [mode, setMode] = useState<"preset" | "custom">("preset");
+  const [actions, setActions] = useState<string[]>([]);
+  const [modes, setModes] = useState<string[]>(["paper"]);
   // The secret lives here, in component state, and nowhere else.
   const [secret, setSecret] = useState<string | null>(null);
 
   const tokens = tokensQuery.data?.tokens ?? [];
   const presets = presetsQuery.data?.presets ?? [];
+  const allActions = presetsQuery.data?.all_actions ?? [];
+  const allModes = presetsQuery.data?.modes ?? [];
   const accountScope = presetsQuery.data?.account_scope ?? scope ?? "—";
+
+  const canCreate =
+    Boolean(label) &&
+    (mode === "preset" ? Boolean(preset ?? presets[0]?.id) : actions.length > 0) &&
+    !create.isPending;
 
   return (
     <div className="flex flex-col gap-4">
@@ -232,6 +246,35 @@ export function TokensPanel({ scope }: Readonly<{ scope: string | null }>) {
             <Input id="token-label" value={label} onChange={(event) => setLabel(event.target.value)} />
           </div>
           <div className="flex flex-col gap-1">
+            <Label htmlFor="token-scope">Account scope (fixed)</Label>
+            <Input id="token-scope" value={accountScope} readOnly aria-readonly="true" />
+          </div>
+        </div>
+
+        <div role="radiogroup" aria-label="Token actions" className="mt-3 flex flex-wrap gap-2">
+          {([
+            ["preset", "Least-privilege preset"],
+            ["custom", "Individual actions (advanced)"],
+          ] as const).map(([value, text]) => (
+            <button
+              key={value}
+              type="button"
+              role="radio"
+              aria-checked={mode === value}
+              onClick={() => setMode(value)}
+              className={
+                mode === value
+                  ? "rounded-full border border-primary/60 bg-primary/10 px-3 py-1 text-xs text-primary"
+                  : "rounded-full border border-border/60 px-3 py-1 text-xs text-muted-foreground hover:text-foreground"
+              }
+            >
+              {text}
+            </button>
+          ))}
+        </div>
+
+        {mode === "preset" ? (
+          <div className="mt-3 flex flex-col gap-1 sm:max-w-md">
             <Label htmlFor="token-preset">Preset</Label>
             <Select value={preset ?? presets[0]?.id} onValueChange={setPreset}>
               <SelectTrigger id="token-preset">
@@ -246,19 +289,72 @@ export function TokensPanel({ scope }: Readonly<{ scope: string | null }>) {
               </SelectContent>
             </Select>
           </div>
-        </div>
+        ) : (
+          <div className="mt-3 flex flex-col gap-3">
+            <fieldset className="flex flex-col gap-1">
+              <legend className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">
+                Actions
+              </legend>
+              {allActions.map((action) => (
+                <label key={action} className="flex items-center gap-2 text-sm">
+                  <Checkbox
+                    checked={actions.includes(action)}
+                    onCheckedChange={(checked) =>
+                      setActions((current) =>
+                        checked === true ? [...current, action] : current.filter((item) => item !== action),
+                      )
+                    }
+                  />
+                  <span className="font-mono text-xs">{action}</span>
+                </label>
+              ))}
+              <p className="mt-1 text-xs text-muted-foreground">
+                Only alerts-platform actions are listed. Execution actions (order submission, risk
+                updates, runs, GTT) are not offered by this surface and are refused by the server.
+              </p>
+            </fieldset>
+            <fieldset className="flex flex-col gap-1">
+              <legend className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">
+                Modes
+              </legend>
+              <div className="flex flex-wrap gap-3">
+                {allModes.map((option) => (
+                  <label key={option} className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      checked={modes.includes(option)}
+                      onCheckedChange={(checked) =>
+                        setModes((current) =>
+                          checked === true
+                            ? [...current, option]
+                            : current.filter((item) => item !== option),
+                        )
+                      }
+                    />
+                    {option}
+                  </label>
+                ))}
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                A live-capable alerts token is not offered: alerts never place orders.
+              </p>
+            </fieldset>
+          </div>
+        )}
+
         <p className="mt-2 text-xs text-muted-foreground">
           Account scope is fixed server-side to <span className="font-mono">{accountScope}</span>.
           A token&apos;s scope <em>is</em> the alerts owner, which is why it cannot be chosen here —
-          and why no execution scope is offered at all.
+          and why the generated token reads exactly the workflows this page shows.
         </p>
         <Button
           className="mt-3"
           size="sm"
-          disabled={!label || create.isPending}
+          disabled={!canCreate}
           onClick={() =>
             create.mutate(
-              { label, preset: preset ?? presets[0]?.id },
+              mode === "preset"
+                ? { label, preset: preset ?? presets[0]?.id }
+                : { label, allowed_actions: actions, allowed_modes: modes },
               {
                 onSuccess: (data) => {
                   // Copy the secret into local state, then clear the mutation
@@ -338,10 +434,13 @@ export function TokensPanel({ scope }: Readonly<{ scope: string | null }>) {
 export function ProducersPanel({ scope }: Readonly<{ scope: string | null }>) {
   const producersQuery = useAlertsProducers(scope);
   const healthQuery = useAlertsSignalsHealth(scope);
-  const { create, revoke, issueCredential } = useAlertsProducerMutations(scope);
+  const { create, revoke, issueCredential, revokeCredential } = useAlertsProducerMutations(scope);
 
   const [name, setName] = useState("");
   const [ttl, setTtl] = useState("");
+  const [schemaText, setSchemaText] = useState("{}");
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
   const [secret, setSecret] = useState<string | null>(null);
 
   const producers = producersQuery.data?.producers ?? [];
@@ -370,13 +469,44 @@ export function ProducersPanel({ scope }: Readonly<{ scope: string | null }>) {
             />
           </div>
         </div>
+        <div className="mt-3 flex flex-col gap-1">
+          <Label htmlFor="producer-schema">Value schema (JSON, optional)</Label>
+          <Textarea
+            id="producer-schema"
+            rows={3}
+            className="font-mono text-xs"
+            value={schemaText}
+            onChange={(event) => setSchemaText(event.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            Declared fields the producer is allowed to submit (typed scalars only — there is no code
+            execution in the ingestion path).
+          </p>
+          {schemaError ? <p className="text-xs text-rose-300">{schemaError}</p> : null}
+        </div>
         <Button
           className="mt-3"
           size="sm"
           disabled={!name || create.isPending}
-          onClick={() =>
-            create.mutate({ name, default_ttl_s: ttl === "" ? null : Number(ttl) })
-          }
+          onClick={() => {
+            let valueSchema: Record<string, unknown> = {};
+            try {
+              const parsed = JSON.parse(schemaText || "{}");
+              if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+                throw new Error("value schema must be a JSON object");
+              }
+              valueSchema = parsed as Record<string, unknown>;
+            } catch (error) {
+              setSchemaError(error instanceof Error ? error.message : "invalid JSON");
+              return;
+            }
+            setSchemaError(null);
+            create.mutate({
+              name,
+              value_schema: valueSchema,
+              default_ttl_s: ttl === "" ? null : Number(ttl),
+            });
+          }}
         >
           <PlusIcon className="size-4" aria-hidden />
           Register
@@ -415,12 +545,23 @@ export function ProducersPanel({ scope }: Readonly<{ scope: string | null }>) {
                 <p className="text-sm font-medium">{producer.name}</p>
                 <p className="text-xs text-muted-foreground">
                   ttl: {producer.default_ttl_s ?? "default"}
+                  {producer.value_schema && Object.keys(producer.value_schema).length > 0
+                    ? ` · schema: ${Object.keys(producer.value_schema).join(", ")}`
+                    : ""}
                   {producer.revoked_at
                     ? ` · revoked ${formatTimestamp(producer.revoked_at) ?? ""}`
                     : ""}
                 </p>
               </div>
               <div className="flex items-center gap-2">
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  aria-expanded={expanded === producer.name}
+                  onClick={() => setExpanded(expanded === producer.name ? null : producer.name)}
+                >
+                  {expanded === producer.name ? "Hide details" : "Details"}
+                </Button>
                 <Button
                   size="xs"
                   variant="outline"
@@ -445,6 +586,18 @@ export function ProducersPanel({ scope }: Readonly<{ scope: string | null }>) {
                   Revoke producer
                 </Button>
               </div>
+              {expanded === producer.name ? (
+                <div className="w-full">
+                  <ProducerDetails
+                    producer={producer.name}
+                    scope={scope}
+                    onRevokeCredential={(tokenId) =>
+                      revokeCredential.mutate({ name: producer.name, tokenId })
+                    }
+                    revoking={revokeCredential.isPending}
+                  />
+                </div>
+              ) : null}
             </li>
           ))}
         </ul>
@@ -464,6 +617,101 @@ export function ProducersPanel({ scope }: Readonly<{ scope: string | null }>) {
         secret={secret}
         onClose={() => setSecret(null)}
       />
+    </div>
+  );
+}
+
+type ProducerDetailsProps = Readonly<{
+  producer: string;
+  scope: string | null;
+  onRevokeCredential: (tokenId: string) => void;
+  revoking: boolean;
+}>;
+
+/**
+ * Credential metadata and recent values for one producer.
+ *
+ * Credentials are NON-SECRET metadata read from the API so an operator can
+ * revoke one later by its token id; the secret itself is shown once at issue
+ * time and is not recoverable. Values are shown with their `status` and
+ * `expires_at` because a retained value may already be unusable by a rule.
+ */
+function ProducerDetails({ producer, scope, onRevokeCredential, revoking }: ProducerDetailsProps) {
+  const credentialsQuery = useAlertsProducerCredentials(producer, scope);
+  const valuesQuery = useAlertsSignalValues(producer, scope, 10);
+
+  const credentials = credentialsQuery.data?.credentials ?? [];
+  const values = valuesQuery.data?.values ?? [];
+
+  return (
+    <div className="mt-3 grid gap-4 border-t border-border/50 pt-3 lg:grid-cols-2">
+      <div className="flex flex-col gap-2">
+        <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">Credentials</p>
+        {credentialsQuery.isLoading ? (
+          <Skeleton className="h-16 w-full rounded-lg" />
+        ) : credentials.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No credentials issued.</p>
+        ) : (
+          <ul className="flex flex-col gap-2">
+            {credentials.map((credential) => (
+              <li
+                key={credential.token_id}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/50 p-2"
+              >
+                <div>
+                  <p className="font-mono text-xs">{credential.token_id}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {credential.status}
+                    {credential.created_at ? ` · issued ${formatTimestamp(credential.created_at)}` : ""}
+                    {credential.last_used_at ? ` · used ${formatTimestamp(credential.last_used_at)}` : ""}
+                  </p>
+                </div>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={revoking || credential.status !== "active"}
+                  onClick={() => onRevokeCredential(credential.token_id)}
+                >
+                  Revoke
+                </Button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="text-xs text-muted-foreground">
+          Metadata only — the secret is shown once at issue time and cannot be retrieved.
+        </p>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">Recent values</p>
+        {valuesQuery.isLoading ? (
+          <Skeleton className="h-16 w-full rounded-lg" />
+        ) : values.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No values received yet.</p>
+        ) : (
+          <ul className="flex flex-col gap-2">
+            {values.map((value) => (
+              <li key={value.value_id} className="rounded-lg border border-border/50 p-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-mono text-xs">{value.instrument_key ?? "—"}</span>
+                  <Badge variant={value.status === "accepted" ? "secondary" : "destructive"}>
+                    {value.status}
+                  </Badge>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {value.event_time ? formatTimestamp(value.event_time) : "no event time"}
+                  {value.expires_at ? ` · expires ${formatTimestamp(value.expires_at)}` : ""}
+                </p>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="text-xs text-muted-foreground">
+          A value can be retained but already expired — &quot;accepted&quot; and &quot;still
+          usable&quot; are different questions.
+        </p>
+      </div>
     </div>
   );
 }
@@ -488,24 +736,80 @@ export function PlatformHealthPanel({ scope }: Readonly<{ scope: string | null }
     );
   }
 
-  const runtime = readRuntimeAvailability(healthQuery.data.runtime);
+  const runtimeView = readRuntimeAvailability(healthQuery.data.runtime);
+  const runtime = healthQuery.data.runtime;
 
   return (
-    <Panel tone="subtle">
-      <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">
-        Evaluation worker
-      </p>
-      {runtime.kind === "unknown" ? (
-        <p className="mt-2 text-sm">
-          <span className="font-medium">Unknown</span> ({runtime.reason}). {runtime.note}
+    <div className="flex flex-col gap-4">
+      <Panel tone="subtle">
+        <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">
+          Evaluation worker
         </p>
-      ) : (
-        <ul className="mt-2 flex flex-wrap gap-4 text-sm">
-          <li>quarantined: {runtime.quarantined}</li>
-          <li>failing subscriptions: {runtime.failedSubscriptions}</li>
-        </ul>
-      )}
-    </Panel>
+        {runtimeView.kind === "unknown" ? (
+          <p className="mt-2 text-sm">
+            <span className="font-medium">Unknown</span> ({runtimeView.reason}). {runtimeView.note}
+          </p>
+        ) : (
+          <ul className="mt-2 flex flex-wrap gap-4 text-sm">
+            <li>quarantined: {runtimeView.quarantined}</li>
+            <li>failing subscriptions: {runtimeView.failedSubscriptions}</li>
+            <li>freshness policy: {runtime.ltp_freshness_enabled ? "on" : "off"}</li>
+            {runtime.last_health_at ? (
+              <li>last health: {formatTimestamp(runtime.last_health_at) ?? "—"}</li>
+            ) : null}
+          </ul>
+        )}
+        {runtime.startup_error ? (
+          <p className="mt-2 text-sm text-rose-300">startup error: {runtime.startup_error}</p>
+        ) : null}
+      </Panel>
+
+      {runtimeView.kind === "available" ? (
+        <>
+          <Panel tone="subtle">
+            <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">
+              Required tasks
+            </p>
+            {Object.keys(runtime.tasks ?? {}).length === 0 ? (
+              <p className="mt-2 text-sm text-muted-foreground">
+                The worker did not report task state. Treat liveness as unknown rather than healthy.
+              </p>
+            ) : (
+              <ul className="mt-2 flex flex-col gap-2">
+                {Object.entries(runtime.tasks ?? {}).map(([name, task]) => (
+                  <li key={name} className="flex flex-wrap items-center gap-3 text-sm">
+                    <span className="font-mono text-xs">{name}</span>
+                    <Badge variant={task.alive ? "secondary" : "destructive"}>
+                      {task.alive ? "alive" : "not alive"}
+                    </Badge>
+                    <span className="text-xs text-muted-foreground">
+                      restarts: {task.restarts}
+                      {task.backoff_s ? ` · backoff ${task.backoff_s}s` : ""}
+                      {task.last_exit_reason ? ` · last exit: ${task.last_exit_reason}` : ""}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Panel>
+
+          <Panel tone="subtle">
+            <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">
+              Freshness counters
+            </p>
+            <ul className="mt-2 flex flex-wrap gap-4 text-sm">
+              <li>stale-tick instruments: {runtime.stale_tick_instruments ?? 0}</li>
+              <li>never-ticked instruments: {runtime.never_ticked_instruments ?? 0}</li>
+              {Object.entries(runtime.rejected_ticks ?? {}).map(([reason, count]) => (
+                <li key={reason}>
+                  rejected · {reason}: {count}
+                </li>
+              ))}
+            </ul>
+          </Panel>
+        </>
+      ) : null}
+    </div>
   );
 }
 

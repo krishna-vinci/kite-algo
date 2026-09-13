@@ -12,6 +12,7 @@ The recurring properties, asserted per surface rather than once:
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -201,6 +202,7 @@ READS = [
     f"{BASE}/screener-runs/r",
     f"{BASE}/signals/producers",
     f"{BASE}/signals/producers/p",
+    f"{BASE}/signals/producers/p/credentials",
     f"{BASE}/signals/values?producer=p",
     f"{BASE}/signals/health",
 ]
@@ -531,6 +533,47 @@ def test_a_foreign_producer_is_404(session_factory, monkeypatch):
         f"{BASE}/signals/values?producer=foreign-producer"
     ).status_code == 404
     assert client.get(f"{BASE}/signals/producers").json()["producers"] == []
+
+
+def test_producer_credentials_are_listed_as_non_secret_metadata(session_factory, monkeypatch):
+    """Management needs a token id to revoke; the secret must never appear."""
+    client = _app(session_factory, monkeypatch)
+    client.post(f"{BASE}/signals/producers", json={"name": "p1"})
+    issued = client.post(f"{BASE}/signals/producers/p1/credentials").json()
+    assert issued["reveal_once"] is True
+
+    body = client.get(f"{BASE}/signals/producers/p1/credentials").json()
+    assert len(body["credentials"]) == 1
+    credential = body["credentials"][0]
+    assert credential["token_id"] == issued["token_id"]
+    assert credential["status"] == "active"
+    assert credential["created_at"] is not None
+    # The one-time secret must not be recoverable from the list.
+    serialized = json.dumps(body)
+    assert issued["secret"] not in serialized
+    assert "secret" not in credential
+
+
+def test_a_foreign_producers_credentials_are_404(session_factory, monkeypatch):
+    from backend.workflows import external_signals as signals
+
+    session = session_factory()
+    try:
+        signals.register_producer(
+            session,
+            owner_id="someone-else",
+            name="foreign-producer",
+            value_schema={},
+            default_ttl_s=600,
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    client = _app(session_factory, monkeypatch)
+    assert client.get(
+        f"{BASE}/signals/producers/foreign-producer/credentials"
+    ).status_code == 404
 
 
 def test_producer_credential_revoke_of_an_unknown_token_is_404(session_factory, monkeypatch):

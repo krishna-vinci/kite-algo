@@ -938,3 +938,35 @@ def test_a_just_activated_workflow_reports_unknown_freshness(session_factory, mo
     assert freshness["subscription_count"] == 1, "subscriptions were materialized"
     assert freshness["last_evaluated_at"] is None
     assert freshness["stale"] is None, "never evaluated must not read as fresh"
+
+
+def test_workflow_health_exposes_durable_suppression_counters(session_factory, monkeypatch):
+    """Suppressions are persisted, so they are visible without the worker file.
+
+    The handoff recorded suppression reasons as runtime-only. The session cap is
+    in fact a DURABLE per-reason counter, and the operator endpoint now exposes
+    it: it must be readable even though no worker health file is mounted here.
+    """
+    from backend.workflows.advanced_repository import record_suppression
+
+    workflow, revision = _seed_workflow(session_factory, OPERATOR_SCOPE, name="suppressed")
+    session = session_factory()
+    try:
+        record_suppression(
+            session,
+            owner_id=OPERATOR_SCOPE,
+            workflow_id=workflow.id,
+            revision_id=revision.id,
+            alert_id="a1",
+            session_id="2026-09-11",
+            reason="session_cap",
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    body = client.get(f"{BASE}/workflows/{workflow.id}/health").json()
+    assert body["suppressions"] == {"session_cap": 1}
+    assert body["runtime"]["available"] is False, "no worker health file in this environment"
+    assert "DURABLE" in body["note"]

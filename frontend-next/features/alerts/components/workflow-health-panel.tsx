@@ -16,7 +16,11 @@ import {
 } from "@/components/ui/table";
 import { useAlertsWorkflowHealth } from "@/features/alerts/hooks/use-alerts-queries";
 import { formatAgeAgo } from "@/features/alerts/lib/format";
-import { describeStaleReason, readRuntimeAvailability } from "@/features/alerts/lib/health";
+import {
+  describeStaleReason,
+  describeSuppression,
+  readRuntimeAvailability,
+} from "@/features/alerts/lib/health";
 
 /**
  * Per-workflow health: durable facts from the database merged with runtime
@@ -88,6 +92,31 @@ export function WorkflowHealthPanel({
             </li>
           </ul>
         )}
+      </Panel>
+
+      <Panel tone="subtle">
+        <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">
+          Suppressions (durable)
+        </p>
+        {Object.keys(health.suppressions ?? {}).length === 0 ? (
+          <p className="mt-2 text-sm text-muted-foreground">
+            No notification has been suppressed for this workflow.
+          </p>
+        ) : (
+          <ul className="mt-2 flex flex-wrap gap-4 text-sm">
+            {Object.entries(health.suppressions ?? {})
+              .sort(([, a], [, b]) => b - a)
+              .map(([reason, count]) => (
+                <li key={reason} title={describeSuppression(reason)}>
+                  {describeSuppression(reason)}: <span className="text-foreground">{count}</span>
+                </li>
+              ))}
+          </ul>
+        )}
+        <p className="mt-2 text-xs text-muted-foreground">
+          These counts are persisted when a notification is skipped, so they are available even when
+          the worker runtime section above reads as unknown.
+        </p>
       </Panel>
 
       <div className="rounded-xl border border-border/70 bg-card/60">

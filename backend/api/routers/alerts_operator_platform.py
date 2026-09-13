@@ -652,6 +652,49 @@ async def get_producer(
         session.close()
 
 
+@router.get("/signals/producers/{name}/credentials")
+async def list_producer_credentials(
+    request: Request,
+    name: str,
+    scope: str = Depends(require_operator_scope),
+    session_factory: Any = Depends(_alerts_db),
+):
+    """Credential metadata for a producer, so one can be revoked later by id.
+
+    NON-SECRET ONLY: the secret is stored as a hash and cannot be retrieved, so
+    this returns the token id and lifecycle fields and nothing a credential
+    could be reconstructed from. Owner-scoped, like every other route here.
+    """
+    _ = request
+    signals = _signals_service()
+    session = session_factory()
+    try:
+        producer = signals.get_producer(session, owner_id=scope, name=name)
+        if producer is None:
+            raise HTTPException(status_code=404, detail="producer not found")
+        credentials = signals.list_credentials(session, producer_id=str(producer.id))
+        return {
+            "ok": True,
+            "producer": name,
+            "credentials": [
+                {
+                    "token_id": credential.token_id,
+                    "status": credential.status,
+                    "created_at": _iso(credential.created_at),
+                    "last_used_at": _iso(credential.last_used_at),
+                    "revoked_at": _iso(credential.revoked_at),
+                }
+                for credential in credentials
+            ],
+            "note": (
+                "metadata only — the secret is shown once, at issue time, and is "
+                "not recoverable"
+            ),
+        }
+    finally:
+        session.close()
+
+
 @router.post("/signals/producers/{name}/revoke")
 async def revoke_producer(
     request: Request,

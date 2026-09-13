@@ -293,11 +293,27 @@ export type AlertsSubscriptionHealth = {
   last_failure_at: string | null;
 };
 
+export type AlertsTaskHealth = {
+  alive: boolean;
+  restarts: number;
+  backoff_s: number | null;
+  last_started_at?: string | null;
+  last_exit_reason?: string | null;
+};
+
 export type AlertsRuntimeHealth = {
   available: boolean;
   reason?: string;
   quarantined?: Record<string, string>;
   subscription_failures?: Record<string, { failures: number; last_error?: string; last_failure_at?: string }>;
+  tasks?: Record<string, AlertsTaskHealth>;
+  /** Rejection counters keyed by reason (`stale_tick`, `future_tick`, ...). */
+  rejected_ticks?: Record<string, number>;
+  stale_tick_instruments?: number;
+  never_ticked_instruments?: number;
+  ltp_freshness_enabled?: boolean;
+  startup_error?: string | null;
+  last_health_at?: string | null;
   [key: string]: unknown;
 };
 
@@ -312,6 +328,28 @@ export type AlertsWorkflowHealthResponse = {
   };
   subscriptions: AlertsSubscriptionHealth[];
   runtime: AlertsRuntimeHealth;
+  /**
+   * DURABLE per-reason suppression counts (e.g. `session_cap`), persisted when
+   * the notification was skipped. Unlike `runtime`, these need no worker health
+   * file — they come from the database.
+   */
+  suppressions?: Record<string, number>;
+  note: string;
+};
+
+/** Non-secret producer credential metadata, for later revocation by token id. */
+export type AlertsProducerCredentialMetadata = {
+  token_id: string;
+  status: string;
+  created_at: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+};
+
+export type AlertsProducerCredentialsResponse = {
+  ok: boolean;
+  producer: string;
+  credentials: AlertsProducerCredentialMetadata[];
   note: string;
 };
 

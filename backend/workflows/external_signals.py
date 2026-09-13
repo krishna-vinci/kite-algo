@@ -66,6 +66,7 @@ __all__ = [
     "list_producers",
     "revoke_producer",
     "issue_credential",
+    "list_credentials",
     "revoke_credential",
     "resolve_producer_credential",
     "ingest_value",
@@ -396,6 +397,26 @@ def issue_credential(
     session.add(credential)
     session.flush()
     return credential, secret
+
+
+def list_credentials(
+    session: Session, *, producer_id: str
+) -> List[ExternalSignalProducerCredential]:
+    """Non-secret credential metadata for later management.
+
+    Returns only the token id and lifecycle fields needed to revoke a credential.
+    The secret is stored as a hash and is never recoverable, so it is not (and
+    cannot be) part of this payload.
+    """
+    return list(
+        session.execute(
+            select(ExternalSignalProducerCredential)
+            .where(ExternalSignalProducerCredential.producer_id == producer_id)
+            .order_by(ExternalSignalProducerCredential.created_at.desc())
+        )
+        .scalars()
+        .all()
+    )
 
 
 def revoke_credential(

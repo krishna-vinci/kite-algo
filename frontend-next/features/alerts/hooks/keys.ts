@@ -62,6 +62,9 @@ export const alertsKeys = {
 
   producers: (scope: string | null) => [...alertsKeys.all, "producers", scope] as const,
 
+  producerCredentials: (producer: string, scope: string | null) =>
+    [...alertsKeys.all, "producer-credentials", producer, scope] as const,
+
   signalValues: (producer: string, scope: string | null) =>
     [...alertsKeys.all, "signal-values", producer, scope] as const,
 

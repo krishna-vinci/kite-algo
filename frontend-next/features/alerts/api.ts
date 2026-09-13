@@ -25,6 +25,7 @@ import type {
   AlertsPlatformHealthResponse,
   AlertsPreviewResponse,
   AlertsProducerCredentialResponse,
+  AlertsProducerCredentialsResponse,
   AlertsProducersResponse,
   AlertsScopesResponse,
   AlertsScreenerAttachmentsResponse,
@@ -331,7 +332,12 @@ export async function fetchAlertsTokens(scope?: string | null): Promise<AlertsTo
 }
 
 export async function createAlertsToken(
-  payload: { label: string; preset?: string; allowed_actions?: string[]; allowed_modes?: string[] },
+  payload: {
+    label: string;
+    preset?: string;
+    allowed_actions?: string[];
+    allowed_modes?: string[];
+  },
   scope?: string | null,
 ): Promise<AlertsTokenCreateResponse> {
   return apiFetch<AlertsTokenCreateResponse>(`${BASE}/tokens${scopeQuery(scope)}`, {
@@ -502,6 +508,16 @@ export async function issueAlertsProducerCredential(
   return apiFetch<AlertsProducerCredentialResponse>(
     `${BASE}/signals/producers/${encodeURIComponent(name)}/credentials${scopeQuery(scope)}`,
     { method: "POST" },
+  );
+}
+
+/** Non-secret credential metadata; the one-time secret is never included. */
+export async function fetchAlertsProducerCredentials(
+  name: string,
+  scope?: string | null,
+): Promise<AlertsProducerCredentialsResponse> {
+  return apiFetch<AlertsProducerCredentialsResponse>(
+    `${BASE}/signals/producers/${encodeURIComponent(name)}/credentials${scopeQuery(scope)}`,
   );
 }
 

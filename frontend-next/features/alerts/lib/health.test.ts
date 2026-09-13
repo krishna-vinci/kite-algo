@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { describeStaleReason, deliveryStatusLabel, readRuntimeAvailability } from "./health";
+import {
+  describeStaleReason,
+  describeSuppression,
+  deliveryStatusLabel,
+  readRuntimeAvailability,
+} from "./health";
 import type { AlertsRuntimeHealth } from "@/features/alerts/types";
 
 describe("describeStaleReason", () => {
@@ -53,7 +58,7 @@ describe("readRuntimeAvailability", () => {
       available: true,
       quarantined: { sub1: "2026-09-11T12:00:00Z" },
       subscription_failures: { sub1: { failures: 3 }, sub2: { failures: 1 } },
-      tasks: { evaluation: { alive: true } },
+      tasks: { evaluation: { alive: true, restarts: 0, backoff_s: null } },
     };
     const view = readRuntimeAvailability(runtime);
     expect(view.kind).toBe("available");
@@ -61,6 +66,16 @@ describe("readRuntimeAvailability", () => {
       expect(view.quarantined).toBe(1);
       expect(view.failedSubscriptions).toBe(2);
     }
+  });
+});
+
+describe("describeSuppression", () => {
+  it("explains the session cap without leaking an internal code", () => {
+    expect(describeSuppression("session_cap")).toMatch(/session/i);
+  });
+
+  it("passes an unknown reason through rather than inventing copy", () => {
+    expect(describeSuppression("mystery_reason")).toBe("mystery_reason");
   });
 });
 

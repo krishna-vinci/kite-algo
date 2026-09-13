@@ -82,6 +82,32 @@ export function readRuntimeAvailability(runtime: AlertsRuntimeHealth | undefined
   };
 }
 
+/**
+ * Durable suppression reasons, in plain language.
+ *
+ * These counts are PERSISTED (in the same transaction that skipped the event),
+ * so they are available without the worker health file — unlike the runtime
+ * counters, which are in-memory and reported as unknown when unreachable.
+ */
+const SUPPRESSION_REASONS: Record<string, string> = {
+  session_cap: "per-session notification cap reached",
+  cooldown: "within the cooldown window after a previous notification",
+  already_fired: "already fired (once / once-per-session)",
+  storm_budget: "delivery budget or admission warming",
+  feed_gap: "a feed gap was detected",
+  stale_bar: "a stale candle was dropped",
+  warmup: "insufficient warmup history",
+  duplicate_occurrence: "duplicate occurrence already recorded",
+  not_owner: "another worker holds the evaluation lease",
+  lease_lost: "the evaluation lease was lost",
+  ltp_gap: "an LTP silence gap invalidated continuity",
+  candle_correction: "a corrected candle was handled",
+};
+
+export function describeSuppression(reason: string): string {
+  return SUPPRESSION_REASONS[reason] ?? reason;
+}
+
 /** Delivery status copy. Provider acceptance is NOT human receipt. */
 export function deliveryStatusLabel(status: string): { label: string; tone: "positive" | "warning" | "danger" | "neutral" } {
   switch (status) {
