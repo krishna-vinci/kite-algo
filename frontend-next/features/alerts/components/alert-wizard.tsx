@@ -81,6 +81,13 @@ export type AlertWizardProps = Readonly<{
   /** Pre-populated draft for the edit path. */
   initialDraft?: AlertDraft;
   /**
+   * The loaded document on the edit path. The form merges the fields it models
+   * onto a clone of this, so keys the editor does not model (`expires_at`,
+   * `message`, `session_cap_reset`, indicator `source`/`offset`, ...) survive a
+   * save untouched and a no-op save cannot move the canonical hash.
+   */
+  baseDocument?: Record<string, unknown> | null;
+  /**
    * Present when editing an existing workflow: saving PATCHes a new draft
    * revision under `expected_revision` instead of creating a workflow, so the
    * optimistic-concurrency check is always engaged.
@@ -88,7 +95,7 @@ export type AlertWizardProps = Readonly<{
   edit?: { workflowId: string; expectedRevision: number };
 }>;
 
-export function AlertWizard({ scope, initialDraft, edit }: AlertWizardProps) {
+export function AlertWizard({ scope, initialDraft, baseDocument, edit }: AlertWizardProps) {
   const router = useRouter();
   const [step, setStep] = useState(0);
   const [draft, setDraft] = useState<AlertDraft>(() => initialDraft ?? emptyDraft());
@@ -107,7 +114,10 @@ export function AlertWizard({ scope, initialDraft, edit }: AlertWizardProps) {
   const capabilities = capabilitiesQuery.data?.capabilities;
   const channels = channelsQuery.data?.channels ?? [];
 
-  const document = useMemo(() => (capabilities ? buildDocument(draft) : null), [draft, capabilities]);
+  const document = useMemo(
+    () => (capabilities ? buildDocument(draft, baseDocument) : null),
+    [draft, baseDocument, capabilities],
+  );
 
   const acceptedExchanges = useMemo(() => {
     if (!capabilities || !draft.session) return null;
@@ -467,6 +477,57 @@ export function AlertWizard({ scope, initialDraft, edit }: AlertWizardProps) {
                   }
                 />
                 <p className="text-xs text-muted-foreground">{capabilities.session_cap_note}</p>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="rearm-level">Rearm level (optional)</Label>
+                <Input
+                  id="rearm-level"
+                  type="number"
+                  step="any"
+                  value={draft.alert.rearm_level ?? ""}
+                  onChange={(event) =>
+                    setDraft({
+                      ...draft,
+                      alert: {
+                        ...draft.alert,
+                        rearm_level: event.target.value === "" ? null : Number(event.target.value),
+                      },
+                    })
+                  }
+                />
+                <p className="text-xs text-muted-foreground">
+                  After firing, the rule re-arms only once the value moves back past this level.
+                </p>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="rearm-direction">Rearm direction (optional)</Label>
+                <Select
+                  value={draft.alert.rearm_direction ?? "unset"}
+                  onValueChange={(direction) =>
+                    setDraft({
+                      ...draft,
+                      alert: {
+                        ...draft.alert,
+                        rearm_direction: direction === "unset" ? null : direction,
+                      },
+                    })
+                  }
+                >
+                  <SelectTrigger id="rearm-direction">
+                    <SelectValue placeholder="Not set" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="unset">Not set</SelectItem>
+                    <SelectItem value="above">above</SelectItem>
+                    <SelectItem value="below">below</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  The server requires the level and direction together; a value on its own is
+                  rejected on validate.
+                </p>
               </div>
             </div>
 

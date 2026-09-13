@@ -1,12 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { AlertCircleIcon, FileWarningIcon } from "lucide-react";
+import { useSearchParams } from "next/navigation";
+import { AlertCircleIcon } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { SectionLabel } from "@/components/operator/section-label";
+import { AdvancedDefinitionEditor } from "@/features/alerts/components/advanced-definition-editor";
 import { AlertWizard } from "@/features/alerts/components/alert-wizard";
 import { useAlertsWorkflow } from "@/features/alerts/hooks/use-alerts-queries";
 import { documentToDraft } from "@/features/alerts/lib/authoring";
@@ -14,17 +14,22 @@ import { documentToDraft } from "@/features/alerts/lib/authoring";
 /**
  * Edit path.
  *
- * If the stored definition uses anything the structured editor does not model,
- * this page REFUSES to open a form and points at the read-only view instead.
- * Opening a form that silently omitted a `sequence` would look like a
- * successful save while destroying the field — so the honest failure is the
- * correct behaviour here.
+ * Two lossless routes, never a lossy one:
+ *   - If the stored definition is fully representable, the structured form is
+ *     opened, and it merges the modeled fields onto the LOADED document, so
+ *     keys it does not model survive a save.
+ *   - If it is not representable, the advanced YAML/JSON editor is opened
+ *     instead of a form that would silently drop a `sequence`, a pair operand
+ *     or an unmodeled key. Opening a lossy form would look like a successful
+ *     save while destroying data.
  */
 export function AlertsEditPage({
   workflowId,
   scope,
 }: Readonly<{ workflowId: string; scope: string | null }>) {
   const workflowQuery = useAlertsWorkflow(workflowId, scope);
+  const searchParams = useSearchParams();
+  const forceAdvanced = searchParams?.get("advanced") === "1";
 
   if (workflowQuery.isLoading) return <Skeleton className="h-96 w-full rounded-xl" />;
 
@@ -44,38 +49,37 @@ export function AlertsEditPage({
 
   const workflow = workflowQuery.data;
   const conversion = documentToDraft(workflow.document);
-
-  if (!conversion.ok) {
-    return (
-      <div className="flex flex-col gap-4 pb-8">
-        <SectionLabel eyebrow="Alerts" title={`Edit ${workflow.name}`} />
-        <Alert>
-          <FileWarningIcon />
-          <AlertTitle>This definition is not editable in the structured form</AlertTitle>
-          <AlertDescription>
-            <p>{conversion.reason}</p>
-            <p className="mt-2">
-              Nothing has been changed. Open the definition in the read-only view, where the full
-              canonical document and the YAML are both shown — editing there will not drop any
-              field.
-            </p>
-            <Button asChild variant="outline" size="sm" className="mt-3">
-              <Link href={`/alerts/${workflowId}`}>Open the read-only definition</Link>
-            </Button>
-          </AlertDescription>
-        </Alert>
-      </div>
-    );
-  }
-
   const expectedRevision =
     workflow.latest_revision?.revision ?? workflow.active_revision?.revision ?? 1;
 
+  if (!conversion.ok || forceAdvanced) {
+    return (
+      <AdvancedDefinitionEditor
+        workflowId={workflowId}
+        scope={scope}
+        name={workflow.name}
+        expectedRevision={expectedRevision}
+        initialYaml={workflow.yaml ?? null}
+        initialDocument={workflow.document}
+        reason={conversion.ok ? undefined : conversion.reason}
+      />
+    );
+  }
+
   return (
-    <AlertWizard
-      scope={scope}
-      initialDraft={conversion.draft}
-      edit={{ workflowId, expectedRevision }}
-    />
+    <div className="flex flex-col gap-3">
+      <p className="text-xs text-muted-foreground">
+        Editing in the structured form. It keeps every field the form does not model.{" "}
+        <Link href={`/alerts/${workflowId}/edit?advanced=1`} className="underline">
+          Edit as YAML/JSON instead
+        </Link>
+      </p>
+      <AlertWizard
+        scope={scope}
+        initialDraft={conversion.draft}
+        baseDocument={workflow.document}
+        edit={{ workflowId, expectedRevision }}
+      />
+    </div>
   );
 }

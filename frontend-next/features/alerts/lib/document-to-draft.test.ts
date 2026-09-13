@@ -124,3 +124,110 @@ describe("documentToDraft", () => {
     expect(documentToDraft(null).ok).toBe(false);
   });
 });
+
+/**
+ * The backend STORES the canonical `to_document_dict()` form — conditions as a
+ * list, verbose operands with `params`, instruments as `{symbol, exchange}`.
+ * The editor must open that, not only the form-shaped shorthand its own tests
+ * happen to produce.
+ */
+const CANONICAL: Record<string, unknown> = {
+  version: 1,
+  name: "canonical-alert",
+  session: "nse_equity",
+  instruments: [{ symbol: "S0001", exchange: "NSE" }],
+  stages: [
+    {
+      id: "px",
+      type: "signal",
+      clock: "candle_close",
+      timeframe: "15minute",
+      input: null,
+      conditions: [
+        {
+          left: { kind: "field", name: "close", value: null, params: {}, source: null, offset: null },
+          op: "crosses_above",
+          right: { kind: "value", name: null, value: 3000, params: {}, source: null, offset: null },
+        },
+      ],
+      any_conditions: [],
+      not_conditions: [],
+      function: null,
+      stage_params: {},
+      source_field: null,
+    },
+  ],
+  alerts: [
+    {
+      id: "a1",
+      source: "px",
+      trigger: "on_transition",
+      reminder_interval_s: null,
+      cooldown_s: 300,
+      rearm_level: 2900,
+      rearm_direction: "below",
+      notify_if_already_true: false,
+      expires_at: "2026-12-31T00:00:00Z",
+      channels: ["ops"],
+      message: "custom message",
+      max_per_session: 5,
+      session_cap_reset: "session",
+    },
+  ],
+  data_policy: { missing: "exclude_and_report", insufficient_history: "wait", require_closed_candles: true },
+};
+
+describe("documentToDraft — canonical stored form", () => {
+  it("opens a canonical document rather than refusing the list-form conditions", () => {
+    const result = documentToDraft(CANONICAL);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.draft.instruments).toEqual(["NSE:S0001"]);
+    expect(result.draft.conditions[0]).toEqual({
+      left: { kind: "field", name: "close" },
+      op: "crosses_above",
+      right: { kind: "constant", value: 3000 },
+    });
+  });
+
+  it("reads rearm level and direction instead of refusing them", () => {
+    const result = documentToDraft(CANONICAL);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.draft.alert.rearm_level).toBe(2900);
+    expect(result.draft.alert.rearm_direction).toBe("below");
+  });
+
+  it("keeps every field the editor does not model when saving (no-op is lossless)", () => {
+    const conversion = documentToDraft(CANONICAL);
+    expect(conversion.ok).toBe(true);
+    if (!conversion.ok) return;
+    const rebuilt = buildDocument(conversion.draft, CANONICAL);
+
+    const alert = (rebuilt.alerts as Array<Record<string, unknown>>)[0];
+    expect(alert.expires_at).toBe("2026-12-31T00:00:00Z");
+    expect(alert.message).toBe("custom message");
+    expect(alert.session_cap_reset).toBe("session");
+    expect(alert.rearm_level).toBe(2900);
+    expect(alert.rearm_direction).toBe("below");
+    expect(alert.max_per_session).toBe(5);
+
+    const stage = (rebuilt.stages as Array<Record<string, unknown>>)[0];
+    expect(stage).toHaveProperty("input", null);
+    expect(stage).toHaveProperty("any_conditions");
+    expect(stage).toHaveProperty("stage_params");
+    expect(stage).toHaveProperty("function", null);
+    expect(rebuilt.data_policy).toEqual(CANONICAL.data_policy);
+    expect(rebuilt.instruments).toEqual(["NSE:S0001"]);
+  });
+
+  it("removes an optional alert key when the editor clears it", () => {
+    const conversion = documentToDraft(CANONICAL);
+    expect(conversion.ok).toBe(true);
+    if (!conversion.ok) return;
+    const draft = { ...conversion.draft, alert: { ...conversion.draft.alert, cooldown_s: null } };
+    const rebuilt = buildDocument(draft, CANONICAL);
+    const alert = (rebuilt.alerts as Array<Record<string, unknown>>)[0];
+    expect(alert).not.toHaveProperty("cooldown_s");
+  });
+});
