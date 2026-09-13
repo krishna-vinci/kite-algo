@@ -62,6 +62,7 @@ scripts/*
 !scripts/check_mcp_http_docker.py
 !scripts/mcp_codex_headers.py
 !scripts/smoke_alerts.sh
+!scripts/alerts_capacity_benchmark.py
 
 # Agent Skills
 .agents/
