@@ -32,6 +32,7 @@ from backend.broker_api.session.kite_auth import API_KEY, login_headless
 from backend.broker_api.session.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
 from backend.broker_api.orders.market_runtime_client import MarketDataRuntime, market_runtime_enabled
 from backend.broker_api.options.options_greeks import prewarm_options_engine
+from backend.shared.runtime_stats import run_stats_sampler
 from backend.app.database import SessionLocal, database as async_db, get_db_connection
 from backend.journaling.runtime import JournalRuntimeWorker
 from backend.journaling.service import JournalService
@@ -488,11 +489,28 @@ async def combined_lifespan(app: FastAPI):
 
     set_component_status("app", startup_status, detail=startup_detail)
 
+    stats_sampler_task = asyncio.create_task(
+        run_stats_sampler(
+            logging.getLogger("backend.app.bootstrap"),
+            interval_s=float(os.environ.get("APP_STATS_INTERVAL_S", "60")),
+            component="finance-app",
+        )
+    )
+
     yield
     
     # Cleanup on shutdown
     # Cancel token watcher first
     set_component_status("app", "stopping", detail="Application shutdown in progress")
+    try:
+        if 'stats_sampler_task' in locals() and stats_sampler_task:
+            stats_sampler_task.cancel()
+            try:
+                await stats_sampler_task
+            except (asyncio.CancelledError, Exception):
+                pass
+    except Exception:
+        pass
     try:
         if 'token_watcher_task' in locals() and token_watcher_task:
             token_watcher_task.cancel()

@@ -51,6 +51,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from backend.database_url import resolve_database_url as _resolve_database_url
 
+from backend.shared.runtime_stats import LagRecorder, run_stats_sampler
+
 logger = logging.getLogger("backend.workflows.worker_entry")
 
 
@@ -802,6 +804,11 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         ltp_max_tick_age_s = 0.0
         ltp_max_future_skew_s = 0.0
 
+    tick_lag = LagRecorder()
+
+    def _stats_extras() -> Dict[str, Any]:
+        return {"tick_lag": tick_lag.snapshot()}
+
     def tick_source_factory(instrument_key: str) -> RedisTickSource:
         token = bindings.get(instrument_key)
         mapping = {token: instrument_key} if token is not None else {}
@@ -812,6 +819,7 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
             mapping,
             max_tick_age_s=ltp_max_tick_age_s or None,
             max_future_skew_s=ltp_max_future_skew_s or None,
+            lag_recorder=tick_lag,
         )
 
     def candle_source_factory(instrument_key: str, timeframe: str) -> RedisCandleSource:
@@ -969,6 +977,16 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         except (NotImplementedError, RuntimeError):
             pass  # non-main loop / platform without signal handlers
 
+    stats_task = asyncio.create_task(
+        run_stats_sampler(
+            logger,
+            interval_s=float(os.environ.get("ALERTS_STATS_INTERVAL_S", "60")),
+            stop=stop_signal,
+            extras=_stats_extras,
+            component="alerts-worker",
+        ),
+        name="runtime-stats-sampler",
+    )
     results = await supervise(
         worker,
         delivery_worker,
@@ -982,6 +1000,11 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
             runtime_owner_id
         ),
     )
+    stats_task.cancel()
+    try:
+        await stats_task
+    except asyncio.CancelledError:
+        pass
     await _sync_market_runtime_subscriptions_runtime_cleanup(runtime_owner_id)
     engine.dispose()
     # Phase 6 6A.0: a task that ended in failure must NOT look like a clean

@@ -121,6 +121,8 @@ __all__ = [
     "MARKET_RUNTIME_OWNER_LEASE_TTL_S",
 ]
 
+from backend.shared.runtime_stats import LagRecorder
+
 logger = logging.getLogger(__name__)
 
 MARKET_TICKS_CHANNEL = "market:ticks"
@@ -243,6 +245,7 @@ class RedisTickSource:
         max_tick_age_s: Optional[float] = None,
         max_future_skew_s: Optional[float] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        lag_recorder: Optional[LagRecorder] = None,
     ) -> None:
         if redis_client is None:
             redis_client = _default_redis_client()
@@ -263,6 +266,9 @@ class RedisTickSource:
             else None
         )
         self._clock = clock or _utcnow
+        # Optional instrumentation: accepted observations record how stale the
+        # runtime's ``received_at`` stamp was at processing time.
+        self._lag_recorder = lag_recorder
         # Rejected-tick counters, aggregated into worker health. They live on
         # the source because only the source sees a tick that never became an
         # observation.
@@ -352,6 +358,10 @@ class RedisTickSource:
             if reason is not None:
                 self.rejected[reason] += 1
                 continue
+            if self._lag_recorder is not None and received_at is not None:
+                self._lag_recorder.record(
+                    (self._clock() - received_at).total_seconds()
+                )
             return Observation(
                 ts=ts,
                 epoch_id=self._epoch_id,
