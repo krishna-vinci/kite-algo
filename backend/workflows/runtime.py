@@ -753,6 +753,8 @@ class EvaluationWorker:
         fundamentals_stale_hours: float = 168.0,
         external_loader=None,
         pair_max_bar_age_s: float = 0.0,
+        ltp_freshness_enabled: bool = True,
+        ltp_max_gap_s: float = 300.0,
     ) -> None:
         self.workflow_repo = workflow_repo
         self.session_factory = session_factory
@@ -776,6 +778,11 @@ class EvaluationWorker:
         # readers, renewal, and health all read snapshots from the registry —
         # never a private copy that drifts out of sync.
         self.bindings = binding_registry or InstrumentBindingRegistry(instrument_tokens)
+        # LTP freshness knobs (4d91792): enforcement lives in the tick source;
+        # these drive the worker health view and were previously passed by
+        # worker_entry but never accepted here.
+        self.ltp_freshness_enabled = bool(ltp_freshness_enabled)
+        self.ltp_max_gap_s = max(1.0, float(ltp_max_gap_s))
         self.instrument_resolver = instrument_resolver
         self._bindings_changed = bindings_changed
         # Phase 2 closure: production fundamentals context (latest stored
@@ -1808,8 +1815,8 @@ class EvaluationWorker:
         map is bounded so a large universe cannot make the health file grow
         without limit.
         """
-        enabled = getattr(self.service, "ltp_freshness_enabled", True)
-        bound_s = float(getattr(self.service, "ltp_max_gap_s", 300.0))
+        enabled = bool(getattr(self, "ltp_freshness_enabled", getattr(self.service, "ltp_freshness_enabled", True)))
+        bound_s = float(getattr(self, "ltp_max_gap_s", getattr(self.service, "ltp_max_gap_s", 300.0)))
         now = _utcnow()
         ages: Dict[str, float] = {}
         for instrument_key in sorted(self._ltp_subs):
