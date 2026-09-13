@@ -104,9 +104,19 @@ services:
       REDIS_URL: redis://redis:6379/0
       MARKET_RUNTIME_ENABLED: "true"
       MARKET_RUNTIME_HTTP_URL: http://market-runtime:8780
+      # Read the evaluation worker's published health from the shared volume
+      # below. The two run in DIFFERENT containers, so without this mount the
+      # operator API would report the entire runtime section as unknown no
+      # matter how healthy the worker is.
+      ALERTS_WORKER_HEALTH_FILE: /health/alerts-health.json
       PYTHONUNBUFFERED: "1"
     ports:
       - "18777:8777"
+    volumes:
+      # Shared with alerts-worker (compose.worker.yml): the worker writes its
+      # health file here, this API container reads it. Directory-level mount,
+      # never /app, so the worker's code tree is not shadowed.
+      - alerts_health:/health
     command:
       - sh
       - -c
@@ -200,3 +210,6 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  #: Shared between finance-app (reads) and alerts-worker (writes) for the
+  #: alerts worker health file. See the ALERTS_WORKER_HEALTH_FILE comment above.
+  alerts_health:

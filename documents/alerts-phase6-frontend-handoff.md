@@ -6,6 +6,14 @@
 what is written here, the route is wrong and the backend should be fixed — do not code
 around it.
 
+> **Closure note (2026-09-13).** The frontend is now implemented in
+> `frontend-next/features/alerts/` (list/detail/edit/operations/universes/screeners/canvas).
+> Several "gap" rows in §16 have since changed and are marked below; the authoritative
+> per-requirement status is the parity document §8. Corrections applied here:
+> producer-credential metadata listing and durable suppression counters now exist as
+> routes, and the compose configuration now mounts the worker health file into the API
+> container so the runtime section is not permanently unknown.
+
 ## How to read this document
 
 Every claim carries a marker:
@@ -1115,14 +1123,14 @@ build UI against them.
 | Gap | Detail | Impact |
 | --- | --- | --- |
 | **Live warmup progress** | No endpoint. `warmup_bars` exists only in preview responses (count of completed bars in the supplied samples). | The detail page cannot show "warming up 40%". Show "waiting for first evaluation" (`no_accepted_tick`) instead. |
-| **Per-occurrence suppression records** | Suppression reasons are logged at INFO, not persisted. Only aggregate counters exist, and only when the health file is readable. | No suppression history list. Show counters and the per-subscription `stale_reason` instead. |
-| **Runtime health without a mounted health file** | Quarantine, failure counts and task liveness live in the worker process in a different container. | `runtime.available: false`. Requires a mount to populate. Design for both states. |
+| **Per-occurrence suppression records** | Suppression reasons are logged at INFO, not persisted as individual occurrences. **Closure correction:** the DURABLE per-reason counters (Phase 4 `alert_suppression_counters`, e.g. `session_cap`) were never runtime-only; `GET /workflows/{id}/health` now returns them as `suppressions`, readable without the worker health file. | No per-occurrence history list, but the durable counter total per reason is shown. |
+| **Runtime health without a mounted health file** | Quarantine, failure counts and task liveness live in the worker process in a different container. | `runtime.available: false`. **Closure:** `compose.yml`/`compose.worker.yml` now share a named `alerts_health` volume and set `ALERTS_WORKER_HEALTH_FILE`/`ALERTS_HEALTH_FILE`, so the deployed stack populates this. Both states are still handled. |
 | **Deliveries total count** | `GET /{id}/deliveries` has no `total`, unlike `events` and `values`. | "Showing 50" rather than "50 of 312". |
 | **Layout concurrency** | No optimistic concurrency on layout. | Last-write-wins per node. Acceptable for cosmetic state; do not present layout as shared truth. |
 | **Per-node layout update** | `PUT` takes a list; there is no single-node endpoint. | Send the nodes you moved; the write merges. |
 | **Screener preview needs candle history** | It runs the real pipeline over stored candles. | In a dev stack with no candle data it may return little. Not a UI bug. |
 | **Screener authoring validation depth** | The compiler validates structure; whether a *schedule* is calendar-backed is reported via `capabilities.screener.schedule_calendars`. | Check capabilities before offering a schedule. |
-| **Producer credential list** | There is no endpoint listing a producer's issued credentials. | You cannot render "3 active credentials" for a producer. Revoke by token id from the issue response only. |
+| **Producer credential list** | **Closure: added.** `GET /api/alerts/signals/producers/{name}/credentials` returns NON-SECRET metadata (token_id, status, created_at, last_used_at, revoked_at). The secret is still one-time-reveal and never listed. | Render the credential list and revoke by token id at any time. |
 | **No platform-wide freshness aggregate** | Each workflow row carries a `freshness` block (see below); there is no single "N alerts stale" endpoint across all workflows. | An operations overview summing staleness does one `GET /workflows` (which returns every row's `freshness`), not one call per workflow. |
 | **`channel_name` is a LEFT JOIN** | `deliveries.channel_id` is `NOT NULL` with a foreign key, so the name resolves in practice; it is read defensively. | Render a null `channel_name` as "unknown channel" rather than crashing, but do not build a "removed channel" state around it — it is not a routine case. |
 
@@ -1142,8 +1150,11 @@ build UI against them.
 
 ## 18. Provenance
 
-Backend work in this assignment is complete and committed. Frontend work has not
-started: **there are currently zero alerts references in `frontend-next/`.**
+Backend work in this assignment is complete and committed. **Closure correction
+(2026-09-13):** frontend work is no longer absent — the alerts operator UI is
+implemented under `frontend-next/features/alerts/` with routes under
+`frontend-next/app/(app)/alerts/`. The sentence that follows was true when this
+handoff was written and is retained only with that revision context.
 
 Test commands used for the claims above:
 

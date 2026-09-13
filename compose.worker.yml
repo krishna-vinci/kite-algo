@@ -29,9 +29,14 @@ services:
       MARKET_RUNTIME_URL: http://market-runtime:8780
       MARKET_RUNTIME_HTTP_URL: http://market-runtime:8780
       ALERTS_INSTRUMENT_TOKENS: ${ALERTS_INSTRUMENT_TOKENS:-{}}
-      ALERTS_HEALTH_FILE: /app/alerts-health.json
+      # Written to a shared volume so the API container (finance-app) can read
+      # it; the default would be a path private to this container, leaving the
+      # operator runtime panel permanently unknown.
+      ALERTS_HEALTH_FILE: /health/alerts-health.json
       ALERTS_HEALTH_INTERVAL_S: ${ALERTS_HEALTH_INTERVAL_S:-30}
       PYTHONUNBUFFERED: "1"
+    volumes:
+      - alerts_health:/health
     command:
       - python
       - -m
