@@ -185,6 +185,7 @@ MUTATIONS = [
     ("POST", f"{BASE}/universes/preview", {"kind": "explicit", "source_config": {}}),
     ("POST", f"{BASE}/universes/u/resolve", None),
     ("POST", f"{BASE}/screeners/w/runs", None),
+    ("POST", f"{BASE}/screeners/w/warm-candles", None),
     ("POST", f"{BASE}/screeners/preview", {"document": PLAIN_DOCUMENT}),
     ("POST", f"{BASE}/signals/producers", {"name": "p"}),
     ("POST", f"{BASE}/signals/producers/p/revoke", None),
@@ -197,6 +198,7 @@ READS = [
     f"{BASE}/universes/u",
     f"{BASE}/universes/u/revisions",
     f"{BASE}/screeners/w/runs",
+    f"{BASE}/screeners/w/data-status",
     f"{BASE}/screeners/w/events",
     f"{BASE}/screeners/w/attachments",
     f"{BASE}/screener-runs/r",
@@ -619,3 +621,156 @@ def test_signals_health_explains_sampling_and_no_fallback(session_factory, monke
     assert body["limits"]["max_lateness_s"] > 0
     assert "SAMPLED" in body["note"]
     assert "UNKNOWN rather than false" in body["note"]
+
+
+# ---------------------------------------------------------------------------
+# candle warming: visibility and the bounded operator control
+# ---------------------------------------------------------------------------
+
+
+class _FakeWarmer:
+    """Bounded warmer stand-in: records what it was asked to warm."""
+
+    required_bars = 30
+
+    def __init__(self, rows=None):
+        self.rows = rows or []
+        self.warmed_calls = []
+
+    def data_status(self, members, *, session, as_of=None):
+        self.status_calls = (sorted(members), session)
+        return [
+            {
+                "instrument_key": key,
+                "bars": 0,
+                "required_bars": self.required_bars,
+                "sufficient": False,
+                "last_candle_ts": None,
+                "warming": True,
+            }
+            for key in sorted(members)
+        ]
+
+    def ensure_members(self, members, *, session, as_of=None):
+        self.warmed_calls.append((sorted(members), session))
+        payload = {
+            "status": "complete",
+            "warmed": len(members),
+            "fresh": 0,
+            "unavailable": 0,
+            "skipped": 0,
+            "expired": 0,
+            "requested": len(members),
+            "required_bars": self.required_bars,
+            "catalog_generation": "generation-1",
+            "budget_exhausted": False,
+            "duration_s": 0.01,
+            "members": [{"instrument_key": key, "status": "warmed"} for key in sorted(members)],
+        }
+        return SimpleNamespace(to_coverage=lambda: payload)
+
+
+def _install_fake_warmer(monkeypatch, warmer):
+    import backend.screeners.candle_warming as warming
+
+    monkeypatch.setattr(warming, "build_screener_warmer", lambda *a, **k: warmer)
+    return warmer
+
+
+def test_screener_data_status_reports_which_members_need_candles(session_factory, monkeypatch):
+    workflow, _revision = _seed_workflow(session_factory, SCREENER_DOCUMENT)
+    client = _app(session_factory, monkeypatch)
+    warmer = _install_fake_warmer(monkeypatch, _FakeWarmer())
+
+    response = client.get(f"{BASE}/screeners/{workflow.id}/data-status")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["warming_supported"] is True
+    assert body["status"] == "warming"
+    assert body["members_needing_candles"] == 2
+    assert {row["instrument_key"] for row in body["members"]} == {"NSE:RELIANCE", "NSE:TCS"}
+    assert body["required_bars"] == 30
+    assert "FINAL daily candles" in body["note"]
+
+
+def test_screener_data_status_is_owner_scoped_and_needs_a_session(session_factory, monkeypatch):
+    workflow, _revision = _seed_workflow(
+        session_factory, SCREENER_DOCUMENT, owner=FOREIGN_SCOPE, name="foreign-screen"
+    )
+    authenticated = _app(session_factory, monkeypatch)
+    warmer = _install_fake_warmer(monkeypatch, _FakeWarmer())
+    assert authenticated.get(f"{BASE}/screeners/{workflow.id}/data-status").status_code == 404
+    assert warmer.warmed_calls == []
+
+    anonymous = _app(session_factory, monkeypatch, authenticated=False)
+    assert anonymous.get(f"{BASE}/screeners/{workflow.id}/data-status").status_code == 401
+
+
+def test_warm_candles_runs_the_bounded_warmer_for_this_universe(session_factory, monkeypatch):
+    workflow, _revision = _seed_workflow(session_factory, SCREENER_DOCUMENT)
+    client = _app(session_factory, monkeypatch)
+    warmer = _install_fake_warmer(monkeypatch, _FakeWarmer())
+
+    response = client.post(f"{BASE}/screeners/{workflow.id}/warm-candles")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["status"] == "complete"
+    assert body["warmed"] == 2
+    assert body["budget_exhausted"] is False
+    # bounded: only this universe's members, with the document's session
+    assert warmer.warmed_calls == [(["NSE:RELIANCE", "NSE:TCS"], "nse_equity")]
+
+
+def test_warm_candles_is_owner_scoped(session_factory, monkeypatch):
+    workflow, _revision = _seed_workflow(
+        session_factory, SCREENER_DOCUMENT, owner=FOREIGN_SCOPE, name="foreign-warm"
+    )
+    client = _app(session_factory, monkeypatch)
+    warmer = _install_fake_warmer(monkeypatch, _FakeWarmer())
+
+    assert client.post(f"{BASE}/screeners/{workflow.id}/warm-candles").status_code == 404
+    assert warmer.warmed_calls == []
+
+
+def test_warm_candles_refuses_non_screener_documents(session_factory, monkeypatch):
+    workflow, _revision = _seed_workflow(session_factory, PLAIN_DOCUMENT, name="plain-alert")
+    client = _app(session_factory, monkeypatch)
+    _install_fake_warmer(monkeypatch, _FakeWarmer())
+
+    response = client.post(f"{BASE}/screeners/{workflow.id}/warm-candles")
+    assert response.status_code == 409
+
+
+def test_candle_warming_works_for_a_screener_without_an_active_revision(
+    session_factory, monkeypatch
+):
+    """Warming/status describe the DEFINITION, so a paused screener still works.
+
+    Regression: these endpoints used the active-revision helper and returned 409
+    ("workflow has no active revision") for a screener that is not switched on —
+    including the deployed MCX screener, which is exactly when an operator wants
+    to know whether its candle data is ready.
+    """
+    from backend.workflows.repository import SqlAlchemyWorkflowRepository
+
+    repository = SqlAlchemyWorkflowRepository(session_factory)
+    compiled = compile_document(parse_workflow_dict(SCREENER_DOCUMENT))
+    workflow, _revision = repository.create_workflow(
+        OPERATOR_SCOPE,
+        "paused-screen",
+        compiled.document.to_document_dict(),
+        compiled.canonical_hash,
+    )  # deliberately never activated
+    client = _app(session_factory, monkeypatch)
+    warmer = _install_fake_warmer(monkeypatch, _FakeWarmer())
+
+    status = client.get(f"{BASE}/screeners/{workflow.id}/data-status")
+    assert status.status_code == 200, status.text
+    assert status.json()["members_needing_candles"] == 2
+
+    warmed = client.post(f"{BASE}/screeners/{workflow.id}/warm-candles")
+    assert warmed.status_code == 200, warmed.text
+    assert warmer.warmed_calls == [(["NSE:RELIANCE", "NSE:TCS"], "nse_equity")]

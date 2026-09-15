@@ -909,18 +909,27 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
     # workers never duplicate a logical run.
     screener_scheduler = None
     try:
+        from backend.screeners.candle_warming import build_screener_warmer
         from backend.screeners.runner import ScreenerPipeline
         from backend.screeners.scheduler import ScreenerScheduler
         from backend.workflows.screener_repository import ScreenerRunRepository
 
         fundamentals_loader = FundamentalsLoader(session_factory)
+        screener_window_bars = int(os.environ.get("ALERTS_SCREENER_WINDOW_BARS", "120"))
+        screener_history = PgCandleHistory(engine, bindings)
         screener_scheduler = ScreenerScheduler(
             session_factory=session_factory,
             workflow_repo=workflow_repo,
             run_repo=ScreenerRunRepository(session_factory),
             pipeline=ScreenerPipeline(
-                candle_history=PgCandleHistory(engine, bindings),
-                window_bars=int(os.environ.get("ALERTS_SCREENER_WINDOW_BARS", "120")),
+                candle_history=screener_history,
+                window_bars=screener_window_bars,
+                # Scheduled runs warm their own universe members, bounded, so a
+                # universe whose daily history was never ingested converges
+                # instead of reporting "unavailable" forever.
+                warmer=build_screener_warmer(
+                    screener_history, required_bars=screener_window_bars
+                ),
             ),
             universe_service=worker.universe_service,
             fundamentals_loader=fundamentals_loader,

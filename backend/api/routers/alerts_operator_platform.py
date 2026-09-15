@@ -16,6 +16,7 @@ concurrency.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -329,6 +330,107 @@ async def get_screener_run(
     }
 
 
+def _screener_warm_context(request: Request, scope: str, workflow_id: str):
+    """Shared setup for the warm/status endpoints: owned screener + members.
+
+    Uses the LATEST revision of an owned screener, not the active one: warming
+    and inspecting candle availability are statements about the definition, and
+    an operator must be able to check a paused or archived screener's data. Only
+    *running* it requires an active revision.
+    """
+    from backend.workflows.parser import parse_workflow_dict
+
+    _workflow, revision = _require_screener(
+        _screener_helper("_session_factory")(request), workflow_id, scope
+    )
+    scheduler = _screener_helper("_scheduler")(request)
+    document = parse_workflow_dict(revision.document)
+    resolved = scheduler.resolve_members(scope, document)
+    members = sorted(str(key) for key in resolved.get("__members__", []) or [])
+    return scheduler, document, members, resolved
+
+
+@router.get("/screeners/{workflow_id}/data-status")
+async def screener_data_status(
+    request: Request,
+    workflow_id: str,
+    scope: str = Depends(require_operator_scope),
+    idempotency_key: Optional[str] = Query(None),
+):
+    """Whether each member of this screener has the candle history it needs.
+
+    Read-only: answers "is this universe warming, unavailable, stale or
+    complete" without running the scan, so the operator can tell missing data
+    apart from a genuine zero-match result.
+    """
+    scheduler, document, members, resolved = _screener_warm_context(
+        request, scope, workflow_id
+    )
+    warmer = getattr(scheduler.pipeline, "warmer", None)
+    if warmer is None:
+        return {
+            "ok": True,
+            "workflow_id": workflow_id,
+            "warming_supported": False,
+            "members": [],
+            "note": "this deployment has no candle warmer configured",
+        }
+    status = warmer.data_status(
+        members, session=str(getattr(document, "session", "") or "")
+    )
+    needed = [row for row in status if row["warming"]]
+    return {
+        "ok": True,
+        "workflow_id": workflow_id,
+        "warming_supported": True,
+        "resolution_ok": bool(resolved.get("__resolution_ok__", True)),
+        "member_count": len(members),
+        "required_bars": warmer.required_bars,
+        "members_needing_candles": len(needed),
+        "status": (
+            "complete"
+            if members and not needed
+            else ("warming" if needed else "unavailable")
+        ),
+        "members": status,
+        "note": (
+            "bars counts FINAL daily candles only; a forming session is excluded "
+            "until its exchange has closed"
+        ),
+    }
+
+
+@router.post("/screeners/{workflow_id}/warm-candles")
+async def warm_screener_candles(
+    request: Request,
+    workflow_id: str,
+    scope: str = Depends(require_operator_scope),
+):
+    """Bounded, idempotent candle acquisition for this screener's members.
+
+    Only this universe's members are fetched, only the ones that still need
+    history, and the whole call is bounded by member count and wall-clock time;
+    anything left over is reported as skipped so a second call continues.
+    """
+    enforce_same_origin(request)
+    scheduler, document, members, _resolved = _screener_warm_context(
+        request, scope, workflow_id
+    )
+    warmer = getattr(scheduler.pipeline, "warmer", None)
+    if warmer is None:
+        raise HTTPException(
+            status_code=503, detail="this deployment has no candle warmer configured"
+        )
+    outcome = await asyncio.to_thread(
+        warmer.ensure_members, members, session=str(getattr(document, "session", "") or "")
+    )
+    return {
+        "ok": True,
+        "workflow_id": workflow_id,
+        **outcome.to_coverage(),
+    }
+
+
 @router.post("/screeners/{workflow_id}/runs")
 async def trigger_screener_run(
     request: Request,
@@ -344,7 +446,12 @@ async def trigger_screener_run(
     workflow, revision = _screener_helper("_owned_screener_revision")(
         request, scope, workflow_id
     )
-    run = scheduler.execute_manual(workflow, revision, idempotency_key=idempotency_key)
+    # Off the event loop: a run may warm bounded candle history (network I/O)
+    # before evaluating, and blocking the API loop for that would stall every
+    # other request.
+    run = await asyncio.to_thread(
+        scheduler.execute_manual, workflow, revision, idempotency_key=idempotency_key
+    )
     if run is None:
         existing = scheduler.run_repo.get_run_by_occurrence(
             scope, f"{workflow.id}:manual:{idempotency_key}"

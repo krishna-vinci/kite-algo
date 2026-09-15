@@ -393,6 +393,14 @@ class ScreenerScheduler:
             )
 
     # ------------------------------------------------------------------
+    def resolve_members(self, owner_id: str, document) -> Dict[str, Any]:
+        """Public wrapper: resolve a screener document's member keys.
+
+        Used by the operator warm/status endpoints so they act on exactly the
+        members a run would scan.
+        """
+        return self._resolve_universe(owner_id, document)
+
     def _resolve_universe(self, owner_id: str, document) -> Dict[str, Any]:
         """Resolve the document universe expression to member keys.
 

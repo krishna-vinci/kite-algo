@@ -11,7 +11,9 @@ state, no subscriptions, no outbox rows, no provider calls.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -224,8 +226,9 @@ async def trigger_run(
     _ = token
     workflow, revision = _owned_screener_revision(request, owner_id, workflow_id)
     scheduler = _scheduler(request)
-    run = scheduler.execute_manual(
-        workflow, revision, idempotency_key=idempotency_key
+    # Off the event loop: a manual run may warm bounded candle history first.
+    run = await asyncio.to_thread(
+        scheduler.execute_manual, workflow, revision, idempotency_key=idempotency_key
     )
     if run is None:
         existing = scheduler.run_repo.get_run_by_occurrence(
@@ -448,6 +451,7 @@ def _engine(request: Request):
 
 
 def _scheduler(request: Request):
+    from backend.screeners.candle_warming import build_screener_warmer
     from backend.screeners.runner import ScreenerPipeline
     from backend.screeners.scheduler import ScreenerScheduler
 
@@ -455,11 +459,17 @@ def _scheduler(request: Request):
     if existing is not None:
         return existing
     factory = _session_factory(request)
+    history = _candle_history(request)
+    window_bars = int(os.environ.get("ALERTS_SCREENER_WINDOW_BARS", "30"))
     return ScreenerScheduler(
         session_factory=factory,
         workflow_repo=None,
         run_repo=ScreenerRunRepository(factory),
-        pipeline=ScreenerPipeline(candle_history=_candle_history(request)),
+        pipeline=ScreenerPipeline(
+            candle_history=history,
+            window_bars=window_bars,
+            warmer=build_screener_warmer(history, required_bars=window_bars),
+        ),
         universe_service=_universe_service(request),
         fundamentals_loader=_fundamentals_loader(request),
         owner_id="api-manual",

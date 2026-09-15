@@ -37,6 +37,11 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from backend.alerts.predicates import Observation, evaluate_stage
+from backend.screeners.candle_warming import (
+    applies_daily_finality,
+    bar_session_date,
+    daily_session_is_final,
+)
 from backend.alerts import predicates as _predicates
 from backend.workflows.feature_engine import FeatureEngine
 from backend.workflows.feature_planner import build_subscription_plan, stage_chain
@@ -126,16 +131,24 @@ def compute_screener_bucket(
 
 
 class ScreenerPipeline:
-    """Evaluate screener documents over stored candles (no live state)."""
+    """Evaluate screener documents over stored candles (no live state).
+
+    ``warmer`` is optional: when present, the members that need daily history
+    acquire it (bounded) before evaluation, and the outcome records what was
+    warmed, skipped or unavailable — so a run that evaluates nothing because the
+    data was never fetched is distinguishable from a run where nothing matched.
+    """
 
     def __init__(
         self,
         *,
         candle_history,
         window_bars: int = _DEFAULT_WINDOW_BARS,
+        warmer: Any = None,
     ) -> None:
         self.candle_history = candle_history
         self.window_bars = max(30, int(window_bars))
+        self.warmer = warmer
 
     # ------------------------------------------------------------------
     def evaluate(
@@ -154,15 +167,29 @@ class ScreenerPipeline:
         pure — persistence and attachments live with the caller.
         """
         terminal = self._terminal_stage(document)
+        session = str(getattr(document, "session", "") or "")
         universe_members = [str(m) for m in members]
         if member_limit is not None:
             universe_members = sorted(universe_members)[: int(member_limit)]
         expected = len(universe_members)
+
+        warming = None
+        if self.warmer is not None and universe_members:
+            try:
+                warming = self.warmer.ensure_members(
+                    universe_members, session=session, as_of=as_of
+                )
+            except Exception:  # warming must never fail the run
+                logger.exception("screener candle warming failed")
+                warming = None
+
         results: List[MemberResult] = []
         candle_max_ts: Optional[datetime] = None
+        forming_excluded = 0
 
         for key in universe_members:
-            bars = self._bars(key, as_of)
+            bars, dropped_forming = self._bars(key, as_of, session=session)
+            forming_excluded += dropped_forming
             if bars:
                 latest_ts = bars[-1].ts
                 if candle_max_ts is None or latest_ts > candle_max_ts:
@@ -199,10 +226,15 @@ class ScreenerPipeline:
             "qualifying": len(passed),
             "complete": complete,
         }
+        if warming is not None:
+            coverage["candle_warming"] = warming.to_coverage()
         freshness = {
             "candle_max_ts": candle_max_ts.isoformat() if candle_max_ts else None,
             "as_of": as_of.isoformat(),
         }
+        if applies_daily_finality(session):
+            freshness["candle_finality_session"] = session
+            freshness["forming_candles_excluded"] = forming_excluded
         return {
             "members": results,
             "coverage": coverage,
@@ -211,11 +243,33 @@ class ScreenerPipeline:
         }
 
     # ------------------------------------------------------------------
-    def _bars(self, instrument_key: str, as_of: datetime) -> List[Observation]:
+    def _bars(
+        self, instrument_key: str, as_of: datetime, *, session: str = ""
+    ) -> tuple[List[Observation], int]:
+        """Bars a run may consume, and how many were dropped as still forming.
+
+        Coherent cutoff: no candle at/after the as-of instant, so a run never
+        consumes future data whatever its bucket time is. For feed-driven
+        sessions (MCX, currency) the schedule is anchored to the NSE calendar,
+        so a bucket can fire mid-session; that session's daily bar is dropped
+        until the exchange has closed and the provider row has settled
+        (``applies_daily_finality``). NSE equity buckets fire at its own close,
+        where the newest bar already is the session's close.
+        """
         recent = self.candle_history.recent_bars(instrument_key, "day", self.window_bars)
-        # coherent cutoff: drop any candle at/after the as-of instant so a
-        # run can never consume future data, whatever the bucket time is.
-        return [bar for bar in recent if self._ts(bar) is not None and self._ts(bar) <= as_of]
+        cutoff = applies_daily_finality(session)
+        now = datetime.now(timezone.utc)
+        consumed: List[Observation] = []
+        forming = 0
+        for bar in recent:
+            ts = self._ts(bar)
+            if ts is None or ts > as_of:
+                continue
+            if cutoff and not daily_session_is_final(session, bar_session_date(ts), now):
+                forming += 1
+                continue
+            consumed.append(bar)
+        return consumed, forming
 
     @staticmethod
     def _ts(bar: Any) -> Optional[datetime]:
