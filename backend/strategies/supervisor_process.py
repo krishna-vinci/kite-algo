@@ -36,9 +36,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 __all__ = [
     "ChildProcessHandle",
     "ProcessIdentity",
+    "finalize_group",
+    "group_members",
     "identity_is_current",
     "read_boot_id",
     "read_container_id",
+    "read_process_session",
     "read_process_start_time",
     "spawn_child",
     "terminate_identity",
@@ -74,6 +77,21 @@ def read_container_id() -> Optional[str]:
 
 def read_process_start_time(pid: int) -> Optional[str]:
     """Field 22 of ``/proc/<pid>/stat`` (clock ticks since boot)."""
+    return _read_stat_field(pid, _PROC_STAT_FIELD_STARTTIME)
+
+
+def read_process_session(pid: int) -> Optional[int]:
+    """Field 6 of ``/proc/<pid>/stat`` (session id)."""
+    raw = _read_stat_field(pid, 6)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _read_stat_field(pid: int, field_number: int) -> Optional[str]:
     try:
         with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
             data = handle.read()
@@ -84,10 +102,40 @@ def read_process_start_time(pid: int) -> Optional[str]:
     if close == -1:
         return None
     fields = data[close + 2 :].split()
-    index = _PROC_STAT_FIELD_STARTTIME - 3  # 1=pid, 2=comm, so field 3 is fields[0]
+    index = field_number - 3  # 1=pid, 2=comm, so field 3 is fields[0]
     if index < 0 or index >= len(fields):
         return None
     return fields[index]
+
+
+def group_members(identity: "ProcessIdentity") -> List[int]:
+    """PIDs still in the recorded child's session, excluding the leader.
+
+    Attribution is by **session id** (equal to the recorded child's pid, which
+    is a session leader) plus boot id. An unrelated recycled process cannot
+    share that session without having forked from the original child, and a
+    fresh session leader would have ``pid == session`` (excluded), so a reused
+    PGID is never signalled. Returns ``[]`` when the session id is unknown (no
+    safe attribution) — callers must surface that as unresolved.
+    """
+    if identity.session_id is None:
+        return []
+    if identity.boot_id is not None and read_boot_id() not in (None, identity.boot_id):
+        return []
+    members: List[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    for name in entries:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == identity.pid:
+            continue
+        if read_process_session(pid) == identity.session_id:
+            members.append(pid)
+    return sorted(members)
 
 
 @dataclass(frozen=True)
@@ -97,6 +145,10 @@ class ProcessIdentity:
     pid: int
     pgid: int
     start_time: Optional[str]
+    #: Session id (== pid, since the child is a session leader). Used to
+    #: attribute surviving descendants safely; ``None`` means no safe
+    #: attribution for group cleanup.
+    session_id: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -105,7 +157,19 @@ class ProcessIdentity:
             "pid": self.pid,
             "pgid": self.pgid,
             "start_time": self.start_time,
+            "session_id": self.session_id,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "ProcessIdentity":
+        return cls(
+            boot_id=payload.get("boot_id"),
+            container_id=payload.get("container_id"),
+            pid=int(payload.get("pid") or -1),
+            pgid=int(payload.get("pgid") or -1),
+            start_time=payload.get("start_time"),
+            session_id=(int(payload["session_id"]) if payload.get("session_id") is not None else None),
+        )
 
 
 def identity_is_current(identity: ProcessIdentity) -> bool:
@@ -140,6 +204,54 @@ def _default_rlimits() -> List[tuple]:
         (resource.RLIMIT_NPROC, (128, 128)),
         (resource.RLIMIT_FSIZE, (256 * 1024 * 1024, 256 * 1024 * 1024)),
     ]
+
+
+def _pgid_exists(pgid: int) -> bool:
+    if pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def finalize_group(identity: ProcessIdentity, grace_seconds: float) -> str:
+    """Ensure no descendants survive after the leader is gone.
+
+    Leader exit is **not** proof the group is empty. This signals the group only
+    when surviving members can be attributed to the recorded child by session id
+    (:func:`group_members`), so a reused PGID is never signalled. When the session
+    id is unknown we can only test whether the PGID exists; if it does we return
+    ``unresolved`` **without signalling** rather than silently ignoring it.
+    Returns ``clean`` (proven empty), ``terminated``, ``killed``, or
+    ``unresolved``.
+    """
+    if identity.session_id is None:
+        return "unresolved" if _pgid_exists(identity.pgid) else "clean"
+    if not group_members(identity):
+        return "clean"
+    try:
+        os.killpg(identity.pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "clean"
+    deadline = time.monotonic() + max(0.0, float(grace_seconds))
+    while time.monotonic() < deadline:
+        if not group_members(identity):
+            return "terminated"
+        time.sleep(0.02)
+    try:
+        os.killpg(identity.pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "terminated"
+    settle = time.monotonic() + 2.0
+    while time.monotonic() < settle:
+        if not group_members(identity):
+            return "killed"
+        time.sleep(0.02)
+    return "unresolved"
 
 
 class _BoundedLogReader(threading.Thread):
@@ -210,37 +322,61 @@ class ChildProcessHandle:
             return None
 
     def stop(self, grace_seconds: float) -> str:
-        """SIGTERM the group, bounded wait, then SIGKILL. No false 'stopped'.
+        """Terminate the leader **and its process group**; never a false success.
 
-        Returns ``terminated`` (exited after SIGTERM), ``killed`` (needed
-        SIGKILL), ``exited`` (already gone), or ``identity_lost`` (the recorded
-        process is no longer the one we started — we do NOT signal it).
+        Signals the group only after verifying the recorded leader identity (so a
+        recycled PID/PGID is never signalled), waits a bounded grace, escalates to
+        SIGKILL, then finalizes any surviving descendants by session attribution.
+
+        Returns ``exited`` / ``terminated`` / ``killed`` when the group is empty,
+        ``group_unresolved`` when descendants remain and could not be safely
+        cleaned, or ``identity_lost`` when the recorded leader is not the process
+        we started *and* the group could not be attributed (we do not signal).
         """
-        if self._popen.poll() is not None:
-            self._join_reader()
-            return "exited"
-        if not identity_is_current(self.identity):
-            self._join_reader()
-            return "identity_lost"
-        try:
-            os.killpg(self.identity.pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            self._join_reader()
-            return "exited"
-        deadline = time.monotonic() + max(0.0, float(grace_seconds))
-        while time.monotonic() < deadline:
-            if self._popen.poll() is not None:
+        if self._popen.poll() is None:
+            if not identity_is_current(self.identity):
+                group = finalize_group(self.identity, grace_seconds)
                 self._join_reader()
-                return "terminated"
-            time.sleep(0.02)
-        try:
-            os.killpg(self.identity.pgid, signal.SIGKILL)
-        except ProcessLookupError:
+                return "group_unresolved" if group == "unresolved" else "identity_lost"
+            try:
+                os.killpg(self.identity.pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                self._join_reader()
+                return self._finalize("exited", grace_seconds)
+            deadline = time.monotonic() + max(0.0, float(grace_seconds))
+            while time.monotonic() < deadline:
+                if self._popen.poll() is not None:
+                    self._join_reader()
+                    return self._finalize("terminated", grace_seconds)
+                time.sleep(0.02)
+            try:
+                os.killpg(self.identity.pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                self._join_reader()
+                return self._finalize("terminated", grace_seconds)
+            try:
+                self._popen.wait(timeout=5)
+            except subprocess.TimeoutExpired:  # pragma: no cover
+                pass
             self._join_reader()
-            return "terminated"
-        self._popen.wait(timeout=5)
+            return self._finalize("killed", grace_seconds)
+        # Leader already exited on its own: descendants may remain.
         self._join_reader()
-        return "killed"
+        return self._finalize("exited", grace_seconds)
+
+    def _finalize(self, base: str, grace_seconds: float) -> str:
+        group = finalize_group(self.identity, grace_seconds)
+        if group == "unresolved":
+            return "group_unresolved"
+        if group == "clean":
+            return base
+        # The leader was gone but descendants needed cleanup: report that we
+        # did it rather than claiming a plain leader exit.
+        if group == "terminated":
+            return base if base != "exited" else "group_terminated"
+        if group == "killed":
+            return base if base != "exited" else "group_killed"
+        return base
 
     def _join_reader(self) -> None:
         if self._reader is not None:
@@ -271,13 +407,18 @@ def spawn_child(
         import resource
 
         # ``start_new_session=True`` already calls setsid(); do not call it again.
+        # Required limits: a failure here must be visible, not silently ignored —
+        # Python surfaces a preexec exception to the parent as SubprocessError.
         for resource_id, value in limits:
-            try:
-                resource.setrlimit(resource_id, value)
-            except (ValueError, OSError):
-                pass
+            resource.setrlimit(resource_id, value)
         if gid is not None:
             os.setgid(gid)
+            # Drop supplementary groups before dropping uid (requires privilege).
+            try:
+                os.setgroups([])
+            except OSError as exc:
+                if errno.EPERM != exc.errno:
+                    raise
         if uid is not None:
             os.setuid(uid)
 
@@ -309,6 +450,7 @@ def spawn_child(
         pid=popen.pid,
         pgid=pgid,
         start_time=start_time,
+        session_id=read_process_session(popen.pid),
     )
     return ChildProcessHandle(popen, identity, log_path=log_path, reader=reader, command=command)
 
@@ -316,27 +458,35 @@ def spawn_child(
 def terminate_identity(identity: ProcessIdentity, grace_seconds: float) -> str:
     """Terminate by identity when we do not own the ``Popen`` (crash recovery).
 
-    Verifies the process is still the recorded one before signalling, so a
-    recycled PID is never killed. Polls for exit rather than ``waitpid`` because
-    the process may not be our child.
+    Verifies the recorded leader before signalling, then finalizes the process
+    group by session attribution so surviving descendants are cleaned without
+    ever signalling a reused PGID. Returns ``exited``/``terminated``/``killed``
+    when the group is empty, ``identity_lost`` when the leader is unproven,
+    ``group_unresolved`` when attributed descendants remain.
     """
-    if not identity_is_current(identity):
+    leader_current = identity_is_current(identity)
+    result = "identity_lost"
+    if leader_current:
+        try:
+            os.killpg(identity.pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            result = "exited"
+        else:
+            deadline = time.monotonic() + max(0.0, float(grace_seconds))
+            result = "killed"
+            while time.monotonic() < deadline:
+                if not identity_is_current(identity):
+                    result = "terminated"
+                    break
+                time.sleep(0.02)
+            if result == "killed":
+                try:
+                    os.killpg(identity.pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    result = "terminated"
+    elif not group_members(identity):
         return "identity_lost"
-    try:
-        os.killpg(identity.pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return "exited"
-    deadline = time.monotonic() + max(0.0, float(grace_seconds))
-    while time.monotonic() < deadline:
-        if not identity_is_current(identity):
-            return "terminated"
-        time.sleep(0.02)
-    try:
-        os.killpg(identity.pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        return "terminated"
-    except OSError as exc:  # pragma: no cover
-        if exc.errno == errno.ESRCH:
-            return "terminated"
-        raise
-    return "killed"
+    group = finalize_group(identity, grace_seconds)
+    if group == "unresolved":
+        return "group_unresolved"
+    return result

@@ -87,8 +87,48 @@ class SupervisorConfig:
     child_uid: Optional[int] = None
     child_gid: Optional[int] = None
     api_timeout_s: float = 10.0
+    #: Bound on consecutive failed progress observations before failing closed
+    #: (we must not renew the parent heartbeat forever while progress is unseen).
+    progress_observation_max_failures: int = 3
+    #: When true, startup fails unless child uid+gid are configured (identity
+    #: separation is required, e.g. in the container).
+    require_identity_separation: bool = False
     #: Test-only bound on how long to observe a child before treating it as hung.
     observe_timeout_s: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Reject configurations that cannot be honoured safely."""
+        problems: List[str] = []
+        if self.lease_seconds <= 0:
+            problems.append("lease_seconds must be > 0")
+        if self.heartbeat_interval_s <= 0:
+            problems.append("heartbeat_interval_s must be > 0")
+        # The lease must comfortably outlive several heartbeat intervals.
+        if self.heartbeat_interval_s > self.lease_seconds * 0.5:
+            problems.append("heartbeat_interval_s must be <= half of lease_seconds")
+        if self.progress_poll_s <= 0:
+            problems.append("progress_poll_s must be > 0")
+        if self.term_grace_s < 0:
+            problems.append("term_grace_s must be >= 0")
+        if self.startup_grace_s < 0:
+            problems.append("startup_grace_s must be >= 0")
+        if self.max_log_bytes < 1024:
+            problems.append("max_log_bytes must be >= 1024")
+        if self.concurrency < 1:
+            problems.append("concurrency must be >= 1")
+        if self.progress_observation_max_failures < 1:
+            problems.append("progress_observation_max_failures must be >= 1")
+        if (self.child_uid is None) != (self.child_gid is None):
+            problems.append("child_uid and child_gid must be set together")
+        if self.require_identity_separation and (self.child_uid is None or self.child_gid is None):
+            problems.append(
+                "identity separation is required but child_uid/child_gid are not configured"
+            )
+        if problems:
+            raise ValueError("invalid supervisor configuration: " + "; ".join(problems))
 
     @classmethod
     def from_env(cls, environ: Optional[Dict[str, str]] = None) -> "SupervisorConfig":
@@ -107,6 +147,12 @@ class SupervisorConfig:
             value = env.get(name)
             return int(value) if value else None
 
+        def _b(name: str, default: bool = False) -> bool:
+            value = env.get(name)
+            if value is None:
+                return default
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
         return cls(
             base_url=base_url,
             credential=credential,
@@ -123,6 +169,8 @@ class SupervisorConfig:
             child_uid=_i("HOSTED_SUPERVISOR_CHILD_UID"),
             child_gid=_i("HOSTED_SUPERVISOR_CHILD_GID"),
             api_timeout_s=_f("HOSTED_SUPERVISOR_API_TIMEOUT_S", 10.0),
+            progress_observation_max_failures=int(_f("HOSTED_SUPERVISOR_PROGRESS_OBS_MAX_FAILURES", 3)),
+            require_identity_separation=_b("HOSTED_SUPERVISOR_REQUIRE_IDENTITY_SEPARATION", False),
         )
 
     def workspace(self) -> Path:
@@ -181,6 +229,25 @@ class HostedSupervisor:
         self._sleep = sleep
         self._workspace = config.workspace()
         self._active: Dict[str, Any] = {}
+        self._stopping = False
+        self._prepare_workspace()
+
+    def _prepare_workspace(self) -> None:
+        """Create the supervisor-owned layout with child-safe permissions.
+
+        - workspace root: ``0711`` (traversable, not listable)
+        - ``attempts``: ``0700`` — authoritative records, child-inaccessible
+        - ``logs``: ``0700``
+        - ``source``: ``0755`` dirs (child can traverse/read), files ``0444``
+        - ``scratch``: per-job, chowned to the child uid/gid when configured
+        """
+        root = self._workspace
+        root.mkdir(parents=True, exist_ok=True)
+        os.chmod(root, 0o711)
+        for name, mode in (("attempts", 0o700), ("logs", 0o700), ("source", 0o755), ("scratch", 0o755)):
+            directory = root / name
+            directory.mkdir(parents=True, exist_ok=True)
+            os.chmod(directory, mode)
 
     # -- paths --------------------------------------------------------------
 
@@ -200,6 +267,7 @@ class HostedSupervisor:
         record.updated_at = self._wall_clock().isoformat()
         path = self._attempt_path(record.job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(record.to_json(), encoding="utf-8")
         os.chmod(tmp, 0o600)
@@ -225,59 +293,198 @@ class HostedSupervisor:
 
     # -- cleanup helper -----------------------------------------------------
 
+    _TERMINAL_STATUSES = {"recovery_required", "stopped", "failed"}
+    _ALREADY_TERMINAL_REASONS = {"HOSTED_ATTEMPT_FENCED", "HOSTED_ATTEMPT_STOPPED"}
+
+    def _state_or_none(self, job_id: str, epoch: int, attempt: int) -> Optional[Dict[str, Any]]:
+        try:
+            return self.api.job_state(
+                job_id, lease_owner=self.config.lease_owner, lease_epoch=epoch, attempt=attempt
+            )
+        except (SupervisorApiError, SupervisorTransportError):
+            return None
+
+    def _authority_check(self, job_id: str, epoch: int, attempt: int) -> Dict[str, Any]:
+        """Full pre-spawn authority check: state, desired state, lease, attempt.
+
+        Returns ``{"ok": bool, "reason": str|None, "state": dict|None}``. Any
+        failure to *prove* live authority refuses spawning.
+        """
+        state = self._state_or_none(job_id, epoch, attempt)
+        if state is None:
+            return {"ok": False, "reason": "HOSTED_AUTHORITY_UNREADABLE", "state": None}
+        if str(state.get("status") or "") not in {"starting", "running"}:
+            return {"ok": False, "reason": "HOSTED_ATTEMPT_FENCED", "state": state}
+        if str(state.get("desired_state") or "") != "started":
+            return {"ok": False, "reason": "HOSTED_ATTEMPT_STOPPED", "state": state}
+        if state.get("lease_epoch") is not None and int(state["lease_epoch"]) != int(epoch):
+            return {"ok": False, "reason": "HOSTED_LEASE_AUTHORITY_MISMATCH", "state": state}
+        if state.get("attempt") is not None and int(state["attempt"]) != int(attempt):
+            return {"ok": False, "reason": "HOSTED_LEASE_AUTHORITY_MISMATCH", "state": state}
+        lease_until = state.get("lease_until")
+        if lease_until:
+            try:
+                if datetime.fromisoformat(str(lease_until).replace("Z", "+00:00")) <= self._wall_clock():
+                    return {"ok": False, "reason": "HOSTED_LEASE_EXPIRED", "state": state}
+            except ValueError:
+                return {"ok": False, "reason": "HOSTED_LEASE_UNREADABLE", "state": state}
+        return {"ok": True, "reason": None, "state": state}
+
     def _fail_closed(
         self, job_id: str, epoch: int, attempt: int, *, reason: str
     ) -> Dict[str, Any]:
-        """Fence while the lease is live, recover once it has expired.
+        """Fence while the lease is live, recover once expired, then confirm.
 
-        Returns an honest report; ``cleanup_required`` is set when the API was
-        unreachable so the caller does not claim a stop it could not confirm.
+        Cleanup is considered resolved **only** when the API confirms it or an
+        authenticated state read proves a terminal condition. Any 403/409/5xx or
+        transport error, and a still-live lease, leaves ``cleanup_required=True``
+        so the caller keeps the retry record and never claims success.
         """
         report: Dict[str, Any] = {
             "fence": "not_attempted",
             "recover": "not_attempted",
-            "cleanup_required": False,
+            "terminal_confirmed": False,
+            "cleanup_required": True,
         }
-        try:
-            self.api.fence(job_id, lease_owner=self.config.lease_owner, lease_epoch=epoch, attempt=attempt, reason=reason)
-            report["fence"] = "ok"
+
+        def _try_fence() -> str:
+            try:
+                self.api.fence(
+                    job_id, lease_owner=self.config.lease_owner, lease_epoch=epoch, attempt=attempt, reason=reason
+                )
+                return "ok"
+            except SupervisorApiError as exc:
+                return exc.reason or f"http_{exc.status_code}"
+            except SupervisorTransportError:
+                return "transport_error"
+
+        def _try_recover() -> str:
+            try:
+                self.api.recover(
+                    job_id, lease_owner=self.config.lease_owner, lease_epoch=epoch, attempt=attempt, reason=reason
+                )
+                return "ok"
+            except SupervisorApiError as exc:
+                return exc.reason or f"http_{exc.status_code}"
+            except SupervisorTransportError:
+                return "transport_error"
+
+        outcome = _try_fence()
+        report["fence"] = outcome
+        if outcome == "ok":
+            report["cleanup_required"] = False
+            report["terminal_confirmed"] = True
             return report
-        except SupervisorApiError as exc:
-            report["fence"] = exc.reason or f"http_{exc.status_code}"
-            if exc.reason in {"HOSTED_LEASE_EXPIRED", "HOSTED_ATTEMPT_FENCED"}:
-                try:
-                    self.api.recover(
-                        job_id, lease_owner=self.config.lease_owner, lease_epoch=epoch, attempt=attempt, reason=reason
-                    )
-                    report["recover"] = "ok"
-                except SupervisorApiError as recover_exc:
-                    report["recover"] = recover_exc.reason or f"http_{recover_exc.status_code}"
-                except SupervisorTransportError:
-                    report["cleanup_required"] = True
-            elif exc.reason == "HOSTED_LEASE_STILL_LIVE":
-                report["cleanup_required"] = True
+        if outcome in self._ALREADY_TERMINAL_REASONS:
+            report["cleanup_required"] = False
+            report["terminal_confirmed"] = True
             return report
-        except SupervisorTransportError:
-            report["cleanup_required"] = True
-            return report
+        if outcome in {"HOSTED_LEASE_EXPIRED", "HOSTED_ATTEMPT_FENCED", "HOSTED_LEASE_STILL_LIVE"}:
+            recover_outcome = _try_recover()
+            report["recover"] = recover_outcome
+            if recover_outcome == "ok":
+                report["cleanup_required"] = False
+                report["terminal_confirmed"] = True
+                return report
+            if recover_outcome in self._ALREADY_TERMINAL_REASONS:
+                report["cleanup_required"] = False
+                report["terminal_confirmed"] = True
+                return report
+
+        # Confirm via an authenticated state read before giving up.
+        state = self._state_or_none(job_id, epoch, attempt)
+        if state is not None and str(state.get("status") or "") in self._TERMINAL_STATUSES:
+            report["cleanup_required"] = False
+            report["terminal_confirmed"] = True
+            report["state_status"] = state.get("status")
+        return report
+
+    def _resolve_record(self, record: AttemptRecord, *, reason: str) -> Dict[str, Any]:
+        """Resolve one interrupted record: terminate any process, then confirm.
+
+        Returns ``{"resolved": bool, "process": str|None, "notes": [...]}``.
+        """
+        notes: List[str] = []
+        process_result: Optional[str] = None
+        if record.identity:
+            try:
+                identity = proc.ProcessIdentity.from_dict(record.identity)
+                process_result = self._terminate_identity(identity, self.config.term_grace_s)
+            except Exception as exc:  # pragma: no cover - defensive
+                process_result = "identity_unreadable"
+                notes.append(f"identity_unreadable:{type(exc).__name__}")
+            if process_result in {"group_unresolved"}:
+                notes.append("process_group_unresolved")
+            elif process_result == "identity_lost":
+                # We did not signal anything we could not prove; record it.
+                notes.append("process_identity_lost")
+
+        authority_ok = True
+        if record.lease_epoch is not None and record.attempt is not None:
+            cleanup = self._fail_closed(
+                record.job_id, int(record.lease_epoch), int(record.attempt), reason=reason
+            )
+            authority_ok = not cleanup["cleanup_required"]
+        elif record.phase not in {"claiming", "claim_refused", "api_unreachable"}:
+            authority_ok = True
+
+        resolved = authority_ok and "process_group_unresolved" not in notes
+        return {"resolved": resolved, "process": process_result, "notes": notes}
 
     def retry_cleanup(self) -> List[Dict[str, Any]]:
-        """Retry fencing/recovering any attempt left ``cleanup_required``."""
-        results = []
+        """Retry termination and fencing/recovering of unresolved records."""
+        results: List[Dict[str, Any]] = []
         for record in self._load_records():
             if record.phase != "cleanup_required":
                 continue
-            if record.lease_epoch is None or record.attempt is None:
-                continue
-            result = self._fail_closed(
-                record.job_id, int(record.lease_epoch), int(record.attempt), reason="cleanup_retry"
-            )
-            if not result["cleanup_required"]:
-                record.phase = "recovered" if result["recover"] == "ok" else "fenced"
-                record.error = None
+            outcome = self._resolve_record(record, reason="cleanup_retry")
+            if outcome["resolved"]:
+                record.phase = "fenced" if not outcome["notes"] else "cleanup_resolved"
+                record.error = ",".join(outcome["notes"]) or None
+            else:
+                record.error = ",".join(outcome["notes"] + ["cleanup_unresolved"])
             self._persist(record)
-            results.append({"job_id": record.job_id, **result})
+            results.append({"job_id": record.job_id, **outcome, "phase": record.phase})
         return results
+
+    def startup_recover(self) -> List[Dict[str, Any]]:
+        """Inspect persisted records after a restart and resolve interrupted work.
+
+        Never reattaches or replays. Verifies recorded identity before touching a
+        process, terminates surviving managed work, and explicitly resolves
+        interrupted pre-spawn/post-spawn states (including the
+        spawn-to-identity-persistence window, where the record is ``spawning``
+        with no identity: no signal is sent — the attempt is fenced so any
+        unrecorded child loses its authority).
+        """
+        actions: List[Dict[str, Any]] = []
+        for record in self._load_records():
+            phase = record.phase
+            if phase in {"conflict", "claim_refused", "prepare_failed"}:
+                # Not our attempt / already handled server-side: do not touch.
+                continue
+            if phase in {"recovered", "fenced", "failed_closed", "cleanup_resolved", "authority_lost", "spawn_failed"}:
+                continue
+            if phase == "cleanup_required":
+                outcome = self._resolve_record(record, reason="startup_cleanup")
+            elif phase == "running":
+                outcome = self._resolve_record(record, reason="startup_recovered_running")
+            elif phase in {"claiming", "claimed", "prepared", "spawning"}:
+                # No (or an unrecorded) process; fence/recover the authority.
+                if phase == "spawning" and not record.identity:
+                    actions.append({"job_id": record.job_id, "phase": phase, "note": "identity_unrecorded"})
+                outcome = self._resolve_record(record, reason=f"startup_interrupted_{phase}")
+            else:
+                continue
+            if outcome["resolved"]:
+                record.phase = "cleanup_resolved" if outcome["notes"] else "fenced"
+                record.error = ",".join(outcome["notes"]) or None
+            else:
+                record.phase = "cleanup_required"
+                record.error = ",".join(outcome["notes"] + ["cleanup_unresolved"])
+            self._persist(record)
+            actions.append({"job_id": record.job_id, "phase": record.phase, **outcome})
+        return actions
 
     # -- child environment --------------------------------------------------
 
@@ -311,19 +518,29 @@ class HostedSupervisor:
             raise ValueError("source hash mismatch")
         path = self._source_path(job_id, version_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Supervisor-owned and read-only: the child cannot rewrite its source.
+        # Traversable/readable by the child, owned and writable only by the
+        # supervisor: the child can read its source but cannot alter it.
+        os.chmod(self._workspace / "source", 0o755)
+        os.chmod(path.parent, 0o755)
         path.write_text(source, encoding="utf-8")
-        os.chmod(path, 0o400)
+        os.chmod(path, 0o444)
         return path
 
-    # -- supervision --------------------------------------------------------
+    def _prepare_scratch(self, scratch: Path) -> None:
+        """Create a child-usable scratch dir (owned by the child uid when set)."""
+        scratch.mkdir(parents=True, exist_ok=True)
+        if self.config.child_uid is not None:
+            try:
+                os.chown(scratch, self.config.child_uid, self.config.child_gid)
+            except OSError as exc:
+                if self.config.require_identity_separation:
+                    raise RuntimeError(
+                        f"cannot set child ownership on scratch {scratch}: {exc}"
+                    ) from exc
+                logger.warning("supervisor_scratch_chown_failed", extra={"path": str(scratch)})
+        os.chmod(scratch, 0o700)
 
-    def _authority_live(self, job_id: str, epoch: int, attempt: int) -> bool:
-        try:
-            state = self.api.job_state(job_id, lease_owner=self.config.lease_owner, lease_epoch=epoch, attempt=attempt)
-            return state.get("status") in {"starting", "running"}
-        except (SupervisorApiError, SupervisorTransportError):
-            return False
+    # -- supervision --------------------------------------------------------
 
     def _progress_stale(self, state: Dict[str, Any], started_monotonic: float) -> bool:
         deadline = float(state.get("progress_deadline_s") or 0)
@@ -441,17 +658,34 @@ class HostedSupervisor:
             self._persist(record)
             return {"status": "source_hash_mismatch", "job_id": job_id, **report}
 
-        # Refuse to spawn if authority is not live.
-        if not self._authority_live(job_id, epoch, attempt):
-            record.phase = "authority_lost"
+        # Refuse to spawn unless live authority is positively established:
+        # status, desired state, lease epoch/attempt and lease expiry.
+        authority = self._authority_check(job_id, epoch, attempt)
+        if not authority["ok"]:
+            report = self._fail_closed(job_id, epoch, attempt, reason=authority["reason"] or "authority_lost")
+            record.phase = "cleanup_required" if report["cleanup_required"] else "authority_lost"
+            record.error = authority["reason"]
             self._persist(record)
-            return {"status": "authority_lost", "job_id": job_id}
+            return {"status": "authority_lost", "job_id": job_id, "reason": authority["reason"], **report}
 
         scratch = self._scratch_path(job_id)
-        scratch.mkdir(parents=True, exist_ok=True)
-        os.chmod(scratch, 0o700)
         log_path = self._log_path(job_id)
         env = self._child_env(launch, scratch)
+        try:
+            self._prepare_scratch(scratch)
+        except Exception as exc:
+            report = self._fail_closed(job_id, epoch, attempt, reason="scratch_prepare_failed")
+            record.phase = "cleanup_required" if report["cleanup_required"] else "failed_closed"
+            record.error = str(exc)
+            self._persist(record)
+            return {"status": "scratch_prepare_failed", "job_id": job_id, **report}
+
+        # Record the spawn intent *before* spawning so the spawn-to-identity
+        # window is visible on restart (no identity yet → never signal blind).
+        record.phase = "spawning"
+        record.log_ref = str(log_path)
+        self._persist(record)
+
         try:
             handle = self._spawn(
                 self._child_command(source_path),
@@ -462,7 +696,7 @@ class HostedSupervisor:
                 uid=self.config.child_uid,
                 gid=self.config.child_gid,
             )
-        except Exception as exc:  # pragma: no cover - spawn failure
+        except Exception as exc:
             report = self._fail_closed(job_id, epoch, attempt, reason="spawn_failed")
             record.phase = "cleanup_required" if report["cleanup_required"] else "failed_closed"
             record.error = str(exc)
@@ -470,15 +704,28 @@ class HostedSupervisor:
             return {"status": "spawn_failed", "job_id": job_id, **report}
 
         self._active[job_id] = handle
-        record.identity = handle.identity.to_dict()
-        record.log_ref = str(log_path)
-        record.phase = "running"
-        self._persist(record)
         started = self._monotonic()
-
-        outcome, detail = self._observe(job_id, epoch, attempt, handle, started)
-        stop_result = handle.stop(self.config.term_grace_s)
-        self._active.pop(job_id, None)
+        outcome = "supervisor_exception"
+        detail: Dict[str, Any] = {}
+        stop_result = "not_attempted"
+        try:
+            record.identity = handle.identity.to_dict()
+            record.phase = "running"
+            self._persist(record)
+            outcome, detail = self._observe(
+                job_id, epoch, attempt, handle, started, max_duration_s=launch.get("max_duration_s")
+            )
+        except BaseException as exc:  # ensure the child is always stopped
+            outcome = "supervisor_exception"
+            detail = {"error": f"{type(exc).__name__}: {exc}"}
+            logger.exception("hosted_supervisor_observation_failed", extra={"job_id": job_id})
+        finally:
+            try:
+                stop_result = handle.stop(self.config.term_grace_s)
+            except Exception:  # pragma: no cover - defensive
+                stop_result = "stop_failed"
+                logger.exception("hosted_supervisor_stop_failed", extra={"job_id": job_id})
+            self._active.pop(job_id, None)
 
         result: Dict[str, Any] = {
             "job_id": job_id,
@@ -490,19 +737,10 @@ class HostedSupervisor:
         if detail:
             result.update(detail)
 
-        if outcome in {"heartbeat_unreachable"} or stop_result == "identity_lost":
-            cleanup = self._fail_closed(job_id, epoch, attempt, reason=outcome)
-            result.update(cleanup)
-            record.phase = "cleanup_required" if cleanup["cleanup_required"] else "failed_closed"
-        elif outcome in {"progress_stale", "authority_lost"}:
-            # A stalled or lost attempt is fenced/recovered: no replay, and the
-            # server keeps the replacement block for launched work.
-            cleanup = self._fail_closed(job_id, epoch, attempt, reason=outcome)
-            result.update(cleanup)
-            record.phase = "cleanup_required" if cleanup["cleanup_required"] else "fenced"
-        else:
-            # Normal completion (or the test-only observe bound) is NOT proof of
-            # flatness: a launched attempt is released into recovery_required.
+        process_unresolved = stop_result in {"group_unresolved", "stop_failed"}
+        if outcome == "exited" and not process_unresolved:
+            # Normal completion is NOT proof of flatness: a launched attempt is
+            # released into recovery_required by the server.
             try:
                 released = self.api.release(
                     job_id, lease_owner=self.config.lease_owner, lease_epoch=epoch, attempt=attempt
@@ -517,11 +755,43 @@ class HostedSupervisor:
             except SupervisorTransportError:
                 record.phase = "cleanup_required"
                 result["cleanup_required"] = True
+        elif outcome == "observe_timeout" and not process_unresolved:
+            try:
+                released = self.api.release(
+                    job_id, lease_owner=self.config.lease_owner, lease_epoch=epoch, attempt=attempt
+                )
+                result["terminal"] = released.get("status")
+                result["replacement_blocked"] = released.get("replacement_blocked")
+                record.phase = str(released.get("status") or "terminal")
+            except (SupervisorApiError, SupervisorTransportError):
+                result["cleanup_required"] = True
+                record.phase = "cleanup_required"
+        else:
+            # authority_lost / heartbeat_unreachable / progress_stale /
+            # progress_unobserved / max_duration_reached / supervisor_stopping /
+            # supervisor_exception / unresolved process: fail closed — no replay,
+            # and the server keeps the replacement block for launched work.
+            cleanup = self._fail_closed(job_id, epoch, attempt, reason=outcome)
+            result.update(cleanup)
+            if process_unresolved:
+                result["cleanup_required"] = True
+            record.phase = "cleanup_required" if result.get("cleanup_required") else "fenced"
+        if process_unresolved:
+            result["cleanup_required"] = True
+            record.phase = "cleanup_required"
+            record.error = f"process_{stop_result}"
         self._persist(record)
         return result
 
     def _observe(
-        self, job_id: str, epoch: int, attempt: int, handle: Any, started: float
+        self,
+        job_id: str,
+        epoch: int,
+        attempt: int,
+        handle: Any,
+        started: float,
+        *,
+        max_duration_s: Optional[float] = None,
     ) -> tuple:
         next_heartbeat = self._monotonic() + self.config.heartbeat_interval_s
         timeout_at = (
@@ -529,10 +799,20 @@ class HostedSupervisor:
             if self.config.observe_timeout_s
             else None
         )
+        duration_deadline = (
+            started + float(max_duration_s)
+            if max_duration_s is not None and float(max_duration_s) > 0
+            else None
+        )
+        progress_failures = 0
         while True:
+            if self._stopping:
+                return "supervisor_stopping", {}
             if handle.poll() is not None:
                 return "exited", {"exit_code": handle.poll()}
             now = self._monotonic()
+            if duration_deadline is not None and now >= duration_deadline:
+                return "max_duration_reached", {"max_duration_s": max_duration_s}
             if timeout_at is not None and now >= timeout_at:
                 return "observe_timeout", {}
             if now >= next_heartbeat:
@@ -555,24 +835,69 @@ class HostedSupervisor:
                     state = self.api.job_state(
                         job_id, lease_owner=self.config.lease_owner, lease_epoch=epoch, attempt=attempt
                     )
+                    progress_failures = 0
                 except (SupervisorApiError, SupervisorTransportError):
                     state = None
+                    # We must not renew the parent heartbeat indefinitely while
+                    # progress is unobservable.
+                    progress_failures += 1
+                    if progress_failures >= self.config.progress_observation_max_failures:
+                        return "progress_unobserved", {"failures": progress_failures}
                 if state is not None and self._progress_stale(state, started):
                     return "progress_stale", {}
             wait_for = max(0.02, min(self.config.progress_poll_s, next_heartbeat - self._monotonic()))
             self._sleep(wait_for)
 
+    # -- signals ------------------------------------------------------------
+
+    def request_stop(self) -> None:
+        """Ask the running loop to stop; observed between supervision steps."""
+        self._stopping = True
+
+    def install_signal_handlers(self) -> None:
+        import signal
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, self._handle_signal)
+            except ValueError:  # not the main thread
+                logger.warning("hosted_supervisor_signal_handler_unavailable", extra={"signal": int(sig)})
+
+    def _handle_signal(self, signum, frame) -> None:  # pragma: no cover - signal path
+        logger.warning("hosted_supervisor_signal", extra={"signal": int(signum)})
+        self.request_stop()
+
+    def terminate_active(self) -> List[Dict[str, Any]]:
+        """Bounded process-group termination of any child the loop still owns."""
+        results: List[Dict[str, Any]] = []
+        for job_id, handle in list(self._active.items()):
+            try:
+                outcome = handle.stop(self.config.term_grace_s)
+            except Exception:  # pragma: no cover - defensive
+                outcome = "stop_failed"
+                logger.exception("hosted_supervisor_signal_stop_failed", extra={"job_id": job_id})
+            results.append({"job_id": job_id, "stop": outcome})
+        return results
+
     def run_forever(self, *, idle_sleep_s: float = 5.0) -> None:
         logger.info("hosted_supervisor_started", extra={"lease_owner": self.config.lease_owner})
-        while True:
+        while not self._stopping:
             try:
                 result = self.run_once()
             except Exception:  # pragma: no cover - keep the runner alive
                 logger.exception("hosted_supervisor_run_failed")
                 result = {"status": "error"}
             logger.info("hosted_supervisor_cycle", extra={"result": result})
-            if result.get("status") == "idle":
+            if result.get("status") == "idle" and not self._stopping:
                 self._sleep(idle_sleep_s)
+
+
+def _result_is_unresolved(result: Dict[str, Any]) -> bool:
+    if result.get("cleanup_required"):
+        return True
+    if str(result.get("stop") or "") in {"group_unresolved", "stop_failed", "identity_lost"}:
+        return True
+    return str(result.get("status") or "") in {"api_unreachable"}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -587,16 +912,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO)
     config = SupervisorConfig.from_env()
     supervisor = HostedSupervisor(config)
+    supervisor.install_signal_handlers()
+
+    # Wire startup inspection: resolve interrupted work before doing anything new.
+    startup = supervisor.startup_recover()
+    if startup:
+        logger.info("hosted_supervisor_startup_recovery", extra={"actions": startup})
+    startup_unresolved = any(
+        str(action.get("phase") or "") == "cleanup_required" or not action.get("resolved", True)
+        for action in startup
+    )
+
     if args.retry_cleanup:
         results = supervisor.retry_cleanup()
         logger.info("hosted_supervisor_cleanup_retry", extra={"results": results})
-        return 0
+        unresolved = any(str(item.get("phase") or "") == "cleanup_required" for item in results)
+        return 2 if unresolved else 0
     if args.once or args.job:
-        result = supervisor.run_once(job_id=args.job)
+        try:
+            result = supervisor.run_once(job_id=args.job)
+        finally:
+            supervisor.terminate_active()
         logger.info("hosted_supervisor_once", extra={"result": result})
-        return 0
-    supervisor.run_forever()
-    return 0
+        return 2 if (_result_is_unresolved(result) or startup_unresolved) else 0
+
+    try:
+        supervisor.run_forever()
+    finally:
+        stops = supervisor.terminate_active()
+        if stops:
+            logger.info("hosted_supervisor_stop_active", extra={"stops": stops})
+    unresolved = any(str(stop.get("stop") or "") in {"group_unresolved", "stop_failed"} for stop in stops)
+    return 2 if (unresolved or startup_unresolved) else 0
 
 
 if __name__ == "__main__":  # pragma: no cover

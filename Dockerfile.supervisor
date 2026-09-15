@@ -1,0 +1,31 @@
+# Supervisor image for the hosted-strategy runner.
+#
+# The supervisor process runs as root inside the container only so it can install
+# per-child rlimits, drop supplementary groups and chown the child scratch dir.
+# The *child* runs as an unprivileged, distinct OS identity (uid/gid 10002) and
+# is the boundary that matters. This is a trusted single-operator setup — it is
+# NOT a claim of complete security isolation.
+FROM python:3.14-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Dedicated unprivileged identity for hosted children.
+RUN groupadd -g 10002 strategy-child \
+    && useradd -u 10002 -g 10002 -M -s /usr/sbin/nologin strategy-child
+
+WORKDIR /app
+
+COPY backend/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ /app/backend/
+COPY fundamentals/ /app/fundamentals/
+COPY sdk/python/kite_algo_worker/ /app/kite_algo_worker/
+
+# No database credentials are provided to this image's default command.
+CMD ["python", "-m", "backend.strategies.supervisor"]

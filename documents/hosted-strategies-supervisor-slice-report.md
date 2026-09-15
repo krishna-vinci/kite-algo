@@ -1,9 +1,9 @@
 # Hosted-strategy supervisor lifecycle — slice report (H1a)
 
 **Base:** `c666343` (hosted-strategy schema + authorization foundation).
-**Closed on:** the reviewed lifecycle-closure fixes applied on top of `f58333b`
-(§1.6) and the process-supervision slice applied on top of `5e3078e` (§1.7, §6).
-This revision corrects the earlier report's baseline evidence (§3).
+**Closed on:** lifecycle-closure fixes on `f58333b`, the process-supervision slice
+on `5e3078e`, and the supervision closure corrections on `d83e79c` (§1.9). This
+revision corrects the earlier report's baseline evidence (§3).
 **Scope:** supervisor lifecycle API, worker-run/session integration, child
 credential handoff, hosted-attempt enforcement, SDK attach-only, and the
 dedicated supervisor process.
@@ -212,6 +212,49 @@ Modules: `backend/strategies/supervisor_api.py` (stdlib HTTP client, no DB),
   stays `recovery_required` with the replacement block. Normal completion is not
   proof of flatness (it triggers a runner-owned release).
 
+### 1.9 Supervision closure corrections (this slice)
+
+- **Exception- and signal-safe shutdown.** Post-spawn work runs under
+  ``try/except/finally``: any persistence/observation/API exception stops the
+  child (bounded process-group termination) before the loop moves on, and the
+  outcome is ``supervisor_exception`` → fail closed, never a false success.
+  ``SIGTERM``/``SIGINT`` set a stop flag observed between supervision steps;
+  ``run_forever`` exits, ``terminate_active()`` reaps any owned child, and the
+  CLI returns non-zero when cleanup is unresolved. A spawn intent is persisted as
+  phase ``spawning`` **before** the fork, so the spawn-to-identity window is
+  visible after a crash and no process is signalled blind.
+- **Real restart cleanup.** ``startup_recover()`` runs at startup: it loads
+  persisted attempts, verifies recorded identity before touching any process,
+  terminates surviving managed work, and explicitly resolves interrupted
+  pre-spawn/post-spawn states (``spawning`` with no identity is fenced, not
+  signalled). Conflicts/claim refusals are left untouched. It never reattaches or
+  replays.
+- **Process-group completion.** Leader exit is not proof the group emptied.
+  ``finalize_group`` reaps surviving descendants attributed by **session id**
+  (never a bare PGID, so a reused PGID is never signalled); when attribution is
+  unavailable it reports ``group_unresolved`` instead of claiming success, and
+  the record stays ``cleanup_required``.
+- **Effective limits and authority.** ``max_duration_s`` is enforced with a
+  monotonic wall-clock deadline; spawning is refused unless status, desired
+  state, lease epoch/attempt and lease expiry are all positively confirmed.
+  ``progress_observation_max_failures`` bounds how long progress may be
+  unobservable while heartbeats continue. Configuration relationships are
+  validated at startup (``heartbeat_interval_s ≤ lease_seconds/2``, positive
+  intervals, log cap, identity fields). Required rlimits that cannot be installed
+  surface as a spawn failure (Python raises the preexec exception to the parent)
+  rather than being silently ignored.
+- **Distinct-identity execution.** Workspace root ``0711``; ``attempts``/``logs``
+  ``0700`` (child-inaccessible); source dirs ``0755`` with files ``0444``
+  (readable, not writable); per-job scratch ``0700`` chowned to the child uid;
+  supplementary groups cleared before the uid drop. ``Dockerfile.supervisor``
+  creates a concrete unprivileged ``strategy-child`` user and the Compose default
+  sets uid/gid ``10002`` with ``REQUIRE_IDENTITY_SEPARATION=true`` (startup fails
+  closed if separation is required but absent). No claim of complete isolation.
+- **Honest cleanup results.** Cleanup is resolved only on a confirmed 2xx or an
+  authenticated state read proving a terminal condition; 403/409/5xx and
+  transport errors preserve the ``cleanup_required`` record for retry. CLI exit
+  codes: ``0`` success/idle, ``2`` unresolved cleanup or ``api_unreachable``.
+
 ---
 
 ## 2. Authentication / configuration
@@ -241,7 +284,7 @@ Targeted suites (SQLite):
   tests/api/test_hosted_lifecycle_api.py \
   tests/api/test_hosted_child_authority.py \
   tests/sdk -q
-→ 554 passed, 1 skipped
+→ 569 passed, 2 skipped
 ```
 
 Disposable PostgreSQL (real concurrency; own invocation):
@@ -271,26 +314,35 @@ child authority (session lifecycle forbidden, fenced/expired/mismatched
 mutations, options run-binding boundary, external compat); SDK attach-only; and
 the PostgreSQL concurrency checks above.
 
-Process-supervision tests (added this slice):
+Process-supervision tests (added this slice) — **real process tests** vs
+**mocked orchestration tests** are distinguished:
 
-- `tests/strategies/test_supervisor_process.py` — real harmless children:
-  completion, crash exit code, **hang → process-group termination** (grandchild
-  also dies), **bounded log** capped with overflow flag, and **PID-reuse**
-  rejection (`terminate_identity` refuses to signal an unproven identity).
-- `tests/strategies/test_supervisor.py` — fake lifecycle API: happy path
-  (prepare once, source verified, release → `recovery_required`, block preserved),
-  `409` conflict does **not** fence, lost prepare response fails closed without
-  replay, authority loss stops the child and fences, **API-unreachable cleanup is
-  visible and retryable**, progress stall fences, source-hash mismatch refuses
-  spawn, authority-not-live refuses spawn, and the child **environment allowlist**
-  contains no supervisor/DB/broker secrets.
+- `tests/strategies/test_supervisor_process.py` — **real local children** (no
+  mocks): completion, crash exit code, hang → process-group termination, leader
+  exits while a **descendant survives** (group reaped), bounded log with overflow
+  flag, PID-reuse rejection, and unattributable-group → `unresolved` without
+  signalling. One **root-gated** test
+  (`test_child_identity_reads_source_writes_scratch_cannot_alter_source`) runs a
+  real cross-UID child and asserts it reads source, cannot write source, cannot
+  read the supervisor attempt records, and can write scratch. This environment is
+  non-root, so that case is **skipped** here (permission *bits* are still asserted
+  non-root in the orchestrator tests).
+- `tests/strategies/test_supervisor.py` — **mocked orchestration** (fake
+  lifecycle API, harmless local child): happy path (prepare once, source
+  verified, release → `recovery_required`), `409` conflict does not fence, lost
+  prepare response fails closed without replay, authority loss stops+fences,
+  API-unreachable cleanup visible/retryable, progress stall fences, progress
+  observation-failure budget fails closed, max-duration deadline fences,
+  exception immediately after spawn still stops the child, `request_stop` /
+  signal handler stop the child, `startup_recover` terminates a surviving child
+  and treats `spawning`-without-identity as unrecorded (no signal), expired lease
+  refuses spawn, source-hash mismatch refuses spawn, config-relationship
+  validation, cleanup 403/5xx stays retryable, workspace permission bits, and the
+  child environment allowlist.
 - `tests/api/test_hosted_child_authority.py` — child progress is
   `runs:progress` + session-bound, refused when fenced, and only accepted progress
-  writes `last_progress_at`; options operation-permission tests (data-only token
-  cannot enter/exit/protection; dry-run mutation rejected while preview allowed;
-  execution-result injection refused).
-- `tests/sdk/test_hosted_bootstrap.py` — `main(ctx)` loading, `ctx.progress`
-  delegation, and missing-`main` refusal.
+  writes `last_progress_at`; options operation-permission tests.
+- `tests/sdk/test_hosted_bootstrap.py` — `main(ctx)` loading and `ctx.progress`.
 - `tests/strategies/test_repository.py` — `record_progress` only for live jobs.
 
 **Unrelated pre-existing failures — corrected baseline evidence.** The earlier
@@ -372,9 +424,17 @@ independent of this slice (reproduces with the slice stashed).
 - **Delete/cleanup of workspace artifacts** (attempt records, source, logs) is
   not automated; retention is a deployment concern.
 - **Reconciliation of a child that outlives the supervisor** is not attempted
-  (no reattach by design). A restart leaves the job `recovery_required`.
+  (no reattach by design). On restart the supervisor terminates surviving
+  children it recorded and fences the attempt; a job found `running` without a
+  local record is left for control-plane reconciliation.
 - Normal script completion is **not** proof of flatness; a finite job may finish
   with open exposure, and the report does not claim otherwise.
+- **The real cross-UID isolation test is root-gated** and is skipped when the
+  test process is not root (as in this environment). Non-root tests assert the
+  permission *bits* and the spawn mechanics; the Dockerfile/Compose defaults are
+  configured for real separation but were not exercised as a container here.
+- Signal handling is exercised through `request_stop`/`_handle_signal` in tests,
+  not by delivering a real `SIGTERM` to the test process.
 
 ## 6. Operational configuration
 
@@ -394,16 +454,25 @@ Supervisor process (no DB credentials; service network only):
 | `HOSTED_SUPERVISOR_MAX_LOG_BYTES` | no | `5242880` | Hard cap per child log |
 | `HOSTED_SUPERVISOR_CHILD_PYTHON` | no | `sys.executable` | Interpreter for the child |
 | `HOSTED_SUPERVISOR_CHILD_PYTHONPATH` | no | repo `sdk/python` | Where the child imports the SDK |
-| `HOSTED_SUPERVISOR_CHILD_UID` / `_GID` | no | unset | Drop the child to a distinct OS identity (needs CAP_SETUID/SETGID) |
+| `HOSTED_SUPERVISOR_CHILD_UID` / `_GID` | no | unset | Drop the child to a distinct OS identity (needs privilege; set together) |
+| `HOSTED_SUPERVISOR_REQUIRE_IDENTITY_SEPARATION` | no | `false` | Fail startup unless child uid/gid are configured |
+| `HOSTED_SUPERVISOR_PROGRESS_OBS_MAX_FAILURES` | no | `3` | Consecutive unobservable-progress reads before failing closed |
 | `HOSTED_SUPERVISOR_API_TIMEOUT_S` | no | `10` | Lifecycle API timeout |
+
+Validation at startup rejects unsafe relationships: ``heartbeat_interval_s ≤
+lease_seconds/2``, positive intervals, ``max_log_bytes ≥ 1024``, uid/gid set
+together, and (when required) identity separation present.
 
 API side (unchanged from §2): `HOSTED_SUPERVISOR_CREDENTIAL(S)` and
 `HOSTED_STRATEGY_ACCOUNT_SCOPES`.
 
 CLI: `python -m backend.strategies.supervisor` (loop), `--once`,
-`--job <job_id>`, `--retry-cleanup`. Packaging: `compose.supervisor.yml` adds a
-`strategy-runner` service with **no** `env_file`/DB credentials and a dedicated
-state volume. This is configuration only — **not** deployed or started.
+`--job <job_id>`, `--retry-cleanup`. Exit codes: `0` success/idle, `2`
+unresolved cleanup (or `api_unreachable`). Packaging: `Dockerfile.supervisor`
+creates the unprivileged `strategy-child` user; `compose.supervisor.yml` adds a
+`strategy-runner` service with **no** `env_file`/DB credentials, a dedicated
+state volume, child uid/gid `10002` and `REQUIRE_IDENTITY_SEPARATION=true`. This
+is configuration only — **not** deployed or started.
 
 **Child environment allowlist (exact):** `PATH`, `HOME` (scratch),
 `PYTHONUNBUFFERED`, `PYTHONPATH`, `KITE_ALGO_BASE_URL`,
@@ -416,13 +485,16 @@ the account scope (a non-secret config value) must reach the child.
 ## 7. Deployment readiness — what is and is not true
 
 - **Implemented and tested:** the supervisor process (claim → prepare → source
-  verify → spawn → heartbeat → progress fence → stop/release/fence/recover), the
-  child bootstrap and attach-only context, process containment and identity
-  handling, the two lifecycle corrections, and the lifecycle API additions.
+  verify → spawn → heartbeat → progress fence → stop/release/fence/recover),
+  exception- and signal-safe shutdown, restart cleanup, process-group completion,
+  limits/authority enforcement, honest cleanup + CLI exit codes, the child
+  bootstrap and attach-only context, process containment and identity handling,
+  the two lifecycle corrections, and the lifecycle API additions.
 - **Not deployment-ready / not done:** the operator reconciliation workflow
-  (still missing), scheduling, frontend, notification delivery, cancel/flatten
-  adapters, live trading, and any production rollout. `compose.supervisor.yml`
-  was added but **not** deployed, and no live database migration was run.
+  (**the next feature slice**), scheduling, frontend, notification delivery,
+  cancel/flatten adapters, live trading, and any production rollout.
+  `Dockerfile.supervisor` / `compose.supervisor.yml` were added but **not**
+  built or deployed, and no live database migration was run.
 - **Explicitly not claimed:** complete security isolation (v1 is a trusted
   single-operator setup; per-run filesystem isolation is not promised), exactly-once
   execution, or that a stopped/revoked attempt is flat.

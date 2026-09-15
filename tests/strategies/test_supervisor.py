@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from backend.strategies.supervisor import HostedSupervisor, SupervisorConfig
+from backend.strategies import supervisor_process as proc
+from backend.strategies.supervisor import AttemptRecord, HostedSupervisor, SupervisorConfig
 from backend.strategies.supervisor_api import SupervisorApiError, SupervisorTransportError
 
 PY = sys.executable
@@ -36,7 +37,18 @@ class FakeApi:
         self.release_error = None
         self.fence_error = None
         self.fence_ok = True
-        self.job_state_payload = {"status": "running", "progress_deadline_s": 600, "last_progress_at": None}
+        self.job_state_error = None
+        self.job_state_fail_after = None
+        self._job_state_calls = 0
+        self.job_state_payload = {
+            "status": "running",
+            "desired_state": "started",
+            "lease_epoch": 1,
+            "attempt": 1,
+            "lease_until": (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
+            "progress_deadline_s": 600,
+            "last_progress_at": None,
+        }
 
     def _record(self, name, **kwargs):
         self.calls.append((name, kwargs))
@@ -82,6 +94,11 @@ class FakeApi:
 
     def job_state(self, job_id, **kwargs):
         self._record("job_state", job_id=job_id, **kwargs)
+        self._job_state_calls += 1
+        if self.job_state_error is not None:
+            raise self.job_state_error
+        if self.job_state_fail_after is not None and self._job_state_calls > self.job_state_fail_after:
+            raise SupervisorTransportError("state unavailable")
         return dict(self.job_state_payload)
 
     def heartbeat(self, job_id, **kwargs):
@@ -121,7 +138,8 @@ def _config(tmp_path: Path, **overrides) -> SupervisorConfig:
         credential="cred",
         workspace_root=str(tmp_path / "ws"),
         lease_owner="sup-test",
-        heartbeat_interval_s=3600.0,
+        lease_seconds=120.0,
+        heartbeat_interval_s=30.0,
         progress_poll_s=0.5,
         term_grace_s=1.0,
     )
@@ -129,7 +147,7 @@ def _config(tmp_path: Path, **overrides) -> SupervisorConfig:
     return SupervisorConfig(**defaults)
 
 
-def _supervisor(tmp_path, api, *, heartbeat_interval_s=3600.0, observe_timeout_s=None):
+def _supervisor(tmp_path, api, *, heartbeat_interval_s=30.0, observe_timeout_s=None):
     return _HarnessSupervisor(
         _config(tmp_path, heartbeat_interval_s=heartbeat_interval_s, observe_timeout_s=observe_timeout_s),
         api=api,
@@ -139,12 +157,14 @@ def _supervisor(tmp_path, api, *, heartbeat_interval_s=3600.0, observe_timeout_s
 
 def test_happy_path_releases_and_does_not_replay(tmp_path):
     api = FakeApi()
-    api.job_state_payload = {"status": "running", "progress_deadline_s": 600, "last_progress_at": datetime.now(timezone.utc).isoformat()}
+    api.job_state_payload = {
+        **api.job_state_payload,
+        "last_progress_at": datetime.now(timezone.utc).isoformat(),
+    }
     sup = _supervisor(tmp_path, api)
 
     result = sup.run_once()
     assert result["outcome"] == "exited", result
-    assert result["outcome"] == "exited"
     assert result["terminal"] == "recovery_required"
     assert result["replacement_blocked"] is True
     names = [c[0] for c in api.calls]
@@ -184,7 +204,7 @@ def test_lost_prepare_response_fails_closed_without_replay(tmp_path):
 def test_authority_loss_stops_child_and_fences(tmp_path):
     api = FakeApi()
     api.heartbeat_error = SupervisorApiError(409, "HOSTED_LEASE_EXPIRED")
-    sup = _supervisor(tmp_path, api, heartbeat_interval_s=0.0)
+    sup = _supervisor(tmp_path, api, heartbeat_interval_s=0.001)
     sup.child_script = "import time; time.sleep(30)"
 
     result = sup.run_once()
@@ -199,7 +219,7 @@ def test_api_unreachable_cleanup_is_visible_and_retryable(tmp_path):
     api = FakeApi()
     api.heartbeat_error = SupervisorTransportError("down")
     api.fence_ok = False  # fence also unreachable
-    sup = _supervisor(tmp_path, api, heartbeat_interval_s=0.0)
+    sup = _supervisor(tmp_path, api, heartbeat_interval_s=0.001)
     sup.child_script = "import time; time.sleep(30)"
 
     result = sup.run_once()
@@ -216,11 +236,11 @@ def test_api_unreachable_cleanup_is_visible_and_retryable(tmp_path):
 def test_progress_stall_fences(tmp_path):
     api = FakeApi()
     api.job_state_payload = {
-        "status": "running",
+        **api.job_state_payload,
         "progress_deadline_s": 1,
         "last_progress_at": (datetime.now(timezone.utc) - timedelta(seconds=3600)).isoformat(),
     }
-    sup = _supervisor(tmp_path, api, heartbeat_interval_s=0.0)
+    sup = _supervisor(tmp_path, api, heartbeat_interval_s=0.001)
     sup.child_script = "import time; time.sleep(30)"
 
     result = sup.run_once()
@@ -278,3 +298,204 @@ def test_child_environment_allowlist(tmp_path):
         assert forbidden not in env
         assert forbidden not in env.values()
     assert env["KITE_ALGO_WORKER_TOKEN"] == "kwa_secret"
+
+
+# ---------------------------------------------------------------------------
+# exception-safe / signal-safe shutdown
+# ---------------------------------------------------------------------------
+
+
+def test_exception_immediately_after_spawn_still_stops_child(tmp_path):
+    api = FakeApi()
+    sup = _supervisor(tmp_path, api)
+    sup.child_script = "import time; time.sleep(30)"
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("observer exploded")
+
+    sup._observe = _boom  # type: ignore[assignment]
+    result = sup.run_once()
+    assert result["outcome"] == "supervisor_exception"
+    assert result["stop"] in {"terminated", "killed"}
+    names = [c[0] for c in api.calls]
+    assert "fence" in names  # unknown state ⇒ fail closed, no replay
+
+
+def test_request_stop_stops_child_and_fences(tmp_path):
+    api = FakeApi()
+    sup = _supervisor(tmp_path, api)
+    sup.child_script = "import time; time.sleep(30)"
+    sup.request_stop()
+    result = sup.run_once()
+    assert result["outcome"] == "supervisor_stopping"
+    assert result["stop"] in {"terminated", "killed"}
+    assert "fence" in [c[0] for c in api.calls]
+
+
+def test_signal_handler_sets_stop_flag(tmp_path):
+    api = FakeApi()
+    sup = _supervisor(tmp_path, api)
+    import signal as _signal
+
+    sup._handle_signal(_signal.SIGTERM, None)
+    assert sup._stopping is True
+
+
+# ---------------------------------------------------------------------------
+# restart cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_startup_recover_terminates_surviving_child(tmp_path):
+    api = FakeApi()
+    sup = _supervisor(tmp_path, api)
+    handle = proc.spawn_child(
+        [PY, "-c", "import time; time.sleep(60)"],
+        env={"PATH": os.environ.get("PATH", "")},
+        cwd=str(tmp_path),
+        log_path=str(tmp_path / "child.log"),
+        rlimits=[],
+    )
+    sup._persist(
+        AttemptRecord(
+            job_id="hsj_1",
+            strategy_id="hs_1",
+            attempt=1,
+            lease_epoch=1,
+            lease_owner="sup-test",
+            phase="running",
+            identity=handle.identity.to_dict(),
+        )
+    )
+    actions = sup.startup_recover()
+    assert handle.poll() is not None  # the surviving child was terminated
+    assert any(a["job_id"] == "hsj_1" for a in actions)
+    assert sup._load_records()[0].phase in {"fenced", "cleanup_resolved"}
+
+
+def test_startup_recover_spawning_without_identity_never_signals(tmp_path):
+    api = FakeApi()
+    sup = _supervisor(tmp_path, api)
+    sup._persist(
+        AttemptRecord(job_id="hsj_1", attempt=1, lease_epoch=1, lease_owner="sup-test", phase="spawning")
+    )
+    actions = sup.startup_recover()
+    assert any(a.get("note") == "identity_unrecorded" for a in actions)
+    assert sup._load_records()[0].phase in {"fenced", "cleanup_resolved"}
+
+
+def test_startup_recover_does_not_touch_conflict(tmp_path):
+    api = FakeApi()
+    sup = _supervisor(tmp_path, api)
+    sup._persist(AttemptRecord(job_id="hsj_1", attempt=1, lease_epoch=1, phase="conflict"))
+    actions = sup.startup_recover()
+    assert actions == []
+    assert "fence" not in [c[0] for c in api.calls]
+
+
+# ---------------------------------------------------------------------------
+# limits and authority
+# ---------------------------------------------------------------------------
+
+
+def test_max_duration_reached_fences(tmp_path):
+    api = FakeApi()
+    original = api.prepare
+
+    def _short(job_id, **kwargs):
+        payload = original(job_id, **kwargs)
+        payload["max_duration_s"] = 0.2
+        return payload
+
+    api.prepare = _short  # type: ignore[assignment]
+    sup = _supervisor(tmp_path, api)
+    sup.child_script = "import time; time.sleep(30)"
+    result = sup.run_once()
+    assert result["outcome"] == "max_duration_reached"
+    assert "fence" in [c[0] for c in api.calls]
+    assert result["stop"] in {"terminated", "killed"}
+
+
+def test_progress_observation_failure_budget_fails_closed(tmp_path):
+    api = FakeApi()
+    # The pre-spawn authority read succeeds; subsequent progress reads do not.
+    api.job_state_fail_after = 1
+    sup = _supervisor(tmp_path, api, heartbeat_interval_s=0.001)
+    sup.child_script = "import time; time.sleep(30)"
+    sup.config.progress_observation_max_failures = 2
+    result = sup.run_once()
+    assert result["outcome"] == "progress_unobserved"
+    assert "fence" in [c[0] for c in api.calls]
+
+
+def test_expired_lease_refuses_spawn(tmp_path):
+    api = FakeApi()
+    api.job_state_payload = {
+        **api.job_state_payload,
+        "lease_until": (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+    }
+    sup = _supervisor(tmp_path, api)
+    result = sup.run_once()
+    assert result["status"] == "authority_lost"
+    assert result["reason"] == "HOSTED_LEASE_EXPIRED"
+    assert "stop" not in result  # no child was ever spawned
+    assert "release" not in [c[0] for c in api.calls]
+
+
+def test_config_validation_rejects_bad_relationships(tmp_path):
+    with pytest.raises(ValueError):
+        _config(tmp_path, heartbeat_interval_s=200.0)
+    with pytest.raises(ValueError):
+        _config(tmp_path, require_identity_separation=True)
+    # Valid separation config is accepted.
+    _config(tmp_path, child_uid=1, child_gid=1, require_identity_separation=True)
+
+
+# ---------------------------------------------------------------------------
+# honest cleanup results
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_api_refusal_is_retryable(tmp_path):
+    api = FakeApi()
+    api.heartbeat_error = SupervisorTransportError("down")
+    api.fence_error = SupervisorApiError(500, None)
+    sup = _supervisor(tmp_path, api, heartbeat_interval_s=0.001)
+    sup.child_script = "import time; time.sleep(30)"
+
+    result = sup.run_once()
+    assert result["cleanup_required"] is True
+    assert sup._load_records()[0].phase == "cleanup_required"
+
+    api.fence_error = None
+    retried = sup.retry_cleanup()
+    assert retried and retried[0]["resolved"] is True
+    assert sup._load_records()[0].phase in {"fenced", "cleanup_resolved"}
+
+
+def test_unresolved_cleanup_result_marks_supervisor_failure(tmp_path):
+    from backend.strategies.supervisor import _result_is_unresolved
+
+    assert _result_is_unresolved({"cleanup_required": True}) is True
+    assert _result_is_unresolved({"stop": "group_unresolved"}) is True
+    assert _result_is_unresolved({"cleanup_required": False, "stop": "terminated"}) is False
+
+
+# ---------------------------------------------------------------------------
+# distinct-identity layout
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_permissions_are_child_safe(tmp_path):
+    api = FakeApi()
+    api.job_state_payload = {
+        **api.job_state_payload,
+        "last_progress_at": datetime.now(timezone.utc).isoformat(),
+    }
+    sup = _supervisor(tmp_path, api)
+    sup.run_once()
+    ws = Path(sup.config.workspace_root)
+    assert (ws.stat().st_mode & 0o777) == 0o711
+    assert ((ws / "attempts").stat().st_mode & 0o777) == 0o700
+    sources = list((ws / "source").rglob("*.py"))
+    assert sources and (sources[0].stat().st_mode & 0o777) == 0o444
