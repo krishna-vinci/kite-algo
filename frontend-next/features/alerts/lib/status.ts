@@ -32,6 +32,13 @@ export type FreshnessView = {
  */
 export function deriveLifecycle(workflow: AlertsWorkflowSummary): LifecycleState {
   if (workflow.archived) return "archived";
+  // The server reports the EFFECTIVE state; fall back to the revision status for
+  // responses that predate it. Pausing keeps the revision active, so reading the
+  // revision status alone showed "active" for a paused workflow.
+  const declared = (workflow as { lifecycle_state?: string | null }).lifecycle_state;
+  if (declared === "archived" || declared === "draft" || declared === "paused" || declared === "active") {
+    return declared;
+  }
   const active = workflow.active_revision;
   if (!active) return "draft";
   return active.status === "active" ? "active" : "paused";

@@ -394,6 +394,13 @@ def test_cross_origin_mutations_are_refused(session_factory, monkeypatch):
 
 
 def test_same_origin_and_scripted_mutations_are_allowed(session_factory, monkeypatch):
+    """The allowlist is configuration: pin it here rather than inheriting .env.
+
+    (The deployed .env sets APP_ALLOWED_ORIGINS explicitly, and these tests load
+    it through the app's dotenv import, so relying on the defaults would make the
+    suite depend on the developer's machine.)
+    """
+    monkeypatch.setenv("APP_ALLOWED_ORIGINS", "http://localhost:3000")
     client = _app(session_factory, monkeypatch=monkeypatch)
     allowed = client.post(
         f"{BASE}/workflows",
@@ -1074,3 +1081,44 @@ def test_workflow_health_exposes_durable_suppression_counters(session_factory, m
     assert body["suppressions"] == {"session_cap": 1}
     assert body["runtime"]["available"] is False, "no worker health file in this environment"
     assert "DURABLE" in body["note"]
+
+
+def test_paused_workflow_reports_its_effective_lifecycle(session_factory, monkeypatch):
+    """Pause must be visible in the detail payload.
+
+    Regression: Pause sets the SUBSCRIPTION state to paused while the revision
+    stays active, so `active_revision.status` still read "active" and the UI
+    badge said ACTIVE for a workflow the operator had just paused.
+    """
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    created = client.post(
+        f"{BASE}/workflows", json={"document": DOCUMENT, "name": "lifecycle-visible"}
+    ).json()
+    workflow_id = created["workflow_id"]
+    client.post(f"{BASE}/workflows/{workflow_id}/activate")
+
+    active = client.get(f"{BASE}/workflows/{workflow_id}").json()
+    assert active["lifecycle_state"] == "active"
+
+    client.post(f"{BASE}/workflows/{workflow_id}/pause")
+    paused = client.get(f"{BASE}/workflows/{workflow_id}").json()
+    assert paused["lifecycle_state"] == "paused"
+    # the revision itself is still active (that is what makes Resume cheap)
+    assert (paused["active_revision"] or {}).get("status") == "active"
+
+    client.post(f"{BASE}/workflows/{workflow_id}/resume")
+    resumed = client.get(f"{BASE}/workflows/{workflow_id}").json()
+    assert resumed["lifecycle_state"] == "active"
+
+    client.post(f"{BASE}/workflows/{workflow_id}/archive")
+    archived = client.get(f"{BASE}/workflows/{workflow_id}").json()
+    assert archived["lifecycle_state"] == "archived"
+
+
+def test_draft_workflow_reports_draft_lifecycle(session_factory, monkeypatch):
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    created = client.post(
+        f"{BASE}/workflows", json={"document": DOCUMENT, "name": "not-activated"}
+    ).json()
+    body = client.get(f"{BASE}/workflows/{created['workflow_id']}").json()
+    assert body["lifecycle_state"] == "draft"

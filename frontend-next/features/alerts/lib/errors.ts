@@ -15,12 +15,34 @@
  */
 import { ApiClientError } from "@/lib/api/client";
 
+/**
+ * The one backend refusal an operator can act on themselves.
+ *
+ * The API refuses cookie-authenticated changes whose Origin is not on the
+ * deployment's allowlist (CSRF protection). That is correct behaviour, but its
+ * message names the route and the origin in backend terms; this turns it into
+ * the action that fixes it.
+ */
+export function isOriginRefused(message: string): boolean {
+  return /cross-origin request refused/i.test(message);
+}
+
+export function originRefusedMessage(message: string): string {
+  const match = message.match(/https?:\/\/[^\s]+/);
+  const origin = match ? match[0] : "this address";
+  return (
+    `This browser address (${origin}) is not allowed to make changes on the server. ` +
+    "Add it to APP_ALLOWED_ORIGINS in the deployment configuration, or open the app " +
+    "from an address that is already listed."
+  );
+}
+
 export function alertsErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiClientError) {
     const detail = (error.body as { detail?: unknown } | null | undefined)?.detail;
 
     if (typeof detail === "string" && detail.trim() !== "") {
-      return detail;
+      return isOriginRefused(detail) ? originRefusedMessage(detail) : detail;
     }
 
     if (detail && typeof detail === "object") {

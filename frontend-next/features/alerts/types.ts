@@ -187,6 +187,12 @@ export type AlertsWorkflowListResponse = {
 export type AlertsWorkflowDetail = AlertsWorkflowSummary & {
   document: Record<string, unknown> | null;
   revision_in_force: AlertsRevisionSummary | null;
+  /**
+   * Effective lifecycle from the server (archived | draft | paused | active).
+   * Pause/Resume act on subscriptions while the revision stays active, so this
+   * is the only field that answers "is it running?".
+   */
+  lifecycle_state?: "archived" | "draft" | "paused" | "active" | null;
   yaml?: string | null;
   yaml_error?: string;
 };

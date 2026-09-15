@@ -145,3 +145,55 @@ describe("worstWarningSeverity", () => {
     ).toBe("warning");
   });
 });
+
+describe("deriveLifecycle", () => {
+  const base = {
+    archived: false,
+    workflow_id: "w",
+    name: "n",
+    kind: "alert" as const,
+    created_at: null,
+    updated_at: null,
+    latest_revision: null,
+    active_revision: { revision_id: "r", revision: 1, status: "active" },
+    instruments: [],
+    instrument_summary: null,
+    has_universe: false,
+    alerts: [],
+    channels: [],
+    warnings: [],
+    subscription_count: 1,
+    freshness: {
+      last_evaluated_at: null,
+      evaluation_age_s: null,
+      subscription_count: 1,
+      stale_subscriptions: 0,
+      stale: null,
+      stale_after_seconds: 300,
+      stale_reason: null,
+      continuity_invalidated_at: null,
+      continuity_invalidation_reason: null,
+    },
+  };
+
+  it("reports paused from the server's effective state even though the revision is active", () => {
+    expect(deriveLifecycle({ ...base, lifecycle_state: "paused" } as never)).toBe("paused");
+  });
+
+  it("still reports active for a running workflow", () => {
+    expect(deriveLifecycle({ ...base, lifecycle_state: "active" } as never)).toBe("active");
+  });
+
+  it("falls back to the revision status when the server omits the field", () => {
+    expect(deriveLifecycle(base as never)).toBe("active");
+    expect(
+      deriveLifecycle({ ...base, active_revision: { revision_id: "r", revision: 1, status: "draft" } } as never),
+    ).toBe("paused");
+  });
+
+  it("keeps archive authoritative", () => {
+    expect(deriveLifecycle({ ...base, archived: true, lifecycle_state: "paused" } as never)).toBe(
+      "archived",
+    );
+  });
+});

@@ -2,7 +2,11 @@
 
 import { Panel } from "@/components/operator/panel";
 import { Badge } from "@/components/ui/badge";
-import { operatorLabel } from "@/features/alerts/lib/authoring";
+import {
+  instrumentKeyFromDocument,
+  operatorLabel,
+  sessionLabel,
+} from "@/features/alerts/lib/authoring";
 
 /**
  * Renders the STORED canonical document for a human.
@@ -171,7 +175,13 @@ export function ReadableDefinition({
 
   const stages = Array.isArray(document.stages) ? (document.stages as StageDocument[]) : [];
   const alerts = Array.isArray(document.alerts) ? (document.alerts as AlertDocument[]) : [];
-  const instruments = Array.isArray(document.instruments) ? document.instruments.map(String) : [];
+  // The canonical document stores instruments as objects ({symbol, exchange}),
+  // so `String()` on them renders "[object Object]": use the identity helper.
+  const instruments = Array.isArray(document.instruments)
+    ? document.instruments
+        .map((entry) => instrumentKeyFromDocument(entry) ?? "")
+        .filter((key) => key !== "")
+    : [];
 
   return (
     <div className="flex flex-col gap-4">
@@ -183,7 +193,8 @@ export function ReadableDefinition({
           </div>
           <div>
             <dt className="text-xs text-muted-foreground">session</dt>
-            <dd className="font-mono">{String(document.session ?? "—")}</dd>
+            {/* Human label; the canonical value stays in the document. */}
+            <dd>{sessionLabel(String(document.session ?? "")) || "—"}</dd>
           </div>
           <div className="col-span-2">
             <dt className="text-xs text-muted-foreground">coverage</dt>

@@ -167,6 +167,33 @@ async def operator_capabilities(
 # ---------------------------------------------------------------------------
 
 
+def _lifecycle_state(session: Any, workflow: Any, payload: Dict[str, Any]) -> str:
+    """The operator-facing lifecycle: archived | draft | paused | active.
+
+    Derived from the revision status AND the subscription states, because a
+    paused workflow keeps an active revision (that is what makes Resume cheap).
+    """
+    if workflow.archived_at is not None:
+        return "archived"
+    active = payload.get("active_revision") or {}
+    if active.get("revision_id") is None:
+        return "draft"
+    from backend.workflows.repository import AlertSubscription
+
+    states = [
+        str(state)
+        for (state,) in session.execute(
+            select(AlertSubscription.state).where(
+                AlertSubscription.revision_id == active.get("revision_id")
+            )
+        ).all()
+    ]
+    live = [state for state in states if state not in ("expired", "completed")]
+    if live and all(state == "paused" for state in live):
+        return "paused"
+    return "active"
+
+
 def _enrich_workflow(
     session: Any, workflow: WorkflowModel, session_factory: Any
 ) -> Dict[str, Any]:
@@ -409,6 +436,11 @@ async def get_workflow(
         payload["revision_in_force"] = (
             _revision_summary(revision) if revision is not None else None
         )
+        # Pause/Resume act on the SUBSCRIPTIONS while the revision stays active,
+        # so `active_revision.status` alone told the operator "ACTIVE" for a
+        # workflow that was explicitly paused. Report the effective state, and
+        # keep the raw revision status alongside it.
+        payload["lifecycle_state"] = _lifecycle_state(session, workflow, payload)
         if include_yaml and revision is not None:
             try:
                 document = parse_workflow_dict(revision.document)
