@@ -590,8 +590,9 @@ statement is about execution it is qualified **VERIFIED LOCALLY**, **DEPLOYED**,
 | Item | Status |
 | --- | --- |
 | Operator API, LTP freshness, failure isolation, level-vs-edge, canvas layout store (backend) | IMPLEMENTED / VERIFIED LOCALLY (564 backend tests) |
-| Frontend implementation | IMPLEMENTED / VERIFIED LOCALLY (233 vitest, production build clean) |
+| Frontend implementation | IMPLEMENTED / VERIFIED LOCALLY (245 vitest, production build clean; release-completion pass §10) |
 | Phase 6A/6B deployed | **DEPLOYED: NO** — deployment pending (see the release manifest) |
+| Frontend release-completion pass (2026-09-15) | IMPLEMENTED / VERIFIED LOCALLY (§10) |
 | Live UI → API → worker → event | CERTIFICATION PENDING |
 | Capacity (500 symbols / 5,000 rules) | **NOT PROVEN** — no supported-capacity figure claimed (§3) |
 | Currency live validation, production smoke, restart fault injection | CERTIFICATION PENDING |
@@ -623,3 +624,66 @@ statement is about execution it is qualified **VERIFIED LOCALLY**, **DEPLOYED**,
 | `09512f2` | Screener canonical parse + schedule range + universe kind controls |
 
 Migration head: `20260912_000018` (unchanged; the closure added no migration).
+
+---
+
+## 10. Frontend release-completion pass (2026-09-15)
+
+A focused pass on `frontend-next/` closed defects found by auditing the pages against the
+required user journeys. **No backend code changed; no migration; the migration head is
+still `20260912_000018`.** Every item below is IMPLEMENTED / VERIFIED LOCALLY (Vitest +
+`tsc --noEmit` + production build), not DEPLOYED and not LIVE VERIFIED.
+
+### 10.1 Defects fixed
+
+| # | Defect (before) | Fix | Evidence |
+| --- | --- | --- | --- |
+| 1 | Alert **Edit** and **Canvas** pages had no inbound link anywhere, so the editing and canvas journeys were unreachable for alerts | Detail page now links to the correct editor (alert vs screener) and the canvas | `workflow-detail-page.tsx`; build route list |
+| 2 | An **archived** workflow still showed Resume (which 409s, because archiving clears the active revision) and Archive | Action row is archived-aware: Activate-only when archived, Pause/Resume by active revision otherwise | `workflow-detail-page.tsx` |
+| 3 | Every detail/screener fetch failure rendered as **"not found"**, hiding 403/503/500 | 404 → "not found"; anything else → the structured error, via `alertsErrorMessage` | `workflow-detail-page.tsx`, `screener-page.tsx`, `universe-detail-page.tsx`, screener edit page |
+| 4 | The channel test-send's `400 missing_env_secret` (which **names the env var**) was shown as "Bad Request" — `ApiClientError.message` is the status text | New `lib/errors.ts` reads the structured `detail` (string or `{message,error,secret_env}`) and classifies 403/404/503 | `lib/errors.test.ts` |
+| 5 | A failed scopes fetch (or a workflows/runs/universes/channels fetch) rendered as an **empty** state on most pages | Shared `AlertsScopeGate` renders loading/error around every alerts route; list/ops/universe/screener panels check `.error` before the empty branch | `alerts-scope-gate.tsx`, list + panels |
+| 6 | The `fellBack` "scope not authorized" banner **flashed** while the scopes list was still loading | `fellBack` is gated on the scopes query having resolved without error | `use-alerts-queries.ts` |
+| 7 | Screener runs table read `started_at`/`finished_at`/`member_count`, **none of which the API returns**, so three columns were permanently blank | Types now mirror `RunOut`; columns show `created_at`/`completed_at`/`triggered_by` | `types.ts`, `screener-page.tsx` |
+| 8 | Screener **coverage**, **data_freshness**, member **values**, and the runs `note` (the partial-run caveat) were fetched and never shown | All rendered on the run row / member table | `screener-page.tsx` |
+| 9 | A manually triggered run that returned `already_finalized` gave **no feedback** | Explicit "already exists; no second scan" message | `screener-page.tsx` |
+| 10 | `running` runs never polled, so "run completeness" was not observable without a refresh | Runs/run-detail poll every 5 s **only while a run is running** | `use-alerts-queries.ts` |
+| 11 | A failed run-members fetch rendered **nothing**; a failed runs/universes/revisions/destinations fetch rendered an empty list | Each now has an explicit error state | `screener-page.tsx`, `universes-page.tsx`, `universe-detail-page.tsx`, `operations-page.tsx` |
+| 12 | Platform health rendered an **absent** counter as `0` and an absent freshness flag as `"off"` | Absent ⇒ "unknown" / "not reported" | `operations-page.tsx` |
+| 13 | Per-producer health (`signals/health.producers`) and producer/credential mutation errors were silently dropped | Producer status list and mutation errors rendered | `operations-page.tsx` |
+| 14 | A subscription with `stale: true` but a null `stale_reason` rendered green **"flowing"** | `stale` is authoritative; the reason is only the explanation | `workflow-health-panel.tsx` |
+| 15 | Opening a stored advanced workflow could **silently drop** fields the form does not model: unknown condition/hysteresis keys were accepted-and-trimmed, and shorthand operands skipped the unmodeled-attribute guard | `documentToDraft` now **refuses** (routing to the advanced editor) instead of dropping | `authoring.ts`; `document-to-draft.test.ts` |
+| 16 | The inline level-only warning ignored the `any`/`not` groups and warned for `reminder`/`notify_if_already_true`, diverging from the compiler | Mirrors the compiler: all groups considered; `reminder`, `notify_if_already_true`, `consecutive_bars` suppress it | `authoring.ts`; `authoring.test.ts` |
+| 17 | The wizard's session↔instrument check only gated step 0 and never blocked **save**, so an invalid pair could be POSTed | Save is blocked with an explicit reason; instrument-count max enforced | `alert-wizard.tsx` |
+| 18 | `preview.issues` were fetched and never shown | Rendered in the preview card | `alert-wizard.tsx` |
+| 19 | Switching the advanced editor YAML⇄JSON **discarded unsaved text** | Separate buffer per mode; YAML disabled when the server rendered none | `advanced-definition-editor.tsx` |
+| 20 | A stored schedule interval the fixed list did not name (e.g. `2h`) rendered an **empty** Select | The loaded value is shown as a "(current)" option | `screener-editor.tsx` |
+
+### 10.2 Checks executed
+
+| Check | Result |
+| --- | --- |
+| `npx tsc --noEmit` | clean |
+| `npx vitest run` | **245 passed / 29 files** |
+| `npx eslint features/alerts app/(app)/alerts` | clean |
+| `npm run build` | compiled successfully; all 12 `/alerts/*` routes present |
+| `npx eslint .` (repo) | 3 pre-existing errors in **unrelated** files (`components/bottom-dock.tsx`, `components/workspace/workspace-provider.tsx`) — not touched by this work |
+
+### 10.3 Deployment and live verification (explicitly separated)
+
+- **Deployment: PENDING.** The running `kite-frontend-next` image is stale — its server bundle
+  contains no `alerts` directory — and the API reports `/api/alerts/workflows` → **401**
+  without a cookie. No frontend or backend change from this pass is deployed.
+- **Live UI → API → worker → event: NOT PROVEN.** No authorized session was available in this
+  environment (only a password *hash* is configured), so the authenticated browser journeys
+  could not be exercised. This is a live-verification gap, not an implementation gap.
+
+### 10.4 Bounded list of live acceptance checks still required
+
+1. Sign in and load `/alerts`: list, scope picker, empty/error states.
+2. Create an alert through the wizard and open it via the new **Edit**/**Canvas** links.
+3. Open an advanced stored workflow and confirm it routes to the advanced editor (no silent drop).
+4. Trigger a screener run and watch it move `running → complete|partial` without a refresh; open members, coverage and baselines.
+5. Confirm a channel **test-send** with an unset `secret_env` shows the variable name (400 `missing_env_secret`).
+6. Confirm `/alerts/operations` platform health reads **unknown** (not 0) when the worker health file is unreadable, and the real counters when it is.
+7. One live UI → API → worker → event run, and one live stale-health-with-no-ticks observation (carried from §2/§5).
