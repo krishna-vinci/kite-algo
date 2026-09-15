@@ -39,7 +39,10 @@ from sqlalchemy.orm import sessionmaker  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
 
 from backend.api.services import hosted_lifecycle  # noqa: E402
-from backend.strategies.repository import SqlAlchemyStrategyRepository  # noqa: E402
+from backend.strategies.repository import (  # noqa: E402
+    SqlAlchemyStrategyRepository,
+    StrategyFenceError,
+)
 from tests.support.hosted_fakes import (  # noqa: E402
     FakeWorkerRepository,
     StubJournalService,
@@ -152,7 +155,10 @@ def _seed_job(factory):
         source="x",
         source_sha256="a" * 64,
         parameters_schema={"type": "object"},
-        capabilities_snapshot={"schema_version": 1},
+        capabilities_snapshot={
+            "schema_version": 2,
+            "capabilities": {"trade": True, "notify": False, "data": True},
+        },
         created_by=OWNER,
     )
     job = repo.create_job(
@@ -263,3 +269,100 @@ def test_reservation_cas_admits_one_winner(env):
         thread.join(timeout=30)
 
     assert sorted(outcomes) == [False, True]
+
+
+def _prepare_context(factory, repo, job):
+    worker = FakeWorkerRepository()
+    app = FastAPI()
+    app.state.strategies_session_factory = factory
+    app.state.algo_worker_repository = worker
+    app.state.journal_service = StubJournalService()
+    request = make_request(app)
+    asyncio.run(
+        hosted_lifecycle.prepare_launch(
+            request,
+            strategy_repo=SqlAlchemyStrategyRepository(factory),
+            worker_repo=worker,
+            job_id=job.id,
+            lease_owner="sup-A",
+            lease_epoch=1,
+            attempt=1,
+        )
+    )
+    return worker, request
+
+
+def test_launched_release_blocks_replacement_pg(env):
+    factory, _engine = env
+    repo, job = _seed_job(factory)
+    worker, _request = _prepare_context(factory, repo, job)
+
+    result = asyncio.run(
+        hosted_lifecycle.release(
+            strategy_repo=SqlAlchemyStrategyRepository(factory),
+            worker_repo=worker,
+            job_id=job.id,
+            lease_owner="sup-A",
+            lease_epoch=1,
+            attempt=1,
+        )
+    )
+    assert result["status"] == "recovery_required"
+    assert result["replacement_blocked"] is True
+
+    # The replacement block survives: create_job is refused in its own txn.
+    with pytest.raises(StrategyFenceError):
+        repo.create_job(
+            strategy_id=job.strategy_id,
+            version_id=job.version_id,
+            owner_id=OWNER,
+            job_kind="finite",
+            execution_mode="paper",
+            params={},
+            attempt=2,
+        )
+
+
+def test_racing_recover_fences_once(env):
+    factory, engine = env
+    repo, job = _seed_job(factory)
+    _prepare_context(factory, repo, job)
+
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE strategy_jobs SET lease_until = now() - interval '1 minute' WHERE id = :id"),
+            {"id": job.id},
+        )
+
+    results = []
+    errors = []
+    barrier = threading.Barrier(2)
+
+    def _recover():
+        try:
+            barrier.wait(timeout=10)
+            results.append(
+                asyncio.run(
+                    hosted_lifecycle.expire(
+                        strategy_repo=SqlAlchemyStrategyRepository(factory),
+                        worker_repo=FakeWorkerRepository(),
+                        job_id=job.id,
+                        lease_owner="sup-A",
+                        lease_epoch=1,
+                        attempt=1,
+                    )
+                )
+            )
+        except hosted_lifecycle.HostedLifecycleError as exc:
+            errors.append(exc.detail["rejection_reason"])
+
+    threads = [threading.Thread(target=_recover) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    # Exactly one durable fence; the loser is refused (already fenced or CAS lost).
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert repo.get_job(OWNER, job.id).status == "recovery_required"

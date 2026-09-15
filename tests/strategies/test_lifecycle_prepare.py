@@ -30,7 +30,7 @@ from sqlalchemy.pool import StaticPool  # noqa: E402
 from backend.api.services import hosted_lifecycle  # noqa: E402
 from backend.strategies import models  # noqa: F401,E402
 from backend.strategies import service  # noqa: E402
-from backend.strategies.repository import SqlAlchemyStrategyRepository  # noqa: E402
+from backend.strategies.repository import SqlAlchemyStrategyRepository, StrategyFenceError  # noqa: E402
 from backend.workflows.repository import Base  # noqa: E402
 from tests.support.hosted_fakes import (  # noqa: E402
     FakeWorkerRepository,
@@ -68,7 +68,7 @@ class Harness:
         self.app.state.journal_service = StubJournalService()
         self.request = make_request(self.app)
 
-    def job(self):
+    def job(self, capabilities=None, stale_exit_policy="exit_on_worker_stale"):
         strategy = self.repo.create_strategy(
             owner_id=OWNER,
             name=f"s-{uuid.uuid4().hex[:8]}",
@@ -78,14 +78,18 @@ class Harness:
             account_scope="kite:paper",
             max_duration_s=21600,
             progress_deadline_s=600,
-            stale_exit_policy="exit_on_worker_stale",
+            stale_exit_policy=stale_exit_policy,
         )
         version = self.repo.create_version(
             strategy_id=strategy.id,
             source="print('hi')\n",
             source_sha256="a" * 64,
             parameters_schema={"type": "object", "properties": {"lots": {"type": "integer"}}, "required": ["lots"]},
-            capabilities_snapshot={"schema_version": 1},
+            capabilities_snapshot=(
+                capabilities
+                if capabilities is not None
+                else service.build_capabilities_snapshot(trade=True)
+            ),
             created_by=OWNER,
         )
         job = self.repo.create_job(
@@ -329,7 +333,7 @@ def test_heartbeat_with_stale_epoch_is_refused(harness):
         )
 
 
-def test_release_stops_and_revokes(harness):
+def test_launched_release_blocks_replacement(harness):
     _strategy, job, attempt, epoch = harness.job()
     config = harness.prepare(job.id, epoch=epoch, attempt=attempt)
     result = asyncio.run(
@@ -342,11 +346,144 @@ def test_release_stops_and_revokes(harness):
             attempt=attempt,
         )
     )
-    assert result["status"] == "stopped"
-    assert harness.repo.get_job(OWNER, job.id).status == "stopped"
-    assert harness.worker.runs[config["run_id"]]["worker_session_nonce"] is None
+    # A launched attempt may have accepted work: release must NOT clear the
+    # replacement block, and must not claim flatness.
+    assert result["status"] == "recovery_required"
+    assert result["replacement_blocked"] is True
     persisted = harness.repo.get_job(OWNER, job.id)
+    assert persisted.status == "recovery_required"
+    assert harness.worker.runs[config["run_id"]]["worker_session_nonce"] is None
     assert harness.worker.tokens[persisted.token_id]["status"] == "revoked"
+
+    # Replacement is genuinely blocked at the service level.
+    with pytest.raises(StrategyFenceError):
+        harness.repo.create_job(
+            strategy_id=job.strategy_id,
+            version_id=job.version_id,
+            owner_id=OWNER,
+            job_kind="finite",
+            execution_mode="paper",
+            params={"lots": 1},
+            attempt=2,
+        )
+
+
+def test_unlaunched_release_allows_replacement(harness):
+    _strategy, job, attempt, epoch = harness.job()
+    # Claimed but never prepared: no credential was ever handed off.
+    result = asyncio.run(
+        hosted_lifecycle.release(
+            strategy_repo=harness.repo,
+            worker_repo=harness.worker,
+            job_id=job.id,
+            lease_owner="sup-A",
+            lease_epoch=epoch,
+            attempt=attempt,
+        )
+    )
+    assert result["status"] == "stopped"
+    assert result["replacement_blocked"] is False
+    assert harness.repo.get_job(OWNER, job.id).status == "stopped"
+    # No launch happened, so a new attempt is permitted.
+    new_job = harness.repo.create_job(
+        strategy_id=job.strategy_id,
+        version_id=job.version_id,
+        owner_id=OWNER,
+        job_kind="finite",
+        execution_mode="paper",
+        params={"lots": 1},
+        attempt=2,
+    )
+    assert new_job.id != job.id
+
+
+def test_expired_lease_recover_fences_without_regaining_authority(harness):
+    _strategy, job, attempt, epoch = harness.job()
+    harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    # Let the lease lapse.
+    with harness.factory() as session:
+        session.execute(
+            text("UPDATE strategy_jobs SET lease_until = :past WHERE id = :id"),
+            {"past": datetime.now(timezone.utc) - timedelta(minutes=1), "id": job.id},
+        )
+        session.commit()
+
+    # The ordinary fence refuses an expired lease ...
+    with pytest.raises(hosted_lifecycle.HostedLifecycleError) as exc:
+        asyncio.run(
+            hosted_lifecycle.fence(
+                strategy_repo=harness.repo,
+                worker_repo=harness.worker,
+                job_id=job.id,
+                lease_owner="sup-A",
+                lease_epoch=epoch,
+                attempt=attempt,
+            )
+        )
+    assert exc.value.detail["rejection_reason"] == "HOSTED_LEASE_EXPIRED"
+
+    # ... and the authenticated recovery path fences it.
+    result = asyncio.run(
+        hosted_lifecycle.expire(
+            strategy_repo=harness.repo,
+            worker_repo=harness.worker,
+            job_id=job.id,
+            lease_owner="sup-A",
+            lease_epoch=epoch,
+            attempt=attempt,
+        )
+    )
+    assert result["status"] == "recovery_required"
+    assert result["replacement_blocked"] is True
+    persisted = harness.repo.get_job(OWNER, job.id)
+    assert persisted.status == "recovery_required"
+    assert harness.worker.tokens[persisted.token_id]["status"] == "revoked"
+
+    # It cannot renew or regain execution authority.
+    with pytest.raises(hosted_lifecycle.HostedLifecycleError):
+        asyncio.run(
+            hosted_lifecycle.heartbeat(
+                strategy_repo=harness.repo,
+                worker_repo=harness.worker,
+                job_id=job.id,
+                lease_owner="sup-A",
+                lease_epoch=epoch,
+                attempt=attempt,
+                lease_until=_future(),
+            )
+        )
+    # A recovery must not be forged by a stale/unrelated identity.
+    other = harness.job()
+    _s2, job2, attempt2, epoch2 = other
+    with pytest.raises(hosted_lifecycle.HostedLifecycleError) as exc2:
+        asyncio.run(
+            hosted_lifecycle.expire(
+                strategy_repo=harness.repo,
+                worker_repo=harness.worker,
+                job_id=job2.id,
+                lease_owner="sup-A",
+                lease_epoch=epoch2 + 1,
+                attempt=attempt2,
+            )
+        )
+    assert exc2.value.status_code == 403
+
+
+def test_recover_refuses_a_still_live_lease(harness):
+    _strategy, job, attempt, epoch = harness.job()
+    harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    with pytest.raises(hosted_lifecycle.HostedLifecycleError) as exc:
+        asyncio.run(
+            hosted_lifecycle.expire(
+                strategy_repo=harness.repo,
+                worker_repo=harness.worker,
+                job_id=job.id,
+                lease_owner="sup-A",
+                lease_epoch=epoch,
+                attempt=attempt,
+            )
+        )
+    assert exc.value.detail["rejection_reason"] == "HOSTED_LEASE_STILL_LIVE"
 
 
 def test_fence_marks_recovery_required_and_revokes(harness):
@@ -365,3 +502,185 @@ def test_fence_marks_recovery_required_and_revokes(harness):
     persisted = harness.repo.get_job(OWNER, job.id)
     assert persisted.status == "recovery_required"
     assert harness.worker.tokens[persisted.token_id]["status"] == "revoked"
+
+
+# ---------------------------------------------------------------------------
+# effective configuration: capabilities + protection policy
+# ---------------------------------------------------------------------------
+
+
+def test_trade_capability_grants_order_actions(harness):
+    _strategy, job, attempt, epoch = harness.job(
+        capabilities=service.build_capabilities_snapshot(trade=True, notify=True)
+    )
+    config = harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    token = next(iter(harness.worker.tokens.values()))
+    actions = set(token["allowed_actions"])
+    assert {"intents:submit", "runs:exit", "risk:update", "notifications:publish"} <= actions
+    assert "heartbeat" not in actions
+    assert config["stale_exit_policy"] == "exit_on_worker_stale"
+
+
+def test_data_only_capability_grants_no_trading_rights(harness):
+    _strategy, job, attempt, epoch = harness.job(
+        capabilities=service.build_capabilities_snapshot(trade=False, notify=False, data=True)
+    )
+    harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    token = next(iter(harness.worker.tokens.values()))
+    assert set(token["allowed_actions"]) == {"runs:read", "runs:log"}
+
+
+def test_notify_only_capability_grants_publish_but_not_trading(harness):
+    _strategy, job, attempt, epoch = harness.job(
+        capabilities=service.build_capabilities_snapshot(trade=False, notify=True, data=True)
+    )
+    harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    token = next(iter(harness.worker.tokens.values()))
+    actions = set(token["allowed_actions"])
+    assert "notifications:publish" in actions
+    assert "intents:submit" not in actions
+    assert "runs:exit" not in actions
+
+
+def test_legacy_marker_only_capability_snapshot_fails_closed(harness):
+    _strategy, job, attempt, epoch = harness.job(
+        capabilities={"schema_version": 1, "captured_at": "x", "source": "hosted_strategy_foundation"}
+    )
+    with pytest.raises(hosted_lifecycle.HostedLifecycleError) as exc:
+        harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    assert exc.value.detail["rejection_reason"] == "HOSTED_CAPABILITIES_AMBIGUOUS"
+    # Nothing was minted or reserved.
+    assert harness.worker.tokens == {}
+    assert harness.repo.get_job(OWNER, job.id).token_id is None
+
+
+def test_pinned_stale_exit_policy_is_installed_in_run_protection(harness):
+    _strategy, job, attempt, epoch = harness.job(stale_exit_policy="exit_on_worker_stale")
+    config = harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    runtime_state = harness.worker.runs[config["run_id"]]["runtime_state"]
+    protection = runtime_state["backend_protection"]
+    assert protection["enabled"] is True
+    assert protection["operations"]["exit_on_worker_stale"] is True
+    assert runtime_state["backend_protection_state"]["status"] == "active"
+
+
+def test_none_stale_exit_policy_installs_no_protection(harness):
+    _strategy, job, attempt, epoch = harness.job(stale_exit_policy="none")
+    config = harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    runtime_state = harness.worker.runs[config["run_id"]]["runtime_state"]
+    assert "backend_protection" not in runtime_state
+    assert config["stale_exit_policy"] == "none"
+
+
+# ---------------------------------------------------------------------------
+# preparation failure handling (every durable step)
+# ---------------------------------------------------------------------------
+
+
+def test_run_record_failure_fences_with_reserved_token(harness, monkeypatch):
+    _strategy, job, attempt, epoch = harness.job()
+
+    def _boom(*a, **k):
+        raise RuntimeError("marker write failed")
+
+    monkeypatch.setattr(harness.repo, "record_child_run", _boom)
+    with pytest.raises(hosted_lifecycle.HostedLifecycleError) as exc:
+        harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    assert exc.value.detail["rejection_reason"] == "HOSTED_PREPARE_INCOMPLETE"
+    assert exc.value.detail["fencing"] == "confirmed"
+    persisted = harness.repo.get_job(OWNER, job.id)
+    assert persisted.status == "recovery_required"
+    # Cleanup used the reserved token id even though the loaded job lacked it.
+    assert harness.worker.tokens[persisted.token_id]["status"] == "revoked"
+
+
+def test_handoff_mark_failure_fences(harness, monkeypatch):
+    _strategy, job, attempt, epoch = harness.job()
+
+    def _boom(*a, **k):
+        raise RuntimeError("handoff write failed")
+
+    monkeypatch.setattr(harness.repo, "mark_running_and_handoff", _boom)
+    with pytest.raises(hosted_lifecycle.HostedLifecycleError) as exc:
+        harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    assert exc.value.detail["rejection_reason"] == "HOSTED_PREPARE_INCOMPLETE"
+    persisted = harness.repo.get_job(OWNER, job.id)
+    assert persisted.status == "recovery_required"
+    assert harness.worker.tokens[persisted.token_id]["status"] == "revoked"
+
+
+def test_session_claim_exception_fences(harness, monkeypatch):
+    _strategy, job, attempt, epoch = harness.job()
+
+    async def _boom(*a, **k):
+        raise RuntimeError("session store down")
+
+    monkeypatch.setattr(harness.worker, "claim_run_session", _boom)
+    with pytest.raises(hosted_lifecycle.HostedLifecycleError) as exc:
+        harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    assert exc.value.detail["rejection_reason"] == "HOSTED_SESSION_CLAIM_FAILED"
+    assert harness.repo.get_job(OWNER, job.id).status == "recovery_required"
+
+
+def test_incomplete_cleanup_is_reported_honestly(harness, monkeypatch):
+    _strategy, job, attempt, epoch = harness.job()
+
+    async def _boom(*a, **k):
+        raise RuntimeError("token store down")
+
+    def _fence_fails(*a, **k):
+        return False
+
+    monkeypatch.setattr(harness.worker, "create_token", _boom)
+    monkeypatch.setattr(harness.repo, "mark_recovery_required", _fence_fails)
+    with pytest.raises(hosted_lifecycle.HostedLifecycleError) as exc:
+        harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    # The response does not claim fencing that did not happen.
+    assert exc.value.detail["fencing"] == "unconfirmed"
+    assert harness.repo.get_job(OWNER, job.id).status == "starting"
+
+
+# ---------------------------------------------------------------------------
+# terminal observability
+# ---------------------------------------------------------------------------
+
+
+def test_state_readable_after_fence_without_mutation_authority(harness):
+    _strategy, job, attempt, epoch = harness.job()
+    harness.prepare(job.id, epoch=epoch, attempt=attempt)
+    asyncio.run(
+        hosted_lifecycle.fence(
+            strategy_repo=harness.repo,
+            worker_repo=harness.worker,
+            job_id=job.id,
+            lease_owner="sup-A",
+            lease_epoch=epoch,
+            attempt=attempt,
+        )
+    )
+    state = asyncio.run(
+        hosted_lifecycle.job_state(
+            strategy_repo=harness.repo,
+            worker_repo=harness.worker,
+            job_id=job.id,
+            lease_owner="sup-A",
+            lease_epoch=epoch,
+            attempt=attempt,
+        )
+    )
+    assert state["status"] == "recovery_required"
+    assert state["lease_owner"] == "sup-A"  # attribution retained for reads
+
+    # Mutation authority is still withdrawn.
+    with pytest.raises(hosted_lifecycle.HostedLifecycleError):
+        asyncio.run(
+            hosted_lifecycle.heartbeat(
+                strategy_repo=harness.repo,
+                worker_repo=harness.worker,
+                job_id=job.id,
+                lease_owner="sup-A",
+                lease_epoch=epoch,
+                attempt=attempt,
+                lease_until=_future(),
+            )
+        )

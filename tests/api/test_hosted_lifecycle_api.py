@@ -94,7 +94,10 @@ def _queued_job(repo):
         source="x",
         source_sha256="a" * 64,
         parameters_schema={"type": "object"},
-        capabilities_snapshot={"schema_version": 1},
+        capabilities_snapshot={
+            "schema_version": 2,
+            "capabilities": {"trade": True, "notify": False, "data": True},
+        },
         created_by=OWNER,
     )
     return repo.create_job(
@@ -306,3 +309,61 @@ async def test_release_and_fence_at_boundary(harness):
             f"{BASE}/jobs/{job.id}/fence", json=_authority(epoch=1), headers=_headers()
         )
         assert fenced.status_code == 200 and fenced.json()["status"] == "recovery_required"
+
+
+@pytest.mark.asyncio
+async def test_launched_release_blocks_replacement_and_state_stays_readable(harness):
+    repo, _worker, app = harness
+    job = _queued_job(repo)
+    async with _client(app) as client:
+        await _claim(client, job)
+        await client.post(f"{BASE}/jobs/{job.id}/prepare", json=_authority(epoch=1), headers=_headers())
+        released = await client.post(
+            f"{BASE}/jobs/{job.id}/release", json=_authority(epoch=1), headers=_headers()
+        )
+        assert released.status_code == 200, released.text
+        assert released.json()["status"] == "recovery_required"
+        assert released.json()["replacement_blocked"] is True
+
+        # Terminal state remains readable with the original authority.
+        state = await client.get(
+            f"{BASE}/jobs/{job.id}",
+            params={"lease_owner": "sup-A", "lease_epoch": 1, "attempt": 1},
+            headers=_headers(),
+        )
+        assert state.status_code == 200
+        assert state.json()["status"] == "recovery_required"
+
+
+@pytest.mark.asyncio
+async def test_recover_expired_lease_at_boundary(harness):
+    repo, _worker, app = harness
+    job = _queued_job(repo)
+    async with _client(app) as client:
+        await _claim(client, job)
+        await client.post(f"{BASE}/jobs/{job.id}/prepare", json=_authority(epoch=1), headers=_headers())
+        # Lapse the lease.
+        with repo.session_factory() as session:
+            from sqlalchemy import text as _text
+
+            session.execute(
+                _text("UPDATE strategy_jobs SET lease_until = :past WHERE id = :id"),
+                {"past": datetime.now(timezone.utc) - timedelta(minutes=1), "id": job.id},
+            )
+            session.commit()
+        recovered = await client.post(
+            f"{BASE}/jobs/{job.id}/recover", json=_authority(epoch=1), headers=_headers()
+        )
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["status"] == "recovery_required"
+        assert recovered.json()["replacement_blocked"] is True
+
+        # A live-lease job refuses recovery and must be fenced instead.
+        other = _queued_job(repo)
+        await _claim(client, other)
+        await client.post(f"{BASE}/jobs/{other.id}/prepare", json=_authority(epoch=1), headers=_headers())
+        refused = await client.post(
+            f"{BASE}/jobs/{other.id}/recover", json=_authority(epoch=1), headers=_headers()
+        )
+        assert refused.status_code == 409
+        assert refused.json()["detail"]["rejection_reason"] == "HOSTED_LEASE_STILL_LIVE"

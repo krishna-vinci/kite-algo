@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "HostedLifecycleError",
     "HostedLifecycleHooks",
+    "expire",
     "heartbeat",
     "job_state",
     "prepare_launch",
@@ -145,50 +146,83 @@ async def _fail_closed(
     *,
     strategy_repo: SqlAlchemyStrategyRepository,
     worker_repo: SqlAlchemyAlgoWorkerRepository,
-    job: StrategyJob,
+    job_id: str,
+    token_id: Optional[str],
     lease_owner: str,
     lease_epoch: int,
     attempt: int,
     reason: str,
-    token_id: Optional[str] = None,
-) -> None:
-    """Fence the attempt and revoke any child authority that may exist.
+) -> Dict[str, Any]:
+    """Best-effort cleanup after a failed preparation step.
 
-    Best-effort for the side effects, but each records durable state: a failure
-    here leaves the job visibly fenced, never silently resumable.
+    Revokes any child authority and fences the attempt to ``recovery_required``.
+    It is **best-effort and retryable**: it returns whether the durable fence was
+    actually written, and callers must report that honestly rather than claiming
+    that a failed write guarantees fencing. ``token_id`` is passed explicitly
+    (the reserved identity), because the job object loaded at the start of the
+    request does not yet contain it.
     """
     try:
-        strategy_repo.record_failure(
-            job.id,
+        await asyncio.to_thread(
+            strategy_repo.record_failure,
+            job_id,
             lease_owner=lease_owner,
             expected_lease_epoch=lease_epoch,
             expected_attempt=attempt,
             reason=reason,
         )
     except Exception:  # pragma: no cover - diagnostic only
-        logger.warning("hosted_lifecycle_record_failure_failed", extra={"job_id": job.id})
-    candidate = token_id or job.token_id
-    if candidate:
+        logger.warning("hosted_lifecycle_record_failure_failed", extra={"job_id": job_id})
+
+    revoked = False
+    if token_id:
         try:
-            await worker_repo.revoke_token(candidate)
+            revoked = (await worker_repo.revoke_token(token_id)) is not None
         except Exception:  # pragma: no cover - best effort
-            logger.warning("hosted_lifecycle_revoke_token_failed", extra={"job_id": job.id})
+            logger.warning("hosted_lifecycle_revoke_token_failed", extra={"job_id": job_id})
+
+    fenced = False
     try:
-        strategy_repo.mark_recovery_required(
-            job.id,
-            lease_owner=lease_owner,
-            expected_lease_epoch=lease_epoch,
-            expected_attempt=attempt,
+        fenced = bool(
+            await asyncio.to_thread(
+                strategy_repo.mark_recovery_required,
+                job_id,
+                lease_owner=lease_owner,
+                expected_lease_epoch=lease_epoch,
+                expected_attempt=attempt,
+            )
         )
-    except Exception:  # pragma: no cover - fencing is idempotent
-        logger.warning("hosted_lifecycle_mark_recovery_failed", extra={"job_id": job.id})
+    except Exception:  # pragma: no cover - fencing is idempotent/retryable
+        logger.warning("hosted_lifecycle_mark_recovery_failed", extra={"job_id": job_id})
+    return {"fenced": fenced, "revoked": revoked}
 
 
-def _child_token_actions() -> list:
-    # Hosted v1 is paper/dry_run only (job CHECK enforces the mode), so the child
-    # may submit paper intents and exit. It never receives ``heartbeat`` —
-    # lifecycle actions are supervisor-owned.
-    return strategy_service.child_run_token_actions(order_capable=True, notify=False)
+def _capability_actions(capabilities: Dict[str, bool]) -> list:
+    # Actions are derived from the version/job capability snapshot: trade grants
+    # paper order actions, notify grants notifications:publish, data grants the
+    # baseline read/log. ``heartbeat`` is never granted (lifecycle is
+    # supervisor-owned).
+    return strategy_service.capability_actions(capabilities)
+
+
+def _protection_runtime_state(
+    stale_exit_policy: str, progress_deadline_s: int
+) -> Optional[Dict[str, Any]]:
+    """Map the pinned stale-exit policy through the validated protection model.
+
+    Only ``exit_on_worker_stale`` is a supported hosted policy; it installs the
+    existing backend-protection runtime config so run creation validates it
+    through the same path as an external worker. The stale threshold is the
+    job's **pinned** progress deadline (clamped to the model's accepted range),
+    so the policy cannot drift with later config. ``none`` installs nothing.
+    """
+    if stale_exit_policy == "exit_on_worker_stale":
+        stale_sec = min(max(int(progress_deadline_s), 30), 86400)
+        return {
+            "enabled": True,
+            "operations": {"exit_on_worker_stale": True, "worker_stale_sec": stale_sec},
+        }
+    return None
 
 
 async def prepare_launch(
@@ -225,12 +259,40 @@ async def prepare_launch(
     if job.token_id is not None:
         raise HostedLifecycleError(409, "HOSTED_PREPARE_INCOMPLETE")
 
+    # Capabilities are parsed from the pinned snapshot BEFORE anything is
+    # minted or reserved. An ambiguous/marker-only legacy snapshot fails closed
+    # (no trading rights are inferred).
+    try:
+        capabilities = strategy_service.parse_capability_snapshot(job.capabilities_snapshot)
+    except strategy_service.StrategyValidationError as exc:
+        raise HostedLifecycleError(
+            409, "HOSTED_CAPABILITIES_AMBIGUOUS", detail=str(exc)
+        ) from exc
+
     strategy = await asyncio.to_thread(
         strategy_repo.get_strategy, job.owner_id, job.strategy_id
     )
     if strategy is None:
         raise HostedLifecycleError(409, "HOSTED_STRATEGY_MISSING")
     template_id = strategy_service.template_id_for(job.strategy_id)
+
+    async def _abort(reason: str, *, token: Optional[str], status_code: int, code: str):
+        cleanup = await _fail_closed(
+            strategy_repo=strategy_repo,
+            worker_repo=worker_repo,
+            job_id=job_id,
+            token_id=token,
+            lease_owner=lease_owner,
+            lease_epoch=lease_epoch,
+            attempt=attempt,
+            reason=reason,
+        )
+        raise HostedLifecycleError(
+            status_code,
+            code,
+            fencing="confirmed" if cleanup["fenced"] else "unconfirmed",
+            token_revoked=cleanup["revoked"],
+        )
 
     token_id, raw_token = hooks.token_factory()
     reserved = await asyncio.to_thread(
@@ -251,7 +313,7 @@ async def prepare_launch(
         name=f"{template_id}:attempt-{attempt}",
         account_scope=job.account_scope,
         allowed_modes=[job.execution_mode],
-        allowed_actions=_child_token_actions(),
+        allowed_actions=_capability_actions(capabilities),
         allowed_templates=[template_id],
         expires_at=expires_at,
         metadata={
@@ -259,22 +321,19 @@ async def prepare_launch(
             "hosted_job_id": job_id,
             "hosted_strategy_id": job.strategy_id,
             "hosted_attempt": int(attempt),
+            "hosted_capabilities": dict(capabilities),
         },
     )
 
     try:
         await worker_repo.create_token(token_payload, raw_token=raw_token, token_id=token_id)
     except Exception as exc:
-        await _fail_closed(
-            strategy_repo=strategy_repo,
-            worker_repo=worker_repo,
-            job=job,
-            lease_owner=lease_owner,
-            lease_epoch=lease_epoch,
-            attempt=attempt,
-            reason=f"token_mint_failed: {type(exc).__name__}",
+        await _abort(
+            f"token_mint_failed: {type(exc).__name__}",
+            token=token_id,
+            status_code=503,
+            code="HOSTED_TOKEN_MINT_FAILED",
         )
-        raise HostedLifecycleError(503, "HOSTED_TOKEN_MINT_FAILED") from exc
 
     child_token = WorkerToken(
         token_id=token_id,
@@ -286,6 +345,22 @@ async def prepare_launch(
         status="active",
         expires_at=expires_at,
     )
+
+    stale_exit_policy = str((job.policy_snapshot or {}).get("stale_exit_policy") or "none")
+    runtime_state: Dict[str, Any] = {
+        "hosted": {
+            "job_id": job_id,
+            "strategy_id": job.strategy_id,
+            "attempt": int(attempt),
+            "version_id": job.version_id,
+            "capabilities": dict(capabilities),
+        }
+    }
+    protection = _protection_runtime_state(stale_exit_policy, job.progress_deadline_s)
+    if protection is not None:
+        # Installed through the same validated run-creation path as an external
+        # worker: run creation normalizes it and seeds the protection state.
+        runtime_state["backend_protection"] = protection
 
     run_id = hooks.run_id_factory()
     run_payload = WorkerRunCreateRequest(
@@ -301,105 +376,77 @@ async def prepare_launch(
             "hosted_strategy_id": job.strategy_id,
             "hosted_attempt": int(attempt),
             "hosted_params": dict(job.params_snapshot or {}),
+            "hosted_capabilities": dict(capabilities),
+            "hosted_stale_exit_policy": stale_exit_policy,
         },
-        runtime_state={
-            "hosted": {
-                "job_id": job_id,
-                "strategy_id": job.strategy_id,
-                "attempt": int(attempt),
-                "version_id": job.version_id,
-            }
-        },
+        runtime_state=runtime_state,
     )
 
     try:
         await create_worker_run_for_token(request, child_token, run_payload, strategy_run_id=run_id)
     except Exception as exc:
-        await _fail_closed(
-            strategy_repo=strategy_repo,
-            worker_repo=worker_repo,
-            job=job,
-            lease_owner=lease_owner,
-            lease_epoch=lease_epoch,
-            attempt=attempt,
-            reason="run_create_failed",
-            token_id=token_id,
+        await _abort(
+            "run_create_failed",
+            token=token_id,
+            status_code=503,
+            code="HOSTED_RUN_CREATE_FAILED",
         )
-        raise HostedLifecycleError(503, "HOSTED_RUN_CREATE_FAILED") from exc
 
-    recorded = await asyncio.to_thread(
-        strategy_repo.record_child_run,
-        job_id,
-        lease_owner=lease_owner,
-        expected_lease_epoch=lease_epoch,
-        expected_attempt=attempt,
-        token_id=token_id,
-        run_id=run_id,
-    )
+    try:
+        recorded = await asyncio.to_thread(
+            strategy_repo.record_child_run,
+            job_id,
+            lease_owner=lease_owner,
+            expected_lease_epoch=lease_epoch,
+            expected_attempt=attempt,
+            token_id=token_id,
+            run_id=run_id,
+        )
+    except Exception:
+        recorded = False
     if not recorded:
-        await _fail_closed(
-            strategy_repo=strategy_repo,
-            worker_repo=worker_repo,
-            job=job,
-            lease_owner=lease_owner,
-            lease_epoch=lease_epoch,
-            attempt=attempt,
-            reason="run_record_failed",
-            token_id=token_id,
+        await _abort(
+            "run_record_failed",
+            token=token_id,
+            status_code=409,
+            code="HOSTED_PREPARE_INCOMPLETE",
         )
-        raise HostedLifecycleError(409, "HOSTED_PREPARE_INCOMPLETE")
 
-    claimed = await worker_repo.claim_run_session(
-        run_id,
-        freshness_seconds=WORKER_SESSION_FRESHNESS_SECONDS,
-        claimed_without_heartbeat_seconds=WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
-    )
-    if claimed is None:
-        await _fail_closed(
-            strategy_repo=strategy_repo,
-            worker_repo=worker_repo,
-            job=job,
-            lease_owner=lease_owner,
-            lease_epoch=lease_epoch,
-            attempt=attempt,
-            reason="session_claim_failed",
-            token_id=token_id,
+    try:
+        claimed = await worker_repo.claim_run_session(
+            run_id,
+            freshness_seconds=WORKER_SESSION_FRESHNESS_SECONDS,
+            claimed_without_heartbeat_seconds=WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
         )
-        raise HostedLifecycleError(503, "HOSTED_SESSION_CLAIM_FAILED")
-    session_nonce = str(claimed.get("worker_session_nonce") or "")
+    except Exception:
+        claimed = None
+    session_nonce = str((claimed or {}).get("worker_session_nonce") or "")
     if not session_nonce:
-        await _fail_closed(
-            strategy_repo=strategy_repo,
-            worker_repo=worker_repo,
-            job=job,
-            lease_owner=lease_owner,
-            lease_epoch=lease_epoch,
-            attempt=attempt,
-            reason="session_nonce_missing",
-            token_id=token_id,
+        await _abort(
+            "session_claim_failed",
+            token=token_id,
+            status_code=503,
+            code="HOSTED_SESSION_CLAIM_FAILED",
         )
-        raise HostedLifecycleError(503, "HOSTED_SESSION_CLAIM_FAILED")
 
-    handed_off = await asyncio.to_thread(
-        strategy_repo.mark_running_and_handoff,
-        job_id,
-        lease_owner=lease_owner,
-        expected_lease_epoch=lease_epoch,
-        expected_attempt=attempt,
-        run_id=run_id,
-    )
-    if not handed_off:
-        await _fail_closed(
-            strategy_repo=strategy_repo,
-            worker_repo=worker_repo,
-            job=job,
+    try:
+        handed_off = await asyncio.to_thread(
+            strategy_repo.mark_running_and_handoff,
+            job_id,
             lease_owner=lease_owner,
-            lease_epoch=lease_epoch,
-            attempt=attempt,
-            reason="handoff_mark_failed",
-            token_id=token_id,
+            expected_lease_epoch=lease_epoch,
+            expected_attempt=attempt,
+            run_id=run_id,
         )
-        raise HostedLifecycleError(409, "HOSTED_PREPARE_INCOMPLETE")
+    except Exception:
+        handed_off = False
+    if not handed_off:
+        await _abort(
+            "handoff_mark_failed",
+            token=token_id,
+            status_code=409,
+            code="HOSTED_PREPARE_INCOMPLETE",
+        )
 
     return {
         "job_id": job_id,
@@ -415,7 +462,7 @@ async def prepare_launch(
         "params": dict(job.params_snapshot or {}),
         "max_duration_s": int(job.max_duration_s),
         "progress_deadline_s": int(job.progress_deadline_s),
-        "stale_exit_policy": str((job.policy_snapshot or {}).get("stale_exit_policy") or "none"),
+        "stale_exit_policy": stale_exit_policy,
     }
 
 
@@ -476,10 +523,21 @@ async def release(
     lease_epoch: int,
     attempt: int,
 ) -> Dict[str, Any]:
-    """Runner-owned stop: release the session, revoke the child, mark stopped.
+    """Runner-owned stop: withdraw authority, then decide replacement safety.
 
-    This is not a cancellation or flatten acknowledgement: open exposure may
-    remain and is reconciled separately.
+    Stopping code/session authority is **not** exposure reconciliation. The
+    server decides the terminal state from persisted evidence, never from a
+    caller-supplied "flat" assertion:
+
+    - an **unlaunched** attempt (no credential was ever handed off) could not
+      have accepted work, so it is safely marked ``stopped`` and replacement is
+      allowed;
+    - a **launched** attempt may have accepted work, so it is fenced to
+      ``recovery_required`` and its replacement stays blocked until explicit
+      reconciliation.
+
+    Either way the session is released and the child token revoked. Open exposure
+    is never asserted to be flat.
     """
     job = await asyncio.to_thread(strategy_repo.get_job_by_id, job_id)
     job = require_job_authority(
@@ -492,6 +550,25 @@ async def release(
             await worker_repo.release_run_session(job.run_id, expected_nonce=nonce)
     if job.token_id:
         await worker_repo.revoke_token(job.token_id)
+
+    launched = job.handoff_at is not None
+    if launched:
+        fenced = await asyncio.to_thread(
+            strategy_repo.mark_recovery_required,
+            job_id,
+            lease_owner=lease_owner,
+            expected_lease_epoch=lease_epoch,
+            expected_attempt=attempt,
+        )
+        if not fenced:
+            raise HostedLifecycleError(409, "HOSTED_RELEASE_REFUSED")
+        return {
+            "status": "recovery_required",
+            "job_id": job_id,
+            "replacement_blocked": True,
+            "reason": "launched_attempt_requires_reconciliation",
+        }
+
     stopped = await asyncio.to_thread(
         strategy_repo.mark_stopped,
         job_id,
@@ -501,7 +578,60 @@ async def release(
     )
     if not stopped:
         raise HostedLifecycleError(409, "HOSTED_RELEASE_REFUSED")
-    return {"status": "stopped", "job_id": job_id}
+    return {
+        "status": "stopped",
+        "job_id": job_id,
+        "replacement_blocked": False,
+        "reason": "unlaunched_attempt",
+    }
+
+
+async def expire(
+    *,
+    strategy_repo: SqlAlchemyStrategyRepository,
+    worker_repo: SqlAlchemyAlgoWorkerRepository,
+    job_id: str,
+    lease_owner: str,
+    lease_epoch: int,
+    attempt: int,
+    reason: str = "lease_expired",
+) -> Dict[str, Any]:
+    """Authenticated lease-loss recovery for an EXPIRED attempt.
+
+    The ordinary ``fence`` requires a live lease, so an attempt whose lease has
+    already lapsed cannot be fenced through it. This path authorizes by full
+    identity (id + ``lease_owner`` + epoch + attempt) but **only** accepts an
+    expired lease for a live attempt; it never renews a lease and never restores
+    execution authority — it durably fences the attempt to ``recovery_required``
+    and revokes the child token. A still-live lease is refused (use ``fence``).
+    """
+    job = await asyncio.to_thread(strategy_repo.get_job_by_id, job_id)
+    job = require_job_authority(
+        job,
+        lease_owner=lease_owner,
+        lease_epoch=lease_epoch,
+        attempt=attempt,
+        require_live_lease=False,
+    )
+    if job.lease_until is not None and _as_utc(job.lease_until) > _utcnow():
+        raise HostedLifecycleError(409, "HOSTED_LEASE_STILL_LIVE")
+    if job.token_id:
+        await worker_repo.revoke_token(job.token_id)
+    fenced = await asyncio.to_thread(
+        strategy_repo.expire_to_recovery_authorized,
+        job_id,
+        lease_owner=lease_owner,
+        expected_lease_epoch=lease_epoch,
+        expected_attempt=attempt,
+    )
+    if not fenced:
+        raise HostedLifecycleError(409, "HOSTED_FENCE_REFUSED")
+    return {
+        "status": "recovery_required",
+        "job_id": job_id,
+        "replacement_blocked": True,
+        "reason": reason,
+    }
 
 
 async def fence(

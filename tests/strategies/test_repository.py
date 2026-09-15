@@ -531,3 +531,80 @@ def test_create_schedule_rejects_wrong_owner_and_version(repo):
             execution_mode="paper",
             at_time="09:15",
         )
+
+
+# ---------------------------------------------------------------------------
+# authorized expired-lease recovery + retained attribution
+# ---------------------------------------------------------------------------
+
+
+def _expire_lease(factory, job):
+    with factory() as session:
+        session.execute(
+            text("UPDATE strategy_jobs SET lease_until = :past WHERE id = :id"),
+            {"past": datetime.now(timezone.utc) - timedelta(minutes=1), "id": job.id},
+        )
+        session.commit()
+
+
+def test_expire_to_recovery_authorized_requires_identity_and_expired_lease(repo, factory):
+    strategy = _strategy(repo)
+    version = _version(repo, strategy.id)
+    job = _job(repo, strategy, version)
+    _claim(repo, job, epoch=0, attempt=1)
+
+    # A still-live lease is not recoverable through the expired path.
+    assert (
+        repo.expire_to_recovery_authorized(
+            job.id, lease_owner="sup-A", expected_lease_epoch=1, expected_attempt=1
+        )
+        is False
+    )
+
+    _expire_lease(factory, job)
+    # Wrong owner / epoch / attempt are all refused even when expired.
+    assert (
+        repo.expire_to_recovery_authorized(
+            job.id, lease_owner="sup-B", expected_lease_epoch=1, expected_attempt=1
+        )
+        is False
+    )
+    assert (
+        repo.expire_to_recovery_authorized(
+            job.id, lease_owner="sup-A", expected_lease_epoch=0, expected_attempt=1
+        )
+        is False
+    )
+    assert (
+        repo.expire_to_recovery_authorized(
+            job.id, lease_owner="sup-A", expected_lease_epoch=1, expected_attempt=2
+        )
+        is False
+    )
+    assert (
+        repo.expire_to_recovery_authorized(
+            job.id, lease_owner="sup-A", expected_lease_epoch=1, expected_attempt=1
+        )
+        is True
+    )
+    persisted = repo.get_job(OWNER, job.id)
+    assert persisted.status == "recovery_required"
+    # Attribution retained so an authorized state read still works.
+    assert persisted.lease_owner == "sup-A"
+    assert persisted.lease_until is None
+
+
+def test_mark_recovery_required_retains_lease_attribution(repo):
+    strategy = _strategy(repo)
+    version = _version(repo, strategy.id)
+    job = _job(repo, strategy, version)
+    _claim(repo, job, epoch=0, attempt=1)
+    assert (
+        repo.mark_recovery_required(
+            job.id, lease_owner="sup-A", expected_lease_epoch=1, expected_attempt=1
+        )
+        is True
+    )
+    persisted = repo.get_job(OWNER, job.id)
+    assert persisted.lease_owner == "sup-A"
+    assert persisted.lease_until is None

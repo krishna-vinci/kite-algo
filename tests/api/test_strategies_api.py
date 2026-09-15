@@ -300,3 +300,56 @@ async def test_there_is_no_lifecycle_route_in_this_slice(session_factory, monkey
         sid = created["strategy_id"]
         for suffix in ("start", "stop", "cancel", "flatten"):
             assert (await client.post(f"{BASE}/{sid}/{suffix}")).status_code in (404, 405)
+
+
+# ---------------------------------------------------------------------------
+# capability snapshot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_version_defaults_to_data_only_capabilities(session_factory, monkeypatch):
+    async with _client(session_factory, monkeypatch) as client:
+        created = await _create(client)
+        response = await client.post(
+            f"{BASE}/{created['strategy_id']}/versions", json={"source": "x"}
+        )
+        assert response.status_code == 200
+        snapshot = response.json()["capabilities_snapshot"]
+        assert snapshot["capabilities"] == {"trade": False, "notify": False, "data": True}
+        assert snapshot["schema_version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_version_accepts_explicit_capabilities(session_factory, monkeypatch):
+    async with _client(session_factory, monkeypatch) as client:
+        created = await _create(client)
+        response = await client.post(
+            f"{BASE}/{created['strategy_id']}/versions",
+            json={"source": "x", "capabilities": {"trade": True, "notify": True}},
+        )
+        assert response.status_code == 200
+        assert response.json()["capabilities_snapshot"]["capabilities"] == {
+            "trade": True,
+            "notify": True,
+            "data": True,
+        }
+
+
+@pytest.mark.asyncio
+async def test_version_rejects_unknown_or_non_boolean_capabilities(session_factory, monkeypatch):
+    async with _client(session_factory, monkeypatch) as client:
+        created = await _create(client)
+        sid = created["strategy_id"]
+        assert (
+            await client.post(
+                f"{BASE}/{sid}/versions",
+                json={"source": "x", "capabilities": {"heartbeat": True}},
+            )
+        ).status_code == 422
+        assert (
+            await client.post(
+                f"{BASE}/{sid}/versions",
+                json={"source": "x", "capabilities": {"trade": "yes"}},
+            )
+        ).status_code == 422

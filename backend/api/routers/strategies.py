@@ -230,6 +230,7 @@ async def create_version(
     try:
         source, digest = service.validate_source(payload.source)
         schema = service.validate_parameters_schema(payload.parameters_schema)
+        capabilities = service.validate_capabilities(payload.capabilities)
     except service.StrategyValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
@@ -238,7 +239,7 @@ async def create_version(
             source=source,
             source_sha256=digest,
             parameters_schema=schema,
-            capabilities_snapshot=service.build_capabilities_snapshot(),
+            capabilities_snapshot=capabilities,
             created_by=owner,
         )
     except StrategyConflict as exc:

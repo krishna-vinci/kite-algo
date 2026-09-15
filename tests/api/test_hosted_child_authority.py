@@ -27,6 +27,7 @@ from sqlalchemy.pool import StaticPool  # noqa: E402
 
 from backend.api.routers import worker_auth as worker_auth_router  # noqa: E402
 from backend.api.routers import worker_execution as worker_execution_router  # noqa: E402
+from backend.options.api.worker_options_router import router as worker_options_router  # noqa: E402
 from backend.shared.serialization import _hash_token  # noqa: E402
 from backend.strategies import models  # noqa: F401,E402
 from backend.strategies.repository import SqlAlchemyStrategyRepository  # noqa: E402
@@ -161,6 +162,7 @@ def harness():
     app = FastAPI()
     app.include_router(worker_auth_router.router, prefix="/api")
     app.include_router(worker_execution_router.router, prefix="/api")
+    app.include_router(worker_options_router)
     app.state.algo_worker_repository = worker
     app.state.strategies_session_factory = factory
     app.state.journal_service = StubJournalService()
@@ -264,6 +266,47 @@ async def test_hosted_mutation_refused_when_lease_expired(harness):
         )
         assert response.status_code == 409
         assert response.json()["detail"]["rejection_reason"] == "HOSTED_LEASE_EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_hosted_token_cannot_mutate_options_without_a_bound_run(harness):
+    _repo, _worker, app, _job, _run_id, _t, _f = harness
+    async with _client(app) as client:
+        # An options id with no corresponding worker run must fail closed.
+        response = await client.post(
+            f"{BASE}/worker/options/runs/run_does_not_exist/enter",
+            headers=_child_headers(),
+            json={},
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"]["rejection_reason"] == "HOSTED_CHILD_RUN_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_hosted_token_cannot_mutate_another_tokens_options_run(harness):
+    _repo, _worker, app, _job, _run_id, _t, _f = harness
+    async with _client(app) as client:
+        # run_external_1 exists but is bound to the external token.
+        response = await client.post(
+            f"{BASE}/worker/options/runs/run_external_1/enter",
+            headers=_child_headers(),
+            json={},
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"]["rejection_reason"] == "HOSTED_CHILD_RUN_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_hosted_token_cannot_create_unbound_options_run(harness):
+    _repo, _worker, app, _job, _run_id, _t, _f = harness
+    async with _client(app) as client:
+        response = await client.post(
+            f"{BASE}/worker/options/runs",
+            headers=_child_headers(),
+            json={"strategy_name": "x", "product": "MIS", "legs": []},
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"]["rejection_reason"] == "HOSTED_CHILD_RUN_REQUIRED"
 
 
 @pytest.mark.asyncio

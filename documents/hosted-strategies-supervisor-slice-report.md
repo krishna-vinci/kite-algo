@@ -1,6 +1,8 @@
 # Hosted-strategy supervisor lifecycle — slice report (H1a)
 
-**Base:** `c666343` (hosted-strategy schema + authorization foundation)
+**Base:** `c666343` (hosted-strategy schema + authorization foundation).
+**Closed on:** the reviewed lifecycle-closure fixes applied on top of `f58333b`
+(see §1.6). This revision corrects the earlier report's baseline evidence (§3).
 **Scope:** supervisor lifecycle API, worker-run/session integration, child
 credential handoff, hosted-attempt enforcement, SDK attach-only.
 
@@ -38,8 +40,9 @@ All routes require the supervisor credential **before any job detail is read**.
 | GET | `/api/hosted-supervisor/jobs/{job_id}` | Authoritative job state |
 | POST | `/api/hosted-supervisor/jobs/{job_id}/prepare` | Prepare launch + one-time child handoff |
 | POST | `/api/hosted-supervisor/jobs/{job_id}/heartbeat` | Runner-owned lease + session heartbeat |
-| POST | `/api/hosted-supervisor/jobs/{job_id}/release` | Runner-owned stop (release session, revoke child, mark stopped) |
-| POST | `/api/hosted-supervisor/jobs/{job_id}/fence` | Fence to `recovery_required` + revoke child |
+| POST | `/api/hosted-supervisor/jobs/{job_id}/release` | Runner-owned stop (release session, revoke child, decide replacement safety) |
+| POST | `/api/hosted-supervisor/jobs/{job_id}/fence` | Fence a **live** attempt to `recovery_required` + revoke child |
+| POST | `/api/hosted-supervisor/jobs/{job_id}/recover` | Authenticated lease-loss recovery for an **expired** attempt |
 
 Authority on every mutation is the **persisted job** `lease_owner` /
 `lease_epoch` / `attempt` (plus a live, non-expired lease and a permitted
@@ -73,11 +76,17 @@ INSERT.
   routes reject a `hosted:` run outright (`HOSTED_CHILD_LIFECYCLE_FORBIDDEN`),
   independent of token composition. Lifecycle authority is the supervisor's,
   via the lifecycle API.
-- The child token is minted with `runs:read`, `runs:log` and the paper order
-  actions and **never** `heartbeat`. Hosted v1 is paper/dry_run by
-  construction (job CHECK).
+- **Options surface is bound to the worker run.** The options routes do not
+  require a worker run, so a hosted token must additionally be bound: a hosted
+  credential that selects an options id with no corresponding worker run, or a
+  run owned by another token, is refused (`HOSTED_CHILD_RUN_REQUIRED`) rather
+  than silently skipping the guard. External tokens are unchanged. Unsupported
+  hosted options modes stay closed; this does not add live options execution.
+- **Child token actions come from the pinned capability snapshot** (see 1.6).
 - **External workers are unchanged:** the guard is a no-op for any non-`hosted:`
-  template; a regression test pins external claim-session behavior.
+  template and the token pre-filter never touches the strategies store for an
+  ordinary external token; a regression test pins external claim-session
+  behavior.
 
 ### 1.4 SDK attach-only (`sdk/python/kite_algo_worker/client.py`)
 
@@ -97,6 +106,46 @@ endpoint manifest is unchanged.
 `20260915_000020`, `schema.sql` parity, ORM parity). `handoff_at` is the durable
 evidence that a credential was handed off; `last_error` is a short, non-secret
 diagnostic. Neither stores a credential.
+
+### 1.6 Lifecycle closure (review fixes)
+
+- **Lease-loss recovery (`/recover`).** The ordinary `fence` requires a live
+  lease, so an expired attempt could not be fenced through the API. A distinct,
+  credential-authenticated path now authorizes by full identity (id +
+  `lease_owner` + `lease_epoch` + `attempt`) and requires the lease to have
+  **expired**; it durably fences to `recovery_required` and revokes the child
+  token. It never renews a lease or restores execution authority, a still-live
+  lease is refused (`HOSTED_LEASE_STILL_LIVE`, use `fence`), and a stale or
+  unrelated identity is refused (403). Repository primitive:
+  `expire_to_recovery_authorized`.
+- **Release vs replacement.** Stopping code/session authority is not exposure
+  reconciliation. The server decides: an **unlaunched** attempt (no credential
+  ever handed off) is marked `stopped` and replacement is allowed; a
+  **launched** attempt may have accepted work, so it is fenced to
+  `recovery_required` and replacement stays blocked until explicit
+  reconciliation. There is no caller-supplied `flat=true` shortcut. The
+  response carries `replacement_blocked`.
+- **Effective configuration.** Child token actions are derived from the pinned
+  capability snapshot, not hardcoded. `capabilities_snapshot` has an explicit
+  schema (`schema_version: 2`, `{data, trade, notify}`); `trade` grants the
+  paper order actions, `notify` grants `notifications:publish`, `data` the
+  baseline read/log. A missing/legacy-marker-only/ambiguous snapshot **fails
+  closed** (`HOSTED_CAPABILITIES_AMBIGUOUS`) before anything is reserved or
+  minted. The store accepts explicit `capabilities` on version creation
+  (default data-only; unknown/non-boolean → 422). The pinned stale-exit policy
+  is mapped through the validated run-creation path into the run's
+  `backend_protection` config (`exit_on_worker_stale` with a pinned stale
+  threshold); `none` installs no protection.
+- **Preparation failure handling.** Every durable step — `record_child_run`,
+  `claim_run_session`, `mark_running_and_handoff` — is wrapped; failures fence
+  the job and revoke using the **reserved** token id (not the stale job object).
+  Cleanup is best-effort and retryable, and the error honestly reports
+  `fencing: confirmed | unconfirmed` rather than claiming a failed write
+  guarantees fencing.
+- **Terminal observability.** Terminal transitions retain `lease_owner` /
+  `lease_epoch` / `attempt` as attribution (only `lease_until` is cleared), so an
+  authorized `GET /jobs/{id}` still works after `release`/`fence`/`recover`
+  without restoring mutation authority (heartbeat/prepare remain refused).
 
 ---
 
@@ -127,7 +176,7 @@ Targeted suites (SQLite):
   tests/api/test_hosted_lifecycle_api.py \
   tests/api/test_hosted_child_authority.py \
   tests/sdk -q
-→ 505 passed, 1 skipped
+→ 529 passed, 1 skipped
 ```
 
 Disposable PostgreSQL (real concurrency; own invocation):
@@ -136,30 +185,50 @@ Disposable PostgreSQL (real concurrency; own invocation):
 HOSTED_FOUNDATION_PG_URL='postgresql://postgres:testonly@127.0.0.1:15433/kite_test' \
   .venv/bin/python -m pytest \
     tests/integration/test_hosted_supervisor_lifecycle_postgres.py -q
-→ 3 passed        # concurrent prepare ⇒ one credential/run; reservation CAS one winner; columns present
+→ 5 passed        # concurrent prepare ⇒ one credential/run; reservation CAS one winner;
+                  # columns present; launched release blocks replacement; racing recover one fence
 
 HOSTED_FOUNDATION_PG_URL='...' \
   .venv/bin/python -m pytest \
     tests/integration/test_hosted_strategy_foundation_postgres.py -q
-→ 9 passed        # chain still applies with 000020
+→ 9 passed        # chain still applies
 ```
 
 `alembic heads` → single head `20260915_000020`. `git diff --check` clean.
 
 **New tests:** supervisor auth (default-deny, wrong/absent credential, rotation);
 lifecycle state machine (happy path, repeat, partial, wrong owner/epoch/attempt,
-expired lease, failures between token/run/session steps, heartbeat ≠ progress,
-release, fence); HTTP boundary (auth before job detail, claim/state, unrelated
-authority 403, one-time handoff, repeat fails closed); child authority (session
-lifecycle forbidden, fenced/expired/mismatched mutations, external compat);
-SDK attach-only; PostgreSQL concurrency.
+expired lease, failures between token/run/session/handoff steps, incomplete
+cleanup reported honestly, heartbeat ≠ progress); lease-loss recovery (expired
+lease fences, live lease refused, stale identity refused, no re-gain of
+authority); release vs replacement (launched blocks, unlaunched allows, actual
+create_job blocked/allowed); capability composition (trade/data-only/notify-only
+and legacy marker-only fail-closed); pinned protection policy mapping; terminal
+state reads; HTTP boundary (auth before job detail, claim/state, unrelated
+authority 403, one-time handoff, repeat no second credential, recover);
+child authority (session lifecycle forbidden, fenced/expired/mismatched
+mutations, options run-binding boundary, external compat); SDK attach-only; and
+the PostgreSQL concurrency checks above.
 
-**Unrelated pre-existing failures observed** (not caused by this slice, and not
-touched by it): `tests/api/test_auth_*`, `test_control_plane_api`,
+**Unrelated pre-existing failures — corrected baseline evidence.** The earlier
+report compared only `backend/api/routers/__init__.py`, which is *not* a complete
+baseline for this commit (it also changes shared services and worker routes).
+The corrected comparison stashes **all** tracked changes of this slice
+(`backend`, `sdk`, `tests`) and re-runs:
+
+| Scope | Baseline (slice stashed) | Current (slice applied) |
+| --- | --- | --- |
+| `tests/api tests/options` | 46 failed, 507 passed | 46 failed, 515 passed |
+
+The failure **set and count are identical** (the 8 added passes are this slice's
+new tests), so no regression is attributable to this slice. Causes of those
+pre-existing failures: `tests/api/test_auth_*`, `test_control_plane_api`,
 `test_public_runtime_config` fail on `ModuleNotFoundError:
 backend.app.runtime_public_config`; a subset of `tests/options` fails on
-`OptionRunCreateRequest` model drift. Both reproduce with the slice's
-`backend/api/routers/__init__.py` reverted.
+`OptionRunCreateRequest`/route-test drift. A smaller pre-existing set also fails
+when only `tests/options` is collected first, due to an import cycle in
+`worker_options_router` → `worker_protection` → `routers/__init__`; it is
+independent of this slice (reproduces with the slice stashed).
 
 ---
 
@@ -185,12 +254,22 @@ backend.app.runtime_public_config`; a subset of `tests/options` fails on
   loss revokes authority and marks `recovery_required`; it does not replay and
   does not reuse the old run with a replacement token. A new attempt needs a new
   run and token and cannot start until reconciliation.
+- **Lease loss has two entry points.** `fence` handles a live lease; `recover`
+  handles an already-expired lease under the same full identity. Neither renews
+  a lease nor restores execution authority, and neither resurrects an expired
+  attempt.
 - **Heartbeat is not progress and not health.** `heartbeat` renews the job lease
   and records the worker-session heartbeat; it never writes `last_progress_at`.
   Runner liveness and child progress are separate signals.
-- **Stop/revoke ≠ cancel/flatten.** `release` stops launching, releases the
-  session, revokes the child and marks the job `stopped`; it does not claim
-  cancellation or flatness, and any exposure remains to be reconciled.
+- **Stop/revoke ≠ cancel/flatten.** `release` withdraws session and token
+  authority and then decides replacement safety from persisted evidence: an
+  unlaunched attempt is `stopped` (replacement allowed); a launched attempt is
+  `recovery_required` (replacement blocked). Open exposure is never asserted to
+  be flat, and there is no caller-supplied flatness flag.
+- **Cleanup honesty.** A preparation failure records `fencing: confirmed` only
+  when the durable fence was actually written; otherwise it reports
+  `unconfirmed` and the attempt is left retryable (the job remains in a
+  pre-terminal state so the fence can be re-driven).
 
 ---
 
@@ -205,22 +284,31 @@ backend.app.runtime_public_config`; a subset of `tests/options` fails on
 - `prepare` returns the child config to the supervisor but nothing consumes it
   yet; the child SDK attach path is available but a hosted child is never
   launched in this slice.
+- **Capability declaration is now required for trading.** A version saved without
+  explicit `capabilities` is data-only, and any pre-existing marker-only snapshot
+  fails closed at `prepare`. Existing foundation-era versions must be re-saved
+  with explicit capabilities before they can trade.
 - Options fail-closed mode propagation and the futures contract resolver remain
-  out of scope (later H1/H2 work).
+  out of scope (later H1/H2 work). The options boundary above binds hosted
+  tokens to their worker run but does not add live options execution.
 - Operator Cancel/Flatten adapters after child-token revocation remain to be
   built (an app-authorized backend adapter, not the revoked child credential).
+  Reconciliation after `release`/`fence`/`recover` still has no operator API.
 - The `handoff_at`-based protocol intentionally does not distinguish a lost
   response from a benign duplicate; both return 409 without re-issuing. The
-  supervisor must call `fence`/`release` when it did not receive a credential.
+  supervisor must call `fence` (live lease) or `recover` (expired lease) when it
+  did not receive a credential.
 
 ### Handoff to the process-supervision slice
 
 Implement `backend/strategies/supervisor.py` (or a runner entrypoint) that:
 claims due jobs via `POST .../claim`; calls `prepare` exactly once and treats a
-409 as "do not replay — fence/release"; writes the returned config into the
-child's restricted environment (never persisting the token to logs); spawns one
-child with `start_new_session=True` and rlimits; records identity; heartbeats via
-the lifecycle API on a schedule; and on lease loss or a stale progress deadline
-calls `fence` and requires operator reconciliation. Add a child progress
-endpoint (and `ManagedRun.progress`) so `last_progress_at` is written by the
-child, never by the parent heartbeat.
+409 as "do not replay — `fence` a live lease / `recover` an expired one"; writes
+the returned config into the child's restricted environment (never persisting
+the token to logs); spawns one child with `start_new_session=True` and rlimits;
+records identity; heartbeats via the lifecycle API on a schedule; and on lease
+loss calls `recover` (expired) or `fence` (live), or on a stale progress deadline
+calls `fence`, then requires operator reconciliation. Declare `trade`/`notify`
+capabilities when saving versions. Add a child progress endpoint (and
+`ManagedRun.progress`) so `last_progress_at` is written by the child, never by
+the parent heartbeat.

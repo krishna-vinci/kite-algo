@@ -53,10 +53,15 @@ __all__ = [
     "MAX_PARAMS_BYTES",
     "MAX_SCHEMA_BYTES",
     "MAX_SOURCE_BYTES",
+    "CAPABILITY_KEYS",
+    "CAPABILITY_SCHEMA_VERSION",
     "StrategyValidationError",
     "build_capabilities_snapshot",
     "build_policy_snapshot",
+    "capability_actions",
     "child_run_token_actions",
+    "parse_capability_snapshot",
+    "validate_capabilities",
     "new_job_id",
     "new_schedule_id",
     "new_strategy_id",
@@ -426,17 +431,112 @@ def validate_schedule(
 # ---------------------------------------------------------------------------
 
 
+#: Capabilities a hosted version may declare. ``trade`` grants the paper order
+#: actions, ``notify`` grants run-scoped notification publish, ``data`` is the
+#: baseline read/log capability. A snapshot that does not clearly declare these
+#: is *ambiguous* and confers NO trading rights.
+CAPABILITY_KEYS = ("data", "trade", "notify")
+#: Current capability snapshot schema. Earlier marker-only snapshots (schema 1,
+#: which recorded no capability entries) are treated as ambiguous and fail closed.
+CAPABILITY_SCHEMA_VERSION = 2
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def build_capabilities_snapshot() -> Dict[str, Any]:
-    """The capability snapshot recorded on a version/job.
+def build_capabilities_snapshot(
+    *,
+    trade: bool = False,
+    notify: bool = False,
+    data: bool = True,
+) -> Dict[str, Any]:
+    """Build a canonical capability snapshot.
 
-    Slice 0 has no dynamic capability registry (no runner/SDK features are
-    wired yet), so this records a stable marker rather than inventing entries.
+    The default is deliberately **data-only** (no trading): a version that does
+    not explicitly ask for trading rights cannot silently receive them.
     """
-    return {"schema_version": 1, "captured_at": _utcnow_iso(), "source": "hosted_strategy_foundation"}
+    for label, value in (("trade", trade), ("notify", notify), ("data", data)):
+        if not isinstance(value, bool):
+            raise StrategyValidationError(f"capability '{label}' must be a boolean")
+    return {
+        "schema_version": CAPABILITY_SCHEMA_VERSION,
+        "capabilities": {"trade": trade, "notify": notify, "data": data},
+        "captured_at": _utcnow_iso(),
+    }
+
+
+def validate_capabilities(payload: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Validate an author-supplied capability request into a canonical snapshot.
+
+    ``None``/``{}`` means data-only. Unknown keys and non-boolean values are
+    rejected (422 at the store).
+    """
+    if payload in (None, {}):
+        return build_capabilities_snapshot()
+    if not isinstance(payload, Mapping):
+        raise StrategyValidationError("capabilities must be a JSON object")
+    unknown = sorted(set(payload) - set(CAPABILITY_KEYS))
+    if unknown:
+        raise StrategyValidationError(
+            "unsupported capabilities: " + ", ".join(unknown)
+        )
+    for key in CAPABILITY_KEYS:
+        if key in payload and not isinstance(payload[key], bool):
+            raise StrategyValidationError(f"capability '{key}' must be a boolean")
+    return build_capabilities_snapshot(
+        trade=bool(payload.get("trade", False)),
+        notify=bool(payload.get("notify", False)),
+        data=bool(payload.get("data", True)),
+    )
+
+
+def parse_capability_snapshot(snapshot: Optional[Mapping[str, Any]]) -> Dict[str, bool]:
+    """Parse a stored capability snapshot into ``{data, trade, notify}``.
+
+    **Fails closed** for anything ambiguous: a missing snapshot, a marker-only
+    legacy snapshot (``schema_version`` 1, no ``capabilities`` map), an unknown
+    schema version, extra keys, or non-boolean values all raise. A caller that
+    cannot positively prove trading rights is not granted any.
+    """
+    if not isinstance(snapshot, Mapping):
+        raise StrategyValidationError("capability snapshot is missing or malformed")
+    if snapshot.get("schema_version") != CAPABILITY_SCHEMA_VERSION:
+        raise StrategyValidationError(
+            "capability snapshot is unsupported/ambiguous "
+            f"(schema_version={snapshot.get('schema_version')!r}); re-save the version "
+            "with explicit capabilities"
+        )
+    capabilities = snapshot.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        raise StrategyValidationError("capability snapshot has no capability map")
+    unknown = sorted(set(capabilities) - set(CAPABILITY_KEYS))
+    if unknown:
+        raise StrategyValidationError(
+            "capability snapshot has unknown capabilities: " + ", ".join(unknown)
+        )
+    parsed: Dict[str, bool] = {}
+    for key in CAPABILITY_KEYS:
+        value = capabilities.get(key)
+        if not isinstance(value, bool):
+            raise StrategyValidationError(
+                f"capability snapshot must declare boolean '{key}'"
+            )
+        parsed[key] = value
+    return parsed
+
+
+def capability_actions(capabilities: Mapping[str, bool]) -> List[str]:
+    """Compose the child token actions for a capability set.
+
+    ``trade`` → paper order actions; ``notify`` → ``notifications:publish``;
+    ``data`` → the baseline read/log actions (always present). ``heartbeat`` is
+    never included.
+    """
+    return child_run_token_actions(
+        order_capable=bool(capabilities.get("trade")),
+        notify=bool(capabilities.get("notify")),
+    )
 
 
 def build_policy_snapshot(

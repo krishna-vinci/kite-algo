@@ -213,3 +213,31 @@ async def fence(
     except hosted_lifecycle.HostedLifecycleError as exc:
         raise _raise(exc) from exc
     return ActionResponse(**result)
+
+
+@router.post("/jobs/{job_id}/recover", response_model=ActionResponse)
+async def recover(
+    job_id: str,
+    payload: FenceRequest,
+    request: Request,
+    strategy_repo: SqlAlchemyStrategyRepository = Depends(_strategies_repo),
+):
+    """Authenticated lease-loss recovery for an expired attempt.
+
+    Distinct from ``fence`` (which needs a live lease): this authorizes by full
+    attempt identity but requires the lease to have expired, and only fences the
+    attempt — it never renews or restores execution authority.
+    """
+    try:
+        result = await hosted_lifecycle.expire(
+            strategy_repo=strategy_repo,
+            worker_repo=_worker_repo(request),
+            job_id=job_id,
+            lease_owner=payload.lease_owner,
+            lease_epoch=payload.lease_epoch,
+            attempt=payload.attempt,
+            reason=payload.reason or "lease_expired",
+        )
+    except hosted_lifecycle.HostedLifecycleError as exc:
+        raise _raise(exc) from exc
+    return ActionResponse(**result)

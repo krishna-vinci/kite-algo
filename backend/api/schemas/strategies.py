@@ -44,6 +44,9 @@ class VersionCreateRequest(BaseModel):
 
     source: str = Field(min_length=1)
     parameters_schema: Optional[Dict[str, Any]] = None
+    #: Explicit capability declaration for this version. Omitted/empty means
+    #: data-only (no trading rights). Unknown keys or non-boolean values are 422.
+    capabilities: Optional[Dict[str, Any]] = None
 
 
 class StrategyResponse(BaseModel):

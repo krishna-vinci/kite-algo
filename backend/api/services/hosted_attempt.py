@@ -33,9 +33,12 @@ from backend.strategies.repository import SqlAlchemyStrategyRepository
 __all__ = [
     "HOSTED_TEMPLATE_PREFIX",
     "assert_child_lifecycle_forbidden",
+    "assert_hosted_run_binding",
     "enforce_hosted_attempt_authority",
+    "hosted_job_for_token",
     "is_hosted_run",
     "is_hosted_template_id",
+    "token_is_hosted_candidate",
 ]
 
 HOSTED_TEMPLATE_PREFIX = "hosted:"
@@ -50,6 +53,17 @@ def is_hosted_template_id(template_id: Any) -> bool:
 
 def is_hosted_run(run: Optional[Dict[str, Any]]) -> bool:
     return bool(run) and is_hosted_template_id(run.get("template_id"))
+
+
+def token_is_hosted_candidate(token: WorkerToken) -> bool:
+    """Cheap, server-side signal that a token *may* be a hosted child token.
+
+    A hosted child token is minted with its ``allowed_templates`` set to exactly
+    ``[hosted:<strategy_id>]``. This is only a pre-filter to avoid touching the
+    strategies store for ordinary external tokens; the authoritative decision is
+    always the persisted ``strategy_jobs`` record (see ``hosted_job_for_token``).
+    """
+    return any(is_hosted_template_id(t) for t in (getattr(token, "allowed_templates", None) or []))
 
 
 def _strategies_repo(request: Request) -> SqlAlchemyStrategyRepository:
@@ -188,3 +202,33 @@ def assert_child_lifecycle_forbidden(run: Optional[Dict[str, Any]], operation: s
             "strategy_run_id": str(run.get("strategy_run_id") or ""),
         },
     )
+
+
+async def hosted_job_for_token(request: Request, token: WorkerToken) -> Optional[StrategyJob]:
+    """The persisted hosted job bound to this token, or ``None``.
+
+    Returns ``None`` for an ordinary external token *without touching the
+    strategies store* (the cheap ``token_is_hosted_candidate`` pre-filter). For a
+    candidate, the authoritative answer is the ``strategy_jobs`` record bound to
+    the token id.
+    """
+    if not token_is_hosted_candidate(token):
+        return None
+    repo = _strategies_repo(request)
+    return await asyncio.to_thread(repo.get_job_by_token_id, token.token_id)
+
+
+def assert_hosted_run_binding(run: Optional[Dict[str, Any]], token: WorkerToken) -> None:
+    """A hosted child token may only act on the worker run bound to its attempt.
+
+    Routes that do not otherwise require a worker run (the options surface) must
+    call this when the caller is hosted: a hosted credential may not select an
+    options id with no corresponding worker run, nor a run owned by another
+    token. Fails closed with 403.
+    """
+    if run is None or str(run.get("token_id") or "") != token.token_id:
+        raise _reject(
+            403,
+            "HOSTED_CHILD_RUN_REQUIRED",
+            strategy_run_id=str((run or {}).get("strategy_run_id") or ""),
+        )

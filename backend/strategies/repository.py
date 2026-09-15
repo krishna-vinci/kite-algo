@@ -637,11 +637,13 @@ class SqlAlchemyStrategyRepository:
         expected_lease_epoch: int,
         expected_attempt: int,
     ) -> bool:
-        """Runner-owned stop under authority. Clears the lease.
+        """Runner-owned stop under authority. Ends the live lease.
 
-        A stop is NOT a claim of cancellation or flatness: it records that
-        launching ceased and the session was released. Any exposure remains and
-        must be reconciled separately.
+        A stop is NOT a claim of cancellation, flatness, or exposure
+        reconciliation. ``lease_owner``/``lease_epoch``/``attempt`` are retained
+        as **attribution** so an authorized state read still works after the
+        transition; mutation authority is withdrawn by clearing ``lease_until``
+        and moving the status out of the live set, not by erasing identity.
         """
         session = self._session()
         try:
@@ -655,7 +657,6 @@ class SqlAlchemyStrategyRepository:
                 .values(
                     status="stopped",
                     desired_state="stopped",
-                    lease_owner=None,
                     lease_until=None,
                     updated_at=_utcnow(),
                 )
@@ -756,6 +757,10 @@ class SqlAlchemyStrategyRepository:
 
         Committed in its own transaction: a later failing effect must not roll the
         fence back. Requires id + lease_owner + epoch + attempt to match.
+        ``lease_owner``/``lease_epoch``/``attempt`` are retained as attribution so
+        an authorized state read still works after fencing; the live lease is
+        ended by clearing ``lease_until`` and moving the status out of the live
+        set, which is what withdraws mutation authority.
         """
         session = self._session()
         try:
@@ -776,7 +781,6 @@ class SqlAlchemyStrategyRepository:
                 .values(
                     status=_UNRECONCILED,
                     recovery_required_at=_utcnow(),
-                    lease_owner=None,
                     lease_until=None,
                     updated_at=_utcnow(),
                 )
@@ -819,6 +823,59 @@ class SqlAlchemyStrategyRepository:
                     status=_UNRECONCILED,
                     recovery_required_at=_utcnow(),
                     lease_owner=None,
+                    lease_until=None,
+                    updated_at=_utcnow(),
+                )
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def expire_to_recovery_authorized(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        expected_lease_epoch: int,
+        expected_attempt: int,
+    ) -> bool:
+        """Authenticated recovery fence for an EXPIRED attempt.
+
+        This is the lease-loss path: the ordinary fence requires a *live* lease,
+        so an attempt whose lease has expired needs a distinct transition. It
+        requires the full authority (id + ``lease_owner`` + epoch + attempt) so a
+        stale or unrelated holder is refused, applies only to a ``starting``/
+        ``running`` job whose lease has expired, and **cannot renew or regain**
+        execution authority — it only ends the attempt durably as
+        ``recovery_required``. Committed in its own transaction.
+        """
+        session = self._session()
+        try:
+            strategy_id = self._strategy_id_for_job(session, job_id)
+            if strategy_id is None:
+                session.rollback()
+                return False
+            self._lock_strategy(session, strategy_id)
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    StrategyJob.id == job_id,
+                    StrategyJob.lease_owner == lease_owner,
+                    StrategyJob.lease_epoch == expected_lease_epoch,
+                    StrategyJob.attempt == expected_attempt,
+                    StrategyJob.status.in_(("starting", "running")),
+                    or_(
+                        StrategyJob.lease_until.is_(None),
+                        StrategyJob.lease_until < _utcnow(),
+                    ),
+                )
+                .values(
+                    status=_UNRECONCILED,
+                    recovery_required_at=_utcnow(),
                     lease_until=None,
                     updated_at=_utcnow(),
                 )

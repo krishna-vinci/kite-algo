@@ -11,7 +11,11 @@ from backend.api.routers.worker_shared import (
     require_active_worker_run_session,
     require_worker_token,
 )
-from backend.api.services.hosted_attempt import enforce_hosted_attempt_authority
+from backend.api.services.hosted_attempt import (
+    assert_hosted_run_binding,
+    enforce_hosted_attempt_authority,
+    hosted_job_for_token,
+)
 from backend.options.api.execution_router import (
     create_option_run,
     enter_option_run,
@@ -38,6 +42,24 @@ from backend.options.market.service import OptionsMarketService
 from backend.options.protection.models import OptionProtectionConfigUpdateRequest, OptionProtectionReplayRequest
 
 router = APIRouter(prefix="/api/algo-workers/worker/options", tags=["Algo Workers"])
+
+
+async def _guard_options_mutation(request, token, strategy_run_id: str):
+    """Bind an options mutation to the caller's worker run.
+
+    A hosted child token must act only on the worker run bound to its attempt:
+    an options id with **no** corresponding worker run, or one owned by another
+    token, is refused (403) rather than silently skipping the guard. External
+    tokens keep their established behavior (a session check when a run exists).
+    """
+    run = await _repo(request).get_run(strategy_run_id)
+    hosted_job = await hosted_job_for_token(request, token)
+    if hosted_job is not None:
+        assert_hosted_run_binding(run, token)
+        await enforce_hosted_attempt_authority(request, token, run)
+    if run is not None:
+        await require_active_worker_run_session(request, run)
+    return run
 
 
 @router.get("/underlyings/{underlying}/session")
@@ -130,9 +152,18 @@ async def preview_worker_option_strategy(
 @router.post("/runs")
 async def create_worker_option_run(
     payload: OptionRunCreateRequest,
+    request: Request,
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
 ):
+    hosted_job = await hosted_job_for_token(request, _token)
+    if hosted_job is not None:
+        # A hosted child may only create an options run pinned to the worker run
+        # bound to its attempt; an unbound or foreign id is refused.
+        requested = str(payload.strategy_run_id or "")
+        run = await _repo(request).get_run(requested) if requested else None
+        assert_hosted_run_binding(run, _token)
+        await enforce_hosted_attempt_authority(request, _token, run)
     return await create_option_run(payload, store)
 
 
@@ -156,10 +187,7 @@ async def enter_worker_option_run(
     store: OptionRunStore = Depends(get_option_run_store),
     runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
 ):
-    run = await _repo(request).get_run(strategy_run_id)
-    if run is not None:
-        await enforce_hosted_attempt_authority(request, _token, run)
-        await require_active_worker_run_session(request, run)
+    await _guard_options_mutation(request, _token, strategy_run_id)
     action_payload = payload or OptionRunActionRequest()
     if action_payload.safety_token:
         await validate_worker_run_safety_token(request, strategy_run_id, action_payload.safety_token)
@@ -192,10 +220,7 @@ async def exit_worker_option_run(
     store: OptionRunStore = Depends(get_option_run_store),
     runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
 ):
-    run = await _repo(request).get_run(strategy_run_id)
-    if run is not None:
-        await enforce_hosted_attempt_authority(request, _token, run)
-        await require_active_worker_run_session(request, run)
+    await _guard_options_mutation(request, _token, strategy_run_id)
     action_payload = payload or OptionRunActionRequest()
     if action_payload.safety_token:
         await validate_worker_run_safety_token(request, strategy_run_id, action_payload.safety_token)
@@ -224,10 +249,7 @@ async def update_worker_option_run_protection(
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
 ):
-    run = await _repo(request).get_run(strategy_run_id)
-    if run is not None:
-        await enforce_hosted_attempt_authority(request, _token, run)
-        await require_active_worker_run_session(request, run)
+    await _guard_options_mutation(request, _token, strategy_run_id)
     return await update_option_run_protection(strategy_run_id, payload, store)
 
 

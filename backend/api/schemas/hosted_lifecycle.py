@@ -96,3 +96,6 @@ class ActionResponse(BaseModel):
     reason: Optional[str] = None
     lease_until: Optional[str] = None
     last_heartbeat_at: Optional[str] = None
+    #: True when the terminal transition leaves the replacement block in place
+    #: (open exposure may remain); False when replacement is safe.
+    replacement_blocked: Optional[bool] = None
