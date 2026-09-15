@@ -926,6 +926,7 @@ class EvaluationService:
                                 fired_at=obs.ts,
                                 evidence=evidence,
                                 channel_ids=channel_ids,
+                                workflow_id=str(sub.workflow_id),
                                 now=now,
                                 db=session,
                             )
@@ -1256,6 +1257,7 @@ class EvaluationService:
                     fired_at=obs.ts,
                     evidence=correction_evidence,
                     channel_ids=(),
+                    workflow_id=str(sub.workflow_id),
                     now=now,
                     db=session,
                 )

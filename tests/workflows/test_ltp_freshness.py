@@ -350,6 +350,29 @@ def test_gap_within_the_bound_still_fires_normally(session_factory):
     assert len(_events(session_factory)) == 1
 
 
+def test_fired_event_carries_its_workflow_id(session_factory):
+    """A fired alert's event must be reachable from the operator UI.
+
+    Regression (live only): the per-subscription emitter wrote the event with
+    the subscription id but a NULL ``workflow_id``, and the operator Events and
+    Deliveries routes query by workflow. The alert fired and the Telegram
+    delivery was accepted by the provider, while the workflow's own Events and
+    Deliveries tabs reported "No signal events recorded" / "No deliveries
+    recorded for this workflow yet".
+    """
+    repo, service, revision = _activate(session_factory)
+    sub = _single_sub(repo)
+
+    service.handle_observation(sub, _tick_obs(99.0, T0, received_at=T0))
+    soon = T0 + timedelta(seconds=1)
+    cross = service.handle_observation(sub, _tick_obs(101.0, soon, received_at=soon))
+    assert cross.emitted is True
+
+    events = _events(session_factory)
+    assert len(events) == 1
+    assert events[0].workflow_id == revision.workflow_id
+
+
 def test_gap_does_not_clear_durable_trigger_bookkeeping(session_factory):
     """A spent ``once`` rule is not re-armed by a stale interval.
 

@@ -875,6 +875,7 @@ class SqlAlchemyWorkflowRepository:
         evidence: dict,
         channel_ids: Sequence[str],
         *,
+        workflow_id: Optional[str] = None,
         db: Optional[Session] = None,
         now: Optional[datetime] = None,
     ):
@@ -885,10 +886,16 @@ class SqlAlchemyWorkflowRepository:
         given, the caller owns the transaction and IntegrityError propagates.
         """
         if db is not None:
-            return self._record_signal(db, subscription_id, occurrence_key, fired_at, evidence, channel_ids, now)
+            return self._record_signal(
+                db, subscription_id, occurrence_key, fired_at, evidence, channel_ids, now,
+                workflow_id=workflow_id,
+            )
         session = self._session()
         try:
-            event = self._record_signal(session, subscription_id, occurrence_key, fired_at, evidence, channel_ids, now)
+            event = self._record_signal(
+                session, subscription_id, occurrence_key, fired_at, evidence, channel_ids, now,
+                workflow_id=workflow_id,
+            )
             session.commit()
             return event
         except IntegrityError:
@@ -920,7 +927,10 @@ class SqlAlchemyWorkflowRepository:
         finally:
             session.close()
 
-    def _record_signal(self, session, subscription_id, occurrence_key, fired_at, evidence, channel_ids, now):
+    def _record_signal(
+        self, session, subscription_id, occurrence_key, fired_at, evidence, channel_ids, now,
+        *, workflow_id: Optional[str] = None,
+    ):
         # Deferred import: notifications.repository imports Base from this
         # module, so resolve it lazily to avoid a circular import.
         from backend.notifications.repository import Delivery
@@ -929,6 +939,10 @@ class SqlAlchemyWorkflowRepository:
         event = SignalEvent(
             id=_uuid(),
             subscription_id=subscription_id,
+            # The operator Events/Deliveries views are per WORKFLOW; an event
+            # that only carries its subscription is invisible there (and the
+            # delivery is unreachable), even though it was emitted and sent.
+            workflow_id=str(workflow_id) if workflow_id else None,
             occurrence_key=occurrence_key,
             fired_at=fired_at,
             evidence=dict(evidence or {}),
