@@ -44,6 +44,7 @@ from backend.notifications.repository import (  # noqa: E402
     Delivery,
     DeliveryAttempt,
 )
+from backend.workflows import advanced_repository as _advanced_repository  # noqa: E402,F401
 from backend.workflows.compiler import compile_document  # noqa: E402
 from backend.workflows.parser import (  # noqa: E402
     document_to_yaml,
@@ -205,6 +206,53 @@ def test_capabilities_render_for_an_authorized_operator(session_factory, monkeyp
     for key in ("operators", "timeframes", "limits"):
         assert key in capabilities, key
     assert "crosses_above" in capabilities["operators"]
+
+
+def test_health_reports_the_newest_checkpoint_state(session_factory, monkeypatch):
+    """The per-subscription freshness must come from the newest checkpoint.
+
+    Regression: the route aggregated with ``func.max(state)``. ``state`` is
+    JSONB, so PostgreSQL has no ``max(jsonb)`` and every workflow with
+    subscriptions returned 500 in the deployed stack; on SQLite the aggregate
+    "worked" but returned the lexically greatest JSON, i.e. not the newest row.
+    """
+    from backend.workflows.repository import AlertSubscription, EvaluationCheckpoint
+
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    workflow, revision = _seed_workflow(session_factory, OPERATOR_SCOPE)
+    _activate(session_factory, workflow, revision)
+
+    session = session_factory()
+    subscription_id = session.execute(select(AlertSubscription.id)).scalars().first()
+    session.add_all(
+        [
+            EvaluationCheckpoint(
+                subscription_id=subscription_id,
+                instrument_key="NSE:RELIANCE",
+                epoch_id="epoch-old",
+                # lexically GREATER than the newer row on purpose
+                state={"last_tick_received_at": "2026-09-15T09:00:00+00:00", "z": "zzz"},
+                owner_epoch=1,
+                updated_at=T0,
+            ),
+            EvaluationCheckpoint(
+                subscription_id=subscription_id,
+                instrument_key="NSE:RELIANCE",
+                epoch_id="epoch-new",
+                state={"last_tick_received_at": "2026-09-15T09:30:00+00:00"},
+                owner_epoch=2,
+                updated_at=T0 + timedelta(minutes=30),
+            ),
+        ]
+    )
+    session.commit()
+    session.close()
+
+    body = client.get(f"{BASE}/workflows/{workflow.id}/health").json()
+    assert body["ok"] is True
+    rows = body["subscriptions"]
+    assert len(rows) == 1
+    assert rows[0]["last_tick_received_at"] == "2026-09-15T09:30:00+00:00"
 
 
 def test_a_worker_token_is_not_accepted(session_factory, monkeypatch):

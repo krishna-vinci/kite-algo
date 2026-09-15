@@ -299,6 +299,24 @@ def test_pg_history_reads_current_binding_not_snapshot():
     assert history._token_for("NSE:A") == 4242
 
 
+def test_pg_history_accepts_a_get_only_provider():
+    """A provider that exposes only ``get()`` is still a provider.
+
+    Regression: the constructor required ``snapshot()`` too, so the API
+    process's lazy catalog token map fell into the static-mapping branch and
+    died on ``.items()`` — every manual screener run and preview 500'd in the
+    deployed stack.
+    """
+
+    class _GetOnly:
+        def get(self, key):
+            return {"NSE:RELIANCE": 738561}.get(key)
+
+    history = PgCandleHistory(engine=None, instrument_tokens=_GetOnly())
+    assert history._token_for("NSE:RELIANCE") == 738561
+    assert history._token_for("NSE:ABSENT") is None
+
+
 def test_registry_retain_only_releases_unneeded_bindings():
     """A binding nobody requires any more must not be retained.
 

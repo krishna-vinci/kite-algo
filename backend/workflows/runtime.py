@@ -500,9 +500,14 @@ class PgCandleHistory:
     def __init__(self, engine: Any, instrument_tokens: Any) -> None:
         self._engine = engine
         self._bindings = instrument_tokens
+        # Anything exposing ``get()`` is a live binding provider (the contract
+        # named in the class docstring). Also requiring ``snapshot()`` meant a
+        # provider that only implements get() — the API process's lazy catalog
+        # token map — silently fell into the mapping branch and crashed on
+        # ``.items()``, taking manual screener runs down with it.
         self._instrument_tokens: Optional[Dict[str, int]] = (
             None
-            if hasattr(instrument_tokens, "get") and hasattr(instrument_tokens, "snapshot")
+            if hasattr(instrument_tokens, "get")
             else {
                 str(key): int(token)
                 for key, token in (instrument_tokens or {}).items()

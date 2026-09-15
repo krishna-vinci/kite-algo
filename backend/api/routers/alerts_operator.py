@@ -1159,17 +1159,27 @@ async def workflow_health(
         last_evaluated: Dict[str, Any] = {}
         states: Dict[str, Any] = {}
         if all_ids:
+            # Newest checkpoint per subscription. This cannot be an aggregate:
+            # ``state`` is JSONB and PostgreSQL has no max(jsonb), so the
+            # previous ``func.max(state)`` passed on SQLite and 500'd here for
+            # every workflow that has subscriptions.
             for subscription_id, updated, state in session.execute(
                 select(
                     EvaluationCheckpoint.subscription_id,
-                    func.max(EvaluationCheckpoint.updated_at),
-                    func.max(EvaluationCheckpoint.state),
+                    EvaluationCheckpoint.updated_at,
+                    EvaluationCheckpoint.state,
                 )
                 .where(EvaluationCheckpoint.subscription_id.in_(all_ids))
-                .group_by(EvaluationCheckpoint.subscription_id)
+                .order_by(
+                    EvaluationCheckpoint.subscription_id.asc(),
+                    EvaluationCheckpoint.updated_at.desc(),
+                )
             ).all():
-                last_evaluated[str(subscription_id)] = updated
-                states[str(subscription_id)] = state
+                key = str(subscription_id)
+                if key in last_evaluated:
+                    continue
+                last_evaluated[key] = updated
+                states[key] = state
 
         document = None
         if active is not None:
