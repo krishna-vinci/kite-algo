@@ -448,6 +448,63 @@ def test_scheduler_executes_due_occurrence_and_finalizes(session_factory):
     assert len(ScreenerRunRepository(session_factory).list_runs("owner-1", workflow.id)) == 1
 
 
+def test_manual_run_survives_session_close_with_expiring_sessions(session_factory):
+    """A manual run must work when the session expires attributes on commit.
+
+    Regression (live only): the app's SessionLocal uses the default
+    ``expire_on_commit=True`` while every test factory passes
+    ``expire_on_commit=False``. Claiming the run committed, which expired the
+    instance; ``_run_pipeline`` then read ``run.scheduled_for`` after the
+    session closed and raised DetachedInstanceError — every manual screener run
+    returned 500 in the deployed stack.
+    """
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _attach_public_schema(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("ATTACH DATABASE ':memory:' AS public")
+        cursor.close()
+
+    Base.metadata.create_all(engine)
+    expiring = sessionmaker(bind=engine, expire_on_commit=True)  # production shape
+
+    doc = _doc([])
+    workflow, revision = _activate(expiring, doc)
+
+    class _UniverseService:
+        def latest_revision(self, owner_id, name):
+            return {"revision": 1, "members": ["NSE:A"]}
+
+        def preview_membership(self, owner_id, kind, config):
+            raise AssertionError("not used")
+
+        def resolve_membership(self, owner_id, name):
+            return {}
+
+    scheduler = ScreenerScheduler(
+        session_factory=expiring,
+        workflow_repo=SqlAlchemyWorkflowRepository(expiring),
+        run_repo=ScreenerRunRepository(expiring),
+        pipeline=_StubPipeline(),
+        universe_service=_UniverseService(),
+        session_gate=lambda at: (True, "session"),
+        owner_id="worker-a",
+        poll_interval_s=30,
+        lease_ttl_s=300,
+    )
+    run = scheduler.execute_manual(workflow, revision, now=T0)
+    assert run is not None
+    # The attribute read that raised DetachedInstanceError before the fix.
+    assert run.scheduled_for.replace(tzinfo=timezone.utc) == T0
+    assert run.status == "complete"
+    engine.dispose()
+
+
 class _StubPipeline:
     def evaluate(self, document, members, *, as_of, context_loader=None, member_limit=None):
         from backend.screeners.runner import MemberResult

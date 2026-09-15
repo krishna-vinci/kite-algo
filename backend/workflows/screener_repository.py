@@ -220,6 +220,23 @@ class ScreenerAttachmentState(Base):
     )
 
 
+def _reload_and_detach(session: Any, instance: Any) -> None:
+    """Reload an instance's attributes and detach it from the session.
+
+    Committing expires attributes on a default session, so returning the
+    instance after ``session.close()`` made the caller's next attribute read
+    raise DetachedInstanceError. Reloading keeps the values available; the
+    tz normalization keeps stored timestamps timezone-aware on backends that
+    drop tzinfo (SQLite), which the pipeline compares against aware "now".
+    """
+    session.refresh(instance)
+    for attribute in ("scheduled_for", "lease_expires_at", "created_at", "updated_at", "completed_at"):
+        value = getattr(instance, attribute, None)
+        if isinstance(value, datetime) and value.tzinfo is None:
+            setattr(instance, attribute, value.replace(tzinfo=timezone.utc))
+    session.expunge(instance)
+
+
 class ScreenerRunRepository:
     """All screener run/attachment-state persistence."""
 
@@ -274,6 +291,13 @@ class ScreenerRunRepository:
                 session.add(run)
                 try:
                     session.commit()
+                    # The caller uses this instance after the session closes. A
+                    # commit expires attributes on a default session
+                    # (expire_on_commit=True in the app; the tests disable it),
+                    # so a later attribute read raised DetachedInstanceError and
+                    # every manual screener run 500'd. Reload while still
+                    # attached, then detach with the values populated.
+                    _reload_and_detach(session, run)
                     return run
                 except IntegrityError:
                     # Lost the unique race: the other worker owns it.
@@ -300,7 +324,7 @@ class ScreenerRunRepository:
                     )
                     session.commit()
                     if result.rowcount == 1:
-                        session.refresh(existing)
+                        _reload_and_detach(session, existing)
                         return existing
             return None
         except Exception:
