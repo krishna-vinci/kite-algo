@@ -10,10 +10,11 @@ from sqlalchemy import text
 from backend.app.database import SessionLocal
 from backend.broker_api.orders.basket_execution import basket_execution_store
 from backend.broker_api.orders.bracket_runtime import bracket_runtime_store
-from backend.api.schemas.worker import WorkerBasketPreviewRequest, WorkerBracketCreateRequest, WorkerExitRequest, WorkerIntentRequest, WorkerOrderActionRequest, WorkerOrderModifyRequest, WorkerOrderPreviewRequest, WorkerProgressRequest
+from backend.api.schemas.worker import WorkerBasketPreviewRequest, WorkerBracketCreateRequest, WorkerExitRequest, WorkerIntentRequest, WorkerOrderActionRequest, WorkerOrderModifyRequest, WorkerOrderPreviewRequest, WorkerProgressRequest, WorkerRunNotifyRequest
 from backend.api.routers.worker_shared import *
 from backend.api.services.hosted_attempt import (
     enforce_hosted_attempt_authority,
+    hosted_job_for_run,
     record_hosted_progress,
 )
 from backend.shared.serialization import _json_dumps
@@ -988,9 +989,67 @@ async def report_worker_run_progress(request: Request, strategy_run_id: str, pay
     return {"status": "ok", "strategy_run_id": strategy_run_id, "recorded": result["updated"]}
 
 
+async def notify_worker_run(request: Request, strategy_run_id: str, payload: WorkerRunNotifyRequest):
+    """Enqueue a run-scoped notification from a hosted child.
+
+    Authorization is the hosted strategy's **app owner** (derived from the
+    persisted job, never the account scope or the worker token). Requires the
+    ``notifications:publish`` action, a live hosted attempt and the session
+    nonce. Unknown/unauthorized/disabled channels are explicit errors and no
+    partial write occurs; provider acceptance is not confirmed receipt, and a
+    notification outcome never authorizes trading.
+    """
+    from backend.notifications.repository import RunNotificationError, SqlAlchemyNotificationRepository
+
+    token = await require_worker_token(request)
+    _require_action(token, "notifications:publish")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    job = await hosted_job_for_run(request, run)
+    if job is None:
+        raise HTTPException(
+            status_code=403,
+            detail={"rejection_reason": "HOSTED_NOTIFY_UNSUPPORTED", "strategy_run_id": strategy_run_id},
+        )
+    await enforce_hosted_attempt_authority(request, token, run)
+    await require_active_worker_run_session(request, run)
+
+    repository = getattr(request.app.state, "notification_repository", None)
+    if repository is None:
+        factory = getattr(request.app.state, "alerts_session_factory", None)
+        if factory is None:
+            factory = SessionLocal
+        repository = SqlAlchemyNotificationRepository(factory)
+
+    try:
+        result = await asyncio.to_thread(
+            repository.enqueue_run_notification,
+            owner_id=str(job.owner_id),
+            run_id=strategy_run_id,
+            channel_names=list(payload.channels),
+            text=payload.text,
+            subject=payload.subject,
+            idempotency_key=payload.idempotency_key,
+        )
+    except RunNotificationError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"rejection_reason": exc.code, "message": exc.detail, "strategy_run_id": strategy_run_id},
+        ) from exc
+    return {
+        "strategy_run_id": strategy_run_id,
+        "status": result["status"],
+        "event_id": result["event_id"],
+        "delivery_count": result["delivery_count"],
+    }
+
+
 router.add_api_route("/worker/orders", list_worker_orders, methods=["GET"])
 router.add_api_route("/worker/trades", list_worker_trades, methods=["GET"])
 router.add_api_route("/worker/runs/{strategy_run_id}/progress", report_worker_run_progress, methods=["POST"])
+router.add_api_route("/worker/runs/{strategy_run_id}/notify", notify_worker_run, methods=["POST"])
 router.add_api_route("/worker/orders/{order_id}", get_worker_order, methods=["GET"])
 router.add_api_route("/worker/orders/{order_id}/history", get_worker_order_history, methods=["GET"])
 router.add_api_route("/worker/orders/{order_id}/cancel", cancel_worker_order, methods=["POST"])

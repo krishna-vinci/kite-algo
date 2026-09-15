@@ -2039,6 +2039,15 @@ ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS workflow_id UUID;
 CREATE INDEX IF NOT EXISTS idx_signal_events_workflow
     ON signal_events (workflow_id, fired_at DESC);
 
+-- Run-scoped notifications (hosted strategies): additive columns; no FK change.
+ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'workflow';
+ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS owner_id TEXT;
+ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS run_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_signal_events_run
+    ON signal_events (run_id, fired_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_events_owner
+    ON signal_events (owner_id);
+
 CREATE TABLE IF NOT EXISTS public.screener_run (
     id UUID PRIMARY KEY,
     owner_id TEXT NOT NULL,

@@ -35,6 +35,7 @@ __all__ = [
     "assert_child_lifecycle_forbidden",
     "assert_hosted_run_binding",
     "enforce_hosted_attempt_authority",
+    "hosted_job_for_run",
     "hosted_job_for_token",
     "is_hosted_run",
     "is_hosted_template_id",
@@ -203,6 +204,14 @@ def assert_child_lifecycle_forbidden(run: Optional[Dict[str, Any]], operation: s
             "strategy_run_id": str(run.get("strategy_run_id") or ""),
         },
     )
+
+
+async def hosted_job_for_run(request: Request, run: Optional[Dict[str, Any]]) -> Optional[StrategyJob]:
+    """The persisted hosted job for a hosted run, or ``None`` for external runs."""
+    if not is_hosted_run(run):
+        return None
+    repo = _strategies_repo(request)
+    return await asyncio.to_thread(repo.get_job_by_run_id, str((run or {}).get("strategy_run_id") or ""))
 
 
 async def hosted_job_for_token(request: Request, token: WorkerToken) -> Optional[StrategyJob]:

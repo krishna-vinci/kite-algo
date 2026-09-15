@@ -301,6 +301,37 @@ class KiteAlgoWorkerClient:
             json=payload,
         )
 
+    def notify_run(
+        self,
+        strategy_run_id: str,
+        *,
+        channels: Iterable[str],
+        text: str,
+        idempotency_key: str,
+        subject: Optional[str] = None,
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
+        """Enqueue a run-scoped notification (hosted attempts).
+
+        The caller supplies the ``idempotency_key``: a repeat with the same key
+        and content is deduplicated; the same key with different content is a
+        conflict (409). Unknown/unauthorized channels are explicit errors.
+        Provider acceptance is not confirmed receipt.
+        """
+        payload: JsonDict = {
+            "channels": [str(channel) for channel in channels],
+            "text": str(text),
+            "idempotency_key": str(idempotency_key),
+        }
+        if subject is not None:
+            payload["subject"] = str(subject)
+        return self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/notify",
+            headers=session_headers(session_nonce),
+            json=payload,
+        )
+
     def safety_check(self, strategy_run_id: str) -> SafetyCheckResult:
         return SafetyCheckResult.model_validate(self._request("GET", f"/worker/runs/{strategy_run_id}/safety-check"))
 

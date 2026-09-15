@@ -39,6 +39,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     select,
     update,
@@ -205,6 +206,13 @@ class SignalEvent(Base):
     occurrence_key = Column(String(512), nullable=False, unique=True, index=True)
     fired_at = Column(DateTime(timezone=True), nullable=False)
     evidence = Column(JSON, nullable=False, default=dict)
+    # Run-scoped (hosted strategy) event support — additive. ``source_kind``
+    # defaults to 'workflow' for every existing row; ``owner_id`` is the hosted
+    # strategy's app owner (NOT an account scope or worker-token owner) and
+    # ``run_id`` is TEXT to match algo_worker_runs.strategy_run_id. No FK change.
+    source_kind = Column(String(32), nullable=False, default="workflow")
+    owner_id = Column(String(255), nullable=True, index=True)
+    run_id = Column(Text, nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 

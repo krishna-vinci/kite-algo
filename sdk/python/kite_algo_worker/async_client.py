@@ -182,6 +182,31 @@ class AsyncKiteAlgoWorkerClient:
             json=payload,
         )
 
+    async def notify_run(
+        self,
+        strategy_run_id: str,
+        *,
+        channels: Iterable[str],
+        text: str,
+        idempotency_key: str,
+        subject: Optional[str] = None,
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
+        """Enqueue a run-scoped notification (async parity)."""
+        payload: JsonDict = {
+            "channels": [str(channel) for channel in channels],
+            "text": str(text),
+            "idempotency_key": str(idempotency_key),
+        }
+        if subject is not None:
+            payload["subject"] = str(subject)
+        return await self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/notify",
+            headers=session_headers(session_nonce),
+            json=payload,
+        )
+
     async def safety_check(self, strategy_run_id: str):
         return SafetyCheckResult.model_validate(
             await self._request("GET", f"/worker/runs/{strategy_run_id}/safety-check")

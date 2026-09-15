@@ -85,7 +85,7 @@ def harness():
         "name": "hosted-child",
         "account_scope": "kite:paper",
         "allowed_modes": ["paper"],
-        "allowed_actions": ["runs:read", "runs:log", "runs:progress", "intents:submit", "runs:exit"],
+        "allowed_actions": ["runs:read", "runs:log", "runs:progress", "intents:submit", "runs:exit", "notifications:publish"],
         "allowed_templates": [template],
         "status": "active",
         "expires_at": None,
@@ -97,7 +97,7 @@ def harness():
         "name": "external",
         "account_scope": "kite:paper",
         "allowed_modes": ["paper"],
-        "allowed_actions": ["runs:read", "heartbeat", "intents:submit"],
+        "allowed_actions": ["runs:read", "heartbeat", "intents:submit", "notifications:publish"],
         "allowed_templates": [],
         "status": "active",
         "expires_at": None,
@@ -173,6 +173,12 @@ def harness():
     app.state.algo_worker_repository = worker
     app.state.strategies_session_factory = factory
     app.state.journal_service = StubJournalService()
+
+    from backend.notifications.repository import SqlAlchemyNotificationRepository
+
+    notification_repo = SqlAlchemyNotificationRepository(factory)
+    notification_repo.upsert_channel(OWNER, "ops", "ntfy", {"url": "https://example.invalid"}, None, True)
+    app.state.notification_repository = notification_repo
 
     yield repo, worker, app, job, run_id, template, factory
     engine.dispose()
@@ -433,3 +439,82 @@ async def test_hosted_execution_injection_rejected(harness):
         )
         assert response.status_code == 403
         assert response.json()["detail"]["rejection_reason"] == "HOSTED_EXECUTION_INJECTION_FORBIDDEN"
+
+
+# ---------------------------------------------------------------------------
+# run-scoped notifications
+# ---------------------------------------------------------------------------
+
+
+def _notify_headers():
+    return {**_child_headers(), "X-Worker-Session-Nonce": "wsn_live"}
+
+
+@pytest.mark.asyncio
+async def test_hosted_child_notify_accepted_then_deduped(harness):
+    _repo, worker, app, _job, run_id, _t, _f = harness
+    worker.runs[run_id]["worker_session_nonce"] = "wsn_live"
+    body = {"text": "target hit", "channels": ["ops"], "idempotency_key": "key-12345678"}
+    async with _client(app) as client:
+        first = await client.post(f"{BASE}/worker/runs/{run_id}/notify", headers=_notify_headers(), json=body)
+        assert first.status_code == 200, first.text
+        assert first.json()["status"] == "accepted" and first.json()["delivery_count"] == 1
+        second = await client.post(f"{BASE}/worker/runs/{run_id}/notify", headers=_notify_headers(), json=body)
+        assert second.json()["status"] == "deduped"
+        assert second.json()["event_id"] == first.json()["event_id"]
+
+
+@pytest.mark.asyncio
+async def test_hosted_child_notify_unknown_channel_is_422(harness):
+    _repo, worker, app, _job, run_id, _t, _f = harness
+    worker.runs[run_id]["worker_session_nonce"] = "wsn_live"
+    async with _client(app) as client:
+        response = await client.post(
+            f"{BASE}/worker/runs/{run_id}/notify",
+            headers=_notify_headers(),
+            json={"text": "hi", "channels": ["nope"], "idempotency_key": "key-12345678"},
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"]["rejection_reason"] == "unknown_channel"
+
+
+@pytest.mark.asyncio
+async def test_hosted_child_notify_requires_session_nonce(harness):
+    _repo, worker, app, _job, run_id, _t, _f = harness
+    worker.runs[run_id]["worker_session_nonce"] = "wsn_live"
+    async with _client(app) as client:
+        response = await client.post(
+            f"{BASE}/worker/runs/{run_id}/notify",
+            headers=_child_headers(),
+            json={"text": "hi", "channels": ["ops"], "idempotency_key": "key-12345678"},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["rejection_reason"] == "WORKER_SESSION_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_hosted_child_notify_requires_publish_permission(harness):
+    _repo, worker, app, _job, run_id, _t, _f = harness
+    worker.runs[run_id]["worker_session_nonce"] = "wsn_live"
+    worker.tokens[CHILD_ID]["allowed_actions"] = ["runs:read", "runs:log"]
+    async with _client(app) as client:
+        response = await client.post(
+            f"{BASE}/worker/runs/{run_id}/notify",
+            headers=_notify_headers(),
+            json={"text": "hi", "channels": ["ops"], "idempotency_key": "key-12345678"},
+        )
+        assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_external_run_notify_is_refused(harness):
+    _repo, worker, app, _job, _run_id, _t, _f = harness
+    worker.runs["run_external_1"]["worker_session_nonce"] = "wsn_ext"
+    async with _client(app) as client:
+        response = await client.post(
+            f"{BASE}/worker/runs/run_external_1/notify",
+            headers={**_external_headers(), "X-Worker-Session-Nonce": "wsn_ext"},
+            json={"text": "hi", "channels": ["ops"], "idempotency_key": "key-12345678"},
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"]["rejection_reason"] == "HOSTED_NOTIFY_UNSUPPORTED"

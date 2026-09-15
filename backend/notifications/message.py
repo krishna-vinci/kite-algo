@@ -189,6 +189,30 @@ def build_breadth_message(
     return subject, _cap_body("\n".join(lines), event_id=event_id)
 
 
+def build_run_message(
+    *,
+    run_id: str,
+    text: str,
+    fired_at: dt.datetime,
+    subject: Optional[str] = None,
+    event_id: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Run-scoped (hosted strategy) notification.
+
+    Renders the caller-supplied text with the run id and event time; it does not
+    impose any workflow/alert shape on the message.
+    """
+    ist_str, utc_str = format_event_time(fired_at)
+    resolved_subject = _cap_subject(subject or f"[Strategy] {run_id}")
+    lines = [
+        f"run: {run_id}",
+        f"message: {str(text or '').strip()}",
+        f"time: {ist_str} ({utc_str})",
+        f"event_id: {event_id if event_id is not None else '-'}",
+    ]
+    return resolved_subject, _cap_body("\n".join(lines), event_id=event_id)
+
+
 def _render_template(
     template: str,
     *,

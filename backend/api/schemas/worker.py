@@ -76,6 +76,18 @@ class WorkerProgressRequest(BaseModel):
 
     note: Optional[str] = Field(default=None, max_length=200)
 
+class WorkerRunNotifyRequest(BaseModel):
+    """Run-scoped notification from a hosted child.
+
+    The caller supplies its own ``idempotency_key``; there is no process-local
+    sequence number, and a same-key/different-content request is a conflict.
+    """
+
+    text: str = Field(min_length=1, max_length=3800)
+    channels: List[str] = Field(min_length=1)
+    idempotency_key: str = Field(min_length=8, max_length=160)
+    subject: Optional[str] = Field(default=None, max_length=120)
+
 class WorkerRunCreateRequest(BaseModel):
     strategy_run_id: Optional[str] = None
     template_id: str = Field(min_length=1)

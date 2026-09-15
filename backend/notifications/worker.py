@@ -72,6 +72,7 @@ from backend.notifications.adapters import (
 from backend.notifications.message import (
     build_message,
     build_breadth_message,
+    build_run_message,
     build_screener_message,
     format_event_time,
 )
@@ -191,7 +192,17 @@ def make_resolver(
             evidence = dict(event.evidence or {})
             kind = evidence.get("message_kind")
             ist_str, utc_str = format_event_time(event.fired_at)
-            if kind == "breadth":
+            if kind == "strategy_run":
+                # Run-scoped hosted-strategy notification: render the caller text
+                # with the run id; no workflow/alert shape is imposed.
+                subject, body = build_run_message(
+                    run_id=str(evidence.get("run_id") or "-"),
+                    text=str(evidence.get("text") or ""),
+                    fired_at=event.fired_at,
+                    subject=evidence.get("subject"),
+                    event_id=event.id,
+                )
+            elif kind == "breadth":
                 # Phase 4 F10: an aggregate crossing. Presenting it with a
                 # symbol line would misdescribe it, so the breadth builder
                 # lists the contributing instruments instead.

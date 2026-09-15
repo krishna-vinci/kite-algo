@@ -326,6 +326,34 @@ destructively.
 - **Excluded:** Cancel/Flatten execution. Open exposure is reported as a blocking
   reason (``OPEN_EXPOSURE``) and the frontend shows why reconciliation is blocked.
 
+### 1.11 Run-scoped notifications (this slice)
+
+Additive migration `20260915_000022` extends `signal_events` with nullable
+`source_kind` (default `workflow`), `owner_id` and `run_id` (TEXT) plus indexes —
+no `deliveries` FK change; alert/screener rows are unaffected.
+
+- **Reuses the durable event/outbox/delivery stack**: one `signal_events` row per
+  notification and one `deliveries` row per channel, claimed/retried/fenced by the
+  existing delivery worker. The `strategy_run` branch is additive; the
+  alert/breadth/screener resolver paths are unchanged.
+- **Ownership is the hosted strategy's app owner** (`strategy_jobs.owner_id`),
+  persisted on the event. Account scope is **not** notification ownership: a
+  channel owned by the account-scope string does not resolve (`channel_not_authorized`).
+- **Child endpoint** `POST /worker/runs/{id}/notify` (action
+  `notifications:publish`, hosted attempt + session nonce required; external runs
+  refused `HOSTED_NOTIFY_UNSUPPORTED`). **SDK** `ManagedRun.notify(text,
+  channels=..., idempotency_key=..., subject=...)` (SDK 0.13.0).
+- **Atomic** event + deliveries in one transaction. Unknown (422), disabled (422)
+  and unauthorized (403) channels are explicit errors raised **before** any write —
+  no partial rows.
+- **Idempotency** is the caller key (`hosted-run:{run_id}:{key}`): same key + same
+  content deduplicates (`deduped`, writes nothing); same key + different content
+  conflicts (409). There is no process-local sequence number.
+- **Loader/rendering/history adapter**: `build_run_message` renders the caller
+  text with the run id, and `list_run_notifications(owner_id, run_id)` provides
+  run-scoped history. Provider acceptance is **not** confirmed receipt, and a
+  notification outcome never authorizes trading.
+
 ---
 
 ## 2. Authentication / configuration
@@ -354,8 +382,9 @@ Targeted suites (SQLite):
   tests/api/test_worker_notifications.py \
   tests/api/test_hosted_lifecycle_api.py \
   tests/api/test_hosted_child_authority.py \
+  tests/notifications \
   tests/sdk -q
-→ 611 passed, 2 skipped
+→ 734 passed, 2 skipped
 ```
 
 Disposable PostgreSQL (real concurrency; own invocation):
@@ -365,11 +394,11 @@ HOSTED_FOUNDATION_PG_URL='postgresql://postgres:testonly@127.0.0.1:15433/kite_te
   .venv/bin/python -m pytest \
     tests/integration/test_hosted_supervisor_lifecycle_postgres.py \
     tests/integration/test_hosted_strategy_foundation_postgres.py -q
-→ 18 passed       # + atomic reconcile-with-audit (one winner) serialized with
+→ 21 passed       # + atomic reconcile-with-audit (one winner) serialized with
                   # create_job; changed-cleanup-evidence CAS refusal; append-only audit
 ```
 
-`alembic heads` → single head `20260915_000021`. `git diff --check` clean.
+`alembic heads` → single head `20260915_000022`. `git diff --check` clean.
 
 **New tests:** supervisor auth (default-deny, wrong/absent credential, rotation);
 lifecycle state machine (happy path, repeat, partial, wrong owner/epoch/attempt,
@@ -435,6 +464,17 @@ Process-supervision tests (added this slice) — **real process tests** vs
   - PostgreSQL — atomic reconcile-with-audit has exactly one winner and serializes
     with `create_job`; a changed cleanup-evidence CAS is refused; audit is
     append-only and ordered.
+- Run-scoped notification tests (this slice):
+  - `tests/notifications/test_run_notifications.py` — atomic event+deliveries,
+    same-key dedupe, same-key/different-content conflict, unknown/disabled/
+    unauthorized channels write nothing, account-scope is not ownership,
+    run-scoped history, and the `strategy_run` resolver/rendering adapter.
+  - `tests/api/test_hosted_child_authority.py` — child notify accepted then
+    deduped, unknown channel 422, session nonce required, `notifications:publish`
+    required, external run refused.
+  - `tests/integration/test_run_notifications_postgres.py` — columns present;
+    concurrent same-key enqueue yields exactly one event + one delivery with one
+    `accepted` and one `deduped`; conflicting content after commit is rejected.
 
 **Unrelated pre-existing failures — corrected baseline evidence.** The earlier
 report compared only `backend/api/routers/__init__.py`, which is *not* a complete
@@ -510,6 +550,9 @@ independent of this slice (reproduces with the slice stashed).
   itself, Cancel/Flatten execution (when exposure is open the operator has no
   backend action to settle it), and the frontend for the reconciliation surface
   (§8 is the API handoff).
+- **Run-scoped notifications are backend-only.** The child endpoint and SDK
+  exist; delivery happens asynchronously through the existing outbox worker and
+  provider acceptance is not confirmed receipt. No frontend is added.
 - **Scheduling is not implemented.** Discovery lists `queued` jobs; nothing
   creates them on a schedule. The supervisor polls (`run_forever`) or runs once.
 - **Options fail-closed mode propagation and the futures contract resolver**
@@ -685,3 +728,38 @@ plus `handoff_at`, `process_cleanup_state`, `process_cleanup_at`,
 Open exposure is surfaced as `OPEN_EXPOSURE`; this slice deliberately does **not**
 add Cancel/Flatten execution — the frontend shows the blocking reason and the
 future operator action needed.
+
+### 8.1 Run-scoped notification API (worker/SDK)
+
+Child endpoint (hosted run, session nonce, `notifications:publish`):
+
+```http
+POST /api/algo-workers/worker/runs/{strategy_run_id}/notify
+X-Worker-Session-Nonce: <nonce>
+Authorization: Bearer <child token>
+
+{ "text": "target hit", "channels": ["ops"], "idempotency_key": "abc12345", "subject": "optional" }
+```
+
+Responses:
+
+```json
+200 { "strategy_run_id": "run_77", "status": "accepted", "event_id": "...", "delivery_count": 1 }
+200 { "strategy_run_id": "run_77", "status": "deduped",  "event_id": "...", "delivery_count": 1 }
+409 { "detail": { "rejection_reason": "idempotency_conflict", "message": "idempotency key reused with different content" } }
+422 { "detail": { "rejection_reason": "unknown_channel", "message": "unknown channel 'nope'" } }
+403 { "detail": { "rejection_reason": "channel_not_authorized" } }
+409 { "detail": { "rejection_reason": "WORKER_SESSION_REQUIRED" } }
+403 { "detail": { "rejection_reason": "HOSTED_NOTIFY_UNSUPPORTED" } }
+```
+
+Status meanings: `accepted` = event + deliveries durably enqueued (provider send
+happens later, asynchronously, and is not confirmed receipt); `deduped` = the same
+key/content already enqueued, nothing written; `idempotency_conflict` = same key,
+different content. Storage errors are surfaced explicitly to the caller; a
+notification outcome never authorizes trading.
+
+Operator/SDK surface for the future frontend: channel management stays on the
+existing `/api/algo-workers/worker/notification-channels` routes; a run's
+notification history is available via `list_run_notifications(owner_id, run_id)`
+(run-scoped `signal_events` newest first). No frontend is added in this slice.

@@ -17,9 +17,11 @@ Only stdlib + SQLAlchemy imports at module load; safe to import anywhere.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from sqlalchemy import (
     JSON,
@@ -41,7 +43,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backend.workflows.repository import Base, LeaseConflict
+from backend.workflows.repository import Base, LeaseConflict, SignalEvent
 
 __all__ = [
     "ChannelReference",
@@ -50,8 +52,19 @@ __all__ = [
     "DELIVERY_STATUSES",
     "DEFAULT_LEASE_SECONDS",
     "LeaseConflict",
+    "RunNotificationError",
     "SqlAlchemyNotificationRepository",
 ]
+
+
+class RunNotificationError(Exception):
+    """A run-scoped notification was refused; ``code`` is a stable reason."""
+
+    def __init__(self, status_code: int, code: str, detail: Optional[str] = None) -> None:
+        self.status_code = int(status_code)
+        self.code = code
+        self.detail = detail
+        super().__init__(code)
 
 DELIVERY_STATUSES = ("pending", "delivering", "delivered", "retrying", "failed", "expired")
 DEFAULT_LEASE_SECONDS = 120
@@ -515,3 +528,217 @@ class SqlAlchemyNotificationRepository:
             ).scalars().all()
         )
         return due, stale
+
+    # -- run-scoped notifications (hosted strategies) -----------------------
+
+    @staticmethod
+    def _resolve_run_channels(session, owner_id: str, channel_names: Sequence[str]) -> List["ChannelReference"]:
+        """Resolve owner-scoped channel names, failing explicitly.
+
+        Unknown names are 422; a name that exists but belongs to another owner
+        is 403. Disabled channels are 422. No partial write happens because this
+        runs before any insert.
+        """
+        names = [str(name).strip() for name in (channel_names or []) if str(name).strip()]
+        unique_names = list(dict.fromkeys(names))
+        if not unique_names:
+            raise RunNotificationError(422, "channel_required", "at least one channel is required")
+        resolved: List["ChannelReference"] = []
+        for name in unique_names:
+            rows = list(
+                session.execute(
+                    select(ChannelReference).where(ChannelReference.name == name)
+                ).scalars().all()
+            )
+            owned = [row for row in rows if str(row.owner_id) == str(owner_id)]
+            if owned:
+                channel = owned[0]
+                if not channel.enabled:
+                    raise RunNotificationError(422, "channel_disabled", f"channel {name!r} is disabled")
+                resolved.append(channel)
+                continue
+            if rows:
+                # The name exists but is owned by someone else: do not leak it as
+                # "unknown".
+                raise RunNotificationError(403, "channel_not_authorized", f"channel {name!r} is not authorized")
+            raise RunNotificationError(422, "unknown_channel", f"unknown channel {name!r}")
+        return resolved
+
+    @staticmethod
+    def _run_content_hash(channel_ids: Sequence[str], text: str, subject: Optional[str]) -> str:
+        canonical = json.dumps(
+            {
+                "channels": sorted(str(cid) for cid in channel_ids),
+                "text": str(text),
+                "subject": (str(subject) if subject is not None else None),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def enqueue_run_notification(
+        self,
+        *,
+        owner_id: str,
+        run_id: str,
+        channel_names: Sequence[str],
+        text: str,
+        idempotency_key: str,
+        subject: Optional[str] = None,
+        occurred_at: Optional[datetime] = None,
+        db: Optional[Session] = None,
+    ) -> Dict[str, Any]:
+        """Atomically enqueue a run-scoped event + one delivery per channel.
+
+        - **Ownership** is the hosted strategy's app ``owner_id`` (never an
+          account scope): only that owner's channels resolve.
+        - **Idempotency** is derived from the caller key
+          (``hosted-run:{run_id}:{idempotency_key}``). A replay with the same
+          content is deduplicated (``deduped``) and writes nothing; the same key
+          with different content is a conflict (409).
+        - Unknown/unauthorized/disabled channels are explicit 422/403 errors
+          raised **before** any row is written.
+        - Event + deliveries commit in one transaction.
+        """
+        normalized_run_id = str(run_id or "").strip()
+        normalized_key = str(idempotency_key or "").strip()
+        if not normalized_run_id:
+            raise RunNotificationError(422, "run_required", "run_id is required")
+        if not normalized_key:
+            raise RunNotificationError(422, "idempotency_key_required", "idempotency_key is required")
+        body = str(text or "").strip()
+        if not body:
+            raise RunNotificationError(422, "text_required", "text is required")
+        fired_at = occurred_at or _utcnow()
+        occurrence_key = f"hosted-run:{normalized_run_id}:{normalized_key}"
+
+        if db is not None:
+            return self._enqueue_run_notification(
+                db, owner_id, normalized_run_id, channel_names, body, subject, occurrence_key, fired_at
+            )
+        session = self._session()
+        try:
+            result = self._enqueue_run_notification(
+                session, owner_id, normalized_run_id, channel_names, body, subject, occurrence_key, fired_at
+            )
+            session.commit()
+            return result
+        except IntegrityError:
+            # Lost the occurrence_key race: resolve to dedupe-or-conflict.
+            session.rollback()
+            return self._replay_run_notification(
+                owner_id, normalized_run_id, channel_names, body, subject, occurrence_key
+            )
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _enqueue_run_notification(
+        self, session, owner_id, run_id, channel_names, body, subject, occurrence_key, fired_at
+    ) -> Dict[str, Any]:
+        channels = self._resolve_run_channels(session, owner_id, channel_names)
+        channel_ids = [channel.id for channel in channels]
+        content_hash = self._run_content_hash(channel_ids, body, subject)
+
+        event = SignalEvent(
+            id=_uuid(),
+            subscription_id=None,
+            workflow_id=None,
+            occurrence_key=occurrence_key,
+            fired_at=fired_at,
+            evidence={
+                "message_kind": "strategy_run",
+                "run_id": run_id,
+                "text": body,
+                "subject": subject,
+                "content_sha256": content_hash,
+                "channels": [channel.name for channel in channels],
+            },
+            source_kind="strategy_run",
+            owner_id=owner_id,
+            run_id=run_id,
+            created_at=fired_at,
+        )
+        session.add(event)
+        session.flush()
+        for channel_id in channel_ids:
+            session.add(
+                Delivery(
+                    id=_uuid(),
+                    event_id=event.id,
+                    channel_id=channel_id,
+                    status="pending",
+                    attempts=0,
+                    next_attempt_at=fired_at,
+                    created_at=fired_at,
+                    updated_at=fired_at,
+                )
+            )
+        session.flush()
+        return {
+            "status": "accepted",
+            "event_id": event.id,
+            "run_id": run_id,
+            "delivery_count": len(channel_ids),
+            "content_sha256": content_hash,
+        }
+
+    def _replay_run_notification(
+        self, owner_id, run_id, channel_names, body, subject, occurrence_key
+    ) -> Dict[str, Any]:
+        session = self._session()
+        try:
+            event = session.execute(
+                select(SignalEvent).where(SignalEvent.occurrence_key == occurrence_key)
+            ).scalar_one_or_none()
+            if event is None or str(event.owner_id or "") != str(owner_id):
+                raise RunNotificationError(409, "idempotency_conflict", "idempotency key already used")
+            delivered_channels = self._resolve_run_channels(session, owner_id, channel_names)
+            existing_hash = str((event.evidence or {}).get("content_sha256") or "")
+            new_hash = self._run_content_hash([c.id for c in delivered_channels], body, subject)
+            if existing_hash != new_hash:
+                raise RunNotificationError(
+                    409, "idempotency_conflict", "idempotency key reused with different content"
+                )
+            delivery_count = int(
+                session.execute(
+                    select(func.count())
+                    .select_from(Delivery)
+                    .where(Delivery.event_id == event.id)
+                ).scalar_one()
+            )
+            return {
+                "status": "deduped",
+                "event_id": event.id,
+                "run_id": run_id,
+                "delivery_count": delivery_count,
+                "content_sha256": existing_hash,
+            }
+        finally:
+            session.close()
+
+    def list_run_notifications(
+        self, owner_id: str, run_id: str, *, limit: int = 50, db: Optional[Session] = None
+    ) -> List[SignalEvent]:
+        """Run-scoped event history for ``(owner_id, run_id)``, newest first."""
+        capped = max(1, min(int(limit), 200))
+        stmt = (
+            select(SignalEvent)
+            .where(
+                SignalEvent.source_kind == "strategy_run",
+                SignalEvent.owner_id == owner_id,
+                SignalEvent.run_id == str(run_id),
+            )
+            .order_by(SignalEvent.fired_at.desc(), SignalEvent.id.desc())
+            .limit(capped)
+        )
+        if db is not None:
+            return list(db.execute(stmt).scalars().all())
+        session = self._session()
+        try:
+            return list(session.execute(stmt).scalars().all())
+        finally:
+            session.close()
