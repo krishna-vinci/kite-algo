@@ -29,6 +29,7 @@ import {
 } from "@/features/alerts/hooks/use-alerts-queries";
 import { alertsErrorMessage, isNotFound } from "@/features/alerts/lib/errors";
 import { formatTimestamp } from "@/features/alerts/lib/format";
+import { newIdempotencyKey } from "@/lib/ids";
 
 function runStatusTone(status: string): "positive" | "warning" | "danger" | "neutral" {
   if (status === "complete") return "positive";
@@ -306,7 +307,10 @@ export function ScreenerPage({
           onClick={() =>
             // An idempotency key makes a double-click or a retry return the
             // original run instead of executing a second scan.
-            trigger.mutate(crypto.randomUUID())
+            // A manual run reuses its key on retry so a retried request cannot
+            // start a second scan; "Run now" after a completed run is a NEW
+            // intent and gets a new key.
+            trigger.mutate(newIdempotencyKey("screener-run"))
           }
         >
           <PlayIcon className="size-4" aria-hidden />

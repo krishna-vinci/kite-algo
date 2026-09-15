@@ -1,3 +1,5 @@
+import { newIdempotencyKey as sharedIdempotencyKey } from "@/lib/ids";
+
 /**
  * Presentation helpers for the hosted-strategy operator surface.
  *
@@ -110,12 +112,15 @@ export function hostedErrorMessage(error: unknown): string {
   return "Request failed";
 }
 
-/** A stable idempotency key for one launch request (retries reuse it). */
+/**
+ * A stable idempotency key for one launch request (retries reuse it).
+ *
+ * Delegates to the shared helper: `crypto.randomUUID()` is secure-context only,
+ * so the previous `Math.random()` fallback was both unreachable in the browsers
+ * that need a fallback and unsuitable for an identity.
+ */
 export function newIdempotencyKey(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `launch-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return sharedIdempotencyKey("launch");
 }
 
 /** Tailwind classes for a job status badge. */

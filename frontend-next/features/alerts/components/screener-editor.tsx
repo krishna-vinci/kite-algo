@@ -44,6 +44,7 @@ import {
   type ScreenerDraft,
   type ScreenerTrigger,
 } from "@/features/alerts/lib/screener-authoring";
+import { newIdempotencyKey } from "@/lib/ids";
 import { ApiClientError } from "@/lib/api/client";
 import { cn } from "@/lib/utils";
 
@@ -78,6 +79,8 @@ export function ScreenerEditor({ scope, initialDraft, baseDocument, edit }: Scre
     [draft, baseDocument],
   );
   const issues = useMemo(() => screenerDraftIssues(draft), [draft]);
+  // One key per creation attempt; retries reuse it (see alert-wizard).
+  const [idempotencyKey] = useState(() => newIdempotencyKey("screener"));
 
   const saveMutation = useMutation({
     mutationFn: async () => {
@@ -90,7 +93,7 @@ export function ScreenerEditor({ scope, initialDraft, baseDocument, edit }: Scre
         return edit.workflowId;
       }
       const response = await createAlertsWorkflow(
-        { name: draft.name, document, idempotency_key: crypto.randomUUID() },
+        { name: draft.name, document, idempotency_key: idempotencyKey },
         scope,
       );
       return response.workflow_id;

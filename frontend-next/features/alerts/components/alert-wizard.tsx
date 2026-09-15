@@ -38,6 +38,7 @@ import {
 import { alertsErrorMessage } from "@/features/alerts/lib/errors";
 import type { AlertsPreviewResponse, AlertsValidateResponse } from "@/features/alerts/types";
 import { ApiClientError } from "@/lib/api/client";
+import { newIdempotencyKey } from "@/lib/ids";
 import { cn } from "@/lib/utils";
 
 const STEPS = [
@@ -161,6 +162,11 @@ export function AlertWizard({ scope, initialDraft, baseDocument, edit }: AlertWi
 
   const isEditing = Boolean(edit);
   const [conflict, setConflict] = useState(false);
+  // One key per creation attempt: a retry after an uncertain failure (timeout,
+  // dropped response) must reuse it so the server deduplicates instead of
+  // creating a second workflow. It is regenerated only for a NEW creation,
+  // which is what this component instance is.
+  const [idempotencyKey] = useState(() => newIdempotencyKey("alert"));
 
   const saveMutation = useMutation({
     mutationFn: async () => {
@@ -173,7 +179,7 @@ export function AlertWizard({ scope, initialDraft, baseDocument, edit }: AlertWi
         return { workflowId: edit.workflowId, response };
       }
       const response = await createAlertsWorkflow(
-        { name: draft.name, document: document ?? {}, idempotency_key: crypto.randomUUID() },
+        { name: draft.name, document: document ?? {}, idempotency_key: idempotencyKey },
         scope,
       );
       return { workflowId: response.workflow_id, response };
