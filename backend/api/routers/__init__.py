@@ -12,6 +12,7 @@ from backend.api.routers.alerts_operator import router as alerts_operator_router
 from backend.api.routers.alerts_operator_platform import (
     router as alerts_operator_platform_router,
 )
+from backend.api.routers.strategies import router as strategies_router
 from backend.api.routers.analytics import router as analytics_router
 from backend.api.routers.auth import router as auth_router
 from backend.api.routers.control import router as control_router
@@ -49,6 +50,7 @@ ALL_ROUTERS = [
     (worker_signals_router, "/api"),
     (alerts_operator_router, "/api"),
     (alerts_operator_platform_router, "/api"),
+    (strategies_router, "/api"),
     (control_router, "/api"),
     (journal_router, "/api"),
     (analytics_router, "/api"),

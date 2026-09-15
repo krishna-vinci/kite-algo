@@ -10,6 +10,7 @@ pandas_market_calendars
 plotly
 psycopg2
 pydantic
+jsonschema
 PyYAML
 pyotp
 python-dotenv
