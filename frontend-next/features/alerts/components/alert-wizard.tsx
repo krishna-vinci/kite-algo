@@ -35,6 +35,7 @@ import {
   universeDraftIssues,
   type AlertDraft,
 } from "@/features/alerts/lib/authoring";
+import { alertsErrorMessage } from "@/features/alerts/lib/errors";
 import type { AlertsPreviewResponse, AlertsValidateResponse } from "@/features/alerts/types";
 import { ApiClientError } from "@/lib/api/client";
 import { cn } from "@/lib/utils";
@@ -131,8 +132,21 @@ export function AlertWizard({ scope, initialDraft, baseDocument, edit }: AlertWi
 
   const inlineWarning = useMemo(() => {
     if (!capabilities) return null;
-    return levelOnlyWarning(draft.conditions, draft.alert.trigger, capabilities.operators);
-  }, [capabilities, draft.conditions, draft.alert.trigger]);
+    return levelOnlyWarning(draft.conditions, draft.alert.trigger, capabilities.operators, {
+      anyConditions: draft.anyConditions,
+      notConditions: draft.notConditions,
+      notifyIfAlreadyTrue: draft.alert.notify_if_already_true,
+      consecutiveBars: draft.consecutiveBars,
+    });
+  }, [
+    capabilities,
+    draft.conditions,
+    draft.anyConditions,
+    draft.notConditions,
+    draft.alert.trigger,
+    draft.alert.notify_if_already_true,
+    draft.consecutiveBars,
+  ]);
 
   const validateMutation = useMutation({
     mutationFn: () => validateAlertsWorkflow({ document: document ?? {} }, scope),
@@ -188,8 +202,7 @@ export function AlertWizard({ scope, initialDraft, baseDocument, edit }: AlertWi
         <AlertTitle>Could not load capabilities</AlertTitle>
         <AlertDescription>
           The authoring form is driven entirely by the backend&apos;s declared capabilities, so it
-          cannot render without them.{" "}
-          {capabilitiesQuery.error instanceof Error ? capabilitiesQuery.error.message : ""}
+          cannot render without them. {alertsErrorMessage(capabilitiesQuery.error, "")}
         </AlertDescription>
       </Alert>
     );
@@ -199,6 +212,34 @@ export function AlertWizard({ scope, initialDraft, baseDocument, edit }: AlertWi
     draft.targeting === "universe"
       ? universeDraftIssues(draft.universe).length === 0
       : draft.instruments.length > 0 && incompatible.length === 0;
+
+  // The server is authoritative, but an invalid pair should never be sent in
+  // the first place. This also closes the gap where the session is chosen AFTER
+  // the instruments, so the step-0 check has already been passed.
+  const tooManyInstruments =
+    draft.targeting === "instruments" &&
+    draft.instruments.length > capabilities.limits.max_instruments;
+
+  const saveBlockers: string[] = [];
+  if (!draft.name.trim()) saveBlockers.push("Give this alert a name.");
+  if (!draft.session) saveBlockers.push("Choose a session.");
+  if (draft.targeting === "instruments") {
+    if (draft.instruments.length === 0) saveBlockers.push("Select at least one instrument.");
+    if (incompatible.length > 0) {
+      saveBlockers.push(
+        `Session “${draft.session}” does not support: ${incompatible
+          .map((item) => `${item.instrumentKey} (${item.exchange})`)
+          .join(", ")}.`,
+      );
+    }
+    if (tooManyInstruments) {
+      saveBlockers.push(
+        `At most ${capabilities.limits.max_instruments} instruments are allowed.`,
+      );
+    }
+  } else {
+    saveBlockers.push(...universeDraftIssues(draft.universe));
+  }
 
   const runPreview = () => {
     let observations: unknown[] = [];
@@ -440,11 +481,11 @@ export function AlertWizard({ scope, initialDraft, baseDocument, edit }: AlertWi
               </summary>
               <ul className="mt-2 flex flex-col gap-1 text-xs text-muted-foreground">
                 <li>
-                  Simultaneous breadth —{" "}
+                  Simultaneous breadth — not offered in this editor (
                   {capabilities.breadth_modes.simultaneous?.implemented === false
-                    ? "reported by the server as not implemented"
-                    : "available"}
-                  . {capabilities.breadth_semantics}
+                    ? "the server reports it as not implemented"
+                    : "only the windowed form is authorable, via the advanced editor"}
+                  ). {capabilities.breadth_semantics}
                 </li>
                 <li>Dynamic / indicator hysteresis — {capabilities.hysteresis.threshold}</li>
               </ul>
@@ -745,6 +786,14 @@ export function AlertWizard({ scope, initialDraft, baseDocument, edit }: AlertWi
                     {preview.note}
                   </p>
                 ) : null}
+                {/* Preview can surface compiler issues too (e.g. a document
+                    that validates structurally but cannot evaluate); they were
+                    previously fetched and dropped. */}
+                {preview.issues && preview.issues.length > 0 ? (
+                  <div className="mt-2">
+                    <OperatorIssueList issues={preview.issues} bare />
+                  </div>
+                ) : null}
               </div>
             ) : null}
 
@@ -771,11 +820,25 @@ export function AlertWizard({ scope, initialDraft, baseDocument, edit }: AlertWi
                 placeholder="reliance-breakout"
               />
             </div>
+            {saveBlockers.length > 0 ? (
+              <Alert variant="destructive">
+                <AlertCircleIcon />
+                <AlertTitle>Fix these before saving</AlertTitle>
+                <AlertDescription>
+                  <ul className="list-disc pl-4">
+                    {saveBlockers.map((blocker) => (
+                      <li key={blocker}>{blocker}</li>
+                    ))}
+                  </ul>
+                </AlertDescription>
+              </Alert>
+            ) : null}
+
             <div className="flex flex-wrap gap-2">
               <Button
                 type="button"
                 variant="outline"
-                disabled={!draft.name || saveMutation.isPending}
+                disabled={saveBlockers.length > 0 || saveMutation.isPending}
                 onClick={() => saveMutation.mutate()}
               >
                 {isEditing ? "Save as new draft revision" : "Save as draft"}

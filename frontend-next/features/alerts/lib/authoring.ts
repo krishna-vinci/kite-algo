@@ -119,29 +119,47 @@ export function isLevelOnly(
   return conditions.every((condition) => operatorGroup(condition.op, operators) === "level");
 }
 
-/** Triggers whose notification requires a transition, so a level-only rule cannot emit. */
-const TRANSITION_TRIGGERS = new Set(["on_transition", "once", "once_per_session", "reminder"]);
-
-export function triggerRequiresTransition(trigger: string): boolean {
-  return TRANSITION_TRIGGERS.has(trigger);
-}
+/**
+ * Extra stage facts the backend's `level_only_never_fires` rule consults.
+ *
+ * The rule looks at EVERY group (`all` + `any` + `not`): a crossing operator in
+ * an OR group is still a transition, so warning on the `all` group alone
+ * produced false positives. `consecutive_bars` produces a transition;
+ * `reminder` and `notify_if_already_true` are legitimate ways for a level rule
+ * to notify, so all three suppress the warning — exactly as the compiler does.
+ */
+export type LevelOnlyContext = {
+  anyConditions?: Condition[];
+  notConditions?: Condition[];
+  notifyIfAlreadyTrue?: boolean;
+  consecutiveBars?: number | null;
+};
 
 /**
- * The inline warning the wizard shows. Returns null when there is nothing to
- * warn about. `reminder` is called out because it *can* emit without a
- * transition, so the advice differs.
+ * The inline warning the wizard shows, mirroring the compiler's
+ * `level_only_never_fires` rule. Returns null when there is nothing to warn
+ * about. The server's warning remains the authority — this only saves a round
+ * trip, and the wizard always surfaces the server's issues too.
  */
 export function levelOnlyWarning(
   conditions: Condition[],
   trigger: string,
   operators: AlertsCapabilities["operators"],
+  context: LevelOnlyContext = {},
 ): string | null {
-  if (!isLevelOnly(conditions, operators)) return null;
-  if (!triggerRequiresTransition(trigger)) return null;
-  if (trigger === "reminder") {
-    return "Every condition is a level test, which reports whether something is currently true and never reports a change. A reminder can still fire on its interval, but if you expect a notification when the level is crossed, choose a crossing operator.";
-  }
-  return "Every condition is a level test, which reports whether something is currently true and never reports a change. With this trigger the alert will never notify. Choose a crossing operator (crosses above / crosses below) or switch to the reminder trigger.";
+  const all = [
+    ...conditions,
+    ...(context.anyConditions ?? []),
+    ...(context.notConditions ?? []),
+  ];
+  if (all.length === 0) return null;
+  if (!all.every((condition) => operatorGroup(condition.op, operators) === "level")) return null;
+  // A stage-level construct that DOES produce a transition.
+  if (context.consecutiveBars != null) return null;
+  // `reminder` emits while the level holds; `notify_if_already_true` opts in at
+  // activation. Neither is a mistake, so neither warns.
+  if (trigger === "reminder" || context.notifyIfAlreadyTrue) return null;
+  return "Every condition is a level test, which reports whether something is currently true and never reports a change. With this trigger the alert will never notify. Choose a crossing operator (crosses above / crosses below), or set the trigger to reminder to notify while the level holds, or enable notify-if-already-true to opt in at activation.";
 }
 
 // ---------------------------------------------------------------------------
@@ -499,9 +517,16 @@ export function operandFromDocument(raw: unknown): Operand | null {
   if (raw === null || typeof raw !== "object") return null;
   const record = raw as Record<string, unknown>;
 
-  // Authoring shorthand.
-  if (!("kind" in record) && "field" in record) return { kind: "field", name: String(record.field) };
+  // Authoring shorthand. The unmodeled-attribute guard applies here too: a
+  // shorthand operand carrying `source`/`offset`/`params` would otherwise be
+  // accepted and those attributes silently dropped on save, which the canonical
+  // `kind:` branches below already refuse.
+  if (!("kind" in record) && "field" in record) {
+    if (operandHasUnmodeledAttributes(record)) return null;
+    return { kind: "field", name: String(record.field) };
+  }
   if (!("kind" in record) && "indicator" in record) {
+    if (operandHasUnmodeledAttributes(record)) return null;
     const period = record.period;
     return {
       kind: "indicator",
@@ -535,6 +560,9 @@ export function operandFromDocument(raw: unknown): Operand | null {
   return null;
 }
 
+/** The only condition keys the structured editor models and re-emits. */
+const CONDITION_KEYS = new Set(["left", "op", "right", "hysteresis"]);
+
 /**
  * Parse one condition, returning a REASON when it cannot be represented.
  *
@@ -548,9 +576,34 @@ export function conditionFromDocument(
     return { ok: false, reason: "A condition is not in a form this editor understands." };
   }
   const record = raw as Record<string, unknown>;
+
+  // A condition this editor cannot fully represent must be REFUSED, not
+  // accepted-and-trimmed: `conditionToDocument` re-emits only left/op/right/
+  // hysteresis, so any additional key would silently disappear on save.
+  const extraKeys = Object.keys(record).filter(
+    (key) => !CONDITION_KEYS.has(key),
+  );
+  if (extraKeys.length > 0) {
+    return {
+      ok: false,
+      reason: `This condition carries field(s) the structured editor does not model (${extraKeys.join(
+        ", ",
+      )}); open it in the advanced editor so they are not dropped.`,
+    };
+  }
+
   let hysteresis: { release: number } | null = null;
   if (record.hysteresis) {
     const rawHysteresis = record.hysteresis as Record<string, unknown>;
+    const extraHysteresisKeys = Object.keys(rawHysteresis).filter((key) => key !== "release");
+    if (extraHysteresisKeys.length > 0) {
+      return {
+        ok: false,
+        reason: `This condition's hysteresis carries field(s) the structured editor does not model (${extraHysteresisKeys.join(
+          ", ",
+        )}); only a constant release is supported.`,
+      };
+    }
     if (typeof rawHysteresis.release === "number") {
       hysteresis = { release: rawHysteresis.release };
     } else {

@@ -58,20 +58,29 @@ export function AdvancedDefinitionEditor({
   const queryClient = useQueryClient();
 
   const hasYaml = typeof initialYaml === "string" && initialYaml.trim() !== "";
-  const [mode, setMode] = useState<EditorMode>(hasYaml ? "yaml" : "json");
-  const [text, setText] = useState(() =>
-    hasYaml ? (initialYaml as string) : JSON.stringify(initialDocument ?? {}, null, 2),
+  const initialJson = useMemo(
+    () => JSON.stringify(initialDocument ?? {}, null, 2),
+    [initialDocument],
   );
+  const [mode, setMode] = useState<EditorMode>(hasYaml ? "yaml" : "json");
+  // One buffer PER MODE, so switching YAML<->JSON never discards unsaved edits.
+  // The active buffer is what gets validated/saved.
+  const [buffers, setBuffers] = useState<Record<EditorMode, string>>(() => ({
+    yaml: hasYaml ? (initialYaml as string) : initialJson,
+    json: initialJson,
+  }));
   const [parseError, setParseError] = useState<string | null>(null);
   const [issues, setIssues] = useState<AlertsIssue[] | null>(null);
   const [conflict, setConflict] = useState(false);
 
-  const currentText = useMemo(() => text, [text]);
+  const text = buffers[mode];
+  const setText = (value: string) =>
+    setBuffers((current) => ({ ...current, [mode]: value }));
 
   const buildPayload = (): { yaml_text?: string; document?: Record<string, unknown> } | { error: string } => {
-    if (mode === "yaml") return { yaml_text: currentText };
+    if (mode === "yaml") return { yaml_text: text };
     try {
-      const parsed = JSON.parse(currentText);
+      const parsed = JSON.parse(text);
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
         return { error: "The JSON document must be an object." };
       }
@@ -158,13 +167,11 @@ export function AdvancedDefinitionEditor({
             size="sm"
             variant={mode === option ? "default" : "outline"}
             aria-pressed={mode === option}
+            // Switching modes keeps each mode's own buffer, so edits are never
+            // discarded. YAML is unavailable when the server rendered none.
+            disabled={option === "yaml" && !hasYaml}
             onClick={() => {
               if (option === mode) return;
-              if (option === "json") {
-                setText(JSON.stringify(initialDocument ?? {}, null, 2));
-              } else if (hasYaml) {
-                setText(initialYaml as string);
-              }
               setMode(option);
               setIssues(null);
               setParseError(null);

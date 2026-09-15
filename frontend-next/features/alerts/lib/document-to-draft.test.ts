@@ -91,6 +91,35 @@ describe("documentToDraft", () => {
     if (result.ok) expect(result.draft.conditions[0].hysteresis).toEqual({ release: 2900 });
   });
 
+  it("refuses a condition carrying an unmodeled key instead of dropping it on save", () => {
+    const document = buildDocument(DRAFT);
+    const stages = document.stages as Array<Record<string, unknown>>;
+    const conditions = stages[0].conditions as { all: Array<Record<string, unknown>> };
+    conditions.all[0] = { ...conditions.all[0], note: "unmodeled" };
+    const result = documentToDraft(document);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/does not model/i);
+  });
+
+  it("refuses a shorthand operand carrying an unmodeled attribute", () => {
+    const document = buildDocument(DRAFT);
+    const stages = document.stages as Array<Record<string, unknown>>;
+    const conditions = stages[0].conditions as { all: Array<Record<string, unknown>> };
+    conditions.all[0] = { ...conditions.all[0], left: { field: "close", source: "close" } };
+    const result = documentToDraft(document);
+    expect(result.ok).toBe(false);
+  });
+
+  it("refuses hysteresis carrying extra keys", () => {
+    const document = buildDocument(DRAFT);
+    const stages = document.stages as Array<Record<string, unknown>>;
+    const conditions = stages[0].conditions as { all: Array<Record<string, unknown>> };
+    conditions.all[0] = { ...conditions.all[0], hysteresis: { release: 2900, extra: 1 } };
+    const result = documentToDraft(document);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/hysteresis/i);
+  });
+
   it("refuses dynamic hysteresis, which is not implemented", () => {
     const document = buildDocument(DRAFT);
     const stages = document.stages as Array<Record<string, unknown>>;

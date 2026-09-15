@@ -81,10 +81,45 @@ describe("isLevelOnly / levelOnlyWarning", () => {
     expect(warning).toContain("crossing operator");
   });
 
-  it("gives different advice for the reminder trigger, which can still fire", () => {
-    const warning = levelOnlyWarning(levelConditions, "reminder", OPERATORS);
-    expect(warning).toContain("reminder");
-    expect(warning).not.toContain("will never notify");
+  it("stays silent for the reminder trigger, which can still fire", () => {
+    // Mirrors the compiler, which does not warn when a reminder (or the
+    // notify_if_already_true opt-in) makes a level-only rule legitimate.
+    expect(levelOnlyWarning(levelConditions, "reminder", OPERATORS)).toBeNull();
+  });
+
+  it("stays silent when notify_if_already_true opts in", () => {
+    expect(
+      levelOnlyWarning(levelConditions, "on_transition", OPERATORS, {
+        notifyIfAlreadyTrue: true,
+      }),
+    ).toBeNull();
+  });
+
+  it("stays silent when consecutive_bars produces the transition", () => {
+    expect(
+      levelOnlyWarning(levelConditions, "on_transition", OPERATORS, { consecutiveBars: 3 }),
+    ).toBeNull();
+  });
+
+  it("does not warn when an OR/NOT group contains a crossing operator", () => {
+    // The warning looks at every group, so a crossing in `any` means the rule
+    // can transition and must not be flagged.
+    expect(
+      levelOnlyWarning(levelConditions, "on_transition", OPERATORS, {
+        anyConditions: [
+          { left: { kind: "field", name: "close" }, op: "crosses_above", right: { kind: "constant", value: 1 } },
+        ],
+      }),
+    ).toBeNull();
+  });
+
+  it("warns when every group is level-only", () => {
+    const warning = levelOnlyWarning(levelConditions, "on_transition", OPERATORS, {
+      anyConditions: [
+        { left: { kind: "field", name: "close" }, op: "gt", right: { kind: "constant", value: 1 } },
+      ],
+    });
+    expect(warning).toContain("never notify");
   });
 
   it("stays silent when the rule can transition", () => {
