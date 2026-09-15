@@ -220,6 +220,13 @@ class StrategyJob(Base):
     last_progress_at = Column(DateTime(timezone=True), nullable=True)
     exit_code = Column(Integer, nullable=True)
     log_ref = Column(Text, nullable=True)
+    #: Set exactly once, when a supervise launch has delivered the child
+    #: configuration (run id + session nonce + one-time token) to the
+    #: supervisor. It is the durable marker that a credential handoff happened,
+    #: so a repeated preparation fails closed instead of minting a second
+    #: credential. ``NULL`` means the handoff is still uncertain (or never ran).
+    handoff_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
     recovery_required_at = Column(DateTime(timezone=True), nullable=True)
     reconciled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

@@ -12,6 +12,7 @@ from backend.broker_api.orders.basket_execution import basket_execution_store
 from backend.broker_api.orders.bracket_runtime import bracket_runtime_store
 from backend.api.schemas.worker import WorkerBasketPreviewRequest, WorkerBracketCreateRequest, WorkerExitRequest, WorkerIntentRequest, WorkerOrderActionRequest, WorkerOrderModifyRequest, WorkerOrderPreviewRequest
 from backend.api.routers.worker_shared import *
+from backend.api.services.hosted_attempt import enforce_hosted_attempt_authority
 from backend.shared.serialization import _json_dumps
 from backend.api.routers.worker_protection import _build_worker_run_pnl_snapshot, validate_worker_run_safety_token
 from backend.algo_runtime.execution_attribution import build_execution_attribution, build_paper_execution_attribution
@@ -529,6 +530,7 @@ async def cancel_worker_order(request: Request, order_id: str, payload: WorkerOr
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     _require_live_run(run, feature="Order cancellation")
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
     corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-cancel-{uuid.uuid4()}"
@@ -551,6 +553,7 @@ async def modify_worker_order(request: Request, order_id: str, payload: WorkerOr
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     _require_live_run(run, feature="Order modification")
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
     corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-modify-{uuid.uuid4()}"
@@ -637,6 +640,7 @@ async def create_worker_bracket(request: Request, strategy_run_id: str, payload:
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     _require_live_run(run, feature="Bracket intents")
     await require_active_worker_run_session(request, run)
 
@@ -773,6 +777,7 @@ async def cancel_worker_bracket(request: Request, strategy_run_id: str, bracket_
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     _require_live_run(run, feature="Bracket intents")
     await require_active_worker_run_session(request, run)
 
@@ -804,6 +809,7 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     await require_active_worker_run_session(request, run)
     if str(run.get("status") or "open") != "open":
         raise HTTPException(status_code=409, detail="Worker intents can only be submitted for open strategy runs")
@@ -938,6 +944,7 @@ async def exit_worker_run(request: Request, strategy_run_id: str, payload: Worke
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     await require_active_worker_run_session(request, run)
     mode = str(run.get("execution_mode") or "").lower()
     _require_v1_mode(mode)

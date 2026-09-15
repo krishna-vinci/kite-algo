@@ -1,0 +1,98 @@
+"""Request/response schemas for the supervisor lifecycle API.
+
+These models carry **authority references only** (lease owner/epoch/attempt) —
+never a run id the caller chooses and never any supervisor secret. Job identity
+and configuration are derived server-side from the persisted job record.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class _Authority(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lease_owner: str = Field(min_length=1, max_length=120)
+    lease_epoch: int = Field(ge=0)
+    attempt: int = Field(ge=1)
+
+
+class ClaimJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lease_owner: str = Field(min_length=1, max_length=120)
+    expected_lease_epoch: int = Field(ge=0)
+    expected_attempt: int = Field(ge=1)
+    lease_until: datetime
+
+
+class PrepareLaunchRequest(_Authority):
+    pass
+
+
+class HeartbeatRequest(_Authority):
+    lease_until: datetime
+
+
+class ReleaseRequest(_Authority):
+    pass
+
+
+class FenceRequest(_Authority):
+    reason: Optional[str] = Field(default=None, max_length=200)
+
+
+class ChildLaunchConfigResponse(BaseModel):
+    """The one-time child configuration handed to the supervisor.
+
+    ``worker_token`` is a secret shown exactly once. It is the *child* token, not
+    the supervisor credential.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    strategy_id: str
+    attempt: int
+    lease_epoch: int
+    run_id: str
+    worker_token: str
+    session_nonce: str
+    template_id: str
+    execution_mode: str
+    account_scope: str
+    params: Dict[str, Any]
+    max_duration_s: int
+    progress_deadline_s: int
+    stale_exit_policy: str
+
+
+class JobStateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    strategy_id: str
+    attempt: int
+    status: str
+    desired_state: str
+    lease_owner: Optional[str] = None
+    lease_epoch: int
+    lease_until: Optional[str] = None
+    run_id: Optional[str] = None
+    token_id: Optional[str] = None
+    handoff_at: Optional[str] = None
+    run_status: Optional[str] = None
+
+
+class ActionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    job_id: str
+    reason: Optional[str] = None
+    lease_until: Optional[str] = None
+    last_heartbeat_at: Optional[str] = None

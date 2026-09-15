@@ -11,6 +11,7 @@ from backend.api.routers.worker_shared import (
     require_active_worker_run_session,
     require_worker_token,
 )
+from backend.api.services.hosted_attempt import enforce_hosted_attempt_authority
 from backend.options.api.execution_router import (
     create_option_run,
     enter_option_run,
@@ -157,6 +158,7 @@ async def enter_worker_option_run(
 ):
     run = await _repo(request).get_run(strategy_run_id)
     if run is not None:
+        await enforce_hosted_attempt_authority(request, _token, run)
         await require_active_worker_run_session(request, run)
     action_payload = payload or OptionRunActionRequest()
     if action_payload.safety_token:
@@ -192,6 +194,7 @@ async def exit_worker_option_run(
 ):
     run = await _repo(request).get_run(strategy_run_id)
     if run is not None:
+        await enforce_hosted_attempt_authority(request, _token, run)
         await require_active_worker_run_session(request, run)
     action_payload = payload or OptionRunActionRequest()
     if action_payload.safety_token:
@@ -223,6 +226,7 @@ async def update_worker_option_run_protection(
 ):
     run = await _repo(request).get_run(strategy_run_id)
     if run is not None:
+        await enforce_hosted_attempt_authority(request, _token, run)
         await require_active_worker_run_session(request, run)
     return await update_option_run_protection(strategy_run_id, payload, store)
 

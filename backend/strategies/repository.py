@@ -403,6 +403,271 @@ class SqlAlchemyStrategyRepository:
         finally:
             session.close()
 
+    # -- internal / supervisor-scoped lookups -------------------------------
+    #
+    # These are used by the narrow, credential-authenticated lifecycle API. They
+    # are NOT owner-scoped (the supervisor is not an app user); the router
+    # authorizes against the job's persisted lease/attempt authority instead, and
+    # never lets a bare run id select an unrelated run.
+
+    def get_job_by_id(self, job_id: str) -> Optional[StrategyJob]:
+        session = self._session()
+        try:
+            return session.execute(
+                select(StrategyJob).where(StrategyJob.id == job_id)
+            ).scalar_one_or_none()
+        finally:
+            session.close()
+
+    def get_job_by_run_id(self, run_id: str) -> Optional[StrategyJob]:
+        if not run_id:
+            return None
+        session = self._session()
+        try:
+            return session.execute(
+                select(StrategyJob).where(StrategyJob.run_id == run_id)
+            ).scalars().first()
+        finally:
+            session.close()
+
+    def get_job_by_token_id(self, token_id: str) -> Optional[StrategyJob]:
+        if not token_id:
+            return None
+        session = self._session()
+        try:
+            return session.execute(
+                select(StrategyJob).where(StrategyJob.token_id == token_id)
+            ).scalars().first()
+        finally:
+            session.close()
+
+    # -- launch preparation markers (fenced, one-way) ------------------------
+    #
+    # Each marker is recorded durably with an authority CAS, so a crash between
+    # steps is visible on retry and preparation can fail closed instead of
+    # re-minting a credential. See ``backend.api.services.hosted_lifecycle``.
+
+    @staticmethod
+    def _authority_clause(
+        job_id: str, lease_owner: str, expected_lease_epoch: int, expected_attempt: int
+    ):
+        return and_(
+            StrategyJob.id == job_id,
+            StrategyJob.status.in_(("starting", "running")),
+            StrategyJob.lease_owner == lease_owner,
+            StrategyJob.lease_epoch == expected_lease_epoch,
+            StrategyJob.attempt == expected_attempt,
+        )
+
+    def reserve_child_token(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        expected_lease_epoch: int,
+        expected_attempt: int,
+        token_id: str,
+    ) -> bool:
+        """CAS the child ``token_id`` onto the job. Only one caller can win."""
+        session = self._session()
+        try:
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    self._authority_clause(
+                        job_id, lease_owner, expected_lease_epoch, expected_attempt
+                    ),
+                    StrategyJob.token_id.is_(None),
+                    StrategyJob.handoff_at.is_(None),
+                )
+                .values(token_id=token_id, updated_at=_utcnow())
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def record_child_run(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        expected_lease_epoch: int,
+        expected_attempt: int,
+        token_id: str,
+        run_id: str,
+    ) -> bool:
+        """CAS the child ``run_id`` onto the job, pinning the token it bounds."""
+        session = self._session()
+        try:
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    self._authority_clause(
+                        job_id, lease_owner, expected_lease_epoch, expected_attempt
+                    ),
+                    StrategyJob.token_id == token_id,
+                    StrategyJob.run_id.is_(None),
+                    StrategyJob.handoff_at.is_(None),
+                )
+                .values(run_id=run_id, updated_at=_utcnow())
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def mark_running_and_handoff(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        expected_lease_epoch: int,
+        expected_attempt: int,
+        run_id: str,
+    ) -> bool:
+        """Record the successful handoff: status ``running`` + ``handoff_at``.
+
+        One-way and authority-fenced. A second call is a no-op (``handoff_at``
+        already set), so it cannot re-open a delivered attempt.
+        """
+        session = self._session()
+        try:
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    self._authority_clause(
+                        job_id, lease_owner, expected_lease_epoch, expected_attempt
+                    ),
+                    StrategyJob.run_id == run_id,
+                    StrategyJob.handoff_at.is_(None),
+                )
+                .values(
+                    status="running",
+                    handoff_at=_utcnow(),
+                    updated_at=_utcnow(),
+                )
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def renew_lease(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        expected_lease_epoch: int,
+        expected_attempt: int,
+        lease_until: datetime,
+    ) -> bool:
+        """Extend a live lease. Authority-fenced; does NOT touch progress.
+
+        Runner liveness (this heartbeat) is deliberately distinct from strategy
+        progress (``last_progress_at``), which is never written here.
+        """
+        if not isinstance(lease_until, datetime) or lease_until.tzinfo is None:
+            raise service.StrategyValidationError("lease_until must be a timezone-aware datetime")
+        if lease_until <= _utcnow():
+            raise service.StrategyValidationError("lease_until must be in the future")
+        session = self._session()
+        try:
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    self._authority_clause(
+                        job_id, lease_owner, expected_lease_epoch, expected_attempt
+                    ),
+                    StrategyJob.handoff_at.is_not(None),
+                )
+                .values(lease_until=lease_until, updated_at=_utcnow())
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def record_failure(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        expected_lease_epoch: int,
+        expected_attempt: int,
+        reason: str,
+    ) -> bool:
+        """Record a short, non-secret failure diagnostic under authority."""
+        session = self._session()
+        try:
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    self._authority_clause(
+                        job_id, lease_owner, expected_lease_epoch, expected_attempt
+                    )
+                )
+                .values(last_error=str(reason)[:500], updated_at=_utcnow())
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def mark_stopped(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        expected_lease_epoch: int,
+        expected_attempt: int,
+    ) -> bool:
+        """Runner-owned stop under authority. Clears the lease.
+
+        A stop is NOT a claim of cancellation or flatness: it records that
+        launching ceased and the session was released. Any exposure remains and
+        must be reconciled separately.
+        """
+        session = self._session()
+        try:
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    self._authority_clause(
+                        job_id, lease_owner, expected_lease_epoch, expected_attempt
+                    )
+                )
+                .values(
+                    status="stopped",
+                    desired_state="stopped",
+                    lease_owner=None,
+                    lease_until=None,
+                    updated_at=_utcnow(),
+                )
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def claim_job(
         self,
         job_id: str,

@@ -16,6 +16,7 @@ from backend.api.schemas.worker import (
     WorkerTokenView,
 )
 from backend.api.routers.worker_shared import *
+from backend.api.services.hosted_attempt import assert_child_lifecycle_forbidden
 
 router = APIRouter(prefix='/algo-workers', tags=['Algo Workers'])
 logger = logging.getLogger(__name__)
@@ -84,6 +85,7 @@ async def claim_worker_run_session(request: Request, strategy_run_id: str):
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    assert_child_lifecycle_forbidden(run, "claim_session")
     try:
         claimed = await _repo(request).claim_run_session(
             strategy_run_id,
@@ -114,6 +116,7 @@ async def release_worker_run_session(request: Request, strategy_run_id: str):
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    assert_child_lifecycle_forbidden(run, "release_session")
     nonce = _worker_session_nonce_from_request(request)
     if not nonce:
         raise HTTPException(
@@ -142,6 +145,7 @@ async def heartbeat_worker_run_session(request: Request, strategy_run_id: str, p
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    assert_child_lifecycle_forbidden(run, "heartbeat_session")
     nonce = _worker_session_nonce_from_request(request)
     if not nonce:
         raise HTTPException(
@@ -169,115 +173,7 @@ async def heartbeat_worker_run_session(request: Request, strategy_run_id: str, p
 async def create_worker_run(request: Request, payload: WorkerRunCreateRequest):
     token = await require_worker_token(request)
     _require_action(token, "runs:create")
-    _require_v1_mode(payload.execution_mode)
-    try:
-        parsed_scope = parse_account_scope(payload.account_scope)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if payload.execution_mode == "paper" and parsed_scope.mode != "paper":
-        raise HTTPException(status_code=400, detail="Paper worker runs require a paper account_scope")
-    if not _token_allows_account_scope(token, payload.account_scope):
-        raise HTTPException(status_code=403, detail="Worker token cannot create runs for this account scope")
-    if token.allowed_templates and payload.template_id not in token.allowed_templates:
-        raise HTTPException(status_code=403, detail="Worker token cannot create this strategy template")
-    if payload.execution_mode not in token.allowed_modes:
-        raise HTTPException(status_code=403, detail="Worker token cannot use this execution mode")
-    if payload.execution_mode == "live":
-        _validate_live_run_contract(account_scope=payload.account_scope, metadata=payload.metadata)
-
-    runtime_state = dict(payload.runtime_state or {})
-    if "backend_protection" in runtime_state:
-        from backend.api.routers.worker_protection import _initial_backend_protection_state, _normalized_backend_protection_runtime_state
-
-        try:
-            runtime_state["backend_protection"] = _normalized_backend_protection_runtime_state(
-                runtime_state.get("backend_protection"),
-                live=payload.execution_mode == "live",
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        runtime_state["backend_protection_state"] = _initial_backend_protection_state(
-            runtime_state["backend_protection"],
-            generation=1,
-            reason="run_create",
-        )
-        payload = payload.model_copy(update={"runtime_state": runtime_state})
-
-    strategy_run_id = payload.strategy_run_id or f"run_{uuid.uuid4().hex}"
-
-    metadata = dict(payload.metadata or {})
-    runtime_state = dict(payload.runtime_state or {})
-    worker_source_metadata = {
-        "token_id": token.token_id,
-        "worker_name": token.name,
-        "allowed_templates": list(token.allowed_templates or []),
-    }
-    try:
-        v2_refs = _journal_service(request).ensure_v2_worker_context(
-            execution_mode=payload.execution_mode,
-            account_scope=payload.account_scope,
-            strategy_run_id=strategy_run_id,
-            external_run_id=strategy_run_id,
-            template_id=str(payload.template_id or "").strip() or None,
-            worker_template_id=str(metadata.get("worker_template_id") or payload.template_id or "").strip() or None,
-            strategy_name=str(metadata.get("strategy_name") or payload.template_id or strategy_run_id).strip(),
-            strategy_family=str(metadata.get("strategy_family") or "indicator_strategy").strip(),
-            scenario_key=str(metadata.get("scenario_key") or "").strip() or None,
-            scenario_name=str(metadata.get("scenario_name") or "").strip() or None,
-            deployment_key=str(metadata.get("deployment_key") or "").strip() or None,
-            config_hash=str(metadata.get("config_hash") or "").strip() or None,
-            source_system="algo_worker",
-            entry_surface=str(metadata.get("entry_surface") or "algo_worker").strip() or "algo_worker",
-            source_metadata=worker_source_metadata,
-        )
-        metadata["journal_v2"] = dict(v2_refs)
-        runtime_state["journal_v2"] = {
-            "environment_id": v2_refs.get("environment_id"),
-            "execution_context_id": v2_refs.get("execution_context_id"),
-            "template_id": v2_refs.get("template_id"),
-            "variant_id": v2_refs.get("variant_id"),
-            "deployment_id": v2_refs.get("deployment_id"),
-        }
-        payload = payload.model_copy(update={"metadata": metadata, "runtime_state": runtime_state})
-    except Exception as exc:
-        metadata.setdefault("journal_v2_warning", "context_resolution_failed")
-        metadata.setdefault("journal_v2_warning_detail", str(exc))
-        payload = payload.model_copy(update={"metadata": metadata, "runtime_state": runtime_state})
-        logger.warning(
-            "algo_worker_run_create_journal_v2_context_failed",
-            extra={
-                "strategy_run_id": strategy_run_id,
-                "account_scope": payload.account_scope,
-                "execution_mode": payload.execution_mode,
-                "template_id": payload.template_id,
-                "error": str(exc),
-            },
-        )
-
-    try:
-        return await _repo(request).create_run(token, payload, strategy_run_id=strategy_run_id)
-    except IntegrityError as exc:
-        logger.warning(
-            "algo_worker_run_create_conflict",
-            extra={
-                "strategy_run_id": strategy_run_id,
-                "account_scope": payload.account_scope,
-                "execution_mode": payload.execution_mode,
-                "template_id": payload.template_id,
-            },
-        )
-        raise HTTPException(status_code=409, detail="Strategy run already exists") from exc
-    except SQLAlchemyError as exc:
-        logger.exception(
-            "algo_worker_run_create_database_failed",
-            extra={
-                "strategy_run_id": strategy_run_id,
-                "account_scope": payload.account_scope,
-                "execution_mode": payload.execution_mode,
-                "template_id": payload.template_id,
-            },
-        )
-        raise HTTPException(status_code=503, detail="Worker run persistence unavailable") from exc
+    return await create_worker_run_for_token(request, token, payload)
 
 
 async def _attach_worker_run_positions(request: Request, run: dict) -> dict:

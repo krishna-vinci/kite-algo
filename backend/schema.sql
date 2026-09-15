@@ -2385,6 +2385,8 @@ CREATE TABLE IF NOT EXISTS public.strategy_jobs (
     last_progress_at TIMESTAMPTZ,
     exit_code INTEGER,
     log_ref TEXT,
+    handoff_at TIMESTAMPTZ,
+    last_error TEXT,
     recovery_required_at TIMESTAMPTZ,
     reconciled_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

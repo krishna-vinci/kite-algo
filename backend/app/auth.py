@@ -222,6 +222,10 @@ def clear_auth_cookies(response: Response) -> None:
 def auth_exempt_path(path: str) -> bool:
     if path.startswith("/api/algo-workers/worker") or path.startswith("/api/worker/"):
         return True
+    # The supervisor lifecycle API authenticates with a narrow service
+    # credential, not the app cookie, so the cookie middleware must not gate it.
+    if path.startswith("/api/hosted-supervisor/"):
+        return True
     return path in {
         "/api/auth/login",
         "/api/auth/refresh",

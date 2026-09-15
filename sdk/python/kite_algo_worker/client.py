@@ -4,7 +4,7 @@ import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, TYPE_CHECKING
 
 import requests
 
@@ -38,6 +38,10 @@ from .investment import (
     WorkerMarketCalendarStatus,
 )
 from .run_config import RunConfig
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .managed_run import ManagedRun
+
 from .models import (
     OrderPreview,
     RunProtectionState,
@@ -156,6 +160,47 @@ class KiteAlgoWorkerClient:
 
     def create_run_from_config(self, config: RunConfig) -> JsonDict:
         return self._request("POST", "/worker/runs", json=config.to_create_run_payload())
+
+    def attach_run(
+        self,
+        run_id: str,
+        *,
+        session_nonce: str,
+        config: RunConfig,
+    ) -> "ManagedRun":
+        """Attach to an EXISTING run as a hosted child — no lifecycle calls.
+
+        This is the attach-only entry point: it fetches and validates the run and
+        returns a :class:`~kite_algo_worker.managed_run.ManagedRun` that carries
+        the caller-supplied ``session_nonce`` for authorized operations. It
+        deliberately does **not** create a run, claim a session, heartbeat or
+        release — those are owned by the supervisor through the lifecycle API,
+        and a hosted child token is not permitted to perform them.
+
+        ``client.run(...)`` is unchanged and remains the create/claim path for
+        external workers.
+        """
+        existing = self.get_run(run_id)
+        mismatches = {
+            "template_id": (existing.get("template_id"), config.template_id),
+            "account_scope": (existing.get("account_scope"), config.account_scope),
+            "execution_mode": (existing.get("execution_mode"), config.execution_mode),
+        }
+        wrong = {key: value for key, value in mismatches.items() if str(value[0]) != str(value[1])}
+        if wrong:
+            raise KiteAlgoWorkerError(
+                f"RunConfig mismatch for {run_id}: {wrong}",
+                status_code=409,
+            )
+
+        from .managed_run import ManagedRun
+
+        return ManagedRun(
+            client=self,
+            config=config,
+            run=existing,
+            session_nonce=str(session_nonce),
+        )
 
     @contextmanager
     def run(
