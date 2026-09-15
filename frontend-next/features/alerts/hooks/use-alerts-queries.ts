@@ -98,9 +98,21 @@ export function useAlertsScope() {
     scopes,
     setScope,
     isLoading: scopesQuery.isLoading,
+    /** True when the scopes call itself failed, so pages can show an error. */
+    isError: scopesQuery.isError,
     error: scopesQuery.error,
-    /** True when the requested scope was not authorized and we fell back. */
-    fellBack: Boolean(requested) && requested !== resolvedScope,
+    /**
+     * True when the requested scope was not authorized and we fell back.
+     *
+     * Gated on the scopes query having RESOLVED: while it is still loading the
+     * authorized list is empty, so every `?scope=` would look unauthorized and
+     * the "not authorized" banner would flash before the truth arrives.
+     */
+    fellBack:
+      !scopesQuery.isLoading &&
+      !scopesQuery.isError &&
+      Boolean(requested) &&
+      requested !== resolvedScope,
   };
 }
 
@@ -282,6 +294,11 @@ export function useAlertsScreenerRuns(workflowId: string, scope: string | null) 
     queryKey: alertsKeys.screenerRuns(workflowId, scope),
     queryFn: () => fetchAlertsScreenerRuns(workflowId, { scope }),
     enabled: Boolean(workflowId && scope),
+    // A manual run completes asynchronously. Poll only while one is running, so
+    // the operator sees running -> complete|partial|failed without a refresh,
+    // and an idle screener is not re-fetched.
+    refetchInterval: (query) =>
+      (query.state.data?.runs ?? []).some((run) => run.status === "running") ? 5_000 : false,
   });
 }
 
@@ -290,6 +307,7 @@ export function useAlertsScreenerRun(runId: string, scope: string | null) {
     queryKey: alertsKeys.screenerRun(runId, scope),
     queryFn: () => fetchAlertsScreenerRun(runId, { scope }),
     enabled: Boolean(runId && scope),
+    refetchInterval: (query) => (query.state.data?.run.status === "running" ? 5_000 : false),
   });
 }
 

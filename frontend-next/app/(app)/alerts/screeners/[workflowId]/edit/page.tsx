@@ -7,8 +7,10 @@ import { AlertCircleIcon } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AdvancedDefinitionEditor } from "@/features/alerts/components/advanced-definition-editor";
+import { AlertsScopeGate } from "@/features/alerts/components/alerts-scope-gate";
 import { ScreenerEditor } from "@/features/alerts/components/screener-editor";
-import { useAlertsScope, useAlertsWorkflow } from "@/features/alerts/hooks/use-alerts-queries";
+import { useAlertsWorkflow } from "@/features/alerts/hooks/use-alerts-queries";
+import { alertsErrorMessage, isNotFound } from "@/features/alerts/lib/errors";
 import { documentToScreenerDraft } from "@/features/alerts/lib/screener-authoring";
 
 /**
@@ -21,24 +23,38 @@ import { documentToScreenerDraft } from "@/features/alerts/lib/screener-authorin
  */
 export default function EditScreenerPage() {
   const params = useParams<{ workflowId: string }>();
-  const searchParams = useSearchParams();
-  const { scope, isLoading } = useAlertsScope();
   const workflowId = typeof params?.workflowId === "string" ? params.workflowId : "";
+
+  if (!workflowId) return <Skeleton className="h-96 w-full rounded-xl" />;
+
+  return (
+    <AlertsScopeGate>
+      {(scope) => <EditScreenerContent workflowId={workflowId} scope={scope} />}
+    </AlertsScopeGate>
+  );
+}
+
+function EditScreenerContent({
+  workflowId,
+  scope,
+}: Readonly<{ workflowId: string; scope: string | null }>) {
+  const searchParams = useSearchParams();
   const workflowQuery = useAlertsWorkflow(workflowId, scope);
   const forceAdvanced = searchParams?.get("advanced") === "1";
 
-  if (isLoading || workflowQuery.isLoading) return <Skeleton className="h-96 w-full rounded-xl" />;
+  if (workflowQuery.isLoading) return <Skeleton className="h-96 w-full rounded-xl" />;
 
   const workflow = workflowQuery.data;
   if (!workflow) {
+    const notFound = !workflowQuery.error || isNotFound(workflowQuery.error);
     return (
       <Alert variant="destructive">
         <AlertCircleIcon />
-        <AlertTitle>Screener not found</AlertTitle>
+        <AlertTitle>{notFound ? "Screener not found" : "Could not load this screener"}</AlertTitle>
         <AlertDescription>
-          {workflowQuery.error instanceof Error
-            ? workflowQuery.error.message
-            : "This screener does not exist in the selected scope."}
+          {notFound
+            ? "This screener does not exist in the selected scope."
+            : alertsErrorMessage(workflowQuery.error, "The request failed.")}
         </AlertDescription>
       </Alert>
     );

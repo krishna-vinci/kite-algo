@@ -24,6 +24,7 @@ import {
   LifecycleBadge,
   WarningBadge,
 } from "@/features/alerts/components/workflow-badges";
+import { alertsErrorMessage } from "@/features/alerts/lib/errors";
 import { summarizeList } from "@/features/alerts/lib/format";
 import { useAlertsScope, useAlertsWorkflows } from "@/features/alerts/hooks/use-alerts-queries";
 import type { AlertsWorkflowSummary } from "@/features/alerts/types";
@@ -104,7 +105,15 @@ export function AlertsListPage() {
   const router = useRouter();
   const pathname = usePathname();
   const includeArchived = searchParams?.get("archived") === "true";
-  const { scope, scopes, setScope, isLoading: scopesLoading, fellBack } = useAlertsScope();
+  const {
+    scope,
+    scopes,
+    setScope,
+    isLoading: scopesLoading,
+    isError: scopesError,
+    error: scopesErrorValue,
+    fellBack,
+  } = useAlertsScope();
   const workflowsQuery = useAlertsWorkflows(scope, includeArchived);
 
   const workflows = workflowsQuery.data?.workflows ?? [];
@@ -132,6 +141,9 @@ export function AlertsListPage() {
             onChange={setScope}
             disabled={scopesLoading}
           />
+          <Button asChild size="sm" variant="outline">
+            <Link href="/alerts/operations">Operations</Link>
+          </Button>
           <Button asChild size="sm" variant="outline">
             <Link href="/alerts/universes">Universes</Link>
           </Button>
@@ -174,14 +186,23 @@ export function AlertsListPage() {
 
       {scopesLoading || workflowsQuery.isLoading ? (
         <ListSkeleton />
+      ) : scopesError ? (
+        // The authorized-scope list itself failed. Without it there is no
+        // scope to query, so show the failure rather than an empty list that
+        // would read as "you have no alerts".
+        <Alert variant="destructive">
+          <AlertCircleIcon />
+          <AlertTitle>Could not load authorized scopes</AlertTitle>
+          <AlertDescription>
+            {alertsErrorMessage(scopesErrorValue, "The scopes request failed.")}
+          </AlertDescription>
+        </Alert>
       ) : workflowsQuery.error ? (
         <Alert variant="destructive">
           <AlertCircleIcon />
           <AlertTitle>Failed to load alerts</AlertTitle>
           <AlertDescription>
-            {workflowsQuery.error instanceof Error
-              ? workflowsQuery.error.message
-              : "Unknown error"}
+            {alertsErrorMessage(workflowsQuery.error, "Unknown error")}
           </AlertDescription>
         </Alert>
       ) : workflows.length === 0 ? (

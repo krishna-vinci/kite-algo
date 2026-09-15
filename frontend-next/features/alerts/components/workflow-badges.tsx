@@ -1,4 +1,4 @@
-import { AlertTriangleIcon, CircleHelpIcon } from "lucide-react";
+import { AlertTriangleIcon } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { StatusBadge } from "@/components/operator/status-badge";
@@ -45,15 +45,5 @@ export function KindBadge({ kind }: Readonly<{ kind: AlertsWorkflowSummary["kind
     <Badge variant={kind === "screener" ? "secondary" : "outline"}>
       {kind === "screener" ? "screener" : "alert"}
     </Badge>
-  );
-}
-
-/** Unknown freshness is an explicit chip, not a blank cell. */
-export function UnknownChip({ label = "unknown" }: Readonly<{ label?: string }>) {
-  return (
-    <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-      <CircleHelpIcon className="size-3" aria-hidden />
-      {label}
-    </span>
   );
 }

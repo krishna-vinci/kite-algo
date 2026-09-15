@@ -140,6 +140,10 @@ export function WorkflowHealthPanel({
             ) : (
               health.subscriptions.map((subscription) => {
                 const reason = describeStaleReason(subscription.stale_reason);
+                // `stale` is the authoritative flag; `stale_reason` is the
+                // explanation. A subscription can be stale with no reason
+                // reported, and rendering that as "flowing" would be a lie.
+                const isStale = subscription.stale === true;
                 return (
                   <TableRow key={subscription.subscription_id}>
                     <TableCell className="font-mono text-sm">{subscription.instrument_key}</TableCell>
@@ -152,14 +156,17 @@ export function WorkflowHealthPanel({
                       {formatAgeAgo(subscription.evaluation_age_s)}
                     </TableCell>
                     <TableCell className="text-sm">
-                      {/* `not_an_ltp_subscription` is informational, not a problem. */}
-                      {reason ? (
+                      {/* `not_an_ltp_subscription` is informational, not a problem,
+                          so it renders muted rather than as an error. */}
+                      {isStale ? (
                         <span
-                          className={
-                            subscription.stale ? "text-rose-300" : "text-muted-foreground"
-                          }
-                          title={`${reason.detail} ${reason.action}`}
+                          className="text-rose-300"
+                          title={reason ? `${reason.detail} ${reason.action}` : undefined}
                         >
+                          {reason?.label ?? "no fresh data"}
+                        </span>
+                      ) : reason ? (
+                        <span className="text-muted-foreground" title={`${reason.detail} ${reason.action}`}>
                           {reason.label}
                         </span>
                       ) : (
