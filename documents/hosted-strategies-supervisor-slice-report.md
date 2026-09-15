@@ -385,7 +385,7 @@ Targeted suites (SQLite):
   tests/api/test_operator_controls.py \
   tests/notifications \
   tests/sdk -q
-→ 746 passed, 2 skipped
+→ 750 passed, 2 skipped
 ```
 
 Disposable PostgreSQL (real concurrency; own invocation):
@@ -395,11 +395,11 @@ HOSTED_FOUNDATION_PG_URL='postgresql://postgres:testonly@127.0.0.1:15433/kite_te
   .venv/bin/python -m pytest \
     tests/integration/test_hosted_supervisor_lifecycle_postgres.py \
     tests/integration/test_hosted_strategy_foundation_postgres.py -q
-→ 24 passed       # + atomic reconcile-with-audit (one winner) serialized with
+→ 26 passed       # + atomic reconcile-with-audit (one winner) serialized with
                   # create_job; changed-cleanup-evidence CAS refusal; append-only audit
 ```
 
-`alembic heads` → single head `20260915_000023`. `git diff --check` clean.
+`alembic heads` → single head `20260915_000024`. `git diff --check` clean.
 
 **New tests:** supervisor auth (default-deny, wrong/absent credential, rotation);
 lifecycle state machine (happy path, repeat, partial, wrong owner/epoch/attempt,
@@ -801,8 +801,10 @@ cross-owner ⇒ 404, cross-account ⇒ 403):
         "attempt": 1, "replacement_blocked": true, "stop": { "state": "none" }, … } }
 ```
 
-- A retry with the same `idempotency_key` returns the same job with
-  `"idempotent": true` (no duplicate, even concurrently).
+- The `idempotency_key` is **bound to the normalized launch request** (version,
+  params, execution mode, job kind). An identical retry returns the same job
+  with `"idempotent": true` (no duplicate, even concurrently); the same key with
+  a different request returns `409 IDEMPOTENCY_CONFLICT`.
 - `409 STRATEGY_BLOCKED` (active/unreconciled job), `409 STRATEGY_DISABLED`,
   `422` (unknown version or invalid params), `403` (account not authorized).
 - The response returns **identity only**; it does not claim the process started.
@@ -843,10 +845,17 @@ cross-owner ⇒ 404, cross-account ⇒ 403):
 ```
 
 - The API never reads the supervisor container's filesystem; the supervisor
-  pushes bounded chunks to the lifecycle API, which **redacts known
-  credentials** before storage and caps the per-attempt size. `available:false`
-  (with a `notice`) means logs were not collected; `truncated:true` means the cap
-  was hit. `after_seq` paginates.
+  pushes bounded chunks to the lifecycle API, which **redacts known credentials**
+  (request chunks are joined before redaction, so a credential split across
+  transport chunk boundaries in one request is still masked) and caps the
+  per-attempt size in exact UTF-8 bytes. `available:false` (with a `notice`) means
+  logs were not collected; `truncated:true` reflects actual loss (a persisted
+  `discarded` flag OR the cap), even when stored bytes are below the cap.
+  `source: "post_termination"` distinguishes post-termination collection from
+  live logs (live collection is not implemented). `after_seq` paginates.
+  Redaction is best-effort: it cannot guarantee removal of an arbitrary secret,
+  and a secret split across *separate* ingestion requests may not be masked.
+  Log collection is independent of process-cleanup confirmation.
 
 **Notification history** — `GET /api/strategies/{id}/jobs/{job_id}/notifications`
 

@@ -37,7 +37,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import Request
 
@@ -857,6 +857,27 @@ async def report_process_cleanup(
     }
 
 
+def _split_by_bytes(text: str, max_bytes: int) -> List[str]:
+    """Split ``text`` into pieces of at most ``max_bytes`` UTF-8 bytes.
+
+    Cuts only at character boundaries so a multi-byte character is never split.
+    """
+    pieces: List[str] = []
+    current: List[str] = []
+    current_bytes = 0
+    for char in text:
+        size = len(char.encode("utf-8"))
+        if current and current_bytes + size > max_bytes:
+            pieces.append("".join(current))
+            current = []
+            current_bytes = 0
+        current.append(char)
+        current_bytes += size
+    if current:
+        pieces.append("".join(current))
+    return pieces
+
+
 async def report_job_logs(
     *,
     strategy_repo: SqlAlchemyStrategyRepository,
@@ -868,10 +889,16 @@ async def report_job_logs(
 ) -> Dict[str, Any]:
     """Accept bounded, redacted child-log chunks from the supervisor.
 
-    The API never reads the supervisor container's filesystem; the supervisor
-    pushes chunks here. Chunks are size-checked and **redacted before storage**.
-    Once the per-attempt cap is reached, further chunks are dropped and the
-    response reports ``truncated`` rather than silently discarding.
+    Request chunks are joined, **redacted as one text** (so a credential split
+    across transport chunk boundaries in the same request is still masked), then
+    re-split on UTF-8 character boundaries. Byte accounting is exact; the cap is
+    enforced by the store, which reports ``discarded`` when output was dropped.
+    The API never reads the supervisor container's filesystem.
+
+    Redaction limits: it masks token-shaped runs and known configured secrets; it
+    cannot guarantee removal of an arbitrary secret, and a secret split across
+    *separate* ingestion requests may not be masked. Log collection is
+    independent of process-cleanup confirmation.
     """
     if not chunks:
         raise HostedLifecycleError(422, "HOSTED_LOGS_EMPTY")
@@ -896,12 +923,13 @@ async def report_job_logs(
         require_live_lease=False,
         require_started=False,
     )
-    redacted = [redact_text(str(chunk)) for chunk in chunks]
+    redacted = redact_text("".join(str(chunk) for chunk in chunks))
+    pieces = _split_by_bytes(redacted, LOG_CHUNK_MAX_BYTES)
     result = await asyncio.to_thread(
         strategy_repo.append_job_log,
         job_id,
         attempt=int(attempt),
-        chunks=redacted,
+        chunks=pieces,
         max_total_bytes=LOG_TOTAL_MAX_BYTES,
     )
     return {
@@ -909,5 +937,6 @@ async def report_job_logs(
         "attempt": int(attempt),
         "stored": int(result["stored"]),
         "truncated": bool(result["truncated"]),
+        "discarded": bool(result.get("discarded", result["truncated"])),
         "next_seq": int(result["next_seq"]),
     }

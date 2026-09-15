@@ -135,6 +135,8 @@ class JobDetailResponse(JobSummaryResponse):
     stop_requested_at: Optional[str] = None
     stop_requested_by: Optional[str] = None
     stop: Dict[str, Any] = Field(default_factory=dict)
+    logs_discarded: bool = False
+    logs_source: Optional[str] = None
 
 
 class ReconciliationAuditResponse(BaseModel):
@@ -308,7 +310,11 @@ class JobLogsResponse(BaseModel):
 
     job_id: str
     available: bool
+    #: True means output was actually discarded (or the stored cap was reached).
     truncated: bool = False
+    #: How logs were collected: `post_termination` in v1 (live collection is not
+    #: implemented); `null` when nothing was collected.
+    source: Optional[str] = None
     next_seq: int = 0
     entries: List[JobLogEntryResponse] = Field(default_factory=list)
     notice: str = ""

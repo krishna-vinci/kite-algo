@@ -239,6 +239,10 @@ class StrategyJob(Base):
     #: bounded local cleanup and the authorized terminal transition.
     stop_requested_at = Column(DateTime(timezone=True), nullable=True)
     stop_requested_by = Column(Text, nullable=True)
+    #: Bounded-log contract: output was actually discarded at the cap, and how
+    #: logs were collected (v1: ``post_termination`` only).
+    logs_discarded = Column(Boolean, nullable=False, default=False)
+    logs_source = Column(Text, nullable=True)
     recovery_required_at = Column(DateTime(timezone=True), nullable=True)
     reconciled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -333,6 +337,8 @@ class StrategyJobLog(Base):
     attempt = Column(Integer, nullable=False)
     seq = Column(Integer, nullable=False)
     content = Column(Text, nullable=False)
+    #: Exact UTF-8 byte length, so the cap is accounted in bytes consistently.
+    byte_len = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (

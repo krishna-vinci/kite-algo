@@ -2401,6 +2401,8 @@ CREATE TABLE IF NOT EXISTS public.strategy_jobs (
     process_cleanup_actor TEXT,
     stop_requested_at TIMESTAMPTZ,
     stop_requested_by TEXT,
+    logs_discarded BOOLEAN NOT NULL DEFAULT false,
+    logs_source TEXT,
     recovery_required_at TIMESTAMPTZ,
     reconciled_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -2455,6 +2457,7 @@ CREATE TABLE IF NOT EXISTS public.strategy_job_logs (
     attempt INTEGER NOT NULL,
     seq INTEGER NOT NULL,
     content TEXT NOT NULL,
+    byte_len INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT uq_strategy_job_logs_seq UNIQUE (job_id, attempt, seq)
 );

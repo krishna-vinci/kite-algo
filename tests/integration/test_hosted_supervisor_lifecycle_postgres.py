@@ -43,6 +43,7 @@ from backend.strategies.repository import (  # noqa: E402
     SqlAlchemyStrategyRepository,
     StrategyConflict,
     StrategyFenceError,
+    StrategyIdempotencyConflict,
 )
 from tests.support.hosted_fakes import (  # noqa: E402
     FakeWorkerRepository,
@@ -648,3 +649,71 @@ def test_stop_queued_job_without_launch(env):
     assert repo.stop_queued_job(job.id, owner_id=OWNER, expected_attempt=1, actor=OWNER) is True
     persisted = repo.get_job(OWNER, job.id)
     assert persisted.status == "stopped" and persisted.desired_state == "stopped"
+
+
+def _fresh_strategy_version(repo, *, prefix):
+    strategy = repo.create_strategy(
+        owner_id=OWNER,
+        name=f"{prefix}-{uuid.uuid4().hex[:8]}",
+        description=None,
+        execution_mode="paper",
+        job_kind="finite",
+        account_scope="kite:paper",
+        max_duration_s=21600,
+        progress_deadline_s=600,
+        stale_exit_policy="none",
+    )
+    version = repo.create_version(
+        strategy_id=strategy.id,
+        source="x",
+        source_sha256="a" * 64,
+        parameters_schema={"type": "object", "properties": {"lots": {"type": "integer"}}, "required": ["lots"]},
+        capabilities_snapshot={"schema_version": 2, "capabilities": {"trade": True, "notify": False, "data": True}},
+        created_by=OWNER,
+    )
+    return strategy, version
+
+
+def test_create_job_same_key_different_request_conflicts(env):
+    factory, _engine = env
+    repo, _claimed = _seed_job(factory)
+    strategy, version = _fresh_strategy_version(repo, prefix="idem")
+    occurrence = f"manual:{strategy.id}:key-1"
+    repo.create_job(
+        strategy_id=strategy.id, version_id=version.id, owner_id=OWNER, job_kind="finite",
+        execution_mode="paper", params={"lots": 1}, occurrence_key=occurrence,
+    )
+    with pytest.raises(StrategyIdempotencyConflict):
+        repo.create_job(
+            strategy_id=strategy.id, version_id=version.id, owner_id=OWNER, job_kind="finite",
+            execution_mode="paper", params={"lots": 2}, occurrence_key=occurrence,
+        )
+
+
+def test_concurrent_log_ingestion_preserves_sequence_and_cap(env):
+    factory, _engine = env
+    repo, job = _seed_job(factory)  # starting
+    chunk = "z" * (8 * 1024)
+    errors = []
+
+    def _ingest():
+        try:
+            for _ in range(10):  # 10 x 8 KiB = 80 KiB per thread
+                repo.append_job_log(
+                    job.id, attempt=1, chunks=[chunk], max_total_bytes=256 * 1024
+                )
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_ingest) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors
+    logs = repo.list_job_logs(job.id, limit=500)
+    seqs = [row.seq for row in logs]
+    assert seqs == sorted(seqs) and len(seqs) == len(set(seqs))
+    assert repo.job_log_byte_count(job.id) == 20 * 8 * 1024
+    assert repo.job_log_byte_count(job.id) <= 256 * 1024

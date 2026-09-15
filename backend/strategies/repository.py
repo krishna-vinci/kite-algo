@@ -51,6 +51,7 @@ __all__ = [
     "StrategyConflict",
     "StrategyDisabled",
     "StrategyFenceError",
+    "StrategyIdempotencyConflict",
     "StrategyIdentityError",
     "StrategyNotFound",
 ]
@@ -74,6 +75,10 @@ class StrategyNotFound(Exception):
 
 class StrategyIdentityError(Exception):
     """A referenced version/owner does not belong to the strategy."""
+
+
+class StrategyIdempotencyConflict(Exception):
+    """An idempotency key was replayed with a different launch request."""
 
 
 class StrategyDisabled(Exception):
@@ -334,6 +339,29 @@ class SqlAlchemyStrategyRepository:
                 if existing is not None:
                     if existing.owner_id != owner_id or existing.strategy_id != strategy_id:
                         raise StrategyConflict("occurrence_key already used by another job")
+                    # Bind the key to the normalized launch request: an identical
+                    # replay returns the original job; a different request is a
+                    # documented conflict (never a silent reuse or duplicate).
+                    replay_version = session.execute(
+                        select(HostedStrategyVersion).where(
+                            HostedStrategyVersion.id == version_id,
+                            HostedStrategyVersion.strategy_id == strategy_id,
+                        )
+                    ).scalar_one_or_none()
+                    if replay_version is None:
+                        raise StrategyIdentityError("version does not belong to this strategy")
+                    normalized_params = service.validate_parameters(
+                        replay_version.parameters_schema, params
+                    )
+                    if (
+                        str(existing.version_id) != str(version_id)
+                        or str(existing.execution_mode) != str(execution_mode)
+                        or str(existing.job_kind) != str(job_kind)
+                        or dict(existing.params_snapshot or {}) != normalized_params
+                    ):
+                        raise StrategyIdempotencyConflict(
+                            "the idempotency key was already used for a different launch request"
+                        )
                     return existing
             # Disable stops NEW attempts; the locked parent row serialises this
             # with update_strategy/disable.
@@ -1397,46 +1425,81 @@ class SqlAlchemyStrategyRepository:
         chunks: List[str],
         max_total_bytes: int,
     ) -> Dict[str, Any]:
-        """Append bounded, already-redacted log chunks under the total cap."""
-        session = self._session()
-        try:
-            current_bytes = int(
+        """Append bounded, already-redacted log chunks under the total cap.
+
+        Byte accounting is exact (``byte_len`` in UTF-8 bytes) and the job row is
+        locked so concurrent ingestion/retries cannot corrupt sequence allocation
+        or over-consume the cap. Once the cap is reached, ``discarded`` is
+        returned and persisted on the job so browser truncation reflects real
+        loss. Returns ``{"stored", "truncated", "discarded", "next_seq"}``.
+        """
+        cap = max(1, int(max_total_bytes))
+        for attempt_no in (1, 2):
+            session = self._session()
+            try:
+                # Serialize ingestion per job (Postgres row lock; SQLite writes
+                # already serialize). Prevents duplicate seq / cap overrun.
                 session.execute(
-                    select(func.coalesce(func.sum(func.length(StrategyJobLog.content)), 0)).where(
-                        StrategyJobLog.job_id == job_id,
-                        StrategyJobLog.attempt == attempt,
+                    select(StrategyJob.id).where(StrategyJob.id == job_id).with_for_update()
+                ).first()
+                current_bytes = int(
+                    session.execute(
+                        select(func.coalesce(func.sum(StrategyJobLog.byte_len), 0)).where(
+                            StrategyJobLog.job_id == job_id,
+                            StrategyJobLog.attempt == attempt,
+                        )
+                    ).scalar_one()
+                )
+                max_seq = int(
+                    session.execute(
+                        select(func.coalesce(func.max(StrategyJobLog.seq), 0)).where(
+                            StrategyJobLog.job_id == job_id,
+                            StrategyJobLog.attempt == attempt,
+                        )
+                    ).scalar_one()
+                    or 0
+                )
+                next_seq = max_seq
+                stored = 0
+                discarded = False
+                for chunk in chunks:
+                    text = str(chunk or "")
+                    if not text:
+                        continue
+                    size = len(text.encode("utf-8"))
+                    if current_bytes + size > cap:
+                        discarded = True
+                        break
+                    next_seq += 1
+                    session.add(
+                        StrategyJobLog(
+                            job_id=job_id,
+                            attempt=int(attempt),
+                            seq=next_seq,
+                            content=text,
+                            byte_len=size,
+                        )
                     )
-                ).scalar_one()
-            )
-            max_seq = session.execute(
-                select(func.coalesce(func.max(StrategyJobLog.seq), 0)).where(
-                    StrategyJobLog.job_id == job_id, StrategyJobLog.attempt == attempt
-                )
-            ).scalar_one()
-            next_seq = int(max_seq or 0)
-            stored = 0
-            truncated = False
-            for chunk in chunks:
-                text = str(chunk or "")
-                if not text:
-                    continue
-                size = len(text.encode("utf-8"))
-                if current_bytes + size > max(1, int(max_total_bytes)):
-                    truncated = True
-                    break
-                next_seq += 1
-                session.add(
-                    StrategyJobLog(job_id=job_id, attempt=int(attempt), seq=next_seq, content=text)
-                )
-                current_bytes += size
-                stored += 1
-            session.commit()
-            return {"stored": stored, "truncated": truncated, "next_seq": next_seq}
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+                    current_bytes += size
+                    stored += 1
+                job = session.get(StrategyJob, job_id)
+                if job is not None:
+                    if job.logs_source is None:
+                        job.logs_source = "post_termination"
+                    if discarded:
+                        job.logs_discarded = True
+                session.commit()
+                return {"stored": stored, "truncated": discarded, "discarded": discarded, "next_seq": next_seq}
+            except IntegrityError:
+                session.rollback()
+                if attempt_no == 2:
+                    raise
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+        raise RuntimeError("unreachable")
 
     def list_job_logs(
         self, job_id: str, *, after_seq: int = 0, limit: int = 200
@@ -1460,7 +1523,7 @@ class SqlAlchemyStrategyRepository:
         try:
             return int(
                 session.execute(
-                    select(func.coalesce(func.sum(func.length(StrategyJobLog.content)), 0)).where(
+                    select(func.coalesce(func.sum(StrategyJobLog.byte_len), 0)).where(
                         StrategyJobLog.job_id == job_id
                     )
                 ).scalar_one()

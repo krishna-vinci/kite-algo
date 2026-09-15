@@ -69,6 +69,7 @@ from backend.strategies.repository import (
     StrategyConflict,
     StrategyDisabled,
     StrategyFenceError,
+    StrategyIdempotencyConflict,
     StrategyIdentityError,
 )
 
@@ -430,6 +431,8 @@ def _job_detail(job: Any) -> JobDetailResponse:
         stop_requested_at=_iso(job.stop_requested_at),
         stop_requested_by=job.stop_requested_by,
         stop=_stop_view(job),
+        logs_discarded=bool(job.logs_discarded),
+        logs_source=job.logs_source,
     )
 
 @router.get("/{strategy_id}/jobs", response_model=JobListResponse)
@@ -618,6 +621,53 @@ async def reconcile_job(
     )
 
 
+def _normalized_launch(repo: SqlAlchemyStrategyRepository, strategy: Any, payload: RunNowRequest) -> dict:
+    """Validate and normalize a launch request against the pinned version.
+
+    Bound to the idempotency key so the same key cannot be reused for a
+    different version/params/mode/kind.
+    """
+    execution_mode = payload.execution_mode or strategy.default_execution_mode
+    job_kind = payload.job_kind or strategy.default_job_kind
+    try:
+        service.validate_account_scope(strategy.default_account_scope, execution_mode)
+        if execution_mode not in service.ALLOWED_EXECUTION_MODES:
+            raise service.StrategyValidationError("unsupported execution_mode")
+        if job_kind not in service.ALLOWED_JOB_KINDS:
+            raise service.StrategyValidationError("unsupported job_kind")
+        version = repo.get_version_by_id(strategy.id, payload.version_id)
+        if version is None:
+            raise service.StrategyValidationError("version does not belong to this strategy")
+        params = service.validate_parameters(version.parameters_schema, payload.params)
+    except service.StrategyValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "version_id": str(version.id),
+        "execution_mode": execution_mode,
+        "job_kind": job_kind,
+        "params": params,
+    }
+
+
+def _replay_or_conflict(existing: Any, normalized: dict, owner: str, strategy_id: str) -> Any:
+    if existing.owner_id != owner or existing.strategy_id != strategy_id:
+        raise HTTPException(status_code=409, detail="REPLACEMENT_CONFLICT")
+    if (
+        str(existing.version_id) == normalized["version_id"]
+        and str(existing.execution_mode) == normalized["execution_mode"]
+        and str(existing.job_kind) == normalized["job_kind"]
+        and dict(existing.params_snapshot or {}) == normalized["params"]
+    ):
+        return existing
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "rejection_reason": "IDEMPOTENCY_CONFLICT",
+            "message": "the idempotency key was already used for a different launch request",
+        },
+    )
+
+
 @router.post("/{strategy_id}/jobs", response_model=RunNowResponse)
 async def run_now(
     strategy_id: str,
@@ -636,51 +686,47 @@ async def run_now(
     """
     enforce_same_origin(request)
     strategy = _owned_strategy(repo, owner, strategy_id)
-    execution_mode = payload.execution_mode or strategy.default_execution_mode
-    job_kind = payload.job_kind or strategy.default_job_kind
-    try:
-        service.validate_account_scope(strategy.default_account_scope, execution_mode)
-        if execution_mode not in service.ALLOWED_EXECUTION_MODES:
-            raise service.StrategyValidationError("unsupported execution_mode")
-        if job_kind not in service.ALLOWED_JOB_KINDS:
-            raise service.StrategyValidationError("unsupported job_kind")
-    except service.StrategyValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    normalized = _normalized_launch(repo, strategy, payload)
+
+    # Server-side authorization: the pinned account scope must be authorized for
+    # the operator's environment (independent of the launch request itself).
     authorize_account_scope(strategy.default_account_scope)
 
     occurrence_key = f"manual:{strategy_id}:{payload.idempotency_key}"
     # Idempotency is checked before the active-job block so a retry of a
-    # still-active launch returns the same job instead of being refused.
+    # still-active launch returns the same job instead of being refused. The key
+    # is bound to the normalized launch request: an identical request replays;
+    # a different request is an explicit conflict.
     existing = repo.get_job_by_occurrence_key(occurrence_key)
     if existing is not None:
-        if existing.owner_id != owner or existing.strategy_id != strategy_id:
-            raise HTTPException(status_code=409, detail="REPLACEMENT_CONFLICT")
-        return RunNowResponse(idempotent=True, job=_job_detail(existing))
+        return RunNowResponse(idempotent=True, job=_job_detail(_replay_or_conflict(existing, normalized, owner, strategy_id)))
 
     idempotent = False
     try:
         job = repo.create_job(
             strategy_id=strategy_id,
-            version_id=payload.version_id,
+            version_id=normalized["version_id"],
             owner_id=owner,
-            job_kind=job_kind,
-            execution_mode=execution_mode,
-            params=payload.params,
+            job_kind=normalized["job_kind"],
+            execution_mode=normalized["execution_mode"],
+            params=normalized["params"],
             occurrence_key=occurrence_key,
         )
-    except StrategyIdentityError as exc:
+    except (service.StrategyValidationError, StrategyIdentityError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except StrategyDisabled as exc:
         raise HTTPException(status_code=409, detail="STRATEGY_DISABLED") from exc
     except StrategyFenceError as exc:
         raise HTTPException(status_code=409, detail="STRATEGY_BLOCKED") from exc
-    except service.StrategyValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StrategyIdempotencyConflict as exc:
+        raise HTTPException(
+            status_code=409, detail={"rejection_reason": "IDEMPOTENCY_CONFLICT", "message": str(exc)}
+        ) from exc
     except StrategyConflict:
         existing = repo.get_job_by_occurrence_key(occurrence_key)
-        if existing is None or existing.owner_id != owner:
+        if existing is None:
             raise HTTPException(status_code=409, detail="REPLACEMENT_CONFLICT")
-        job = existing
+        job = _replay_or_conflict(existing, normalized, owner, strategy_id)
         idempotent = True
     return RunNowResponse(idempotent=idempotent, job=_job_detail(job))
 
@@ -769,8 +815,14 @@ async def get_job_logs(
     ]
     next_seq = int(rows[-1].seq) if rows else int(after_seq)
     available = total_bytes > 0
+    # Truncation reflects actual loss: the persisted discarded flag OR the cap.
+    truncated = bool(job.logs_discarded) or total_bytes >= LOG_TOTAL_MAX_BYTES
     if available:
-        notice = ""
+        notice = (
+            "Logs were collected after the child terminated (live streaming is not implemented). "
+            "Output was discarded at the size cap." if truncated
+            else "Logs were collected after the child terminated (live streaming is not implemented)."
+        )
     elif job.handoff_at is None:
         notice = "No child was launched for this attempt; no logs exist."
     else:
@@ -778,7 +830,8 @@ async def get_job_logs(
     return JobLogsResponse(
         job_id=job.id,
         available=available,
-        truncated=total_bytes >= LOG_TOTAL_MAX_BYTES,
+        truncated=truncated,
+        source=job.logs_source,
         next_seq=next_seq,
         entries=entries,
         notice=notice,

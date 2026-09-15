@@ -133,6 +133,7 @@ class ProcessLogsResponse(BaseModel):
     attempt: int
     stored: int
     truncated: bool
+    discarded: bool = False
     next_seq: int
 
 

@@ -340,3 +340,95 @@ async def test_notification_history_is_owner_scoped(session_factory, monkeypatch
 
     async with _client(session_factory, monkeypatch, username="other", notification_repo=notifications) as client:
         assert (await client.get(f"{BASE}/{strategy.id}/jobs/{job.id}/notifications")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_run_now_idempotency_binds_the_normalized_request(session_factory, monkeypatch):
+    repo = _repo(session_factory)
+    strategy, version = _strategy(repo)
+    version2 = repo.create_version(
+        strategy_id=strategy.id,
+        source="y",
+        source_sha256="b" * 64,
+        parameters_schema={"type": "object", "properties": {"lots": {"type": "integer", "minimum": 1}}, "required": ["lots"]},
+        capabilities_snapshot=strategy_service.build_capabilities_snapshot(trade=True),
+        created_by=OWNER,
+    )
+    base_key = "same-key-0001"
+    async with _client(session_factory, monkeypatch) as client:
+        first = await client.post(f"{BASE}/{strategy.id}/jobs", json=_run_body(version.id, idempotency_key=base_key))
+        assert first.status_code == 200
+        job_id = first.json()["job"]["job_id"]
+
+        # Identical normalized request replays.
+        same = await client.post(f"{BASE}/{strategy.id}/jobs", json=_run_body(version.id, idempotency_key=base_key))
+        assert same.status_code == 200 and same.json()["idempotent"] is True
+        assert same.json()["job"]["job_id"] == job_id
+
+        # Different version / params / mode / kind are documented conflicts.
+        for body in (
+            _run_body(version2.id, idempotency_key=base_key),
+            _run_body(version.id, idempotency_key=base_key, params={"lots": 2}),
+            _run_body(version.id, idempotency_key=base_key, execution_mode="dry_run"),
+            _run_body(version.id, idempotency_key=base_key, job_kind="continuous"),
+        ):
+            response = await client.post(f"{BASE}/{strategy.id}/jobs", json=body)
+            assert response.status_code == 409, (body, response.text)
+            assert response.json()["detail"]["rejection_reason"] == "IDEMPOTENCY_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_logs_byte_accounting_multibyte_and_source(session_factory, monkeypatch):
+    repo = _repo(session_factory)
+    strategy, version = _strategy(repo)
+    job = _to_running(repo, strategy, version)
+    # Multi-byte characters are 4 bytes each; 100 of them = 400 bytes.
+    await hosted_lifecycle.report_job_logs(
+        strategy_repo=repo, job_id=job.id, lease_owner="sup-A", lease_epoch=1, attempt=1,
+        chunks=["😀" * 100],
+    )
+    assert repo.job_log_byte_count(job.id) == 400
+    assert repo.get_job(OWNER, job.id).logs_source == "post_termination"
+    async with _client(session_factory, monkeypatch) as client:
+        body = (await client.get(f"{BASE}/{strategy.id}/jobs/{job.id}/logs")).json()
+        assert body["source"] == "post_termination" and body["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_logs_redact_across_transport_chunk_boundaries(session_factory, monkeypatch):
+    repo = _repo(session_factory)
+    strategy, version = _strategy(repo)
+    job = _to_running(repo, strategy, version)
+    # The token is split across two transport chunks in the same request.
+    await hosted_lifecycle.report_job_logs(
+        strategy_repo=repo, job_id=job.id, lease_owner="sup-A", lease_epoch=1, attempt=1,
+        chunks=["prefix kwa_abcdef", "ghijklmnop suffix\n"],
+    )
+    async with _client(session_factory, monkeypatch) as client:
+        body = (await client.get(f"{BASE}/{strategy.id}/jobs/{job.id}/logs")).json()
+        text = "".join(entry["content"] for entry in body["entries"])
+        assert "kwa_" not in text and "[redacted]" in text
+
+
+@pytest.mark.asyncio
+async def test_logs_discarded_below_cap_is_reported_and_cleanup_untouched(session_factory, monkeypatch):
+    repo = _repo(session_factory)
+    strategy, version = _strategy(repo)
+    job = _to_running(repo, strategy, version)
+    chunk = "a" * (15 * 1024)  # 15 KiB each
+    for _ in range(17):  # 255 KiB stored (< 256 KiB cap)
+        await hosted_lifecycle.report_job_logs(
+            strategy_repo=repo, job_id=job.id, lease_owner="sup-A", lease_epoch=1, attempt=1, chunks=[chunk]
+        )
+    # One more would exceed the cap: discarded while stored bytes are below it.
+    await hosted_lifecycle.report_job_logs(
+        strategy_repo=repo, job_id=job.id, lease_owner="sup-A", lease_epoch=1, attempt=1, chunks=[chunk]
+    )
+    stored = repo.job_log_byte_count(job.id)
+    persisted = repo.get_job(OWNER, job.id)
+    assert stored < 256 * 1024 and persisted.logs_discarded is True
+    # Log ingestion never touches process-cleanup confirmation.
+    assert persisted.process_cleanup_state is None
+    async with _client(session_factory, monkeypatch) as client:
+        body = (await client.get(f"{BASE}/{strategy.id}/jobs/{job.id}/logs")).json()
+        assert body["truncated"] is True
