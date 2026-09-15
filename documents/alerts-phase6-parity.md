@@ -354,9 +354,17 @@ class of problem. Worth doing, but it is a test-infrastructure change beyond thi
 Markets closed for the whole session, so nothing here claims live *market* evaluation. What was
 verified is stated precisely, and the blocked items are named.
 
-### 5.1 Deployment currency — Phase 6 is NOT deployed
+### 5.1 Deployment currency — Phase 6 IS now deployed (2026-09-15)
 
-This is the first finding, and it limits everything else:
+> Superseded on 2026-09-15: the phase-6 work plus the frontend
+> release-completion pass was deployed to the application environment
+> (`development` at `f6d1740` + forward fixes, migration `20260915_000024`).
+> The deployment record, the live verification results and the six defects the
+> deployment surfaced are in the release manifest §9 and in
+> `hosted-strategies-supervisor-slice-report.md` §12. The probes below record
+> the pre-deployment state and are kept for history.
+
+The original pre-deployment probes were:
 
 | Probe | Result |
 | --- | --- |
@@ -364,9 +372,10 @@ This is the first finding, and it limits everything else:
 | `kite-frontend-next` image (built 2026-09-11) | `.next/server/app/(app)/` contains `analytics, custom-display, dashboard, journal, options, paper, settings, strategies, trading` — **no `alerts` directory**. The deployed frontend has no alerts UI at all |
 | `GET /alerts`, `/alerts/new`, `/alerts/screeners/new`, `/alerts/universes` (port 13000) | 307 → `/login?next=…` — auth middleware fires before route resolution, so this says nothing about whether the route exists; the bundle listing above is the authoritative answer |
 
-**Consequence:** there is no deployed UI→API→worker path to exercise, so the live end-to-end
-item cannot be validated until this work is deployed. Everything below is either the deployed
-*backend/worker* behaviour or a structural check.
+**Consequence (then):** there was no deployed UI→API→worker path to exercise. That is no
+longer true: §11 records the deployed end-to-end verification (live tick → accepted
+observation → evaluation → event → outbox → Telegram provider accepted, with the UI showing
+the event and the delivery).
 
 ### 5.2 Verified live
 
@@ -591,9 +600,9 @@ statement is about execution it is qualified **VERIFIED LOCALLY**, **DEPLOYED**,
 | --- | --- |
 | Operator API, LTP freshness, failure isolation, level-vs-edge, canvas layout store (backend) | IMPLEMENTED / VERIFIED LOCALLY (564 backend tests) |
 | Frontend implementation | IMPLEMENTED / VERIFIED LOCALLY (245 vitest, production build clean; release-completion pass §10) |
-| Phase 6A/6B deployed | **DEPLOYED: NO** — deployment pending (see the release manifest) |
+| Phase 6A/6B deployed | **DEPLOYED 2026-09-15** — see the release manifest §9 for what is live verified vs untested |
 | Frontend release-completion pass (2026-09-15) | IMPLEMENTED / VERIFIED LOCALLY (§10) |
-| Live UI → API → worker → event | CERTIFICATION PENDING |
+| Live UI → API → worker → event | **VERIFIED LIVE 2026-09-15** (one complete delivery: event → outbox → Telegram provider accepted, UI shows both). A *crossing* firing on natural movement is still unproven — two bounded windows saw live evaluation without a crossing (release manifest §9.2–9.3) |
 | Capacity (500 symbols / 5,000 rules) | **NOT PROVEN** — no supported-capacity figure claimed (§3) |
 | Currency live validation, production smoke, restart fault injection | CERTIFICATION PENDING |
 | Scheduler-ntfy cutover | NOT STARTED (post-certification, by design) |
@@ -671,12 +680,11 @@ still `20260912_000018`.** Every item below is IMPLEMENTED / VERIFIED LOCALLY (V
 
 ### 10.3 Deployment and live verification (explicitly separated)
 
-- **Deployment: PENDING.** The running `kite-frontend-next` image is stale — its server bundle
-  contains no `alerts` directory — and the API reports `/api/alerts/workflows` → **401**
-  without a cookie. No frontend or backend change from this pass is deployed.
-- **Live UI → API → worker → event: NOT PROVEN.** No authorized session was available in this
-  environment (only a password *hash* is configured), so the authenticated browser journeys
-  could not be exercised. This is a live-verification gap, not an implementation gap.
+- **Deployment: DONE 2026-09-15.** The frontend bundle now serves the `/alerts/*` routes and the
+  API serves `/api/alerts/*` (401 without a cookie, 200 with one). See §11.
+- **Live UI → API → worker → event: PROVEN for one alert** (live tick → accepted observation →
+  evaluation → event → outbox → provider-accepted Telegram delivery, plus the UI's Events and
+  Deliveries views). A crossing on natural price movement remains unproven (see §11.2).
 
 ### 10.4 Bounded list of live acceptance checks still required
 
@@ -687,3 +695,53 @@ still `20260912_000018`.** Every item below is IMPLEMENTED / VERIFIED LOCALLY (V
 5. Confirm a channel **test-send** with an unset `secret_env` shows the variable name (400 `missing_env_secret`).
 6. Confirm `/alerts/operations` platform health reads **unknown** (not 0) when the worker health file is unreadable, and the real counters when it is.
 7. One live UI → API → worker → event run, and one live stale-health-with-no-ticks observation (carried from §2/§5).
+
+---
+
+## 11. Deployed verification (2026-09-15)
+
+Deployed from `development` at `f6d1740` + forward fixes (`a7ce3c3`, `3d348ab`,
+`3a48346`, `a60639c`, `3e79fb5`), migration `20260912_000018 → 20260915_000024`.
+Full deployment record, credential verification and order/position invariance
+evidence: `hosted-strategies-supervisor-slice-report.md` §12 and the release
+manifest §9.
+
+### 11.1 Live verified
+
+| Item | Evidence | Class |
+| --- | --- | --- |
+| Frontend bundle serves the alerts UI | `/alerts`, `/alerts/new`, `/alerts/screeners/{id}`, `/alerts/universes` render in the deployed production build (browser, authenticated) | DEPLOYED + LIVE |
+| Operator auth boundary | `/api/alerts/*` → 401 without a cookie; authorized session gets 200 for scopes/workflows/channels/capabilities/health | LIVE |
+| Worker-health visibility across containers | `/api/alerts/health` → `runtime.available: true`; `evaluation-worker`, `screener-scheduler`, `delivery-worker` all `alive: true`, `restarts: 0` | LIVE |
+| Authoring journey | Wizard: instrument search (catalog identity) → session `mcx_commodity` → clock `ltp` → condition → trigger → channel → **Validate** → save → **Activate**, all through the UI | LIVE |
+| Live tick → accepted observation → evaluation | Three bounded windows (~45 min): `last_evaluated_at` within ~1 s of each poll, `tick_age_s` tracked, `stale` flagged honestly; runtime published live ticks with advancing exchange timestamps | LIVE |
+| Signal event → outbox → **provider accepted** | Event `8a529e4d-a37b-46c4-9cc6-e443ffafbd45` (exchange event `14:37:37Z`) → delivery `f44410c7…` → Telegram `accepted`, provider message id `6`, **exactly one** event and one delivery | LIVE, real send |
+| UI shows event + delivery accurately | Events tab: the event with its instrument binding (broker, public key, broker token, catalog generation). Deliveries tab: `PROVIDER ACCEPTED`, attempts 1, provider id 6 | LIVE |
+| Screener manual run + coverage | Explicit MCX universe (5 members, 0 rejected, generation `48d56789…`); manual run executed with `expected=5, evaluated=0, unavailable=5`, `candle_max_ts=null` → status `failed` (no MCX daily candles stored). Scheduler claimed the day's coalesced `session_close` bucket once | LIVE |
+| No duplicate notification | One event, one delivery, one attempt for the authorized send | LIVE |
+
+### 11.2 Observed limits (not defects, but not success either)
+
+- **A crossing did not fire**: two 15-minute windows (CRUDEOIL DEC ₹8740; SILVER100 SEP ₹2305)
+  saw continuous live evaluation with no crossing. The delivery leg was then proven with a
+  documented `notify_if_already_true` level trigger. Reported as “live evaluation observed,
+  crossing not observed”.
+- **MCX feed cadence**: the runtime receives intermittent snapshots for these contracts; the
+  300 s freshness guard refused frozen re-publishes (263 `stale_tick` in one window). The guard
+  is the reason a stale price is never evaluated — the UI shows `stale`/`stale_reason`.
+- **MCX screener members cannot rank** until daily candles for MCX futures exist in
+  `historical_candles` (none do today).
+
+### 11.3 Defects the deployment surfaced (fixed forward)
+
+`a7ce3c3` operator `/capabilities` required a worker bearer token (authoring UI dead);
+`3d348ab` `max(jsonb)` 500 on the workflow health route + `PgCandleHistory` rejected a
+`get()`-only token provider (manual screener runs 500'd); `3a48346` `claim_run` returned a
+detached instance (`DetachedInstanceError` on every manual screener run); `a60639c`
+pause/resume read a detached revision (500 on Pause); `3e79fb5` fired events were stored with a
+NULL `workflow_id`, hiding a delivered alert from its own Events/Deliveries tabs (the one
+pre-fix event was backfilled). Each has a focused regression test.
+
+The four SQLite-invisible ones share a root cause worth keeping in mind: the test factories
+pass `expire_on_commit=False` (and SQLite tolerates `max()` over any type) while the deployed
+application uses the default `expire_on_commit=True` on PostgreSQL.

@@ -1219,3 +1219,163 @@ with a rollback rehearsal, validate cross-host networking for
 `HOSTED_SUPERVISOR_BASE_URL`, and authorize real-provider notification delivery
 separately. The execution-settlement barrier remains required only for
 trading-capable reconciliation, which stays blocked by design.
+
+---
+
+## 12. Deployment and live acceptance — manual data-only release (2026-09-15)
+
+Deployed from branch `development` at `f6d1740` into the existing application
+environment, then extended by the fixes listed in §12.5. **Secrets are not
+recorded here** (the supervisor credential is a generated ≥32-byte value; only
+its presence and a SHA-256 fingerprint prefix are known to the operator).
+
+Status vocabulary used below: **deployed** (running in the environment),
+**live verified** (observed against live data/providers), **locally verified**
+(isolated tests), **not tested**, **deferred**.
+
+### 12.1 What was deployed
+
+| Item | Value |
+| --- | --- |
+| Branch / revision | `development`, deployed at `f6d1740` + forward-fix commits `a7ce3c3`, `3d348ab`, `3a48346`, `a60639c`, `3e79fb5` |
+| Migration | `20260912_000018` → `20260915_000024` (the app ran `alembic upgrade head`) |
+| Images rebuilt | `finance-app` (`kite-app`), `alerts-worker`, `frontend-next`, `strategy-runner` (new service); `market-runtime` unchanged (no source change since its image) |
+| Services recreated | `finance-app`, `alerts-worker`, `frontend-next`, `strategy-runner` — no `compose down`, unrelated volumes preserved |
+| New configuration (names only) | `HOSTED_SUPERVISOR_CREDENTIAL` (API + runner), `HOSTED_STRATEGY_ACCOUNT_SCOPES=kite:paper-a` |
+| Runner credential surface | `HOSTED_SUPERVISOR_BASE_URL=http://finance-app:8777/api`; no `DB_*`/`DATABASE_URL`/`KITE_*`/`TELEGRAM_*`/`APP_JWT_*` in the runner service; child base URL derived (host root) |
+
+**Deployed-code check:** SHA-256 of `backend/api/routers/hosted_lifecycle.py`,
+`backend/api/routers/strategies.py`, `backend/api/services/hosted_lifecycle.py`,
+`backend/strategies/supervisor.py` and the `000024` migration inside the running
+container match the tree at the deployed revision; the runner image matches for
+`supervisor.py` and `supervisor_api.py`.
+
+### 12.2 Supervisor credential — verified behaviour
+
+| Check | Result |
+| --- | --- |
+| Missing credential on the lifecycle API | 401, uniform body `{"detail":"Supervisor authentication required"}` |
+| Wrong credential | 401 with a byte-identical body |
+| Correct credential, discovery | 200 `{"jobs":[]}` then claimable work |
+| Credential in the runner's environment | Present (required) — and nothing else: no DB, broker, Telegram or app-JWT keys |
+| Credential in child environment / stored logs / browser responses | Absent (child env is a fixed allowlist; grep of runner logs = 0 matches; the API never returns it) |
+
+### 12.3 Live data-only acceptance (executed)
+
+Browser, production build of the deployed frontend; the strategy was created,
+versioned, configured, run, stopped and reconciled **through the UI**.
+
+| Step | Observed |
+| --- | --- |
+| Register immutable version | `v1`, capabilities shown as `data` only (`trade: false`, `notify: false`), SHA-256 pinned |
+| Configure + Run now | Parameters validated server-side; toast “Queued. The process has not started yet.”; job row `Queued · paper · Blocked` — queued is not shown as started |
+| Supervisor claim → prepare → spawn | Job reached `running`; `handoff_at` set; child alive inside `kite-strategy-runner` |
+| Child identity | `docker top` shows supervisor as `root` and the child as **uid 10002**: `python -m kite_algo_worker.hosted /var/lib/kite-supervisor/source/<job>/<version>.py` |
+| Source / scratch / records as the child | Source `r--r--r--` root-owned, readable but **not writable**; per-job scratch owned by 10002 and writable; `attempts/` and `logs/` **permission denied**; append to source refused |
+| Progress + status in the browser | `last_progress_at` advanced from the child's own `ctx.progress`; job state visible |
+| Logs | Labelled “Collected after the child terminated (live streaming is not implemented)” with the child's lines (including the harmless SDK read `ctx.client.get_run`) |
+| Stop (running attempt) | UI showed `Stopping — Stop requested…`; the supervisor terminated the child, reported cleanup, released → terminal `recovery_required` with `stop.state=confirmed`, `process_cleanup_state=confirmed`; **no child process remained** |
+| Stop (queued attempt) | Confirmed before launch, no process ever existed |
+| Reconciliation (data-only) | `Ready to reconcile / data_only_completed / DATA_ONLY_COMPLETED`; the action cleared the replacement block; `reconciled_at` recorded |
+| Idempotency | Same key + identical launch request → `idempotent: true`, the original job, job count unchanged; same key + different content → `409 IDEMPOTENCY_CONFLICT` |
+| Second attempt | New key → new run/token, stop mid-run, reconcile cleanly |
+
+Both attempts ended `stopped`; no attempt is active or replacement-blocked.
+
+### 12.4 Order / position invariance
+
+Counted before deployment and after cleanup (live database):
+
+```
+paper_orders 16 (pending 0) · paper_positions 6 rows / 4 open lots · paper_trades 16
+live_order_intents 24 · order_projection_rows 22 · option_runs 4 · protection 0
+```
+
+**Unchanged.** `signal_events` 38 → 39 and `deliveries` 2 → 3 (the single MCX
+test notification, §12.6) plus `channel_references` 1 → 2 (the operator channel
+used for that test) are the only deltas, and all three are explained by the
+authorized test. No order, position, paper fill or protection row was created,
+modified or cancelled.
+
+### 12.5 Defects found by deploying and running it, and fixed forward
+
+Deploying to a live database and exercising the real paths exposed five defects
+that the isolated suites could not: four are the same class (SQLite tolerates
+what PostgreSQL does not, or tests disable `expire_on_commit` while the app does
+not), one is a missing column write.
+
+| Commit | Defect |
+| --- | --- |
+| `a7ce3c3` | `GET /api/alerts/capabilities` delegated to the worker handler, which requires a worker bearer token → an authenticated operator got 401 and the entire alert/screener authoring form rendered “Could not load capabilities”. Now uses the worker route's pure builder. |
+| `3d348ab` | `func.max(EvaluationCheckpoint.state)` → `max(jsonb)` does not exist in PostgreSQL, so the workflow health route returned 500 for every workflow with subscriptions (SQLite hid it). Replaced with “newest checkpoint per subscription”. |
+| `3d348ab` | `PgCandleHistory` required both `get()` and `snapshot()`, so the API's lazy catalog token map fell into the dict branch and raised `AttributeError: '_CatalogTokenMap' object has no attribute 'items'` — every manual screener run and preview 500'd. |
+| `3a48346` | `ScreenerRunRepository.claim_run` returned a committed, expired ORM instance after `session.close()` → `DetachedInstanceError` on every manual screener run (tests pass `expire_on_commit=False`). |
+| `a60639c` | `_set_state` (pause/resume) read `active.revision` after the session closed → 500 on Pause. |
+| `3e79fb5` | Fired signal events were written with a NULL `workflow_id`, so an alert that fired and delivered showed “No signal events recorded” / “No deliveries recorded” in its own Events and Deliveries tabs. The one pre-fix event was backfilled from its occurrence key so the operator can audit the delivered notification. |
+
+Each fix has a focused regression test that fails without it (three of them
+drive production-shaped `expire_on_commit=True` sessions). Rebuilds were limited
+to the affected services (`finance-app` for the API-only fixes; `finance-app` +
+`alerts-worker` for the shared runtime/repository ones).
+
+### 12.6 MCX alert acceptance — result
+
+- **Instrument:** `MCX:SILVER10026SEPFUT` — canonical identity from the catalog,
+  catalog generation `48d56789-9ee2-4ca6-af83-b536368d6fb1` (published
+  2026-09-09), broker token `147154951` (kite/MCX), segment `MCX-FUT`,
+  lifecycle `active`; `MCX:CRUDEOIL26DECFUT` was probed first and is far-month
+  and thinly traded.
+- **Attempt 1 (crossing, ₹8740 on CRUDEOIL DEC)** and **attempt 2 (crossing,
+  ₹2305 on SILVER SEP)** ran in bounded 15-minute windows: **live evaluation
+  observed, crossing not observed.** The worker evaluated continuously
+  (`last_evaluated_at` within ~1 s of poll) and the runtime delivered live ticks
+  (exchange timestamps advancing), but the price did not cross either level
+  inside its window; the far-month crude contract did not move at all during its
+  window.
+- **Attempt 3 (level trigger, `ltp > 2200`, `notify_if_already_true: true`)**
+  completed the delivery path with a genuine live tick: exchange event time
+  `14:37:37Z` → event `8a529e4d-a37b-46c4-9cc6-e443ffafbd45` →
+  one outbox delivery `f44410c7…` → **provider accepted** Telegram message id
+  `6` at `14:37:44Z`, exactly **one** event and **one** notification (no
+  duplicates). The workflow's Events tab shows the event (with its instrument
+  binding: broker kite, public key, broker token, catalog generation) and the
+  Deliveries tab shows `PROVIDER ACCEPTED`, attempt 1, provider id 6.
+- **Freshness guard observed honestly:** the worker counts rejected ticks
+  (`stale_tick`) and the subscription's `tick_age_s` grows without ticks; the UI
+  reports `stale`/`stale_reason` rather than treating silence as success. In this
+  environment the MCX feed sends intermittent snapshots for these contracts, and
+  the guard correctly refused the frozen re-publishes (263 counted).
+- **Screener check:** explicit MCX universe `mcx-acceptance-universe`
+  (5 members, 0 rejected, generation `48d56789…`); a manual run executed
+  end-to-end and the scheduler also claimed the day's due `session_close` bucket
+  once. Coverage recorded `expected=5, evaluated=0, unavailable=5`,
+  `candle_max_ts=null`, status **failed** — **no stored daily candles exist for
+  MCX futures in this deployment**, so no member could be ranked. This is a data
+  availability result, not a pipeline error. No attachment notifications were
+  configured or sent.
+
+### 12.7 Verdicts (independent)
+
+- **Alerts/screeners live acceptance: PARTIAL.** The live UI → API → worker →
+  event → outbox → provider-accepted path is proven end-to-end once (including
+  the UI's event and delivery views), and the screener path runs with honest
+  coverage reporting. Not proven: a *crossing* alert firing on natural price
+  movement, and any screener producing ranked members (no MCX daily candles).
+- **Hosted manual data-only deployment: PASS.** The full data-only journey ran
+  through the deployed frontend with a distinct-identity child, honest queued/
+  stop/cleanup/reconciliation states, working idempotency, and unchanged order
+  and position state.
+- **Hosted real-order readiness: NOT READY by design.** Trading-capable
+  reconciliation stays blocked on `EXECUTION_QUIESCENCE_UNVERIFIED`; there is no
+  Cancel/Flatten, no scheduling and no live-trading activation.
+
+### 12.8 Not tested / deferred (unchanged by this deployment)
+
+- Real-provider notification acceptance beyond the single authorized Telegram
+  test message; ntfy delivery; delivery retry/backoff under failure.
+- Scheduling beyond the single coalesced screener bucket; no long-running
+  schedule observation.
+- Currency (CDS/BCD) live validation; capacity campaign; restart fault injection.
+- Rollback was **not** prepared or rehearsed by instruction (forward-fix only);
+  the pre-migration `pg_dump` was taken as operational protection only.
+- MCX daily-candle backfill (the reason a screener over MCX cannot rank yet).

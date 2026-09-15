@@ -4,9 +4,12 @@ Prepared 2026-09-13 for the closure build on branch `development`. This is the
 operator-facing deployment plan: what to rebuild, what to configure, in what
 order, and how to roll back. **No secret values appear here.**
 
-> **Deployment status: PENDING.** The revision is built and verified locally but
-> has not been deployed from this machine. Do not read this manifest as evidence
-> of a live deployment.
+> **Deployment status: DEPLOYED (2026-09-15).** Phase 6 plus the 2026-09-15
+> frontend release-completion pass and the alerts fixes listed in §9 were rolled
+> out to the existing application environment from branch `development`
+> (`f6d1740` + forward fixes, migration `20260915_000024`). See §9 for what was
+> deployed, what is live verified, what remains not tested, and the defects the
+> deployment itself surfaced.
 
 ## 1. Revision
 
@@ -125,3 +128,67 @@ the parity document §8 and the validation inventory in the closure handoff).
   `ALERTS_WORKFLOW_QUARANTINE_AFTER`/`_COOLDOWN_S` can be disabled/tuned without a
   redeploy. The health-file env change is inert if the volume is absent (the API
   reports `runtime.available: false` rather than failing).
+
+
+---
+
+## 9. Deployment record and live verification (2026-09-15)
+
+Status vocabulary: **deployed** (running in the environment), **live verified**
+(observed against live market data/providers), **locally verified** (isolated
+tests), **not tested**, **deferred**. No secret values appear here.
+
+### 9.1 What was deployed
+
+| Item | Value |
+| --- | --- |
+| Revision | branch `development`, deployed at `f6d1740`, extended by `a7ce3c3`, `3d348ab`, `3a48346`, `a60639c`, `3e79fb5` |
+| Migration | `20260912_000018` → `20260915_000024` (applied by the `finance-app` container at start) |
+| Images rebuilt | `kite-algo-finance-app`, `kite-algo-alerts-worker`, `kite-algo-frontend-next` (+ new `kite-algo-strategy-runner`); `market-runtime` unchanged |
+| Services recreated | `finance-app`, `alerts-worker`, `frontend-next`, `strategy-runner` (no `compose down`; unrelated volumes preserved) |
+| Alert delivery | `ALERTS_DELIVERY_ENABLED=1` (pre-existing); one operator-scoped Telegram channel created for the bounded test |
+
+Deployed-code spot check: SHA-256 of the operator/router files inside the
+running containers matches the deployed revision.
+
+### 9.2 Live verified (Phase 6 objectives)
+
+| Objective | Result |
+| --- | --- |
+| Worker-health visibility across containers | `GET /api/alerts/health` → `runtime.available: true`, with `evaluation-worker`, `screener-scheduler` and `delivery-worker` reported alive (the shared `alerts_health` volume works) |
+| Alerts list, scope picker, empty state | Rendered in the deployed production build; scope selector offers only the authorized scope |
+| Alert authoring wizard → validate → save → activate | Executed in the browser (instruments, session `mcx_commodity`, clock `ltp`, condition, trigger, channel, validate, save, activate) — this surfaced the capabilities defect in §9.4 |
+| Live tick → accepted observation → evaluation | Observed continuously over three bounded windows (~45 minutes total) with per-subscription `last_evaluated_at` inside ~1 s of the poll and live exchange timestamps |
+| Signal event → outbox → provider accepted | **One** complete run: exchange event `14:37:37Z` → event `8a529e4d-a37b-46c4-9cc6-e443ffafbd45` → delivery `f44410c7…` → Telegram **accepted**, provider message id `6`, exactly one event and one delivery |
+| UI shows the event and the delivery accurately | Events tab renders the event with its instrument binding (broker, public key, broker token, catalog generation); Deliveries tab renders `PROVIDER ACCEPTED`, attempts 1, provider id 6 |
+| No duplicate notification | One event, one delivery row, one attempt |
+| Screener: explicit MCX universe, manual run, membership + coverage | Manual run executed; membership resolved 5/5 with 0 rejected; coverage `expected=5, evaluated=0, unavailable=5`; status **failed** with `candle_max_ts: null` — no stored daily candles for MCX futures in this deployment |
+| Screener scheduler | Claimed the day's due `session_close` bucket once (coalesced per E-19) — not a long-running schedule claim |
+
+### 9.3 Not tested here (do not read as verified)
+
+- A **crossing** alert firing on natural price movement: two bounded windows
+  observed live evaluation but no crossing (reported as “live evaluation
+  observed, crossing not observed”; the delivery leg was then proven with a
+  documented `notify_if_already_true` level trigger).
+- Scheduled execution beyond that single coalesced bucket; currency (CDS/BCD)
+  live validation; the capacity campaign; restart fault injection; ntfy
+  delivery; delivery retry/backoff under provider failure.
+- Rollback: not prepared or rehearsed by instruction (forward-fix only). A
+  `pg_dump` was taken before the migration as operational protection.
+
+### 9.4 Defects the deployment surfaced (all fixed forward)
+
+Four of the five were invisible to the SQLite suites and appeared immediately
+against PostgreSQL / the real UI:
+
+| Commit | Defect |
+| --- | --- |
+| `a7ce3c3` | `GET /api/alerts/capabilities` delegated to the worker handler (worker bearer token required) → 401 for an authenticated operator, so the whole authoring form showed “Could not load capabilities”. |
+| `3d348ab` | `max(jsonb)` in the workflow health route → 500 for every workflow with subscriptions on PostgreSQL. |
+| `3d348ab` | `PgCandleHistory` required both `get()` and `snapshot()`, so the API's lazy catalog token map crashed with `AttributeError: '_CatalogTokenMap' object has no attribute 'items'` — every manual screener run and preview 500'd. |
+| `3a48346` | `ScreenerRunRepository.claim_run` returned a committed, expired ORM instance after `session.close()` → `DetachedInstanceError` on every manual screener run. |
+| `a60639c` | Pause/resume read a detached `WorkflowRevision.revision` → 500 on Pause. |
+| `3e79fb5` | Fired signal events were written with a NULL `workflow_id`, so a delivered alert still showed “No signal events recorded” and “No deliveries recorded for this workflow yet”. The one pre-fix event was backfilled from its occurrence key. |
+
+Each fix carries a focused regression test that fails without it.
