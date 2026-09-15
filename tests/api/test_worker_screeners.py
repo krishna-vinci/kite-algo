@@ -345,3 +345,32 @@ def test_preview_is_pure_dry_run(session_factory):
         runs = session.query(ScreenerRun).count()
         deliveries = session.query(Delivery).count()
     assert runs == 0 and deliveries == 0
+
+
+def _request_for(app):
+    """A minimal Request carrying the app state `_scheduler` reads."""
+    from starlette.requests import Request
+
+    scope = {"type": "http", "app": app, "headers": [], "method": "GET", "path": "/"}
+    return Request(scope)
+
+
+def test_manual_and_scheduled_runs_use_the_same_history_window(session_factory):
+    """A screener must evaluate identically however it was triggered.
+
+    Regression (live): the worker's scheduler defaulted `window_bars` to 120
+    while the API's manual-run scheduler defaulted to 30, so the SAME definition
+    reported `partial` when the schedule ran it and `complete` when an operator
+    pressed Run now. Both now take the pipeline's own default.
+    """
+    from backend.api.routers import worker_screeners as screeners_router
+    from backend.screeners.runner import DEFAULT_WINDOW_BARS
+
+    client = _client(session_factory, _token())
+    app = client.app  # type: ignore[attr-defined]
+    app.state.alerts_session_factory = session_factory
+    app.state.screener_scheduler = None
+    scheduler = screeners_router._scheduler(_request_for(app))
+    assert scheduler.pipeline.window_bars == DEFAULT_WINDOW_BARS
+    assert scheduler.pipeline.warmer is not None
+    assert scheduler.pipeline.warmer.required_bars == DEFAULT_WINDOW_BARS

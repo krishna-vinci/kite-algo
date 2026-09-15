@@ -56,7 +56,8 @@ __all__ = [
     "compute_screener_bucket",
 ]
 
-_DEFAULT_WINDOW_BARS = 120
+DEFAULT_WINDOW_BARS = 120
+_DEFAULT_WINDOW_BARS = DEFAULT_WINDOW_BARS
 _SESSION_CLOSE = "15:30"
 
 

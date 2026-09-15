@@ -17,7 +17,7 @@
 
 import Link from "next/link";
 import { AlertCircleIcon, CheckIcon, InfoIcon, PlayIcon } from "lucide-react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
@@ -36,9 +36,13 @@ import {
 } from "@/components/ui/select";
 import { ConditionEditor } from "@/features/alerts/components/condition-editor";
 import { UniverseTargetingEditor } from "@/features/alerts/components/universe-targeting-editor";
-import { activateAlertsWorkflow, createAlertsWorkflow } from "@/features/alerts/api";
+import {
+  activateAlertsWorkflow,
+  createAlertsWorkflow,
+  fetchAlertsUniverse,
+} from "@/features/alerts/api";
 import { useAlertsCapabilities, useAlertsChannels } from "@/features/alerts/hooks/use-alerts-queries";
-import { sessionLabel } from "@/features/alerts/lib/authoring";
+import { exchangeOf, sessionForExchange, sessionLabel } from "@/features/alerts/lib/authoring";
 import { alertsErrorMessage } from "@/features/alerts/lib/errors";
 import {
   DURATION_CHOICES,
@@ -66,12 +70,32 @@ export function QuickScreenerComposer({ scope }: { scope: string | null }) {
 
   const [draft, setDraft] = useState<ScreenerDraft>(() => emptyScreenerDraft());
   const [notifyEntry, setNotifyEntry] = useState(false);
+  const [sessionTouched, setSessionTouched] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [idempotencyKey] = useState(() => newIdempotencyKey("screener"));
 
   const capabilities = capabilitiesQuery.data?.capabilities;
+  // The session must match the exchanges a universe resolves to, which the
+  // operator should not have to work out. When the universe resolves to a single
+  // exchange, take its session; otherwise leave the choice visible.
+  const universeNamesEarly = draft.universe.union
+    .map((ref) => ref.name.trim())
+    .filter(Boolean);
+  const universeProbe = useQuery({
+    queryKey: ["alerts", "universe-session-probe", scope, universeNamesEarly[0] ?? ""],
+    queryFn: () => fetchAlertsUniverse(universeNamesEarly[0], scope),
+    enabled: Boolean(scope && universeNamesEarly.length === 1 && capabilities),
+    staleTime: 5 * 60_000,
+  });
   const enabledChannels = (channelsQuery.data?.channels ?? []).filter((c) => c.enabled);
-  const universeNames = draft.universe.union.map((ref) => ref.name.trim()).filter(Boolean);
+
+  const inferredSession = (() => {
+    const members = universeProbe.data?.latest_members;
+    if (!members || !capabilities) return "";
+    const exchanges = new Set(members.map((key) => exchangeOf(String(key))));
+    if (exchanges.size !== 1) return "";
+    return sessionForExchange([...exchanges][0], capabilities.session_exchanges);
+  })();
 
   const conditionText = `${
     draft.conditions[0]?.left.kind === "field" ? draft.conditions[0].left.name : "value"
@@ -81,9 +105,11 @@ export function QuickScreenerComposer({ scope }: { scope: string | null }) {
     ] ?? draft.conditions[0]?.op
   } ${draft.conditions[0]?.right.kind === "constant" ? draft.conditions[0].right.value : ""}`;
 
+  const effectiveSession = sessionTouched ? draft.session : inferredSession || draft.session;
   const effectiveDraft: ScreenerDraft = {
     ...draft,
-    name: draft.name.trim() || generatedName(universeNames, conditionText, draft.top_n),
+    session: effectiveSession,
+    name: draft.name.trim() || generatedName(universeNamesEarly, conditionText, draft.top_n),
     attachments:
       notifyEntry && enabledChannels.length
         ? [
@@ -343,8 +369,11 @@ export function QuickScreenerComposer({ scope }: { scope: string | null }) {
         <div className="flex flex-col gap-2">
           <Label htmlFor="quick-screener-session">Session</Label>
           <Select
-            value={draft.session}
-            onValueChange={(session) => setDraft({ ...draft, session })}
+            value={effectiveSession}
+            onValueChange={(session) => {
+              setSessionTouched(true);
+              setDraft({ ...draft, session });
+            }}
           >
             <SelectTrigger id="quick-screener-session" className="sm:w-72">
               <SelectValue />
@@ -357,13 +386,18 @@ export function QuickScreenerComposer({ scope }: { scope: string | null }) {
               ))}
             </SelectContent>
           </Select>
+          <p className="text-xs text-muted-foreground">
+            {inferredSession
+              ? `Set from the universe's instruments (${sessionLabel(inferredSession)}).`
+              : "Must match the instruments the universe resolves to."}
+          </p>
         </div>
 
         <div className="flex flex-col gap-2">
           <Label htmlFor="quick-screener-name">Name</Label>
           <Input
             id="quick-screener-name"
-            value={draft.name || generatedName(universeNames, conditionText, draft.top_n)}
+            value={draft.name || generatedName(universeNamesEarly, conditionText, draft.top_n)}
             onChange={(event) => setDraft({ ...draft, name: event.target.value })}
             placeholder="Generated from the definition"
           />

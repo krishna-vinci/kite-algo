@@ -460,7 +460,9 @@ def _scheduler(request: Request):
         return existing
     factory = _session_factory(request)
     history = _candle_history(request)
-    window_bars = int(os.environ.get("ALERTS_SCREENER_WINDOW_BARS", "30"))
+    from backend.screeners.runner import DEFAULT_WINDOW_BARS
+
+    window_bars = int(os.environ.get("ALERTS_SCREENER_WINDOW_BARS", str(DEFAULT_WINDOW_BARS)))
     return ScreenerScheduler(
         session_factory=factory,
         workflow_repo=None,

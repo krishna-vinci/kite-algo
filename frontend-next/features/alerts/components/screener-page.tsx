@@ -360,19 +360,38 @@ export function ScreenerPage({
           matches" has to be visible BEFORE a run, not inferred from an empty
           result. */}
       {dataStatus.data?.warming_supported ? (
-        <Panel tone={((dataStatus.data.members_needing_candles ?? 0) > 0) ? "default" : "subtle"}>
+        <Panel tone={dataStatus.data.status === "complete" ? "subtle" : "default"}>
           <div className="flex flex-wrap items-center gap-3">
             <span className="text-sm font-medium">Candle data</span>
             <StatusBadge
-              tone={((dataStatus.data.members_needing_candles ?? 0) > 0) ? "warning" : "positive"}
+              tone={
+                dataStatus.data.status === "complete"
+                  ? "positive"
+                  : dataStatus.data.status === "warming"
+                    ? "warning"
+                    : "neutral"
+              }
             >
-              {((dataStatus.data.members_needing_candles ?? 0) > 0) ? "warming" : "ready"}
+              {dataStatus.data.status === "complete"
+                ? "ready"
+                : dataStatus.data.status === "warming"
+                  ? "warming"
+                  : "unavailable"}
             </StatusBadge>
+            {/* Zero members is NOT "ready": the universe has not been resolved
+                (or resolved to nothing), and a scan over it cannot rank. */}
             <span className="text-xs text-muted-foreground">
-              {(dataStatus.data.members_needing_candles ?? 0) > 0
-                ? `${dataStatus.data.members_needing_candles} of ${dataStatus.data.member_count} symbols still need ${dataStatus.data.required_bars} final daily candles`
-                : `All ${dataStatus.data.member_count} symbols have the history this scan needs`}
+              {!dataStatus.data.member_count
+                ? "This universe has no resolved members yet"
+                : (dataStatus.data.members_needing_candles ?? 0) > 0
+                  ? `${dataStatus.data.members_needing_candles} of ${dataStatus.data.member_count} symbols still need ${dataStatus.data.required_bars} final daily candles`
+                  : `All ${dataStatus.data.member_count} symbols have the history this scan needs`}
             </span>
+            {dataStatus.data.status === "unavailable" ? (
+              <Button asChild size="xs" variant="outline">
+                <Link href="/alerts/universes">Open universes</Link>
+              </Button>
+            ) : null}
             {(dataStatus.data.members_needing_candles ?? 0) > 0 ? (
               <Button size="xs" variant="outline" disabled={warm.isPending} onClick={() => warm.mutate(undefined, {
                 onSuccess: (result: { warmed: number; fresh: number; unavailable: number; skipped: number; duration_s: number }) =>
@@ -472,9 +491,6 @@ export function ScreenerPage({
                           {/* What happened, in words: a zero-evaluated run caused by
                               missing candle data must not read like "no matches". */}
                           {readScreenerRun(run).summary}
-                          {run.failure_reason && !readScreenerRun(run).dataLimited ? (
-                            <span className="ml-1 text-rose-300">({run.failure_reason})</span>
-                          ) : null}
                         </TableCell>
                         <TableCell>
                           <Button

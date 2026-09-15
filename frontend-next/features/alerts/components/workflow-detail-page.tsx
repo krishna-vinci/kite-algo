@@ -24,6 +24,7 @@ import {
   WorkflowEventsPanel,
 } from "@/features/alerts/components/workflow-activity-panels";
 import { FreshnessBadge, KindBadge, LifecycleBadge } from "@/features/alerts/components/workflow-badges";
+import { deriveLifecycle } from "@/features/alerts/lib/status";
 import { WorkflowHealthPanel } from "@/features/alerts/components/workflow-health-panel";
 import { OperatorIssueList } from "@/features/alerts/components/operator-issue-list";
 import {
@@ -159,7 +160,10 @@ export function WorkflowDetailPage({
 
   const workflow = workflowQuery.data;
   const activeRevision = workflow.active_revision?.revision ?? null;
-  const isActive = Boolean(workflow.active_revision);
+  // The effective lifecycle (pause acts on subscriptions, not the revision), so
+  // the action offered matches the state the operator sees.
+  const lifecycle = deriveLifecycle(workflow);
+  const isActive = lifecycle === "active";
   const archived = Boolean(workflow.archived);
   const issues: AlertsIssue[] = workflow.warnings ?? [];
 

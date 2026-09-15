@@ -915,7 +915,11 @@ async def main(extra_tokens: Optional[Dict[str, int]] = None) -> int:
         from backend.workflows.screener_repository import ScreenerRunRepository
 
         fundamentals_loader = FundamentalsLoader(session_factory)
-        screener_window_bars = int(os.environ.get("ALERTS_SCREENER_WINDOW_BARS", "120"))
+        from backend.screeners.runner import DEFAULT_WINDOW_BARS
+
+        screener_window_bars = int(
+            os.environ.get("ALERTS_SCREENER_WINDOW_BARS", str(DEFAULT_WINDOW_BARS))
+        )
         screener_history = PgCandleHistory(engine, bindings)
         screener_scheduler = ScreenerScheduler(
             session_factory=session_factory,
