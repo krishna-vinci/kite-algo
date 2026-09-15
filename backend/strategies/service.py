@@ -87,7 +87,8 @@ ALLOWED_STALE_EXIT_POLICIES = ("none", "exit_on_worker_stale")
 ALLOWED_SCHEDULE_KINDS = ("daily", "weekly")
 
 #: Actions a CHILD run token may hold. ``heartbeat`` is absent on purpose.
-CHILD_BASE_ACTIONS = frozenset({"runs:read", "runs:log"})
+#: ``runs:progress`` is the child-authenticated liveness/progress marker.
+CHILD_BASE_ACTIONS = frozenset({"runs:read", "runs:log", "runs:progress"})
 CHILD_ORDER_ACTIONS = frozenset({"intents:submit", "runs:exit", "risk:update"})
 CHILD_NOTIFY_ACTIONS = frozenset({"notifications:publish"})
 #: Lifecycle rights reserved to the supervisor (internal lifecycle API).

@@ -141,7 +141,7 @@ def test_child_token_composition_order_and_notify():
     order = service.child_run_token_actions(order_capable=True)
     assert "intents:submit" in order and "heartbeat" not in order
     notify = service.child_run_token_actions(notify=True)
-    assert notify == ["notifications:publish", "runs:log", "runs:read"]
+    assert notify == ["notifications:publish", "runs:log", "runs:progress", "runs:read"]
     assert "intents:submit" not in notify
 
 

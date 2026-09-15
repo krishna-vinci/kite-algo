@@ -67,6 +67,15 @@ class WorkerHeartbeatRequest(BaseModel):
     status: str = "healthy"
     metrics: Dict[str, Any] = Field(default_factory=dict)
 
+class WorkerProgressRequest(BaseModel):
+    """Child-reported progress marker for a hosted attempt.
+
+    The note is an optional short human label; it is length-bounded and is never
+    persisted or logged verbatim (only the arrival time is recorded).
+    """
+
+    note: Optional[str] = Field(default=None, max_length=200)
+
 class WorkerRunCreateRequest(BaseModel):
     strategy_run_id: Optional[str] = None
     template_id: str = Field(min_length=1)

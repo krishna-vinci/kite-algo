@@ -10,9 +10,12 @@ from sqlalchemy import text
 from backend.app.database import SessionLocal
 from backend.broker_api.orders.basket_execution import basket_execution_store
 from backend.broker_api.orders.bracket_runtime import bracket_runtime_store
-from backend.api.schemas.worker import WorkerBasketPreviewRequest, WorkerBracketCreateRequest, WorkerExitRequest, WorkerIntentRequest, WorkerOrderActionRequest, WorkerOrderModifyRequest, WorkerOrderPreviewRequest
+from backend.api.schemas.worker import WorkerBasketPreviewRequest, WorkerBracketCreateRequest, WorkerExitRequest, WorkerIntentRequest, WorkerOrderActionRequest, WorkerOrderModifyRequest, WorkerOrderPreviewRequest, WorkerProgressRequest
 from backend.api.routers.worker_shared import *
-from backend.api.services.hosted_attempt import enforce_hosted_attempt_authority
+from backend.api.services.hosted_attempt import (
+    enforce_hosted_attempt_authority,
+    record_hosted_progress,
+)
 from backend.shared.serialization import _json_dumps
 from backend.api.routers.worker_protection import _build_worker_run_pnl_snapshot, validate_worker_run_safety_token
 from backend.algo_runtime.execution_attribution import build_execution_attribution, build_paper_execution_attribution
@@ -966,8 +969,28 @@ async def exit_worker_run(request: Request, strategy_run_id: str, payload: Worke
     return {"mode": "paper", "status": result_status, "result": result, "run": updated}
 
 
+async def report_worker_run_progress(request: Request, strategy_run_id: str, payload: WorkerProgressRequest):
+    """Accept a child-authenticated progress marker for a hosted attempt.
+
+    The note is length-bounded but not persisted; only the arrival time is
+    recorded. Progress requires a live attempt, a matching session nonce and the
+    child token's ``runs:progress`` action. It is the *only* writer of
+    ``last_progress_at`` — the supervisor heartbeat never writes it.
+    """
+    token = await require_worker_token(request)
+    _require_action(token, "runs:progress")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    await require_active_worker_run_session(request, run)
+    result = await record_hosted_progress(request, token, run)
+    return {"status": "ok", "strategy_run_id": strategy_run_id, "recorded": result["updated"]}
+
+
 router.add_api_route("/worker/orders", list_worker_orders, methods=["GET"])
 router.add_api_route("/worker/trades", list_worker_trades, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/progress", report_worker_run_progress, methods=["POST"])
 router.add_api_route("/worker/orders/{order_id}", get_worker_order, methods=["GET"])
 router.add_api_route("/worker/orders/{order_id}/history", get_worker_order_history, methods=["GET"])
 router.add_api_route("/worker/orders/{order_id}/cancel", cancel_worker_order, methods=["POST"])

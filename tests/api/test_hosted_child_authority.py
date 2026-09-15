@@ -28,6 +28,7 @@ from sqlalchemy.pool import StaticPool  # noqa: E402
 from backend.api.routers import worker_auth as worker_auth_router  # noqa: E402
 from backend.api.routers import worker_execution as worker_execution_router  # noqa: E402
 from backend.options.api.worker_options_router import router as worker_options_router  # noqa: E402
+from backend.options.execution.store import get_option_run_store  # noqa: E402
 from backend.shared.serialization import _hash_token  # noqa: E402
 from backend.strategies import models  # noqa: F401,E402
 from backend.strategies.repository import SqlAlchemyStrategyRepository  # noqa: E402
@@ -84,7 +85,7 @@ def harness():
         "name": "hosted-child",
         "account_scope": "kite:paper",
         "allowed_modes": ["paper"],
-        "allowed_actions": ["runs:read", "runs:log", "intents:submit", "runs:exit"],
+        "allowed_actions": ["runs:read", "runs:log", "runs:progress", "intents:submit", "runs:exit"],
         "allowed_templates": [template],
         "status": "active",
         "expires_at": None,
@@ -163,6 +164,12 @@ def harness():
     app.include_router(worker_auth_router.router, prefix="/api")
     app.include_router(worker_execution_router.router, prefix="/api")
     app.include_router(worker_options_router)
+
+    class _NoRunsOptionStore:
+        def get_run(self, *_a, **_k):
+            raise KeyError("no option run")
+
+    app.dependency_overrides[get_option_run_store] = lambda: _NoRunsOptionStore()
     app.state.algo_worker_repository = worker
     app.state.strategies_session_factory = factory
     app.state.journal_service = StubJournalService()
@@ -328,3 +335,101 @@ async def test_hosted_mutation_refused_on_token_mismatch(harness):
         )
         assert response.status_code == 403
         assert response.json()["detail"]["rejection_reason"] == "HOSTED_ATTEMPT_TOKEN_MISMATCH"
+
+
+@pytest.mark.asyncio
+async def test_hosted_child_progress_is_child_authenticated_and_session_bound(harness):
+    repo, worker, app, job, run_id, _t, _f = harness
+    worker.runs[run_id]["worker_session_nonce"] = "wsn_live"
+    async with _client(app) as client:
+        # Session-bound: without the nonce the progress call is refused.
+        missing = await client.post(
+            f"{BASE}/worker/runs/{run_id}/progress", headers=_child_headers(), json={}
+        )
+        assert missing.status_code == 409
+        assert missing.json()["detail"]["rejection_reason"] == "WORKER_SESSION_REQUIRED"
+
+        assert repo.get_job(OWNER, job.id).last_progress_at is None
+        ok = await client.post(
+            f"{BASE}/worker/runs/{run_id}/progress",
+            headers={**_child_headers(), "X-Worker-Session-Nonce": "wsn_live"},
+            json={"note": "tick"},
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["recorded"] is True
+        # Only accepted child progress writes last_progress_at.
+        assert repo.get_job(OWNER, job.id).last_progress_at is not None
+
+
+@pytest.mark.asyncio
+async def test_hosted_child_progress_refused_when_fenced(harness):
+    repo, worker, app, job, run_id, _t, _f = harness
+    worker.runs[run_id]["worker_session_nonce"] = "wsn_live"
+    repo.mark_recovery_required(job.id, lease_owner="sup-A", expected_lease_epoch=1, expected_attempt=1)
+    async with _client(app) as client:
+        response = await client.post(
+            f"{BASE}/worker/runs/{run_id}/progress",
+            headers={**_child_headers(), "X-Worker-Session-Nonce": "wsn_live"},
+            json={},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["rejection_reason"] == "HOSTED_ATTEMPT_FENCED"
+
+
+# ---------------------------------------------------------------------------
+# options operation permissions (independent of identity)
+# ---------------------------------------------------------------------------
+
+
+def _options_entry_url(run_id: str, leaf: str) -> str:
+    return f"{BASE}/worker/options/runs/{run_id}/{leaf}"
+
+
+@pytest.mark.asyncio
+async def test_hosted_data_only_token_cannot_enter_exit_or_change_protection(harness):
+    _repo, worker, app, _job, run_id, _t, _f = harness
+    # Same identity, but the token carries no trading/protection action.
+    worker.tokens[CHILD_ID]["allowed_actions"] = ["runs:read", "runs:log", "runs:progress"]
+    async with _client(app) as client:
+        for leaf, method in (("enter", "post"), ("exit", "post"), ("protection", "put")):
+            response = await getattr(client, method)(
+                _options_entry_url(run_id, leaf), headers=_child_headers(), json={}
+            )
+            assert response.status_code == 403, (leaf, response.text)
+            assert response.json()["detail"]["rejection_reason"] == "HOSTED_OPERATION_NOT_PERMITTED"
+
+
+@pytest.mark.asyncio
+async def test_hosted_dry_run_options_mutation_rejected_but_preview_allowed(harness):
+    _repo, worker, app, job, run_id, _t, factory = harness
+    worker.runs[run_id]["execution_mode"] = "dry_run"
+    with factory() as session:
+        session.execute(
+            text("UPDATE strategy_jobs SET execution_mode = 'dry_run' WHERE id = :id"),
+            {"id": job.id},
+        )
+        session.commit()
+    async with _client(app) as client:
+        response = await client.post(_options_entry_url(run_id, "enter"), headers=_child_headers(), json={})
+        assert response.status_code == 409
+        assert response.json()["detail"]["rejection_reason"] == "HOSTED_OPTIONS_MUTATION_PAPER_ONLY"
+
+        # Preview does not mutate, so the mode gate does not apply to it.
+        preview = await client.post(
+            _options_entry_url(run_id, "preview-entry"), headers=_child_headers(), json={}
+        )
+        assert "HOSTED_OPTIONS_MUTATION_PAPER_ONLY" not in preview.text
+        assert "HOSTED_OPERATION_NOT_PERMITTED" not in preview.text
+
+
+@pytest.mark.asyncio
+async def test_hosted_execution_injection_rejected(harness):
+    _repo, _worker, app, _job, run_id, _t, _f = harness
+    async with _client(app) as client:
+        response = await client.post(
+            _options_entry_url(run_id, "enter"),
+            headers=_child_headers(),
+            json={"order_results": [{"order_id": "fake"}]},
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"]["rejection_reason"] == "HOSTED_EXECUTION_INJECTION_FORBIDDEN"

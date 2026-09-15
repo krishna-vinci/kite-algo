@@ -59,7 +59,9 @@ __all__ = [
     "HostedLifecycleHooks",
     "expire",
     "heartbeat",
+    "job_source",
     "job_state",
+    "list_jobs",
     "prepare_launch",
     "release",
     "fence",
@@ -98,12 +100,18 @@ def require_job_authority(
     attempt: int,
     allow_statuses=_LIVE_STATUSES,
     require_live_lease: bool = True,
+    require_started: bool = True,
 ) -> StrategyJob:
     """Authorize a lifecycle request against the persisted job authority.
 
     This is the only way a lifecycle request touches a job. It never accepts a
     bare run id: identity and configuration are derived from the job record, and
     the lease owner/epoch/attempt must all match.
+
+    ``require_started=False`` is for **terminal reads only**: after a
+    released-unlaunched attempt, ``desired_state`` is ``stopped`` and a state
+    read must still succeed. It never relaxes the live-status/lease gates that
+    gate mutation, so reads cannot regain mutation authority.
     """
     if job is None:
         raise HostedLifecycleError(404, "HOSTED_JOB_NOT_FOUND")
@@ -115,7 +123,7 @@ def require_job_authority(
         raise HostedLifecycleError(
             403, "HOSTED_LEASE_AUTHORITY_MISMATCH", job_status=str(job.status or "")
         )
-    if str(job.desired_state or "") != "started":
+    if require_started and str(job.desired_state or "") != "started":
         raise HostedLifecycleError(409, "HOSTED_ATTEMPT_STOPPED")
     if str(job.status or "") not in allow_statuses:
         raise HostedLifecycleError(
@@ -274,6 +282,11 @@ async def prepare_launch(
     )
     if strategy is None:
         raise HostedLifecycleError(409, "HOSTED_STRATEGY_MISSING")
+    version = await asyncio.to_thread(
+        strategy_repo.get_version_by_id, job.strategy_id, job.version_id
+    )
+    if version is None:
+        raise HostedLifecycleError(409, "HOSTED_VERSION_MISSING")
     template_id = strategy_service.template_id_for(job.strategy_id)
 
     async def _abort(reason: str, *, token: Optional[str], status_code: int, code: str):
@@ -463,6 +476,8 @@ async def prepare_launch(
         "max_duration_s": int(job.max_duration_s),
         "progress_deadline_s": int(job.progress_deadline_s),
         "stale_exit_policy": stale_exit_policy,
+        "version_id": version.id,
+        "source_sha256": version.source_sha256,
     }
 
 
@@ -684,6 +699,7 @@ async def job_state(
         attempt=attempt,
         allow_statuses=("starting", "running", "recovery_required", "stopped", "failed", "hung", "fencing"),
         require_live_lease=False,
+        require_started=False,
     )
     run_status = None
     if job.run_id:
@@ -702,5 +718,63 @@ async def job_state(
         "run_id": job.run_id,
         "token_id": job.token_id,
         "handoff_at": _as_utc(job.handoff_at).isoformat() if job.handoff_at else None,
+        "last_progress_at": _as_utc(job.last_progress_at).isoformat() if job.last_progress_at else None,
+        "progress_deadline_s": int(job.progress_deadline_s),
         "run_status": run_status,
+    }
+
+
+def list_jobs(*, strategy_repo: SqlAlchemyStrategyRepository, statuses=("queued",), limit: int = 50):
+    """Narrow discovery: the oldest jobs awaiting a supervisor.
+
+    Read-only and bounded. Only jobs whose ``desired_state`` is ``started`` are
+    returned, so a stopped/paused job is never re-offered. This deliberately does
+    not implement scheduling — it merely lets a supervisor find work.
+    """
+    rows = strategy_repo.list_jobs_by_status(tuple(statuses), limit=limit)
+    return [
+        {
+            "job_id": row.id,
+            "strategy_id": row.strategy_id,
+            "attempt": int(row.attempt),
+            "status": row.status,
+            "execution_mode": row.execution_mode,
+            "lease_epoch": int(row.lease_epoch),
+            "created_at": _as_utc(row.created_at).isoformat() if row.created_at else None,
+        }
+        for row in rows
+    ]
+
+
+async def job_source(
+    *,
+    strategy_repo: SqlAlchemyStrategyRepository,
+    job_id: str,
+    lease_owner: str,
+    lease_epoch: int,
+    attempt: int,
+) -> Dict[str, Any]:
+    """Deliver the exact pinned source/version/hash to an *authorized* supervisor.
+
+    Requires a **live** lease on a live attempt, so source can only be fetched
+    while the supervisor legitimately owns the launch. The source is returned as
+    text for the supervisor to persist and hash-verify; it is never imported by
+    the API.
+    """
+    job = await asyncio.to_thread(strategy_repo.get_job_by_id, job_id)
+    job = require_job_authority(
+        job, lease_owner=lease_owner, lease_epoch=lease_epoch, attempt=attempt
+    )
+    version = await asyncio.to_thread(
+        strategy_repo.get_version_by_id, job.strategy_id, job.version_id
+    )
+    if version is None:
+        raise HostedLifecycleError(409, "HOSTED_VERSION_MISSING")
+    return {
+        "job_id": job.id,
+        "strategy_id": job.strategy_id,
+        "version_id": version.id,
+        "version": int(version.version),
+        "source": version.source,
+        "source_sha256": version.source_sha256,
     }

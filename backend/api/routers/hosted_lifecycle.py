@@ -32,6 +32,8 @@ from backend.api.schemas.hosted_lifecycle import (
     ClaimJobRequest,
     FenceRequest,
     HeartbeatRequest,
+    JobListResponse,
+    JobSourceResponse,
     JobStateResponse,
     PrepareLaunchRequest,
     ReleaseRequest,
@@ -104,6 +106,51 @@ async def claim_job(
         lease_epoch=int(claimed.lease_epoch),
         attempt=payload.expected_attempt,
     )
+
+
+@router.get("/jobs", response_model=JobListResponse)
+async def list_jobs(
+    request: Request,
+    status: str = "queued",
+    limit: int = 50,
+    strategy_repo: SqlAlchemyStrategyRepository = Depends(_strategies_repo),
+):
+    """Narrow, authenticated discovery of jobs awaiting a supervisor.
+
+    Read-only and bounded; no strategy configuration or secrets are exposed. It
+    does not implement scheduling — a supervisor uses it to find work, then
+    claims a specific job by id.
+    """
+    statuses = tuple(item.strip() for item in str(status or "queued").split(",") if item.strip()) or ("queued",)
+    return JobListResponse(
+        jobs=hosted_lifecycle.list_jobs(strategy_repo=strategy_repo, statuses=statuses, limit=limit)
+    )
+
+
+@router.get("/jobs/{job_id}/source", response_model=JobSourceResponse)
+async def get_job_source(
+    job_id: str,
+    request: Request,
+    lease_owner: str,
+    lease_epoch: int,
+    attempt: int,
+    strategy_repo: SqlAlchemyStrategyRepository = Depends(_strategies_repo),
+):
+    """Deliver the pinned source/version/hash to an authorized supervisor.
+
+    Requires a live lease on a live attempt. The source is returned as text for
+    the supervisor to persist and hash-verify; the API never imports it.
+    """
+    try:
+        return await hosted_lifecycle.job_source(
+            strategy_repo=strategy_repo,
+            job_id=job_id,
+            lease_owner=lease_owner,
+            lease_epoch=lease_epoch,
+            attempt=attempt,
+        )
+    except hosted_lifecycle.HostedLifecycleError as exc:
+        raise _raise(exc) from exc
 
 
 @router.get("/jobs/{job_id}", response_model=JobStateResponse)

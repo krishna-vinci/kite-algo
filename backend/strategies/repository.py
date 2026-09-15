@@ -419,6 +419,28 @@ class SqlAlchemyStrategyRepository:
         finally:
             session.close()
 
+    def list_jobs_by_status(self, statuses: tuple, *, limit: int = 50) -> List[StrategyJob]:
+        """Narrow, unscoped listing for supervisor discovery.
+
+        Returns the oldest jobs in the given statuses so a supervisor can find
+        work. It carries no owner scoping because the lifecycle API already
+        authenticates the narrow supervisor credential; it is still read-only and
+        bounded.
+        """
+        capped = max(1, min(int(limit), 200))
+        session = self._session()
+        try:
+            return list(
+                session.execute(
+                    select(StrategyJob)
+                    .where(StrategyJob.status.in_(tuple(statuses)), StrategyJob.desired_state == "started")
+                    .order_by(StrategyJob.created_at, StrategyJob.id)
+                    .limit(capped)
+                ).scalars()
+            )
+        finally:
+            session.close()
+
     def get_job_by_run_id(self, run_id: str) -> Optional[StrategyJob]:
         if not run_id:
             return None
@@ -591,6 +613,31 @@ class SqlAlchemyStrategyRepository:
                     StrategyJob.handoff_at.is_not(None),
                 )
                 .values(lease_until=lease_until, updated_at=_utcnow())
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def record_progress(self, job_id: str) -> bool:
+        """Record a child-reported progress marker on a live job.
+
+        Only the child-authenticated progress route calls this; the runner
+        heartbeat never does. Grepping the schema, ``last_progress_at`` is the
+        single progress signal and is written only here.
+        """
+        session = self._session()
+        try:
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    StrategyJob.id == job_id,
+                    StrategyJob.status.in_(("starting", "running")),
+                )
+                .values(last_progress_at=_utcnow(), updated_at=_utcnow())
             )
             session.commit()
             return bool(result.rowcount)

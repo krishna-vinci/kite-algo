@@ -279,6 +279,28 @@ class KiteAlgoWorkerClient:
             json=payload,
         )
 
+    def run_progress(
+        self,
+        strategy_run_id: str,
+        *,
+        session_nonce: str,
+        note: Optional[str] = None,
+    ) -> JsonDict:
+        """Report child progress for a hosted attempt.
+
+        This is a *child* signal; the supervisor heartbeat does not write it. The
+        server records arrival time only and refuses a fenced/expired attempt.
+        """
+        payload: JsonDict = {}
+        if note is not None:
+            payload["note"] = str(note)
+        return self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/progress",
+            headers=session_headers(session_nonce),
+            json=payload,
+        )
+
     def safety_check(self, strategy_run_id: str) -> SafetyCheckResult:
         return SafetyCheckResult.model_validate(self._request("GET", f"/worker/runs/{strategy_run_id}/safety-check"))
 

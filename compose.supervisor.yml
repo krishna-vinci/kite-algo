@@ -1,0 +1,45 @@
+# Hosted-strategy process supervisor.
+#
+# Deliberately a separate file: compose.yml / compose.dev.yml have in-flight
+# changes; this adds one service without touching them. Run with:
+#
+#   HOSTED_SUPERVISOR_CREDENTIAL=... \
+#   docker compose -f compose.yml -f compose.supervisor.yml up -d strategy-runner
+#
+# The supervisor holds NO database credentials (note the absence of DB_* and of
+# env_file: .env) and reaches the control plane only through the
+# credential-authenticated lifecycle API on the service network.
+services:
+  strategy-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kite-strategy-runner
+    restart: unless-stopped
+    # Only the supervisor credential and its own workspace are provided.
+    environment:
+      HOSTED_SUPERVISOR_BASE_URL: http://finance-app:8777
+      HOSTED_SUPERVISOR_CREDENTIAL: ${HOSTED_SUPERVISOR_CREDENTIAL:?set HOSTED_SUPERVISOR_CREDENTIAL}
+      HOSTED_SUPERVISOR_WORKSPACE: /var/lib/kite-supervisor
+      HOSTED_SUPERVISOR_LEASE_SECONDS: ${HOSTED_SUPERVISOR_LEASE_SECONDS:-120}
+      HOSTED_SUPERVISOR_HEARTBEAT_INTERVAL_S: ${HOSTED_SUPERVISOR_HEARTBEAT_INTERVAL_S:-30}
+      HOSTED_SUPERVISOR_STARTUP_GRACE_S: ${HOSTED_SUPERVISOR_STARTUP_GRACE_S:-30}
+      HOSTED_SUPERVISOR_TERM_GRACE_S: ${HOSTED_SUPERVISOR_TERM_GRACE_S:-10}
+      HOSTED_SUPERVISOR_MAX_LOG_BYTES: ${HOSTED_SUPERVISOR_MAX_LOG_BYTES:-5242880}
+      # Drop the child to a distinct OS identity when the runner is granted
+      # CAP_SETUID/CAP_SETGID (or a minimal setpriv/sudo rule). Optional.
+      HOSTED_SUPERVISOR_CHILD_UID: ${HOSTED_SUPERVISOR_CHILD_UID:-}
+      HOSTED_SUPERVISOR_CHILD_GID: ${HOSTED_SUPERVISOR_CHILD_GID:-}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - strategy_runner_state:/var/lib/kite-supervisor
+    command:
+      - python
+      - -m
+      - backend.strategies.supervisor
+    depends_on:
+      finance-app:
+        condition: service_healthy
+
+volumes:
+  strategy_runner_state:

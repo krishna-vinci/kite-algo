@@ -608,3 +608,20 @@ def test_mark_recovery_required_retains_lease_attribution(repo):
     persisted = repo.get_job(OWNER, job.id)
     assert persisted.lease_owner == "sup-A"
     assert persisted.lease_until is None
+
+
+def test_record_progress_only_for_live_jobs(repo):
+    strategy = _strategy(repo)
+    version = _version(repo, strategy.id)
+    job = _job(repo, strategy, version)
+    _claim(repo, job, epoch=0, attempt=1)
+
+    assert repo.get_job(OWNER, job.id).last_progress_at is None
+    assert repo.record_progress(job.id) is True
+    assert repo.get_job(OWNER, job.id).last_progress_at is not None
+
+    repo.mark_recovery_required(
+        job.id, lease_owner="sup-A", expected_lease_epoch=1, expected_attempt=1
+    )
+    # A fenced job accepts no progress.
+    assert repo.record_progress(job.id) is False

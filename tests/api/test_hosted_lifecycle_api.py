@@ -336,6 +336,44 @@ async def test_launched_release_blocks_replacement_and_state_stays_readable(harn
 
 
 @pytest.mark.asyncio
+async def test_released_unlaunched_state_read_and_authority_withdrawal(harness):
+    repo, _worker, app = harness
+    job = _queued_job(repo)
+    async with _client(app) as client:
+        assert (await _claim(client, job)).status_code == 200
+        released = await client.post(
+            f"{BASE}/jobs/{job.id}/release", json=_authority(epoch=1), headers=_headers()
+        )
+        assert released.status_code == 200, released.text
+        assert released.json()["status"] == "stopped"
+        assert released.json()["replacement_blocked"] is False
+
+        # Terminal state read works and reports desired_state=stopped.
+        state = await client.get(
+            f"{BASE}/jobs/{job.id}",
+            params={"lease_owner": "sup-A", "lease_epoch": 1, "attempt": 1},
+            headers=_headers(),
+        )
+        assert state.status_code == 200, state.text
+        assert state.json()["status"] == "stopped"
+        assert state.json()["desired_state"] == "stopped"
+
+        # Reads did not restore heartbeat or prepare authority.
+        assert (
+            await client.post(
+                f"{BASE}/jobs/{job.id}/heartbeat",
+                json={**_authority(epoch=1), "lease_until": _lease()},
+                headers=_headers(),
+            )
+        ).status_code in (409, 403)
+        assert (
+            await client.post(
+                f"{BASE}/jobs/{job.id}/prepare", json=_authority(epoch=1), headers=_headers()
+            )
+        ).status_code in (409, 403)
+
+
+@pytest.mark.asyncio
 async def test_recover_expired_lease_at_boundary(harness):
     repo, _worker, app = harness
     job = _queued_job(repo)

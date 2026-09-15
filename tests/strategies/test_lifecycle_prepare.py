@@ -384,6 +384,19 @@ def test_unlaunched_release_allows_replacement(harness):
     assert result["status"] == "stopped"
     assert result["replacement_blocked"] is False
     assert harness.repo.get_job(OWNER, job.id).status == "stopped"
+    # Terminal read works after release, and reports desired_state=stopped.
+    state = asyncio.run(
+        hosted_lifecycle.job_state(
+            strategy_repo=harness.repo,
+            worker_repo=harness.worker,
+            job_id=job.id,
+            lease_owner="sup-A",
+            lease_epoch=epoch,
+            attempt=attempt,
+        )
+    )
+    assert state["status"] == "stopped"
+    assert state["desired_state"] == "stopped"
     # No launch happened, so a new attempt is permitted.
     new_job = harness.repo.create_job(
         strategy_id=job.strategy_id,
@@ -527,7 +540,7 @@ def test_data_only_capability_grants_no_trading_rights(harness):
     )
     harness.prepare(job.id, epoch=epoch, attempt=attempt)
     token = next(iter(harness.worker.tokens.values()))
-    assert set(token["allowed_actions"]) == {"runs:read", "runs:log"}
+    assert set(token["allowed_actions"]) == {"runs:read", "runs:log", "runs:progress"}
 
 
 def test_notify_only_capability_grants_publish_but_not_trading(harness):

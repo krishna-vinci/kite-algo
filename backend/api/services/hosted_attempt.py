@@ -38,6 +38,7 @@ __all__ = [
     "hosted_job_for_token",
     "is_hosted_run",
     "is_hosted_template_id",
+    "record_hosted_progress",
     "token_is_hosted_candidate",
 ]
 
@@ -232,3 +233,25 @@ def assert_hosted_run_binding(run: Optional[Dict[str, Any]], token: WorkerToken)
             "HOSTED_CHILD_RUN_REQUIRED",
             strategy_run_id=str((run or {}).get("strategy_run_id") or ""),
         )
+
+
+async def record_hosted_progress(
+    request: Request, token: WorkerToken, run: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Record a child-accepted progress marker on the hosted attempt.
+
+    Hosted-only: an external (non-``hosted:``) run has no hosted attempt to
+    attribute progress to, so it is refused rather than inventing semantics.
+    The full attempt authority is re-validated (fenced/expired/mismatched are
+    refused) before ``last_progress_at`` is written.
+    """
+    if not is_hosted_run(run):
+        raise _reject(403, "HOSTED_PROGRESS_UNSUPPORTED")
+    run_id = str((run or {}).get("strategy_run_id") or "")
+    repo = _strategies_repo(request)
+    job = await asyncio.to_thread(_load_hosted_job, repo, run_id)
+    if job is None:
+        raise _reject(403, "HOSTED_ATTEMPT_UNKNOWN", strategy_run_id=run_id)
+    await asyncio.to_thread(_validate_authority, job, token, run)
+    updated = await asyncio.to_thread(repo.record_progress, job.id)
+    return {"job_id": job.id, "strategy_run_id": run_id, "updated": bool(updated)}

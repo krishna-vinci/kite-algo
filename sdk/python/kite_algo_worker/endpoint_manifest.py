@@ -115,6 +115,7 @@ WORKER_HTTP_ENDPOINTS = (
     _e("POST", "/worker/runs/{strategy_run_id}/heartbeat", "run_heartbeat", mutates=True),
     _e("POST", "/worker/runs/{strategy_run_id}/intents", "place_order", mutates=True),
     _e("GET", "/worker/runs/{strategy_run_id}/pnl", "get_run_pnl"),
+    _e("POST", "/worker/runs/{strategy_run_id}/progress", "run_progress", mutates=True),
     _e("GET", "/worker/runs/{strategy_run_id}/pnl/stream", "stream_run_pnl", response_kind="sse"),
     _e("POST", "/worker/runs/{strategy_run_id}/preview/basket", "preview_basket"),
     _e("POST", "/worker/runs/{strategy_run_id}/preview/order", "preview_order"),

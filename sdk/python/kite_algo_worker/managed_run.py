@@ -49,6 +49,16 @@ class ManagedRun:
             metrics=metrics,
         )
 
+    def progress(self, note: str | None = None) -> JsonDict:
+        """Report child progress to the hosted attempt.
+
+        Requires the attach run's session nonce. This is the child's own liveness
+        signal; it is not a heartbeat and the supervisor never fabricates it.
+        """
+        if self.session_nonce is None:
+            raise ValueError("ManagedRun progress requires a session nonce")
+        return self.client.run_progress(self.run_id, session_nonce=self.session_nonce, note=note)
+
     def safety_check(self) -> SafetyCheckResult:
         return self.client.safety_check(self.run_id)
 

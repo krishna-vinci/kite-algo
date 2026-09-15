@@ -164,6 +164,24 @@ class AsyncKiteAlgoWorkerClient:
             json=build_heartbeat_payload(worker_id=worker_id, status=status, metrics=metrics),
         )
 
+    async def run_progress(
+        self,
+        strategy_run_id: str,
+        *,
+        session_nonce: str,
+        note: Optional[str] = None,
+    ) -> JsonDict:
+        """Report child progress for a hosted attempt (async parity)."""
+        payload: JsonDict = {}
+        if note is not None:
+            payload["note"] = str(note)
+        return await self._request(
+            "POST",
+            f"/worker/runs/{strategy_run_id}/progress",
+            headers=session_headers(session_nonce),
+            json=payload,
+        )
+
     async def safety_check(self, strategy_run_id: str):
         return SafetyCheckResult.model_validate(
             await self._request("GET", f"/worker/runs/{strategy_run_id}/safety-check")

@@ -8,7 +8,7 @@ and configuration are derived server-side from the persisted job record.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -69,6 +69,8 @@ class ChildLaunchConfigResponse(BaseModel):
     max_duration_s: int
     progress_deadline_s: int
     stale_exit_policy: str
+    version_id: Optional[str] = None
+    source_sha256: Optional[str] = None
 
 
 class JobStateResponse(BaseModel):
@@ -85,6 +87,8 @@ class JobStateResponse(BaseModel):
     run_id: Optional[str] = None
     token_id: Optional[str] = None
     handoff_at: Optional[str] = None
+    last_progress_at: Optional[str] = None
+    progress_deadline_s: Optional[int] = None
     run_status: Optional[str] = None
 
 
@@ -99,3 +103,34 @@ class ActionResponse(BaseModel):
     #: True when the terminal transition leaves the replacement block in place
     #: (open exposure may remain); False when replacement is safe.
     replacement_blocked: Optional[bool] = None
+
+
+class JobSummaryResponse(BaseModel):
+    """Narrow discovery row; no secrets, no strategy configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    strategy_id: str
+    attempt: int
+    status: str
+    execution_mode: str
+    lease_epoch: int
+    created_at: Optional[str] = None
+
+
+class JobListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    jobs: List[JobSummaryResponse] = Field(default_factory=list)
+
+
+class JobSourceResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    strategy_id: str
+    version_id: str
+    version: int
+    source: str
+    source_sha256: str

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from backend.api.routers.worker_protection import (
     observe_worker_option_protection_timeline_state,
@@ -44,22 +44,66 @@ from backend.options.protection.models import OptionProtectionConfigUpdateReques
 router = APIRouter(prefix="/api/algo-workers/worker/options", tags=["Algo Workers"])
 
 
-async def _guard_options_mutation(request, token, strategy_run_id: str):
-    """Bind an options mutation to the caller's worker run.
+async def _guard_options_mutation(
+    request, token, strategy_run_id: str, *, required_action: str, operation: str
+):
+    """Authorize an options mutation: operation permission + run binding + mode.
 
-    A hosted child token must act only on the worker run bound to its attempt:
-    an options id with **no** corresponding worker run, or one owned by another
-    token, is refused (403) rather than silently skipping the guard. External
-    tokens keep their established behavior (a session check when a run exists).
+    Two independent gates:
+
+    - **Operation permission (hosted only).** A hosted child must hold the action
+      the mutation needs (``intents:submit`` to enter/exit, ``risk:update`` to
+      change protection). A data-only token therefore cannot trade or alter
+      protection. External tokens keep their established behavior.
+    - **Identity + mode.** The caller must be bound to the worker run (an options
+      id with no worker run, or another token's run, is refused), the attempt
+      authority must be live, and hosted execution must be **paper**. A
+      ``dry_run`` hosted mutation is rejected; previews (which do not mutate) are
+      unaffected.
+
+    Returns ``(run, hosted_job)`` so callers can apply hosted-only payload rules.
     """
-    run = await _repo(request).get_run(strategy_run_id)
     hosted_job = await hosted_job_for_token(request, token)
+    if hosted_job is not None and required_action not in set(token.allowed_actions or []):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "rejection_reason": "HOSTED_OPERATION_NOT_PERMITTED",
+                "operation": operation,
+                "required_action": required_action,
+            },
+        )
+    run = await _repo(request).get_run(strategy_run_id)
     if hosted_job is not None:
         assert_hosted_run_binding(run, token)
         await enforce_hosted_attempt_authority(request, token, run)
+        if str(run.get("execution_mode") or "").lower() != "paper":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "rejection_reason": "HOSTED_OPTIONS_MUTATION_PAPER_ONLY",
+                    "execution_mode": str(run.get("execution_mode") or ""),
+                },
+            )
     if run is not None:
         await require_active_worker_run_session(request, run)
-    return run
+    return run, hosted_job
+
+
+def _reject_hosted_execution_injection(hosted_job, action_payload) -> None:
+    """Refuse caller-supplied execution results on the hosted path.
+
+    The hosted path must never let a child inject ``order_results``/
+    ``trade_results`` (the deterministic test seam) as if they were real fills.
+    External callers are unaffected.
+    """
+    if hosted_job is None:
+        return
+    if getattr(action_payload, "order_results", None) or getattr(action_payload, "trade_results", None):
+        raise HTTPException(
+            status_code=403,
+            detail={"rejection_reason": "HOSTED_EXECUTION_INJECTION_FORBIDDEN"},
+        )
 
 
 @router.get("/underlyings/{underlying}/session")
@@ -159,11 +203,28 @@ async def create_worker_option_run(
     hosted_job = await hosted_job_for_token(request, _token)
     if hosted_job is not None:
         # A hosted child may only create an options run pinned to the worker run
-        # bound to its attempt; an unbound or foreign id is refused.
+        # bound to its attempt, needs the trading action, and must be in paper.
+        if "intents:submit" not in set(_token.allowed_actions or []):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "rejection_reason": "HOSTED_OPERATION_NOT_PERMITTED",
+                    "operation": "options.create_run",
+                    "required_action": "intents:submit",
+                },
+            )
         requested = str(payload.strategy_run_id or "")
         run = await _repo(request).get_run(requested) if requested else None
         assert_hosted_run_binding(run, _token)
         await enforce_hosted_attempt_authority(request, _token, run)
+        if str(run.get("execution_mode") or "").lower() != "paper":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "rejection_reason": "HOSTED_OPTIONS_MUTATION_PAPER_ONLY",
+                    "execution_mode": str(run.get("execution_mode") or ""),
+                },
+            )
     return await create_option_run(payload, store)
 
 
@@ -187,8 +248,11 @@ async def enter_worker_option_run(
     store: OptionRunStore = Depends(get_option_run_store),
     runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
 ):
-    await _guard_options_mutation(request, _token, strategy_run_id)
+    _, hosted_job = await _guard_options_mutation(
+        request, _token, strategy_run_id, required_action="intents:submit", operation="options.enter"
+    )
     action_payload = payload or OptionRunActionRequest()
+    _reject_hosted_execution_injection(hosted_job, action_payload)
     if action_payload.safety_token:
         await validate_worker_run_safety_token(request, strategy_run_id, action_payload.safety_token)
     return await enter_option_run(
@@ -220,8 +284,11 @@ async def exit_worker_option_run(
     store: OptionRunStore = Depends(get_option_run_store),
     runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
 ):
-    await _guard_options_mutation(request, _token, strategy_run_id)
+    _, hosted_job = await _guard_options_mutation(
+        request, _token, strategy_run_id, required_action="intents:submit", operation="options.exit"
+    )
     action_payload = payload or OptionRunActionRequest()
+    _reject_hosted_execution_injection(hosted_job, action_payload)
     if action_payload.safety_token:
         await validate_worker_run_safety_token(request, strategy_run_id, action_payload.safety_token)
     return await exit_option_run(
@@ -249,7 +316,9 @@ async def update_worker_option_run_protection(
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
 ):
-    await _guard_options_mutation(request, _token, strategy_run_id)
+    await _guard_options_mutation(
+        request, _token, strategy_run_id, required_action="risk:update", operation="options.protection"
+    )
     return await update_option_run_protection(strategy_run_id, payload, store)
 
 
