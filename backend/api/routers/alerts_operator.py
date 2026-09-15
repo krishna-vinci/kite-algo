@@ -38,8 +38,8 @@ from backend.api.routers.worker_workflows import (
     _preview_evaluate,
     _validation_issues,
     _warning_issues,
+    capabilities_payload,
     serialize_channel,
-    workflow_capabilities,
 )
 from backend.api.routers.worker_notifications import build_test_destination
 from backend.api.schemas.workflows import (
@@ -152,12 +152,14 @@ async def operator_capabilities(
 ):
     """Everything the UI may offer, straight from the platform registry.
 
-    Delegates to the worker route's builder so the operator UI and the SDK see
-    the same declared limits, operators, timeframes and unsupported-feature
-    flags — the UI must never hard-code what the backend actually supports.
+    Uses the worker route's *builder* (``capabilities_payload``) rather than
+    calling the worker handler: that handler authorizes a worker bearer token,
+    which a browser session cannot present — delegating to it made the route
+    401 for an authenticated operator, which broke the entire authoring form
+    (it renders from these capabilities).
     """
-    _ = scope
-    return await workflow_capabilities(request)
+    _ = (request, scope)
+    return {"ok": True, "capabilities": capabilities_payload()}
 
 
 # ---------------------------------------------------------------------------

@@ -186,6 +186,27 @@ def test_every_route_requires_app_authentication(session_factory, monkeypatch):
         )
 
 
+def test_capabilities_render_for_an_authorized_operator(session_factory, monkeypatch):
+    """The authoring form renders from these capabilities, so the operator route
+    must serve them to a BROWSER session.
+
+    Regression: the route delegated to the worker handler, whose
+    ``workflows:read`` dependency requires a worker bearer token, so an
+    authenticated operator got 401 "Worker bearer token required" and the whole
+    new/edit alert form showed "Could not load capabilities".
+    """
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    response = client.get(f"{BASE}/capabilities")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    capabilities = body["capabilities"]
+    # The fields the form cannot work without.
+    for key in ("operators", "timeframes", "limits"):
+        assert key in capabilities, key
+    assert "crosses_above" in capabilities["operators"]
+
+
 def test_a_worker_token_is_not_accepted(session_factory, monkeypatch):
     """The operator surface is cookie-only; a bearer token must not open it."""
     client = _app(session_factory, monkeypatch=monkeypatch)
