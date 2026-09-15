@@ -461,6 +461,8 @@ preview = client.preview_order(
 
 Typed variants of the preview endpoints. They call the same raw preview methods, validate the response into an `OrderPreview` model, and **never submit orders** — the backend preview endpoints are dry-run only.
 
+`paper` remains the durable simulated execution mode: it keeps isolated orders, trades, positions, funds, grouped run P&L, and journal-visible strategy attribution under the selected paper account scope without calling broker write APIs.
+
 ```python
 from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient
 
