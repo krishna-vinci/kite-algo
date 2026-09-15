@@ -562,6 +562,41 @@ def test_create_then_activate_then_pause_resume_then_archive(session_factory, mo
     assert client.get(f"{BASE}/workflows/{workflow_id}").status_code == 200
 
 
+def test_pause_returns_the_revision_with_expiring_sessions(monkeypatch):
+    """Pause/resume must work when the session expires attributes on commit.
+
+    Regression (live only): the app's SessionLocal uses the default
+    ``expire_on_commit=True`` while every test factory disables it. ``_set_state``
+    read ``active.revision`` after the session block had closed, so Pause
+    returned 500 with DetachedInstanceError in the deployed stack.
+    """
+    from backend.workflows.repository import AlertSubscription  # noqa: F401
+
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    expiring = sessionmaker(bind=engine, expire_on_commit=True)  # production shape
+
+    client = _app(expiring, monkeypatch=monkeypatch)
+    created = client.post(
+        f"{BASE}/workflows", json={"document": DOCUMENT, "name": "expiring"}
+    ).json()
+    workflow_id = created["workflow_id"]
+    client.post(f"{BASE}/workflows/{workflow_id}/activate")
+
+    paused = client.post(f"{BASE}/workflows/{workflow_id}/pause")
+    assert paused.status_code == 200, paused.text
+    assert paused.json()["state"] == "paused"
+    assert paused.json()["revision"] == 1
+    resumed = client.post(f"{BASE}/workflows/{workflow_id}/resume")
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["state"] == "active"
+    engine.dispose()
+
+
 def test_revision_conflict_is_409_with_a_recoverable_shape(session_factory, monkeypatch):
     workflow, _revision = _seed_workflow(session_factory, OPERATOR_SCOPE, name="conflict")
     client = _app(session_factory, monkeypatch=monkeypatch)

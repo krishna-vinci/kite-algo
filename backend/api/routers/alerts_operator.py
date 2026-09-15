@@ -744,13 +744,17 @@ def _set_state(request: Request, workflow_id: str, scope: str, session_factory: 
             )
             .values(state=state)
         )
+        # Commit expires the instance on a default session, and the session is
+        # closed on exit: read the value while it is still attached.
+        revision_number = int(active.revision)
+        updated = int(result.rowcount or 0)
         session.commit()
     return {
         "ok": True,
         "workflow_id": workflow_id,
-        "revision": int(active.revision),
+        "revision": revision_number,
         "state": state,
-        "updated": int(result.rowcount or 0),
+        "updated": updated,
     }
 
 
