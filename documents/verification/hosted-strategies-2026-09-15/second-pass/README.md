@@ -17,6 +17,7 @@ in any image.
 | `07-candle-ready.png` | After the fetch: **READY** with "Fetched 2 symbol(s); 0 already had history (4.7s)". |
 | `08-partial-run-and-coverage.png` | The runs table distinguishing states in words: a `COMPLETE` run with "none met the qualification", a `PARTIAL` run citing the member that could not be scored, and a `FAILED` run naming its resolution failure — so a data gap never reads as an empty result. |
 | `09-quick-alert-narrow.png` | The same composer at 390×844: single column, no horizontal overflow (`scrollWidth == innerWidth`). |
+| `10-advanced-document-routes-to-editor.png` | A document the structured form does not model (an A-then-B sequence) opens the lossless YAML/JSON editor with "the text below IS the definition" instead of silently dropping the sequence. |
 
 Related live evidence not shown here (recorded in the slice report §13): the MCX
 universe warming 5/5 contracts in 2.8s and the screener ranking them by
