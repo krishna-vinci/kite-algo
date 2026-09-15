@@ -353,3 +353,16 @@ async def test_version_rejects_unknown_or_non_boolean_capabilities(session_facto
                 json={"source": "x", "capabilities": {"trade": "yes"}},
             )
         ).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_hosted_options_expose_only_authorized_account_scopes(session_factory, monkeypatch):
+    monkeypatch.setattr(strategies_router, "authorized_account_scopes", lambda: ["kite:paper"])
+    async with _client(session_factory, monkeypatch) as client:
+        response = await client.get("/api/strategies/options")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["account_scopes"] == ["kite:paper"]
+    assert set(body["execution_modes"]) == {"paper", "dry_run"}
+    assert "live" not in body["account_scopes"]
+    assert body["stale_exit_policies"]

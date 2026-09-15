@@ -779,11 +779,17 @@ notification history is available via `list_run_notifications(owner_id, run_id)`
 Additive migration `20260915_000023` adds `strategy_jobs.stop_requested_at/_by`
 and the bounded, redacted `strategy_job_logs` table.
 
+`GET /api/strategies/options` returns the **server-authorized** selection options
+(`account_scopes` from the `HOSTED_STRATEGY_ACCOUNT_SCOPES` allowlist, plus
+supported `execution_modes`, `job_kinds`, `stale_exit_policies`). The browser
+must not invent account choices.
+
 Endpoints (all app-cookie, origin-checked, owner-scoped, account-authorized;
 cross-owner ⇒ 404, cross-account ⇒ 403):
 
 | Step | Method / path |
 | --- | --- |
+| 0. Options | `GET /api/strategies/options` |
 | 1. List | `GET /api/strategies` |
 | 2. Register version | `POST /api/strategies/{id}/versions` |
 | 3. Configure | `POST /api/strategies` / `PATCH /api/strategies/{id}` |
@@ -891,7 +897,90 @@ is blocked (above).
 - **Execution-settlement barrier** (quiescence) — required before trading-capable
   reconciliation can clear a block.
 - **Cancel/Flatten adapters** — settling open exposure after a stop.
-- **Frontend implementation** — this section is the API handoff only.
+- **Frontend implementation** — delivered in §10 (list, versions, configure,
+  run now, job inspection, stop, logs, notifications, reconciliation).
 - **Scheduling loop**, **notification delivery in a real environment**, and a
   **deployment pass** (container build, real cross-UID run, delivered-signal
   shutdown) — none executed here.
+
+## 10. Frontend implementation (hosted strategies)
+
+Implemented in `frontend-next` using the existing conventions (App Router under
+`app/(app)/strategies`, `apiFetch`, TanStack Query, server-derived auth via the
+session cookie and `require_strategy_owner`, existing UI primitives).
+
+### 10.1 Files
+
+| Concern | Path |
+| --- | --- |
+| Types | `lib/hosted-strategies/types.ts` |
+| API wrappers | `lib/hosted-strategies/api.ts` |
+| Query keys / hooks | `features/strategies/hooks/keys.ts`, `features/strategies/hooks/use-hosted-strategies-queries.ts` |
+| List | `features/strategies/components/hosted-strategies-list-page.tsx` |
+| Detail (versions + configure + run now + jobs) | `features/strategies/components/hosted-strategy-detail-page.tsx` |
+| Job (state, stop, logs, notifications, reconciliation) | `features/strategies/components/hosted-job-detail-page.tsx` |
+| Routes | `app/(app)/strategies/page.tsx`, `app/(app)/strategies/[strategyId]/page.tsx`, `app/(app)/strategies/[strategyId]/jobs/[jobId]/page.tsx` |
+| Helpers | `features/strategies/lib/format.ts`, `features/strategies/lib/params.ts` |
+
+### 10.2 User flows
+
+- **List / enable / disable** — `GET /api/strategies`; `PATCH` toggles
+  `status`. Disabling stops *new* attempts only.
+- **Register version** — Python source + JSON-Schema parameters + `data|trade|notify`
+  capabilities → `POST …/versions`; versions are immutable and shown with their
+  pinned SHA-256.
+- **Configure** — account scope, mode, job kind and stale-exit policy are chosen
+  from `GET /api/strategies/options` only; no hardcoded account list.
+- **Run now** — an **idempotency key is generated per launch** (`New key` for a
+  genuinely new launch; retries reuse it). The success toast/alert says
+  **"Queued — the process has not started yet"**; a replay is labelled as a
+  replay. Params are entered as JSON and validated server-side.
+- **Job detail** — status, desired state, attempt, run id, replacement block,
+  process-cleanup state and stop state. The job query polls while the attempt is
+  `queued|starting|running|fencing`.
+- **Stop** — targets the current attempt identity; the UI shows the API's
+  `requested` / `stopping` / `confirmed` / `cleanup_unresolved` distinction and
+  states plainly that **Stop does not cancel orders or flatten**.
+- **Logs** — paginated by `after_seq`, with an explicit **unavailable** notice
+  (not "no output") and a **truncation** alert that reflects persisted discard;
+  `source: post_termination` is shown.
+- **Notifications** — event/delivery status with per-attempt history; the copy
+  states provider acceptance ≠ confirmed receipt.
+- **Reconciliation** — inspection (case, reason, blocking reasons, raw evidence,
+  history) and the existing action. An `EXECUTION_QUIESCENCE_UNVERIFIED` block is
+  rendered as **not dismissible** and disables the action; only `unlaunched` /
+  `data_only_completed` attempts can be reconciled.
+
+### 10.3 Product semantics encoded in the UI
+
+- Run-now success = **queued**, not started.
+- Stop ≠ cancel orders / flatten.
+- Unknown cleanup = **not** confirmed stopped.
+- `EXECUTION_QUIESCENCE_UNVERIFIED` is a genuine block.
+- Data-only reconciliation is supported; trading reconciliation stays blocked.
+- Provider acceptance ≠ notification receipt.
+- Paper / dry-run limitations are shown; live trading is not advertised.
+
+### 10.4 Verification
+
+- `npm run typecheck` (tsc `--noEmit`) → clean.
+- `npx eslint features/strategies lib/hosted-strategies "app/(app)/strategies"` → clean.
+- `npm run build` → succeeds; routes `/strategies`, `/strategies/[strategyId]`,
+  `/strategies/[strategyId]/jobs/[jobId]` are emitted.
+- `npx vitest run features/strategies` → **13 passed** (list scoping + toggle,
+  job cleanup-unresolved + truncation + non-dismissible quiescence, format and
+  params helpers).
+- Note: this environment exports `NODE_ENV=production`, which removes `React.act`
+  and makes every `@testing-library/react` render test fail (`React.act is not a
+  function`) — pre-existing for other suites too. Run browser tests with
+  `NODE_ENV=test` (used above). No repo config was changed for this.
+
+### 10.5 Remaining restrictions vs. deployment prerequisites
+
+Still **restrictions** (v1 product scope): no scheduling UI, no Cancel/Flatten,
+no live trading, trading-capable reconciliation blocked, `NODE_ENV`-independent
+real-provider notification delivery not exercised.
+
+Still **deployment prerequisites**: backend container build, a real cross-UID
+child run, delivered-signal shutdown, real notification delivery in an
+environment, and the execution-settlement barrier.

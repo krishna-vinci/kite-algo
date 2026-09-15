@@ -30,6 +30,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from backend.api.schemas.strategies import (
+    HostedStrategyOptionsResponse,
     JobDetailResponse,
     JobListResponse,
     JobSummaryResponse,
@@ -59,6 +60,7 @@ from backend.api.schemas.strategies import (
 from backend.api.services.csrf import enforce_same_origin
 from backend.api.services.hosted_strategy_authz import (
     authorize_account_scope,
+    authorized_account_scopes,
     is_account_authorized,
 )
 from backend.app.auth import AppUser, require_app_user
@@ -278,6 +280,21 @@ async def list_strategies(
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
 ):
     return StrategyListResponse(strategies=[_strategy_out(row) for row in repo.list_strategies(owner)])
+
+
+@router.get("/options", response_model=HostedStrategyOptionsResponse)
+async def get_hosted_options(owner: str = Depends(require_strategy_owner)):
+    """Server-authorized selection options for configuring a hosted strategy.
+
+    Account scopes come from the server allowlist (`HOSTED_STRATEGY_ACCOUNT_SCOPES`,
+    default-deny) — the browser never invents them.
+    """
+    return HostedStrategyOptionsResponse(
+        account_scopes=authorized_account_scopes(),
+        execution_modes=list(service.ALLOWED_EXECUTION_MODES),
+        job_kinds=list(service.ALLOWED_JOB_KINDS),
+        stale_exit_policies=list(service.ALLOWED_STALE_EXIT_POLICIES),
+    )
 
 
 @router.get("/{strategy_id}", response_model=StrategyResponse)

@@ -318,3 +318,20 @@ class JobLogsResponse(BaseModel):
     next_seq: int = 0
     entries: List[JobLogEntryResponse] = Field(default_factory=list)
     notice: str = ""
+
+
+class HostedStrategyOptionsResponse(BaseModel):
+    """Server-authorized choices for configuring a hosted strategy.
+
+    The browser must never hardcode or invent account choices: this returns only
+    the account scopes the server will actually authorize, plus the supported
+    modes, job kinds and policies.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    account_scopes: List[str] = Field(default_factory=list)
+    execution_modes: List[str] = Field(default_factory=list)
+    job_kinds: List[str] = Field(default_factory=list)
+    stale_exit_policies: List[str] = Field(default_factory=list)
+    hosted_execution_only: bool = True
