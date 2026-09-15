@@ -65,6 +65,7 @@ __all__ = [
     "prepare_launch",
     "release",
     "fence",
+    "report_process_cleanup",
     "require_job_authority",
 ]
 
@@ -720,6 +721,8 @@ async def job_state(
         "handoff_at": _as_utc(job.handoff_at).isoformat() if job.handoff_at else None,
         "last_progress_at": _as_utc(job.last_progress_at).isoformat() if job.last_progress_at else None,
         "progress_deadline_s": int(job.progress_deadline_s),
+        "process_cleanup_state": job.process_cleanup_state,
+        "process_cleanup_at": _as_utc(job.process_cleanup_at).isoformat() if job.process_cleanup_at else None,
         "run_status": run_status,
     }
 
@@ -777,4 +780,58 @@ async def job_source(
         "version": int(version.version),
         "source": version.source,
         "source_sha256": version.source_sha256,
+    }
+
+
+async def report_process_cleanup(
+    *,
+    strategy_repo: SqlAlchemyStrategyRepository,
+    job_id: str,
+    lease_owner: str,
+    lease_epoch: int,
+    attempt: int,
+    state: str,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record supervisor-owned process-cleanup evidence, bound to the attempt.
+
+    Only the authenticated supervisor reaches this (the child has no lifecycle
+    credential), so it cannot forge cleanup evidence. Authority is the same
+    lease/attempt identity, allowing a report after the attempt has been fenced
+    (the lease owner/epoch/attempt are retained as attribution).
+    """
+    if state not in ("confirmed", "unresolved"):
+        raise HostedLifecycleError(422, "HOSTED_PROCESS_CLEANUP_STATE_INVALID")
+    job = await asyncio.to_thread(strategy_repo.get_job_by_id, job_id)
+    job = require_job_authority(
+        job,
+        lease_owner=lease_owner,
+        lease_epoch=lease_epoch,
+        attempt=attempt,
+        allow_statuses=(
+            "starting",
+            "running",
+            "fencing",
+            "recovery_required",
+            "stopped",
+            "failed",
+            "hung",
+        ),
+        require_live_lease=False,
+        require_started=False,
+    )
+    recorded = await asyncio.to_thread(
+        strategy_repo.report_process_cleanup,
+        job_id,
+        state=state,
+        actor=lease_owner,
+        expected_attempt=int(attempt),
+    )
+    if not recorded:
+        raise HostedLifecycleError(409, "HOSTED_PROCESS_CLEANUP_REFUSED")
+    return {
+        "job_id": job_id,
+        "attempt": int(attempt),
+        "process_cleanup_state": state,
+        "note": (str(note)[:200] if note else None),
     }

@@ -138,6 +138,10 @@ def new_job_id() -> str:
     return f"hsj_{uuid.uuid4().hex}"
 
 
+def new_reconciliation_id() -> str:
+    return f"hsr_{uuid.uuid4().hex}"
+
+
 def template_id_for(strategy_id: str) -> str:
     """The worker ``template_id`` for a hosted strategy.
 

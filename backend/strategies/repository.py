@@ -41,6 +41,7 @@ from backend.strategies.models import (
     HostedStrategySchedule,
     HostedStrategyVersion,
     StrategyJob,
+    StrategyJobReconciliation,
 )
 from backend.strategies import service
 
@@ -400,6 +401,124 @@ class SqlAlchemyStrategyRepository:
                     StrategyJob.id == job_id, StrategyJob.owner_id == owner_id
                 )
             ).scalar_one_or_none()
+        finally:
+            session.close()
+
+    def list_jobs_for_strategy(
+        self, owner_id: str, strategy_id: str, *, limit: int = 50
+    ) -> List[StrategyJob]:
+        capped = max(1, min(int(limit), 200))
+        session = self._session()
+        try:
+            return list(
+                session.execute(
+                    select(StrategyJob)
+                    .where(
+                        StrategyJob.owner_id == owner_id,
+                        StrategyJob.strategy_id == strategy_id,
+                    )
+                    .order_by(StrategyJob.created_at.desc(), StrategyJob.id.desc())
+                    .limit(capped)
+                ).scalars()
+            )
+        finally:
+            session.close()
+
+    # -- reconciliation evidence + audit ------------------------------------
+
+    def report_process_cleanup(
+        self,
+        job_id: str,
+        *,
+        state: str,
+        actor: str,
+        expected_attempt: int,
+    ) -> bool:
+        """Record supervisor-reported process cleanup, bound to the attempt.
+
+        Only the supervisor lifecycle API calls this; the update matches the
+        immutable ``attempt`` so a report can never apply to a different attempt.
+        """
+        if state not in ("confirmed", "unresolved"):
+            raise service.StrategyValidationError("process cleanup state must be confirmed/unresolved")
+        session = self._session()
+        try:
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    StrategyJob.id == job_id,
+                    StrategyJob.attempt == expected_attempt,
+                    StrategyJob.status.notin_(("queued",)),
+                )
+                .values(
+                    process_cleanup_state=state,
+                    process_cleanup_at=_utcnow(),
+                    process_cleanup_actor=str(actor)[:200],
+                    updated_at=_utcnow(),
+                )
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def record_reconciliation(
+        self,
+        *,
+        job_id: str,
+        strategy_id: str,
+        owner_id: str,
+        attempt: int,
+        run_id: Optional[str],
+        outcome: str,
+        reason_code: str,
+        evidence: Dict[str, Any],
+        actor_id: str,
+    ) -> StrategyJobReconciliation:
+        """Append an audit row. Never updates or overwrites prior history."""
+        session = self._session()
+        try:
+            row = StrategyJobReconciliation(
+                id=service.new_reconciliation_id(),
+                job_id=job_id,
+                strategy_id=strategy_id,
+                owner_id=owner_id,
+                attempt=int(attempt),
+                run_id=run_id,
+                outcome=outcome,
+                reason_code=reason_code,
+                evidence_json=copy.deepcopy(dict(evidence or {})),
+                actor_id=actor_id,
+            )
+            session.add(row)
+            session.commit()
+            return row
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def list_reconciliations(
+        self, job_id: str, *, limit: int = 50
+    ) -> List[StrategyJobReconciliation]:
+        capped = max(1, min(int(limit), 200))
+        session = self._session()
+        try:
+            return list(
+                session.execute(
+                    select(StrategyJobReconciliation)
+                    .where(StrategyJobReconciliation.job_id == job_id)
+                    .order_by(
+                        StrategyJobReconciliation.created_at.desc(),
+                        StrategyJobReconciliation.id.desc(),
+                    )
+                    .limit(capped)
+                ).scalars()
+            )
         finally:
             session.close()
 

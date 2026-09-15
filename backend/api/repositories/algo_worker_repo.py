@@ -165,6 +165,14 @@ class SqlAlchemyAlgoWorkerRepository:
     async def get_token_by_hash(self, token_hash: str) -> Optional[WorkerToken]:
         return await asyncio.to_thread(self._get_token_by_hash_sync, token_hash)
 
+    async def get_token_status(self, token_id: str) -> Optional[str]:
+        """Token status by id (for reconciliation authority evidence).
+
+        Returns ``None`` when the token does not exist (e.g. it was never minted),
+        which callers treat as "no active credential" rather than "unknown".
+        """
+        return await asyncio.to_thread(self._get_token_status_sync, token_id)
+
     async def touch_token(self, token_id: str) -> None:
         await asyncio.to_thread(self._touch_token_sync, token_id)
 
@@ -488,6 +496,17 @@ class SqlAlchemyAlgoWorkerRepository:
                 status=str(payload.get("status") or "active"),
                 expires_at=payload.get("expires_at"),
             )
+        finally:
+            db.close()
+
+    def _get_token_status_sync(self, token_id: str) -> Optional[str]:
+        db = self.session_factory()
+        try:
+            row = db.execute(
+                text("SELECT status FROM public.algo_worker_tokens WHERE token_id = :token_id"),
+                {"token_id": token_id},
+            ).fetchone()
+            return str(row[0]) if row else None
         finally:
             db.close()
 

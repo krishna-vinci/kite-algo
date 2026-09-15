@@ -227,6 +227,13 @@ class StrategyJob(Base):
     #: credential. ``NULL`` means the handoff is still uncertain (or never ran).
     handoff_at = Column(DateTime(timezone=True), nullable=True)
     last_error = Column(Text, nullable=True)
+    #: Supervisor-reported process-cleanup evidence, bound to this attempt.
+    #: ``None`` = unknown/unreported, ``confirmed`` = the supervisor proved the
+    #: child process group is gone, ``unresolved`` = it could not. Only the
+    #: supervisor lifecycle API (never the child) writes these.
+    process_cleanup_state = Column(Text, nullable=True)
+    process_cleanup_at = Column(DateTime(timezone=True), nullable=True)
+    process_cleanup_actor = Column(Text, nullable=True)
     recovery_required_at = Column(DateTime(timezone=True), nullable=True)
     reconciled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -263,8 +270,46 @@ class StrategyJob(Base):
             "'recovery_required', 'stopped', 'failed', 'hung')",
             name="ck_strategy_jobs_status",
         ),
+        CheckConstraint(
+            "process_cleanup_state IS NULL OR process_cleanup_state IN ('confirmed', 'unresolved')",
+            name="ck_strategy_jobs_process_cleanup_state",
+        ),
         Index("idx_strategy_jobs_lease", "status", "lease_until"),
         Index("idx_strategy_jobs_owner_strategy", "owner_id", "strategy_id"),
+    )
+
+
+class StrategyJobReconciliation(Base):
+    """Append-only audit of operator reconciliation attempts and evidence.
+
+    History is never overwritten: every inspection-driven action writes a row
+    with the evidence snapshot, the outcome and the server-derived actor. A job's
+    block is cleared only when server-side evidence supports it.
+    """
+
+    __tablename__ = "strategy_job_reconciliations"
+
+    id = Column(Text, primary_key=True)
+    job_id = Column(
+        Text, ForeignKey("strategy_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    strategy_id = Column(Text, nullable=False)
+    owner_id = Column(Text, nullable=False)
+    attempt = Column(Integer, nullable=False)
+    run_id = Column(Text, nullable=True)
+    outcome = Column(Text, nullable=False)
+    reason_code = Column(Text, nullable=False)
+    evidence_json = Column(JSON, nullable=False, default=dict)
+    actor_id = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('reconciled', 'blocked')",
+            name="ck_strategy_job_reconciliations_outcome",
+        ),
+        CheckConstraint("attempt > 0", name="ck_strategy_job_reconciliations_attempt"),
+        Index("idx_strategy_job_reconciliations_job", "job_id", "created_at"),
     )
 
 
@@ -273,4 +318,5 @@ __all__ = [
     "HostedStrategySchedule",
     "HostedStrategyVersion",
     "StrategyJob",
+    "StrategyJobReconciliation",
 ]

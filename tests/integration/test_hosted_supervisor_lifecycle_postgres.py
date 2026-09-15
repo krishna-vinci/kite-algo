@@ -366,3 +366,87 @@ def test_racing_recover_fences_once(env):
     assert len(results) == 1
     assert len(errors) == 1
     assert repo.get_job(OWNER, job.id).status == "recovery_required"
+
+
+def test_concurrent_reconcile_and_replacement(env):
+    factory, _engine = env
+    repo, job = _seed_job(factory)
+    assert repo.mark_recovery_required(
+        job.id, lease_owner="sup-A", expected_lease_epoch=1, expected_attempt=1
+    )
+
+    # Replacement is blocked while unreconciled.
+    with pytest.raises(StrategyFenceError):
+        repo.create_job(
+            strategy_id=job.strategy_id,
+            version_id=job.version_id,
+            owner_id=OWNER,
+            job_kind="finite",
+            execution_mode="paper",
+            params={},
+            attempt=2,
+        )
+
+    outcomes = []
+    barrier = threading.Barrier(2)
+
+    def _reconcile():
+        barrier.wait(timeout=10)
+        outcomes.append(
+            repo.reconcile_recovery(
+                job.id, owner_id=OWNER, expected_lease_epoch=1, expected_attempt=1
+            )
+        )
+
+    threads = [threading.Thread(target=_reconcile) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    # Exactly one reconciliation clears the block; the other CAS loses.
+    assert sorted(outcomes) == [False, True]
+    assert repo.get_job(OWNER, job.id).status == "stopped"
+    new_job = repo.create_job(
+        strategy_id=job.strategy_id,
+        version_id=job.version_id,
+        owner_id=OWNER,
+        job_kind="finite",
+        execution_mode="paper",
+        params={},
+        attempt=2,
+    )
+    assert new_job.id != job.id
+
+
+def test_reconciliation_audit_is_append_only(env):
+    factory, _engine = env
+    repo, job = _seed_job(factory)
+    assert repo.mark_recovery_required(
+        job.id, lease_owner="sup-A", expected_lease_epoch=1, expected_attempt=1
+    )
+    repo.record_reconciliation(
+        job_id=job.id,
+        strategy_id=job.strategy_id,
+        owner_id=OWNER,
+        attempt=1,
+        run_id=job.run_id,
+        outcome="blocked",
+        reason_code="OPEN_EXPOSURE",
+        evidence={"exposure_state": "open"},
+        actor_id=OWNER,
+    )
+    repo.record_reconciliation(
+        job_id=job.id,
+        strategy_id=job.strategy_id,
+        owner_id=OWNER,
+        attempt=1,
+        run_id=job.run_id,
+        outcome="reconciled",
+        reason_code="TRADING_SETTLED_FLAT",
+        evidence={"exposure_state": "flat"},
+        actor_id=OWNER,
+    )
+    history = repo.list_reconciliations(job.id)
+    assert [row.outcome for row in history] == ["reconciled", "blocked"]  # newest first
+    assert {row.actor_id for row in history} == {OWNER}

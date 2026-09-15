@@ -30,6 +30,14 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from backend.api.schemas.strategies import (
+    JobDetailResponse,
+    JobListResponse,
+    JobSummaryResponse,
+    ReconciliationActionRequest,
+    ReconciliationActionResponse,
+    ReconciliationAuditResponse,
+    ReconciliationAssessmentResponse,
+    ReconciliationInspectionResponse,
     StrategyCreateRequest,
     StrategyListResponse,
     StrategyResponse,
@@ -39,9 +47,13 @@ from backend.api.schemas.strategies import (
     VersionResponse,
 )
 from backend.api.services.csrf import enforce_same_origin
-from backend.api.services.hosted_strategy_authz import authorize_account_scope
+from backend.api.services.hosted_strategy_authz import (
+    authorize_account_scope,
+    is_account_authorized,
+)
 from backend.app.auth import AppUser, require_app_user
 from backend.strategies import service
+from backend.strategies.reconciliation import assess
 from backend.strategies.repository import (
     SqlAlchemyStrategyRepository,
     StrategyConflict,
@@ -128,6 +140,69 @@ def _owned_strategy(repo: SqlAlchemyStrategyRepository, owner: str, strategy_id:
         # Foreign and missing are indistinguishable on purpose.
         raise HTTPException(status_code=404, detail="Strategy not found")
     return row
+
+
+def _collector(request: Request):
+    """Reconciliation evidence collector (injectable; reuses worker services)."""
+    collector = getattr(request.app.state, "reconciliation_collector", None)
+    if collector is not None:
+        return collector
+    from backend.api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository
+    from backend.strategies.reconciliation_service import ReconciliationEvidenceCollector
+
+    worker = getattr(request.app.state, "algo_worker_repository", None) or SqlAlchemyAlgoWorkerRepository()
+    paper = getattr(request.app.state, "paper_runtime_service", None)
+    return ReconciliationEvidenceCollector(worker_repo=worker, paper_runtime=paper)
+
+
+def _job_replacement_blocked(job: Any) -> bool:
+    status = str(job.status or "")
+    if status in {"queued", "starting", "running"}:
+        return True
+    return status == "recovery_required" and job.reconciled_at is None
+
+
+def _job_summary(job: Any) -> JobSummaryResponse:
+    return JobSummaryResponse(
+        job_id=job.id,
+        strategy_id=job.strategy_id,
+        owner_id=job.owner_id,
+        attempt=int(job.attempt),
+        status=job.status,
+        desired_state=job.desired_state,
+        execution_mode=job.execution_mode,
+        account_scope=job.account_scope,
+        run_id=job.run_id,
+        replacement_blocked=_job_replacement_blocked(job),
+        recovery_required_at=_iso(job.recovery_required_at),
+        reconciled_at=_iso(job.reconciled_at),
+        created_at=_iso(job.created_at),
+        updated_at=_iso(job.updated_at),
+    )
+
+
+def _authorized_job(repo: SqlAlchemyStrategyRepository, owner: str, strategy_id: str, job_id: str):
+    """Owner-scoped, then account-authorized. Cross-owner ⇒ 404; cross-account ⇒ 403."""
+    _owned_strategy(repo, owner, strategy_id)
+    job = repo.get_job(owner, job_id)
+    if job is None or job.strategy_id != strategy_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # Re-authorize the job's pinned account for the operator's environment.
+    authorize_account_scope(str(job.account_scope))
+    return job
+
+
+def _audit_out(row: Any) -> ReconciliationAuditResponse:
+    return ReconciliationAuditResponse(
+        id=row.id,
+        attempt=int(row.attempt),
+        outcome=row.outcome,
+        reason_code=row.reason_code,
+        actor_id=row.actor_id,
+        run_id=row.run_id,
+        evidence=dict(row.evidence_json or {}),
+        created_at=_iso(row.created_at),
+    )
 
 
 @router.post("", response_model=StrategyResponse)
@@ -269,3 +344,180 @@ async def get_version(
     if row is None:
         raise HTTPException(status_code=404, detail="Version not found")
     return _version_out(row)
+
+
+# ---------------------------------------------------------------------------
+# jobs + operator reconciliation
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{strategy_id}/jobs", response_model=JobListResponse)
+async def list_jobs(
+    strategy_id: str,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Owner-scoped job list. Account-unauthorized jobs are omitted, not leaked."""
+    _owned_strategy(repo, owner, strategy_id)
+    jobs = [job for job in repo.list_jobs_for_strategy(owner, strategy_id) if is_account_authorized(str(job.account_scope))]
+    return JobListResponse(jobs=[_job_summary(job) for job in jobs])
+
+
+@router.get("/{strategy_id}/jobs/{job_id}", response_model=JobDetailResponse)
+async def get_job(
+    strategy_id: str,
+    job_id: str,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    job = _authorized_job(repo, owner, strategy_id, job_id)
+    base = _job_summary(job)
+    return JobDetailResponse(
+        **base.model_dump(),
+        handoff_at=_iso(job.handoff_at),
+        process_cleanup_state=job.process_cleanup_state,
+        process_cleanup_at=_iso(job.process_cleanup_at),
+        process_cleanup_actor=job.process_cleanup_actor,
+        last_progress_at=_iso(job.last_progress_at),
+        version_id=job.version_id,
+        token_present=bool(job.token_id),
+    )
+
+
+@router.get(
+    "/{strategy_id}/jobs/{job_id}/reconciliation",
+    response_model=ReconciliationInspectionResponse,
+)
+async def inspect_reconciliation(
+    strategy_id: str,
+    job_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Inspect why replacement is blocked and whether evidence supports clearing it."""
+    job = _authorized_job(repo, owner, strategy_id, job_id)
+    evidence = await _collector(request).collect(job)
+    assessment = assess(evidence)
+    history = repo.list_reconciliations(job_id)
+    return ReconciliationInspectionResponse(
+        job_id=job.id,
+        strategy_id=job.strategy_id,
+        attempt=int(job.attempt),
+        replacement_blocked=_job_replacement_blocked(job),
+        assessment=ReconciliationAssessmentResponse(**assessment.to_dict()),
+        evidence=evidence.to_dict(),
+        history=[_audit_out(row) for row in history],
+    )
+
+
+@router.post(
+    "/{strategy_id}/jobs/{job_id}/reconciliation",
+    response_model=ReconciliationActionResponse,
+)
+async def reconcile_job(
+    strategy_id: str,
+    job_id: str,
+    request: Request,
+    payload: ReconciliationActionRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Explicitly reconcile a blocked attempt against immutable identity.
+
+    The server alone decides whether evidence supports unblocking; a
+    caller-provided ``flat``/``reconciled`` assertion is not accepted. The
+    request pins the attempt (and optionally the lease epoch) so a stale request
+    is refused.
+    """
+    enforce_same_origin(request)
+    job = _authorized_job(repo, owner, strategy_id, job_id)
+
+    if int(job.attempt) != int(payload.attempt):
+        raise HTTPException(
+            status_code=409,
+            detail={"rejection_reason": "STALE_ATTEMPT", "current_attempt": int(job.attempt)},
+        )
+    if payload.lease_epoch is not None and int(job.lease_epoch) != int(payload.lease_epoch):
+        raise HTTPException(
+            status_code=409,
+            detail={"rejection_reason": "STALE_LEASE_EPOCH", "current_lease_epoch": int(job.lease_epoch)},
+        )
+
+    evidence = await _collector(request).collect(job)
+    assessment = assess(evidence)
+
+    if not assessment.allowed:
+        audit = repo.record_reconciliation(
+            job_id=job.id,
+            strategy_id=job.strategy_id,
+            owner_id=owner,
+            attempt=int(job.attempt),
+            run_id=job.run_id,
+            outcome="blocked",
+            reason_code=assessment.reason_code,
+            evidence=evidence.to_dict(),
+            actor_id=owner,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": assessment.reason_code,
+                "case": assessment.case,
+                "blocking_reasons": assessment.blocking_reasons,
+                "notes": assessment.notes,
+                "evidence": evidence.to_dict(),
+                "audit_id": audit.id,
+            },
+        )
+
+    # Serialized with job creation via the strategy row lock inside the repo.
+    reconciled = repo.reconcile_recovery(
+        job.id,
+        owner_id=owner,
+        expected_lease_epoch=int(job.lease_epoch),
+        expected_attempt=int(job.attempt),
+    )
+    if not reconciled:
+        audit = repo.record_reconciliation(
+            job_id=job.id,
+            strategy_id=job.strategy_id,
+            owner_id=owner,
+            attempt=int(job.attempt),
+            run_id=job.run_id,
+            outcome="blocked",
+            reason_code="RECONCILE_RACE_LOST",
+            evidence=evidence.to_dict(),
+            actor_id=owner,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "RECONCILE_RACE_LOST",
+                "message": "attempt state changed; re-inspect before reconciling",
+                "audit_id": audit.id,
+            },
+        )
+
+    audit = repo.record_reconciliation(
+        job_id=job.id,
+        strategy_id=job.strategy_id,
+        owner_id=owner,
+        attempt=int(job.attempt),
+        run_id=job.run_id,
+        outcome="reconciled",
+        reason_code=assessment.reason_code,
+        evidence=evidence.to_dict(),
+        actor_id=owner,
+    )
+    return ReconciliationActionResponse(
+        status="reconciled",
+        job_id=job.id,
+        attempt=int(job.attempt),
+        case=assessment.case,
+        reason_code=assessment.reason_code,
+        replacement_blocked=False,
+        blocking_reasons=[],
+        evidence=evidence.to_dict(),
+        audit_id=audit.id,
+    )

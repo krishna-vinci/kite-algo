@@ -405,3 +405,42 @@ async def test_recover_expired_lease_at_boundary(harness):
         )
         assert refused.status_code == 409
         assert refused.json()["detail"]["rejection_reason"] == "HOSTED_LEASE_STILL_LIVE"
+
+
+@pytest.mark.asyncio
+async def test_process_cleanup_evidence_is_attempt_bound(harness):
+    repo, _worker, app = harness
+    job = _queued_job(repo)
+    async with _client(app) as client:
+        await _claim(client, job)
+        await client.post(f"{BASE}/jobs/{job.id}/prepare", json=_authority(epoch=1), headers=_headers())
+
+        body = {**_authority(epoch=1), "state": "confirmed"}
+        recorded = await client.post(
+            f"{BASE}/jobs/{job.id}/process-cleanup", json=body, headers=_headers()
+        )
+        assert recorded.status_code == 200, recorded.text
+        assert recorded.json()["process_cleanup_state"] == "confirmed"
+
+        state = await client.get(
+            f"{BASE}/jobs/{job.id}",
+            params={"lease_owner": "sup-A", "lease_epoch": 1, "attempt": 1},
+            headers=_headers(),
+        )
+        assert state.json()["process_cleanup_state"] == "confirmed"
+
+        # A stale attempt cannot attach cleanup evidence.
+        stale = await client.post(
+            f"{BASE}/jobs/{job.id}/process-cleanup",
+            json={"lease_owner": "sup-A", "lease_epoch": 1, "attempt": 2, "state": "confirmed"},
+            headers=_headers(),
+        )
+        assert stale.status_code == 403
+
+        # A child worker token cannot forge supervisor cleanup evidence.
+        forged = await client.post(
+            f"{BASE}/jobs/{job.id}/process-cleanup",
+            json=body,
+            headers={"Authorization": "Bearer kwa_child"},
+        )
+        assert forged.status_code == 401

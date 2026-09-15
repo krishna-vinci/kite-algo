@@ -2,11 +2,12 @@
 
 **Base:** `c666343` (hosted-strategy schema + authorization foundation).
 **Closed on:** lifecycle-closure fixes on `f58333b`, the process-supervision slice
-on `5e3078e`, and the supervision closure corrections on `d83e79c` (§1.9). This
-revision corrects the earlier report's baseline evidence (§3).
+on `5e3078e`, the supervision closure corrections on `d83e79c`, and the operator
+reconciliation backend on `9b5bbad` + this commit (§1.10). This revision corrects
+the earlier report's baseline evidence (§3).
 **Scope:** supervisor lifecycle API, worker-run/session integration, child
-credential handoff, hosted-attempt enforcement, SDK attach-only, and the
-dedicated supervisor process.
+credential handoff, hosted-attempt enforcement, SDK attach-only, the dedicated
+supervisor process, and the operator reconciliation backend.
 
 Slices 0–1 implement **preparation only**. This slice (process supervision) adds
 a runner that *claims, prepares, spawns, supervises and stops* one child, but
@@ -255,6 +256,45 @@ Modules: `backend/strategies/supervisor_api.py` (stdlib HTTP client, no DB),
   transport errors preserve the ``cleanup_required`` record for retry. CLI exit
   codes: ``0`` success/idle, ``2`` unresolved cleanup or ``api_unreachable``.
 
+### 1.10 Operator reconciliation backend (this slice)
+
+Additive migration `20260915_000021` adds ``strategy_jobs.process_cleanup_state``
+/ ``_at`` / ``_actor`` (supervisor-reported, attempt-bound) and the append-only
+``strategy_job_reconciliations`` audit table. No existing table is altered
+destructively.
+
+- **Authenticated cleanup evidence.** New lifecycle route
+  ``POST /hosted-supervisor/jobs/{id}/process-cleanup`` (supervisor credential
+  only; a child run token is refused 401) records ``confirmed``/``unresolved``
+  bound to the attempt. The supervisor reports it after every stop and during
+  restart recovery. The child cannot forge it.
+- **Operator surface (app-cookie, owner-scoped, origin-checked).**
+  ``GET .../{strategy_id}/jobs``, ``GET .../jobs/{job_id}``,
+  ``GET .../jobs/{job_id}/reconciliation`` (assessment + evidence + history),
+  ``POST .../jobs/{job_id}/reconciliation`` (attempt-bound action). Cross-owner ⇒
+  404; cross-account ⇒ 403; account-unauthorized jobs are omitted from lists.
+- **No caller assertion.** The action accepts only ``attempt`` (and optionally
+  ``lease_epoch``) for staleness — there is no ``flat=true``/``reconciled=true``
+  input. The server classifies persisted evidence; a terminal job label alone
+  never unblocks.
+- **Evidence axes** (examples and status meanings in §8): process cleanup,
+  authority, work, exposure, protection, availability. Any unavailable source ⇒
+  ``EVIDENCE_UNAVAILABLE`` (blocked).
+- **Cases.** (1) ``unlaunched`` — no handoff, no work; (2) ``data_only_completed``
+  — no trading capability/work, cleanup established; (3) ``trading_settled_flat``
+  — cleanup confirmed, work settled, exposure flat, authority revoked;
+  (4) ``blocked`` otherwise (open exposure, outstanding/unknown work, unknown/
+  unresolved cleanup, active/uncertain authority, pending recovery, unavailable
+  evidence, or an active job).
+- **Races.** Action pins the attempt; ``reconcile_recovery`` CAS-matches
+  lease-epoch/attempt and locks the strategy row, so it serializes with
+  ``create_job`` (tested on PostgreSQL). A new attempt gets a new run/token; the
+  old attempt is never revived. History is append-only and never overwritten.
+- **Reuses existing services** (worker-run repo, paper runtime, protection/
+  recovery state) — no second position or execution ledger.
+- **Excluded:** Cancel/Flatten execution. Open exposure is reported as a blocking
+  reason (``OPEN_EXPOSURE``) and the frontend shows why reconciliation is blocked.
+
 ---
 
 ## 2. Authentication / configuration
@@ -284,7 +324,7 @@ Targeted suites (SQLite):
   tests/api/test_hosted_lifecycle_api.py \
   tests/api/test_hosted_child_authority.py \
   tests/sdk -q
-→ 569 passed, 2 skipped
+→ 603 passed, 2 skipped
 ```
 
 Disposable PostgreSQL (real concurrency; own invocation):
@@ -294,11 +334,10 @@ HOSTED_FOUNDATION_PG_URL='postgresql://postgres:testonly@127.0.0.1:15433/kite_te
   .venv/bin/python -m pytest \
     tests/integration/test_hosted_supervisor_lifecycle_postgres.py \
     tests/integration/test_hosted_strategy_foundation_postgres.py -q
-→ 14 passed       # concurrent prepare ⇒ one credential/run; reservation CAS one winner;
-                  # launched release blocks replacement; racing recover one fence; chain applies
+→ 16 passed       # + concurrent reconcile-and-replacement one winner; append-only audit ordering
 ```
 
-`alembic heads` → single head `20260915_000020`. `git diff --check` clean.
+`alembic heads` → single head `20260915_000021`. `git diff --check` clean.
 
 **New tests:** supervisor auth (default-deny, wrong/absent credential, rotation);
 lifecycle state machine (happy path, repeat, partial, wrong owner/epoch/attempt,
@@ -344,6 +383,23 @@ Process-supervision tests (added this slice) — **real process tests** vs
   writes `last_progress_at`; options operation-permission tests.
 - `tests/sdk/test_hosted_bootstrap.py` — `main(ctx)` loading and `ctx.progress`.
 - `tests/strategies/test_repository.py` — `record_progress` only for live jobs.
+- Reconciliation tests (this slice):
+  - `tests/strategies/test_reconciliation.py` — **pure** assessment across the four
+    cases and every evidence axis (open exposure, outstanding/unknown work,
+    unknown/unresolved cleanup, active authority, unavailable evidence, active
+    job, terminal-label-alone), plus the **real collector** with fake worker/paper
+    services (settled/flat, open exposure, outstanding work, unavailable paper,
+    active authority, unlaunched data-only).
+  - `tests/api/test_reconciliation_api.py` — allowed reconciliation unblocks a new
+    attempt; open exposure stays blocked + audited; stale attempt refused;
+    cross-owner 404; cross-account 403 (and omitted from lists); data-only
+    completion records `not_applicable` (no invented flatness); unavailable
+    evidence blocked; owner list/detail; authentication required.
+  - `tests/api/test_hosted_lifecycle_api.py` — process-cleanup evidence is
+    attempt-bound, visible in state, refused for a stale attempt, and refused for
+    a child worker token (401).
+  - PostgreSQL — concurrent reconcile has exactly one winner and replacement is
+    serialized; reconciliation audit is append-only and ordered.
 
 **Unrelated pre-existing failures — corrected baseline evidence.** The earlier
 report compared only `backend/api/routers/__init__.py`, which is *not* a complete
@@ -410,11 +466,12 @@ independent of this slice (reproduces with the slice stashed).
 
 ## 5. Remaining gaps (after process supervision)
 
-- **Operator reconciliation has no API.** `release`/`fence`/`recover` leave a
-  launched attempt in `recovery_required`, which is correct, but there is still
-  no operator-facing reconciliation workflow to inspect exposure and clear the
-  replacement block. Until it exists, `recovery_required` is terminal for the
-  operator surface. This is the single most important missing piece.
+- **Operator reconciliation now exists (backend, this slice).** An authorized
+  operator can inspect why a `recovery_required` attempt is blocked and clear the
+  block only when server-side evidence supports it. **Still missing:**
+  Cancel/Flatten execution (when exposure is open, reconciliation is blocked and
+  the operator has no backend action to settle it), and the frontend for the
+  reconciliation surface (§8 is the API handoff).
 - **Scheduling is not implemented.** Discovery lists `queued` jobs; nothing
   creates them on a schedule. The supervisor polls (`run_forever`) or runs once.
 - **Options fail-closed mode propagation and the futures contract resolver**
@@ -484,17 +541,107 @@ the account scope (a non-secret config value) must reach the child.
 
 ## 7. Deployment readiness — what is and is not true
 
-- **Implemented and tested:** the supervisor process (claim → prepare → source
-  verify → spawn → heartbeat → progress fence → stop/release/fence/recover),
-  exception- and signal-safe shutdown, restart cleanup, process-group completion,
-  limits/authority enforcement, honest cleanup + CLI exit codes, the child
-  bootstrap and attach-only context, process containment and identity handling,
-  the two lifecycle corrections, and the lifecycle API additions.
-- **Not deployment-ready / not done:** the operator reconciliation workflow
-  (**the next feature slice**), scheduling, frontend, notification delivery,
-  cancel/flatten adapters, live trading, and any production rollout.
-  `Dockerfile.supervisor` / `compose.supervisor.yml` were added but **not**
-  built or deployed, and no live database migration was run.
+- **Implemented and tested (unit/integration, disposable PostgreSQL):** the
+  supervisor process (claim → prepare → source verify → spawn → heartbeat →
+  progress fence → stop/release/fence/recover), exception/signal-safe shutdown,
+  restart cleanup, process-group completion, limits/authority enforcement,
+  honest cleanup + CLI exit codes, the child bootstrap and attach-only context,
+  process containment and identity handling, the lifecycle corrections, the
+  lifecycle API additions, and the **operator reconciliation backend**
+  (inspection, action, evidence classification, durable audit).
+- **Not deployment-ready / not done:** the frontend (only the API handoff in §8),
+  scheduling, notification delivery, Cancel/Flatten execution, live trading, and
+  any production rollout. `Dockerfile.supervisor` / `compose.supervisor.yml`
+  were added but **not** built or deployed, and no live database migration was run.
+- **Deployment checks NOT executed here (do not read configuration as runtime
+  proof):** building/running the supervisor container; real cross-UID execution
+  (the root-gated test is skipped on this non-root host); delivering a real
+  `SIGTERM` to the supervisor process (signal handling is tested through the
+  flag/handler path only). These remain verification steps for an isolated
+  deployment environment.
 - **Explicitly not claimed:** complete security isolation (v1 is a trusted
   single-operator setup; per-run filesystem isolation is not promised), exactly-once
   execution, or that a stopped/revoked attempt is flat.
+
+## 8. Frontend handoff — reconciliation API, examples and status meanings
+
+All routes are app-cookie authenticated, origin-checked, owner-scoped and
+account-authorized. Owner is server-derived; cross-owner ⇒ 404, cross-account ⇒
+403.
+
+**List jobs** `GET /api/strategies/{strategy_id}/jobs`
+
+```json
+{ "jobs": [ {
+  "job_id": "hsj_ab12", "strategy_id": "hs_9", "owner_id": "app:admin",
+  "attempt": 2, "status": "recovery_required", "desired_state": "started",
+  "execution_mode": "paper", "account_scope": "kite:paper", "run_id": "run_77",
+  "replacement_blocked": true, "recovery_required_at": "2026-09-15T10:00:00+00:00",
+  "reconciled_at": null, "created_at": "...", "updated_at": "..."
+} ] }
+```
+
+**Job detail** `GET /api/strategies/{strategy_id}/jobs/{job_id}` — the summary
+plus `handoff_at`, `process_cleanup_state`, `process_cleanup_at`,
+`process_cleanup_actor`, `last_progress_at`, `version_id`, `token_present`.
+
+**Inspect** `GET /api/strategies/{strategy_id}/jobs/{job_id}/reconciliation`
+
+```json
+{
+  "job_id": "hsj_ab12", "strategy_id": "hs_9", "attempt": 2,
+  "replacement_blocked": true,
+  "assessment": { "allowed": false, "case": "blocked",
+                  "reason_code": "OPEN_EXPOSURE",
+                  "blocking_reasons": ["OPEN_EXPOSURE"],
+                  "notes": [] },
+  "evidence": {
+    "launched": true, "trade_capable": true, "job_status": "recovery_required",
+    "process_cleanup_state": "confirmed", "authority_state": "revoked",
+    "run_status": "closed", "work_state": "settled", "exposure_state": "open",
+    "protection_state": "settled", "evidence_complete": true, "unavailable": []
+  },
+  "history": [ { "id": "hsr_1", "attempt": 2, "outcome": "blocked",
+                 "reason_code": "OPEN_EXPOSURE", "actor_id": "app:admin",
+                 "run_id": "run_77", "evidence": { }, "created_at": "..." } ]
+}
+```
+
+**Reconcile** `POST /api/strategies/{strategy_id}/jobs/{job_id}/reconciliation`
+
+```json
+{ "attempt": 2, "lease_epoch": 3 }
+```
+
+- `200` `{ "status": "reconciled", "case": "trading_settled_flat", ... }` — the
+  block is cleared; a new attempt may start (new run/token).
+- `409` with `detail.rejection_reason` one of the reason codes below; the audit
+  row is still written (`outcome: "blocked"`).
+- `409 STALE_ATTEMPT` / `STALE_LEASE_EPOCH` — re-inspect and retry.
+- `409 RECONCILE_RACE_LOST` — the attempt changed; re-inspect.
+
+**Status meanings**
+
+| Field / code | Meaning |
+| --- | --- |
+| `case = unlaunched` | No child credential was handed off; no work possible |
+| `case = data_only_completed` | No trading capability/work; process cleanup established |
+| `case = trading_settled_flat` | Cleanup confirmed, work settled, exposure flat, authority revoked |
+| `case = blocked` | Evidence does not support unblocking (see codes) |
+| `case = not_blocked` | Replacement is not blocked; nothing to reconcile |
+| `process_cleanup_state` | `confirmed` (process group gone) / `unresolved` / `null` unknown |
+| `authority_state` | `revoked` / `active` (credential still live) / `uncertain` |
+| `work_state` | `none` / `settled` / `outstanding` / `unknown` |
+| `exposure_state` | `not_applicable` (data-only) / `flat` / `open` / `unknown` |
+| `PROCESS_CLEANUP_UNKNOWN`/`_UNRESOLVED` | Child cleanup not established |
+| `AUTHORITY_ACTIVE`/`_UNCERTAIN` | Child credential not demonstrably revoked |
+| `OUTSTANDING_WORK` / `WORK_UNKNOWN` | Accepted work not settled / could not be read |
+| `OPEN_EXPOSURE` / `EXPOSURE_UNKNOWN` | Attributable exposure open / could not be read |
+| `PROTECTION_UNKNOWN` / `RECOVERY_ACTION_PENDING` | Protection state unavailable / recovery action outstanding |
+| `EVIDENCE_UNAVAILABLE` | A required evidence source could not be read |
+| `HOSTED_JOB_ACTIVE` | Attempt is live; stop it before reconciling |
+| `HOSTED_JOB_NOT_BLOCKED` | Replacement is not blocked |
+
+Open exposure is surfaced as `OPEN_EXPOSURE`; this slice deliberately does **not**
+add Cancel/Flatten execution — the frontend shows the blocking reason and the
+future operator action needed.

@@ -294,7 +294,6 @@ class HostedSupervisor:
     # -- cleanup helper -----------------------------------------------------
 
     _TERMINAL_STATUSES = {"recovery_required", "stopped", "failed"}
-    _ALREADY_TERMINAL_REASONS = {"HOSTED_ATTEMPT_FENCED", "HOSTED_ATTEMPT_STOPPED"}
 
     def _state_or_none(self, job_id: str, epoch: int, attempt: int) -> Optional[Dict[str, Any]]:
         try:
@@ -304,11 +303,30 @@ class HostedSupervisor:
         except (SupervisorApiError, SupervisorTransportError):
             return None
 
+    def _report_process_cleanup(self, job_id: str, epoch: int, attempt: int, state: str) -> bool:
+        """Best-effort attempt-bound cleanup evidence report (never raises)."""
+        try:
+            self.api.process_cleanup(
+                job_id,
+                lease_owner=self.config.lease_owner,
+                lease_epoch=epoch,
+                attempt=attempt,
+                state=state,
+            )
+            return True
+        except Exception as exc:  # best effort; local control flow is unaffected
+            logger.warning(
+                "hosted_supervisor_process_cleanup_report_failed",
+                extra={"job_id": job_id, "state": state, "error": type(exc).__name__},
+            )
+            return False
+
     def _authority_check(self, job_id: str, epoch: int, attempt: int) -> Dict[str, Any]:
         """Full pre-spawn authority check: state, desired state, lease, attempt.
 
-        Returns ``{"ok": bool, "reason": str|None, "state": dict|None}``. Any
-        failure to *prove* live authority refuses spawning.
+        Returns ``{"ok": bool, "reason": str|None, "state": dict|None}``. This
+        **fails closed**: any required authority field that is missing,
+        unreadable or mismatched refuses spawning.
         """
         state = self._state_or_none(job_id, epoch, attempt)
         if state is None:
@@ -317,17 +335,27 @@ class HostedSupervisor:
             return {"ok": False, "reason": "HOSTED_ATTEMPT_FENCED", "state": state}
         if str(state.get("desired_state") or "") != "started":
             return {"ok": False, "reason": "HOSTED_ATTEMPT_STOPPED", "state": state}
-        if state.get("lease_epoch") is not None and int(state["lease_epoch"]) != int(epoch):
-            return {"ok": False, "reason": "HOSTED_LEASE_AUTHORITY_MISMATCH", "state": state}
-        if state.get("attempt") is not None and int(state["attempt"]) != int(attempt):
-            return {"ok": False, "reason": "HOSTED_LEASE_AUTHORITY_MISMATCH", "state": state}
+
+        epoch_field = state.get("lease_epoch")
+        attempt_field = state.get("attempt")
+        if epoch_field is None or attempt_field is None:
+            # Missing epoch/attempt cannot prove authority: refuse.
+            return {"ok": False, "reason": "HOSTED_AUTHORITY_INCOMPLETE", "state": state}
+        try:
+            if int(epoch_field) != int(epoch) or int(attempt_field) != int(attempt):
+                return {"ok": False, "reason": "HOSTED_LEASE_AUTHORITY_MISMATCH", "state": state}
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "HOSTED_AUTHORITY_INCOMPLETE", "state": state}
+
         lease_until = state.get("lease_until")
-        if lease_until:
-            try:
-                if datetime.fromisoformat(str(lease_until).replace("Z", "+00:00")) <= self._wall_clock():
-                    return {"ok": False, "reason": "HOSTED_LEASE_EXPIRED", "state": state}
-            except ValueError:
-                return {"ok": False, "reason": "HOSTED_LEASE_UNREADABLE", "state": state}
+        if not lease_until:
+            # A missing/unreadable lease cannot prove a live lease: refuse.
+            return {"ok": False, "reason": "HOSTED_LEASE_UNREADABLE", "state": state}
+        try:
+            if datetime.fromisoformat(str(lease_until).replace("Z", "+00:00")) <= self._wall_clock():
+                return {"ok": False, "reason": "HOSTED_LEASE_EXPIRED", "state": state}
+        except ValueError:
+            return {"ok": False, "reason": "HOSTED_LEASE_UNREADABLE", "state": state}
         return {"ok": True, "reason": None, "state": state}
 
     def _fail_closed(
@@ -335,9 +363,11 @@ class HostedSupervisor:
     ) -> Dict[str, Any]:
         """Fence while the lease is live, recover once expired, then confirm.
 
-        Cleanup is considered resolved **only** when the API confirms it or an
-        authenticated state read proves a terminal condition. Any 403/409/5xx or
-        transport error, and a still-live lease, leaves ``cleanup_required=True``
+        Cleanup is considered resolved **only** when the API confirms it with a
+        2xx response or an **authenticated state read** proves a terminal
+        condition. An error code such as ``HOSTED_ATTEMPT_FENCED``/``..STOPPED``
+        is *not* treated as proof — the state read is required. Any 403/409/5xx
+        or transport error, and a still-live lease, leaves ``cleanup_required``
         so the caller keeps the retry record and never claims success.
         """
         report: Dict[str, Any] = {
@@ -375,23 +405,16 @@ class HostedSupervisor:
             report["cleanup_required"] = False
             report["terminal_confirmed"] = True
             return report
-        if outcome in self._ALREADY_TERMINAL_REASONS:
-            report["cleanup_required"] = False
-            report["terminal_confirmed"] = True
-            return report
-        if outcome in {"HOSTED_LEASE_EXPIRED", "HOSTED_ATTEMPT_FENCED", "HOSTED_LEASE_STILL_LIVE"}:
+        if outcome in {"HOSTED_LEASE_EXPIRED", "HOSTED_LEASE_STILL_LIVE"}:
             recover_outcome = _try_recover()
             report["recover"] = recover_outcome
             if recover_outcome == "ok":
                 report["cleanup_required"] = False
                 report["terminal_confirmed"] = True
                 return report
-            if recover_outcome in self._ALREADY_TERMINAL_REASONS:
-                report["cleanup_required"] = False
-                report["terminal_confirmed"] = True
-                return report
 
-        # Confirm via an authenticated state read before giving up.
+        # Everything else (including HOSTED_ATTEMPT_FENCED/STOPPED) must be
+        # confirmed by an authenticated state read.
         state = self._state_or_none(job_id, epoch, attempt)
         if state is not None and str(state.get("status") or "") in self._TERMINAL_STATUSES:
             report["cleanup_required"] = False
@@ -425,6 +448,18 @@ class HostedSupervisor:
                 record.job_id, int(record.lease_epoch), int(record.attempt), reason=reason
             )
             authority_ok = not cleanup["cleanup_required"]
+            # Report attempt-bound process-cleanup evidence for the operator.
+            if record.phase == "spawning" and not record.identity:
+                process_state = "unresolved"  # an unrecorded child may exist
+            elif record.identity is None:
+                process_state = "confirmed"  # nothing was spawned
+            elif process_result in {"exited", "terminated", "killed", "group_terminated", "group_killed", "clean"}:
+                process_state = "confirmed"
+            else:
+                process_state = "unresolved"
+            self._report_process_cleanup(
+                record.job_id, int(record.lease_epoch), int(record.attempt), process_state
+            )
         elif record.phase not in {"claiming", "claim_refused", "api_unreachable"}:
             authority_ok = True
 
@@ -736,6 +771,21 @@ class HostedSupervisor:
         }
         if detail:
             result.update(detail)
+
+        # Report supervisor-owned process-cleanup evidence for this attempt so an
+        # operator can distinguish "process stopped" from "cleanup unknown". This
+        # is best-effort and never changes the local control flow; a failure
+        # leaves the job's cleanup evidence unknown (reconciliation stays blocked).
+        cleanup_confirmed = stop_result in {
+            "exited",
+            "terminated",
+            "killed",
+            "group_terminated",
+            "group_killed",
+        }
+        result["process_cleanup_reported"] = self._report_process_cleanup(
+            job_id, epoch, attempt, "confirmed" if cleanup_confirmed else "unresolved"
+        )
 
         process_unresolved = stop_result in {"group_unresolved", "stop_failed"}
         if outcome == "exited" and not process_unresolved:

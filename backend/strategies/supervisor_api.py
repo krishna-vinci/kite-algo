@@ -207,3 +207,25 @@ class LifecycleApiClient:
                 "reason": reason,
             },
         )
+
+    def process_cleanup(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        lease_epoch: int,
+        attempt: int,
+        state: str,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "lease_owner": lease_owner,
+            "lease_epoch": lease_epoch,
+            "attempt": attempt,
+            "state": state,
+        }
+        if note is not None:
+            body["note"] = str(note)[:200]
+        return self._request(
+            "POST", f"/hosted-supervisor/jobs/{job_id}/process-cleanup", body=body
+        )

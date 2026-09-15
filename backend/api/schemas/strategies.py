@@ -92,3 +92,106 @@ class VersionListResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     versions: List[VersionResponse] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# jobs + operator reconciliation
+# ---------------------------------------------------------------------------
+
+
+class JobSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    strategy_id: str
+    owner_id: str
+    attempt: int
+    status: str
+    desired_state: str
+    execution_mode: str
+    account_scope: str
+    run_id: Optional[str] = None
+    replacement_blocked: bool = False
+    recovery_required_at: Optional[str] = None
+    reconciled_at: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class JobListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    jobs: List[JobSummaryResponse] = Field(default_factory=list)
+
+
+class JobDetailResponse(JobSummaryResponse):
+    handoff_at: Optional[str] = None
+    process_cleanup_state: Optional[str] = None
+    process_cleanup_at: Optional[str] = None
+    process_cleanup_actor: Optional[str] = None
+    last_progress_at: Optional[str] = None
+    version_id: str
+    token_present: bool = False
+
+
+class ReconciliationAuditResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    attempt: int
+    outcome: str
+    reason_code: str
+    actor_id: str
+    run_id: Optional[str] = None
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+
+
+class ReconciliationAssessmentResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allowed: bool
+    case: str
+    reason_code: str
+    blocking_reasons: List[str] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+
+class ReconciliationInspectionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    strategy_id: str
+    attempt: int
+    replacement_blocked: bool
+    assessment: ReconciliationAssessmentResponse
+    evidence: Dict[str, Any]
+    history: List[ReconciliationAuditResponse] = Field(default_factory=list)
+
+
+class ReconciliationActionRequest(BaseModel):
+    """Explicit reconciliation against immutable identity.
+
+    Deliberately carries **no** ``flat``/``reconciled`` assertion: the server
+    decides from persisted evidence. ``attempt`` (and optionally ``lease_epoch``)
+    pin the request to the exact attempt so a stale request is refused.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempt: int = Field(ge=1)
+    lease_epoch: Optional[int] = Field(default=None, ge=0)
+
+
+class ReconciliationActionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    job_id: str
+    attempt: int
+    case: str
+    reason_code: str
+    replacement_blocked: bool
+    blocking_reasons: List[str] = Field(default_factory=list)
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    audit_id: str

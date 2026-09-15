@@ -2387,6 +2387,9 @@ CREATE TABLE IF NOT EXISTS public.strategy_jobs (
     log_ref TEXT,
     handoff_at TIMESTAMPTZ,
     last_error TEXT,
+    process_cleanup_state TEXT,
+    process_cleanup_at TIMESTAMPTZ,
+    process_cleanup_actor TEXT,
     recovery_required_at TIMESTAMPTZ,
     reconciled_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -2407,9 +2410,30 @@ CREATE TABLE IF NOT EXISTS public.strategy_jobs (
     CONSTRAINT ck_strategy_jobs_progress_deadline CHECK (progress_deadline_s > 0),
     CONSTRAINT ck_strategy_jobs_status CHECK (
         status IN ('queued', 'starting', 'running', 'fencing', 'recovery_required', 'stopped', 'failed', 'hung')
+    ),
+    CONSTRAINT ck_strategy_jobs_process_cleanup_state CHECK (
+        process_cleanup_state IS NULL OR process_cleanup_state IN ('confirmed', 'unresolved')
     )
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_jobs_lease
     ON public.strategy_jobs (status, lease_until);
 CREATE INDEX IF NOT EXISTS idx_strategy_jobs_owner_strategy
     ON public.strategy_jobs (owner_id, strategy_id);
+
+CREATE TABLE IF NOT EXISTS public.strategy_job_reconciliations (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES public.strategy_jobs(id) ON DELETE CASCADE,
+    strategy_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    run_id TEXT,
+    outcome TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    evidence_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    actor_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_strategy_job_reconciliations_outcome CHECK (outcome IN ('reconciled', 'blocked')),
+    CONSTRAINT ck_strategy_job_reconciliations_attempt CHECK (attempt > 0)
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_job_reconciliations_job
+    ON public.strategy_job_reconciliations (job_id, created_at DESC);

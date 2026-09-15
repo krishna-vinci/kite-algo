@@ -89,7 +89,30 @@ class JobStateResponse(BaseModel):
     handoff_at: Optional[str] = None
     last_progress_at: Optional[str] = None
     progress_deadline_s: Optional[int] = None
+    process_cleanup_state: Optional[str] = None
+    process_cleanup_at: Optional[str] = None
     run_status: Optional[str] = None
+
+
+class ProcessCleanupRequest(BaseModel):
+    """Supervisor-owned child process-cleanup report, bound to the attempt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    lease_owner: str = Field(min_length=1, max_length=120)
+    lease_epoch: int = Field(ge=0)
+    attempt: int = Field(ge=1)
+    state: str = Field(pattern="^(confirmed|unresolved)$")
+    note: Optional[str] = Field(default=None, max_length=200)
+
+
+class ProcessCleanupResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    attempt: int
+    process_cleanup_state: str
+    note: Optional[str] = None
 
 
 class ActionResponse(BaseModel):

@@ -122,6 +122,10 @@ class FakeApi:
         self._record("recover", job_id=job_id, **kwargs)
         return {"status": "recovery_required", "replacement_blocked": True}
 
+    def process_cleanup(self, job_id, **kwargs):
+        self._record("process_cleanup", job_id=job_id, **kwargs)
+        return {"job_id": job_id, "process_cleanup_state": kwargs.get("state")}
+
 
 class _HarnessSupervisor(HostedSupervisor):
     """Runs a harmless local program instead of the SDK bootstrap."""
@@ -479,6 +483,55 @@ def test_unresolved_cleanup_result_marks_supervisor_failure(tmp_path):
     assert _result_is_unresolved({"cleanup_required": True}) is True
     assert _result_is_unresolved({"stop": "group_unresolved"}) is True
     assert _result_is_unresolved({"cleanup_required": False, "stop": "terminated"}) is False
+
+
+def test_cleanup_error_code_is_not_treated_as_proof(tmp_path):
+    """HOSTED_ATTEMPT_FENCED must be confirmed by a read, not inferred."""
+    api = FakeApi()
+    api.fence_error = SupervisorApiError(409, "HOSTED_ATTEMPT_FENCED")
+    # The authenticated read still shows a live attempt → cleanup unresolved.
+    api.job_state_payload = {**api.job_state_payload, "status": "running"}
+    sup = _supervisor(tmp_path, api)
+
+    report = sup._fail_closed("hsj_1", 1, 1, reason="test")
+    assert report["fence"] == "HOSTED_ATTEMPT_FENCED"
+    assert report["cleanup_required"] is True
+    assert report["terminal_confirmed"] is False
+
+
+def test_cleanup_error_code_confirmed_by_authenticated_read(tmp_path):
+    api = FakeApi()
+    api.fence_error = SupervisorApiError(409, "HOSTED_ATTEMPT_FENCED")
+    api.job_state_payload = {**api.job_state_payload, "status": "recovery_required"}
+    sup = _supervisor(tmp_path, api)
+
+    report = sup._fail_closed("hsj_1", 1, 1, reason="test")
+    assert report["cleanup_required"] is False
+    assert report["terminal_confirmed"] is True
+    assert report["state_status"] == "recovery_required"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        {"lease_epoch": None},
+        {"attempt": None},
+        {"lease_until": None},
+        {"desired_state": None},
+    ],
+)
+def test_authority_check_fails_closed_on_missing_fields(tmp_path, mutate):
+    api = FakeApi()
+    api.job_state_payload = {**api.job_state_payload, **mutate}
+    sup = _supervisor(tmp_path, api)
+
+    authority = sup._authority_check("hsj_1", 1, 1)
+    assert authority["ok"] is False
+    assert authority["reason"] in {
+        "HOSTED_AUTHORITY_INCOMPLETE",
+        "HOSTED_LEASE_UNREADABLE",
+        "HOSTED_ATTEMPT_STOPPED",
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -36,6 +36,8 @@ from backend.api.schemas.hosted_lifecycle import (
     JobSourceResponse,
     JobStateResponse,
     PrepareLaunchRequest,
+    ProcessCleanupRequest,
+    ProcessCleanupResponse,
     ReleaseRequest,
 )
 from backend.api.services import hosted_lifecycle
@@ -151,6 +153,33 @@ async def get_job_source(
         )
     except hosted_lifecycle.HostedLifecycleError as exc:
         raise _raise(exc) from exc
+
+
+@router.post("/jobs/{job_id}/process-cleanup", response_model=ProcessCleanupResponse)
+async def report_process_cleanup(
+    job_id: str,
+    payload: ProcessCleanupRequest,
+    request: Request,
+    strategy_repo: SqlAlchemyStrategyRepository = Depends(_strategies_repo),
+):
+    """Record supervisor-owned child process-cleanup evidence for this attempt.
+
+    The child cannot reach this route (it holds only a child run token), so it
+    cannot forge cleanup evidence used by operator reconciliation.
+    """
+    try:
+        result = await hosted_lifecycle.report_process_cleanup(
+            strategy_repo=strategy_repo,
+            job_id=job_id,
+            lease_owner=payload.lease_owner,
+            lease_epoch=payload.lease_epoch,
+            attempt=payload.attempt,
+            state=payload.state,
+            note=payload.note,
+        )
+    except hosted_lifecycle.HostedLifecycleError as exc:
+        raise _raise(exc) from exc
+    return ProcessCleanupResponse(**result)
 
 
 @router.get("/jobs/{job_id}", response_model=JobStateResponse)
