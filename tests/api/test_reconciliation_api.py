@@ -167,7 +167,9 @@ BASE = "/api/strategies"
 async def test_allowed_reconciliation_unblocks_replacement(session_factory, monkeypatch):
     repo = _repo(session_factory)
     strategy, job = _make_job(repo)
-    collector = StubCollector(_evidence())
+    # A real execution-settlement barrier does not exist yet, so exercise the
+    # allowed path with quiescence explicitly verified.
+    collector = StubCollector(_evidence(quiescence_state="verified"))
     async with _client(session_factory, monkeypatch, collector) as client:
         inspection = await client.get(f"{BASE}/{strategy.id}/jobs/{job.id}/reconciliation")
         assert inspection.status_code == 200
@@ -320,11 +322,26 @@ async def test_authentication_required(session_factory, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_trading_capable_blocked_on_unverified_quiescence(session_factory, monkeypatch):
+    repo = _repo(session_factory)
+    strategy, job = _make_job(repo)
+    # Fully clean trading evidence but no execution-settlement barrier.
+    collector = StubCollector(_evidence())
+    async with _client(session_factory, monkeypatch, collector) as client:
+        response = await client.post(
+            f"{BASE}/{strategy.id}/jobs/{job.id}/reconciliation", json={"attempt": 1}
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["rejection_reason"] == "EXECUTION_QUIESCENCE_UNVERIFIED"
+    assert repo.get_job(OWNER, job.id).status == "recovery_required"
+
+
+@pytest.mark.asyncio
 async def test_evidence_changed_between_assessment_and_commit_is_refused(session_factory, monkeypatch):
     repo = _repo(session_factory)
     strategy, job = _make_job(repo)
     # First collection allows; the pre-commit re-check sees open exposure.
-    collector = StubCollector(_evidence(), second=_evidence(exposure_state="open"))
+    collector = StubCollector(_evidence(quiescence_state="verified"), second=_evidence(exposure_state="open"))
     async with _client(session_factory, monkeypatch, collector) as client:
         response = await client.post(
             f"{BASE}/{strategy.id}/jobs/{job.id}/reconciliation", json={"attempt": 1}

@@ -16,6 +16,7 @@ from backend.strategies import service as strategy_service
 from backend.strategies.reconciliation import (
     BLOCK_AUTHORITY_ACTIVE,
     BLOCK_EVIDENCE_UNAVAILABLE,
+    BLOCK_EXECUTION_QUIESCENCE_UNVERIFIED,
     BLOCK_JOB_ACTIVE,
     BLOCK_OPEN_EXPOSURE,
     BLOCK_OUTSTANDING_WORK,
@@ -66,9 +67,15 @@ def test_case_data_only_completed_allowed():
     assert result.allowed and result.case == CASE_DATA_ONLY_COMPLETED
 
 
-def test_case_trading_settled_flat_allowed():
-    result = assess(_ev())
-    assert result.allowed and result.case == CASE_TRADING_SETTLED_FLAT
+def test_trading_capable_requires_verified_quiescence():
+    # No durable execution-settlement barrier exists, so quiescence is unverified
+    # and a trading-capable attempt stays blocked.
+    blocked = assess(_ev())
+    assert not blocked.allowed
+    assert BLOCK_EXECUTION_QUIESCENCE_UNVERIFIED in blocked.blocking_reasons
+    # If a real barrier ever establishes quiescence, the case becomes allowed.
+    allowed = assess(_ev(quiescence_state="verified"))
+    assert allowed.allowed and allowed.case == CASE_TRADING_SETTLED_FLAT
 
 
 def test_open_exposure_blocked():
@@ -159,13 +166,14 @@ class FakePaper:
         return self.payload
 
 
-def _settlement(*, run_state, order_count=0, pending_order_count=0, account="kite:paper", run_id="run_1"):
+def _settlement(*, run_state, order_count=0, pending_order_count=0, account="kite:paper", run_id="run_1", coverage_complete=True):
     return {
         "account_scope": account,
         "strategy_run_id": run_id,
         "run_state": run_state,
         "order_count": order_count,
         "pending_order_count": pending_order_count,
+        "coverage_complete": coverage_complete,
     }
 
 
@@ -224,7 +232,7 @@ def _collector(worker, paper):
 
 
 @pytest.mark.asyncio
-async def test_collector_trading_settled_flat_allows():
+async def test_collector_trading_evidence_but_quiescence_unverified_blocks():
     job = _job()
     worker = FakeWorker(run={"status": "closed", "runtime_state": {}}, token_status="revoked")
     paper = FakePaper(_settlement(run_state=_run_state([{"net_quantity": 0}]), order_count=2))
@@ -232,7 +240,10 @@ async def test_collector_trading_settled_flat_allows():
     assert evidence.work_state == "settled"
     assert evidence.exposure_state == "flat"
     assert evidence.evidence_complete
-    assert assess(evidence).allowed
+    assert evidence.quiescence_state == "unverified"
+    result = assess(evidence)
+    assert not result.allowed
+    assert BLOCK_EXECUTION_QUIESCENCE_UNVERIFIED in result.blocking_reasons
     # Read-only path used; no ensure_account-style PnL call.
     assert paper.calls == 1
 
@@ -280,7 +291,21 @@ async def test_collector_confirmed_empty_run_state_is_flat_not_unknown():
     assert evidence.work_state == "none"
     assert evidence.exposure_state == "flat"
     assert evidence.evidence_complete
-    assert assess(evidence).allowed
+    # Trading-capable, so still blocked on unverified quiescence (not on evidence).
+    assert assess(evidence).reason_code == BLOCK_EXECUTION_QUIESCENCE_UNVERIFIED
+
+
+@pytest.mark.asyncio
+async def test_collector_truncated_coverage_is_blocked():
+    job = _job()
+    worker = FakeWorker(run={"status": "closed", "runtime_state": {}}, token_status="revoked")
+    paper = FakePaper(
+        _settlement(run_state=_run_state([{"net_quantity": 0}]), order_count=1, coverage_complete=False)
+    )
+    evidence = await _collector(worker, paper).collect(job)
+    assert "paper_settlement_incomplete" in evidence.unavailable
+    assert evidence.exposure_state == "unknown" and evidence.work_state == "unknown"
+    assert assess(evidence).reason_code == BLOCK_EVIDENCE_UNAVAILABLE
 
 
 @pytest.mark.asyncio
@@ -341,3 +366,80 @@ async def test_data_only_completion_does_not_require_closed_run():
     result = assess(evidence)
     # Unlaunched (no handoff) is case 1; a launched data-only attempt is case 2.
     assert result.case in {CASE_UNLAUNCHED, CASE_DATA_ONLY_COMPLETED}
+
+
+# ---------------------------------------------------------------------------
+# authoritative strategy-attributed order query (coverage detection)
+# ---------------------------------------------------------------------------
+
+
+def test_attributed_order_query_filters_by_strategy_and_flags_truncation():
+    from sqlalchemy import create_engine, event, text
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from backend.paper_runtime.repository import SqlAlchemyPaperRepository
+
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _attach(dbapi_connection, connection_record):
+        _ = connection_record
+        cursor = dbapi_connection.cursor()
+        cursor.execute("ATTACH DATABASE ':memory:' AS public")
+        cursor.close()
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE public.paper_orders (
+                    account_scope TEXT NOT NULL,
+                    order_id TEXT PRIMARY KEY,
+                    instrument_token INTEGER,
+                    exchange TEXT,
+                    tradingsymbol TEXT,
+                    product TEXT,
+                    transaction_type TEXT,
+                    order_type TEXT,
+                    quantity INTEGER,
+                    filled_quantity INTEGER,
+                    pending_quantity INTEGER,
+                    price TEXT,
+                    trigger_price TEXT,
+                    average_price TEXT,
+                    status TEXT,
+                    placed_at TEXT,
+                    updated_at TEXT,
+                    completed_at TEXT,
+                    metadata_json TEXT
+                )
+                """
+            )
+        )
+        for index, run_id in enumerate(["run_1", "run_1", "run_2"]):
+            conn.execute(
+                text(
+                    "INSERT INTO public.paper_orders "
+                    "(account_scope, order_id, instrument_token, transaction_type, quantity, status, "
+                    " placed_at, updated_at, metadata_json) "
+                    "VALUES ('kite:paper', :oid, 1, 'buy', 1, 'filled', :ts, :ts, :meta)"
+                ),
+                {
+                    "oid": f"o{index}",
+                    "ts": f"2026-09-15T10:0{index}:00+00:00",
+                    "meta": '{"strategy_run_id": "%s"}' % run_id,
+                },
+            )
+
+    repo = SqlAlchemyPaperRepository(session_factory=sessionmaker(bind=engine))
+    orders, complete = repo.list_orders_for_strategy("kite:paper", "run_1")
+    assert len(orders) == 2 and complete is True
+
+    # Truncation is reported as incomplete coverage, never as "settled".
+    orders, complete = repo.list_orders_for_strategy("kite:paper", "run_1", limit=1)
+    assert len(orders) == 1 and complete is False

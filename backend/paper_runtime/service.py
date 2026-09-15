@@ -523,18 +523,14 @@ class PaperTradingService:
         run_state = await asyncio.to_thread(
             self.run_state_service.get_run_state, account_scope, normalized_strategy_run_id
         )
-        orders = await asyncio.to_thread(self.repository.list_orders, account_scope, limit=50000)
-        identity_keys = ("strategy_run_id", "option_strategy_id", "strategy_id", "algo_instance_id")
-
-        def _identity(metadata: Any) -> Optional[str]:
-            payload = dict(metadata or {})
-            for key in identity_keys:
-                value = str(payload.get(key) or "").strip()
-                if value:
-                    return value
-            return None
-
-        relevant = [order for order in orders if _identity(order.metadata) == normalized_strategy_run_id]
+        # Authoritative strategy-attributed order query (not a capped account-wide
+        # scan); ``coverage_complete`` is False when the result was truncated.
+        orders, coverage_complete = await asyncio.to_thread(
+            self.repository.list_orders_for_strategy,
+            account_scope,
+            normalized_strategy_run_id,
+            limit=5000,
+        )
         pending_statuses = {
             PaperOrderStatus.PENDING.value,
             PaperOrderStatus.OPEN.value,
@@ -542,15 +538,16 @@ class PaperTradingService:
         }
         pending = [
             order
-            for order in relevant
+            for order in orders
             if str(getattr(order.status, "value", order.status)) in pending_statuses
         ]
         return {
             "account_scope": account_scope,
             "strategy_run_id": normalized_strategy_run_id,
             "run_state": run_state,
-            "order_count": len(relevant),
+            "order_count": len(orders),
             "pending_order_count": len(pending),
+            "coverage_complete": bool(coverage_complete),
         }
 
     async def get_strategy_run_pnl(self, account_scope: str, strategy_run_id: str) -> Dict[str, Any] | None:

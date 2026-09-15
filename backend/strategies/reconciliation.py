@@ -65,6 +65,7 @@ BLOCK_EXPOSURE_UNKNOWN = "EXPOSURE_UNKNOWN"
 BLOCK_PROTECTION_UNKNOWN = "PROTECTION_UNKNOWN"
 BLOCK_RECOVERY_ACTION_PENDING = "RECOVERY_ACTION_PENDING"
 BLOCK_EVIDENCE_UNAVAILABLE = "EVIDENCE_UNAVAILABLE"
+BLOCK_EXECUTION_QUIESCENCE_UNVERIFIED = "EXECUTION_QUIESCENCE_UNVERIFIED"
 BLOCK_NOT_BLOCKED = "HOSTED_JOB_NOT_BLOCKED"
 BLOCK_JOB_ACTIVE = "HOSTED_JOB_ACTIVE"
 
@@ -99,6 +100,10 @@ class ReconciliationEvidence:
     #: pending counts). Used to detect that execution evidence changed between
     #: assessment and commit.
     settlement_watermark: Optional[str] = None
+    #: Whether execution quiescence is established by a durable barrier/version.
+    #: There is no such barrier today, so this is ``unverified`` and a
+    #: trading-capable attempt stays blocked.
+    quiescence_state: str = "unverified"  # verified | unverified
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -126,6 +131,7 @@ def evidence_digest(evidence: ReconciliationEvidence) -> str:
         "evidence_complete": evidence.evidence_complete,
         "unavailable": sorted(evidence.unavailable),
         "settlement_watermark": evidence.settlement_watermark,
+        "quiescence_state": evidence.quiescence_state,
     }
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -236,14 +242,23 @@ def assess(evidence: ReconciliationEvidence) -> ReconciliationAssessment:
         return ReconciliationAssessment(True, CASE_DATA_ONLY_COMPLETED, "DATA_ONLY_COMPLETED", [], notes)
 
     # Case 3: trading-capable with settled work, flat exposure, revoked authority.
+    # Evidence-integrity blockers (process cleanup, authority) come first; then
+    # proven execution quiescence. There is no durable execution-settlement
+    # barrier in the platform today, so quiescence cannot be established and
+    # trading-capable reconciliation stays blocked (a terminal job label and two
+    # matching reads are NOT proof that already-admitted work cannot complete).
+    blockers += process_blockers + authority_blockers
+    if evidence.exposure_state != "flat":
+        blockers += _exposure_blockers(evidence)
     if evidence.protection_state == "unknown":
         blockers.append(BLOCK_PROTECTION_UNKNOWN)
     elif evidence.protection_state == "active":
         blockers.append(BLOCK_RECOVERY_ACTION_PENDING)
-    if evidence.exposure_state != "flat":
-        blockers += _exposure_blockers(evidence)
-    blockers += process_blockers + authority_blockers
-    # De-duplicate, preserving order.
+    # Quiescence is the residual blocker once the concrete evidence is clean:
+    # a terminal job label and two matching reads are NOT proof that
+    # already-admitted work cannot complete afterwards.
+    if evidence.quiescence_state != "verified":
+        blockers.append(BLOCK_EXECUTION_QUIESCENCE_UNVERIFIED)
     blockers = list(dict.fromkeys(blockers))
     if blockers:
         return ReconciliationAssessment(False, CASE_BLOCKED, blockers[0], blockers, notes)

@@ -89,6 +89,9 @@ class ReconciliationEvidenceCollector:
         pending_count = _to_int_checked(payload.get("pending_order_count"))
         if order_count is None or pending_count is None or order_count < 0 or pending_count < 0:
             return {"work_state": "unknown", "exposure_state": "unknown", "unavailable": ["paper_settlement_counts"], "watermark": None}
+        # Truncated attribution is incomplete coverage, never "settled".
+        if payload.get("coverage_complete") is False:
+            return {"work_state": "unknown", "exposure_state": "unknown", "unavailable": ["paper_settlement_incomplete"], "watermark": None}
 
         run_state = payload.get("run_state")
         if run_state is None:
@@ -155,6 +158,8 @@ class ReconciliationEvidenceCollector:
         launched = job.handoff_at is not None
         trade_capable, cap_notes = self._capabilities(job)
         notes.extend(cap_notes)
+        if trade_capable:
+            notes.append("no_execution_settlement_barrier_quiescence_unverified")
 
         run: Optional[Dict[str, Any]] = None
         if job.run_id:
@@ -228,6 +233,7 @@ class ReconciliationEvidenceCollector:
             unavailable=sorted(set(unavailable)),
             notes=notes,
             settlement_watermark=watermark,
+            quiescence_state="unverified",
         )
 
 

@@ -280,15 +280,17 @@ destructively.
 - **Reuses existing services, read-only.** The worker-run repo + the paper
   runtime's new **read-only settlement view**
   (`get_strategy_run_settlement_readonly`) — it does **not** call
-  `ensure_account`, so reconciliation never creates account state. It returns the
-  durable run state plus attributed order/pending-order counts. No second
-  position or execution ledger.
+  `ensure_account`, so reconciliation never creates account state. It runs an
+  **authoritative, strategy-attributed order query**
+  (`list_orders_for_strategy`, SQL-filtered on strategy identity) that reports a
+  `coverage_complete` flag. Truncated results are treated as incomplete coverage
+  (`unknown`, blocked) — never as settled. No second position or execution ledger.
 - **Evidence axes** (examples and status meanings in §8): process cleanup,
-  authority, work, exposure, protection, availability. Any missing, malformed,
-  unavailable or ambiguous source keeps the axis `unknown` and the assessment
-  blocked — it is never read as flat. Confirmed-empty positions (an empty
-  `positions` list) are distinguished from missing position data (no run state /
-  missing `positions` / malformed quantities).
+  authority, work, exposure, protection, availability, quiescence. Any missing,
+  malformed, unavailable or ambiguous source keeps the axis `unknown` and the
+  assessment blocked — it is never read as flat. Confirmed-empty positions (an
+  empty `positions` list) are distinguished from missing position data (no run
+  state / missing `positions` / malformed quantities).
 - **Work is authoritative, not the worker-run label.** `work_state` comes from
   attributed paper order settlement (pending/open/partially-filled ⇒
   outstanding) plus the options run state and protection activity — a
@@ -300,17 +302,22 @@ destructively.
   updates the job to `stopped`, and appends the audit row. If the audit insert
   fails the whole transaction rolls back, so the block is never cleared without a
   durable record.
-- **Evidence validity.** Because lease-epoch does not version external execution
-  evidence, the endpoint re-collects the settlement evidence immediately before
-  commit; a changed digest (or a source that became unavailable) is refused with
-  `EVIDENCE_CHANGED`. This narrows (but does not eliminate) the TOCTOU window and
-  fails closed when validity cannot be established — no exactly-once claim.
+- **Quiescence, not repeated reads.** There is no durable execution-settlement
+  barrier/version in the platform today, so a **trading-capable** attempt cannot
+  prove that already-admitted execution will not complete after assessment; it
+  stays blocked with `EXECUTION_QUIESCENCE_UNVERIFIED`. Two matching evidence
+  reads are **not** treated as proof of quiescence. Only `unlaunched` and
+  `data_only_completed` attempts remain reconcilable; when a real barrier is
+  later added, `quiescence_state="verified"` unlocks the trading case. If a re-read
+  before commit disagrees with the assessment it is refused with
+  `EVIDENCE_CHANGED`; the in-DB CAS still fences the final transition.
 - **Cases.** (1) ``unlaunched`` — no handoff, no work; (2) ``data_only_completed``
   — no trading capability/work, cleanup established; (3) ``trading_settled_flat``
-  — cleanup confirmed, work settled, exposure flat, authority revoked;
-  (4) ``blocked`` otherwise (open exposure, outstanding/unknown work, unknown/
-  unresolved cleanup, active/uncertain authority, pending recovery, unavailable
-  evidence, or an active job).
+  — cleanup confirmed, work settled, exposure flat, authority revoked, **and**
+  quiescence verified (not currently reachable without a barrier); (4) ``blocked``
+  otherwise (open exposure, outstanding/unknown work, unknown/unresolved cleanup,
+  active/uncertain authority, pending recovery, unavailable/truncated evidence,
+  unverified quiescence, or an active job).
 - **Races.** The action pins the attempt and the atomic `reconcile_with_audit`
   CAS-matches the in-DB evidence and locks the strategy row, so it serializes
   with `create_job` and cleanup-state updates (tested on PostgreSQL). A new
@@ -348,7 +355,7 @@ Targeted suites (SQLite):
   tests/api/test_hosted_lifecycle_api.py \
   tests/api/test_hosted_child_authority.py \
   tests/sdk -q
-→ 608 passed, 2 skipped
+→ 611 passed, 2 skipped
 ```
 
 Disposable PostgreSQL (real concurrency; own invocation):
@@ -496,10 +503,13 @@ independent of this slice (reproduces with the slice stashed).
 
 - **Operator reconciliation now exists (backend, this slice).** An authorized
   operator can inspect why a `recovery_required` attempt is blocked and clear the
-  block only when server-side evidence supports it. **Still missing:**
-  Cancel/Flatten execution (when exposure is open, reconciliation is blocked and
-  the operator has no backend action to settle it), and the frontend for the
-  reconciliation surface (§8 is the API handoff).
+  block only when server-side evidence supports it. **Restriction:** there is no
+  durable execution-settlement barrier, so a **trading-capable** attempt remains
+  blocked with `EXECUTION_QUIESCENCE_UNVERIFIED`; only `unlaunched` and
+  `data_only_completed` attempts reconcile today. **Still missing:** the barrier
+  itself, Cancel/Flatten execution (when exposure is open the operator has no
+  backend action to settle it), and the frontend for the reconciliation surface
+  (§8 is the API handoff).
 - **Scheduling is not implemented.** Discovery lists `queued` jobs; nothing
   creates them on a schedule. The supervisor polls (`run_forever`) or runs once.
 - **Options fail-closed mode propagation and the futures contract resolver**
@@ -668,6 +678,7 @@ plus `handoff_at`, `process_cleanup_state`, `process_cleanup_at`,
 | `PROTECTION_UNKNOWN` / `RECOVERY_ACTION_PENDING` | Protection state unavailable / recovery action outstanding |
 | `EVIDENCE_UNAVAILABLE` | A required evidence source could not be read |
 | `EVIDENCE_CHANGED` | Execution evidence changed between assessment and commit (re-inspect) |
+| `EXECUTION_QUIESCENCE_UNVERIFIED` | No durable barrier proves already-admitted execution cannot complete; trading-capable reconciliation blocked |
 | `HOSTED_JOB_ACTIVE` | Attempt is live; stop it before reconciling |
 | `HOSTED_JOB_NOT_BLOCKED` | Replacement is not blocked |
 
