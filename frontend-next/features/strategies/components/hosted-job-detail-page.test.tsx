@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import type { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -36,6 +37,7 @@ import {
   fetchHostedJobLogs,
   fetchHostedJobNotifications,
   inspectHostedReconciliation,
+  stopHostedJob,
 } from "@/lib/hosted-strategies/api";
 
 function renderPage(ui: ReactElement = <HostedJobDetailPage strategyId="s-1" jobId="j-1" />) {
@@ -88,7 +90,64 @@ describe("HostedJobDetailPage", () => {
     vi.mocked(fetchHostedJobLogs).mockReset();
     vi.mocked(fetchHostedJobNotifications).mockReset();
     vi.mocked(inspectHostedReconciliation).mockReset();
+    vi.mocked(stopHostedJob).mockReset();
     vi.mocked(fetchHostedJobNotifications).mockResolvedValue({ job_id: "j-1", run_id: "run-1", events: [] });
+  });
+
+  it("offers Stop for a queued (unlaunched) attempt", async () => {
+    vi.mocked(fetchHostedJob).mockResolvedValue(
+      job({
+        status: "queued",
+        desired_state: "started",
+        handoff_at: null,
+        run_id: null,
+        replacement_blocked: true,
+        process_cleanup_state: null,
+        stop_requested_at: null,
+        stop_requested_by: null,
+        stop: {
+          requested: false,
+          state: "none",
+          requested_at: null,
+          requested_by: null,
+          replacement_blocked: true,
+          note: "Queued; no stop requested. Stop does not cancel orders or flatten.",
+        },
+      }),
+    );
+    vi.mocked(fetchHostedJobLogs).mockResolvedValue({
+      job_id: "j-1",
+      available: false,
+      truncated: false,
+      source: null,
+      next_seq: 0,
+      entries: [],
+      notice: "No child was launched for this attempt; no logs exist.",
+    });
+    vi.mocked(stopHostedJob).mockResolvedValue({} as never);
+    vi.mocked(inspectHostedReconciliation).mockResolvedValue({
+      job_id: "j-1",
+      strategy_id: "s-1",
+      attempt: 2,
+      replacement_blocked: true,
+      assessment: {
+        allowed: false,
+        case: "blocked",
+        reason_code: "HOSTED_JOB_ACTIVE",
+        blocking_reasons: ["HOSTED_JOB_ACTIVE"],
+        notes: [],
+      },
+      evidence: {},
+      history: [],
+    });
+    renderPage();
+
+    expect(await screen.findByText(/Queued; no stop requested/)).toBeInTheDocument();
+    expect(screen.getByText(/never launched; stopping it prevents launch/)).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /stop attempt #2/i }));
+    await waitFor(() => expect(stopHostedJob).toHaveBeenCalledWith("s-1", "j-1", { attempt: 2 }));
   });
 
   it("shows unconfirmed cleanup as not confirmed stopped", async () => {

@@ -399,15 +399,21 @@ def _stop_view(job: Any) -> dict:
     blocked = _job_replacement_blocked(job)
     if status in {"queued", "starting", "running"}:
         if not requested:
+            label = {"queued": "Queued", "starting": "Starting", "running": "Running"}.get(status, status)
             return {"requested": False, "state": "none", "requested_at": None, "requested_by": None,
                     "replacement_blocked": blocked,
-                    "note": "Running; no stop requested. Stop does not cancel orders or flatten."}
+                    "note": f"{label}; no stop requested. Stop does not cancel orders or flatten."}
         state = "requested" if (status == "queued" or not launched) else "stopping"
         note = ("Stop requested; the supervisor will stop the child and complete the authorized "
                 "terminal transition. Stop does not cancel orders or flatten.")
         return {"requested": True, "state": state, "requested_at": _iso(job.stop_requested_at),
                 "requested_by": job.stop_requested_by, "replacement_blocked": blocked, "note": note}
     if status in {"stopped", "recovery_required", "failed"}:
+        if not launched:
+            return {"requested": requested, "state": "confirmed",
+                    "requested_at": _iso(job.stop_requested_at), "requested_by": job.stop_requested_by,
+                    "replacement_blocked": blocked,
+                    "note": "Stopped before launch; no child process was ever started."}
         if launched and str(job.process_cleanup_state or "") != "confirmed":
             return {"requested": requested, "state": "cleanup_unresolved",
                     "requested_at": _iso(job.stop_requested_at), "requested_by": job.stop_requested_by,

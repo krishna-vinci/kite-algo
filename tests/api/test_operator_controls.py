@@ -213,6 +213,29 @@ async def test_stop_queued_job_does_not_launch(session_factory, monkeypatch):
     assert persisted.status == "stopped" and persisted.desired_state == "stopped"
 
 
+@pytest.mark.asyncio
+async def test_queued_stop_view_does_not_claim_running(session_factory, monkeypatch):
+    """A queued attempt is stoppable and its note must not say "Running"."""
+    repo = _repo(session_factory)
+    strategy, version = _strategy(repo)
+    async with _client(session_factory, monkeypatch) as client:
+        created = (await client.post(f"{BASE}/{strategy.id}/jobs", json=_run_body(version.id))).json()["job"]
+        detail = (await client.get(f"{BASE}/{strategy.id}/jobs/{created['job_id']}")).json()
+        assert detail["status"] == "queued"
+        assert detail["stop"]["requested"] is False
+        assert detail["stop"]["note"].startswith("Queued; no stop requested")
+        assert "Running" not in detail["stop"]["note"]
+
+        # Stopping it prevents launch: no process ever existed, and the wording
+        # must not claim process cleanup that never applied.
+        stopped = (await client.post(
+            f"{BASE}/{strategy.id}/jobs/{created['job_id']}/stop", json={"attempt": 1}
+        )).json()
+        assert stopped["stop"]["state"] == "confirmed"
+        assert stopped["stop"]["note"].startswith("Stopped before launch")
+        assert repo.get_job(OWNER, created["job_id"]).handoff_at is None
+
+
 def _to_running(repo, strategy, version, *, launched=True):
     job = repo.create_job(
         strategy_id=strategy.id, version_id=version.id, owner_id=OWNER, job_kind="finite",

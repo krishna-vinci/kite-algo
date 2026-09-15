@@ -180,12 +180,15 @@ function RunNowForm({
 }>) {
   const mutation = useRunHostedStrategy(strategyId);
   const optionsQuery = useHostedOptions();
-  const [versionId, setVersionId] = useState(versions[0]?.version_id ?? "");
+  // Versions arrive oldest-first; default the launch to the newest revision so
+  // registering a new version does not silently run the previous one.
+  const newestVersion = versions.length > 0 ? versions[versions.length - 1] : undefined;
+  const [versionId, setVersionId] = useState(newestVersion?.version_id ?? "");
   const [params, setParams] = useState("{}");
   const [idempotencyKey, setIdempotencyKey] = useState(() => newIdempotencyKey());
   const [acknowledgedJob, setAcknowledgedJob] = useState<string | null>(null);
 
-  const selected = versions.find((version) => version.version_id === versionId) ?? versions[0];
+  const selected = versions.find((version) => version.version_id === versionId) ?? newestVersion;
 
   async function submit() {
     if (!selected) {

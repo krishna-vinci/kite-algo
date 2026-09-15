@@ -21,6 +21,8 @@ describe("hosted strategy format helpers", () => {
   it("keeps the cleanup-unresolved stop state distinct from confirmed", () => {
     expect(stopStateLabel("cleanup_unresolved")).toBe("Cleanup unresolved");
     expect(stopStateLabel("confirmed")).toBe("Stopped and process cleanup confirmed");
+    // A never-launched attempt must not claim process cleanup.
+    expect(stopStateLabel("confirmed", false)).toBe("Stopped before launch");
   });
 
   it("frames a successful run-now response as queued, and a replay as a replay", () => {
@@ -38,11 +40,21 @@ describe("hosted strategy format helpers", () => {
     const conflict = new ApiClientError(409, {
       detail: { rejection_reason: "IDEMPOTENCY_CONFLICT", message: "different request" },
     });
-    expect(hostedErrorMessage(conflict)).toBe("IDEMPOTENCY_CONFLICT: different request");
+    expect(hostedErrorMessage(conflict)).toContain("different request");
+    expect(hostedErrorMessage(conflict)).toContain("IDEMPOTENCY_CONFLICT");
     const blocked = new ApiClientError(409, {
       detail: { rejection_reason: "EXECUTION_QUIESCENCE_UNVERIFIED", blocking_reasons: ["STALE_LEDGER"] },
     });
-    expect(hostedErrorMessage(blocked)).toBe("EXECUTION_QUIESCENCE_UNVERIFIED (STALE_LEDGER)");
+    expect(hostedErrorMessage(blocked)).toContain("EXECUTION_QUIESCENCE_UNVERIFIED");
+    // Known codes get operator copy; the raw code stays alongside it.
+    const strategyBlocked = new ApiClientError(409, { detail: "STRATEGY_BLOCKED" });
+    expect(hostedErrorMessage(strategyBlocked)).toContain("active or unreconciled attempt");
+    expect(hostedErrorMessage(strategyBlocked)).toContain("STRATEGY_BLOCKED");
+    // An unknown reason keeps the server's blocking reasons.
+    const unknown = new ApiClientError(409, {
+      detail: { rejection_reason: "SOMETHING_NEW", blocking_reasons: ["A", "B"] },
+    });
+    expect(hostedErrorMessage(unknown)).toBe("SOMETHING_NEW (A, B)");
     expect(hostedErrorMessage(new Error("boom"))).toBe("boom");
     expect(hostedErrorMessage("nope")).toBe("Request failed");
   });

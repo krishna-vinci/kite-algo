@@ -14,7 +14,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { SectionLabel } from "@/components/operator/section-label";
 import {
   useHostedJob,
-  useHostedJobLogs,
+  useHostedJobLogPages,
   useHostedJobNotifications,
   useHostedReconciliation,
   useReconcileHostedJob,
@@ -26,17 +26,16 @@ import {
   jobStatusTone,
   stopStateLabel,
 } from "@/features/strategies/lib/format";
+import type { JobLogEntry } from "@/lib/hosted-strategies/types";
 
 const EXECUTION_QUIESCENCE_UNVERIFIED = "EXECUTION_QUIESCENCE_UNVERIFIED";
 
-function StopCard({ strategyId, jobId, attempt, jobStatus }: Readonly<{
+function StopCard({ strategyId, jobId, attempt }: Readonly<{
   strategyId: string;
   jobId: string;
   attempt: number;
-  jobStatus: string;
 }>) {
   const stopMutation = useStopHostedJob(strategyId, jobId);
-  const terminal = ["stopped", "failed", "recovery_required"].includes(jobStatus);
 
   async function stop() {
     try {
@@ -49,12 +48,7 @@ function StopCard({ strategyId, jobId, attempt, jobStatus }: Readonly<{
 
   return (
     <div className="flex items-center gap-3">
-      <Button
-        variant="outline"
-        onClick={stop}
-        disabled={stopMutation.isPending || terminal}
-        title={terminal ? "The attempt is already terminal" : undefined}
-      >
+      <Button variant="outline" onClick={stop} disabled={stopMutation.isPending}>
         <OctagonIcon className="size-4" aria-hidden />
         Stop attempt #{attempt}
       </Button>
@@ -66,9 +60,24 @@ function StopCard({ strategyId, jobId, attempt, jobStatus }: Readonly<{
 }
 
 function LogsCard({ strategyId, jobId }: Readonly<{ strategyId: string; jobId: string }>) {
-  const [afterSeq, setAfterSeq] = useState(0);
-  const logsQuery = useHostedJobLogs(strategyId, jobId, { after_seq: afterSeq, limit: 200 });
-  const logs = logsQuery.data;
+  // Each page is its own query, so "Load more" appends instead of replacing the
+  // output the operator has already read.
+  const [offsets, setOffsets] = useState<number[]>([0]);
+  const results = useHostedJobLogPages(strategyId, jobId, offsets);
+  const logs = results[0]?.data;
+  const logsQuery = {
+    isLoading: results.some((result) => result.isLoading),
+    isError: results.some((result) => result.isError),
+    error: results.find((result) => result.isError)?.error,
+  };
+  const collected = new Map<number, JobLogEntry>();
+  for (const result of results) {
+    for (const entry of result.data?.entries ?? []) collected.set(entry.seq, entry);
+  }
+  const page = [...collected.values()].sort((a, b) => a.seq - b.seq);
+  const lastSeq = page.length > 0 ? page[page.length - 1].seq : 0;
+  const lastPage = results[results.length - 1]?.data;
+  const hasMore = (lastPage?.entries.length ?? 0) >= 200;
 
   return (
     <Card>
@@ -106,19 +115,20 @@ function LogsCard({ strategyId, jobId }: Readonly<{ strategyId: string; jobId: s
               </Alert>
             ) : null}
             <pre className="max-h-96 overflow-auto rounded-lg border bg-muted/30 p-3 font-mono text-xs">
-              {logs.entries.map((entry) => `[${entry.seq}] ${entry.content}`).join("")}
+              {page.map((entry) => `[${entry.seq}] ${entry.content}`).join("")}
             </pre>
             <p className="text-xs text-muted-foreground">
               {logs.source === "post_termination"
-                ? "Collected after the child terminated (live streaming is not implemented)."
-                : logs.notice}
+                ? "Collected after the child terminated (live streaming is not implemented). "
+                : `${logs.notice} `}
+              Showing {page.length} chunk(s) up to seq {lastSeq}.
             </p>
-            {logs.entries.length >= 200 ? (
+            {hasMore ? (
               <Button
                 size="sm"
                 variant="outline"
                 className="self-start"
-                onClick={() => setAfterSeq(logs.next_seq)}
+                onClick={() => setOffsets((current) => [...current, lastPage?.next_seq ?? lastSeq])}
               >
                 Load more
               </Button>
@@ -314,6 +324,8 @@ export function HostedJobDetailPage({ strategyId, jobId }: Readonly<{ strategyId
   const job = jobQuery.data;
   const launched = job.handoff_at !== null;
   const cleanupConfirmed = job.process_cleanup_state === "confirmed";
+  // Queued attempts are stoppable too: stopping one prevents its launch.
+  const stoppable = ["queued", "starting", "running"].includes(job.status);
 
   return (
     <div className="flex flex-col gap-6">
@@ -378,22 +390,26 @@ export function HostedJobDetailPage({ strategyId, jobId }: Readonly<{ strategyId
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
           <p className="text-sm text-muted-foreground" data-testid="stop-state">
-            {stopStateLabel(job.stop.state)} — {job.stop.note}
+            {stopStateLabel(job.stop.state, launched)} — {job.stop.note}
           </p>
-          {job.handoff_at !== null ? (
-            <StopCard
-              strategyId={strategyId}
-              jobId={jobId}
-              attempt={job.attempt}
-              jobStatus={job.status}
-            />
+          {stoppable ? (
+            <StopCard strategyId={strategyId} jobId={jobId} attempt={job.attempt} />
           ) : (
             <p className="text-xs text-muted-foreground">
-              {cleanupConfirmed
-                ? "Process cleanup confirmed."
-                : "This attempt was never launched; stopping it prevents launch without any process cleanup."}
+              {job.replacement_blocked
+                ? "Already terminal; the replacement block stays until reconciliation."
+                : "Already terminal; nothing to stop."}
             </p>
           )}
+          {stoppable && !launched ? (
+            <p className="text-xs text-muted-foreground">
+              This attempt was never launched; stopping it prevents launch without needing any process
+              cleanup.
+            </p>
+          ) : null}
+          {launched && cleanupConfirmed ? (
+            <p className="text-xs text-muted-foreground">Process cleanup confirmed.</p>
+          ) : null}
         </CardContent>
       </Card>
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { hostedKeys } from "@/features/strategies/hooks/keys";
 import {
@@ -74,16 +74,20 @@ export function useHostedJob(strategyId: string | null, jobId: string | null) {
   });
 }
 
-export function useHostedJobLogs(
-  strategyId: string | null,
-  jobId: string | null,
-  params?: { after_seq?: number; limit?: number },
-) {
-  return useQuery({
-    queryKey: [...hostedKeys.logs(strategyId ?? "", jobId ?? ""), params?.after_seq ?? 0, params?.limit ?? 0],
-    queryFn: () => fetchHostedJobLogs(strategyId as string, jobId as string, params),
-    enabled: Boolean(strategyId && jobId),
-    refetchInterval: 5_000,
+/**
+ * One query per requested page offset. Keeping the pages as separate queries is
+ * what lets "Load more" append instead of replacing what the operator already
+ * read (and avoids setState-in-effect accumulation).
+ */
+export function useHostedJobLogPages(strategyId: string | null, jobId: string | null, offsets: number[]) {
+  return useQueries({
+    queries: offsets.map((offset) => ({
+      queryKey: [...hostedKeys.logs(strategyId ?? "", jobId ?? ""), offset, 200],
+      queryFn: () =>
+        fetchHostedJobLogs(strategyId as string, jobId as string, { after_seq: offset, limit: 200 }),
+      enabled: Boolean(strategyId && jobId),
+      refetchInterval: 5_000,
+    })),
   });
 }
 
