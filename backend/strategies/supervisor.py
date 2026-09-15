@@ -46,6 +46,7 @@ from backend.strategies.supervisor_api import (
     SupervisorApiError,
     SupervisorTransportError,
 )
+from backend.strategies.supervisor_health import SupervisorHealth
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,9 @@ class SupervisorConfig:
     require_identity_separation: bool = False
     #: Test-only bound on how long to observe a child before treating it as hung.
     observe_timeout_s: Optional[float] = None
+    #: Read-only health snapshot the loop publishes for the container
+    #: healthcheck (empty means "<workspace>/state/health.json").
+    health_file: str = ""
 
     def __post_init__(self) -> None:
         if not self.child_base_url:
@@ -193,10 +197,16 @@ class SupervisorConfig:
             api_timeout_s=_f("HOSTED_SUPERVISOR_API_TIMEOUT_S", 10.0),
             progress_observation_max_failures=int(_f("HOSTED_SUPERVISOR_PROGRESS_OBS_MAX_FAILURES", 3)),
             require_identity_separation=_b("HOSTED_SUPERVISOR_REQUIRE_IDENTITY_SEPARATION", False),
+            health_file=env.get("HOSTED_SUPERVISOR_HEALTH_FILE") or "",
         )
 
     def workspace(self) -> Path:
         return Path(self.workspace_root)
+
+    def health_path(self) -> Path:
+        if self.health_file:
+            return Path(self.health_file)
+        return self.workspace() / "state" / "health.json"
 
 
 @dataclass
@@ -253,6 +263,7 @@ class HostedSupervisor:
         self._active: Dict[str, Any] = {}
         self._stopping = False
         self._prepare_workspace()
+        self.health = SupervisorHealth(config.health_path())
 
     def _prepare_workspace(self) -> None:
         """Create the supervisor-owned layout with child-safe permissions.
@@ -648,14 +659,36 @@ class HostedSupervisor:
         return age > graceful
 
     def run_once(self, job_id: Optional[str] = None) -> Dict[str, Any]:
-        jobs = self.discover()
+        try:
+            jobs = self.discover()
+        except SupervisorApiError as exc:
+            # 401/403 is permanent (the credential will not heal itself) and is
+            # reported as such so the container healthcheck can say so instead of
+            # merely "unreachable".
+            denied = int(getattr(exc, "status_code", 0) or 0) in (401, 403)
+            self._record_health(
+                "api_denied" if denied else "api_error",
+                auth_failed=denied,
+            )
+            return {
+                "status": "api_denied" if denied else "api_error",
+                "reason": f"http_{getattr(exc, 'status_code', 'unknown')}",
+            }
+        except SupervisorTransportError as exc:
+            self._record_health("api_unreachable", auth_failed=False)
+            return {"status": "api_unreachable", "reason": str(exc)[:200]}
         if job_id is not None:
             jobs = [entry for entry in jobs if str(entry.get("job_id")) == job_id]
             if not jobs:
                 return {"status": "not_found", "job_id": job_id}
         if not jobs:
+            self._record_health(None)
             return {"status": "idle"}
-        return self._supervise(jobs[0])
+        result = self._supervise(jobs[0])
+        # A failed CHILD is the job's outcome, not the supervisor's: the loop
+        # itself reached the control plane and did its work, so it stays healthy.
+        self._record_health(None)
+        return result
 
     def _supervise(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         job_id = str(entry["job_id"])
@@ -960,6 +993,17 @@ class HostedSupervisor:
             wait_for = max(0.02, min(self.config.progress_poll_s, next_heartbeat - self._monotonic()))
             self._sleep(wait_for)
 
+    def _record_health(self, failure: Optional[str], *, auth_failed: bool = False) -> None:
+        """Publish the loop's snapshot. Never raises, never includes secrets."""
+        try:
+            active = len(self._active)
+            if failure is None:
+                self.health.record_success(active_children=active)
+            else:
+                self.health.record_failure(failure, auth_failed=auth_failed, active_children=active)
+        except Exception:  # pragma: no cover - health must never break supervision
+            logger.warning("supervisor_health_record_failed", exc_info=True)
+
     # -- signals ------------------------------------------------------------
 
     def request_stop(self) -> None:
@@ -993,6 +1037,7 @@ class HostedSupervisor:
 
     def run_forever(self, *, idle_sleep_s: float = 5.0) -> None:
         logger.info("hosted_supervisor_started", extra={"lease_owner": self.config.lease_owner})
+        self.health.record_start(lease_owner=self.config.lease_owner)
         while not self._stopping:
             try:
                 result = self.run_once()
@@ -1025,6 +1070,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     config = SupervisorConfig.from_env()
     supervisor = HostedSupervisor(config)
     supervisor.install_signal_handlers()
+    # Publish liveness before the first (possibly slow) control-plane contact so
+    # the healthcheck distinguishes "starting" from "stalled".
+    supervisor.health.record_start(lease_owner=config.lease_owner)
 
     # Wire startup inspection: resolve interrupted work before doing anything new.
     startup = supervisor.startup_recover()

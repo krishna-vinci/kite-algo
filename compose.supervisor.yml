@@ -39,6 +39,14 @@ services:
       HOSTED_SUPERVISOR_CHILD_UID: ${HOSTED_SUPERVISOR_CHILD_UID:-10002}
       HOSTED_SUPERVISOR_CHILD_GID: ${HOSTED_SUPERVISOR_CHILD_GID:-10002}
       HOSTED_SUPERVISOR_REQUIRE_IDENTITY_SEPARATION: "true"
+      # Read-only health: the loop publishes a nonsecret snapshot next to its
+      # attempts (root-only), and the healthcheck only reads that file. The
+      # windows below are the verdict bounds; the container `start_period` gives
+      # a fresh container time to reach the control plane before it counts.
+      HOSTED_SUPERVISOR_HEALTH_FILE: /var/lib/kite-supervisor/state/health.json
+      HOSTED_SUPERVISOR_HEALTH_STARTUP_GRACE_S: ${HOSTED_SUPERVISOR_HEALTH_STARTUP_GRACE_S:-60}
+      HOSTED_SUPERVISOR_HEALTH_LOOP_STALE_S: ${HOSTED_SUPERVISOR_HEALTH_LOOP_STALE_S:-45}
+      HOSTED_SUPERVISOR_HEALTH_CONTROL_PLANE_STALE_S: ${HOSTED_SUPERVISOR_HEALTH_CONTROL_PLANE_STALE_S:-150}
       PYTHONUNBUFFERED: "1"
     volumes:
       - strategy_runner_state:/var/lib/kite-supervisor
@@ -46,6 +54,14 @@ services:
       - python
       - -m
       - backend.strategies.supervisor
+    healthcheck:
+      # Read-only: reads the published snapshot, makes no API call, claims no
+      # job, renews no lease, and prints only a reason code.
+      test: ["CMD", "python", "-m", "backend.strategies.supervisor_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
     depends_on:
       finance-app:
         condition: service_healthy
