@@ -399,6 +399,14 @@ export function ScreenerEditor({ scope, initialDraft, baseDocument, edit }: Scre
                         {choice.label}
                       </SelectItem>
                     ))}
+                    {/* The backend accepts any 5m..31d, which can include a
+                        duration the fixed list does not name (e.g. "2h"). Show
+                        the loaded value rather than an empty box. */}
+                    {DURATION_CHOICES.every((choice) => choice.value !== draft.schedule.every) ? (
+                      <SelectItem value={draft.schedule.every}>
+                        {draft.schedule.every} (current)
+                      </SelectItem>
+                    ) : null}
                   </SelectContent>
                 </Select>
               </div>
@@ -472,6 +480,11 @@ export function ScreenerEditor({ scope, initialDraft, baseDocument, edit }: Scre
                       {choice.label}
                     </SelectItem>
                   ))}
+                  {FRESHNESS_CHOICES.every((choice) => choice.seconds !== draft.freshness_limit_s) ? (
+                    <SelectItem value={String(draft.freshness_limit_s)}>
+                      {Math.round(draft.freshness_limit_s / 3600)}h (current)
+                    </SelectItem>
+                  ) : null}
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">

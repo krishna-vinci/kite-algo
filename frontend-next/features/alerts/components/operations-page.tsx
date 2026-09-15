@@ -33,6 +33,7 @@ import {
   useAlertsTokenPresets,
   useAlertsTokens,
 } from "@/features/alerts/hooks/use-alerts-queries";
+import { alertsErrorMessage } from "@/features/alerts/lib/errors";
 import { formatTimestamp } from "@/features/alerts/lib/format";
 import { readRuntimeAvailability } from "@/features/alerts/lib/health";
 
@@ -126,10 +127,23 @@ export function ChannelsPanel({ scope }: Readonly<{ scope: string | null }>) {
           <PlusIcon className="size-4" aria-hidden />
           Save channel
         </Button>
+        {upsert.error ? (
+          <p className="mt-2 text-xs text-rose-300">
+            {alertsErrorMessage(upsert.error, "Could not save the channel.")}
+          </p>
+        ) : null}
       </Panel>
 
       {channelsQuery.isLoading ? (
         <Skeleton className="h-24 w-full rounded-xl" />
+      ) : channelsQuery.error ? (
+        <Alert variant="destructive">
+          <AlertCircleIcon />
+          <AlertTitle>Could not load destinations</AlertTitle>
+          <AlertDescription>
+            {alertsErrorMessage(channelsQuery.error, "The channels request failed.")}
+          </AlertDescription>
+        </Alert>
       ) : channels.length === 0 ? (
         <p className="text-sm text-muted-foreground">No destinations configured yet.</p>
       ) : (
@@ -195,7 +209,9 @@ export function ChannelsPanel({ scope }: Readonly<{ scope: string | null }>) {
           <AlertCircleIcon />
           <AlertTitle>Test failed</AlertTitle>
           <AlertDescription>
-            {test.error instanceof Error ? test.error.message : "Unknown error"}
+            {/* A missing environment variable is a 400 whose body names the
+                variable, which is the actionable part (handoff §10). */}
+            {alertsErrorMessage(test.error, "Unknown error")}
           </AlertDescription>
         </Alert>
       ) : null}
@@ -369,10 +385,28 @@ export function TokensPanel({ scope }: Readonly<{ scope: string | null }>) {
           <PlusIcon className="size-4" aria-hidden />
           Create token
         </Button>
+        {presetsQuery.error ? (
+          <p className="mt-2 text-xs text-rose-300">
+            {alertsErrorMessage(presetsQuery.error, "Could not load the presets.")}
+          </p>
+        ) : null}
+        {create.error ? (
+          <p className="mt-2 text-xs text-rose-300">
+            {alertsErrorMessage(create.error, "Could not create the token.")}
+          </p>
+        ) : null}
       </Panel>
 
       {tokensQuery.isLoading ? (
         <Skeleton className="h-24 w-full rounded-xl" />
+      ) : tokensQuery.error ? (
+        <Alert variant="destructive">
+          <AlertCircleIcon />
+          <AlertTitle>Could not load worker tokens</AlertTitle>
+          <AlertDescription>
+            {alertsErrorMessage(tokensQuery.error, "The tokens request failed.")}
+          </AlertDescription>
+        </Alert>
       ) : tokens.length === 0 ? (
         <p className="text-sm text-muted-foreground">No worker tokens issued yet.</p>
       ) : (
@@ -416,6 +450,12 @@ export function TokensPanel({ scope }: Readonly<{ scope: string | null }>) {
         </ul>
       )}
 
+      {revoke.error ? (
+        <p className="text-xs text-rose-300">
+          {alertsErrorMessage(revoke.error, "Could not revoke the token.")}
+        </p>
+      ) : null}
+
       <OneTimeSecretDialog
         open={secret !== null}
         title="Worker token created"
@@ -445,6 +485,7 @@ export function ProducersPanel({ scope }: Readonly<{ scope: string | null }>) {
 
   const producers = producersQuery.data?.producers ?? [];
   const limits = healthQuery.data?.limits;
+  const producerHealth = healthQuery.data?.producers ?? [];
 
   return (
     <div className="flex flex-col gap-4">
@@ -511,6 +552,11 @@ export function ProducersPanel({ scope }: Readonly<{ scope: string | null }>) {
           <PlusIcon className="size-4" aria-hidden />
           Register
         </Button>
+        {create.error ? (
+          <p className="mt-2 text-xs text-rose-300">
+            {alertsErrorMessage(create.error, "Could not register the producer.")}
+          </p>
+        ) : null}
       </Panel>
 
       {limits ? (
@@ -528,10 +574,49 @@ export function ProducersPanel({ scope }: Readonly<{ scope: string | null }>) {
           </ul>
           <p className="mt-2 text-xs text-muted-foreground">{healthQuery.data?.note}</p>
         </Panel>
+      ) : healthQuery.error ? (
+        <Alert variant="destructive">
+          <AlertCircleIcon />
+          <AlertTitle>Could not load signal health</AlertTitle>
+          <AlertDescription>
+            {alertsErrorMessage(healthQuery.error, "The signals health request failed.")}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {/* Per-producer counters: accepted/late, expired-now, last receipt,
+          revoked/disabled — the operational half of the producer surface. */}
+      {producerHealth.length > 0 ? (
+        <Panel tone="subtle">
+          <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">
+            Producer status
+          </p>
+          <ul className="mt-2 flex flex-col gap-1 text-xs text-muted-foreground">
+            {producerHealth.map((entry) => {
+              const name = String(entry.name ?? entry.producer ?? "—");
+              const parts = Object.entries(entry)
+                .filter(([key]) => key !== "name" && key !== "producer")
+                .map(([key, value]) => `${key}: ${String(value)}`);
+              return (
+                <li key={name}>
+                  <span className="font-mono text-foreground">{name}</span> — {parts.join(" · ")}
+                </li>
+              );
+            })}
+          </ul>
+        </Panel>
       ) : null}
 
       {producersQuery.isLoading ? (
         <Skeleton className="h-24 w-full rounded-xl" />
+      ) : producersQuery.error ? (
+        <Alert variant="destructive">
+          <AlertCircleIcon />
+          <AlertTitle>Could not load producers</AlertTitle>
+          <AlertDescription>
+            {alertsErrorMessage(producersQuery.error, "The producers request failed.")}
+          </AlertDescription>
+        </Alert>
       ) : producers.length === 0 ? (
         <p className="text-sm text-muted-foreground">No producers registered yet.</p>
       ) : (
@@ -603,6 +688,18 @@ export function ProducersPanel({ scope }: Readonly<{ scope: string | null }>) {
         </ul>
       )}
 
+      {revoke.error || issueCredential.error || revokeCredential.error ? (
+        <ul className="flex flex-col gap-1 text-xs text-rose-300">
+          {revoke.error ? <li>{alertsErrorMessage(revoke.error, "Could not revoke the producer.")}</li> : null}
+          {issueCredential.error ? (
+            <li>{alertsErrorMessage(issueCredential.error, "Could not issue a credential.")}</li>
+          ) : null}
+          {revokeCredential.error ? (
+            <li>{alertsErrorMessage(revokeCredential.error, "Could not revoke the credential.")}</li>
+          ) : null}
+        </ul>
+      ) : null}
+
       <p className="flex items-start gap-2 text-xs text-muted-foreground">
         <CircleHelpIcon className="mt-0.5 size-3 shrink-0" aria-hidden />
         Values are SAMPLED by the consuming stage&apos;s candle clock and never trigger evaluation
@@ -649,6 +746,10 @@ function ProducerDetails({ producer, scope, onRevokeCredential, revoking }: Prod
         <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">Credentials</p>
         {credentialsQuery.isLoading ? (
           <Skeleton className="h-16 w-full rounded-lg" />
+        ) : credentialsQuery.error ? (
+          <p className="text-xs text-rose-300">
+            {alertsErrorMessage(credentialsQuery.error, "Could not load credentials.")}
+          </p>
         ) : credentials.length === 0 ? (
           <p className="text-sm text-muted-foreground">No credentials issued.</p>
         ) : (
@@ -687,6 +788,10 @@ function ProducerDetails({ producer, scope, onRevokeCredential, revoking }: Prod
         <p className="text-xs uppercase tracking-[0.2em] text-muted-foreground/60">Recent values</p>
         {valuesQuery.isLoading ? (
           <Skeleton className="h-16 w-full rounded-lg" />
+        ) : valuesQuery.error ? (
+          <p className="text-xs text-rose-300">
+            {alertsErrorMessage(valuesQuery.error, "Could not load values.")}
+          </p>
         ) : values.length === 0 ? (
           <p className="text-sm text-muted-foreground">No values received yet.</p>
         ) : (
@@ -753,7 +858,14 @@ export function PlatformHealthPanel({ scope }: Readonly<{ scope: string | null }
           <ul className="mt-2 flex flex-wrap gap-4 text-sm">
             <li>quarantined: {runtimeView.quarantined}</li>
             <li>failing subscriptions: {runtimeView.failedSubscriptions}</li>
-            <li>freshness policy: {runtime.ltp_freshness_enabled ? "on" : "off"}</li>
+            <li>
+              freshness policy:{" "}
+              {typeof runtime.ltp_freshness_enabled === "boolean"
+                ? runtime.ltp_freshness_enabled
+                  ? "on"
+                  : "off"
+                : "not reported"}
+            </li>
             {runtime.last_health_at ? (
               <li>last health: {formatTimestamp(runtime.last_health_at) ?? "—"}</li>
             ) : null}
@@ -798,8 +910,21 @@ export function PlatformHealthPanel({ scope }: Readonly<{ scope: string | null }
               Freshness counters
             </p>
             <ul className="mt-2 flex flex-wrap gap-4 text-sm">
-              <li>stale-tick instruments: {runtime.stale_tick_instruments ?? 0}</li>
-              <li>never-ticked instruments: {runtime.never_ticked_instruments ?? 0}</li>
+              {/* An absent counter is UNKNOWN, not zero: reporting 0 would
+                  tell the operator nothing is stale, which is the opposite of
+                  what an unreported counter means. */}
+              <li>
+                stale-tick instruments:{" "}
+                {typeof runtime.stale_tick_instruments === "number"
+                  ? runtime.stale_tick_instruments
+                  : "unknown"}
+              </li>
+              <li>
+                never-ticked instruments:{" "}
+                {typeof runtime.never_ticked_instruments === "number"
+                  ? runtime.never_ticked_instruments
+                  : "unknown"}
+              </li>
               {Object.entries(runtime.rejected_ticks ?? {}).map(([reason, count]) => (
                 <li key={reason}>
                   rejected · {reason}: {count}

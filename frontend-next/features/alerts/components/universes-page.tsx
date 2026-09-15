@@ -33,6 +33,7 @@ import {
   useAlertsUniverses,
   useAlertsWorkflows,
 } from "@/features/alerts/hooks/use-alerts-queries";
+import { alertsErrorMessage } from "@/features/alerts/lib/errors";
 import { formatTimestamp } from "@/features/alerts/lib/format";
 
 const KIND_HELP: Record<string, string> = {
@@ -294,6 +295,16 @@ export function UniversesPage({ scope }: Readonly<{ scope: string | null }>) {
           </Button>
         </div>
 
+        {preview.error ? (
+          <Alert variant="destructive">
+            <AlertCircleIcon />
+            <AlertTitle>Preview failed</AlertTitle>
+            <AlertDescription>
+              {alertsErrorMessage(preview.error, "The preview request failed.")}
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
         {preview.data ? (
           <div className="rounded-lg border border-border/60 p-3 text-sm">
             {/* Preview is explicitly non-persisting; saying so prevents an
@@ -314,7 +325,7 @@ export function UniversesPage({ scope }: Readonly<{ scope: string | null }>) {
             <AlertCircleIcon />
             <AlertTitle>Could not create</AlertTitle>
             <AlertDescription>
-              {create.error instanceof Error ? create.error.message : "Unknown error"}
+              {alertsErrorMessage(create.error, "Unknown error")}
             </AlertDescription>
           </Alert>
         ) : null}
@@ -322,6 +333,14 @@ export function UniversesPage({ scope }: Readonly<{ scope: string | null }>) {
 
       {universesQuery.isLoading ? (
         <Skeleton className="h-40 w-full rounded-xl" />
+      ) : universesQuery.error ? (
+        <Alert variant="destructive">
+          <AlertCircleIcon />
+          <AlertTitle>Could not load universes</AlertTitle>
+          <AlertDescription>
+            {alertsErrorMessage(universesQuery.error, "The universes request failed.")}
+          </AlertDescription>
+        </Alert>
       ) : universes.length === 0 ? (
         <p className="text-sm text-muted-foreground">No universes in this scope yet.</p>
       ) : (

@@ -559,17 +559,27 @@ export type AlertsUniverseResolveResponse = AlertsUniversePreviewResponse & {
 // screeners
 // ---------------------------------------------------------------------------
 
+/**
+ * One screener run. Mirrors the worker's `RunOut`
+ * (`backend/api/schemas/screeners.py`): `created_at`/`completed_at` — there is
+ * no `started_at`/`finished_at`, and the member count comes from the run-detail
+ * response, not the run row.
+ */
 export type AlertsScreenerRun = {
-  run_id?: string;
-  id?: string;
+  run_id: string;
+  workflow_id?: string;
+  workflow_revision_id?: string;
+  occurrence_key?: string;
+  scheduled_for?: string | null;
+  triggered_by?: string;
   status: string;
-  failure_reason?: string | null;
-  schedule_kind?: string | null;
-  started_at?: string | null;
-  finished_at?: string | null;
-  member_count?: number;
+  universe_revision?: number | null;
+  as_of?: string | null;
   coverage?: Record<string, unknown>;
   data_freshness?: Record<string, unknown> | null;
+  failure_reason?: string | null;
+  created_at?: string | null;
+  completed_at?: string | null;
   [key: string]: unknown;
 };
 

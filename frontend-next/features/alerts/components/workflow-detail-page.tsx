@@ -1,7 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { AlertCircleIcon, ArrowLeftIcon, PlayIcon, RotateCcwIcon } from "lucide-react";
+import {
+  AlertCircleIcon,
+  ArrowLeftIcon,
+  NetworkIcon,
+  PencilIcon,
+  PlayIcon,
+  RotateCcwIcon,
+} from "lucide-react";
 import { useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -23,6 +30,7 @@ import {
   useAlertsWorkflow,
   useAlertsWorkflowRevisions,
 } from "@/features/alerts/hooks/use-alerts-queries";
+import { alertsErrorMessage, isNotFound } from "@/features/alerts/lib/errors";
 import { formatTimestamp } from "@/features/alerts/lib/format";
 import type { AlertsIssue } from "@/features/alerts/types";
 
@@ -58,15 +66,18 @@ function RevisionPicker({
         </Button>
         {activate.error ? (
           <span className="text-xs text-rose-300">
-            {activate.error instanceof Error ? activate.error.message : "Activation failed"}
+            {alertsErrorMessage(activate.error, "Activation failed")}
           </span>
         ) : null}
       </div>
 
       {candidates.length > 0 ? (
         <details className="rounded-lg border border-border/60 p-3">
+          {/* These are revisions other than the active one — a newer draft as
+              well as an older revision — so the wording says "another", not
+              "earlier". Activating one makes it the revision in force. */}
           <summary className="cursor-pointer text-xs text-muted-foreground">
-            Roll back to an earlier revision ({candidates.length})
+            Switch to another revision ({candidates.length})
           </summary>
           <ul className="mt-2 flex flex-col gap-1">
             {candidates.map((revision) => (
@@ -89,7 +100,7 @@ function RevisionPicker({
                     activate.mutate(revision.revision, {
                       onSuccess: (result) =>
                         setNote(
-                          `Rolled back to r${revision.revision}. ${
+                          `Switched to r${revision.revision}. ${
                             result.subscriptions_created != null
                               ? `${result.subscriptions_created} subscription(s) materialized. `
                               : ""
@@ -99,7 +110,7 @@ function RevisionPicker({
                   }
                 >
                   <RotateCcwIcon className="size-3" aria-hidden />
-                  Roll back
+                  Activate
                 </Button>
               </li>
             ))}
@@ -128,14 +139,18 @@ export function WorkflowDetailPage({
   if (workflowQuery.isLoading) return <Skeleton className="h-96 w-full rounded-xl" />;
 
   if (workflowQuery.error || !workflowQuery.data) {
+    // A 404 means "not here" (which also covers a foreign owner id, by design).
+    // Anything else — 403 scope, 503 dependency, network — is a different
+    // problem and must not be presented as "this alert does not exist".
+    const notFound = !workflowQuery.error || isNotFound(workflowQuery.error);
     return (
       <Alert variant="destructive">
         <AlertCircleIcon />
-        <AlertTitle>Alert not found</AlertTitle>
+        <AlertTitle>{notFound ? "Alert not found" : "Could not load this alert"}</AlertTitle>
         <AlertDescription>
-          {workflowQuery.error instanceof Error
-            ? workflowQuery.error.message
-            : "This alert does not exist in the selected scope."}
+          {notFound
+            ? "This alert does not exist in the selected scope."
+            : alertsErrorMessage(workflowQuery.error, "The request failed.")}
         </AlertDescription>
       </Alert>
     );
@@ -144,11 +159,17 @@ export function WorkflowDetailPage({
   const workflow = workflowQuery.data;
   const activeRevision = workflow.active_revision?.revision ?? null;
   const isActive = Boolean(workflow.active_revision);
+  const archived = Boolean(workflow.archived);
   const issues: AlertsIssue[] = workflow.warnings ?? [];
+
+  const editHref =
+    workflow.kind === "screener"
+      ? `/alerts/screeners/${workflowId}/edit`
+      : `/alerts/${workflowId}/edit`;
 
   const run = (mutation: { mutate: (arg?: never, opts?: { onError?: (e: unknown) => void }) => void }) =>
     mutation.mutate(undefined, {
-      onError: (error) => setActionError(error instanceof Error ? error.message : "Action failed"),
+      onError: (error) => setActionError(alertsErrorMessage(error, "Action failed")),
     });
 
   return (
@@ -180,7 +201,32 @@ export function WorkflowDetailPage({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {isActive ? (
+            {/* The edit and canvas pages are otherwise unreachable: nothing
+                else links to them for alerts. */}
+            {!archived ? (
+              <>
+                <Button asChild variant="outline" size="sm">
+                  <Link href={editHref}>
+                    <PencilIcon className="size-4" aria-hidden />
+                    Edit
+                  </Link>
+                </Button>
+                <Button asChild variant="outline" size="sm">
+                  <Link href={`/alerts/${workflowId}/canvas`}>
+                    <NetworkIcon className="size-4" aria-hidden />
+                    Canvas
+                  </Link>
+                </Button>
+              </>
+            ) : null}
+
+            {archived ? (
+              // Archiving clears the active revision, so Resume would 409.
+              // The only lifecycle action left is to activate a revision again.
+              <span className="text-xs text-muted-foreground">
+                Archived — activate a revision to bring it back.
+              </span>
+            ) : isActive ? (
               <Button
                 variant="outline"
                 size="sm"
@@ -199,14 +245,17 @@ export function WorkflowDetailPage({
                 Resume
               </Button>
             )}
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={archive.isPending}
-              onClick={() => run(archive as never)}
-            >
-              Archive
-            </Button>
+
+            {!archived ? (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={archive.isPending}
+                onClick={() => run(archive as never)}
+              >
+                Archive
+              </Button>
+            ) : null}
           </div>
         </div>
       </div>

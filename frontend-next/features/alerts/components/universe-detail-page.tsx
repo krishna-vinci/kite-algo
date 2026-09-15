@@ -22,7 +22,15 @@ import {
   useAlertsUniverseMutations,
   useAlertsUniverseRevisions,
 } from "@/features/alerts/hooks/use-alerts-queries";
+import { alertsErrorMessage, isNotFound } from "@/features/alerts/lib/errors";
 import { formatTimestamp, summarizeList } from "@/features/alerts/lib/format";
+
+/** Coverage is a small map; render it readably instead of dumping JSON. */
+function summarizeCoverage(coverage: Record<string, unknown>): string | null {
+  const entries = Object.entries(coverage).filter(([, value]) => value !== null && value !== undefined);
+  if (entries.length === 0) return null;
+  return entries.map(([key, value]) => `${key}: ${String(value)}`).join(" · ");
+}
 
 export function UniverseDetailPage({
   name,
@@ -35,14 +43,15 @@ export function UniverseDetailPage({
   if (universeQuery.isLoading) return <Skeleton className="h-96 w-full rounded-xl" />;
 
   if (universeQuery.error || !universeQuery.data) {
+    const notFound = !universeQuery.error || isNotFound(universeQuery.error);
     return (
       <Alert variant="destructive">
         <AlertCircleIcon />
-        <AlertTitle>Universe not found</AlertTitle>
+        <AlertTitle>{notFound ? "Universe not found" : "Could not load this universe"}</AlertTitle>
         <AlertDescription>
-          {universeQuery.error instanceof Error
-            ? universeQuery.error.message
-            : "This universe does not exist in the selected scope."}
+          {notFound
+            ? "This universe does not exist in the selected scope."
+            : alertsErrorMessage(universeQuery.error, "The request failed.")}
         </AlertDescription>
       </Alert>
     );
@@ -88,7 +97,7 @@ export function UniverseDetailPage({
         </span>
         {resolve.error ? (
           <span className="text-xs text-rose-300">
-            {resolve.error instanceof Error ? resolve.error.message : "Resolution failed"}
+            {alertsErrorMessage(resolve.error, "Resolution failed")}
           </span>
         ) : null}
       </div>
@@ -106,9 +115,9 @@ export function UniverseDetailPage({
         ) : (
           <p className="mt-2 break-words font-mono text-xs">{members.join(", ")}</p>
         )}
-        {universe.latest_coverage ? (
+        {summarizeCoverage(universe.latest_coverage ?? {}) ? (
           <p className="mt-3 text-xs text-muted-foreground">
-            coverage: {JSON.stringify(universe.latest_coverage)}
+            coverage: {summarizeCoverage(universe.latest_coverage ?? {})}
           </p>
         ) : null}
       </Panel>
@@ -119,6 +128,14 @@ export function UniverseDetailPage({
         </h3>
         {revisionsQuery.isLoading ? (
           <Skeleton className="h-32 w-full rounded-xl" />
+        ) : revisionsQuery.error ? (
+          <Alert variant="destructive">
+            <AlertCircleIcon />
+            <AlertTitle>Could not load revision history</AlertTitle>
+            <AlertDescription>
+              {alertsErrorMessage(revisionsQuery.error, "The revisions request failed.")}
+            </AlertDescription>
+          </Alert>
         ) : revisions.length === 0 ? (
           <p className="text-sm text-muted-foreground">No revisions yet.</p>
         ) : (

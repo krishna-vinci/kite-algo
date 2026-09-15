@@ -27,6 +27,7 @@ import {
   useAlertsScreenerRuns,
   useAlertsWorkflow,
 } from "@/features/alerts/hooks/use-alerts-queries";
+import { alertsErrorMessage, isNotFound } from "@/features/alerts/lib/errors";
 import { formatTimestamp } from "@/features/alerts/lib/format";
 
 function runStatusTone(status: string): "positive" | "warning" | "danger" | "neutral" {
@@ -36,12 +37,45 @@ function runStatusTone(status: string): "positive" | "warning" | "danger" | "neu
   return "neutral";
 }
 
+/** Compact rendering of a member's computed values (score inputs / outputs). */
+function summarizeValues(values: Record<string, unknown>): string {
+  const entries = Object.entries(values);
+  if (entries.length === 0) return "—";
+  return entries
+    .map(([key, value]) =>
+      typeof value === "number" ? `${key}=${Number(value).toFixed(2)}` : `${key}=${String(value)}`,
+    )
+    .join(" · ");
+}
+
+/** Coverage / data-freshness maps returned per run, rendered readably. */
+function summarizeRecord(record: Record<string, unknown> | null | undefined): string | null {
+  if (!record) return null;
+  const entries = Object.entries(record).filter(([, value]) => value !== null && value !== undefined);
+  if (entries.length === 0) return null;
+  return entries.map(([key, value]) => `${key}: ${String(value)}`).join(" · ");
+}
+
 function RunMembers({ runId, scope }: Readonly<{ runId: string; scope: string | null }>) {
   const runQuery = useAlertsScreenerRun(runId, scope);
   if (runQuery.isLoading) return <Skeleton className="h-32 w-full rounded-xl" />;
-  if (!runQuery.data) return null;
+  if (runQuery.error || !runQuery.data) {
+    // Previously returned null on any non-data state, so a failed member fetch
+    // rendered as nothing at all instead of as an error.
+    return (
+      <Alert variant="destructive">
+        <AlertCircleIcon />
+        <AlertTitle>Could not load run members</AlertTitle>
+        <AlertDescription>
+          {alertsErrorMessage(runQuery.error, "The run detail request failed.")}
+        </AlertDescription>
+      </Alert>
+    );
+  }
 
   const { members, member_count, run } = runQuery.data;
+  const coverage = summarizeRecord(run.coverage);
+  const freshness = summarizeRecord(run.data_freshness);
 
   return (
     <Panel tone="subtle">
@@ -59,12 +93,26 @@ function RunMembers({ runId, scope }: Readonly<{ runId: string; scope: string | 
         </p>
       ) : null}
 
+      {run.failure_reason ? (
+        <p className="mt-2 text-xs text-rose-300">Failure reason: {run.failure_reason}</p>
+      ) : null}
+
+      {/* Coverage and data freshness are what make "complete" verifiable rather
+          than asserted. */}
+      {coverage ? (
+        <p className="mt-2 text-xs text-muted-foreground">Coverage — {coverage}</p>
+      ) : null}
+      {freshness ? (
+        <p className="mt-1 text-xs text-muted-foreground">Data freshness — {freshness}</p>
+      ) : null}
+
       <Table>
         <TableHeader>
           <TableRow>
             <TableHead>Rank</TableHead>
             <TableHead>Instrument</TableHead>
             <TableHead>Score</TableHead>
+            <TableHead>Values</TableHead>
             <TableHead>Passed</TableHead>
             <TableHead>Exclusion reason</TableHead>
           </TableRow>
@@ -76,6 +124,9 @@ function RunMembers({ runId, scope }: Readonly<{ runId: string; scope: string | 
               <TableCell className="font-mono text-sm">{member.instrument_key}</TableCell>
               <TableCell className="text-sm">
                 {member.score === null ? "—" : member.score.toFixed(4)}
+              </TableCell>
+              <TableCell className="max-w-[22rem] truncate text-xs text-muted-foreground">
+                {summarizeValues(member.values)}
               </TableCell>
               <TableCell>
                 <Badge variant={member.passed ? "secondary" : "outline"}>
@@ -107,7 +158,7 @@ function AttachmentBaselines({
         <AlertCircleIcon />
         <AlertTitle>Attachment baselines unavailable</AlertTitle>
         <AlertDescription>
-          {attachmentsQuery.error instanceof Error ? attachmentsQuery.error.message : "No data."}
+          {alertsErrorMessage(attachmentsQuery.error, "No data.")}
         </AlertDescription>
       </Alert>
     );
@@ -206,14 +257,15 @@ export function ScreenerPage({
   if (workflowQuery.isLoading) return <Skeleton className="h-96 w-full rounded-xl" />;
 
   if (workflowQuery.error || !workflowQuery.data) {
+    const notFound = !workflowQuery.error || isNotFound(workflowQuery.error);
     return (
       <Alert variant="destructive">
         <AlertCircleIcon />
-        <AlertTitle>Screener not found</AlertTitle>
+        <AlertTitle>{notFound ? "Screener not found" : "Could not load this screener"}</AlertTitle>
         <AlertDescription>
-          {workflowQuery.error instanceof Error
-            ? workflowQuery.error.message
-            : "This screener does not exist in the selected scope."}
+          {notFound
+            ? "This screener does not exist in the selected scope."
+            : alertsErrorMessage(workflowQuery.error, "The request failed.")}
         </AlertDescription>
       </Alert>
     );
@@ -221,6 +273,7 @@ export function ScreenerPage({
 
   const workflow = workflowQuery.data;
   const runs = runsQuery.data?.runs ?? [];
+  const runsNote = runsQuery.data?.note;
 
   return (
     <div className="flex flex-col gap-6 pb-8">
@@ -261,7 +314,21 @@ export function ScreenerPage({
         </Button>
         {trigger.error ? (
           <span className="text-xs text-rose-300">
-            {trigger.error instanceof Error ? trigger.error.message : "Manual run failed"}
+            {alertsErrorMessage(trigger.error, "Manual run failed")}
+          </span>
+        ) : null}
+        {/* A repeated idempotency key returns the existing run instead of
+            executing a second scan; say so rather than looking like nothing
+            happened. */}
+        {trigger.data?.status === "already_finalized" ? (
+          <span className="text-xs text-amber-300">
+            This run already exists for that request; no second scan was started.
+          </span>
+        ) : null}
+        {trigger.data?.status && trigger.data.status !== "already_finalized" ? (
+          <span className="text-xs text-muted-foreground">
+            Run {trigger.data.run_id ? trigger.data.run_id.slice(0, 8) : ""} accepted (
+            {trigger.data.status}).
           </span>
         ) : null}
       </div>
@@ -292,6 +359,15 @@ export function ScreenerPage({
         <div className="flex flex-col gap-4">
           {runsQuery.isLoading ? (
             <Skeleton className="h-40 w-full rounded-xl" />
+          ) : runsQuery.error ? (
+            // A failed run fetch is not "no runs". Show the failure.
+            <Alert variant="destructive">
+              <AlertCircleIcon />
+              <AlertTitle>Could not load runs</AlertTitle>
+              <AlertDescription>
+                {alertsErrorMessage(runsQuery.error, "The run history request failed.")}
+              </AlertDescription>
+            </Alert>
           ) : runs.length === 0 ? (
             <p className="text-sm text-muted-foreground">No runs recorded yet.</p>
           ) : (
@@ -300,28 +376,32 @@ export function ScreenerPage({
                 <TableHeader>
                   <TableRow>
                     <TableHead>Status</TableHead>
-                    <TableHead>Started</TableHead>
-                    <TableHead>Finished</TableHead>
-                    <TableHead>Members</TableHead>
+                    <TableHead>Created</TableHead>
+                    <TableHead>Completed</TableHead>
+                    <TableHead>Triggered by</TableHead>
                     <TableHead>Failure reason</TableHead>
                     <TableHead />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {runs.map((run) => {
-                    const id = String(run.run_id ?? run.id ?? "");
+                    const id = run.run_id;
                     return (
                       <TableRow key={id}>
                         <TableCell>
                           <StatusBadge tone={runStatusTone(run.status)}>{run.status}</StatusBadge>
                         </TableCell>
                         <TableCell className="text-sm text-muted-foreground">
-                          {formatTimestamp(run.started_at ?? null) ?? "—"}
+                          {formatTimestamp(run.created_at ?? null) ?? "—"}
                         </TableCell>
                         <TableCell className="text-sm text-muted-foreground">
-                          {formatTimestamp(run.finished_at ?? null) ?? "—"}
+                          {run.status === "running"
+                            ? "running…"
+                            : formatTimestamp(run.completed_at ?? null) ?? "—"}
                         </TableCell>
-                        <TableCell className="text-sm">{run.member_count ?? "—"}</TableCell>
+                        <TableCell className="text-sm text-muted-foreground">
+                          {run.triggered_by ?? "—"}
+                        </TableCell>
                         <TableCell className="text-xs text-rose-300">
                           {/* A failed run must say WHY rather than just failing. */}
                           {run.failure_reason ?? "—"}
@@ -343,6 +423,10 @@ export function ScreenerPage({
               </Table>
             </div>
           )}
+
+          {/* The runs-level caveat the server sends, shown on the list rather
+              than only inside an expanded member panel. */}
+          {runsNote ? <p className="text-xs text-muted-foreground">{runsNote}</p> : null}
 
           {selectedRun ? <RunMembers runId={selectedRun} scope={scope} /> : null}
 
