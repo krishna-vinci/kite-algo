@@ -65,6 +65,21 @@ ENV_SCRATCH = "KITE_ALGO_SCRATCH"
 _DEFAULT_SDK_PATH = str(Path(__file__).resolve().parents[2] / "sdk" / "python")
 
 
+def derive_child_base_url(lifecycle_base_url: str) -> str:
+    """Host-root base URL for the hosted child's SDK.
+
+    The lifecycle API is mounted under ``/api`` on the control plane, but the
+    SDK composes its own ``{base}/api/algo-workers/worker/...`` paths. Handing
+    the lifecycle URL straight to the child therefore produces a doubled prefix
+    (``/api/api/algo-workers/...``), so the trailing ``/api`` segment is removed
+    here. An explicit ``HOSTED_SUPERVISOR_CHILD_BASE_URL`` overrides this.
+    """
+    base = str(lifecycle_base_url or "").strip().rstrip("/")
+    if base.endswith("/api"):
+        base = base[: -len("/api")]
+    return base.rstrip("/")
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -84,6 +99,10 @@ class SupervisorConfig:
     max_log_bytes: int = 5 * 1024 * 1024
     child_python: str = sys.executable
     child_pythonpath: str = _DEFAULT_SDK_PATH
+    #: Base URL handed to the hosted child. The SDK appends its own
+    #: ``/api/algo-workers`` prefix, so this must be a host root; empty means
+    #: "derive from ``base_url``" (see ``derive_child_base_url``).
+    child_base_url: str = ""
     child_uid: Optional[int] = None
     child_gid: Optional[int] = None
     api_timeout_s: float = 10.0
@@ -97,6 +116,8 @@ class SupervisorConfig:
     observe_timeout_s: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if not self.child_base_url:
+            self.child_base_url = derive_child_base_url(self.base_url)
         self.validate()
 
     def validate(self) -> None:
@@ -166,6 +187,7 @@ class SupervisorConfig:
             max_log_bytes=int(_f("HOSTED_SUPERVISOR_MAX_LOG_BYTES", 5 * 1024 * 1024)),
             child_python=env.get("HOSTED_SUPERVISOR_CHILD_PYTHON", sys.executable),
             child_pythonpath=env.get("HOSTED_SUPERVISOR_CHILD_PYTHONPATH", _DEFAULT_SDK_PATH),
+            child_base_url=env.get("HOSTED_SUPERVISOR_CHILD_BASE_URL") or "",
             child_uid=_i("HOSTED_SUPERVISOR_CHILD_UID"),
             child_gid=_i("HOSTED_SUPERVISOR_CHILD_GID"),
             api_timeout_s=_f("HOSTED_SUPERVISOR_API_TIMEOUT_S", 10.0),
@@ -564,7 +586,7 @@ class HostedSupervisor:
             "HOME": str(scratch),
             "PYTHONUNBUFFERED": "1",
             "PYTHONPATH": self.config.child_pythonpath,
-            ENV_BASE_URL: self.config.base_url,
+            ENV_BASE_URL: self.config.child_base_url or derive_child_base_url(self.config.base_url),
             ENV_WORKER_TOKEN: config["worker_token"],
             ENV_RUN_ID: config["run_id"],
             ENV_SESSION_NONCE: config["session_nonce"],

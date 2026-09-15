@@ -299,6 +299,45 @@ async def test_repeat_prepare_fails_closed(harness):
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_serializes_session_heartbeat_timestamp(harness):
+    """A production-shaped worker repo returns a datetime, not an ISO string.
+
+    The response model declares ``last_heartbeat_at: Optional[str]``; returning
+    the raw datetime made every post-session heartbeat fail response validation
+    (HTTP 500) while the string-returning fake hid it.
+    """
+    repo, worker, app = harness
+    job = _queued_job(repo)
+    async with _client(app) as client:
+        await _claim(client, job)
+        prepared = await client.post(
+            f"{BASE}/jobs/{job.id}/prepare", json=_authority(epoch=1), headers=_headers()
+        )
+        assert prepared.status_code == 200, prepared.text
+        run_id = prepared.json()["run_id"]
+
+        async def datetime_heartbeat(strategy_run_id, *, expected_nonce):
+            run = await FakeWorkerRepository.record_run_heartbeat(
+                worker, strategy_run_id, expected_nonce=expected_nonce
+            )
+            if run is None:
+                return None
+            run["last_heartbeat_at"] = datetime.now(timezone.utc)
+            return run
+
+        worker.record_run_heartbeat = datetime_heartbeat  # type: ignore[assignment]
+        response = await client.post(
+            f"{BASE}/jobs/{job.id}/heartbeat",
+            json={**_authority(epoch=1), "lease_until": _lease()},
+            headers=_headers(),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert isinstance(body["last_heartbeat_at"], str)
+        assert run_id in worker.runs
+
+
+@pytest.mark.asyncio
 async def test_release_and_fence_at_boundary(harness):
     repo, _worker, app = harness
     job = _queued_job(repo)

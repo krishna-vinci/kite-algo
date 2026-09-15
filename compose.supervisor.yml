@@ -18,8 +18,14 @@ services:
     restart: unless-stopped
     # Only the supervisor credential and its own workspace are provided.
     environment:
-      HOSTED_SUPERVISOR_BASE_URL: http://finance-app:8777
+      # The control plane mounts its routers under /api; without the suffix every
+      # lifecycle call 404s (verified against an isolated deployment).
+      HOSTED_SUPERVISOR_BASE_URL: http://finance-app:8777/api
       HOSTED_SUPERVISOR_CREDENTIAL: ${HOSTED_SUPERVISOR_CREDENTIAL:?set HOSTED_SUPERVISOR_CREDENTIAL}
+      # Optional: the child SDK base URL (host root). Left unset it is derived
+      # from HOSTED_SUPERVISOR_BASE_URL by dropping the /api suffix, because the
+      # SDK appends /api/algo-workers itself.
+      HOSTED_SUPERVISOR_CHILD_BASE_URL: ${HOSTED_SUPERVISOR_CHILD_BASE_URL:-}
       HOSTED_SUPERVISOR_WORKSPACE: /var/lib/kite-supervisor
       HOSTED_SUPERVISOR_LEASE_SECONDS: ${HOSTED_SUPERVISOR_LEASE_SECONDS:-120}
       HOSTED_SUPERVISOR_HEARTBEAT_INTERVAL_S: ${HOSTED_SUPERVISOR_HEARTBEAT_INTERVAL_S:-30}

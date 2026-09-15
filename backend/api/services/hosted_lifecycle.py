@@ -532,7 +532,14 @@ async def heartbeat(
             updated = await worker_repo.record_run_heartbeat(job.run_id, expected_nonce=nonce)
             if updated is None:
                 raise HostedLifecycleError(409, "HOSTED_SESSION_CONFLICT")
-            session_heartbeat_at = updated.get("last_heartbeat_at")
+            # The worker repository returns a datetime; the response contract is a
+            # string. Leaking the raw value fails response validation (HTTP 500 on
+            # every heartbeat after a session exists).
+            raw_heartbeat = updated.get("last_heartbeat_at")
+            if hasattr(raw_heartbeat, "isoformat"):
+                session_heartbeat_at = raw_heartbeat.isoformat()
+            elif raw_heartbeat is not None:
+                session_heartbeat_at = str(raw_heartbeat)
     return {
         "status": "ok",
         "job_id": job_id,

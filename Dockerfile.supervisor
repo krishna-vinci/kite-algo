@@ -10,9 +10,17 @@ FROM python:3.14-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 \
-    && rm -rf /var/lib/apt/lists/*
+# Dependencies are deliberately limited to the hosted child's SDK runtime.
+# The supervisor itself is standard-library only (urllib/subprocess), and it
+# holds NO database or broker credentials, so the platform's backend
+# requirements (psycopg2, SQLAlchemy, FastAPI, uvicorn, kiteconnect, ...) are
+# NOT installed here: they are unnecessary, they previously broke the build
+# (psycopg2 has no binary wheel on slim images), and a DB driver inside the
+# runner image would work against the credential-free design.
+#
+# Limitation: strategies that need the SDK's optional extras (pandas/numpy/numba
+# indicators) are not supported by this image as configured.
+RUN pip install --no-cache-dir "requests>=2" "httpx>=0.27" "websockets>=12"
 
 # Dedicated unprivileged identity for hosted children.
 RUN groupadd -g 10002 strategy-child \
@@ -20,12 +28,15 @@ RUN groupadd -g 10002 strategy-child \
 
 WORKDIR /app
 
-COPY backend/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# The hosted child imports this SDK from its OWN working directory (the child
+# never runs with /app as cwd), so it must be installed rather than merely
+# copied into /app. The platform's repo-level `fundamentals/` package is not
+# part of this image (the SDK ships its own module).
+COPY sdk/python/pyproject.toml sdk/python/README.md /tmp/sdk/
+COPY sdk/python/kite_algo_worker/ /tmp/sdk/kite_algo_worker/
+RUN pip install --no-cache-dir /tmp/sdk && rm -rf /tmp/sdk
 
 COPY backend/ /app/backend/
-COPY fundamentals/ /app/fundamentals/
-COPY sdk/python/kite_algo_worker/ /app/kite_algo_worker/
 
 # No database credentials are provided to this image's default command.
 CMD ["python", "-m", "backend.strategies.supervisor"]

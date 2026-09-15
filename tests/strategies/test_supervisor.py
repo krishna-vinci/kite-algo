@@ -289,6 +289,33 @@ def test_spawn_refused_when_authority_not_live(tmp_path):
     assert result["status"] == "authority_lost"
 
 
+def test_child_base_url_is_a_host_root_for_the_sdk(tmp_path):
+    """The SDK adds ``/api/algo-workers`` itself, so the child must not receive
+    the lifecycle URL verbatim (that doubles the prefix) and an explicit
+    override must win."""
+    from backend.strategies.supervisor import SupervisorConfig, derive_child_base_url
+
+    assert derive_child_base_url("http://finance-app:8777/api") == "http://finance-app:8777"
+    assert derive_child_base_url("http://finance-app:8777/api/") == "http://finance-app:8777"
+    assert derive_child_base_url("http://finance-app:8777") == "http://finance-app:8777"
+
+    config = _config(tmp_path, base_url="http://finance-app:8777/api")
+    assert config.child_base_url == "http://finance-app:8777"
+    api = FakeApi()
+    sup = _HarnessSupervisor(config, api=api, sleep=lambda _s: None)
+    env = sup._child_env(api.prepare("hsj_1"), tmp_path)
+    assert env["KITE_ALGO_BASE_URL"] == "http://finance-app:8777"
+
+    explicit = SupervisorConfig.from_env(
+        {
+            "HOSTED_SUPERVISOR_BASE_URL": "http://finance-app:8777/api",
+            "HOSTED_SUPERVISOR_CREDENTIAL": "c",
+            "HOSTED_SUPERVISOR_CHILD_BASE_URL": "https://worker.example",
+        }
+    )
+    assert explicit.child_base_url == "https://worker.example"
+
+
 def test_child_environment_allowlist(tmp_path):
     api = FakeApi()
     sup = _supervisor(tmp_path, api)
