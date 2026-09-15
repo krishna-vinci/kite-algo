@@ -41,6 +41,7 @@ from sqlalchemy.pool import NullPool  # noqa: E402
 from backend.api.services import hosted_lifecycle  # noqa: E402
 from backend.strategies.repository import (  # noqa: E402
     SqlAlchemyStrategyRepository,
+    StrategyConflict,
     StrategyFenceError,
 )
 from tests.support.hosted_fakes import (  # noqa: E402
@@ -546,3 +547,104 @@ def test_reconcile_with_audit_rejects_changed_cleanup_evidence(env):
     assert result is None
     assert repo.get_job(OWNER, job.id).status == "recovery_required"
     assert repo.list_reconciliations(job.id) == []
+
+
+def test_concurrent_run_now_same_idempotency_key_creates_one_job(env):
+    factory, _engine = env
+    repo, claimed_job = _seed_job(factory)
+    # _seed_job already created a queued+claimed job; use a fresh strategy.
+    strategy = repo.create_strategy(
+        owner_id=OWNER,
+        name=f"rn-{uuid.uuid4().hex[:8]}",
+        description=None,
+        execution_mode="paper",
+        job_kind="finite",
+        account_scope="kite:paper",
+        max_duration_s=21600,
+        progress_deadline_s=600,
+        stale_exit_policy="exit_on_worker_stale",
+    )
+    version = repo.create_version(
+        strategy_id=strategy.id,
+        source="x",
+        source_sha256="a" * 64,
+        parameters_schema={"type": "object"},
+        capabilities_snapshot={"schema_version": 2, "capabilities": {"trade": True, "notify": False, "data": True}},
+        created_by=OWNER,
+    )
+    occurrence = f"manual:{strategy.id}:race-key"
+    errors = []
+    created = []
+
+    def _create():
+        try:
+            created.append(
+                repo.create_job(
+                    strategy_id=strategy.id,
+                    version_id=version.id,
+                    owner_id=OWNER,
+                    job_kind="finite",
+                    execution_mode="paper",
+                    params={},
+                    occurrence_key=occurrence,
+                )
+            )
+        except StrategyConflict:
+            errors.append("conflict")
+
+    threads = [threading.Thread(target=_create) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    # Exactly one job exists; a retry returns the same job (no duplicate).
+    assert not errors
+    assert len({job.id for job in created}) == 1
+    existing = repo.get_job_by_occurrence_key(occurrence)
+    assert existing is not None and existing.id == created[0].id
+
+
+def test_stop_request_retains_authority_for_cleanup(env):
+    factory, _engine = env
+    repo, job = _seed_job(factory)  # claimed -> starting
+    assert repo.request_stop_active(job.id, owner_id=OWNER, expected_attempt=1, actor=OWNER) is True
+    persisted = repo.get_job(OWNER, job.id)
+    assert persisted.desired_state == "stopped" and persisted.status == "starting"
+    assert persisted.lease_owner == "sup-A" and persisted.lease_until is not None
+    # The supervisor can still complete its authorized terminal transition.
+    assert (
+        repo.mark_recovery_required(job.id, lease_owner="sup-A", expected_lease_epoch=1, expected_attempt=1)
+        is True
+    )
+
+
+def test_stop_queued_job_without_launch(env):
+    factory, _engine = env
+    repo, claimed = _seed_job(factory)
+    strategy = repo.create_strategy(
+        owner_id=OWNER,
+        name=f"q-{uuid.uuid4().hex[:8]}",
+        description=None,
+        execution_mode="paper",
+        job_kind="finite",
+        account_scope="kite:paper",
+        max_duration_s=21600,
+        progress_deadline_s=600,
+        stale_exit_policy="none",
+    )
+    version = repo.create_version(
+        strategy_id=strategy.id,
+        source="x",
+        source_sha256="a" * 64,
+        parameters_schema={"type": "object"},
+        capabilities_snapshot={"schema_version": 2, "capabilities": {"trade": True, "notify": False, "data": True}},
+        created_by=OWNER,
+    )
+    job = repo.create_job(
+        strategy_id=strategy.id, version_id=version.id, owner_id=OWNER, job_kind="finite",
+        execution_mode="paper", params={},
+    )
+    assert repo.stop_queued_job(job.id, owner_id=OWNER, expected_attempt=1, actor=OWNER) is True
+    persisted = repo.get_job(OWNER, job.id)
+    assert persisted.status == "stopped" and persisted.desired_state == "stopped"

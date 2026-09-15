@@ -382,9 +382,10 @@ Targeted suites (SQLite):
   tests/api/test_worker_notifications.py \
   tests/api/test_hosted_lifecycle_api.py \
   tests/api/test_hosted_child_authority.py \
+  tests/api/test_operator_controls.py \
   tests/notifications \
   tests/sdk -q
-→ 734 passed, 2 skipped
+→ 746 passed, 2 skipped
 ```
 
 Disposable PostgreSQL (real concurrency; own invocation):
@@ -394,11 +395,11 @@ HOSTED_FOUNDATION_PG_URL='postgresql://postgres:testonly@127.0.0.1:15433/kite_te
   .venv/bin/python -m pytest \
     tests/integration/test_hosted_supervisor_lifecycle_postgres.py \
     tests/integration/test_hosted_strategy_foundation_postgres.py -q
-→ 21 passed       # + atomic reconcile-with-audit (one winner) serialized with
+→ 24 passed       # + atomic reconcile-with-audit (one winner) serialized with
                   # create_job; changed-cleanup-evidence CAS refusal; append-only audit
 ```
 
-`alembic heads` → single head `20260915_000022`. `git diff --check` clean.
+`alembic heads` → single head `20260915_000023`. `git diff --check` clean.
 
 **New tests:** supervisor auth (default-deny, wrong/absent credential, rotation);
 lifecycle state machine (happy path, repeat, partial, wrong owner/epoch/attempt,
@@ -472,6 +473,12 @@ Process-supervision tests (added this slice) — **real process tests** vs
   - `tests/api/test_hosted_child_authority.py` — child notify accepted then
     deduped, unknown channel 422, session nonce required, `notifications:publish`
     required, external run refused.
+  - `tests/api/test_operator_controls.py` — Run now (idempotent retry, active/
+    disabled/recovery blocks, cross-owner/account/origin), Stop (queued without
+    launch; active preserves supervisor cleanup + replacement block;
+    cleanup-unresolved without evidence), bounded/redacted logs with explicit
+    unavailable/truncated states, and notification-history ownership. Plus a
+    PostgreSQL concurrent same-key Run now (one job) and stop-authority retention.
   - `tests/integration/test_run_notifications_postgres.py` — columns present;
     concurrent same-key enqueue yields exactly one event + one delivery with one
     `accepted` and one `deduped`; conflicting content after commit is rejected.
@@ -541,9 +548,12 @@ independent of this slice (reproduces with the slice stashed).
 
 ## 5. Remaining gaps (after process supervision)
 
-- **Operator reconciliation now exists (backend, this slice).** An authorized
-  operator can inspect why a `recovery_required` attempt is blocked and clear the
-  block only when server-side evidence supports it. **Restriction:** there is no
+- **Operator controls now exist (backend).** Run now (idempotent), Stop
+  (queued/active, with distinct requested/stopping/confirmed/cleanup-unresolved
+  states), bounded/redacted logs and run-notification history, plus the
+  inspection/reconciliation from the previous slice. An authorized operator can
+  inspect why a `recovery_required` attempt is blocked and clear the block only
+  when server-side evidence supports it. **Restriction:** there is no
   durable execution-settlement barrier, so a **trading-capable** attempt remains
   blocked with `EXECUTION_QUIESCENCE_UNVERIFIED`; only `unlaunched` and
   `data_only_completed` attempts reconcile today. **Still missing:** the barrier
@@ -763,3 +773,116 @@ Operator/SDK surface for the future frontend: channel management stays on the
 existing `/api/algo-workers/worker/notification-channels` routes; a run's
 notification history is available via `list_run_notifications(owner_id, run_id)`
 (run-scoped `signal_events` newest first). No frontend is added in this slice.
+
+## 9. Frontend handoff — operator controls (end to end)
+
+Additive migration `20260915_000023` adds `strategy_jobs.stop_requested_at/_by`
+and the bounded, redacted `strategy_job_logs` table.
+
+Endpoints (all app-cookie, origin-checked, owner-scoped, account-authorized;
+cross-owner ⇒ 404, cross-account ⇒ 403):
+
+| Step | Method / path |
+| --- | --- |
+| 1. List | `GET /api/strategies` |
+| 2. Register version | `POST /api/strategies/{id}/versions` |
+| 3. Configure | `POST /api/strategies` / `PATCH /api/strategies/{id}` |
+| 4. Run now | `POST /api/strategies/{id}/jobs` |
+| 5. Inspect | `GET /api/strategies/{id}/jobs`, `.../jobs/{job_id}`, `.../reconciliation`, `.../logs`, `.../notifications` |
+| 6. Stop | `POST /api/strategies/{id}/jobs/{job_id}/stop` |
+| 7. Reconcile | `POST /api/strategies/{id}/jobs/{job_id}/reconciliation` |
+
+**Run now** — `POST /api/strategies/{id}/jobs`
+
+```json
+{ "version_id": "hsv_4", "params": { "lots": 1 }, "execution_mode": "paper",
+  "job_kind": "finite", "idempotency_key": "run-2026-09-15-1" }
+→ 200 { "idempotent": false, "job": { "job_id": "hsj_…", "status": "queued",
+        "attempt": 1, "replacement_blocked": true, "stop": { "state": "none" }, … } }
+```
+
+- A retry with the same `idempotency_key` returns the same job with
+  `"idempotent": true` (no duplicate, even concurrently).
+- `409 STRATEGY_BLOCKED` (active/unreconciled job), `409 STRATEGY_DISABLED`,
+  `422` (unknown version or invalid params), `403` (account not authorized).
+- The response returns **identity only**; it does not claim the process started.
+
+**Inspect a job** — `GET /api/strategies/{id}/jobs/{job_id}` includes
+`status`, `desired_state`, `attempt`, `run_id`, `process_cleanup_state`,
+`stop` and `replacement_blocked`.
+
+- `stop.state`: `none` | `requested` | `stopping` | `confirmed` |
+  `cleanup_unresolved`. **Unknown process state is not "stopped"**: a launched
+  job whose supervisor has not reported `process_cleanup_state="confirmed"`
+  reports `cleanup_unresolved`, never `confirmed`.
+
+**Stop** — `POST /api/strategies/{id}/jobs/{job_id}/stop`
+
+```json
+{ "attempt": 1, "lease_epoch": 3 }
+→ 200 { "job_id": "hsj_…", "attempt": 1, "idempotent": false,
+        "stop": { "requested": true, "state": "stopping",
+                  "replacement_blocked": true,
+                  "note": "… Stop does not cancel orders or flatten." } }
+```
+
+- Queued work is stopped **without launching** (`state: "confirmed"`,
+  `replacement_blocked: false`).
+- Active work gets a durable stop request the supervisor observes; it keeps its
+  lease so it can stop the child and complete the authorized terminal
+  transition. Launched work stays `recovery_required` until reconciled.
+- **Stop does not cancel orders or flatten positions.** Cancel/Flatten are not
+  implemented in this slice.
+
+**Logs** — `GET /api/strategies/{id}/jobs/{job_id}/logs?after_seq=&limit=`
+
+```json
+{ "available": true, "truncated": false, "next_seq": 12,
+  "entries": [ { "seq": 11, "content": "…[redacted]…", "created_at": "…" } ],
+  "notice": "" }
+```
+
+- The API never reads the supervisor container's filesystem; the supervisor
+  pushes bounded chunks to the lifecycle API, which **redacts known
+  credentials** before storage and caps the per-attempt size. `available:false`
+  (with a `notice`) means logs were not collected; `truncated:true` means the cap
+  was hit. `after_seq` paginates.
+
+**Notification history** — `GET /api/strategies/{id}/jobs/{job_id}/notifications`
+
+```json
+{ "run_id": "run_77", "events": [ {
+  "event_id": "…", "fired_at": "…", "text": "target hit",
+  "delivery_status_counts": { "pending": 1 },
+  "deliveries": [ { "channel_name": "ops", "status": "pending", "attempts": 0,
+                    "attempt_history": [] } ] } ] }
+```
+
+- Delivery `status`: `pending|delivering|delivered|retrying|failed|expired`.
+  **Provider acceptance is not confirmed receipt** — `delivered` means the
+  provider accepted the send, not that a human received it.
+
+**Reconciliation** — see §8. `EXECUTION_QUIESCENCE_UNVERIFIED` is a **genuine
+block**, not a dismissible warning: without a durable execution-settlement
+barrier, a trading-capable attempt cannot prove already-admitted execution will
+not complete later, so the block cannot be cleared. Only `unlaunched` and
+`data_only_completed` attempts reconcile today.
+
+**Data-only example**: register a version with `{"capabilities": {"data": true}}`
+and `POST .../jobs`; on completion the job reconciles via the
+`data_only_completed` case (no trading work). **Notification-capable example**:
+register `{"capabilities": {"data": true, "notify": true}}`; the child uses
+`ManagedRun.notify(...)` (§8.1). **Paper trading limitations**: hosted v1 is
+paper/dry_run only; options mutation is paper-only and `dry_run` is
+preview-only; no Cancel/Flatten, no live trading; trading-capable reconciliation
+is blocked (above).
+
+### 9.1 Remaining release prerequisites
+
+- **Execution-settlement barrier** (quiescence) — required before trading-capable
+  reconciliation can clear a block.
+- **Cancel/Flatten adapters** — settling open exposure after a stop.
+- **Frontend implementation** — this section is the API handoff only.
+- **Scheduling loop**, **notification delivery in a real environment**, and a
+  **deployment pass** (container build, real cross-UID run, delivered-signal
+  shutdown) — none executed here.

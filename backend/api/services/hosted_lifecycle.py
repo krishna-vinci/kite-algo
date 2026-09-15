@@ -50,9 +50,14 @@ from backend.api.routers.worker_shared import (
 from backend.api.schemas.worker import WorkerRunCreateRequest, WorkerTokenCreateRequest
 from backend.strategies import service as strategy_service
 from backend.strategies.models import StrategyJob
+from backend.strategies.redaction import redact_text
 from backend.strategies.repository import SqlAlchemyStrategyRepository
 
 logger = logging.getLogger(__name__)
+
+#: Bounded log shipping contract (supervisor -> API). Per chunk and per attempt.
+LOG_CHUNK_MAX_BYTES = 16 * 1024
+LOG_TOTAL_MAX_BYTES = 256 * 1024
 
 __all__ = [
     "HostedLifecycleError",
@@ -499,8 +504,14 @@ async def heartbeat(
     healthy.
     """
     job = await asyncio.to_thread(strategy_repo.get_job_by_id, job_id)
+    # A stop request (desired_state=stopped) must not revoke the supervisor's
+    # authority to heartbeat/observe; require_started=False keeps these usable.
     job = require_job_authority(
-        job, lease_owner=lease_owner, lease_epoch=lease_epoch, attempt=attempt
+        job,
+        lease_owner=lease_owner,
+        lease_epoch=lease_epoch,
+        attempt=attempt,
+        require_started=False,
     )
     renewed = await asyncio.to_thread(
         strategy_repo.renew_lease,
@@ -557,7 +568,11 @@ async def release(
     """
     job = await asyncio.to_thread(strategy_repo.get_job_by_id, job_id)
     job = require_job_authority(
-        job, lease_owner=lease_owner, lease_epoch=lease_epoch, attempt=attempt
+        job,
+        lease_owner=lease_owner,
+        lease_epoch=lease_epoch,
+        attempt=attempt,
+        require_started=False,
     )
     if job.run_id:
         run = await worker_repo.get_run(job.run_id)
@@ -628,6 +643,7 @@ async def expire(
         lease_epoch=lease_epoch,
         attempt=attempt,
         require_live_lease=False,
+        require_started=False,
     )
     if job.lease_until is not None and _as_utc(job.lease_until) > _utcnow():
         raise HostedLifecycleError(409, "HOSTED_LEASE_STILL_LIVE")
@@ -667,7 +683,11 @@ async def fence(
     """
     job = await asyncio.to_thread(strategy_repo.get_job_by_id, job_id)
     job = require_job_authority(
-        job, lease_owner=lease_owner, lease_epoch=lease_epoch, attempt=attempt
+        job,
+        lease_owner=lease_owner,
+        lease_epoch=lease_epoch,
+        attempt=attempt,
+        require_started=False,
     )
     if job.token_id:
         await worker_repo.revoke_token(job.token_id)
@@ -834,4 +854,60 @@ async def report_process_cleanup(
         "attempt": int(attempt),
         "process_cleanup_state": state,
         "note": (str(note)[:200] if note else None),
+    }
+
+
+async def report_job_logs(
+    *,
+    strategy_repo: SqlAlchemyStrategyRepository,
+    job_id: str,
+    lease_owner: str,
+    lease_epoch: int,
+    attempt: int,
+    chunks,
+) -> Dict[str, Any]:
+    """Accept bounded, redacted child-log chunks from the supervisor.
+
+    The API never reads the supervisor container's filesystem; the supervisor
+    pushes chunks here. Chunks are size-checked and **redacted before storage**.
+    Once the per-attempt cap is reached, further chunks are dropped and the
+    response reports ``truncated`` rather than silently discarding.
+    """
+    if not chunks:
+        raise HostedLifecycleError(422, "HOSTED_LOGS_EMPTY")
+    for chunk in chunks:
+        if len(str(chunk).encode("utf-8")) > LOG_CHUNK_MAX_BYTES:
+            raise HostedLifecycleError(413, "HOSTED_LOG_CHUNK_TOO_LARGE")
+    job = await asyncio.to_thread(strategy_repo.get_job_by_id, job_id)
+    job = require_job_authority(
+        job,
+        lease_owner=lease_owner,
+        lease_epoch=lease_epoch,
+        attempt=attempt,
+        allow_statuses=(
+            "starting",
+            "running",
+            "fencing",
+            "recovery_required",
+            "stopped",
+            "failed",
+            "hung",
+        ),
+        require_live_lease=False,
+        require_started=False,
+    )
+    redacted = [redact_text(str(chunk)) for chunk in chunks]
+    result = await asyncio.to_thread(
+        strategy_repo.append_job_log,
+        job_id,
+        attempt=int(attempt),
+        chunks=redacted,
+        max_total_bytes=LOG_TOTAL_MAX_BYTES,
+    )
+    return {
+        "job_id": job.id,
+        "attempt": int(attempt),
+        "stored": int(result["stored"]),
+        "truncated": bool(result["truncated"]),
+        "next_seq": int(result["next_seq"]),
     }

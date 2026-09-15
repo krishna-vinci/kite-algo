@@ -132,6 +132,9 @@ class JobDetailResponse(JobSummaryResponse):
     last_progress_at: Optional[str] = None
     version_id: str
     token_present: bool = False
+    stop_requested_at: Optional[str] = None
+    stop_requested_by: Optional[str] = None
+    stop: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ReconciliationAuditResponse(BaseModel):
@@ -195,3 +198,117 @@ class ReconciliationActionResponse(BaseModel):
     blocking_reasons: List[str] = Field(default_factory=list)
     evidence: Dict[str, Any] = Field(default_factory=dict)
     audit_id: str
+
+
+# ---------------------------------------------------------------------------
+# operator controls: run now, stop, logs, notification history
+# ---------------------------------------------------------------------------
+
+
+class RunNowRequest(BaseModel):
+    """Explicit operator launch request against an immutable version."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version_id: str = Field(min_length=1, max_length=128)
+    params: Dict[str, Any] = Field(default_factory=dict)
+    execution_mode: Optional[str] = None
+    job_kind: Optional[str] = None
+    #: Request idempotency: a retry with the same key returns the same job.
+    idempotency_key: str = Field(min_length=8, max_length=160)
+
+
+class JobStopView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requested: bool
+    state: str  # none | requested | stopping | confirmed | cleanup_unresolved
+    requested_at: Optional[str] = None
+    requested_by: Optional[str] = None
+    replacement_blocked: bool = False
+    note: str = ""
+
+
+class RunNowResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotent: bool = False
+    job: "JobDetailResponse"
+
+
+class StopJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    attempt: int = Field(ge=1)
+    lease_epoch: Optional[int] = Field(default=None, ge=0)
+
+
+class StopJobResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    attempt: int
+    idempotent: bool = False
+    stop: JobStopView
+
+
+class DeliveryAttemptResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_no: int
+    outcome: str
+    detail: str = ""
+    provider_id: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class DeliveryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    delivery_id: str
+    channel_id: str
+    channel_name: Optional[str] = None
+    status: str
+    attempts: int
+    last_error: Optional[str] = None
+    delivered_at: Optional[str] = None
+    attempt_history: List[DeliveryAttemptResponse] = Field(default_factory=list)
+
+
+class RunNotificationEventResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: str
+    run_id: str
+    fired_at: Optional[str] = None
+    text: str = ""
+    subject: Optional[str] = None
+    deliveries: List[DeliveryResponse] = Field(default_factory=list)
+    delivery_status_counts: Dict[str, int] = Field(default_factory=dict)
+
+
+class RunNotificationListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    run_id: Optional[str] = None
+    events: List[RunNotificationEventResponse] = Field(default_factory=list)
+
+
+class JobLogEntryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    seq: int
+    content: str
+    created_at: Optional[str] = None
+
+
+class JobLogsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    available: bool
+    truncated: bool = False
+    next_seq: int = 0
+    entries: List[JobLogEntryResponse] = Field(default_factory=list)
+    notice: str = ""

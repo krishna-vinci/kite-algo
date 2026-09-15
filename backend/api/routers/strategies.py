@@ -38,6 +38,16 @@ from backend.api.schemas.strategies import (
     ReconciliationAuditResponse,
     ReconciliationAssessmentResponse,
     ReconciliationInspectionResponse,
+    JobLogEntryResponse,
+    JobLogsResponse,
+    RunNotificationEventResponse,
+    RunNotificationListResponse,
+    RunNowRequest,
+    RunNowResponse,
+    DeliveryAttemptResponse,
+    DeliveryResponse,
+    StopJobRequest,
+    StopJobResponse,
     StrategyCreateRequest,
     StrategyListResponse,
     StrategyResponse,
@@ -57,6 +67,9 @@ from backend.strategies.reconciliation import assess, evidence_digest
 from backend.strategies.repository import (
     SqlAlchemyStrategyRepository,
     StrategyConflict,
+    StrategyDisabled,
+    StrategyFenceError,
+    StrategyIdentityError,
 )
 
 router = APIRouter(prefix="/strategies", tags=["Hosted strategies (operator)"])
@@ -354,6 +367,71 @@ async def get_version(
 # ---------------------------------------------------------------------------
 
 
+
+def _stop_view(job: Any) -> dict:
+    """Distinguish requested/stopping/confirmed/cleanup-unresolved for a stop.
+
+    A terminal job label alone does not prove process cleanup: for a launched
+    attempt we require the supervisor's ``process_cleanup_state == 'confirmed'``
+    before reporting ``confirmed``.
+    """
+    launched = job.handoff_at is not None
+    requested = job.stop_requested_at is not None or str(job.desired_state or "") == "stopped"
+    status = str(job.status or "")
+    blocked = _job_replacement_blocked(job)
+    if status in {"queued", "starting", "running"}:
+        if not requested:
+            return {"requested": False, "state": "none", "requested_at": None, "requested_by": None,
+                    "replacement_blocked": blocked,
+                    "note": "Running; no stop requested. Stop does not cancel orders or flatten."}
+        state = "requested" if (status == "queued" or not launched) else "stopping"
+        note = ("Stop requested; the supervisor will stop the child and complete the authorized "
+                "terminal transition. Stop does not cancel orders or flatten.")
+        return {"requested": True, "state": state, "requested_at": _iso(job.stop_requested_at),
+                "requested_by": job.stop_requested_by, "replacement_blocked": blocked, "note": note}
+    if status in {"stopped", "recovery_required", "failed"}:
+        if launched and str(job.process_cleanup_state or "") != "confirmed":
+            return {"requested": requested, "state": "cleanup_unresolved",
+                    "requested_at": _iso(job.stop_requested_at), "requested_by": job.stop_requested_by,
+                    "replacement_blocked": blocked,
+                    "note": "Terminal, but child process cleanup is not confirmed. Unknown is not 'stopped'."}
+        return {"requested": requested, "state": "confirmed", "requested_at": _iso(job.stop_requested_at),
+                "requested_by": job.stop_requested_by, "replacement_blocked": blocked,
+                "note": "Stopped and process cleanup confirmed."}
+    return {"requested": requested, "state": "none", "requested_at": _iso(job.stop_requested_at),
+            "requested_by": job.stop_requested_by, "replacement_blocked": blocked, "note": ""}
+
+
+def _notification_store(request: Request):
+    repo = getattr(request.app.state, "notification_repository", None)
+    if repo is not None:
+        return repo
+    from backend.notifications.repository import SqlAlchemyNotificationRepository
+
+    factory = getattr(request.app.state, "alerts_session_factory", None)
+    if factory is None:
+        from backend.app.database import SessionLocal
+
+        factory = SessionLocal
+    return SqlAlchemyNotificationRepository(factory)
+
+
+def _job_detail(job: Any) -> JobDetailResponse:
+    base = _job_summary(job)
+    return JobDetailResponse(
+        **base.model_dump(),
+        handoff_at=_iso(job.handoff_at),
+        process_cleanup_state=job.process_cleanup_state,
+        process_cleanup_at=_iso(job.process_cleanup_at),
+        process_cleanup_actor=job.process_cleanup_actor,
+        last_progress_at=_iso(job.last_progress_at),
+        version_id=job.version_id,
+        token_present=bool(job.token_id),
+        stop_requested_at=_iso(job.stop_requested_at),
+        stop_requested_by=job.stop_requested_by,
+        stop=_stop_view(job),
+    )
+
 @router.get("/{strategy_id}/jobs", response_model=JobListResponse)
 async def list_jobs(
     strategy_id: str,
@@ -374,17 +452,7 @@ async def get_job(
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
 ):
     job = _authorized_job(repo, owner, strategy_id, job_id)
-    base = _job_summary(job)
-    return JobDetailResponse(
-        **base.model_dump(),
-        handoff_at=_iso(job.handoff_at),
-        process_cleanup_state=job.process_cleanup_state,
-        process_cleanup_at=_iso(job.process_cleanup_at),
-        process_cleanup_actor=job.process_cleanup_actor,
-        last_progress_at=_iso(job.last_progress_at),
-        version_id=job.version_id,
-        token_present=bool(job.token_id),
-    )
+    return _job_detail(job)
 
 
 @router.get(
@@ -548,3 +616,242 @@ async def reconcile_job(
         evidence=recheck.to_dict(),
         audit_id=audit.id,
     )
+
+
+@router.post("/{strategy_id}/jobs", response_model=RunNowResponse)
+async def run_now(
+    strategy_id: str,
+    request: Request,
+    payload: RunNowRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Operator "Run now": create a queued job through the existing repository.
+
+    Owner is server-derived; the pinned account scope is authorized for the
+    requested mode. The version is immutable and params are validated against its
+    schema; mode/capabilities/policy snapshots are persisted by the store. The
+    response returns the job identity — it does **not** claim the process has
+    started. A retry with the same ``idempotency_key`` returns the same job.
+    """
+    enforce_same_origin(request)
+    strategy = _owned_strategy(repo, owner, strategy_id)
+    execution_mode = payload.execution_mode or strategy.default_execution_mode
+    job_kind = payload.job_kind or strategy.default_job_kind
+    try:
+        service.validate_account_scope(strategy.default_account_scope, execution_mode)
+        if execution_mode not in service.ALLOWED_EXECUTION_MODES:
+            raise service.StrategyValidationError("unsupported execution_mode")
+        if job_kind not in service.ALLOWED_JOB_KINDS:
+            raise service.StrategyValidationError("unsupported job_kind")
+    except service.StrategyValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    authorize_account_scope(strategy.default_account_scope)
+
+    occurrence_key = f"manual:{strategy_id}:{payload.idempotency_key}"
+    # Idempotency is checked before the active-job block so a retry of a
+    # still-active launch returns the same job instead of being refused.
+    existing = repo.get_job_by_occurrence_key(occurrence_key)
+    if existing is not None:
+        if existing.owner_id != owner or existing.strategy_id != strategy_id:
+            raise HTTPException(status_code=409, detail="REPLACEMENT_CONFLICT")
+        return RunNowResponse(idempotent=True, job=_job_detail(existing))
+
+    idempotent = False
+    try:
+        job = repo.create_job(
+            strategy_id=strategy_id,
+            version_id=payload.version_id,
+            owner_id=owner,
+            job_kind=job_kind,
+            execution_mode=execution_mode,
+            params=payload.params,
+            occurrence_key=occurrence_key,
+        )
+    except StrategyIdentityError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StrategyDisabled as exc:
+        raise HTTPException(status_code=409, detail="STRATEGY_DISABLED") from exc
+    except StrategyFenceError as exc:
+        raise HTTPException(status_code=409, detail="STRATEGY_BLOCKED") from exc
+    except service.StrategyValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StrategyConflict:
+        existing = repo.get_job_by_occurrence_key(occurrence_key)
+        if existing is None or existing.owner_id != owner:
+            raise HTTPException(status_code=409, detail="REPLACEMENT_CONFLICT")
+        job = existing
+        idempotent = True
+    return RunNowResponse(idempotent=idempotent, job=_job_detail(job))
+
+
+@router.post("/{strategy_id}/jobs/{job_id}/stop", response_model=StopJobResponse)
+async def stop_job(
+    strategy_id: str,
+    job_id: str,
+    request: Request,
+    payload: StopJobRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Operator Stop against an immutable job/attempt.
+
+    Queued work is stopped without launching it; active work receives a durable
+    stop request the supervisor observes to perform bounded local cleanup.
+    Stop does **not** cancel orders or flatten positions, and it does not clear
+    the replacement block: launched work still requires reconciliation.
+    """
+    enforce_same_origin(request)
+    job = _authorized_job(repo, owner, strategy_id, job_id)
+    if int(job.attempt) != int(payload.attempt):
+        raise HTTPException(
+            status_code=409,
+            detail={"rejection_reason": "STALE_ATTEMPT", "current_attempt": int(job.attempt)},
+        )
+    if payload.lease_epoch is not None and int(job.lease_epoch) != int(payload.lease_epoch):
+        raise HTTPException(
+            status_code=409,
+            detail={"rejection_reason": "STALE_LEASE_EPOCH", "current_lease_epoch": int(job.lease_epoch)},
+        )
+
+    idempotent = False
+    if job.status == "queued":
+        stopped = repo.stop_queued_job(
+            job.id, owner_id=owner, expected_attempt=int(job.attempt), actor=owner
+        )
+        if not stopped:
+            raise HTTPException(status_code=409, detail={"rejection_reason": "STOP_RACE_LOST"})
+    elif job.status in {"starting", "running"}:
+        requested = repo.request_stop_active(
+            job.id, owner_id=owner, expected_attempt=int(job.attempt), actor=owner
+        )
+        if not requested:
+            refreshed = repo.get_job(owner, job.id)
+            if refreshed is None or str(refreshed.desired_state or "") != "stopped":
+                raise HTTPException(status_code=409, detail={"rejection_reason": "STOP_RACE_LOST"})
+            idempotent = True
+    else:
+        idempotent = True  # already terminal: nothing to stop
+
+    refreshed = repo.get_job(owner, job.id)
+    return StopJobResponse(
+        job_id=job.id,
+        attempt=int(job.attempt),
+        idempotent=idempotent,
+        stop=_stop_view(refreshed),
+    )
+
+
+@router.get("/{strategy_id}/jobs/{job_id}/logs", response_model=JobLogsResponse)
+async def get_job_logs(
+    strategy_id: str,
+    job_id: str,
+    request: Request,
+    after_seq: int = 0,
+    limit: int = 200,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Bounded, redacted child logs for an owner/account-authorized job.
+
+    The API never reads the supervisor container's filesystem; logs are pushed
+    by the supervisor through the lifecycle API, redacted on ingest and capped.
+    Unavailable/truncated states are explicit.
+    """
+    from backend.api.services.hosted_lifecycle import LOG_TOTAL_MAX_BYTES
+
+    job = _authorized_job(repo, owner, strategy_id, job_id)
+    rows = repo.list_job_logs(job.id, after_seq=after_seq, limit=limit)
+    total_bytes = repo.job_log_byte_count(job.id)
+    entries = [
+        JobLogEntryResponse(seq=int(row.seq), content=str(row.content), created_at=_iso(row.created_at))
+        for row in rows
+    ]
+    next_seq = int(rows[-1].seq) if rows else int(after_seq)
+    available = total_bytes > 0
+    if available:
+        notice = ""
+    elif job.handoff_at is None:
+        notice = "No child was launched for this attempt; no logs exist."
+    else:
+        notice = "Logs not collected (the supervisor may be unavailable or the child produced no output)."
+    return JobLogsResponse(
+        job_id=job.id,
+        available=available,
+        truncated=total_bytes >= LOG_TOTAL_MAX_BYTES,
+        next_seq=next_seq,
+        entries=entries,
+        notice=notice,
+    )
+
+
+@router.get(
+    "/{strategy_id}/jobs/{job_id}/notifications",
+    response_model=RunNotificationListResponse,
+)
+async def get_job_notifications(
+    strategy_id: str,
+    job_id: str,
+    request: Request,
+    limit: int = 50,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Owner-scoped run notification events with delivery/attempt history."""
+    job = _authorized_job(repo, owner, strategy_id, job_id)
+    if not job.run_id:
+        return RunNotificationListResponse(job_id=job.id, run_id=None, events=[])
+    store = _notification_store(request)
+    events = store.list_run_notifications(job.owner_id, str(job.run_id), limit=limit)
+    deliveries = store.list_deliveries_for_events([event.id for event in events])
+    attempts = store.list_attempts_for_deliveries([delivery.id for delivery in deliveries])
+    channels = store.get_channels_by_ids([delivery.channel_id for delivery in deliveries])
+
+    attempts_by_delivery: Dict[str, list] = {}
+    for attempt in attempts:
+        attempts_by_delivery.setdefault(attempt.delivery_id, []).append(attempt)
+    deliveries_by_event: Dict[str, list] = {}
+    for delivery in deliveries:
+        deliveries_by_event.setdefault(delivery.event_id, []).append(delivery)
+
+    payload_events = []
+    for event in events:
+        rendered_deliveries = []
+        counts: Dict[str, int] = {}
+        for delivery in deliveries_by_event.get(event.id, []):
+            counts[delivery.status] = counts.get(delivery.status, 0) + 1
+            channel = channels.get(delivery.channel_id)
+            rendered_deliveries.append(
+                DeliveryResponse(
+                    delivery_id=delivery.id,
+                    channel_id=delivery.channel_id,
+                    channel_name=(channel.name if channel is not None else None),
+                    status=delivery.status,
+                    attempts=int(delivery.attempts or 0),
+                    last_error=delivery.last_error,
+                    delivered_at=_iso(delivery.delivered_at),
+                    attempt_history=[
+                        DeliveryAttemptResponse(
+                            attempt_no=int(a.attempt_no),
+                            outcome=str(a.outcome),
+                            detail=str(a.detail or ""),
+                            provider_id=a.provider_id,
+                            created_at=_iso(a.created_at),
+                        )
+                        for a in attempts_by_delivery.get(delivery.id, [])
+                    ],
+                )
+            )
+        evidence = dict(event.evidence or {})
+        payload_events.append(
+            RunNotificationEventResponse(
+                event_id=event.id,
+                run_id=str(event.run_id or ""),
+                fired_at=_iso(event.fired_at),
+                text=str(evidence.get("text") or ""),
+                subject=evidence.get("subject"),
+                deliveries=rendered_deliveries,
+                delivery_status_counts=counts,
+            )
+        )
+    return RunNotificationListResponse(job_id=job.id, run_id=job.run_id, events=payload_events)

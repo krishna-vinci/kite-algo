@@ -208,6 +208,26 @@ class LifecycleApiClient:
             },
         )
 
+    def process_logs(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        lease_epoch: int,
+        attempt: int,
+        chunks: list,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/hosted-supervisor/jobs/{job_id}/logs",
+            body={
+                "lease_owner": lease_owner,
+                "lease_epoch": lease_epoch,
+                "attempt": attempt,
+                "chunks": list(chunks),
+            },
+        )
+
     def process_cleanup(
         self,
         job_id: str,

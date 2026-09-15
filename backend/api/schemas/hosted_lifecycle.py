@@ -115,6 +115,27 @@ class ProcessCleanupResponse(BaseModel):
     note: Optional[str] = None
 
 
+class ProcessLogsRequest(BaseModel):
+    """Bounded child-log chunks pushed by the supervisor (redacted on ingest)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    lease_owner: str = Field(min_length=1, max_length=120)
+    lease_epoch: int = Field(ge=0)
+    attempt: int = Field(ge=1)
+    chunks: List[str] = Field(min_length=1, max_length=64)
+
+
+class ProcessLogsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    attempt: int
+    stored: int
+    truncated: bool
+    next_seq: int
+
+
 class ActionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -321,6 +321,39 @@ class HostedSupervisor:
             )
             return False
 
+    def _ship_logs(self, job_id: str, epoch: int, attempt: int) -> bool:
+        """Push bounded local log chunks to the API (best effort, never raises).
+
+        The API redacts and caps them; the supervisor does not assume the API can
+        read its filesystem.
+        """
+        log_path = self._log_path(job_id)
+        try:
+            if not log_path.is_file():
+                return False
+            raw = log_path.read_bytes()[: 256 * 1024]
+            text = raw.decode("utf-8", errors="replace")
+        except OSError:
+            return False
+        chunks = [text[i : i + 8 * 1024] for i in range(0, len(text), 8 * 1024)]
+        if not chunks:
+            return False
+        try:
+            self.api.process_logs(
+                job_id,
+                lease_owner=self.config.lease_owner,
+                lease_epoch=epoch,
+                attempt=attempt,
+                chunks=chunks,
+            )
+            return True
+        except Exception as exc:  # best effort
+            logger.warning(
+                "hosted_supervisor_log_ship_failed",
+                extra={"job_id": job_id, "error": type(exc).__name__},
+            )
+            return False
+
     def _authority_check(self, job_id: str, epoch: int, attempt: int) -> Dict[str, Any]:
         """Full pre-spawn authority check: state, desired state, lease, attempt.
 
@@ -786,9 +819,10 @@ class HostedSupervisor:
         result["process_cleanup_reported"] = self._report_process_cleanup(
             job_id, epoch, attempt, "confirmed" if cleanup_confirmed else "unresolved"
         )
+        result["logs_shipped"] = self._ship_logs(job_id, epoch, attempt)
 
         process_unresolved = stop_result in {"group_unresolved", "stop_failed"}
-        if outcome == "exited" and not process_unresolved:
+        if outcome in {"exited", "stop_requested"} and not process_unresolved:
             # Normal completion is NOT proof of flatness: a launched attempt is
             # released into recovery_required by the server.
             try:
@@ -893,8 +927,14 @@ class HostedSupervisor:
                     progress_failures += 1
                     if progress_failures >= self.config.progress_observation_max_failures:
                         return "progress_unobserved", {"failures": progress_failures}
-                if state is not None and self._progress_stale(state, started):
-                    return "progress_stale", {}
+                if state is not None:
+                    if str(state.get("desired_state") or "") == "stopped":
+                        # Operator stop request: stop the local child and complete
+                        # the authorized terminal transition (desired_state no
+                        # longer gates fence/recover/release).
+                        return "stop_requested", {}
+                    if self._progress_stale(state, started):
+                        return "progress_stale", {}
             wait_for = max(0.02, min(self.config.progress_poll_s, next_heartbeat - self._monotonic()))
             self._sleep(wait_for)
 

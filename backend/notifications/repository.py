@@ -742,3 +742,56 @@ class SqlAlchemyNotificationRepository:
             return list(session.execute(stmt).scalars().all())
         finally:
             session.close()
+
+    def list_deliveries_for_events(
+        self, event_ids: Sequence[str], *, db: Optional[Session] = None
+    ) -> List["Delivery"]:
+        ids = [str(value) for value in (event_ids or [])]
+        if not ids:
+            return []
+        stmt = (
+            select(Delivery)
+            .where(Delivery.event_id.in_(ids))
+            .order_by(Delivery.created_at.asc(), Delivery.id.asc())
+        )
+        if db is not None:
+            return list(db.execute(stmt).scalars().all())
+        session = self._session()
+        try:
+            return list(session.execute(stmt).scalars().all())
+        finally:
+            session.close()
+
+    def list_attempts_for_deliveries(
+        self, delivery_ids: Sequence[str], *, db: Optional[Session] = None
+    ) -> List["DeliveryAttempt"]:
+        ids = [str(value) for value in (delivery_ids or [])]
+        if not ids:
+            return []
+        stmt = (
+            select(DeliveryAttempt)
+            .where(DeliveryAttempt.delivery_id.in_(ids))
+            .order_by(DeliveryAttempt.created_at.asc(), DeliveryAttempt.id.asc())
+        )
+        if db is not None:
+            return list(db.execute(stmt).scalars().all())
+        session = self._session()
+        try:
+            return list(session.execute(stmt).scalars().all())
+        finally:
+            session.close()
+
+    def get_channels_by_ids(
+        self, channel_ids: Sequence[str], *, db: Optional[Session] = None
+    ) -> Dict[str, "ChannelReference"]:
+        ids = [str(value) for value in (channel_ids or [])]
+        if not ids:
+            return {}
+        stmt = select(ChannelReference).where(ChannelReference.id.in_(ids))
+        if db is not None:
+            return {row.id: row for row in db.execute(stmt).scalars().all()}
+        session = self._session()
+        try:
+            return {row.id: row for row in session.execute(stmt).scalars().all()}
+        finally:
+            session.close()

@@ -32,7 +32,7 @@ import copy
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -41,6 +41,7 @@ from backend.strategies.models import (
     HostedStrategySchedule,
     HostedStrategyVersion,
     StrategyJob,
+    StrategyJobLog,
     StrategyJobReconciliation,
 )
 from backend.strategies import service
@@ -323,6 +324,17 @@ class SqlAlchemyStrategyRepository:
             strategy = self._lock_strategy(session, strategy_id, owner_id)
             if strategy is None:
                 raise StrategyNotFound("strategy not found for this owner")
+            # Idempotent replay: the occurrence_key is unique and the strategy row
+            # is locked, so a retry returns the original job instead of creating a
+            # duplicate (and is not subject to the active-job block).
+            if occurrence_key:
+                existing = session.execute(
+                    select(StrategyJob).where(StrategyJob.occurrence_key == occurrence_key)
+                ).scalar_one_or_none()
+                if existing is not None:
+                    if existing.owner_id != owner_id or existing.strategy_id != strategy_id:
+                        raise StrategyConflict("occurrence_key already used by another job")
+                    return existing
             # Disable stops NEW attempts; the locked parent row serialises this
             # with update_strategy/disable.
             if strategy.status != "active":
@@ -1295,5 +1307,163 @@ class SqlAlchemyStrategyRepository:
                     HostedStrategySchedule.strategy_id == strategy_id
                 )
             ).scalar_one_or_none()
+        finally:
+            session.close()
+
+    # -- operator controls: run-now idempotency, stop, bounded logs ---------
+
+    def get_job_by_occurrence_key(self, occurrence_key: str) -> Optional[StrategyJob]:
+        if not occurrence_key:
+            return None
+        session = self._session()
+        try:
+            return session.execute(
+                select(StrategyJob).where(StrategyJob.occurrence_key == occurrence_key)
+            ).scalar_one_or_none()
+        finally:
+            session.close()
+
+    def stop_queued_job(
+        self, job_id: str, *, owner_id: str, expected_attempt: int, actor: str
+    ) -> bool:
+        """Stop a queued job without launching it. Owner/attempt bound."""
+        session = self._session()
+        try:
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    StrategyJob.id == job_id,
+                    StrategyJob.owner_id == owner_id,
+                    StrategyJob.attempt == expected_attempt,
+                    StrategyJob.status == "queued",
+                )
+                .values(
+                    status="stopped",
+                    desired_state="stopped",
+                    stop_requested_at=_utcnow(),
+                    stop_requested_by=str(actor)[:200],
+                    updated_at=_utcnow(),
+                )
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def request_stop_active(
+        self, job_id: str, *, owner_id: str, expected_attempt: int, actor: str
+    ) -> bool:
+        """Record a durable stop request for an active job.
+
+        Only ``desired_state`` (and the stop attribution) changes — status and
+        lease are untouched so the supervisor keeps authority to observe the
+        request, perform a bounded cleanup and complete its authorized terminal
+        transition. Idempotent: a repeat while already stopped is a no-op.
+        """
+        session = self._session()
+        try:
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    StrategyJob.id == job_id,
+                    StrategyJob.owner_id == owner_id,
+                    StrategyJob.attempt == expected_attempt,
+                    StrategyJob.status.in_(("starting", "running")),
+                    StrategyJob.desired_state != "stopped",
+                )
+                .values(
+                    desired_state="stopped",
+                    stop_requested_at=_utcnow(),
+                    stop_requested_by=str(actor)[:200],
+                    updated_at=_utcnow(),
+                )
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def append_job_log(
+        self,
+        job_id: str,
+        *,
+        attempt: int,
+        chunks: List[str],
+        max_total_bytes: int,
+    ) -> Dict[str, Any]:
+        """Append bounded, already-redacted log chunks under the total cap."""
+        session = self._session()
+        try:
+            current_bytes = int(
+                session.execute(
+                    select(func.coalesce(func.sum(func.length(StrategyJobLog.content)), 0)).where(
+                        StrategyJobLog.job_id == job_id,
+                        StrategyJobLog.attempt == attempt,
+                    )
+                ).scalar_one()
+            )
+            max_seq = session.execute(
+                select(func.coalesce(func.max(StrategyJobLog.seq), 0)).where(
+                    StrategyJobLog.job_id == job_id, StrategyJobLog.attempt == attempt
+                )
+            ).scalar_one()
+            next_seq = int(max_seq or 0)
+            stored = 0
+            truncated = False
+            for chunk in chunks:
+                text = str(chunk or "")
+                if not text:
+                    continue
+                size = len(text.encode("utf-8"))
+                if current_bytes + size > max(1, int(max_total_bytes)):
+                    truncated = True
+                    break
+                next_seq += 1
+                session.add(
+                    StrategyJobLog(job_id=job_id, attempt=int(attempt), seq=next_seq, content=text)
+                )
+                current_bytes += size
+                stored += 1
+            session.commit()
+            return {"stored": stored, "truncated": truncated, "next_seq": next_seq}
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def list_job_logs(
+        self, job_id: str, *, after_seq: int = 0, limit: int = 200
+    ) -> List[StrategyJobLog]:
+        capped = max(1, min(int(limit), 500))
+        session = self._session()
+        try:
+            return list(
+                session.execute(
+                    select(StrategyJobLog)
+                    .where(StrategyJobLog.job_id == job_id, StrategyJobLog.seq > int(after_seq))
+                    .order_by(StrategyJobLog.seq.asc())
+                    .limit(capped)
+                ).scalars()
+            )
+        finally:
+            session.close()
+
+    def job_log_byte_count(self, job_id: str) -> int:
+        session = self._session()
+        try:
+            return int(
+                session.execute(
+                    select(func.coalesce(func.sum(func.length(StrategyJobLog.content)), 0)).where(
+                        StrategyJobLog.job_id == job_id
+                    )
+                ).scalar_one()
+            )
         finally:
             session.close()

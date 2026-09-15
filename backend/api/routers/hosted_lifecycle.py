@@ -38,6 +38,8 @@ from backend.api.schemas.hosted_lifecycle import (
     PrepareLaunchRequest,
     ProcessCleanupRequest,
     ProcessCleanupResponse,
+    ProcessLogsRequest,
+    ProcessLogsResponse,
     ReleaseRequest,
 )
 from backend.api.services import hosted_lifecycle
@@ -180,6 +182,32 @@ async def report_process_cleanup(
     except hosted_lifecycle.HostedLifecycleError as exc:
         raise _raise(exc) from exc
     return ProcessCleanupResponse(**result)
+
+
+@router.post("/jobs/{job_id}/logs", response_model=ProcessLogsResponse)
+async def report_job_logs(
+    job_id: str,
+    payload: ProcessLogsRequest,
+    request: Request,
+    strategy_repo: SqlAlchemyStrategyRepository = Depends(_strategies_repo),
+):
+    """Accept bounded, redacted child-log chunks from the supervisor.
+
+    The API does not read the supervisor's filesystem; chunks are size-checked
+    and redacted before storage, and the total per-attempt size is capped.
+    """
+    try:
+        result = await hosted_lifecycle.report_job_logs(
+            strategy_repo=strategy_repo,
+            job_id=job_id,
+            lease_owner=payload.lease_owner,
+            lease_epoch=payload.lease_epoch,
+            attempt=payload.attempt,
+            chunks=payload.chunks,
+        )
+    except hosted_lifecycle.HostedLifecycleError as exc:
+        raise _raise(exc) from exc
+    return ProcessLogsResponse(**result)
 
 
 @router.get("/jobs/{job_id}", response_model=JobStateResponse)

@@ -39,6 +39,7 @@ class FakeApi:
         self.fence_ok = True
         self.job_state_error = None
         self.job_state_fail_after = None
+        self.job_state_stop_after = None
         self._job_state_calls = 0
         self.job_state_payload = {
             "status": "running",
@@ -99,7 +100,10 @@ class FakeApi:
             raise self.job_state_error
         if self.job_state_fail_after is not None and self._job_state_calls > self.job_state_fail_after:
             raise SupervisorTransportError("state unavailable")
-        return dict(self.job_state_payload)
+        payload = dict(self.job_state_payload)
+        if self.job_state_stop_after is not None and self._job_state_calls > self.job_state_stop_after:
+            payload["desired_state"] = "stopped"
+        return payload
 
     def heartbeat(self, job_id, **kwargs):
         self._record("heartbeat", job_id=job_id, **kwargs)
@@ -552,3 +556,27 @@ def test_workspace_permissions_are_child_safe(tmp_path):
     assert ((ws / "attempts").stat().st_mode & 0o777) == 0o700
     sources = list((ws / "source").rglob("*.py"))
     assert sources and (sources[0].stat().st_mode & 0o777) == 0o444
+
+
+def test_observe_returns_stop_requested_and_releases(tmp_path):
+    api = FakeApi()
+    # The attempt starts normally; the operator stop request appears later.
+    api.job_state_stop_after = 1
+    sup = _supervisor(tmp_path, api, heartbeat_interval_s=0.001)
+    sup.child_script = "import time; time.sleep(30)"
+
+    result = sup.run_once()
+    assert result["outcome"] == "stop_requested"
+    assert result["stop"] in {"terminated", "killed"}
+    assert result["terminal"] == "recovery_required"
+    assert result["replacement_blocked"] is True
+
+
+def test_stop_request_refuses_spawn(tmp_path):
+    api = FakeApi()
+    api.job_state_payload = {**api.job_state_payload, "desired_state": "stopped"}
+    sup = _supervisor(tmp_path, api)
+
+    authority = sup._authority_check("hsj_1", 1, 1)
+    assert authority["ok"] is False
+    assert authority["reason"] == "HOSTED_ATTEMPT_STOPPED"

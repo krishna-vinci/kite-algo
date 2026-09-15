@@ -234,6 +234,11 @@ class StrategyJob(Base):
     process_cleanup_state = Column(Text, nullable=True)
     process_cleanup_at = Column(DateTime(timezone=True), nullable=True)
     process_cleanup_actor = Column(Text, nullable=True)
+    #: Operator stop request, bound to the immutable attempt. ``desired_state``
+    #: becomes ``stopped`` while the supervisor keeps its authority to perform a
+    #: bounded local cleanup and the authorized terminal transition.
+    stop_requested_at = Column(DateTime(timezone=True), nullable=True)
+    stop_requested_by = Column(Text, nullable=True)
     recovery_required_at = Column(DateTime(timezone=True), nullable=True)
     reconciled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -313,10 +318,34 @@ class StrategyJobReconciliation(Base):
     )
 
 
+class StrategyJobLog(Base):
+    """Bounded, redacted child-log chunks shipped by the supervised runner.
+
+    The API never reads the supervisor container's filesystem; the supervisor
+    pushes bounded chunks through the lifecycle API, which redacts known
+    credentials before they are persisted or presented to a browser.
+    """
+
+    __tablename__ = "strategy_job_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(Text, ForeignKey("strategy_jobs.id", ondelete="CASCADE"), nullable=False)
+    attempt = Column(Integer, nullable=False)
+    seq = Column(Integer, nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("job_id", "attempt", "seq", name="uq_strategy_job_logs_seq"),
+        Index("idx_strategy_job_logs_job", "job_id", "attempt", "seq"),
+    )
+
+
 __all__ = [
     "HostedStrategy",
     "HostedStrategySchedule",
     "HostedStrategyVersion",
     "StrategyJob",
+    "StrategyJobLog",
     "StrategyJobReconciliation",
 ]
