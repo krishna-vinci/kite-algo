@@ -18,6 +18,9 @@ export const alertsKeys = {
   workflow: (workflowId: string, scope: string | null) =>
     [...alertsKeys.all, "workflow", workflowId, scope] as const,
 
+  screenerDataStatus: (workflowId: string, scope: string | null) =>
+    [...alertsKeys.all, "screener-data-status", workflowId, scope] as const,
+
   workflowHealth: (workflowId: string, scope: string | null) =>
     [...alertsKeys.all, "workflow-health", workflowId, scope] as const,
 

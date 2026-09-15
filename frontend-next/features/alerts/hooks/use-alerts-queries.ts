@@ -15,6 +15,8 @@ import {
   fetchAlertsCanvasLayout,
   fetchAlertsCapabilities,
   fetchAlertsChannels,
+  fetchScreenerDataStatus,
+  warmScreenerCandles,
   fetchAlertsPlatformHealth,
   fetchAlertsProducerCredentials,
   fetchAlertsProducers,
@@ -316,6 +318,34 @@ export function useAlertsScreenerAttachments(workflowId: string, scope: string |
     queryKey: alertsKeys.screenerAttachments(workflowId, scope),
     queryFn: () => fetchAlertsScreenerAttachments(workflowId, { scope }),
     enabled: Boolean(workflowId && scope),
+  });
+}
+
+/**
+ * Candle availability for a screener's members.
+ *
+ * Polls only while something still needs candles, because that is the only state
+ * that changes on its own; a complete universe is fetched once.
+ */
+export function useAlertsScreenerDataStatus(workflowId: string, scope: string | null) {
+  return useQuery({
+    queryKey: alertsKeys.screenerDataStatus(workflowId, scope),
+    queryFn: () => fetchScreenerDataStatus(workflowId, scope),
+    enabled: Boolean(scope && workflowId),
+    refetchInterval: (query) =>
+      (query.state.data?.members_needing_candles ?? 0) > 0 ? 20_000 : false,
+  });
+}
+
+export function useAlertsScreenerWarm(workflowId: string, scope: string | null) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => warmScreenerCandles(workflowId, scope),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: alertsKeys.screenerDataStatus(workflowId, scope),
+      });
+    },
   });
 }
 

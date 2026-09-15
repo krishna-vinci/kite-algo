@@ -758,3 +758,51 @@ export type AlertsCanvasLayoutResponse = {
     note: string;
   };
 };
+
+/** Per-member candle availability for a screener (GET .../data-status). */
+export type AlertsScreenerMemberCandles = {
+  instrument_key: string;
+  bars: number;
+  required_bars: number;
+  sufficient: boolean;
+  last_candle_ts: string | null;
+  warming: boolean;
+};
+
+export type AlertsScreenerDataStatusResponse = {
+  ok: boolean;
+  workflow_id: string;
+  warming_supported: boolean;
+  resolution_ok?: boolean;
+  member_count?: number;
+  required_bars?: number;
+  members_needing_candles?: number;
+  status?: "complete" | "warming" | "unavailable";
+  members?: AlertsScreenerMemberCandles[];
+  note?: string;
+};
+
+/** Result of a bounded candle-warming call (POST .../warm-candles). */
+export type AlertsScreenerWarmResponse = {
+  ok: boolean;
+  workflow_id: string;
+  status: string;
+  requested: number;
+  warmed: number;
+  fresh: number;
+  unavailable: number;
+  skipped: number;
+  expired: number;
+  required_bars: number;
+  catalog_generation?: string | null;
+  budget_exhausted: boolean;
+  duration_s: number;
+  members?: Array<{
+    instrument_key: string;
+    status: string;
+    broker_token?: number | null;
+    bars?: number;
+    required_bars?: number;
+    detail?: string | null;
+  }>;
+};

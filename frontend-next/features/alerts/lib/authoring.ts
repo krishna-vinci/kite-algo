@@ -180,6 +180,37 @@ export function sessionAcceptsExchange(
 }
 
 /** Exchange of a qualified `EXCHANGE:SYMBOL` key. */
+/**
+ * The session a given exchange belongs to, when exactly one policy accepts it.
+ *
+ * The server publishes `session_exchanges`; the UI mirrors that map instead of
+ * hard-coding names, so an operator never has to know the word `mcx_commodity`.
+ * ``null`` means "more than one session accepts this exchange", where guessing
+ * would silently pick a policy.
+ */
+export function sessionForExchange(
+  exchange: string,
+  sessionExchanges: Record<string, string[]>,
+): string {
+  const wanted = exchange.trim().toUpperCase();
+  if (!wanted) return "";
+  const matches = Object.entries(sessionExchanges)
+    .filter(([, exchanges]) => exchanges.some((item) => item.trim().toUpperCase() === wanted))
+    .map(([session]) => session);
+  return matches.length === 1 ? matches[0] : "";
+}
+
+/** Human labels for the canonical session names (values are unchanged). */
+export const SESSION_LABELS: Record<string, string> = {
+  nse_equity: "NSE equities",
+  mcx_commodity: "MCX commodities",
+  currency: "Currency (CDS/BCD)",
+};
+
+export function sessionLabel(session: string): string {
+  return SESSION_LABELS[session] ?? session;
+}
+
 export function exchangeOf(instrumentKey: string): string {
   const separator = instrumentKey.indexOf(":");
   return separator === -1 ? "" : instrumentKey.slice(0, separator).toUpperCase();

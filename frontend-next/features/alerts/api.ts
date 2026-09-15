@@ -18,6 +18,8 @@ import type {
   AlertsCapabilitiesResponse,
   AlertsChannelTestResponse,
   AlertsChannelsResponse,
+  AlertsScreenerDataStatusResponse,
+  AlertsScreenerWarmResponse,
   AlertsDeliveriesResponse,
   AlertsEventsResponse,
   AlertsInstrumentSearchResponse,
@@ -146,6 +148,33 @@ export async function createAlertsWorkflow(
     method: "POST",
     json: payload,
   });
+}
+
+/**
+ * Per-member candle availability for a screener, resolved from the catalog.
+ *
+ * Read-only and safe to poll: it answers "is this universe warming,
+ * unavailable, stale or complete" without running the scan, which is how the UI
+ * distinguishes "no candles yet" from "nothing matched".
+ */
+export async function fetchScreenerDataStatus(
+  workflowId: string,
+  scope?: string | null,
+): Promise<AlertsScreenerDataStatusResponse> {
+  return apiFetch<AlertsScreenerDataStatusResponse>(
+    `${BASE}/screeners/${workflowId}/data-status${scopeQuery(scope)}`,
+  );
+}
+
+/** Bounded, idempotent candle acquisition for this screener's members. */
+export async function warmScreenerCandles(
+  workflowId: string,
+  scope?: string | null,
+): Promise<AlertsScreenerWarmResponse> {
+  return apiFetch<AlertsScreenerWarmResponse>(
+    `${BASE}/screeners/${workflowId}/warm-candles${scopeQuery(scope)}`,
+    { method: "POST" },
+  );
 }
 
 export async function patchAlertsWorkflow(

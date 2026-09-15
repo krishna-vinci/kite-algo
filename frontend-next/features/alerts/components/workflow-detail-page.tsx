@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { SectionLabel } from "@/components/operator/section-label";
+import { sessionLabel } from "@/features/alerts/lib/authoring";
 import { StatusBadge } from "@/components/operator/status-badge";
 import { ReadableDefinition } from "@/features/alerts/components/readable-definition";
 import {
@@ -189,15 +190,17 @@ export function WorkflowDetailPage({
               <KindBadge kind={workflow.kind} />
               <LifecycleBadge workflow={workflow} />
               <FreshnessBadge freshness={workflow.freshness} />
-              <span className="font-mono text-[10px] text-muted-foreground">
-                {workflow.workflow_id}
-              </span>
             </div>
             <p className="text-sm text-muted-foreground">
-              {workflow.instrument_summary ?? "no coverage"} · session{" "}
-              <span className="font-mono">{workflow.session ?? "—"}</span> ·{" "}
+              {workflow.instrument_summary ?? "no coverage"} · {sessionLabel(workflow.session ?? "")} ·{" "}
               {workflow.subscription_count} subscription(s)
             </p>
+            {/* The identifier is an implementation detail: useful when quoting a
+                specific definition, never the headline. */}
+            <details className="text-xs text-muted-foreground">
+              <summary className="cursor-pointer">Technical details</summary>
+              <p className="mt-1 font-mono text-[10px]">{workflow.workflow_id}</p>
+            </details>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">

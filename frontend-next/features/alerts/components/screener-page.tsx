@@ -22,13 +22,16 @@ import {
 import {
   useAlertsCapabilities,
   useAlertsScreenerAttachments,
+  useAlertsScreenerDataStatus,
   useAlertsScreenerMutations,
   useAlertsScreenerRun,
   useAlertsScreenerRuns,
+  useAlertsScreenerWarm,
   useAlertsWorkflow,
 } from "@/features/alerts/hooks/use-alerts-queries";
 import { alertsErrorMessage, isNotFound } from "@/features/alerts/lib/errors";
 import { formatTimestamp } from "@/features/alerts/lib/format";
+import { readScreenerRun } from "@/features/alerts/lib/run-summary";
 import { newIdempotencyKey } from "@/lib/ids";
 
 function runStatusTone(status: string): "positive" | "warning" | "danger" | "neutral" {
@@ -81,10 +84,12 @@ function RunMembers({ runId, scope }: Readonly<{ runId: string; scope: string | 
   return (
     <Panel tone="subtle">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-medium">Run {runId.slice(0, 8)}</span>
+        <span className="text-sm font-medium">Latest run</span>
         <StatusBadge tone={runStatusTone(run.status)}>{run.status}</StatusBadge>
         <span className="text-xs text-muted-foreground">{member_count} member rows</span>
       </div>
+
+      <p className="mt-2 text-xs text-muted-foreground">{readScreenerRun(run).summary}</p>
 
       {/* A partial run is NOT a complete membership replacement. */}
       {run.status === "partial" ? (
@@ -252,6 +257,27 @@ export function ScreenerPage({
   const capabilitiesQuery = useAlertsCapabilities(scope);
   const runsQuery = useAlertsScreenerRuns(workflowId, scope);
   const { trigger } = useAlertsScreenerMutations(workflowId, scope);
+  const dataStatus = useAlertsScreenerDataStatus(workflowId, scope);
+  const warm = useAlertsScreenerWarm(workflowId, scope);
+  // One key per run intent: a double click or a retry reuses it (the server
+  // returns the original run); the key is replaced only after a run is accepted,
+  // so the NEXT deliberate run is a new intent.
+  const [runKey, setRunKey] = useState(() => newIdempotencyKey("screener-run"));
+  const [candleNotice, setCandleNotice] = useState<string | null>(null);
+
+  const startRun = () => {
+    if (trigger.isPending) return;
+    trigger.mutate(runKey, {
+      onSuccess: (result) => {
+        // A retried request must reuse the key; the next deliberate run is a new
+        // intent, so the key is replaced only once this one is settled.
+        setRunKey(newIdempotencyKey("screener-run"));
+        if (result?.status !== "already_finalized") {
+          void dataStatus.refetch();
+        }
+      },
+    });
+  };
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [tab, setTab] = useState<"runs" | "baselines">("runs");
 
@@ -304,14 +330,7 @@ export function ScreenerPage({
         <Button
           size="sm"
           disabled={trigger.isPending}
-          onClick={() =>
-            // An idempotency key makes a double-click or a retry return the
-            // original run instead of executing a second scan.
-            // A manual run reuses its key on retry so a retried request cannot
-            // start a second scan; "Run now" after a completed run is a NEW
-            // intent and gets a new key.
-            trigger.mutate(newIdempotencyKey("screener-run"))
-          }
+          onClick={startRun}
         >
           <PlayIcon className="size-4" aria-hidden />
           {trigger.isPending ? "Starting…" : "Run now"}
@@ -336,6 +355,49 @@ export function ScreenerPage({
           </span>
         ) : null}
       </div>
+
+      {/* Candle availability: the difference between "no candles yet" and "no
+          matches" has to be visible BEFORE a run, not inferred from an empty
+          result. */}
+      {dataStatus.data?.warming_supported ? (
+        <Panel tone={((dataStatus.data.members_needing_candles ?? 0) > 0) ? "default" : "subtle"}>
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-sm font-medium">Candle data</span>
+            <StatusBadge
+              tone={((dataStatus.data.members_needing_candles ?? 0) > 0) ? "warning" : "positive"}
+            >
+              {((dataStatus.data.members_needing_candles ?? 0) > 0) ? "warming" : "ready"}
+            </StatusBadge>
+            <span className="text-xs text-muted-foreground">
+              {(dataStatus.data.members_needing_candles ?? 0) > 0
+                ? `${dataStatus.data.members_needing_candles} of ${dataStatus.data.member_count} symbols still need ${dataStatus.data.required_bars} final daily candles`
+                : `All ${dataStatus.data.member_count} symbols have the history this scan needs`}
+            </span>
+            {(dataStatus.data.members_needing_candles ?? 0) > 0 ? (
+              <Button size="xs" variant="outline" disabled={warm.isPending} onClick={() => warm.mutate(undefined, {
+                onSuccess: (result: { warmed: number; fresh: number; unavailable: number; skipped: number; duration_s: number }) =>
+                  setCandleNotice(
+                    `Fetched ${result.warmed} symbol(s); ${result.fresh} already had history` +
+                      (result.unavailable ? `, ${result.unavailable} unavailable` : "") +
+                      (result.skipped ? `, ${result.skipped} left for a follow-up call` : "") +
+                      ` (${result.duration_s.toFixed(1)}s).`,
+                  ),
+              })}>
+                {warm.isPending ? "Fetching…" : "Fetch candle history"}
+              </Button>
+            ) : null}
+          </div>
+          {warm.error ? (
+            <p className="mt-2 text-xs text-rose-300">
+              {alertsErrorMessage(warm.error, "Candle fetching failed")}
+            </p>
+          ) : null}
+          {candleNotice ? <p className="mt-2 text-xs text-muted-foreground">{candleNotice}</p> : null}
+          {dataStatus.data.note ? (
+            <p className="mt-1 text-xs text-muted-foreground">{dataStatus.data.note}</p>
+          ) : null}
+        </Panel>
+      ) : null}
 
       <div role="tablist" aria-label="Screener sections" className="flex flex-wrap gap-2">
         {([
@@ -383,7 +445,7 @@ export function ScreenerPage({
                     <TableHead>Created</TableHead>
                     <TableHead>Completed</TableHead>
                     <TableHead>Triggered by</TableHead>
-                    <TableHead>Failure reason</TableHead>
+                    <TableHead>What happened</TableHead>
                     <TableHead />
                   </TableRow>
                 </TableHeader>
@@ -406,9 +468,13 @@ export function ScreenerPage({
                         <TableCell className="text-sm text-muted-foreground">
                           {run.triggered_by ?? "—"}
                         </TableCell>
-                        <TableCell className="text-xs text-rose-300">
-                          {/* A failed run must say WHY rather than just failing. */}
-                          {run.failure_reason ?? "—"}
+                        <TableCell className="max-w-[26rem] text-xs text-muted-foreground">
+                          {/* What happened, in words: a zero-evaluated run caused by
+                              missing candle data must not read like "no matches". */}
+                          {readScreenerRun(run).summary}
+                          {run.failure_reason && !readScreenerRun(run).dataLimited ? (
+                            <span className="ml-1 text-rose-300">({run.failure_reason})</span>
+                          ) : null}
                         </TableCell>
                         <TableCell>
                           <Button
