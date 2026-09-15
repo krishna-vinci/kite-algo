@@ -277,21 +277,45 @@ destructively.
   ``lease_epoch``) for staleness — there is no ``flat=true``/``reconciled=true``
   input. The server classifies persisted evidence; a terminal job label alone
   never unblocks.
+- **Reuses existing services, read-only.** The worker-run repo + the paper
+  runtime's new **read-only settlement view**
+  (`get_strategy_run_settlement_readonly`) — it does **not** call
+  `ensure_account`, so reconciliation never creates account state. It returns the
+  durable run state plus attributed order/pending-order counts. No second
+  position or execution ledger.
 - **Evidence axes** (examples and status meanings in §8): process cleanup,
-  authority, work, exposure, protection, availability. Any unavailable source ⇒
-  ``EVIDENCE_UNAVAILABLE`` (blocked).
+  authority, work, exposure, protection, availability. Any missing, malformed,
+  unavailable or ambiguous source keeps the axis `unknown` and the assessment
+  blocked — it is never read as flat. Confirmed-empty positions (an empty
+  `positions` list) are distinguished from missing position data (no run state /
+  missing `positions` / malformed quantities).
+- **Work is authoritative, not the worker-run label.** `work_state` comes from
+  attributed paper order settlement (pending/open/partially-filled ⇒
+  outstanding) plus the options run state and protection activity — a
+  `closed`/`failed` worker run does **not** by itself mean settled. Data-only
+  attempts classify with no trading work regardless of trading-run status.
+- **Atomic unblocking.** `reconcile_with_audit` does one transaction: locks the
+  strategy row (serializing with `create_job` and cleanup-state updates),
+  CAS-matches owner/attempt/lease-epoch/recovery state/process-cleanup/run,
+  updates the job to `stopped`, and appends the audit row. If the audit insert
+  fails the whole transaction rolls back, so the block is never cleared without a
+  durable record.
+- **Evidence validity.** Because lease-epoch does not version external execution
+  evidence, the endpoint re-collects the settlement evidence immediately before
+  commit; a changed digest (or a source that became unavailable) is refused with
+  `EVIDENCE_CHANGED`. This narrows (but does not eliminate) the TOCTOU window and
+  fails closed when validity cannot be established — no exactly-once claim.
 - **Cases.** (1) ``unlaunched`` — no handoff, no work; (2) ``data_only_completed``
   — no trading capability/work, cleanup established; (3) ``trading_settled_flat``
   — cleanup confirmed, work settled, exposure flat, authority revoked;
   (4) ``blocked`` otherwise (open exposure, outstanding/unknown work, unknown/
   unresolved cleanup, active/uncertain authority, pending recovery, unavailable
   evidence, or an active job).
-- **Races.** Action pins the attempt; ``reconcile_recovery`` CAS-matches
-  lease-epoch/attempt and locks the strategy row, so it serializes with
-  ``create_job`` (tested on PostgreSQL). A new attempt gets a new run/token; the
-  old attempt is never revived. History is append-only and never overwritten.
-- **Reuses existing services** (worker-run repo, paper runtime, protection/
-  recovery state) — no second position or execution ledger.
+- **Races.** The action pins the attempt and the atomic `reconcile_with_audit`
+  CAS-matches the in-DB evidence and locks the strategy row, so it serializes
+  with `create_job` and cleanup-state updates (tested on PostgreSQL). A new
+  attempt gets a new run/token; the old attempt is never revived. History is
+  append-only and never overwritten.
 - **Excluded:** Cancel/Flatten execution. Open exposure is reported as a blocking
   reason (``OPEN_EXPOSURE``) and the frontend shows why reconciliation is blocked.
 
@@ -324,7 +348,7 @@ Targeted suites (SQLite):
   tests/api/test_hosted_lifecycle_api.py \
   tests/api/test_hosted_child_authority.py \
   tests/sdk -q
-→ 603 passed, 2 skipped
+→ 608 passed, 2 skipped
 ```
 
 Disposable PostgreSQL (real concurrency; own invocation):
@@ -334,7 +358,8 @@ HOSTED_FOUNDATION_PG_URL='postgresql://postgres:testonly@127.0.0.1:15433/kite_te
   .venv/bin/python -m pytest \
     tests/integration/test_hosted_supervisor_lifecycle_postgres.py \
     tests/integration/test_hosted_strategy_foundation_postgres.py -q
-→ 16 passed       # + concurrent reconcile-and-replacement one winner; append-only audit ordering
+→ 18 passed       # + atomic reconcile-with-audit (one winner) serialized with
+                  # create_job; changed-cleanup-evidence CAS refusal; append-only audit
 ```
 
 `alembic heads` → single head `20260915_000021`. `git diff --check` clean.
@@ -385,21 +410,24 @@ Process-supervision tests (added this slice) — **real process tests** vs
 - `tests/strategies/test_repository.py` — `record_progress` only for live jobs.
 - Reconciliation tests (this slice):
   - `tests/strategies/test_reconciliation.py` — **pure** assessment across the four
-    cases and every evidence axis (open exposure, outstanding/unknown work,
-    unknown/unresolved cleanup, active authority, unavailable evidence, active
-    job, terminal-label-alone), plus the **real collector** with fake worker/paper
-    services (settled/flat, open exposure, outstanding work, unavailable paper,
-    active authority, unlaunched data-only).
+    cases and every evidence axis, plus the **real collector** driven with
+    production-shaped read-only settlement responses: nested `strategy.positions`
+    with nonzero exposure blocked; `None`/missing/malformed quantities stay
+    unknown (never flat); confirmed-empty run state is flat; closed worker run
+    with pending orders stays outstanding; unavailable paper service; attribution
+    mismatch; active authority; data-only completion with an open trading run.
   - `tests/api/test_reconciliation_api.py` — allowed reconciliation unblocks a new
     attempt; open exposure stays blocked + audited; stale attempt refused;
-    cross-owner 404; cross-account 403 (and omitted from lists); data-only
-    completion records `not_applicable` (no invented flatness); unavailable
-    evidence blocked; owner list/detail; authentication required.
+    cross-owner 404; cross-account 403 (list omits); data-only completion records
+    `not_applicable`; unavailable evidence blocked; **evidence changed between
+    assessment and commit refused**; **audit-write failure rolls back unblocking**
+    (job stays blocked, no audit row); owner list/detail; authentication required.
   - `tests/api/test_hosted_lifecycle_api.py` — process-cleanup evidence is
     attempt-bound, visible in state, refused for a stale attempt, and refused for
     a child worker token (401).
-  - PostgreSQL — concurrent reconcile has exactly one winner and replacement is
-    serialized; reconciliation audit is append-only and ordered.
+  - PostgreSQL — atomic reconcile-with-audit has exactly one winner and serializes
+    with `create_job`; a changed cleanup-evidence CAS is refused; audit is
+    append-only and ordered.
 
 **Unrelated pre-existing failures — corrected baseline evidence.** The earlier
 report compared only `backend/api/routers/__init__.py`, which is *not* a complete
@@ -639,6 +667,7 @@ plus `handoff_at`, `process_cleanup_state`, `process_cleanup_at`,
 | `OPEN_EXPOSURE` / `EXPOSURE_UNKNOWN` | Attributable exposure open / could not be read |
 | `PROTECTION_UNKNOWN` / `RECOVERY_ACTION_PENDING` | Protection state unavailable / recovery action outstanding |
 | `EVIDENCE_UNAVAILABLE` | A required evidence source could not be read |
+| `EVIDENCE_CHANGED` | Execution evidence changed between assessment and commit (re-inspect) |
 | `HOSTED_JOB_ACTIVE` | Attempt is live; stop it before reconciling |
 | `HOSTED_JOB_NOT_BLOCKED` | Replacement is not blocked |
 

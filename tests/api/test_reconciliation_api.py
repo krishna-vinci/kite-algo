@@ -59,15 +59,24 @@ def _evidence(**overrides) -> ReconciliationEvidence:
 
 
 class StubCollector:
-    def __init__(self, template: ReconciliationEvidence) -> None:
+    """Deterministic evidence, or a sequence for TOCTOU tests."""
+
+    def __init__(self, template, *, second=None) -> None:
         self.template = template
+        self.second = second
+        self.calls = 0
 
     async def collect(self, job):
+        self.calls += 1
+        source = self.template
+        if self.second is not None and self.calls > 1:
+            source = self.second
         return replace(
-            self.template,
+            source,
             job_id=str(job.id),
             strategy_id=str(job.strategy_id),
             attempt=int(job.attempt),
+            run_id=str(job.run_id),
         )
 
 
@@ -308,3 +317,42 @@ async def test_authentication_required(session_factory, monkeypatch):
     collector = StubCollector(_evidence())
     async with _client(session_factory, monkeypatch, collector, username=None) as client:
         assert (await client.get(f"{BASE}/{strategy.id}/jobs")).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_evidence_changed_between_assessment_and_commit_is_refused(session_factory, monkeypatch):
+    repo = _repo(session_factory)
+    strategy, job = _make_job(repo)
+    # First collection allows; the pre-commit re-check sees open exposure.
+    collector = StubCollector(_evidence(), second=_evidence(exposure_state="open"))
+    async with _client(session_factory, monkeypatch, collector) as client:
+        response = await client.post(
+            f"{BASE}/{strategy.id}/jobs/{job.id}/reconciliation", json={"attempt": 1}
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["rejection_reason"] == "EVIDENCE_CHANGED"
+    assert repo.get_job(OWNER, job.id).status == "recovery_required"
+    history = repo.list_reconciliations(job.id)
+    assert history and history[0].outcome == "blocked"
+
+
+def test_audit_write_failure_rolls_back_unblocking(session_factory):
+    repo = _repo(session_factory)
+    strategy, job = _make_job(repo)
+    # A non-JSON-serializable evidence value makes the audit insert fail inside
+    # the same transaction: the block must NOT be cleared.
+    with pytest.raises(Exception):
+        repo.reconcile_with_audit(
+            job.id,
+            owner_id=OWNER,
+            expected_lease_epoch=1,
+            expected_attempt=1,
+            expected_process_cleanup_state="confirmed",
+            expected_run_id="run_1",
+            reason_code="TRADING_SETTLED_FLAT",
+            evidence={"bad": object()},
+            actor_id=OWNER,
+        )
+    assert repo.get_job(OWNER, job.id).status == "recovery_required"
+    assert repo.get_job(OWNER, job.id).reconciled_at is None
+    assert repo.list_reconciliations(job.id) == []

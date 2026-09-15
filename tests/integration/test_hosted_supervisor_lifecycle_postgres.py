@@ -450,3 +450,99 @@ def test_reconciliation_audit_is_append_only(env):
     history = repo.list_reconciliations(job.id)
     assert [row.outcome for row in history] == ["reconciled", "blocked"]  # newest first
     assert {row.actor_id for row in history} == {OWNER}
+
+
+def test_reconcile_with_audit_is_atomic_and_serialized(env):
+    factory, _engine = env
+    repo, job = _seed_job(factory)
+    assert repo.mark_recovery_required(
+        job.id, lease_owner="sup-A", expected_lease_epoch=1, expected_attempt=1
+    )
+    # Confirmed cleanup evidence on the job for the CAS.
+    with factory() as session:
+        session.execute(
+            text("UPDATE strategy_jobs SET process_cleanup_state = 'confirmed' WHERE id = :id"),
+            {"id": job.id},
+        )
+        session.commit()
+
+    results = []
+    errors = []
+    barrier = threading.Barrier(3)
+
+    def _reconcile():
+        barrier.wait(timeout=10)
+        try:
+            results.append(
+                repo.reconcile_with_audit(
+                    job.id,
+                    owner_id=OWNER,
+                    expected_lease_epoch=1,
+                    expected_attempt=1,
+                    expected_process_cleanup_state="confirmed",
+                    expected_run_id=job.run_id,
+                    reason_code="TRADING_SETTLED_FLAT",
+                    evidence={"exposure_state": "flat"},
+                    actor_id=OWNER,
+                )
+            )
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    def _replace():
+        barrier.wait(timeout=10)
+        try:
+            repo.create_job(
+                strategy_id=job.strategy_id,
+                version_id=job.version_id,
+                owner_id=OWNER,
+                job_kind="finite",
+                execution_mode="paper",
+                params={},
+                attempt=2,
+            )
+        except StrategyFenceError:
+            pass
+
+    threads = [threading.Thread(target=_reconcile), threading.Thread(target=_reconcile), threading.Thread(target=_replace)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors
+    winners = [row for row in results if row is not None]
+    assert len(winners) == 1  # exactly one reconciliation clears the block
+    # Atomic: the block is cleared AND exactly one audit row was written.
+    assert repo.get_job(OWNER, job.id).status == "stopped"
+    audit_rows = [row for row in repo.list_reconciliations(job.id) if row.outcome == "reconciled"]
+    assert len(audit_rows) == 1
+
+
+def test_reconcile_with_audit_rejects_changed_cleanup_evidence(env):
+    factory, _engine = env
+    repo, job = _seed_job(factory)
+    assert repo.mark_recovery_required(
+        job.id, lease_owner="sup-A", expected_lease_epoch=1, expected_attempt=1
+    )
+    with factory() as session:
+        session.execute(
+            text("UPDATE strategy_jobs SET process_cleanup_state = 'confirmed' WHERE id = :id"),
+            {"id": job.id},
+        )
+        session.commit()
+    # Assessment saw 'unresolved' but the durable row says 'confirmed' → refuse.
+    result = repo.reconcile_with_audit(
+        job.id,
+        owner_id=OWNER,
+        expected_lease_epoch=1,
+        expected_attempt=1,
+        expected_process_cleanup_state="unresolved",
+        expected_run_id=job.run_id,
+        reason_code="TRADING_SETTLED_FLAT",
+        evidence={"process_cleanup_state": "unresolved"},
+        actor_id=OWNER,
+    )
+    assert result is None
+    assert repo.get_job(OWNER, job.id).status == "recovery_required"
+    assert repo.list_reconciliations(job.id) == []

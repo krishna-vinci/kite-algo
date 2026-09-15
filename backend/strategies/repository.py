@@ -443,6 +443,11 @@ class SqlAlchemyStrategyRepository:
             raise service.StrategyValidationError("process cleanup state must be confirmed/unresolved")
         session = self._session()
         try:
+            # Lock the parent strategy row so a concurrent reconciliation
+            # (which also locks it) sees a stable cleanup state.
+            strategy_id = self._strategy_id_for_job(session, job_id)
+            if strategy_id is not None:
+                self._lock_strategy(session, strategy_id)
             result = session.execute(
                 update(StrategyJob)
                 .where(
@@ -459,6 +464,80 @@ class SqlAlchemyStrategyRepository:
             )
             session.commit()
             return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def reconcile_with_audit(
+        self,
+        job_id: str,
+        *,
+        owner_id: str,
+        expected_lease_epoch: int,
+        expected_attempt: int,
+        expected_process_cleanup_state: Optional[str],
+        expected_run_id: Optional[str],
+        reason_code: str,
+        evidence: Dict[str, Any],
+        actor_id: str,
+    ) -> Optional[StrategyJobReconciliation]:
+        """Clear the replacement block **and** append the audit row atomically.
+
+        One transaction: locks the strategy row (serializing with ``create_job``
+        and with cleanup-state updates), CAS-matches the in-DB evidence
+        (owner/attempt/lease-epoch/recovery state/process-cleanup/run), updates the
+        job to ``stopped`` and inserts the audit row. If the CAS loses, or the
+        audit insert fails, the whole transaction rolls back so the block is never
+        cleared without a durable record. Returns the audit row or ``None``.
+        """
+        session = self._session()
+        try:
+            row = session.execute(
+                select(StrategyJob.strategy_id, StrategyJob.owner_id).where(StrategyJob.id == job_id)
+            ).first()
+            if row is None or str(row.owner_id) != owner_id:
+                session.rollback()
+                return None
+            strategy_id = str(row.strategy_id)
+            self._lock_strategy(session, strategy_id, owner_id)
+
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    StrategyJob.id == job_id,
+                    StrategyJob.owner_id == owner_id,
+                    StrategyJob.attempt == expected_attempt,
+                    StrategyJob.lease_epoch == expected_lease_epoch,
+                    StrategyJob.status == _UNRECONCILED,
+                    StrategyJob.reconciled_at.is_(None),
+                    StrategyJob.process_cleanup_state.is_not_distinct_from(
+                        expected_process_cleanup_state
+                    ),
+                    StrategyJob.run_id.is_not_distinct_from(expected_run_id),
+                )
+                .values(status="stopped", reconciled_at=_utcnow(), updated_at=_utcnow())
+            )
+            if not result.rowcount:
+                session.rollback()
+                return None
+
+            audit = StrategyJobReconciliation(
+                id=service.new_reconciliation_id(),
+                job_id=job_id,
+                strategy_id=strategy_id,
+                owner_id=owner_id,
+                attempt=int(expected_attempt),
+                run_id=expected_run_id,
+                outcome="reconciled",
+                reason_code=reason_code,
+                evidence_json=copy.deepcopy(dict(evidence or {})),
+                actor_id=actor_id,
+            )
+            session.add(audit)
+            session.commit()
+            return audit
         except Exception:
             session.rollback()
             raise

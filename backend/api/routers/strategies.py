@@ -53,7 +53,7 @@ from backend.api.services.hosted_strategy_authz import (
 )
 from backend.app.auth import AppUser, require_app_user
 from backend.strategies import service
-from backend.strategies.reconciliation import assess
+from backend.strategies.reconciliation import assess, evidence_digest
 from backend.strategies.repository import (
     SqlAlchemyStrategyRepository,
     StrategyConflict,
@@ -143,7 +143,7 @@ def _owned_strategy(repo: SqlAlchemyStrategyRepository, owner: str, strategy_id:
 
 
 def _collector(request: Request):
-    """Reconciliation evidence collector (injectable; reuses worker services)."""
+    """Reconciliation evidence collector (injectable; read-only services)."""
     collector = getattr(request.app.state, "reconciliation_collector", None)
     if collector is not None:
         return collector
@@ -152,7 +152,10 @@ def _collector(request: Request):
 
     worker = getattr(request.app.state, "algo_worker_repository", None) or SqlAlchemyAlgoWorkerRepository()
     paper = getattr(request.app.state, "paper_runtime_service", None)
-    return ReconciliationEvidenceCollector(worker_repo=worker, paper_runtime=paper)
+    option_status = getattr(request.app.state, "option_run_status_reader", None)
+    return ReconciliationEvidenceCollector(
+        worker_repo=worker, paper_runtime=paper, option_status_reader=option_status
+    )
 
 
 def _job_replacement_blocked(job: Any) -> bool:
@@ -444,7 +447,8 @@ async def reconcile_job(
             detail={"rejection_reason": "STALE_LEASE_EPOCH", "current_lease_epoch": int(job.lease_epoch)},
         )
 
-    evidence = await _collector(request).collect(job)
+    collector = _collector(request)
+    evidence = await collector.collect(job)
     assessment = assess(evidence)
 
     if not assessment.allowed:
@@ -471,14 +475,13 @@ async def reconcile_job(
             },
         )
 
-    # Serialized with job creation via the strategy row lock inside the repo.
-    reconciled = repo.reconcile_recovery(
-        job.id,
-        owner_id=owner,
-        expected_lease_epoch=int(job.lease_epoch),
-        expected_attempt=int(job.attempt),
-    )
-    if not reconciled:
+    # Re-collect immediately before commit: outstanding/in-flight execution
+    # evidence is not versioned by lease-epoch, so a changed digest (or a source
+    # that became unavailable) fails closed rather than clearing the block on
+    # stale evidence.
+    recheck = await collector.collect(job)
+    reassessment = assess(recheck)
+    if evidence_digest(recheck) != evidence_digest(evidence) or not reassessment.allowed:
         audit = repo.record_reconciliation(
             job_id=job.id,
             strategy_id=job.strategy_id,
@@ -486,8 +489,43 @@ async def reconcile_job(
             attempt=int(job.attempt),
             run_id=job.run_id,
             outcome="blocked",
+            reason_code="EVIDENCE_CHANGED",
+            evidence=recheck.to_dict(),
+            actor_id=owner,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "EVIDENCE_CHANGED",
+                "message": "execution evidence changed; re-inspect before reconciling",
+                "blocking_reasons": reassessment.blocking_reasons,
+                "evidence": recheck.to_dict(),
+                "audit_id": audit.id,
+            },
+        )
+
+    # Atomic: CAS on the in-DB evidence + clear the block + append the audit row.
+    audit = repo.reconcile_with_audit(
+        job.id,
+        owner_id=owner,
+        expected_lease_epoch=int(job.lease_epoch),
+        expected_attempt=int(job.attempt),
+        expected_process_cleanup_state=recheck.process_cleanup_state,
+        expected_run_id=recheck.run_id,
+        reason_code=reassessment.reason_code,
+        evidence=recheck.to_dict(),
+        actor_id=owner,
+    )
+    if audit is None:
+        blocked = repo.record_reconciliation(
+            job_id=job.id,
+            strategy_id=job.strategy_id,
+            owner_id=owner,
+            attempt=int(job.attempt),
+            run_id=job.run_id,
+            outcome="blocked",
             reason_code="RECONCILE_RACE_LOST",
-            evidence=evidence.to_dict(),
+            evidence=recheck.to_dict(),
             actor_id=owner,
         )
         raise HTTPException(
@@ -495,29 +533,18 @@ async def reconcile_job(
             detail={
                 "rejection_reason": "RECONCILE_RACE_LOST",
                 "message": "attempt state changed; re-inspect before reconciling",
-                "audit_id": audit.id,
+                "audit_id": blocked.id,
             },
         )
 
-    audit = repo.record_reconciliation(
-        job_id=job.id,
-        strategy_id=job.strategy_id,
-        owner_id=owner,
-        attempt=int(job.attempt),
-        run_id=job.run_id,
-        outcome="reconciled",
-        reason_code=assessment.reason_code,
-        evidence=evidence.to_dict(),
-        actor_id=owner,
-    )
     return ReconciliationActionResponse(
         status="reconciled",
         job_id=job.id,
         attempt=int(job.attempt),
-        case=assessment.case,
-        reason_code=assessment.reason_code,
+        case=reassessment.case,
+        reason_code=reassessment.reason_code,
         replacement_blocked=False,
         blocking_reasons=[],
-        evidence=evidence.to_dict(),
+        evidence=recheck.to_dict(),
         audit_id=audit.id,
     )

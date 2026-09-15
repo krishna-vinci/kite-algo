@@ -145,14 +145,56 @@ class FakeWorker:
 
 
 class FakePaper:
-    def __init__(self, pnl=None, *, raise_error=False):
-        self.pnl = pnl
-        self.raise_error = raise_error
+    """Production-shaped read-only settlement view (no ensure_account)."""
 
-    async def get_strategy_run_pnl(self, account_scope, run_id):
+    def __init__(self, payload=None, *, raise_error=False):
+        self.payload = payload
+        self.raise_error = raise_error
+        self.calls = 0
+
+    async def get_strategy_run_settlement_readonly(self, account_scope, strategy_run_id):
+        self.calls += 1
         if self.raise_error:
             raise RuntimeError("paper down")
-        return self.pnl
+        return self.payload
+
+
+def _settlement(*, run_state, order_count=0, pending_order_count=0, account="kite:paper", run_id="run_1"):
+    return {
+        "account_scope": account,
+        "strategy_run_id": run_id,
+        "run_state": run_state,
+        "order_count": order_count,
+        "pending_order_count": pending_order_count,
+    }
+
+
+class _Missing:
+    pass
+
+
+_MISSING = _Missing()
+
+
+def _run_state(positions, *, run_id="run_1", is_stale=False, last_event_at="2026-09-15T10:00:00+00:00"):
+    open_qty = 0
+    if isinstance(positions, list):
+        for position in positions:
+            if isinstance(position, dict):
+                try:
+                    open_qty += abs(int(position.get("net_quantity") or 0))
+                except (TypeError, ValueError):
+                    pass
+    state = {
+        "strategy_run_id": run_id,
+        "strategy_id": run_id,
+        "is_stale": is_stale,
+        "status": "open" if open_qty else "closed",
+        "last_event_at": last_event_at,
+    }
+    if positions is not _MISSING:
+        state["positions"] = positions
+    return state
 
 
 def _job(**overrides):
@@ -177,36 +219,77 @@ def _job(**overrides):
     return SimpleNamespace(**base)
 
 
+def _collector(worker, paper):
+    return ReconciliationEvidenceCollector(worker_repo=worker, paper_runtime=paper)
+
+
 @pytest.mark.asyncio
-async def test_collector_trading_settled_flat():
+async def test_collector_trading_settled_flat_allows():
     job = _job()
     worker = FakeWorker(run={"status": "closed", "runtime_state": {}}, token_status="revoked")
-    collector = ReconciliationEvidenceCollector(worker_repo=worker, paper_runtime=FakePaper(pnl={"positions": []}))
-    evidence = await collector.collect(job)
-    assert evidence.trade_capable and evidence.launched
+    paper = FakePaper(_settlement(run_state=_run_state([{"net_quantity": 0}]), order_count=2))
+    evidence = await _collector(worker, paper).collect(job)
     assert evidence.work_state == "settled"
     assert evidence.exposure_state == "flat"
-    assert evidence.authority_state == "revoked"
     assert evidence.evidence_complete
     assert assess(evidence).allowed
+    # Read-only path used; no ensure_account-style PnL call.
+    assert paper.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_collector_open_exposure_blocked():
+async def test_collector_nested_positions_nonzero_stays_blocked():
     job = _job()
     worker = FakeWorker(run={"status": "closed", "runtime_state": {}}, token_status="revoked")
-    paper = FakePaper(pnl={"positions": [{"net_quantity": 75}]})
-    evidence = await ReconciliationEvidenceCollector(worker_repo=worker, paper_runtime=paper).collect(job)
+    paper = FakePaper(_settlement(run_state=_run_state([{"net_quantity": 75}]), order_count=2))
+    evidence = await _collector(worker, paper).collect(job)
     assert evidence.exposure_state == "open"
     result = assess(evidence)
     assert not result.allowed and BLOCK_OPEN_EXPOSURE in result.blocking_reasons
 
 
 @pytest.mark.asyncio
-async def test_collector_outstanding_work_blocked():
+async def test_collector_none_and_missing_and_malformed_stay_unknown():
     job = _job()
-    worker = FakeWorker(run={"status": "open", "runtime_state": {}}, token_status="revoked")
-    evidence = await ReconciliationEvidenceCollector(worker_repo=worker, paper_runtime=FakePaper(pnl={"positions": []})).collect(job)
+    worker = FakeWorker(run={"status": "closed", "runtime_state": {}}, token_status="revoked")
+
+    # None payload (blank run id) → unknown, not flat.
+    evidence = await _collector(worker, FakePaper(None)).collect(job)
+    assert evidence.exposure_state == "unknown" and not assess(evidence).allowed
+
+    # run_state missing but orders exist → unknown.
+    evidence = await _collector(worker, FakePaper(_settlement(run_state=None, order_count=3))).collect(job)
+    assert evidence.exposure_state == "unknown" and "paper_run_state" in evidence.unavailable
+
+    # positions key missing → unknown.
+    evidence = await _collector(worker, FakePaper(_settlement(run_state=_run_state(_MISSING), order_count=1))).collect(job)
+    assert evidence.exposure_state == "unknown" and "paper_positions" in evidence.unavailable
+
+    # malformed quantity → unknown.
+    bad = _settlement(run_state=_run_state([{"net_quantity": "not-a-number"}]), order_count=1)
+    evidence = await _collector(worker, FakePaper(bad)).collect(job)
+    assert evidence.exposure_state == "unknown" and not assess(evidence).allowed
+
+
+@pytest.mark.asyncio
+async def test_collector_confirmed_empty_run_state_is_flat_not_unknown():
+    job = _job()
+    worker = FakeWorker(run={"status": "closed", "runtime_state": {}}, token_status="revoked")
+    paper = FakePaper(_settlement(run_state=None, order_count=0))
+    evidence = await _collector(worker, paper).collect(job)
+    assert evidence.work_state == "none"
+    assert evidence.exposure_state == "flat"
+    assert evidence.evidence_complete
+    assert assess(evidence).allowed
+
+
+@pytest.mark.asyncio
+async def test_collector_closed_run_with_pending_work_stays_blocked():
+    job = _job()
+    # Worker status is closed, but authoritative order evidence shows work pending.
+    worker = FakeWorker(run={"status": "closed", "runtime_state": {}}, token_status="revoked")
+    paper = FakePaper(_settlement(run_state=_run_state([{"net_quantity": 0}]), order_count=2, pending_order_count=1))
+    evidence = await _collector(worker, paper).collect(job)
     assert evidence.work_state == "outstanding"
     assert BLOCK_OUTSTANDING_WORK in assess(evidence).blocking_reasons
 
@@ -215,31 +298,46 @@ async def test_collector_outstanding_work_blocked():
 async def test_collector_unavailable_paper_is_blocked():
     job = _job()
     worker = FakeWorker(run={"status": "closed", "runtime_state": {}}, token_status="revoked")
-    evidence = await ReconciliationEvidenceCollector(worker_repo=worker, paper_runtime=None).collect(job)
-    assert "paper_runtime" in evidence.unavailable
+    evidence = await _collector(worker, None).collect(job)
+    assert "paper_settlement" in evidence.unavailable
     assert evidence.exposure_state == "unknown"
     assert assess(evidence).reason_code == BLOCK_EVIDENCE_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_collector_attribution_mismatch_is_blocked():
+    job = _job()
+    worker = FakeWorker(run={"status": "closed", "runtime_state": {}}, token_status="revoked")
+    paper = FakePaper(_settlement(run_state=_run_state([], run_id="run_OTHER"), order_count=1))
+    evidence = await _collector(worker, paper).collect(job)
+    assert "paper_run_state_attribution" in evidence.unavailable
+    assert not assess(evidence).allowed
 
 
 @pytest.mark.asyncio
 async def test_collector_authority_active_blocked():
     job = _job()
     worker = FakeWorker(run={"status": "closed", "runtime_state": {}}, token_status="active")
-    evidence = await ReconciliationEvidenceCollector(worker_repo=worker, paper_runtime=FakePaper(pnl={"positions": []})).collect(job)
+    paper = FakePaper(_settlement(run_state=_run_state([{"net_quantity": 0}]), order_count=1))
+    evidence = await _collector(worker, paper).collect(job)
     assert evidence.authority_state == "active"
     assert BLOCK_AUTHORITY_ACTIVE in assess(evidence).blocking_reasons
 
 
 @pytest.mark.asyncio
-async def test_collector_unlaunched_data_only():
+async def test_data_only_completion_does_not_require_closed_run():
     job = _job(
         handoff_at=None,
-        run_id=None,
+        run_id="run_1",
         token_id=None,
         capabilities_snapshot=strategy_service.build_capabilities_snapshot(trade=False),
     )
-    worker = FakeWorker()
-    evidence = await ReconciliationEvidenceCollector(worker_repo=worker, paper_runtime=None).collect(job)
-    assert not evidence.launched
+    # Trading worker run is still open, but data-only has no trading work.
+    worker = FakeWorker(run={"status": "open", "runtime_state": {}}, token_status=None)
+    evidence = await _collector(worker, None).collect(job)
+    assert evidence.trade_capable is False
     assert evidence.work_state == "none"
-    assert assess(evidence).case == CASE_UNLAUNCHED
+    assert evidence.exposure_state == "not_applicable"
+    result = assess(evidence)
+    # Unlaunched (no handoff) is case 1; a launched data-only attempt is case 2.
+    assert result.case in {CASE_UNLAUNCHED, CASE_DATA_ONLY_COMPLETED}

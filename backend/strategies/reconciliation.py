@@ -30,6 +30,8 @@ The classification yields one of four explicit cases:
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -42,6 +44,7 @@ __all__ = [
     "ReconciliationAssessment",
     "ReconciliationEvidence",
     "assess",
+    "evidence_digest",
 ]
 
 CASE_UNLAUNCHED = "unlaunched"
@@ -92,9 +95,40 @@ class ReconciliationEvidence:
     evidence_complete: bool = True
     unavailable: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    #: Opaque watermark over the external settlement evidence (last event time /
+    #: pending counts). Used to detect that execution evidence changed between
+    #: assessment and commit.
+    settlement_watermark: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def evidence_digest(evidence: ReconciliationEvidence) -> str:
+    """A stable digest of the evidence axes that gate reconciliation.
+
+    Re-computed immediately before commit; a change means outstanding/in-flight
+    execution evidence moved under us, so reconciliation fails closed.
+    """
+    canonical = {
+        "job_id": evidence.job_id,
+        "attempt": evidence.attempt,
+        "job_status": evidence.job_status,
+        "launched": evidence.launched,
+        "trade_capable": evidence.trade_capable,
+        "process_cleanup_state": evidence.process_cleanup_state,
+        "authority_state": evidence.authority_state,
+        "run_status": evidence.run_status,
+        "work_state": evidence.work_state,
+        "exposure_state": evidence.exposure_state,
+        "protection_state": evidence.protection_state,
+        "recovery_action_required": evidence.recovery_action_required,
+        "evidence_complete": evidence.evidence_complete,
+        "unavailable": sorted(evidence.unavailable),
+        "settlement_watermark": evidence.settlement_watermark,
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 @dataclass
