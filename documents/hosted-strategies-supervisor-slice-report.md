@@ -370,7 +370,7 @@ no `deliveries` FK change; alert/screener rows are unaffected.
 
 ## 3. Verification (exact results)
 
-Targeted suites (SQLite):
+Backend suites (SQLite), exact command and result of the pre-deployment pass:
 
 ```
 .venv/bin/python -m pytest \
@@ -380,12 +380,13 @@ Targeted suites (SQLite):
   tests/api/test_algo_worker_route_mounts.py \
   tests/api/test_worker_run_discovery.py \
   tests/api/test_worker_notifications.py \
+  tests/api/test_worker_workflows.py \
   tests/api/test_hosted_lifecycle_api.py \
   tests/api/test_hosted_child_authority.py \
   tests/api/test_operator_controls.py \
   tests/notifications \
   tests/sdk -q
-→ 750 passed, 2 skipped
+→ 742 passed, 2 skipped
 ```
 
 Disposable PostgreSQL (real concurrency; own invocation):
@@ -394,9 +395,24 @@ Disposable PostgreSQL (real concurrency; own invocation):
 HOSTED_FOUNDATION_PG_URL='postgresql://postgres:testonly@127.0.0.1:15433/kite_test' \
   .venv/bin/python -m pytest \
     tests/integration/test_hosted_supervisor_lifecycle_postgres.py \
-    tests/integration/test_hosted_strategy_foundation_postgres.py -q
+    tests/integration/test_hosted_strategy_foundation_postgres.py \
+    tests/integration/test_run_notifications_postgres.py -q
 → 26 passed       # + atomic reconcile-with-audit (one winner) serialized with
-                  # create_job; changed-cleanup-evidence CAS refusal; append-only audit
+                  # create_job; changed-cleanup-evidence CAS refusal; append-only
+                  # audit; concurrent same-key launch and stop-authority retention
+```
+
+Frontend suites (component tests, not browser tests) — run per command with
+`NODE_ENV=test` because this environment exports `NODE_ENV=production`, which
+removes `React.act` and breaks every `@testing-library/react` render (no global
+setting is changed):
+
+```
+cd frontend-next
+NODE_ENV=test npx vitest run features/strategies   → 14 passed
+npx tsc --noEmit                                    → clean
+npx eslint features/strategies lib/hosted-strategies "app/(app)/strategies" → clean
+npm run build                                       → succeeds
 ```
 
 `alembic heads` → single head `20260915_000024`. `git diff --check` clean.
@@ -632,27 +648,72 @@ the account scope (a non-secret config value) must reach the child.
 
 ## 7. Deployment readiness — what is and is not true
 
-- **Implemented and tested (unit/integration, disposable PostgreSQL):** the
-  supervisor process (claim → prepare → source verify → spawn → heartbeat →
-  progress fence → stop/release/fence/recover), exception/signal-safe shutdown,
-  restart cleanup, process-group completion, limits/authority enforcement,
-  honest cleanup + CLI exit codes, the child bootstrap and attach-only context,
-  process containment and identity handling, the lifecycle corrections, the
-  lifecycle API additions, and the **operator reconciliation backend**
-  (inspection, action, evidence classification, durable audit).
-- **Not deployment-ready / not done:** the frontend (only the API handoff in §8),
-  scheduling, notification delivery, Cancel/Flatten execution, live trading, and
-  any production rollout. `Dockerfile.supervisor` / `compose.supervisor.yml`
-  were added but **not** built or deployed, and no live database migration was run.
-- **Deployment checks NOT executed here (do not read configuration as runtime
-  proof):** building/running the supervisor container; real cross-UID execution
-  (the root-gated test is skipped on this non-root host); delivering a real
-  `SIGTERM` to the supervisor process (signal handling is tested through the
-  flag/handler path only). These remain verification steps for an isolated
-  deployment environment.
-- **Explicitly not claimed:** complete security isolation (v1 is a trusted
-  single-operator setup; per-run filesystem isolation is not promised), exactly-once
-  execution, or that a stopped/revoked attempt is flat.
+Four separate things, deliberately not conflated.
+
+### 7.1 Implemented functionality
+
+Supervisor lifecycle (claim → prepare → source verify → spawn → heartbeat →
+progress fence → stop/release/fence/recover); process containment with a distinct
+child OS identity; exception/signal-safe shutdown; restart cleanup; process-group
+completion; limits/authority enforcement; honest cleanup results and CLI exit
+codes; the child bootstrap with an attach-only `ManagedRun`; supervisor
+credential auth; the operator reconciliation backend (inspection, action,
+evidence classification, durable append-only audit); bounded reconciliation
+safeguards; run-scoped notifications; the operator controls (Run now, Stop,
+bounded/redacted logs, notification history); the **hosted-strategy frontend**
+(list, versions, configure, run now, job detail, stop, logs, notifications,
+reconciliation) and the `GET /api/strategies/options` authorization contract.
+
+### 7.2 Executed verification (this pass — see §11 for commands and evidence)
+
+- Focused backend suites: 742 passed, 2 skipped (SQLite).
+- Disposable PostgreSQL concurrency suites: 26 passed.
+- Frontend: `tsc --noEmit` clean, `eslint` clean, `next build` succeeds,
+  component tests 14 passed.
+- **Browser pass** (headless Chrome over CDP against an isolated deployment:
+  real API + disposable PostgreSQL + dev server, never production accounts):
+  list, configuration, version registration, Run now (queued/replay/new),
+  Stop (queued and running), logs (pagination, truncation, post-termination
+  availability), notification delivery/attempt history, data-only reconciliation,
+  trading reconciliation blocked, and loading/empty/auth/authorization/server-error
+  states. Screenshots in §11.3.
+- **Runner packaging**: the supervisor image builds; the Compose configuration
+  validates with no DB/broker environment in the runner service; a harmless
+  data-only child ran inside the container as the configured distinct UID
+  (10002); source readable-not-writable, per-job scratch writable, supervisor
+  records unreadable to the child; a real `SIGTERM` to the supervisor while a
+  child was alive produced bounded shutdown (2.1 s), no surviving child and an
+  honest terminal/recovery state. Evidence in §11.4.
+
+### 7.3 Unexecuted deployment checks (still required before rollout)
+
+- Migration applied to the **real** deployment database (only the disposable
+  database was migrated here; `alembic heads` = `20260915_000024`).
+- The full application image/rollout (this pass built and ran only the
+  supervisor image), plus a rollback rehearsal.
+- Real-provider notification delivery/acceptance (fixtures only here).
+- Cross-host networking/DNS for `HOSTED_SUPERVISOR_BASE_URL` in the target
+  environment (verified here with host networking, not the Compose network).
+- Restart behaviour under an orchestrator (restart policy, volume persistence
+  across node replacement).
+
+### 7.4 Deferred product capabilities (not blockers for the manual data-only release)
+
+Scheduling loop, Cancel/Flatten execution, live trading, Go/MCP surfaces.
+
+**Execution-settlement barrier:** the durable barrier is required for
+**trading-capable reconciliation** (clearing a block on a launched, trade-capable
+attempt). It is **not** required for the manual data-only release: data-only
+attempts reconcile through the `unlaunched` / `data_only_completed` cases, and
+trading-capable reconciliation stays blocked with
+`EXECUTION_QUIESCENCE_UNVERIFIED` — a genuine, non-dismissible block.
+
+### 7.5 Explicitly not claimed
+
+Complete security isolation (v1 is a trusted single-operator setup; per-run
+filesystem isolation is not promised), exactly-once execution, that a
+stopped/revoked attempt is flat, that the child cannot be affected by host-level
+compromise, or that provider acceptance equals receipt.
 
 ## 8. Frontend handoff — reconciliation API, examples and status meanings
 
@@ -963,24 +1024,198 @@ session cookie and `require_strategy_owner`, existing UI primitives).
 
 ### 10.4 Verification
 
+These are **component tests** (`@testing-library/react` + jsdom), not browser
+tests. The real-browser pass is §11.3.
+
 - `npm run typecheck` (tsc `--noEmit`) → clean.
 - `npx eslint features/strategies lib/hosted-strategies "app/(app)/strategies"` → clean.
 - `npm run build` → succeeds; routes `/strategies`, `/strategies/[strategyId]`,
   `/strategies/[strategyId]/jobs/[jobId]` are emitted.
-- `npx vitest run features/strategies` → **13 passed** (list scoping + toggle,
-  job cleanup-unresolved + truncation + non-dismissible quiescence, format and
-  params helpers).
+- `NODE_ENV=test npx vitest run features/strategies` → **14 passed** (list scoping
+  + toggle, queued-attempt stop affordance, job cleanup-unresolved + truncation +
+  non-dismissible quiescence, format and params helpers).
 - Note: this environment exports `NODE_ENV=production`, which removes `React.act`
-  and makes every `@testing-library/react` render test fail (`React.act is not a
-  function`) — pre-existing for other suites too. Run browser tests with
-  `NODE_ENV=test` (used above). No repo config was changed for this.
+  and makes every `@testing-library/react` render fail (`React.act is not a
+  function`) — pre-existing for other suites too. Component tests therefore run
+  with `NODE_ENV=test` **per command**; no global or repo setting was changed.
 
 ### 10.5 Remaining restrictions vs. deployment prerequisites
 
 Still **restrictions** (v1 product scope): no scheduling UI, no Cancel/Flatten,
-no live trading, trading-capable reconciliation blocked, `NODE_ENV`-independent
-real-provider notification delivery not exercised.
+no live trading, trading-capable reconciliation blocked, real-provider
+notification delivery not exercised.
 
-Still **deployment prerequisites**: backend container build, a real cross-UID
-child run, delivered-signal shutdown, real notification delivery in an
-environment, and the execution-settlement barrier.
+Still **deployment prerequisites**: applying the migration to the real database,
+the full application rollout, real-provider notification delivery, and
+cross-host networking validation. (The runner image build, the distinct-UID
+child run and delivered-signal shutdown were executed in this pass — §11.4.)
+
+## 11. Pre-deployment verification pass — manual data-only release
+
+Scope: verify the **manual data-only release** (operator registers a version with
+data-only capabilities, runs it, watches it, stops it, reconciles it) before any
+deployment. No production system was touched: no orders, no real notifications,
+no deployment, no live migration, no scheduling, no Cancel/Flatten.
+
+### 11.1 Isolated environment actually used
+
+| Piece | What ran |
+| --- | --- |
+| Control plane | The real routers (`auth`, `strategies`, `hosted_lifecycle`, `worker_auth`, `worker_execution`) served by uvicorn on `127.0.0.1:8181` from a harness module in the session scratch dir — no production container, no production credentials |
+| Database | **Disposable** PostgreSQL 16 in `kite-test-postgres` (`127.0.0.1:15433`), database `hosted_verify`, migrated from `alembic upgrade head` |
+| Data | Disposable fixtures seeded through the real HTTP APIs (strategies, versions, jobs) plus synthetic notification rows |
+| Frontend | `next dev` on `127.0.0.1:3300` with `BACKEND_INTERNAL_URL=http://127.0.0.1:8181` |
+| Browser | Headless Chrome 146 driven over CDP (`Page.captureScreenshot`, real DOM events) |
+| Supervisor | `kite-strategy-runner:verify` built from `Dockerfile.supervisor`, run with host networking against the same disposable control plane |
+
+The account scope allowlist was `kite:paper` (the seeded fixture scope) except in
+the authorization-state check, where it was deliberately changed to prove the
+refusal path. No production account, token, order or notification was involved.
+
+### 11.2 Browser flows exercised (results)
+
+| Flow | Result |
+| --- | --- |
+| List + enable/disable, authorized scopes only | Renders seeded strategies; the scope selector offers only `kite:paper`; toggling issues `PATCH` |
+| Register strategy and version, configure parameters | Created from the form (Radix selects included); version registered and shown with its pinned SHA-256; empty jobs table showed the empty state |
+| Run now → queued is honest | Toast: “Queued. The process has not started yet.” |
+| Retry the same launch after an uncertain response | Second click with the same key: “Queued — this retry replayed the original launch (no new job).”; job count unchanged |
+| Change inputs and start a genuinely new request | New key + changed params → blocked while an attempt was active (operator copy + `STRATEGY_BLOCKED`), then created a second job once the queued attempt was stopped |
+| Stop: requested vs confirmed cleanup | Running attempt → “Stopping — Stop requested…”; after supervisor cleanup + release → “Stopped and process cleanup confirmed”; queued attempt → “Stopped before launch; no child process was ever started.” |
+| Logs: pagination, post-termination availability, truncation | 200 chunks → “Load more” → 226 chunks accumulated; `post_termination` source notice; a job past the 256 KB cap showed the truncation banner |
+| Notification delivery/attempt history (synthetic) | Two events, three deliveries (`delivered` with provider id, `failed` with last error, `pending`), per-attempt history rendered |
+| Supported data-only reconciliation | `Ready to reconcile / data_only_completed` → action cleared the block (`reconciled_at` set) |
+| Trading reconciliation blocked | `Blocked / EXECUTION_QUIESCENCE_UNVERIFIED`, action disabled, copy says the block is not dismissible |
+| Unknown process state | Fenced attempt shows “Cleanup unresolved — … Unknown is not 'stopped'.” |
+| Loading / empty / auth / authorization / server-error | Skeletons under throttling; “No attempts yet.”; unauthenticated visit redirects to `/login`; unauthorized scope refused explicitly; injected 500 shows “Could not load job …” |
+
+### 11.3 Screenshots
+
+Committed (captured against the isolated deployment above — never production):
+`documents/verification/hosted-strategies-2026-09-15/`
+
+| File | Shows |
+| --- | --- |
+| `01-strategies-list.png` | Strategy list + create form, authorized scope only |
+| `02-strategy-detail.png` | Configuration, Run now, immutable versions, jobs |
+| `03-job-detail.png` | Job state, process cleanup, stop, logs, notifications |
+| `06-reconciled.png` | Data-only reconciliation cleared the block |
+| `07-trading-blocked.png` | `EXECUTION_QUIESCENCE_UNVERIFIED` blocked and non-dismissible |
+| `11-cleanup-unresolved.png` | Cleanup unresolved ≠ confirmed stopped |
+| `17-queued-stop-before-launch.png` | Queued stop confirmed before launch |
+| `19-loading-state.png` | Loading skeletons |
+| `20-auth-redirect.png` | Unauthenticated redirect to login |
+| `21-server-error.png` | Server-error state |
+
+Additional session-only captures (not committed): stop-requested, recovery with
+confirmed cleanup, queued stop with the older wording, log pagination before/after
+“Load more”, truncated logs, run-now replay/new-request, blocked-run copy,
+unauthorized-scope and injected-failure states.
+
+### 11.4 Runner packaging evidence (executed)
+
+```
+docker build -f Dockerfile.supervisor -t kite-strategy-runner:verify .        → success
+HOSTED_SUPERVISOR_CREDENTIAL=… docker compose -f compose.yml \
+  -f compose.supervisor.yml config                                            → valid
+  strategy-runner env: 0 entries matching DB_/DATABASE_URL/REDIS/KITE_API/env_file
+```
+
+Harmless data-only child (short-lived) inside the container:
+
+```
+docker run … kite-strategy-runner:verify python -m backend.strategies.supervisor \
+  --once --job hsj_a771c3af9bb545d5ad9a50b45b4ece4e
+→ job: recovery_required, process_cleanup_state=confirmed, last_progress_at set
+→ logs (post_termination): "short child: hello from the supervised container"
+```
+
+Distinct identity, confirmed at runtime with `docker top`:
+
+```
+root    python -m backend.strategies.supervisor --once --job hsj_…
+10002   python -m kite_algo_worker.hosted /var/lib/kite-supervisor/source/<job>/<version>.py
+```
+
+Filesystem separation, verified as the child uid (`--user 10002:10002`):
+
+```
+supervisor attempts dir: PERMISSION DENIED (expected)
+supervisor logs dir:     PERMISSION DENIED (expected)
+source files visible: 5 | readable: True | writable: False | append refused: PermissionError
+per-job scratch writable by child: True (wrote a probe file)
+```
+
+Delivered signal (not a handler call) — `docker stop -t 30` while the child was
+alive and reporting progress:
+
+```
+before: status=running, last_progress_at set, cleanup=null
+docker stop → shutdown took 2.1 s, container exit code 0
+supervisor log: WARNING hosted_supervisor_signal → INFO hosted_supervisor_once
+after:  status=recovery_required, process_cleanup_state=confirmed,
+        replacement_blocked=true, no child process owned by uid 10002 survives
+```
+
+### 11.5 Defects found by this pass and fixed
+
+Backend / packaging:
+
+1. **`heartbeat` returned a `datetime` in a `str` response field** → HTTP 500 on
+   every heartbeat once a run session existed. The fake worker repo returned an
+   ISO string, so unit tests could not catch it; the container run did. Fixed and
+   covered by `test_heartbeat_serializes_session_heartbeat_timestamp`.
+2. **The supervisor image could not build** — it installed the platform's whole
+   `backend/requirements.txt` (psycopg2 has no wheel on slim images and needs
+   `libpq-dev`). Fixed: install only the child SDK's runtime dependencies, and
+   document that a DB driver is deliberately absent.
+3. **The child could not import the SDK** in the image (copied to `/app`, which is
+   not the child's working directory or `PYTHONPATH`) — every child died with
+   `ModuleNotFoundError`. Fixed by installing the SDK into the image.
+4. **`compose.supervisor.yml` base URL was missing `/api`** → every lifecycle call
+   would 404. Fixed in the Compose environment.
+5. **The child was handed the lifecycle base URL**, but the SDK appends
+   `/api/algo-workers` itself (doubled prefix → child could not attach). Fixed by
+   deriving a host-root child base URL, with `HOSTED_SUPERVISOR_CHILD_BASE_URL` as
+   an explicit override, plus a regression test.
+
+Frontend / contract:
+
+6. **Queued attempts had no Stop affordance** in the UI even though the API
+   supports stopping before launch. Fixed (Stop is offered for
+   `queued|starting|running`), covered by a component test.
+7. **Stop wording was wrong**: a queued job reported “Running; no stop requested”,
+   and a stopped-but-never-launched job claimed “Stopped and process cleanup
+   confirmed”. Both now state the truth (“Queued; …”, “Stopped before launch; no
+   child process was ever started.”).
+8. **“Load more” replaced the loaded log page** instead of appending it. Fixed with
+   per-page queries, so output accumulates (verified 200 → 226 chunks).
+9. **Raw machine codes surfaced to operators** (e.g. `STRATEGY_BLOCKED`). Added
+   operator copy while keeping the code visible; unknown codes still show the
+   server's blocking reasons.
+10. **Run now defaulted to the oldest registered version** rather than the newest,
+    so a newly registered version was not the one launched. Fixed.
+
+### 11.6 Cleanup
+
+All verification processes and artifacts were removed after the pass: the
+frontend dev server, the harness API, the headless Chrome instance, the
+verification container, its volume and image, and the disposable
+`hosted_verify` database. Unrelated work (including the alerts/market-day
+fixtures) was untouched; no production container, database or account was
+modified.
+
+### 11.7 Verdict
+
+**Manual data-only release ready for deployment.** The data-only happy path —
+register → configure → Run now → inspect → Stop → reconcile — was executed end to
+end in a real browser against a real API on a disposable database, and the runner
+image was built, started under a distinct child identity, and shut down by a real
+`SIGTERM` with honest terminal state.
+
+Remaining prerequisites are **deployment steps**, not product gaps (§7.3):
+apply the migration to the real database, perform the full application rollout
+with a rollback rehearsal, validate cross-host networking for
+`HOSTED_SUPERVISOR_BASE_URL`, and authorize real-provider notification delivery
+separately. The execution-settlement barrier remains required only for
+trading-capable reconciliation, which stays blocked by design.
