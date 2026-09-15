@@ -192,3 +192,37 @@ against PostgreSQL / the real UI:
 | `3e79fb5` | Fired signal events were written with a NULL `workflow_id`, so a delivered alert still showed “No signal events recorded” and “No deliveries recorded for this workflow yet”. The one pre-fix event was backfilled from its occurrence key. |
 
 Each fix carries a focused regression test that fails without it.
+
+---
+
+## 10. Second deployment pass (2026-09-15, later the same day)
+
+Forward-deployed from `origin/development` after the release-cleanup task. No
+migration was added (head stays `20260915_000024`).
+
+| Item | Value |
+| --- | --- |
+| Revision | `development` at `880bb9e` plus the commits listed in §10.1 |
+| Services rebuilt | `finance-app`, `frontend-next`, `strategy-runner` (the runner gained a healthcheck) |
+| New configuration (names only) | `APP_ALLOWED_ORIGINS` (explicit CSRF allowlist for the operator's origin), `HOSTED_SUPERVISOR_HEALTH_*` windows, `ALERTS_SCREENER_WARM_*` bounds |
+
+### 10.1 What changed and what was verified live
+
+| Area | Status |
+| --- | --- |
+| MCX candle acquisition for screener universes | **DEPLOYED + LIVE VERIFIED**: 5/5 contracts fetched (58–77 daily bars each), a repeat fetch made no broker calls, and the screener then ranked all five members with `unavailable: 0` |
+| Partial availability handling | **LIVE VERIFIED**: a mixed universe produced "Scanned 1 of 2 symbols; 1 could not be scored (missing or insufficient data)" |
+| One history window for manual and scheduled runs | **FIXED** (30 vs 120 default) and pinned by a test; visible in the UI as "needs 120 final daily candles" |
+| Strategy-runner Docker health | **LIVE VERIFIED**: `healthy`, failing streak 0, `healthy: ok` probe output; the child identity cannot read the snapshot |
+| Alert/screener creation over a non-secure origin | **FIXED + LIVE VERIFIED**: creation, activation, retry-idempotency, edit, pause/resume and archive all exercised in a browser on the LAN origin |
+| One-screen creation paths | **DEPLOYED + LIVE VERIFIED** (desktop and 390px wide) |
+| Candle-data warming/unavailability in the UI | **LAST ASSESSMENT**: measured live; a universe with unresolved members reports `UNAVAILABLE`, a universe needing history reports `WARMING` with a bounded fetch action, and both states are distinct from a zero-match result |
+
+### 10.2 Still not tested (unchanged)
+
+- Scheduled execution beyond the single coalesced `session_close` bucket.
+- Currency (CDS/BCD) live validation; the capacity campaign; restart fault
+  injection; ntfy delivery; delivery retry/backoff under provider failure.
+- MCX daily-candle **backfill for arbitrary new contracts** beyond the bounded
+  warming path (a recently listed contract legitimately reports insufficient
+  history until it has traded enough sessions).

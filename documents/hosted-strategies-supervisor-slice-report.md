@@ -1379,3 +1379,128 @@ to the affected services (`finance-app` for the API-only fixes; `finance-app` +
 - Rollback was **not** prepared or rehearsed by instruction (forward-fix only);
   the pre-migration `pg_dump` was taken as operational protection only.
 - MCX daily-candle backfill (the reason a screener over MCX cannot rank yet).
+
+---
+
+## 13. Release cleanup, MCX candle screening and runner healthcheck (2026-09-15, second pass)
+
+Deployed forward from `880bb9e` (branch `development`, pushed to
+`origin/development` as a fast-forward after the working tree was repaired).
+Services rebuilt: `finance-app`, `frontend-next`, `strategy-runner`.
+
+### 13.1 Repository state
+
+A foreign stash apply (`stash@{0}`, "opencode: stash local development before
+sync", 2026-05-02) had left four unmerged index entries and a staged test file.
+Resolved after investigating the index stages, the stash contents and each path's
+deletion history: three files stay deleted (they were removed deliberately —
+open-source prep and a leaked-file cleanup — and the stash's versions were
+byte-identical resurrects), and `sdk/python/README.md` kept upstream's text plus
+the one still-valid sentence the stash added. The same stash carried a revived
+order-runtime schema test, which was kept after repairing the module paths it
+patched (the file had 10 pre-existing failures for the same reason). Both foreign
+stash entries were left intact. Local and remote `development` are now the same
+commit (`880bb9e` at push time), and `origin/development` is an ancestor of local
+(all later work is additive).
+
+### 13.2 MCX candle-backed screening
+
+**Diagnosis (live, not assumed):** the catalog resolved every member of the
+acceptance universe to a current broker token and the broker returned 58–77 daily
+bars per contract, while `historical_candles` held **zero** rows for all of them.
+Nothing acquired daily history for a screener universe: the post-close finalizer
+targets NSE indexes, and the worker history API only ingests when asked for one
+symbol.
+
+**Fix:** `backend/screeners/candle_warming.py` — one bounded, idempotent
+operation, wired into both the scheduled and the manual run paths, plus two
+operator endpoints (`GET /screeners/{id}/data-status`,
+`POST /screeners/{id}/warm-candles`). Only the universe's own members are
+considered, only those missing history are fetched, the fetch goes through the
+existing authenticated adapter (chunked, 0.35s rate limiter, `ON CONFLICT`
+upsert) over a bounded lookback, and every member reports its catalog-resolved
+token, generation and lifecycle. Members that already hold enough final daily
+candles are skipped, so restarts and repeats converge instead of refetching.
+
+**Finality:** MCX and currency schedules are anchored to the NSE calendar, so a
+bucket can fire while those exchanges are still trading. The pipeline drops a
+daily bar whose session has not closed (+15 min) for feed-driven sessions and
+records `forming_candles_excluded`. NSE equity is unchanged (its buckets fire at
+its own close).
+
+**Live evidence:** 5/5 MCX futures warmed in 2.8s; a second warm made zero broker
+calls; the screener then ran `complete` with `expected=5, evaluated=5,
+qualifying=5, unavailable=0` and a real ranking by `change_pct` (NATURALGAS 0.92
+> CRUDEOIL 0.86 > ZINC -0.60 > SILVER -1.03 > COPPER -1.18). A mixed universe
+(one contract with history, one recently listed) produced an honest **partial**
+run: "Scanned 1 of 2 symbols; 1 could not be scored (missing or insufficient
+data)". Tests: 21 unit/pipeline + 5 PostgreSQL (persistence, repeat no-op,
+forming-bar handling, retryable failure, concurrent backfill converging to one
+row set).
+
+**One history window:** the API's manual-run scheduler defaulted `window_bars` to
+30 while the worker's used 120, so the same definition was `partial` from the
+schedule and `complete` from Run now. Both now take the pipeline's single default.
+
+### 13.3 Strategy-runner healthcheck
+
+The runner had no healthcheck at all, so Docker could not report its state. The
+loop now publishes a nonsecret snapshot after every cycle (`state/health.json`,
+dir 0700 / file 0600 so the child identity cannot read it) and
+`python -m backend.strategies.supervisor_health` turns it into a verdict:
+healthy, starting (inside the grace), loop_stalled, auth_rejected,
+control_plane_unavailable, or `health_file_absent/invalid`. It makes no API call,
+claims no job, renews no lease, mutates no lifecycle state, needs no database or
+broker credential and never reads the supervisor credential. A transient outage
+stays healthy (no restart thrashing); an authentication rejection stops being
+tolerated as soon as the grace passes; a failed **child** is the job's outcome and
+does not mark the supervisor dead.
+
+**Live evidence:** Docker reports `healthy` with failing streak 0 (`healthy: ok`
+once past the grace, `healthy: starting (grace 60s)` during it), the runner
+container was recreated with the healthcheck wired through
+`compose.supervisor.yml` (interval 30s, timeout 5s, retries 3, start_period 45s),
+and uid 10002 gets "Permission denied" reading the snapshot. 20 focused tests.
+
+### 13.4 Frontend creation defect and usability
+
+**Root cause of "cannot create an alert" (reproduced in a real browser against
+the deployed API):** the operator reaches the app over plain HTTP on a LAN
+address, where `window.isSecureContext` is false and `crypto.randomUUID` does not
+exist (`{'secure': false, 'hasRandomUUID': 'undefined'}`). Saving called it
+directly, so the browser threw and the form showed
+"Could not save — crypto.randomUUID is not a function". A second, independent
+blocker appeared when that was fixed: the API's CSRF allowlist
+(`APP_ALLOWED_ORIGINS`) did not contain the operator's LAN origin, so every
+cookie-authenticated mutation was refused after Next forwarded the browser's
+`Origin`. Both are fixed — ids come from one tested helper
+(`crypto.randomUUID` → `getRandomValues`-built UUIDv4 → timestamp+counter, never
+`Math.random()`), the create key is generated once per attempt and reused on
+retry, and the deployment lists its origins.
+
+**Redesign:** `/alerts/new` is now a single screen (instrument, condition, level,
+destination, generated-but-editable name) with "Create and activate" primary and
+"Save draft" secondary; the session is inferred from the instrument's exchange,
+the clock is LTP for price rules, a timeframe appears only for percentage rules,
+and the crossing/silence contract is stated where it matters. A create that
+succeeds while activation fails is reported as "Saved as a draft — activation
+failed" with the reason and a link, never as success. `/alerts/screeners/new` is
+the same shape for screeners (scan / qualification / rank / schedule / optional
+entry notification), with the session inferred from the universe's instruments.
+The seven-step wizard and the screener step editor remain at `?mode=advanced`,
+so every backend capability (groups, sequences, breadth, producers, arithmetic
+operands, raw preview observations, custom messages) stays reachable and
+unmodeled documents still route to the lossless YAML/JSON editor.
+
+**Honesty fixes found in the same pass:** the lifecycle badge and action row
+showed ACTIVE/Pause for a paused workflow (pause acts on subscriptions while the
+revision stays active — the API now reports `lifecycle_state`); an unresolved
+universe was reported as candle data "ready" (zero members is not readiness); the
+Definition panel rendered instruments as "[object Object]" and the session as the
+raw code; a failed run printed its reason twice.
+
+**Verified in the deployed browser** (desktop 1600×1113 and narrow 390×844, no
+horizontal overflow): quick create → activated, retry with the same key returns
+the same workflow (workflow count grew by exactly one), edit, pause/resume,
+archive, advanced editor reachable, screener warming → ready → run with coverage,
+and a partial run with a data reason. Screenshots: `documents/verification/…`.
