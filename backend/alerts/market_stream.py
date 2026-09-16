@@ -638,12 +638,21 @@ class OperatorMarketStream:
             self._catalog = InstrumentCatalog()
         return self._catalog
 
-    def _runtime(self) -> Any:
+    async def _runtime(self) -> Any:
+        """The market-runtime client.
+
+        The production accessor is a coroutine (it builds the shared HTTP client
+        lazily), so this must be awaited: returning the coroutine object instead
+        fails at the call site with "'coroutine' object has no attribute ...",
+        which is exactly how the first browser run against the deployed stack
+        lost every subscription owner while the unit tests — which inject a
+        factory — stayed green.
+        """
         if self._runtime_client_factory is not None:
             return self._runtime_client_factory()
         from backend.broker_api.orders.market_runtime_client import get_market_runtime_client
 
-        return get_market_runtime_client()
+        return await get_market_runtime_client()
 
     def session_state_for(self, instrument_key: str) -> Dict[str, Any]:
         exchange = str(instrument_key or "").partition(":")[0].strip().upper()
@@ -923,7 +932,7 @@ class OperatorMarketStream:
         """Register the complete token set with the runtime (single PUT)."""
         tokens = {token: "ltp" for token in self._token_to_key}
         try:
-            runtime = self._runtime()
+            runtime = await self._runtime()
             await runtime.set_owner_subscriptions(self.owner_id, tokens)
             self._owner_created = bool(tokens)
             self._owner_dirty = False
@@ -942,7 +951,7 @@ class OperatorMarketStream:
         if not self._owner_created and not self._token_to_key:
             return
         try:
-            runtime = self._runtime()
+            runtime = await self._runtime()
             await runtime.delete_owner(self.owner_id)
         except Exception as exc:
             # The runtime's owner lease TTL is the second safety net.

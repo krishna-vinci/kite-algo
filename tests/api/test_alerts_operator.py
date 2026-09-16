@@ -1168,3 +1168,37 @@ def test_rule_summary_is_null_for_a_rule_it_cannot_describe(session_factory, mon
     rows = client.get(f"{BASE}/workflows").json()["workflows"]
     row = next(item for item in rows if item["workflow_id"] == created["workflow_id"])
     assert row["rule"] is None
+
+
+def test_list_rows_report_the_effective_lifecycle(session_factory, monkeypatch):
+    """A paused workflow must not read as active in the list.
+
+    The list drives Pause/Resume, so showing "active" (the revision status) for a
+    workflow whose subscriptions are paused would offer the wrong action — the
+    same defect the detail endpoint had.
+    """
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    document = json.loads(json.dumps(DOCUMENT))
+    document["name"] = "list-lifecycle"
+    created = client.post(f"{BASE}/workflows", json={"document": document}).json()
+    workflow_id = created["workflow_id"]
+
+    rows = client.get(f"{BASE}/workflows").json()["workflows"]
+    row = next(item for item in rows if item["workflow_id"] == workflow_id)
+    assert row["lifecycle_state"] == "draft"
+
+    client.post(f"{BASE}/workflows/{workflow_id}/activate")
+    rows = client.get(f"{BASE}/workflows").json()["workflows"]
+    assert next(item for item in rows if item["workflow_id"] == workflow_id)["lifecycle_state"] == "active"
+
+    client.post(f"{BASE}/workflows/{workflow_id}/pause")
+    rows = client.get(f"{BASE}/workflows").json()["workflows"]
+    assert next(item for item in rows if item["workflow_id"] == workflow_id)["lifecycle_state"] == "paused"
+
+    client.post(f"{BASE}/workflows/{workflow_id}/resume")
+    rows = client.get(f"{BASE}/workflows").json()["workflows"]
+    assert next(item for item in rows if item["workflow_id"] == workflow_id)["lifecycle_state"] == "active"
+
+    client.post(f"{BASE}/workflows/{workflow_id}/archive")
+    rows = client.get(f"{BASE}/workflows", params={"include_archived": "true"}).json()["workflows"]
+    assert next(item for item in rows if item["workflow_id"] == workflow_id)["lifecycle_state"] == "archived"

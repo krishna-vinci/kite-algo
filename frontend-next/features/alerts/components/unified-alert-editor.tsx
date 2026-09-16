@@ -68,6 +68,7 @@ import {
   type AlertDraft,
   buildDocument,
   exchangeOf,
+  sessionLabel,
 } from "@/features/alerts/lib/authoring";
 import { alertsErrorMessage } from "@/features/alerts/lib/errors";
 import {
@@ -194,12 +195,6 @@ export function UnifiedAlertEditor({
     return inferSession(primaryInstrument, capabilities.session_exchanges);
   }, [capabilities, targetingUniverse, universeProbe.data, primaryInstrument]);
 
-  // The inferred session travels into the saved document without ever becoming a
-  // control the operator has to understand; an ambiguous exchange is reported
-  // instead of guessed.
-  const effectiveDraft: AlertDraft = inference.session
-    ? { ...draft, session: inference.session }
-    : draft;
 
   const operator = draft.conditions[0]?.op ?? "crosses_above";
   const rightOperand = draft.conditions[0]?.right;
@@ -230,6 +225,16 @@ export function UnifiedAlertEditor({
         );
 
   const target = describeTarget(targetValue, presentation.price, operator);
+
+  // What gets validated and saved: the inferred session (never a control the
+  // operator has to understand, and an ambiguous exchange is reported instead of
+  // guessed) and the generated name (a saved document must not carry an empty
+  // name just because the operator never typed one).
+  const effectiveDraft: AlertDraft = {
+    ...draft,
+    session: inference.session || draft.session,
+    name: effectiveName,
+  };
 
   const updateCondition = (patch: Partial<AlertDraft["conditions"][number]>) => {
     setDraft((current) => {
@@ -571,7 +576,7 @@ export function UnifiedAlertEditor({
               </p>
             ) : inference.session ? (
               <p className="text-xs text-muted-foreground">
-                Evaluated in the {inference.session === "nse_equity" ? "NSE equity" : inference.session === "mcx_commodity" ? "MCX commodity" : "currency"} session (from the instrument&apos;s exchange).
+                {`Evaluated in the ${sessionLabel(inference.session)} session, taken from the instrument's exchange.`}
               </p>
             ) : null}
           </Panel>

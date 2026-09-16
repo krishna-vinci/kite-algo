@@ -314,9 +314,13 @@ def test_authorized_connection_receives_welcome_and_cleans_up(app, monkeypatch):
         "backend.broker_api.instruments.catalog.InstrumentCatalog",
         lambda *a, **k: FakeCatalog({"MCX:GOLD26DECFUT": descriptor(111)}),
     )
+    async def _runtime_accessor():
+        # mirrors the production accessor, which is a coroutine
+        return runtime
+
     monkeypatch.setattr(
         "backend.broker_api.orders.market_runtime_client.get_market_runtime_client",
-        lambda: runtime,
+        _runtime_accessor,
     )
     hub = MarketStreamHub(redis_client=redis_client, limits=lim())
     _patch_hub(monkeypatch, hub, recorded)
@@ -687,3 +691,45 @@ def test_calendar_refresh_populates_the_cache(monkeypatch):
     )
     assert state["state"] == "open" and state["basis"] == "calendar"
     assert calls["exchange"] == "NSE" and calls["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_owner_sync_awaits_the_production_client_accessor(monkeypatch):
+    """The default path must await the shared runtime client.
+
+    Regression: `get_market_runtime_client()` is a coroutine, and returning the
+    coroutine object made every owner registration fail with "'coroutine' object
+    has no attribute 'set_owner_subscriptions'" — invisible to the injected
+    factory the other tests use, and caught only by the deployed browser run.
+    """
+    runtime = FakeRuntimeClient()
+    calls: List[str] = []
+
+    async def _accessor():
+        calls.append("awaited")
+        return runtime
+
+    monkeypatch.setattr(
+        "backend.broker_api.orders.market_runtime_client.get_market_runtime_client",
+        _accessor,
+    )
+    catalog = FakeCatalog({"MCX:GOLD26DECFUT": descriptor(111)})
+    hub = MarketStreamHub(redis_client=FakeRedis(), limits=lim())
+    stream = OperatorMarketStream(
+        FakeWebSocket(),
+        hub=hub,
+        scope=SCOPE,
+        catalog=catalog,
+        # no factory: exercise the production path
+        redis_client=FakeRedis(),
+        limits=lim(),
+        clock=lambda: NOW,
+        calendar_loader=lambda exchange, day: {"2026-09-15"},
+    )
+
+    await stream.subscribe(["MCX:GOLD26DECFUT"])
+    assert calls == ["awaited"]
+    assert runtime.owner_tokens[stream.owner_id] == {111: "ltp"}
+
+    await stream.release_owner()
+    assert runtime.owner_tokens == {}

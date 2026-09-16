@@ -14,6 +14,7 @@ import { UnifiedAlertEditor } from "@/features/alerts/components/unified-alert-e
 import { useAlertsScope } from "@/features/alerts/hooks/use-alerts-queries";
 import { AlertsMarketStreamProvider } from "@/features/alerts/hooks/use-market-stream";
 import { emptyDraft } from "@/features/alerts/lib/authoring";
+import { applyFrequency } from "@/features/alerts/lib/plain-language";
 
 /**
  * A new alert starts on the common case: a live-price crossing with no target
@@ -25,6 +26,8 @@ function newAlertDraft() {
   return {
     ...base,
     clock: "ltp",
+    // The calm default for a first alert: tell me once, then stay quiet.
+    alert: applyFrequency(base.alert, "once"),
     conditions: [
       {
         left: { kind: "field" as const, name: "ltp" },

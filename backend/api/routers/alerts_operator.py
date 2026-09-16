@@ -430,6 +430,44 @@ def _instrument_summary(keys: List[str], document: Any) -> str:
     return f"{', '.join(keys[:3])} +{len(keys) - 3} more"
 
 
+def _lifecycle_states_for_workflows(
+    session: Any, workflow_ids: List[str]
+) -> Dict[str, str]:
+    """Effective lifecycle per workflow, in one query for the whole page.
+
+    Pause/Resume act on SUBSCRIPTIONS while the revision stays active, so the
+    revision status alone would tell the list "active" for a workflow the
+    operator explicitly paused — and the row would then offer the wrong action.
+    """
+    if not workflow_ids:
+        return {}
+    from backend.workflows.repository import AlertSubscription, WorkflowRevision
+
+    rows = session.execute(
+        select(
+            WorkflowRevision.workflow_id,
+            WorkflowRevision.id,
+            AlertSubscription.state,
+        )
+        .outerjoin(AlertSubscription, AlertSubscription.revision_id == WorkflowRevision.id)
+        .where(WorkflowRevision.workflow_id.in_(workflow_ids))
+        .where(WorkflowRevision.status == "active")
+    ).all()
+    states: Dict[str, List[str]] = {}
+    for workflow_id, _revision_id, state in rows:
+        if state is None:
+            continue
+        states.setdefault(str(workflow_id), []).append(str(state))
+    return {
+        workflow_id: (
+            "paused"
+            if values and all(value == "paused" for value in values)
+            else "active"
+        )
+        for workflow_id, values in states.items()
+    }
+
+
 @router.get("/workflows")
 async def list_workflows(
     request: Request,
@@ -453,8 +491,19 @@ async def list_workflows(
         freshness = _freshness_for_workflows(
             session, [workflow.id for workflow in workflows]
         )
+        lifecycles = _lifecycle_states_for_workflows(
+            session, [workflow.id for workflow in workflows]
+        )
     for row in rows:
         row["freshness"] = freshness.get(row["workflow_id"], _empty_freshness())
+        # Archived and never-activated rows keep their own state; the batch only
+        # distinguishes paused from active for rows that have an active revision.
+        if row.get("archived"):
+            row["lifecycle_state"] = "archived"
+        elif row.get("active_revision") is None:
+            row["lifecycle_state"] = "draft"
+        else:
+            row["lifecycle_state"] = lifecycles.get(row["workflow_id"], "active")
     return {"ok": True, "scope": scope, "workflows": rows}
 
 
