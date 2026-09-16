@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { AlertCircleIcon, ArrowLeftIcon, PlayIcon } from "lucide-react";
+import { AlertCircleIcon, PlayIcon } from "lucide-react";
 import { useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -19,6 +19,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { AlertsPageHeader } from "@/features/alerts/components/alerts-page-header";
 import {
   useAlertsCapabilities,
   useAlertsScreenerAttachments,
@@ -305,13 +306,15 @@ export function ScreenerPage({
   return (
     <div className="flex flex-col gap-6 pb-8">
       <div>
-        <Button asChild variant="ghost" size="sm" className="mb-2 -ml-2">
-          <Link href="/alerts">
-            <ArrowLeftIcon className="size-4" aria-hidden />
-            All alerts
-          </Link>
-        </Button>
-        <SectionLabel eyebrow="Screener" title={workflow.name} />
+        <AlertsPageHeader
+          backHref="/alerts"
+          trail={[
+            { label: "Alerts", href: "/alerts" },
+            { label: "Screeners", href: "/alerts/screeners" },
+            { label: workflow.name },
+          ]}
+        />
+        <SectionLabel eyebrow="Screener" />
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <Badge variant="secondary">screener</Badge>
           <span className="text-xs text-muted-foreground">

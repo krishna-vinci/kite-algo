@@ -9,6 +9,10 @@
  * re-derives them inconsistently.
  */
 
+import type {
+  IssueSection,
+  ValidationState,
+} from "@/features/alerts/hooks/use-definition-validation";
 import type { AlertsFreshness, AlertsWorkflowSummary } from "@/features/alerts/types";
 
 export type LifecycleState = "active" | "paused" | "draft" | "archived";
@@ -104,3 +108,39 @@ export const WARNING_TONE: Record<"error" | "warning", StatusTone> = {
   error: "danger",
   warning: "warning",
 };
+
+// -- shared presentation of validation state and issue sections ------------
+// Moved out of the editor so the rail and the save bar render one vocabulary.
+
+export const VALIDATION_TONE: Record<string, "positive" | "warning" | "danger" | "neutral"> = {
+  ready: "positive",
+  crossed: "warning",
+  checking: "neutral",
+  incomplete: "neutral",
+  invalid: "danger",
+  unavailable: "warning",
+  "no-data": "neutral",
+};
+
+export const VALIDATION_LABEL: Record<string, string> = {
+  ready: "Valid",
+  crossed: "Already past the level",
+  checking: "Checking…",
+  incomplete: "Waiting for the required fields",
+  invalid: "Needs attention",
+  unavailable: "Validation unavailable",
+  "no-data": "No market data yet",
+};
+
+export const SECTION_META: Array<{
+  section: IssueSection;
+  label: string;
+  anchor: string;
+}> = [
+  { section: "instrument", label: "Instrument", anchor: "section-instrument" },
+  { section: "rule", label: "Condition", anchor: "section-rule" },
+  { section: "evaluation", label: "Evaluation", anchor: "section-evaluation" },
+  { section: "frequency", label: "Notification frequency", anchor: "section-frequency" },
+  { section: "destinations", label: "Destinations", anchor: "section-destinations" },
+  { section: "other", label: "Definition", anchor: "section-name" },
+];

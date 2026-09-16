@@ -1,7 +1,6 @@
 "use client";
 
-import Link from "next/link";
-import { AlertCircleIcon, ArrowLeftIcon } from "lucide-react";
+import { AlertCircleIcon } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -17,6 +16,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { AlertsPageHeader } from "@/features/alerts/components/alerts-page-header";
 import {
   useAlertsUniverse,
   useAlertsUniverseMutations,
@@ -64,13 +64,15 @@ export function UniverseDetailPage({
   return (
     <div className="flex flex-col gap-6 pb-8">
       <div>
-        <Button asChild variant="ghost" size="sm" className="mb-2 -ml-2">
-          <Link href="/alerts/universes">
-            <ArrowLeftIcon className="size-4" aria-hidden />
-            All universes
-          </Link>
-        </Button>
-        <SectionLabel eyebrow="Universe" title={universe.name} />
+        <AlertsPageHeader
+          backHref="/alerts/universes"
+          trail={[
+            { label: "Alerts", href: "/alerts" },
+            { label: "Universes", href: "/alerts/universes" },
+            { label: universe.name },
+          ]}
+        />
+        <SectionLabel eyebrow="Universe" />
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <Badge variant="outline">{universe.kind}</Badge>
           <Badge variant={universe.enabled ? "secondary" : "destructive"}>

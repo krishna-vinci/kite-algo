@@ -205,18 +205,21 @@ describe("UnifiedAlertEditor", () => {
     renderWithQuery(
       <UnifiedAlertEditor scope="app:admin" mode={{ kind: "create" }} initialDraft={draftWithInstrument()} />,
     );
-    expect(await screen.findByText("₹1,24,860.00")).toBeTruthy();
-    expect(screen.getByText("LIVE")).toBeTruthy();
-    expect(screen.getByText(/updated 1s ago/)).toBeTruthy();
-    expect(screen.getByText(/exchange .*received/)).toBeTruthy();
+    // The price card exists twice on purpose: the inline strip (small screens)
+    // and the rail's Live market card both render it.
+    expect((await screen.findAllByText("₹1,24,860.00")).length).toBe(2);
+    expect(screen.getAllByText("LIVE").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/updated 1s ago/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/exchange .*received/).length).toBe(2);
   });
 
   it("explains the distance to the target and offers shortcuts from the live price", async () => {
     renderWithQuery(
       <UnifiedAlertEditor scope="app:admin" mode={{ kind: "create" }} initialDraft={draftWithInstrument()} />,
     );
-    // 124,860 → 125,000 is ₹140 above
-    expect(await screen.findByText(/₹140\.00 above the current price/)).toBeTruthy();
+    // 124,860 → 125,000 is ₹140 above, rendered by the rule row and by the
+    // rail's price ladder.
+    expect((await screen.findAllByText(/₹140\.00 above the current price/)).length).toBeGreaterThan(0);
     expect(screen.getByText("Use current price")).toBeTruthy();
     fireEvent.click(screen.getByText("+1%"));
     await waitFor(() =>
@@ -236,8 +239,10 @@ describe("UnifiedAlertEditor", () => {
         })}
       />,
     );
-    expect(await screen.findByText(/Price is already above/)).toBeTruthy();
-    expect(screen.getByText(/wait for the price to move below the target/)).toBeTruthy();
+    // The preview sentence surfaces in the rail's insight card and (prefixed by
+    // the evaluation label) in the save bar.
+    expect((await screen.findAllByText(/Price is already above/)).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/wait for the price to move below the target/).length).toBeGreaterThan(0);
   });
 
   it("shows the timeframe only when the evaluation needs one", async () => {
@@ -353,7 +358,9 @@ describe("UnifiedAlertEditor", () => {
     renderWithQuery(
       <UnifiedAlertEditor scope="app:admin" mode={mode} initialDraft={draftWithInstrument()} />,
     );
-    expect(await screen.findByText("Edit GOLD breakout")).toBeTruthy();
+    // The header trail names where you are: Alerts / {name} / Edit.
+    expect(await screen.findByText("GOLD breakout")).toBeTruthy();
+    expect(screen.getByText("Edit")).toBeTruthy();
     expect(screen.getByText("Save changes")).toBeTruthy();
     expect(screen.getByText("Save and activate latest")).toBeTruthy();
 
@@ -425,6 +432,21 @@ describe("UnifiedAlertEditor", () => {
     expect(await screen.findByText(/changed while you were editing/)).toBeTruthy();
     expect((screen.getByLabelText("Target value") as HTMLInputElement).value).toBe("130000");
     expect(screen.getByText("Load the newer revision")).toBeTruthy();
+  });
+
+  it("renders the workspace: sticky rail with summary, and a compact frequency segmented control", async () => {
+    renderWithQuery(
+      <UnifiedAlertEditor scope="app:admin" mode={{ kind: "create" }} initialDraft={draftWithInstrument()} />,
+    );
+    expect(await screen.findByText("New alert")).toBeTruthy();
+    // The rail exists with its three cards:
+    expect(screen.getByText("Live market")).toBeTruthy();
+    expect(screen.getByText("What this alert will do")).toBeTruthy();
+    expect(screen.getByText("You are creating")).toBeTruthy();
+    // Frequency is a segmented radiogroup, one row, hints collapsed to the selected one:
+    const group = screen.getByRole("radiogroup", { name: "Notification frequency" });
+    expect(group.querySelectorAll("input[type=radio]").length).toBe(3);
+    expect(screen.getAllByRole("radio", { name: "Once when it happens" }).length).toBeGreaterThan(0);
   });
 });
 

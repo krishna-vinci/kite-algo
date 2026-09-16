@@ -36,11 +36,11 @@ import { useMemo, useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Panel } from "@/components/operator/panel";
 import { StatusBadge } from "@/components/operator/status-badge";
-import { SectionLabel } from "@/components/operator/section-label";
 import {
   Select,
   SelectContent,
@@ -48,9 +48,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 import { AdvancedDefinitionEditor } from "@/features/alerts/components/advanced-definition-editor";
+import { AlertsPageHeader } from "@/features/alerts/components/alerts-page-header";
 import { ConditionEditor } from "@/features/alerts/components/condition-editor";
 import { InstrumentPicker } from "@/features/alerts/components/instrument-picker";
+import { LiveSidePanel } from "@/features/alerts/components/live-side-panel";
 import { UniverseTargetingEditor } from "@/features/alerts/components/universe-targeting-editor";
 import {
   activateAlertsWorkflow,
@@ -63,6 +66,7 @@ import {
 import { useAlertsCapabilities, useAlertsChannels } from "@/features/alerts/hooks/use-alerts-queries";
 import { useDefinitionValidation } from "@/features/alerts/hooks/use-definition-validation";
 import { useMarketQuote, useQuotePresentation } from "@/features/alerts/hooks/use-market-stream";
+import { describeCoverage } from "@/features/alerts/lib/alert-state";
 import {
   OPERATOR_LABELS,
   type AlertDraft,
@@ -77,6 +81,7 @@ import {
   TARGET_SHORTCUTS,
   applyFrequency,
   describeFrequency,
+  describeRule,
   describeTarget,
   evaluationLabel,
   formatAge,
@@ -88,6 +93,11 @@ import {
   suggestName,
   timeframeOptions,
 } from "@/features/alerts/lib/plain-language";
+import {
+  VALIDATION_LABEL,
+  VALIDATION_TONE,
+} from "@/features/alerts/lib/status";
+import { useDirtyGuard } from "@/features/alerts/lib/use-dirty-guard";
 import { newIdempotencyKey } from "@/lib/ids";
 
 const LEVEL_OPERATORS = [
@@ -244,6 +254,31 @@ export function UnifiedAlertEditor({
     alert: { ...draft.alert, channels: selectedChannels },
   };
 
+  // The unsaved-work guard compares the draft as first loaded with what the
+  // operator sees now; the target text and touched flags are part of the draft's
+  // story even though they live outside `AlertDraft`. useState captures the
+  // first render's value without touching refs during render.
+  const dirtySnapshot = JSON.stringify({ draft: effectiveDraft, targetText, nameTouched, channelsTouched });
+  const [initialSnapshot] = useState(dirtySnapshot);
+  const isDirty = dirtySnapshot !== initialSnapshot;
+  const { attemptExit, dialog: dirtyDialog } = useDirtyGuard(isDirty);
+
+  // The rail's reading of exactly what will be saved, derived from the same
+  // effective draft the save path uses — never a parallel interpretation.
+  const railSummary = {
+    title: isEdit ? "You are editing" : "You are creating",
+    name: effectiveName,
+    rule: targetingUniverse
+      ? describeCoverage(draft.instruments, true, [])
+      : describeRule(
+          primaryInstrument.split(":").slice(1).join(":"),
+          OPERATOR_LABELS[operator] ?? operator,
+          targetValue,
+        ),
+    frequency: describeFrequency(effectiveDraft.alert),
+    channels: selectedChannels,
+  };
+
   const updateCondition = (patch: Partial<AlertDraft["conditions"][number]>) => {
     setDraft((current) => {
       const conditions = [...current.conditions];
@@ -352,25 +387,6 @@ export function UnifiedAlertEditor({
     crossed: Boolean(target?.alreadyBeyond),
   });
 
-  const validationTone: Record<string, "positive" | "warning" | "danger" | "neutral"> = {
-    ready: "positive",
-    crossed: "warning",
-    checking: "neutral",
-    incomplete: "neutral",
-    invalid: "danger",
-    unavailable: "warning",
-    "no-data": "neutral",
-  };
-  const validationLabel: Record<string, string> = {
-    ready: "Valid",
-    crossed: "Already past the level",
-    checking: "Checking…",
-    incomplete: "Waiting for the required fields",
-    invalid: "Needs attention",
-    unavailable: "Validation unavailable",
-    "no-data": "No market data yet",
-  };
-
   if (capabilitiesQuery.isLoading) {
     return <p className="text-sm text-muted-foreground">Loading alert options…</p>;
   }
@@ -388,48 +404,60 @@ export function UnifiedAlertEditor({
 
   return (
     <div className="flex flex-col gap-5 pb-32">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <SectionLabel
-          eyebrow="Alerts"
-          title={isEdit ? `Edit ${mode.workflowName}` : "New alert"}
-          description={
-            isEdit
-              ? "Saving creates a new draft revision; activation stays a separate, explicit step."
-              : "Pick an instrument, set the level, choose where it notifies."
-          }
-        />
-        <div role="tablist" aria-label="Editor view" className="flex gap-2">
-          {(
-            [
-              // Code view is never gated: it is the route that preserves an
-              // unmodeled definition, so the FORM is what becomes unavailable.
+      <AlertsPageHeader
+        backHref={isEdit ? `/alerts/${mode.workflowId}` : "/alerts"}
+        onBack={attemptExit}
+        trail={
+          isEdit
+            ? [
+                { label: "Alerts", href: "/alerts" },
+                { label: mode.workflowName, href: `/alerts/${mode.workflowId}` },
+                { label: "Edit" },
+              ]
+            : [
+                { label: "Alerts", href: "/alerts" },
+                { label: "New alert" },
+              ]
+        }
+        right={
+          <div role="tablist" aria-label="Editor view" className="flex gap-2">
+            {(
               [
-                "form",
-                "Form",
-                conversionError ? "this definition uses features the form cannot show" : null,
-              ],
-              ["code", "Code view", null],
-            ] as const
-          ).map(([value, label, disabledReason]) => (
-            <button
-              key={value}
-              type="button"
-              role="tab"
-              aria-selected={view === value}
-              disabled={disabledReason !== null}
-              title={disabledReason ?? undefined}
-              onClick={() => setView(value)}
-              className={
-                view === value
-                  ? "rounded-full border border-primary/60 bg-primary/10 px-3 py-1 text-xs text-primary"
-                  : "rounded-full border border-border/60 px-3 py-1 text-xs text-muted-foreground disabled:opacity-50"
-              }
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-      </div>
+                // Code view is never gated: it is the route that preserves an
+                // unmodeled definition, so the FORM is what becomes unavailable.
+                [
+                  "form",
+                  "Form",
+                  conversionError ? "this definition uses features the form cannot show" : null,
+                ],
+                ["code", "Code view", null],
+              ] as const
+            ).map(([value, label, disabledReason]) => (
+              <button
+                key={value}
+                type="button"
+                role="tab"
+                aria-selected={view === value}
+                disabled={disabledReason !== null}
+                title={disabledReason ?? undefined}
+                onClick={() => setView(value)}
+                className={
+                  view === value
+                    ? "rounded-full border border-primary/60 bg-primary/10 px-3 py-1 text-xs text-primary"
+                    : "rounded-full border border-border/60 px-3 py-1 text-xs text-muted-foreground disabled:opacity-50"
+                }
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        }
+      />
+      <p className="text-sm text-muted-foreground">
+        {isEdit
+          ? "Saving creates a new draft revision; activation stays a separate, explicit step."
+          : "Pick an instrument, set the level, choose where it notifies."}
+      </p>
 
       {conversionError ? (
         <Alert role="status">
@@ -515,431 +543,454 @@ export function UnifiedAlertEditor({
           />
         )
       ) : (
-        <>
-          {/* ---------------------------------------------------------- instrument */}
-          <Panel className="flex flex-col gap-4 p-5">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <Label htmlFor="alert-instrument">Instrument</Label>
-              <button
-                type="button"
-                className="text-xs underline text-muted-foreground"
-                onClick={() =>
-                  setDraft((current) => ({
-                    ...current,
-                    targeting: current.targeting === "universe" ? "instruments" : "universe",
-                  }))
-                }
-              >
-                {targetingUniverse ? "Use specific instruments instead" : "Scan a universe instead"}
-              </button>
-            </div>
-            {targetingUniverse ? (
-              <UniverseTargetingEditor
-                scope={scope}
-                value={draft.universe}
-                onChange={(universe) => setDraft({ ...draft, universe })}
-              />
-            ) : (
-              <InstrumentPicker
-                selected={draft.instruments}
-                onChange={(instruments) => setDraft({ ...draft, instruments })}
-                acceptedExchanges={
-                  inference.session ? capabilities.session_exchanges[inference.session] ?? [] : null
-                }
-              />
-            )}
-
-            {primaryInstrument && quote ? (
-              <div className="flex flex-wrap items-baseline gap-3 rounded-lg border border-border/60 bg-card/40 px-3 py-2">
-                <span className="text-lg font-semibold tabular-nums">
-                  {formatPrice(presentation.price)}
-                </span>
-                <StatusBadge tone={presentation.tone}>{presentation.label}</StatusBadge>
-                <span className="text-xs text-muted-foreground">{formatAge(quote.age_ms)}</span>
-                <span className="text-xs text-muted-foreground">
-                  {quote.exchange_timestamp
-                    ? `exchange ${new Date(quote.exchange_timestamp).toLocaleTimeString()}`
-                    : "no exchange timestamp"}
-                  {quote.received_at
-                    ? ` · received ${new Date(quote.received_at).toLocaleTimeString()}`
-                    : ""}
-                </span>
-                {quote.change_percent !== null && quote.change_percent !== undefined ? (
-                  <span className="text-xs text-muted-foreground">
-                    {quote.change_percent >= 0 ? "+" : ""}
-                    {quote.change_percent.toFixed(2)}% today
-                  </span>
-                ) : null}
-              </div>
-            ) : primaryInstrument ? (
-              <p className="text-xs text-muted-foreground">
-                Waiting for the first price… {presentation.label === "NO DATA" ? "no data for this instrument yet" : presentation.label}
-              </p>
-            ) : null}
-
-            <SectionIssues issues={validation.bySection.instrument} />
-            {inference.error ? (
-              <p className="text-xs text-rose-300" role="alert">
-                {inference.error}
-              </p>
-            ) : inference.session ? (
-              <p className="text-xs text-muted-foreground">
-                {`Evaluated in the ${sessionLabel(inference.session)} session, taken from the instrument's exchange.`}
-              </p>
-            ) : null}
-          </Panel>
-
-          {/* ---------------------------------------------------------- rule */}
-          <Panel className="flex flex-col gap-4 p-5">
-            <Label htmlFor="alert-operator">Alert me when</Label>
-            <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-              <Select
-                value={operator}
-                onValueChange={(op) => {
-                  const value = op === "rises_pct" || op === "falls_pct" ? 1 : targetValue ?? 0;
-                  updateCondition({
-                    op,
-                    right: { kind: "constant", value },
-                    left: { kind: "field", name: op === "rises_pct" || op === "falls_pct" ? "close" : "ltp" },
-                  });
-                  if (op === "rises_pct" || op === "falls_pct") {
-                    setDraft((current) => ({ ...current, clock: "candle_close" }));
+        <div className="mx-auto grid w-full max-w-6xl gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
+          <div className="flex min-w-0 flex-col gap-5">
+            {/* ---------------------------------------------------------- instrument */}
+            <Panel id="section-instrument" className="flex flex-col gap-4 p-5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <Label htmlFor="alert-instrument">Instrument</Label>
+                <button
+                  type="button"
+                  className="text-xs underline text-muted-foreground"
+                  onClick={() =>
+                    setDraft((current) => ({
+                      ...current,
+                      targeting: current.targeting === "universe" ? "instruments" : "universe",
+                    }))
                   }
-                }}
-              >
-                <SelectTrigger id="alert-operator" aria-label="Condition">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {LEVEL_OPERATORS.filter((op) => op in OPERATOR_LABELS).map((op) => (
-                    <SelectItem key={op} value={op}>
-                      {OPERATOR_LABELS[op]}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <div>
-                <Input
-                  id="alert-value"
-                  aria-label="Target value"
-                  type="number"
-                  inputMode="decimal"
-                  step="any"
-                  value={targetText}
-                  onChange={(event) => {
-                    setTargetText(event.target.value);
-                    const next = event.target.value.trim() === "" ? null : Number(event.target.value);
-                    updateCondition({
-                      right: { kind: "constant", value: next !== null && Number.isFinite(next) ? next : 0 },
-                      left: {
-                        kind: "field",
-                        name: operator === "rises_pct" || operator === "falls_pct" ? "close" : "ltp",
-                      },
-                    });
-                  }}
-                />
-              </div>
-            </div>
-
-            {target ? (
-              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                <span>{target.sentence}</span>
-                {presentation.price !== null ? (
-                  <span className="flex flex-wrap gap-1">
-                    {TARGET_SHORTCUTS.map((shortcut) => (
-                      <Button
-                        key={shortcut.label}
-                        type="button"
-                        size="xs"
-                        variant="outline"
-                        onClick={() => {
-                          const next =
-                            shortcut.percent === null || shortcut.percent === 0
-                              ? Math.round((presentation.price ?? 0) * 100) / 100
-                              : offsetPrice(presentation.price ?? 0, shortcut.percent);
-                          setTargetText(String(next));
-                          updateCondition({ right: { kind: "constant", value: next } });
-                        }}
-                      >
-                        {shortcut.label}
-                      </Button>
-                    ))}
-                  </span>
-                ) : null}
-              </div>
-            ) : null}
-
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="alert-evaluation">Evaluation</Label>
-              <Select
-                value={draft.clock}
-                onValueChange={(clock) => setDraft({ ...draft, clock })}
-              >
-                <SelectTrigger id="alert-evaluation" className="sm:w-72">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {EVALUATION_OPTIONS.map((option) => (
-                    <SelectItem key={option.value} value={option.value}>
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <p className="text-xs text-muted-foreground">
-                {EVALUATION_OPTIONS.find((option) => option.value === draft.clock)?.hint}
-              </p>
-              <SectionIssues issues={validation.bySection.evaluation} />
-            </div>
-
-            {needsTimeframe(draft) ? (
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="alert-timeframe">Measured over</Label>
-                <Select
-                  value={draft.timeframe}
-                  onValueChange={(timeframe) => setDraft({ ...draft, timeframe })}
                 >
-                  <SelectTrigger id="alert-timeframe" className="sm:w-72">
+                  {targetingUniverse ? "Use specific instruments instead" : "Scan a universe instead"}
+                </button>
+              </div>
+              {targetingUniverse ? (
+                <UniverseTargetingEditor
+                  scope={scope}
+                  value={draft.universe}
+                  onChange={(universe) => setDraft({ ...draft, universe })}
+                />
+              ) : (
+                <InstrumentPicker
+                  selected={draft.instruments}
+                  onChange={(instruments) => setDraft({ ...draft, instruments })}
+                  acceptedExchanges={
+                    inference.session ? capabilities.session_exchanges[inference.session] ?? [] : null
+                  }
+                />
+              )}
+
+              {primaryInstrument && quote ? (
+                <div className="flex flex-wrap items-baseline gap-3 rounded-lg border border-border/60 bg-card/40 px-3 py-2 lg:hidden">
+                  <span className="text-lg font-semibold tabular-nums">
+                    {formatPrice(presentation.price)}
+                  </span>
+                  <StatusBadge tone={presentation.tone}>{presentation.label}</StatusBadge>
+                  <span className="text-xs text-muted-foreground">{formatAge(quote.age_ms)}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {quote.exchange_timestamp
+                      ? `exchange ${new Date(quote.exchange_timestamp).toLocaleTimeString()}`
+                      : "no exchange timestamp"}
+                    {quote.received_at
+                      ? ` · received ${new Date(quote.received_at).toLocaleTimeString()}`
+                      : ""}
+                  </span>
+                  {quote.change_percent !== null && quote.change_percent !== undefined ? (
+                    <span className="text-xs text-muted-foreground">
+                      {quote.change_percent >= 0 ? "+" : ""}
+                      {quote.change_percent.toFixed(2)}% today
+                    </span>
+                  ) : null}
+                </div>
+              ) : primaryInstrument ? (
+                <p className="text-xs text-muted-foreground lg:hidden">
+                  Waiting for the first price… {presentation.label === "NO DATA" ? "no data for this instrument yet" : presentation.label}
+                </p>
+              ) : null}
+
+              <SectionIssues issues={validation.bySection.instrument} />
+              {inference.error ? (
+                <p className="text-xs text-rose-300" role="alert">
+                  {inference.error}
+                </p>
+              ) : inference.session ? (
+                <p className="text-xs text-muted-foreground">
+                  {`Evaluated in the ${sessionLabel(inference.session)} session, taken from the instrument's exchange.`}
+                </p>
+              ) : null}
+            </Panel>
+
+            {/* ---------------------------------------------------------- rule */}
+            <Panel id="section-rule" className="flex flex-col gap-4 p-5">
+              <Label htmlFor="alert-operator">Alert me when</Label>
+              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+                <Select
+                  value={operator}
+                  onValueChange={(op) => {
+                    const value = op === "rises_pct" || op === "falls_pct" ? 1 : targetValue ?? 0;
+                    updateCondition({
+                      op,
+                      right: { kind: "constant", value },
+                      left: { kind: "field", name: op === "rises_pct" || op === "falls_pct" ? "close" : "ltp" },
+                    });
+                    if (op === "rises_pct" || op === "falls_pct") {
+                      setDraft((current) => ({ ...current, clock: "candle_close" }));
+                    }
+                  }}
+                >
+                  <SelectTrigger id="alert-operator" aria-label="Condition">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {timeframeOptions(capabilities.timeframes ?? []).map((option) => (
+                    {LEVEL_OPERATORS.filter((op) => op in OPERATOR_LABELS).map((op) => (
+                      <SelectItem key={op} value={op}>
+                        {OPERATOR_LABELS[op]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <div>
+                  <Input
+                    id="alert-value"
+                    aria-label="Target value"
+                    type="number"
+                    inputMode="decimal"
+                    step="any"
+                    value={targetText}
+                    onChange={(event) => {
+                      setTargetText(event.target.value);
+                      const next = event.target.value.trim() === "" ? null : Number(event.target.value);
+                      updateCondition({
+                        right: { kind: "constant", value: next !== null && Number.isFinite(next) ? next : 0 },
+                        left: {
+                          kind: "field",
+                          name: operator === "rises_pct" || operator === "falls_pct" ? "close" : "ltp",
+                        },
+                      });
+                    }}
+                  />
+                </div>
+              </div>
+
+              {target ? (
+                <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <span>{target.sentence}</span>
+                  {presentation.price !== null ? (
+                    <span className="flex flex-wrap gap-1">
+                      {TARGET_SHORTCUTS.map((shortcut) => (
+                        <Button
+                          key={shortcut.label}
+                          type="button"
+                          size="xs"
+                          variant="outline"
+                          onClick={() => {
+                            const next =
+                              shortcut.percent === null || shortcut.percent === 0
+                                ? Math.round((presentation.price ?? 0) * 100) / 100
+                                : offsetPrice(presentation.price ?? 0, shortcut.percent);
+                            setTargetText(String(next));
+                            updateCondition({ right: { kind: "constant", value: next } });
+                          }}
+                        >
+                          {shortcut.label}
+                        </Button>
+                      ))}
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
+
+              <div id="section-evaluation" className="flex flex-col gap-2">
+                <Label htmlFor="alert-evaluation">Evaluation</Label>
+                <Select
+                  value={draft.clock}
+                  onValueChange={(clock) => setDraft({ ...draft, clock })}
+                >
+                  <SelectTrigger id="alert-evaluation" className="sm:w-72">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {EVALUATION_OPTIONS.map((option) => (
                       <SelectItem key={option.value} value={option.value}>
                         {option.label}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
+                <p className="text-xs text-muted-foreground">
+                  {EVALUATION_OPTIONS.find((option) => option.value === draft.clock)?.hint}
+                </p>
+                <SectionIssues issues={validation.bySection.evaluation} />
               </div>
-            ) : null}
 
-            <SectionIssues issues={validation.bySection.rule} />
-            <details className="rounded-lg border border-border/60 px-3 py-2">
-              <summary className="cursor-pointer text-xs text-muted-foreground">
-                All conditions and groups
-              </summary>
-              <div className="mt-3">
-                <ConditionEditor
-                  conditions={draft.conditions}
-                  capabilities={capabilities}
-                  onChange={(conditions) => setDraft({ ...draft, conditions })}
-                />
-              </div>
-            </details>
-          </Panel>
-
-          {/* ---------------------------------------------------------- frequency */}
-          <Panel className="flex flex-col gap-4 p-5">
-            <Label>When should we notify you?</Label>
-            <div role="radiogroup" aria-label="Notification frequency" className="flex flex-col gap-2">
-              {FREQUENCY_OPTIONS.map((option) => {
-                const active = frequencyOf(draft.alert) === option.value;
-                return (
-                  <label
-                    key={option.value}
-                    className="flex cursor-pointer items-start gap-3 rounded-lg border border-border/60 px-3 py-2"
+              {needsTimeframe(draft) ? (
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="alert-timeframe">Measured over</Label>
+                  <Select
+                    value={draft.timeframe}
+                    onValueChange={(timeframe) => setDraft({ ...draft, timeframe })}
                   >
-                    <input
-                      type="radio"
-                      name="alert-frequency"
-                      className="mt-1"
-                      checked={active}
-                      onChange={() => setDraft({ ...draft, alert: applyFrequency(draft.alert, option.value) })}
-                    />
-                    <span className="flex flex-col">
-                      <span className="text-sm">{option.label}</span>
-                      <span className="text-xs text-muted-foreground">{option.hint}</span>
-                    </span>
-                  </label>
-                );
-              })}
-            </div>
-            <p className="text-xs text-muted-foreground">{describeFrequency(draft.alert)}</p>
-            <SectionIssues issues={validation.bySection.frequency} />
+                    <SelectTrigger id="alert-timeframe" className="sm:w-72">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {timeframeOptions(capabilities.timeframes ?? []).map((option) => (
+                        <SelectItem key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              ) : null}
 
-            <details
-              className="rounded-lg border border-border/60 px-3 py-2"
-              open={moreOpen}
-              onToggle={(event) => setMoreOpen((event.target as HTMLDetailsElement).open)}
-            >
-              <summary className="cursor-pointer text-xs text-muted-foreground">
-                More timing and noise controls
-              </summary>
-              <div className="mt-3 grid gap-4 sm:grid-cols-2">
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="alert-cooldown">Wait before notifying again (minutes)</Label>
-                  <Input
-                    id="alert-cooldown"
-                    type="number"
-                    min={0}
-                    value={draft.alert.cooldown_s ? Math.round(draft.alert.cooldown_s / 60) : ""}
-                    placeholder="no wait"
-                    onChange={(event) =>
-                      setDraft({
-                        ...draft,
-                        alert: {
-                          ...draft.alert,
-                          cooldown_s: event.target.value === "" ? null : Number(event.target.value) * 60,
-                        },
-                      })
-                    }
+              <SectionIssues issues={validation.bySection.rule} />
+              <details className="rounded-lg border border-border/60 px-3 py-2">
+                <summary className="cursor-pointer text-xs text-muted-foreground">
+                  All conditions and groups
+                </summary>
+                <div className="mt-3">
+                  <ConditionEditor
+                    conditions={draft.conditions}
+                    capabilities={capabilities}
+                    onChange={(conditions) => setDraft({ ...draft, conditions })}
                   />
-                  <p className="text-xs text-muted-foreground">
-                    Stops a price hovering at the level from notifying repeatedly.
-                  </p>
                 </div>
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="alert-max">Maximum notifications today</Label>
-                  <Input
-                    id="alert-max"
-                    type="number"
-                    min={1}
-                    value={draft.alert.max_per_session ?? ""}
-                    placeholder="no limit"
-                    onChange={(event) =>
-                      setDraft({
-                        ...draft,
-                        alert: {
-                          ...draft.alert,
-                          max_per_session: event.target.value === "" ? null : Number(event.target.value),
-                        },
-                      })
-                    }
-                  />
-                  <p className="text-xs text-muted-foreground">A daily cap for a noisy instrument.</p>
-                </div>
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="alert-rearm">Becomes ready again above/below</Label>
-                  <Input
-                    id="alert-rearm"
-                    type="number"
-                    step="any"
-                    value={draft.alert.rearm_level ?? ""}
-                    placeholder="no reset level"
-                    onChange={(event) =>
-                      setDraft({
-                        ...draft,
-                        alert: {
-                          ...draft.alert,
-                          rearm_level: event.target.value === "" ? null : Number(event.target.value),
-                          rearm_direction:
-                            event.target.value === ""
-                              ? null
-                              : draft.alert.rearm_direction ??
-                                ((targetValue ?? 0) >= (presentation.price ?? 0) ? "below" : "above"),
-                        },
-                      })
-                    }
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    After notifying once, the alert waits until the price reaches this level before it can notify again.
-                  </p>
-                </div>
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="alert-consecutive">Consecutive completed candles</Label>
-                  <Input
-                    id="alert-consecutive"
-                    type="number"
-                    min={1}
-                    value={draft.consecutiveBars ?? ""}
-                    placeholder="not required"
-                    onChange={(event) =>
-                      setDraft({
-                        ...draft,
-                        consecutiveBars: event.target.value === "" ? null : Number(event.target.value),
-                      })
-                    }
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Requires the condition to hold for several candles before notifying.
-                  </p>
-                </div>
-                <label className="flex items-center gap-2 text-sm" htmlFor="alert-already-true">
-                  <input
-                    id="alert-already-true"
-                    type="checkbox"
-                    checked={draft.alert.notify_if_already_true}
-                    onChange={(event) =>
-                      setDraft({
-                        ...draft,
-                        alert: { ...draft.alert, notify_if_already_true: event.target.checked },
-                      })
-                    }
-                  />
-                  Tell me if it is already true when I switch it on
-                </label>
+              </details>
+            </Panel>
+
+            {/* ---------------------------------------------------------- frequency */}
+            <Panel id="section-frequency" className="flex flex-col gap-4 p-5">
+              <Label>When should we notify you?</Label>
+              <div role="radiogroup" aria-label="Notification frequency" className="flex w-fit flex-wrap overflow-hidden rounded-lg border border-border/60">
+                {FREQUENCY_OPTIONS.map((option) => {
+                  const active = frequencyOf(draft.alert) === option.value;
+                  return (
+                    <label
+                      key={option.value}
+                      className={cn(
+                        "cursor-pointer border-r border-border/60 px-4 py-2 text-sm last:border-r-0",
+                        active ? "bg-primary/10 text-primary" : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      <input
+                        type="radio"
+                        name="alert-frequency"
+                        className="sr-only"
+                        checked={active}
+                        onChange={() => setDraft({ ...draft, alert: applyFrequency(draft.alert, option.value) })}
+                      />
+                      {option.label}
+                    </label>
+                  );
+                })}
               </div>
-            </details>
-          </Panel>
+              <p className="text-xs text-muted-foreground">
+                {FREQUENCY_OPTIONS.find((option) => frequencyOf(draft.alert) === option.value)?.hint}
+              </p>
+              <p className="text-xs text-muted-foreground">{describeFrequency(draft.alert)}</p>
+              <SectionIssues issues={validation.bySection.frequency} />
 
-          {/* ---------------------------------------------------------- destinations */}
-          <Panel className="flex flex-col gap-3 p-5">
-            <Label>Notify via</Label>
-            {channelsQuery.isLoading ? (
-              <p className="text-xs text-muted-foreground">Loading destinations…</p>
-            ) : enabledChannels.length === 0 ? (
-              <Alert role="status">
-                <InfoIcon className="size-4" />
-                <AlertTitle>No notification destination yet</AlertTitle>
-                <AlertDescription>
-                  Add one under{" "}
-                  <Link className="underline" href="/alerts/operations">
-                    Operations → Destinations
-                  </Link>
-                  . Everything you have entered here is kept.
-                </AlertDescription>
-              </Alert>
-            ) : (
-              <div className="flex flex-wrap gap-3">
-                {enabledChannels.map((channel) => (
-                  <label
-                    key={channel.channel_id}
-                    htmlFor={`destination-${channel.channel_id}`}
-                    className="flex items-center gap-2 text-sm"
-                  >
-                    <input
-                      id={`destination-${channel.channel_id}`}
-                      type="checkbox"
-                      checked={selectedChannels.includes(channel.name)}
-                      onChange={(event) => {
-                        setChannelsTouched(true);
+              <details
+                className="rounded-lg border border-border/60 px-3 py-2"
+                open={moreOpen}
+                onToggle={(event) => setMoreOpen((event.target as HTMLDetailsElement).open)}
+              >
+                <summary className="cursor-pointer text-xs text-muted-foreground">
+                  More timing and noise controls
+                </summary>
+                <div className="mt-3 grid gap-4 sm:grid-cols-2">
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="alert-cooldown">Wait before notifying again (minutes)</Label>
+                    <Input
+                      id="alert-cooldown"
+                      type="number"
+                      min={0}
+                      value={draft.alert.cooldown_s ? Math.round(draft.alert.cooldown_s / 60) : ""}
+                      placeholder="no wait"
+                      onChange={(event) =>
                         setDraft({
                           ...draft,
                           alert: {
                             ...draft.alert,
-                            channels: event.target.checked
-                              ? [...selectedChannels, channel.name]
-                              : selectedChannels.filter((name) => name !== channel.name),
+                            cooldown_s: event.target.value === "" ? null : Number(event.target.value) * 60,
                           },
-                        });
-                      }}
+                        })
+                      }
                     />
-                    {channel.name} · {channel.provider}
+                    <p className="text-xs text-muted-foreground">
+                      Stops a price hovering at the level from notifying repeatedly.
+                    </p>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="alert-max">Maximum notifications today</Label>
+                    <Input
+                      id="alert-max"
+                      type="number"
+                      min={1}
+                      value={draft.alert.max_per_session ?? ""}
+                      placeholder="no limit"
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          alert: {
+                            ...draft.alert,
+                            max_per_session: event.target.value === "" ? null : Number(event.target.value),
+                          },
+                        })
+                      }
+                    />
+                    <p className="text-xs text-muted-foreground">A daily cap for a noisy instrument.</p>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="alert-rearm">Becomes ready again above/below</Label>
+                    <Input
+                      id="alert-rearm"
+                      type="number"
+                      step="any"
+                      value={draft.alert.rearm_level ?? ""}
+                      placeholder="no reset level"
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          alert: {
+                            ...draft.alert,
+                            rearm_level: event.target.value === "" ? null : Number(event.target.value),
+                            rearm_direction:
+                              event.target.value === ""
+                                ? null
+                                : draft.alert.rearm_direction ??
+                                  ((targetValue ?? 0) >= (presentation.price ?? 0) ? "below" : "above"),
+                          },
+                        })
+                      }
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      After notifying once, the alert waits until the price reaches this level before it can notify again.
+                    </p>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="alert-consecutive">Consecutive completed candles</Label>
+                    <Input
+                      id="alert-consecutive"
+                      type="number"
+                      min={1}
+                      value={draft.consecutiveBars ?? ""}
+                      placeholder="not required"
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          consecutiveBars: event.target.value === "" ? null : Number(event.target.value),
+                        })
+                      }
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Requires the condition to hold for several candles before notifying.
+                    </p>
+                  </div>
+                  <label className="flex items-center gap-2 text-sm" htmlFor="alert-already-true">
+                    <input
+                      id="alert-already-true"
+                      type="checkbox"
+                      checked={draft.alert.notify_if_already_true}
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          alert: { ...draft.alert, notify_if_already_true: event.target.checked },
+                        })
+                      }
+                    />
+                    Tell me if it is already true when I switch it on
                   </label>
-                ))}
+                </div>
+              </details>
+            </Panel>
+
+            {/* ---------------------------------------------------------- destinations */}
+            <Panel id="section-destinations" className="flex flex-col gap-3 p-5">
+              <Label>Notify via</Label>
+              {channelsQuery.isLoading ? (
+                <p className="text-xs text-muted-foreground">Loading destinations…</p>
+              ) : enabledChannels.length === 0 ? (
+                <Alert role="status">
+                  <InfoIcon className="size-4" />
+                  <AlertTitle>No notification destination yet</AlertTitle>
+                  <AlertDescription>
+                    Add one under{" "}
+                    <Link className="underline" href="/alerts/operations">
+                      Operations → Destinations
+                    </Link>
+                    . Everything you have entered here is kept.
+                  </AlertDescription>
+                </Alert>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {enabledChannels.map((channel) => {
+                  const checked = selectedChannels.includes(channel.name);
+                  return (
+                    <label
+                      key={channel.channel_id}
+                      htmlFor={`destination-${channel.channel_id}`}
+                      className={cn(
+                        "flex cursor-pointer items-center gap-2 rounded-full border px-3 py-1.5 text-sm",
+                        checked
+                          ? "border-primary/60 bg-primary/10 text-primary"
+                          : "border-border/60 text-muted-foreground",
+                      )}
+                    >
+                      <Checkbox
+                        id={`destination-${channel.channel_id}`}
+                        checked={checked}
+                        onCheckedChange={() => {
+                          setChannelsTouched(true);
+                          setDraft({
+                            ...draft,
+                            alert: {
+                              ...draft.alert,
+                              channels: checked
+                                ? selectedChannels.filter((name) => name !== channel.name)
+                                : [...selectedChannels, channel.name],
+                            },
+                          });
+                        }}
+                      />
+                      {channel.name} · {channel.provider}
+                    </label>
+                  );
+                })}
               </div>
             )}
-            <p className="text-xs text-muted-foreground">
-              Delivery is accepted by the provider, which is not proof anyone has read it.
-            </p>
-            <SectionIssues issues={validation.bySection.destinations} />
-          </Panel>
+              <p className="text-xs text-muted-foreground">
+                Delivery is accepted by the provider, which is not proof anyone has read it.
+              </p>
+              <SectionIssues issues={validation.bySection.destinations} />
+            </Panel>
 
-          {/* ---------------------------------------------------------- name */}
-          <Panel className="flex flex-col gap-2 p-5">
-            <Label htmlFor="alert-name">Name</Label>
-            <Input
-              id="alert-name"
-              value={nameTouched ? draft.name : effectiveName}
-              onChange={(event) => {
-                setNameTouched(true);
-                setDraft({ ...draft, name: event.target.value });
-              }}
-              placeholder="Generated from the definition"
+            {/* ---------------------------------------------------------- name */}
+            <Panel id="section-name" className="flex flex-col gap-2 p-5">
+              <Label htmlFor="alert-name">Name</Label>
+              <Input
+                id="alert-name"
+                value={nameTouched ? draft.name : effectiveName}
+                onChange={(event) => {
+                  setNameTouched(true);
+                  setDraft({ ...draft, name: event.target.value });
+                }}
+                placeholder="Generated from the definition"
+              />
+              <SectionIssues issues={validation.bySection.other} />
+            </Panel>
+          </div>
+          <aside className="lg:sticky lg:top-4 lg:self-start">
+            <LiveSidePanel
+              quote={quote ?? null}
+              presentation={presentation}
+              coverage={targetingUniverse ? describeCoverage(draft.instruments, true, []) : null}
+              targetValue={targetValue}
+              distance={target}
+              validation={validation}
+              summary={railSummary}
             />
-            <SectionIssues issues={validation.bySection.other} />
-          </Panel>
-        </>
+          </aside>
+        </div>
       )}
 
       {/* ---------------------------------------------------------- save bar */}
@@ -967,8 +1018,8 @@ export function UnifiedAlertEditor({
           </Button>
           <div className="flex flex-1 flex-col gap-1 text-xs">
             <span className="flex items-center gap-2">
-              <StatusBadge tone={validationTone[validation.state] ?? "neutral"}>
-                {validationLabel[validation.state] ?? validation.state}
+              <StatusBadge tone={VALIDATION_TONE[validation.state] ?? "neutral"}>
+                {VALIDATION_LABEL[validation.state] ?? validation.state}
               </StatusBadge>
               <span className="text-muted-foreground">
                 {evaluationLabel(draft.clock)}
@@ -990,19 +1041,10 @@ export function UnifiedAlertEditor({
                 {validation.error} Your draft is untouched.
               </span>
             ) : null}
-            {sectionsWithIssues(validation.bySection).length > 0 ? (
-              <ul className="flex flex-col text-rose-300" role="alert">
-                {sectionsWithIssues(validation.bySection).map(([section, messages]) => (
-                  <li key={section}>
-                    <span className="font-medium">{SECTION_LABELS[section]}: </span>
-                    {messages.join(" ")}
-                  </li>
-                ))}
-              </ul>
-            ) : null}
           </div>
         </div>
       </div>
+      {dirtyDialog}
     </div>
   );
 }
@@ -1020,21 +1062,6 @@ function SectionIssues({ issues }: { issues: string[] | undefined }) {
       ))}
     </ul>
   );
-}
-
-const SECTION_LABELS: Record<string, string> = {
-  instrument: "Instrument",
-  rule: "Condition",
-  evaluation: "Evaluation",
-  frequency: "Notification frequency",
-  destinations: "Destinations",
-  other: "Definition",
-};
-
-function sectionsWithIssues(
-  bySection: Record<string, string[]>,
-): Array<[string, string[]]> {
-  return Object.entries(bySection).filter(([, messages]) => messages.length > 0);
 }
 
 /**

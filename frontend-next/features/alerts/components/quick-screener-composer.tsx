@@ -19,14 +19,13 @@ import Link from "next/link";
 import { AlertCircleIcon, CheckIcon, InfoIcon, PlayIcon } from "lucide-react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Panel } from "@/components/operator/panel";
-import { SectionLabel } from "@/components/operator/section-label";
 import {
   Select,
   SelectContent,
@@ -34,6 +33,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { AlertsPageHeader } from "@/features/alerts/components/alerts-page-header";
+import { useDirtyGuard } from "@/features/alerts/lib/use-dirty-guard";
 import { ConditionEditor } from "@/features/alerts/components/condition-editor";
 import { UniverseTargetingEditor } from "@/features/alerts/components/universe-targeting-editor";
 import {
@@ -69,6 +70,12 @@ export function QuickScreenerComposer({ scope }: { scope: string | null }) {
   const channelsQuery = useAlertsChannels(scope);
 
   const [draft, setDraft] = useState<ScreenerDraft>(() => emptyScreenerDraft());
+  // The unsaved-work guard compares the draft as first loaded with what the
+  // operator sees now; a clean form keeps the header's back navigation direct.
+  // useState captures the first render's value without touching refs during render.
+  const [initialDraftSnapshot] = useState(() => JSON.stringify(draft));
+  const isDirty = JSON.stringify(draft) !== initialDraftSnapshot;
+  const { attemptExit, dialog: dirtyDialog } = useDirtyGuard(isDirty);
   const [notifyEntry, setNotifyEntry] = useState(false);
   const [sessionTouched, setSessionTouched] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
@@ -179,11 +186,18 @@ export function QuickScreenerComposer({ scope }: { scope: string | null }) {
 
   return (
     <div className="flex flex-col gap-5 pb-8">
-      <SectionLabel
-        eyebrow="Screeners"
-        title="New screener"
-        description="Scan a universe, rank what qualifies, and run it on a schedule."
+      <AlertsPageHeader
+        backHref="/alerts"
+        onBack={attemptExit}
+        trail={[
+          { label: "Alerts", href: "/alerts" },
+          { label: "Screeners", href: "/alerts/screeners" },
+          { label: "New screener" },
+        ]}
       />
+      <p className="text-sm text-muted-foreground">
+        Scan a universe, rank what qualifies, and run it on a schedule.
+      </p>
 
       {outcome?.kind === "draft-saved" ? (
         <Alert role="status">
@@ -436,6 +450,8 @@ export function QuickScreenerComposer({ scope }: { scope: string | null }) {
           </Link>
         </div>
       </Panel>
+
+      {dirtyDialog}
     </div>
   );
 }

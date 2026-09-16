@@ -4,7 +4,6 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   AlertCircleIcon,
-  ArrowLeftIcon,
   NetworkIcon,
   PencilIcon,
   PlayIcon,
@@ -18,6 +17,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { RepeatIcon, TrashIcon } from "lucide-react";
 import { SectionLabel } from "@/components/operator/section-label";
+import { AlertsPageHeader } from "@/features/alerts/components/alerts-page-header";
 import { OPERATOR_LABELS, sessionLabel } from "@/features/alerts/lib/authoring";
 import { StatusBadge } from "@/components/operator/status-badge";
 import { ReadableDefinition } from "@/features/alerts/components/readable-definition";
@@ -260,16 +260,14 @@ export function WorkflowDetailPage({
     <AlertsMarketStreamProvider scope={scope}>
     <div className="flex flex-col gap-6 pb-8">
       <div>
-        <Button asChild variant="ghost" size="sm" className="mb-2 -ml-2">
-          <Link href="/alerts">
-            <ArrowLeftIcon className="size-4" aria-hidden />
-            All alerts
-          </Link>
-        </Button>
+        <AlertsPageHeader
+          backHref="/alerts"
+          trail={[{ label: "Alerts", href: "/alerts" }, { label: workflow.name }]}
+        />
 
-        <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="mt-2 flex flex-wrap items-start justify-between gap-4">
           <div className="flex flex-col gap-2">
-            <SectionLabel eyebrow="Alert" title={workflow.name} />
+            <SectionLabel eyebrow="Alert" />
             <div className="flex flex-wrap items-center gap-2">
               <KindBadge kind={workflow.kind} />
               <LifecycleBadge workflow={workflow} />

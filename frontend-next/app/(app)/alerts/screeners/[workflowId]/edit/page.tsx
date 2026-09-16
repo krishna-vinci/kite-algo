@@ -7,6 +7,7 @@ import { AlertCircleIcon } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AdvancedDefinitionEditor } from "@/features/alerts/components/advanced-definition-editor";
+import { AlertsPageHeader } from "@/features/alerts/components/alerts-page-header";
 import { AlertsScopeGate } from "@/features/alerts/components/alerts-scope-gate";
 import { ScreenerEditor } from "@/features/alerts/components/screener-editor";
 import { useAlertsWorkflow } from "@/features/alerts/hooks/use-alerts-queries";
@@ -66,15 +67,26 @@ function EditScreenerContent({
 
   if (!conversion.ok || forceAdvanced) {
     return (
-      <AdvancedDefinitionEditor
-        workflowId={workflowId}
-        scope={scope}
-        name={workflow.name}
-        expectedRevision={expectedRevision}
-        initialYaml={workflow.yaml ?? null}
-        initialDocument={workflow.document}
-        reason={conversion.ok ? undefined : conversion.reason}
-      />
+      <div className="flex flex-col gap-3">
+        <AlertsPageHeader
+          backHref={`/alerts/screeners/${workflowId}`}
+          trail={[
+            { label: "Alerts", href: "/alerts" },
+            { label: "Screeners", href: "/alerts/screeners" },
+            { label: workflow.name, href: `/alerts/screeners/${workflowId}` },
+            { label: "Edit" },
+          ]}
+        />
+        <AdvancedDefinitionEditor
+          workflowId={workflowId}
+          scope={scope}
+          name={workflow.name}
+          expectedRevision={expectedRevision}
+          initialYaml={workflow.yaml ?? null}
+          initialDocument={workflow.document}
+          reason={conversion.ok ? undefined : conversion.reason}
+        />
+      </div>
     );
   }
 

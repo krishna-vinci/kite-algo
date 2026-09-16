@@ -1,7 +1,7 @@
 "use client";
 
 import { AlertCircleIcon, CheckIcon, PlusIcon, Trash2Icon } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
@@ -20,7 +20,8 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
-import { SectionLabel } from "@/components/operator/section-label";
+import { AlertsPageHeader } from "@/features/alerts/components/alerts-page-header";
+import { useDirtyGuard } from "@/features/alerts/lib/use-dirty-guard";
 import { ConditionEditor } from "@/features/alerts/components/condition-editor";
 import { InstrumentPicker } from "@/features/alerts/components/instrument-picker";
 import { OperatorIssueList } from "@/features/alerts/components/operator-issue-list";
@@ -68,6 +69,12 @@ export function ScreenerEditor({ scope, initialDraft, baseDocument, edit }: Scre
 
   const [step, setStep] = useState(0);
   const [draft, setDraft] = useState<ScreenerDraft>(() => initialDraft ?? emptyScreenerDraft());
+  // The unsaved-work guard compares the draft as first loaded with what the
+  // operator sees now; a clean form keeps the header's back navigation direct.
+  // useState captures the first render's value without touching refs during render.
+  const [initialDraftSnapshot] = useState(() => JSON.stringify(draft));
+  const isDirty = JSON.stringify(draft) !== initialDraftSnapshot;
+  const { attemptExit, dialog: dirtyDialog } = useDirtyGuard(isDirty);
   const [conflict, setConflict] = useState(false);
 
   const capabilities = capabilitiesQuery.data?.capabilities;
@@ -130,11 +137,27 @@ export function ScreenerEditor({ scope, initialDraft, baseDocument, edit }: Scre
 
   return (
     <div className="flex flex-col gap-6 pb-8">
-      <SectionLabel
-        eyebrow="Screeners"
-        title={isEditing ? "Edit screener" : "New screener"}
-        description="A scheduled ranked scan. Results persist as runs; attachments notify on the transitions you choose."
+      <AlertsPageHeader
+        backHref={isEditing ? `/alerts/screeners/${edit!.workflowId}` : "/alerts"}
+        onBack={attemptExit}
+        trail={
+          isEditing
+            ? [
+                { label: "Alerts", href: "/alerts" },
+                { label: "Screeners", href: "/alerts/screeners" },
+                { label: draft.name || "Edit screener" },
+              ]
+            : [
+                { label: "Alerts", href: "/alerts" },
+                { label: "Screeners", href: "/alerts/screeners" },
+                { label: "New screener" },
+              ]
+        }
       />
+      <p className="text-sm text-muted-foreground">
+        A scheduled ranked scan. Results persist as runs; attachments notify on the transitions you
+        choose.
+      </p>
 
       <div className="flex flex-wrap gap-2">
         {STEPS.map((label, index) => (
@@ -806,6 +829,8 @@ export function ScreenerEditor({ scope, initialDraft, baseDocument, edit }: Scre
         </summary>
         <pre className="mt-3 overflow-auto text-xs">{JSON.stringify(document, null, 2)}</pre>
       </details>
+
+      {dirtyDialog}
     </div>
   );
 }
