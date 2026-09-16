@@ -71,10 +71,10 @@ Start here:
 Current public package install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.10.0
+python3 -m pip install kite-algo-worker==0.13.0
 ```
 
-`kite-algo-worker==0.10.0` is the 0.10.0 release candidate described by this branch; publication from the `kite-algo-worker-v0.10.0` tag requires the release gate.
+`kite-algo-worker==0.13.0` is the 0.13.0 release described by this branch; publication from the `kite-algo-worker-v0.13.0` tag requires the release gate.
 
 ## Quick start
 
