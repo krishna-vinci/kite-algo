@@ -194,6 +194,44 @@ def _lifecycle_state(session: Any, workflow: Any, payload: Dict[str, Any]) -> st
     return "active"
 
 
+def _rule_summary(document: Any) -> Optional[Dict[str, Any]]:
+    """The first stage's simple comparison, or None when it is not one.
+
+    Deliberately narrow: a sequence, a group or an indicator operand is not
+    described here, because a wrong one-line rule is worse than no rule.
+    """
+    stages = getattr(document, "stages", None) or []
+    if not stages:
+        return None
+    stage = stages[0]
+    # A sequence replaces the stage's own conditions; groups/any/not mean the
+    # rule is not a single comparison.
+    if getattr(stage, "sequence", None) is not None:
+        return None
+    conditions = getattr(stage, "conditions", None) or ()
+    if len(conditions) != 1:
+        return None
+    condition = conditions[0]
+    left = getattr(condition, "left", None)
+    right = getattr(condition, "right", None)
+    if str(getattr(left, "kind", "")) != "field" or str(getattr(right, "kind", "")) != "value":
+        return None
+    if getattr(left, "offset", None) is not None or getattr(right, "params", None):
+        return None
+    value = getattr(right, "value", None)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "field": str(getattr(left, "name", "") or ""),
+        "operator": str(getattr(condition, "op", "") or ""),
+        "value": numeric,
+        "clock": str(getattr(stage, "clock", "") or ""),
+        "timeframe": str(getattr(stage, "timeframe", "") or ""),
+    }
+
+
 def _enrich_workflow(
     session: Any, workflow: WorkflowModel, session_factory: Any
 ) -> Dict[str, Any]:
@@ -259,6 +297,11 @@ def _enrich_workflow(
         {"id": alert.id, "source": alert.source, "trigger": alert.trigger}
         for alert in document.alerts
     ]
+    # A compact rule for the list row, so the operator reads "crosses above
+    # 125,000" instead of opening every alert. Canonical pieces only: the UI owns
+    # the wording, and anything that is not a simple field-vs-constant comparison
+    # reports None rather than a half-description.
+    summary["rule"] = _rule_summary(document)
     summary["channels"] = sorted(
         {name for alert in document.alerts for name in (alert.channels or ())}
     )

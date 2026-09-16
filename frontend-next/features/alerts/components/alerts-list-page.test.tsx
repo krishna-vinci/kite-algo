@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -17,7 +17,51 @@ vi.mock("next/navigation", () => ({
 vi.mock("@/features/alerts/api", () => ({
   fetchAlertsScopes: vi.fn(),
   fetchAlertsWorkflows: vi.fn(),
+  pauseAlertsWorkflow: vi.fn(),
+  resumeAlertsWorkflow: vi.fn(),
 }));
+
+const LIVE_QUOTE = {
+  instrument_key: "NSE:INFY",
+  broker_token: 1,
+  last_price: 1500,
+  change_absolute: null,
+  change_percent: null,
+  ohlc: null,
+  exchange_timestamp: null,
+  received_at: null,
+  server_time: null,
+  age_ms: 800,
+  session_state: "open" as const,
+  freshness: "LIVE" as const,
+  origin: "tick" as const,
+};
+
+vi.mock("@/features/alerts/lib/market-stream", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/features/alerts/lib/market-stream")>();
+  class StubStream {
+    register() {
+      return () => undefined;
+    }
+    subscribeQuote(_key: string, listener: (quote: unknown) => void) {
+      listener(LIVE_QUOTE);
+      return () => undefined;
+    }
+    subscribeStatus() {
+      return () => undefined;
+    }
+    getQuote() {
+      return LIVE_QUOTE;
+    }
+    getStatus() {
+      return { state: "live" as const, runtime: null, error: null, frames: 1, reconnects: 0 };
+    }
+    destroy() {
+      return undefined;
+    }
+  }
+  return { ...actual, AlertsMarketStream: StubStream };
+});
 
 import { fetchAlertsScopes, fetchAlertsWorkflows } from "@/features/alerts/api";
 
@@ -74,20 +118,35 @@ beforeEach(() => {
 
 describe("AlertsListPage", () => {
   it("renders lifecycle and freshness as separate signals", async () => {
+    // The row answers two different questions: is the alert switched on
+    // (lifecycle/state) and is the market data current (freshness). One badge
+    // must never stand in for the other.
     vi.mocked(fetchAlertsWorkflows).mockResolvedValue({
       ok: true,
       scope: "paper-a",
-      workflows: [workflow()],
+      workflows: [
+        workflow({
+          freshness: {
+            last_evaluated_at: "2026-09-15T10:00:00+00:00",
+            evaluation_age_s: 12,
+            subscription_count: 1,
+            stale_subscriptions: 0,
+            stale: false,
+            stale_after_seconds: 300,
+          },
+        }),
+      ],
     } as never);
 
     renderPage();
 
     expect(await screen.findByText("NIFTY breakout")).toBeInTheDocument();
-    // lifecycle
-    expect(screen.getByText("active")).toBeInTheDocument();
-    // freshness, shown independently of lifecycle
-    expect(screen.getByText(/data 12s old/i)).toBeInTheDocument();
-    expect(screen.getByText("NSE:INFY")).toBeInTheDocument();
+    // lifecycle: active with a real evaluation and a live feed
+    expect(screen.getByText("Watching")).toBeInTheDocument();
+    // freshness: independent of the lifecycle
+    expect(screen.getByText("LIVE")).toBeInTheDocument();
+    expect(screen.getByText(/checked 12s ago/)).toBeInTheDocument();
+    expect(screen.getByText(/NSE:INFY/)).toBeInTheDocument();
   });
 
   it("shows 'not evaluated yet' when the backend reports stale === null", async () => {
@@ -112,7 +171,8 @@ describe("AlertsListPage", () => {
 
     renderPage();
 
-    expect(await screen.findByText("not evaluated yet")).toBeInTheDocument();
+    await screen.findByText("NIFTY breakout");
+    expect(screen.getByText("not evaluated yet")).toBeInTheDocument();
   });
 
   it("surfaces a never-firing warning badge with its message", async () => {
@@ -135,10 +195,16 @@ describe("AlertsListPage", () => {
 
     renderPage();
 
-    expect(await screen.findByText("will not fire")).toBeInTheDocument();
+    // The state badge carries the verdict; the message and its code live in the
+    // row's diagnostics rather than in the row's headline.
+    await screen.findByText("NIFTY breakout");
+    const table = screen.getByRole("table");
+    expect(within(table).getByText("Needs attention")).toBeInTheDocument();
+    fireEvent.click(within(table).getByText("Details"));
     expect(
       screen.getByText("a level condition cannot emit this transition trigger"),
     ).toBeInTheDocument();
+    expect(screen.getByText(/level_only_transition/)).toBeInTheDocument();
   });
 
   it("renders an empty state that distinguishes empty from unauthorized", async () => {

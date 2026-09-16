@@ -176,6 +176,18 @@ export type AlertsWorkflowSummary = {
   subscription_count: number;
   freshness: AlertsFreshness;
   session?: string;
+  /**
+   * The first stage's simple comparison, when it is one: the list row shows
+   * "crosses above 125,000" without fetching every document. Null when the rule
+   * is a group, a sequence or an operand the description cannot be honest about.
+   */
+  rule?: {
+    field: string;
+    operator: string;
+    value: number;
+    clock: string;
+    timeframe: string;
+  } | null;
 };
 
 export type AlertsWorkflowListResponse = {

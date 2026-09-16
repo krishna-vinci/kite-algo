@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { SectionLabel } from "@/components/operator/section-label";
-import { sessionLabel } from "@/features/alerts/lib/authoring";
+import { OPERATOR_LABELS, sessionLabel } from "@/features/alerts/lib/authoring";
 import { StatusBadge } from "@/components/operator/status-badge";
 import { ReadableDefinition } from "@/features/alerts/components/readable-definition";
 import {
@@ -25,6 +25,13 @@ import {
 } from "@/features/alerts/components/workflow-activity-panels";
 import { FreshnessBadge, KindBadge, LifecycleBadge } from "@/features/alerts/components/workflow-badges";
 import { deriveLifecycle } from "@/features/alerts/lib/status";
+import {
+  AlertsMarketStreamProvider,
+  useMarketQuote,
+  useQuotePresentation,
+} from "@/features/alerts/hooks/use-market-stream";
+import { describeAlertState } from "@/features/alerts/lib/alert-state";
+import { describeTarget, formatAge, formatPrice } from "@/features/alerts/lib/plain-language";
 import { WorkflowHealthPanel } from "@/features/alerts/components/workflow-health-panel";
 import { OperatorIssueList } from "@/features/alerts/components/operator-issue-list";
 import {
@@ -34,7 +41,7 @@ import {
 } from "@/features/alerts/hooks/use-alerts-queries";
 import { alertsErrorMessage, isNotFound } from "@/features/alerts/lib/errors";
 import { formatTimestamp } from "@/features/alerts/lib/format";
-import type { AlertsIssue } from "@/features/alerts/types";
+import type { AlertsIssue, AlertsWorkflowDetailResponse } from "@/features/alerts/types";
 
 function RevisionPicker({
   workflowId,
@@ -130,6 +137,68 @@ function RevisionPicker({
   );
 }
 
+
+/**
+ * The answer to "what is happening right now", above the fold.
+ *
+ * Current price, the level being watched, the distance between them and the
+ * effective state — from the same vocabulary the list uses, so a state never
+ * means one thing on one page and another thing on the next.
+ */
+function AlertLiveHeader({
+  workflow,
+  lifecycle,
+}: {
+  workflow: AlertsWorkflowDetailResponse;
+  lifecycle: string;
+}) {
+  const rule = workflow.rule ?? null;
+  const single = !workflow.has_universe && workflow.instruments.length === 1;
+  const instrumentKey = single ? workflow.instruments[0] : null;
+  const { quote, status } = useMarketQuote(instrumentKey);
+  const presentation = useQuotePresentation(quote, status);
+  const target = rule
+    ? describeTarget(rule.value, presentation.price, rule.operator)
+    : null;
+  const view = describeAlertState({
+    lifecycle,
+    hasErrorWarning: (workflow.warnings ?? []).some(
+      (warning: AlertsIssue) => warning.severity === "error",
+    ),
+    hasWarning: (workflow.warnings ?? []).length > 0,
+    lastEvaluatedAt: workflow.freshness.last_evaluated_at ?? null,
+    quote,
+    alreadyBeyond: Boolean(target?.alreadyBeyond),
+  });
+
+  if (!single) {
+    return (
+      <div className="rounded-lg border border-border/60 bg-card/40 px-3 py-2 text-sm text-muted-foreground">
+        {workflow.has_universe
+          ? "This alert watches a universe, so no single price represents it. Its members are evaluated as the universe resolves."
+          : `${workflow.instruments.length} instruments are watched together; per-instrument prices are listed below.`}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-3 rounded-lg border border-border/60 bg-card/40 px-3 py-2">
+      <span className="text-lg font-semibold tabular-nums">{formatPrice(presentation.price)}</span>
+      <StatusBadge tone={presentation.tone}>{presentation.label}</StatusBadge>
+      <span className="text-xs text-muted-foreground">{formatAge(quote?.age_ms)}</span>
+      {rule ? (
+        <span className="text-xs text-muted-foreground">
+          watching {workflow.instrument_summary ?? instrumentKey}{" "}
+          {OPERATOR_LABELS[rule.operator] ?? rule.operator} {formatPrice(rule.value)}
+        </span>
+      ) : null}
+      {target ? <span className="text-xs text-muted-foreground">{target.sentence}</span> : null}
+      <StatusBadge tone={view.tone}>{view.label}</StatusBadge>
+      <span className="text-xs text-muted-foreground">{view.hint}</span>
+    </div>
+  );
+}
+
 export function WorkflowDetailPage({
   workflowId,
   scope,
@@ -178,6 +247,7 @@ export function WorkflowDetailPage({
     });
 
   return (
+    <AlertsMarketStreamProvider scope={scope}>
     <div className="flex flex-col gap-6 pb-8">
       <div>
         <Button asChild variant="ghost" size="sm" className="mb-2 -ml-2">
@@ -199,6 +269,7 @@ export function WorkflowDetailPage({
               {workflow.instrument_summary ?? "no coverage"} · {sessionLabel(workflow.session ?? "")} ·{" "}
               {workflow.subscription_count} subscription(s)
             </p>
+            <AlertLiveHeader workflow={workflow} lifecycle={lifecycle} />
             {/* The identifier is an implementation detail: useful when quoting a
                 specific definition, never the headline. */}
             <details className="text-xs text-muted-foreground">
@@ -328,5 +399,6 @@ export function WorkflowDetailPage({
         </TabsContent>
       </Tabs>
     </div>
+    </AlertsMarketStreamProvider>
   );
 }

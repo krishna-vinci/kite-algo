@@ -17,6 +17,8 @@ properties that make that safe, plus the read models the UI needs:
 
 from __future__ import annotations
 
+import json
+
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -1122,3 +1124,47 @@ def test_draft_workflow_reports_draft_lifecycle(session_factory, monkeypatch):
     ).json()
     body = client.get(f"{BASE}/workflows/{created['workflow_id']}").json()
     assert body["lifecycle_state"] == "draft"
+
+
+def test_list_row_carries_a_plain_rule_for_a_simple_alert(session_factory, monkeypatch):
+    """The list needs the rule without opening each alert.
+
+    Only a simple field-vs-constant comparison is described: a wrong one-line
+    rule would be worse than none, so anything else reports null and the UI falls
+    back to the instrument summary.
+    """
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    document = json.loads(json.dumps(DOCUMENT))
+    document["name"] = "rule-probe"
+    document["instruments"] = ["NSE:RELIANCE"]
+    document["stages"][0]["clock"] = "ltp"
+    document["stages"][0]["timeframe"] = "day"
+    document["stages"][0]["conditions"]["all"] = [
+        {"left": {"field": "ltp"}, "op": "crosses_above", "right": {"value": 2950.5}}
+    ]
+    created = client.post(f"{BASE}/workflows", json={"document": document}).json()
+
+    rows = client.get(f"{BASE}/workflows").json()["workflows"]
+    row = next(item for item in rows if item["workflow_id"] == created["workflow_id"])
+    assert row["rule"] == {
+        "field": "ltp",
+        "operator": "crosses_above",
+        "value": 2950.5,
+        "clock": "ltp",
+        "timeframe": "day",
+    }
+
+
+def test_rule_summary_is_null_for_a_rule_it_cannot_describe(session_factory, monkeypatch):
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    document = json.loads(json.dumps(DOCUMENT))
+    document["name"] = "complex-probe"
+    document["stages"][0]["conditions"]["all"] = [
+        {"left": {"field": "ltp"}, "op": "crosses_above", "right": {"value": 1}},
+        {"left": {"field": "ltp"}, "op": "lt", "right": {"value": 99}},
+    ]
+    created = client.post(f"{BASE}/workflows", json={"document": document}).json()
+
+    rows = client.get(f"{BASE}/workflows").json()["workflows"]
+    row = next(item for item in rows if item["workflow_id"] == created["workflow_id"])
+    assert row["rule"] is None
