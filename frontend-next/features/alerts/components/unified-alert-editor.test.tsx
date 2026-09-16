@@ -10,7 +10,7 @@
  */
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -96,6 +96,8 @@ import {
   fetchAlertsChannels,
   fetchAlertsWorkflow,
   patchAlertsWorkflow,
+  previewAlertsWorkflow,
+  validateAlertsWorkflow,
 } from "@/features/alerts/api";
 import { AlertsMarketStreamProvider } from "@/features/alerts/hooks/use-market-stream";
 import { UnifiedAlertEditor, type UnifiedEditorMode } from "./unified-alert-editor";
@@ -123,7 +125,14 @@ function capabilities() {
       timeframes: ["minute", "5minute", "15minute", "day"],
       sessions: ["nse_equity", "mcx_commodity"],
       session_exchanges: { nse_equity: ["NSE"], mcx_commodity: ["MCX"] },
-      features: {},
+      features: {
+        ema: {
+          params: { period: { min: 1, max: 500 } },
+          defaults: { period: 9 },
+          inputs: ["close"],
+          outputs: ["ema"],
+        },
+      },
       arithmetic: [],
       limits: { max_instruments: 100 },
       stage_types: ["signal", "filter"],
@@ -162,6 +171,18 @@ function draftWithInstrument(overrides: Partial<AlertDraft> = {}): AlertDraft {
   };
 }
 
+function indicatorRuleDraft(): AlertDraft {
+  return draftWithInstrument({
+    conditions: [
+      {
+        left: { kind: "indicator", name: "ema", period: 9 },
+        op: "crosses_above",
+        right: { kind: "indicator", name: "ema", period: 19 },
+      },
+    ],
+  });
+}
+
 beforeAll(() => {
   // Radix Select scrolls its highlighted option into view; jsdom has no layout.
   Element.prototype.scrollIntoView = Element.prototype.scrollIntoView ?? (() => undefined);
@@ -189,8 +210,9 @@ describe("UnifiedAlertEditor", () => {
     );
 
     expect(await screen.findByText("New alert")).toBeTruthy();
-    expect(screen.getByLabelText("Condition")).toBeTruthy();
-    expect(screen.getByLabelText("Target value")).toBeTruthy();
+    // The rule is one editor: row 1 carries the operator and the level.
+    expect(screen.getByLabelText("Operator")).toBeTruthy();
+    expect(screen.getByLabelText("condition 1 right value")).toBeTruthy();
     expect(screen.getByLabelText("Evaluation")).toBeTruthy();
     expect(screen.getByText("When should we notify you?")).toBeTruthy();
     expect(screen.getByText("Notify via")).toBeTruthy();
@@ -223,7 +245,9 @@ describe("UnifiedAlertEditor", () => {
     expect(screen.getByText("Use current price")).toBeTruthy();
     fireEvent.click(screen.getByText("+1%"));
     await waitFor(() =>
-      expect((screen.getByLabelText("Target value") as HTMLInputElement).value).toBe("126108.6"),
+      expect((screen.getByLabelText("condition 1 right value") as HTMLInputElement).value).toBe(
+        "126108.6",
+      ),
     );
   });
 
@@ -270,6 +294,105 @@ describe("UnifiedAlertEditor", () => {
     );
     await screen.findByText("New alert");
     expect(screen.queryByText("+1%")).toBeNull();
+  });
+
+  it("creates an indicator-versus-indicator rule instead of demanding a value", async () => {
+    // Regression: the top row owned conditions[0] and could only express a
+    // level, so a rule comparing two indicators could never satisfy "enter the
+    // value this alert compares against" and the alert could not be created at
+    // all.
+    vi.mocked(validateAlertsWorkflow).mockResolvedValue({ ok: true, issues: [] } as never);
+    vi.mocked(previewAlertsWorkflow).mockResolvedValue({ ok: true } as never);
+
+    renderWithQuery(
+      <UnifiedAlertEditor
+        scope="app:admin"
+        mode={{ kind: "create" }}
+        initialDraft={indicatorRuleDraft()}
+      />,
+    );
+
+    expect(await screen.findByText("New alert")).toBeTruthy();
+    expect(screen.queryByText(/Enter the value/)).toBeNull();
+    expect(screen.queryByText(/choose what it compares against/)).toBeNull();
+    expect((screen.getByText("Save draft").closest("button") as HTMLButtonElement).disabled).toBe(
+      false,
+    );
+    expect(
+      (screen.getByText("Create and activate").closest("button") as HTMLButtonElement).disabled,
+    ).toBe(false);
+
+    // The definition the server is asked about carries the indicator operand.
+    await waitFor(() => expect(validateAlertsWorkflow).toHaveBeenCalled(), { timeout: 3000 });
+    const payload = vi.mocked(validateAlertsWorkflow).mock.calls[0][0] as {
+      document: { stages: Array<{ conditions: { all: Array<{ right: unknown; op: string }> } }> };
+    };
+    expect(payload.document.stages[0].conditions.all[0]).toMatchObject({
+      op: "crosses_above",
+      right: { indicator: "ema", period: 19 },
+    });
+  });
+
+  it("keeps a brand-new alert unready while the level is the untouched placeholder", async () => {
+    renderWithQuery(
+      <UnifiedAlertEditor
+        scope="app:admin"
+        mode={{ kind: "create" }}
+        initialDraft={draftWithInstrument({
+          conditions: [
+            {
+              left: { kind: "field", name: "ltp" },
+              op: "crosses_above",
+              right: { kind: "constant", value: 0 },
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(await screen.findByText("New alert")).toBeTruthy();
+    expect(screen.getByText(/Condition 1: choose what it compares against/)).toBeTruthy();
+    expect((screen.getByText("Save draft").closest("button") as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    expect(
+      (screen.getByText("Create and activate").closest("button") as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("moves the clock and the left side when the operator becomes a percentage move", async () => {
+    renderWithQuery(
+      <UnifiedAlertEditor scope="app:admin" mode={{ kind: "create" }} initialDraft={draftWithInstrument()} />,
+    );
+    await screen.findByText("New alert");
+    expect(screen.queryByLabelText("Measured over")).toBeNull();
+
+    fireEvent.click(screen.getByLabelText("Operator"));
+    fireEvent.click(await screen.findByText("rises by %"));
+
+    // A percentage move is measured between completed candles and compares the
+    // close, so both have to follow the operator.
+    await waitFor(() =>
+      expect(screen.getByLabelText("condition 1 left field").textContent).toContain("close"),
+    );
+    expect(screen.getByLabelText("Evaluation").textContent).toContain("Completed candle");
+    expect(screen.getByLabelText("Measured over")).toBeTruthy();
+  });
+
+  it("reads the rule and the generated name in the operands' own words", async () => {
+    renderWithQuery(
+      <UnifiedAlertEditor
+        scope="app:admin"
+        mode={{ kind: "create" }}
+        initialDraft={indicatorRuleDraft()}
+      />,
+    );
+
+    const rail = (await screen.findByText("You are creating")).closest("section") as HTMLElement;
+    expect(within(rail).getAllByText("EMA 9 crosses above EMA 19").length).toBeGreaterThan(0);
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe(
+      "EMA 9 crosses above EMA 19",
+    );
   });
 
   it("reports a saved draft when activation fails, and links to it", async () => {
@@ -339,11 +462,13 @@ describe("UnifiedAlertEditor", () => {
     renderWithQuery(
       <UnifiedAlertEditor scope="app:admin" mode={{ kind: "create" }} initialDraft={draftWithInstrument()} />,
     );
-    fireEvent.change(await screen.findByLabelText("Target value"), { target: { value: "9999" } });
+    fireEvent.change(await screen.findByLabelText("condition 1 right value"), {
+      target: { value: "9999" },
+    });
     fireEvent.click(screen.getByText("Create and activate"));
 
     expect(await screen.findByText("Could not save")).toBeTruthy();
-    expect((screen.getByLabelText("Target value") as HTMLInputElement).value).toBe("9999");
+    expect((screen.getByLabelText("condition 1 right value") as HTMLInputElement).value).toBe("9999");
   });
 
   it("renders the edit page with the stored definition and the edit actions", async () => {
@@ -426,11 +551,15 @@ describe("UnifiedAlertEditor", () => {
     renderWithQuery(
       <UnifiedAlertEditor scope="app:admin" mode={mode} initialDraft={draftWithInstrument()} />,
     );
-    fireEvent.change(await screen.findByLabelText("Target value"), { target: { value: "130000" } });
+    fireEvent.change(await screen.findByLabelText("condition 1 right value"), {
+      target: { value: "130000" },
+    });
     fireEvent.click(screen.getByText("Save changes"));
 
     expect(await screen.findByText(/changed while you were editing/)).toBeTruthy();
-    expect((screen.getByLabelText("Target value") as HTMLInputElement).value).toBe("130000");
+    expect((screen.getByLabelText("condition 1 right value") as HTMLInputElement).value).toBe(
+      "130000",
+    );
     expect(screen.getByText("Load the newer revision")).toBeTruthy();
   });
 

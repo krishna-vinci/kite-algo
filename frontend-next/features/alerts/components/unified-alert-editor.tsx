@@ -70,6 +70,8 @@ import { describeCoverage } from "@/features/alerts/lib/alert-state";
 import {
   OPERATOR_LABELS,
   type AlertDraft,
+  type Condition,
+  type Operand,
   buildDocument,
   exchangeOf,
   sessionLabel,
@@ -80,8 +82,8 @@ import {
   FREQUENCY_OPTIONS,
   TARGET_SHORTCUTS,
   applyFrequency,
+  describeCondition,
   describeFrequency,
-  describeRule,
   describeTarget,
   evaluationLabel,
   formatAge,
@@ -97,6 +99,7 @@ import {
   VALIDATION_LABEL,
   VALIDATION_TONE,
 } from "@/features/alerts/lib/status";
+import type { AlertsCapabilities } from "@/features/alerts/types";
 import { useDirtyGuard } from "@/features/alerts/lib/use-dirty-guard";
 import { newIdempotencyKey } from "@/lib/ids";
 
@@ -110,6 +113,45 @@ const LEVEL_OPERATORS = [
   "rises_pct",
   "falls_pct",
 ];
+
+/** Operators measured between completed candles, always against the close. */
+const PCT_OPERATORS = new Set(["rises_pct", "falls_pct"]);
+
+/** A missing operand, and the row the operator has to touch to fix it. */
+type EditorIssue = { message: string; anchor: string };
+
+/**
+ * What is missing from one condition's right side.
+ *
+ * The right side is what the rule compares against, and it can be a level, a
+ * bar field or an indicator. Only a level has a value to type, so asking for
+ * "the value this alert compares against" made a complete
+ * indicator-vs-indicator rule impossible to save.
+ *
+ * `placeholder` marks the untouched level a brand-new alert opens with: nobody
+ * entered that 0, and a meaningless rule must not look ready.
+ */
+function rightSideIssue(
+  condition: Condition,
+  placeholder: boolean,
+  features: AlertsCapabilities["features"] | undefined,
+): string | null {
+  const right = condition.right;
+  if (right.kind === "field") {
+    return right.name.trim() === "" ? "choose the bar field it compares against" : null;
+  }
+  if (right.kind === "indicator") {
+    if (right.name.trim() === "") return "choose the indicator it compares against";
+    const bounds = features?.[right.name]?.params?.period;
+    if (!bounds) return null;
+    // Mirrors the operand editor, which falls back to the registry default and
+    // then to the lower bound — a feature that takes a period always shows one.
+    const period = right.period ?? features?.[right.name]?.defaults?.period ?? bounds.min;
+    return Number.isFinite(period) ? null : "enter the indicator's period";
+  }
+  if (!Number.isFinite(right.value)) return "enter the value it compares against";
+  return placeholder ? "choose what it compares against" : null;
+}
 
 type Outcome =
   | { kind: "draft-saved"; workflowId: string }
@@ -162,6 +204,13 @@ export function UnifiedAlertEditor({
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [idempotencyKey] = useState(() => newIdempotencyKey("alert"));
   const [moreOpen, setMoreOpen] = useState(false);
+  // A brand-new alert opens with a placeholder level of 0 that nobody entered,
+  // and the value alone cannot say whether it was typed. The first render's
+  // operands are captured and compared — the same first-render snapshot the
+  // dirty guard uses — so an untouched placeholder is never read as a target.
+  const [initialRightOperands] = useState(() =>
+    initialDraft.conditions.map((condition) => condition.right),
+  );
 
   const capabilities = capabilitiesQuery.data?.capabilities;
   const enabledChannels = (channelsQuery.data?.channels ?? []).filter((channel) => channel.enabled);
@@ -209,34 +258,47 @@ export function UnifiedAlertEditor({
     return inferSession(primaryInstrument, capabilities.session_exchanges);
   }, [capabilities, targetingUniverse, universeProbe.data, primaryInstrument]);
 
+  const instrumentLabel = primaryInstrument
+    ? primaryInstrument.split(":").slice(1).join(":")
+    : draft.universe.union[0]?.name ?? "";
+  const firstCondition = draft.conditions[0];
 
-  const operator = draft.conditions[0]?.op ?? "crosses_above";
-  const rightOperand = draft.conditions[0]?.right;
-  const storedTarget =
-    rightOperand && rightOperand.kind === "constant" && typeof rightOperand.value === "number"
-      ? rightOperand.value
+  const isPlaceholderTarget = (index: number, right: Operand): boolean => {
+    if (mode.kind !== "create") return false;
+    if (right.kind !== "constant" || right.value !== 0) return false;
+    const initial = initialRightOperands[index];
+    // A row the operator adds opens as the same untouched 0.
+    if (!initial) return true;
+    return initial.kind === "constant" && initial.value === 0;
+  };
+
+  // Alert conditions stay crossing/level/percentage. `breaks_prev_high` and
+  // `within` are screener vocabulary, and offering them here would promise
+  // behaviour the alert compiler does not have.
+  const alertOperators = Object.fromEntries(
+    LEVEL_OPERATORS.filter((op) => op in OPERATOR_LABELS).map((op) => [
+      op,
+      capabilities?.operators[op] ?? null,
+    ]),
+  );
+
+  const operator = firstCondition?.op ?? "crosses_above";
+  const operatorText = OPERATOR_LABELS[operator] ?? operator;
+
+  // The level the rest of the page explains. The price ladder, the preview
+  // sentence and the rearm direction only mean something when the rule compares
+  // against a level, so an operand on the right leaves them nothing to say.
+  const targetValue =
+    firstCondition?.right.kind === "constant" &&
+    Number.isFinite(firstCondition.right.value) &&
+    !isPlaceholderTarget(0, firstCondition.right)
+      ? firstCondition.right.value
       : null;
-  // The target is held as text so "not entered yet" is distinguishable from a
-  // real value: a brand-new alert must not look ready with a 0 target.
-  const [targetText, setTargetText] = useState<string>(() => {
-    if (storedTarget === null) return "";
-    // A brand-new alert starts with a placeholder level of 0 that the operator
-    // has not entered anything into; showing it as a real target would let a
-    // meaningless rule look ready to save.
-    if (mode.kind === "create" && storedTarget === 0) return "";
-    return String(storedTarget);
-  });
-  const parsedTarget = targetText.trim() === "" ? null : Number(targetText);
-  const targetValue = parsedTarget !== null && Number.isFinite(parsedTarget) ? parsedTarget : null;
 
   const effectiveName =
     nameTouched && draft.name.trim()
       ? draft.name
-      : suggestName(
-          primaryInstrument ? primaryInstrument.split(":").slice(1).join(":") : draft.universe.union[0]?.name ?? "",
-          OPERATOR_LABELS[operator] ?? operator,
-          targetValue,
-        );
+      : suggestName(instrumentLabel, operatorText, targetValue, firstCondition);
 
   const target = describeTarget(targetValue, presentation.price, operator);
 
@@ -255,10 +317,10 @@ export function UnifiedAlertEditor({
   };
 
   // The unsaved-work guard compares the draft as first loaded with what the
-  // operator sees now; the target text and touched flags are part of the draft's
-  // story even though they live outside `AlertDraft`. useState captures the
-  // first render's value without touching refs during render.
-  const dirtySnapshot = JSON.stringify({ draft: effectiveDraft, targetText, nameTouched, channelsTouched });
+  // operator sees now; the touched flags are part of the draft's story even
+  // though they live outside `AlertDraft`. useState captures the first render's
+  // value without touching refs during render.
+  const dirtySnapshot = JSON.stringify({ draft: effectiveDraft, nameTouched, channelsTouched });
   const [initialSnapshot] = useState(dirtySnapshot);
   const isDirty = dirtySnapshot !== initialSnapshot;
   const { attemptExit, dialog: dirtyDialog } = useDirtyGuard(isDirty);
@@ -270,21 +332,43 @@ export function UnifiedAlertEditor({
     name: effectiveName,
     rule: targetingUniverse
       ? describeCoverage(draft.instruments, true, [])
-      : describeRule(
-          primaryInstrument.split(":").slice(1).join(":"),
-          OPERATOR_LABELS[operator] ?? operator,
-          targetValue,
-        ),
+      : firstCondition
+        ? describeCondition(instrumentLabel, operatorText, firstCondition, targetValue)
+        : "",
     frequency: describeFrequency(effectiveDraft.alert),
     channels: selectedChannels,
   };
 
-  const updateCondition = (patch: Partial<AlertDraft["conditions"][number]>) => {
+  /** Patch the primary rule row without rebuilding the whole list. */
+  const patchFirstCondition = (patch: Partial<Condition>) => {
     setDraft((current) => {
-      const conditions = [...current.conditions];
-      conditions[0] = { ...conditions[0], ...patch };
-      return { ...current, conditions };
+      const first = current.conditions[0];
+      if (!first) return current;
+      return {
+        ...current,
+        conditions: [{ ...first, ...patch }, ...current.conditions.slice(1)],
+      };
     });
+  };
+
+  /**
+   * Every condition change lands here, because one of them carries a side
+   * effect the condition itself cannot: a percentage operator is measured
+   * between completed candles and always compares the close against itself, so
+   * choosing one has to move the left side and the clock with it.
+   */
+  const applyConditions = (next: Condition[]) => {
+    const first = next[0];
+    const previousOp = draft.conditions[0]?.op;
+    if (first && first.op !== previousOp && PCT_OPERATORS.has(first.op)) {
+      setDraft((current) => ({
+        ...current,
+        conditions: [{ ...first, left: { kind: "field", name: "close" } }, ...next.slice(1)],
+        clock: "candle_close",
+      }));
+      return;
+    }
+    setDraft((current) => ({ ...current, conditions: next }));
   };
 
   // -- save ------------------------------------------------------------
@@ -360,14 +444,34 @@ export function UnifiedAlertEditor({
 
   // -- completeness ----------------------------------------------------
 
-  const issues: string[] = [];
-  if (!targetingUniverse && draft.instruments.length === 0) issues.push("Choose an instrument.");
-  if (targetingUniverse && draft.universe.union.every((ref) => !ref.name.trim())) {
-    issues.push("Choose a universe.");
+  const issues: EditorIssue[] = [];
+  if (!targetingUniverse && draft.instruments.length === 0) {
+    issues.push({ message: "Choose an instrument.", anchor: "section-instrument" });
   }
-  if (targetValue === null) issues.push("Enter the value this alert compares against.");
-  if (selectedChannels.length === 0) issues.push("Choose at least one destination.");
-  if (inference.error) issues.push(inference.error);
+  if (targetingUniverse && draft.universe.union.every((ref) => !ref.name.trim())) {
+    issues.push({ message: "Choose a universe.", anchor: "section-instrument" });
+  }
+  // Every visible row is checked by what ITS right side actually is, and the
+  // message names the row so the fix is never ambiguous.
+  draft.conditions.forEach((condition, index) => {
+    const problem = rightSideIssue(
+      condition,
+      isPlaceholderTarget(index, condition.right),
+      capabilities?.features,
+    );
+    if (problem) {
+      issues.push({
+        message: `Condition ${index + 1}: ${problem}`,
+        anchor: `condition-row-${index}`,
+      });
+    }
+  });
+  if (selectedChannels.length === 0) {
+    issues.push({ message: "Choose at least one destination.", anchor: "section-destinations" });
+  }
+  if (inference.error) {
+    issues.push({ message: inference.error, anchor: "section-instrument" });
+  }
 
   const ready = issues.length === 0;
   const pending = save.isPending;
@@ -620,59 +724,20 @@ export function UnifiedAlertEditor({
 
             {/* ---------------------------------------------------------- rule */}
             <Panel id="section-rule" className="flex flex-col gap-4 p-5">
-              <Label htmlFor="alert-operator">Alert me when</Label>
-              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-                <Select
-                  value={operator}
-                  onValueChange={(op) => {
-                    const value = op === "rises_pct" || op === "falls_pct" ? 1 : targetValue ?? 0;
-                    updateCondition({
-                      op,
-                      right: { kind: "constant", value },
-                      left: { kind: "field", name: op === "rises_pct" || op === "falls_pct" ? "close" : "ltp" },
-                    });
-                    if (op === "rises_pct" || op === "falls_pct") {
-                      setDraft((current) => ({ ...current, clock: "candle_close" }));
-                    }
-                  }}
-                >
-                  <SelectTrigger id="alert-operator" aria-label="Condition">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {LEVEL_OPERATORS.filter((op) => op in OPERATOR_LABELS).map((op) => (
-                      <SelectItem key={op} value={op}>
-                        {OPERATOR_LABELS[op]}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <div>
-                  <Input
-                    id="alert-value"
-                    aria-label="Target value"
-                    type="number"
-                    inputMode="decimal"
-                    step="any"
-                    value={targetText}
-                    onChange={(event) => {
-                      setTargetText(event.target.value);
-                      const next = event.target.value.trim() === "" ? null : Number(event.target.value);
-                      updateCondition({
-                        right: { kind: "constant", value: next !== null && Number.isFinite(next) ? next : 0 },
-                        left: {
-                          kind: "field",
-                          name: operator === "rises_pct" || operator === "falls_pct" ? "close" : "ltp",
-                        },
-                      });
-                    }}
-                  />
-                </div>
-              </div>
+              <Label>Alert me when</Label>
+              {/* One editor for the whole rule, whether it compares against a
+                  level or against another operand. Row 1 IS the primary rule and
+                  opens as the common case, so nothing is duplicated above it. */}
+              <ConditionEditor
+                conditions={draft.conditions}
+                capabilities={capabilities}
+                operators={alertOperators}
+                onChange={applyConditions}
+              />
 
-              {target ? (
+              {firstCondition?.right.kind === "constant" ? (
                 <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                  <span>{target.sentence}</span>
+                  {target ? <span>{target.sentence}</span> : null}
                   {presentation.price !== null ? (
                     <span className="flex flex-wrap gap-1">
                       {TARGET_SHORTCUTS.map((shortcut) => (
@@ -686,8 +751,7 @@ export function UnifiedAlertEditor({
                               shortcut.percent === null || shortcut.percent === 0
                                 ? Math.round((presentation.price ?? 0) * 100) / 100
                                 : offsetPrice(presentation.price ?? 0, shortcut.percent);
-                            setTargetText(String(next));
-                            updateCondition({ right: { kind: "constant", value: next } });
+                            patchFirstCondition({ right: { kind: "constant", value: next } });
                           }}
                         >
                           {shortcut.label}
@@ -743,18 +807,6 @@ export function UnifiedAlertEditor({
               ) : null}
 
               <SectionIssues issues={validation.bySection.rule} />
-              <details className="rounded-lg border border-border/60 px-3 py-2">
-                <summary className="cursor-pointer text-xs text-muted-foreground">
-                  All conditions and groups
-                </summary>
-                <div className="mt-3">
-                  <ConditionEditor
-                    conditions={draft.conditions}
-                    capabilities={capabilities}
-                    onChange={(conditions) => setDraft({ ...draft, conditions })}
-                  />
-                </div>
-              </details>
             </Panel>
 
             {/* ---------------------------------------------------------- frequency */}
@@ -1029,9 +1081,11 @@ export function UnifiedAlertEditor({
             {issues.length ? (
               <ul className="flex flex-col text-muted-foreground" role="status">
                 {issues.map((issue) => (
-                  <li key={issue} className="flex items-center gap-1">
+                  <li key={issue.message} className="flex items-center gap-1">
                     <ArrowRightIcon className="size-3" aria-hidden />
-                    {issue}
+                    <a className="underline" href={`#${issue.anchor}`}>
+                      {issue.message}
+                    </a>
                   </li>
                 ))}
               </ul>

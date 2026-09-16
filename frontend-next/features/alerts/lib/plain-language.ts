@@ -7,7 +7,7 @@
  * untouched in the document — these functions are display and translation only.
  */
 
-import type { AlertDraft, AlertTriggerDraft } from "@/features/alerts/lib/authoring";
+import type { AlertDraft, AlertTriggerDraft, Operand } from "@/features/alerts/lib/authoring";
 
 // ---------------------------------------------------------------------------
 // evaluation (clock) and timeframes
@@ -312,9 +312,62 @@ export function describeRule(
   return `${instrumentLabel} ${operatorLabel} ${target}`.trim();
 }
 
+/**
+ * One side of a condition in the operator's words.
+ *
+ * A field reads as its own name, because that name is the vocabulary the
+ * operator picked it from. An indicator carries its period — "ema 9" is not how
+ * anyone says it out loud, and the period is what makes two uses of the same
+ * indicator different operands.
+ */
+export function describeOperand(operand: Operand): string {
+  switch (operand.kind) {
+    case "constant":
+      return formatPrice(operand.value);
+    case "field":
+      return operand.name;
+    case "indicator":
+      return operand.period === undefined
+        ? operand.name.toUpperCase()
+        : `${operand.name.toUpperCase()} ${operand.period}`;
+  }
+}
+
+/**
+ * The whole rule in the operator's words, whichever operands it compares.
+ *
+ * With a level on the right the instrument is the subject — "INFY crosses above
+ * ₹1,500" — which is the sentence this rail has always shown. When the right
+ * side is itself an operand, the instrument is no longer what the sentence is
+ * about: "EMA 9 crosses above EMA 19" is the complete rule, and naming the
+ * instrument in front of it would read as a second subject.
+ */
+export function describeCondition(
+  instrumentLabel: string,
+  operatorLabel: string,
+  condition: { left: Operand; right: Operand },
+  target: number | null | undefined,
+): string {
+  if (condition.right.kind === "constant") {
+    return describeRule(instrumentLabel, operatorLabel, target);
+  }
+  const sides = `${describeOperand(condition.left)} ${operatorLabel} ${describeOperand(condition.right)}`;
+  return sides.replace(/\s+/g, " ").trim();
+}
+
 /** A name suggested from the definition, which the operator can override. */
-export function suggestName(symbol: string, operatorLabel: string, value: number | null | undefined): string {
+export function suggestName(
+  symbol: string,
+  operatorLabel: string,
+  value: number | null | undefined,
+  operands?: { left: Operand; right: Operand },
+): string {
   if (!symbol) return "";
+  // An operand-vs-operand rule names both of its sides; the level form below
+  // would have no price to put after the operator.
+  if (operands && operands.right.kind !== "constant") {
+    return describeCondition(symbol, operatorLabel, operands, value).replace(/\s+/g, " ").trim();
+  }
   const target = value === null || value === undefined ? "" : formatPrice(value).replace("₹", "");
   return `${symbol} ${operatorLabel} ${target}`.replace(/\s+/g, " ").trim();
 }

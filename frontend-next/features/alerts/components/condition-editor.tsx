@@ -125,6 +125,16 @@ type ConditionEditorProps = Readonly<{
   conditions: Condition[];
   onChange: (next: Condition[]) => void;
   capabilities: AlertsCapabilities;
+  /**
+   * The operators this surface may offer, when it is narrower than everything
+   * the backend advertises — the alerts editor offers only the crossing/level/
+   * percentage subset, while the screener editors keep the full list.
+   *
+   * This narrows the CHOICES only. Grouping stays on `capabilities.operators`,
+   * because level-versus-crossing is the backend's classification and a
+   * restricted list must not change how an operator is read.
+   */
+  operators?: Record<string, string | null>;
   /** Shown above the list, e.g. "Any of" / "None of". */
   title?: string;
   /** A group may be empty when it is optional (any/not); the `all` group may not. */
@@ -144,11 +154,12 @@ export function ConditionEditor({
   conditions,
   onChange,
   capabilities,
+  operators,
   title,
   allowEmpty = false,
   addLabel = "Add condition",
 }: ConditionEditorProps) {
-  const operatorEntries = Object.entries(capabilities.operators);
+  const operatorEntries = Object.entries(operators ?? capabilities.operators);
 
   const updateAt = (index: number, next: Condition) => {
     const copy = [...conditions];
@@ -168,6 +179,9 @@ export function ConditionEditor({
         return (
           <div
             key={index}
+            // The anchor the editor's own issue list links back to, so a
+            // missing operand is one click from the row that can fix it.
+            id={`condition-row-${index}`}
             className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/40 p-3"
           >
             <div className="flex flex-wrap items-end gap-3">
