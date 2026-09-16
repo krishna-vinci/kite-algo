@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional
+from typing import Any, AsyncGenerator, Dict, Iterable, List, Mapping, Optional
 
 from fastapi import HTTPException, Request, WebSocket
 from pydantic import BaseModel, Field, field_validator
 
 from backend.algo_runtime.models import CandleSeriesSpec
+from backend.broker_api.instruments.catalog import AmbiguousInstrumentError
 from backend.broker_api.instruments.instruments_repository import InstrumentsRepository
 from backend.broker_api.orders.market_runtime_client import RUNTIME_TICKS_CHANNEL
 
@@ -18,6 +20,7 @@ from backend.broker_api.orders.market_runtime_client import RUNTIME_TICKS_CHANNE
 VALID_MARKET_MODES = {"ltp", "quote", "full"}
 DEFAULT_TICK_STALE_MS = 15_000
 MAX_INSTRUMENT_TOKEN = 9_999_999_999
+_DEPTH_MISSING = object()
 MAX_HISTORY_DAYS_BY_INTERVAL = {
     "minute": 90,
     "3minute": 180,
@@ -100,6 +103,50 @@ def normalize_instrument_token(value: Any) -> int:
     return token
 
 
+def _normalize_depth_payload(depth: Any) -> tuple[Optional[Dict[str, List[Dict[str, Any]]]], Optional[str]]:
+    """Validate and preserve broker-provided buy/sell depth levels.
+
+    A missing or null depth payload means the feed did not supply depth.  A
+    present payload with empty buy/sell arrays is still available data and
+    represents an empty market, not an unavailable feed.  Invalid level data
+    is rejected rather than turned into synthetic liquidity.
+    """
+
+    if depth is _DEPTH_MISSING or depth is None:
+        return None, "depth_not_supplied_by_feed"
+    if not isinstance(depth, Mapping) or not ("buy" in depth or "sell" in depth):
+        return None, "depth_payload_invalid"
+
+    normalized: Dict[str, List[Dict[str, Any]]] = {}
+    for side in ("buy", "sell"):
+        raw_levels = depth.get(side, [])
+        if not isinstance(raw_levels, list):
+            return None, "depth_payload_invalid"
+        levels: List[Dict[str, Any]] = []
+        for raw_level in raw_levels:
+            if not isinstance(raw_level, Mapping) or "price" not in raw_level:
+                return None, "depth_payload_invalid"
+            try:
+                price = float(raw_level["price"])
+            except (TypeError, ValueError):
+                return None, "depth_payload_invalid"
+            if not math.isfinite(price):
+                return None, "depth_payload_invalid"
+
+            level: Dict[str, Any] = {"price": price}
+            for field in ("quantity", "orders"):
+                if field not in raw_level or raw_level[field] is None:
+                    continue
+                try:
+                    level[field] = int(raw_level[field])
+                except (TypeError, ValueError):
+                    return None, "depth_payload_invalid"
+            levels.append(level)
+        normalized[side] = levels
+
+    return normalized, None
+
+
 class WorkerInstrumentResolveRequest(BaseModel):
     symbols: List[str] = Field(default_factory=list)
     instrument_tokens: List[int] = Field(default_factory=list)
@@ -154,6 +201,8 @@ class WorkerMarketDataService:
         tradingsymbol = str(row.get("tradingsymbol") or "").strip().upper()
         return {
             "symbol": f"{exchange}:{tradingsymbol}",
+            "public_key": row.get("public_key") or f"{exchange}:{tradingsymbol}",
+            "instrument_id": row.get("instrument_id"),
             "instrument_token": int(row["instrument_token"]),
             "exchange": exchange,
             "tradingsymbol": tradingsymbol,
@@ -164,10 +213,20 @@ class WorkerMarketDataService:
             "lot_size": int(row["lot_size"]) if row.get("lot_size") is not None else None,
             "expiry": row.get("expiry"),
             "strike": float(row["strike"]) if row.get("strike") is not None else None,
+            "underlying": row.get("underlying"),
+            "option_type": row.get("option_type"),
+            "catalog_generation": row.get("catalog_generation"),
+            "lifecycle_status": row.get("lifecycle_status"),
         }
 
     async def resolve_ticker(self, symbol: str) -> Dict[str, Any]:
-        row = await asyncio.to_thread(self.instruments.resolve_market_symbol, symbol)
+        try:
+            row = await asyncio.to_thread(self.instruments.resolve_market_symbol, symbol)
+        except AmbiguousInstrumentError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"rejection_reason": "AMBIGUOUS_INSTRUMENT", "symbol": symbol, "message": str(exc)},
+            ) from exc
         if not row:
             raise HTTPException(status_code=404, detail=f"Instrument not found for symbol {symbol}")
         return self._instrument_payload(row)
@@ -352,6 +411,10 @@ class WorkerMarketDataService:
                 for rec in records
             ]
             source = "kite_passthrough"
+            ingestion = {
+                "status": "completed",
+                "message": "Synchronous broker passthrough completed without cache ingestion",
+            }
         else:
             if ingest:
                 try:
@@ -618,6 +681,7 @@ class WorkerMarketDataService:
         age_ms = None
         if received_at is not None:
             age_ms = max(0, int((utcnow() - received_at.astimezone(timezone.utc)).total_seconds() * 1000))
+        depth, depth_unavailable_reason = _normalize_depth_payload(tick.get("depth", _DEPTH_MISSING))
         return {
             **instrument,
             "mode": tick.get("mode") or mode,
@@ -629,6 +693,9 @@ class WorkerMarketDataService:
             "average_price": tick.get("average_price"),
             "buy_quantity": tick.get("buy_quantity"),
             "sell_quantity": tick.get("sell_quantity"),
+            "depth": depth,
+            "depth_available": depth is not None,
+            "depth_unavailable_reason": depth_unavailable_reason,
             "last_trade_time": tick.get("last_trade_time"),
             "exchange_timestamp": tick.get("exchange_timestamp"),
             "received_at": received_at.isoformat() if received_at is not None else received_at_raw,
@@ -670,14 +737,24 @@ class WorkerMarketDataService:
         return value
 
     async def _get_system_kite_client(self) -> Any:
-        from backend.broker_api.market.candles_api import get_kite_db
         from backend.app.database import SessionLocal
+        from backend.broker_api.session.kite_session import KiteSession, build_kite_client
 
         db = SessionLocal()
         try:
-            return await get_kite_db(db)
+            system_session = db.query(KiteSession).filter_by(session_id="system").first()
+            access_token = (
+                str(system_session.access_token).strip()
+                if system_session is not None and system_session.access_token
+                else ""
+            )
         finally:
+            db.rollback()
             db.close()
+
+        if not access_token:
+            raise HTTPException(status_code=401, detail="Not authenticated; login first")
+        return build_kite_client(access_token, session_id="system")
 
     def _unpack_candle_series(self, raw: Any) -> tuple[List[Any], Any]:
         if isinstance(raw, dict):

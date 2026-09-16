@@ -1,6 +1,7 @@
 import Link from "next/link";
 import {
   Activity,
+  BellRing,
   BookOpen,
   LayoutDashboard,
   LayoutGrid,
@@ -17,6 +18,7 @@ type LeftRailProps = Readonly<{
 
 const iconByHref: Record<string, LucideIcon> = {
   "/dashboard": LayoutDashboard,
+  "/alerts": BellRing,
   "/strategies": Activity,
   "/journal": BookOpen,
   "/settings": Settings,

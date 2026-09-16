@@ -49,6 +49,41 @@ class ManagedRun:
             metrics=metrics,
         )
 
+    def progress(self, note: str | None = None) -> JsonDict:
+        """Report child progress to the hosted attempt.
+
+        Requires the attach run's session nonce. This is the child's own liveness
+        signal; it is not a heartbeat and the supervisor never fabricates it.
+        """
+        if self.session_nonce is None:
+            raise ValueError("ManagedRun progress requires a session nonce")
+        return self.client.run_progress(self.run_id, session_nonce=self.session_nonce, note=note)
+
+    def notify(
+        self,
+        text: str,
+        *,
+        channels: Iterable[str],
+        idempotency_key: str,
+        subject: str | None = None,
+    ) -> JsonDict:
+        """Enqueue a run-scoped notification for this hosted attempt.
+
+        Requires the attach run's session nonce. The caller's ``idempotency_key``
+        deduplicates a repeat with the same content and conflicts on different
+        content; a notification outcome never authorizes trading.
+        """
+        if self.session_nonce is None:
+            raise ValueError("ManagedRun notify requires a session nonce")
+        return self.client.notify_run(
+            self.run_id,
+            channels=channels,
+            text=text,
+            idempotency_key=idempotency_key,
+            subject=subject,
+            session_nonce=self.session_nonce,
+        )
+
     def safety_check(self) -> SafetyCheckResult:
         return self.client.safety_check(self.run_id)
 

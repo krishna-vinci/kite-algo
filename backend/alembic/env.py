@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import os
+import sys
 from logging.config import fileConfig
 from pathlib import Path
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend.database_url import resolve_database_url
 
 
 config = context.config
@@ -18,10 +22,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
 def get_database_url() -> str:
-    return os.getenv(
-        "DATABASE_URL",
-        f"postgresql://{os.getenv('DB_USER', 'postgres')}:{os.getenv('DB_PASSWORD', 'postgres')}@{os.getenv('DB_HOST', 'postgres')}:{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME', 'postgres')}",
-    )
+    return resolve_database_url()
 
 
 config.set_main_option("sqlalchemy.url", get_database_url())

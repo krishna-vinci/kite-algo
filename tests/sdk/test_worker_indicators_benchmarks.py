@@ -9,7 +9,7 @@ from tests.support.test_support import install_dependency_stubs
 install_dependency_stubs(stub_kite_orders=False)
 sys.modules.pop("broker_api.orders", None)
 
-SDK_ROOT = Path(__file__).resolve().parents[1] / "sdk" / "python"
+SDK_ROOT = Path(__file__).resolve().parents[2] / "sdk" / "python"
 if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 

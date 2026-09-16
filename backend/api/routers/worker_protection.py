@@ -17,6 +17,7 @@ from backend.broker_api.timeline.worker_timeline import worker_timeline_store
 from backend.app.database import SessionLocal
 from backend.api.schemas.worker import WorkerDecisionEventRequest, WorkerProtectionPatchRequest, WorkerRiskPatchRequest, WorkerRunPnlLeg, WorkerRunPnlSnapshot, WorkerRunPnlTotals, WorkerFundsSegment, WorkerFundsSnapshot, WorkerExitRequest
 from backend.api.routers.worker_shared import *
+from backend.api.services.hosted_attempt import enforce_hosted_attempt_authority
 
 router = APIRouter(prefix='/algo-workers', tags=['Algo Workers'])
 
@@ -1041,6 +1042,7 @@ async def patch_worker_run_risk(request: Request, strategy_run_id: str, payload:
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     await require_active_worker_run_session(request, run)
     if run.get("status") in {"closed", "failed"}:
         raise HTTPException(status_code=409, detail="Closed strategy runs cannot be risk-edited")
@@ -1053,6 +1055,7 @@ async def patch_worker_run_protection(request: Request, strategy_run_id: str, pa
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     await require_active_worker_run_session(request, run)
     if run.get("status") in {"closed", "failed"}:
         raise HTTPException(status_code=409, detail="Closed strategy runs cannot be protection-edited")

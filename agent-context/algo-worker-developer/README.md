@@ -13,16 +13,20 @@ Give this pack to an external coding agent when you want worker code written in 
 ## Current package status
 
 - Package name: `kite-algo-worker`
-- Current public PyPI release: `0.7.5`
+- SDK version described by this pack: `0.13.0`
+- Current public PyPI release: `0.7.7`
+- Pending release tag: `kite-algo-worker-v0.13.0`
 - SDK tag convention: `kite-algo-worker-vX.Y.Z`
 
 Canonical public install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.5
+python3 -m pip install kite-algo-worker==0.13.0
 ```
 
-This pack describes the current released SDK surface. If this pack and the repo disagree, trust the repo files.
+This pack documents the 0.13.0 release candidate. Keep the exact pin when the
+release is published; do not silently fall back to an unpinned package. If
+this pack and the repo disagree, trust the repo files.
 
 ## Read in this order
 
@@ -44,7 +48,8 @@ For deeper source-of-truth reading in the main repo, start with:
 - `sdk/python/README.md`
 - `documents/algo-worker-sdk-guide.md`
 - `sdk/python/kite_algo_worker/`
-- `api/routers/worker_auth.py`, `worker_market.py`, `worker_execution.py`, and `worker_protection.py`
-- `options/api/worker_options_router.py`
+- `backend/api/routers/worker_auth.py`, `worker_market.py`, `worker_execution.py`, `worker_protection.py`, and `fundamentals.py`
+- `backend/options/api/worker_options_router.py`
+- `fundamentals/`
 
 If this pack and the repo disagree, trust the repo files.

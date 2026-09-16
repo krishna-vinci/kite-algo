@@ -10,6 +10,8 @@ from sqlalchemy.orm import sessionmaker
 from databases import Database  # if you still use it elsewhere
 import logging
 
+from backend.database_url import resolve_database_url
+
 # Configure logging for database operations
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -261,13 +263,15 @@ def get_db_connection():
         logging.error(f"Error connecting to the database or creating tables: {e}")
         raise
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
-)
+DATABASE_URL = resolve_database_url()
 
-# synchronous SQLAlchemy
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=5, pool_recycle=3600)
+# synchronous SQLAlchemy. PostgreSQL accepts connection-pool tuning; SQLite
+# (tests/dev fallback) uses SingletonThreadPool and rejects pool_size/
+# max_overflow, so those kwargs must stay dialect-gated or import fails.
+_ENGINE_KWARGS = {"pool_pre_ping": True, "pool_recycle": 3600}
+if not DATABASE_URL.strip().lower().startswith("sqlite"):
+    _ENGINE_KWARGS.update({"pool_size": 5, "max_overflow": 5})
+engine = create_engine(DATABASE_URL, **_ENGINE_KWARGS)
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
@@ -343,10 +347,7 @@ async def get_nifty50_instruments():
     Fetches Nifty50 instruments from the database.
     """
     from databases import Database
-    DATABASE_URL = os.getenv(
-        "DATABASE_URL",
-        f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
-    )
+    DATABASE_URL = resolve_database_url()
     database = Database(DATABASE_URL)
     await database.connect()
     query = """

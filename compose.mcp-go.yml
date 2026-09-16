@@ -1,0 +1,34 @@
+# Go MCP adapter — the only MCP service since the Phase 3 cutover (2026-09-11).
+# The Python adapter was retired after zero requests in the 48h before the
+# cutover; its compose service, image and package are gone. This overlay exists
+# because compose.yml carries the core stack and the MCP adapter is optional.
+# Usage:
+#   docker compose -f compose.yml -f compose.mcp-go.yml --profile mcp up -d mcp-go
+services:
+  mcp-go:
+    profiles: [mcp]
+    build:
+      context: ./mcp/go
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    environment:
+      KITE_MCP_TRANSPORT: http
+      KITE_MCP_HOST: 0.0.0.0
+      KITE_MCP_PORT: "8788"
+      KITE_MCP_API_URL: http://finance-app:8777
+      KITE_MCP_WORKER_TOKEN: ${KITE_MCP_WORKER_TOKEN:-}
+      KITE_MCP_PROFILE: ${KITE_MCP_PROFILE:-live}
+      KITE_MCP_HTTP_TOKEN: ${KITE_MCP_HTTP_TOKEN:-}
+      KITE_MCP_ALLOW_DATA_REFRESH: ${KITE_MCP_ALLOW_DATA_REFRESH:-false}
+    ports:
+      - "${KITE_MCP_BIND_ADDRESS:-0.0.0.0}:${KITE_MCP_HOST_PORT:-18789}:8788"
+    depends_on:
+      finance-app:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true

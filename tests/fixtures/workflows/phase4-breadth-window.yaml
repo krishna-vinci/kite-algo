@@ -1,0 +1,23 @@
+# Phase 4 example: at least 3 DIFFERENT instruments triggering within 30
+# minutes (windowed participation, NOT simultaneous breadth).
+version: 1
+name: phase4-breadth-window
+session: nse_equity
+instruments: ["NSE:A", "NSE:B", "NSE:C", "NSE:D"]
+stages:
+  - id: breadth3
+    type: breadth
+    clock: candle_close
+    timeframe: 5minute
+    breadth:
+      condition:
+        all:
+          - {field: close, op: gt, value: 100}
+      distinct_instruments: 3
+      window: 30m
+      mode: triggers_within
+alerts:
+  - id: breadth
+    source: breadth3
+    trigger: on_transition
+    channels: []

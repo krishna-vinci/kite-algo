@@ -29,7 +29,10 @@ from backend.app.monitor import install_log_buffer
 load_dotenv()  # Load environment variables from .env file
 
 # Configure logging for the main application
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# force=True: module-level basicConfig calls in imported modules (e.g.
+# backend.app.database) otherwise win the race and leave root at WARNING,
+# silently dropping every app-level INFO line (bootstrap, runtime sampler).
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 install_log_buffer()
 
 

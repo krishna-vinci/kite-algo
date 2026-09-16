@@ -42,7 +42,7 @@ class ConvertPositionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "broker_api.orders.run_kite_write_action",
+            "backend.broker_api.orders.service.run_kite_write_action",
             AsyncMock(return_value=True),
         ) as run_action:
             response = await service.convert_position(kite, req, corr_id="corr-1")

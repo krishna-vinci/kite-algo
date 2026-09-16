@@ -10,6 +10,7 @@ from backend.app.database import SessionLocal
 from backend.broker_api.broker_api import run_headless_login_and_persist_system_token
 from backend.broker_api.instruments.index_ingestion import (
     get_index_refresh_state,
+    index_refresh_is_due,
     list_supported_index_source_lists,
     refresh_live_metrics_for_indices,
     refresh_supported_indices,
@@ -119,17 +120,177 @@ async def _schedule_daily_token_refresh() -> None:
             set_component_status("daily_token_scheduler", "degraded", detail=str(e))
             await asyncio.sleep(30)
 
+async def _schedule_exchange_calendar_refresh(
+    *,
+    now_fn=None,
+    sleep_fn=None,
+    refresh_fn=None,
+    heartbeat_enabled: bool = True,
+) -> None:
+    """Run the official NSE calendar synchronization once daily at 05:45 IST.
+
+    ``refresh_fn`` receives the list of years (current and next). A failed or
+    awaiting-release refresh never retries rapidly: the loop simply sleeps
+    until the next daily 05:45 window.
+    """
+    tz = ZoneInfo("Asia/Kolkata")
+    now_fn = now_fn or (lambda: datetime.now(tz))
+    sleep_fn = sleep_fn or asyncio.sleep
+    if refresh_fn is None:
+        def refresh_fn(years):
+            from backend.app.database import get_db_connection
+            from backend.broker_api.market.nse_calendar_source import synchronize_official_calendar
+
+            conn = get_db_connection()
+            try:
+                return synchronize_official_calendar(conn, years)
+            finally:
+                conn.close()
+
+    async def _refresh(years):
+        return await asyncio.to_thread(refresh_fn, years)
+
+    set_component_status("calendar_refresh_scheduler", "healthy", detail="Daily exchange calendar refresh scheduler started")
+    while True:
+        try:
+            now = now_fn()
+            next_run = now.replace(hour=5, minute=45, second=0, microsecond=0)
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            sleep_sec = max(1, int((next_run - now).total_seconds()))
+            set_meta(
+                "calendar_refresh_scheduler",
+                {
+                    "next_run": next_run.isoformat(),
+                    "sleep_seconds": sleep_sec,
+                },
+            )
+            if heartbeat_enabled:
+                heartbeat("calendar_refresh_scheduler", detail="Sleeping until next calendar refresh window", meta={"next_run": next_run.isoformat()})
+            await sleep_fn(sleep_sec)
+
+            current = now_fn()
+            years = [current.year, current.year + 1]
+            set_component_status("calendar_refresh_scheduler", "running", detail=f"Refreshing official NSE calendar for {years}")
+            result = await _refresh(years)
+            status = str((result or {}).get("status") or "success")
+            if status == "failure":
+                set_component_status(
+                    "calendar_refresh_scheduler",
+                    "degraded",
+                    detail=str((result or {}).get("error") or "official calendar refresh failed"),
+                )
+            elif status == "awaiting_release":
+                set_component_status(
+                    "calendar_refresh_scheduler",
+                    "healthy",
+                    detail=f"Official next-year calendar not released yet; retaining current coverage ({years[1]})",
+                    meta={"awaiting_release_years": (result or {}).get("awaiting_release_years")},
+                )
+            else:
+                set_component_status(
+                    "calendar_refresh_scheduler",
+                    "healthy",
+                    detail=f"Official calendar refresh completed ({status})",
+                    meta={"result": result},
+                )
+        except asyncio.CancelledError:
+            set_component_status("calendar_refresh_scheduler", "stopped", detail="Exchange calendar refresh scheduler cancelled")
+            break
+        except Exception as e:
+            logging.error("[SCHED] Exchange calendar refresh failed: %s", e, exc_info=True)
+            set_component_status("calendar_refresh_scheduler", "degraded", detail=str(e))
+
+
+async def _schedule_fundamentals_nightly_refresh(
+    *,
+    now_fn=None,
+    sleep_fn=None,
+    sync_fn=None,
+    heartbeat_enabled: bool = True,
+    sync_hour: int = 2,
+) -> None:
+    """Nightly incremental fundamentals refresh for every supported index scope.
+
+    Runs once daily at 02:00 Asia/Kolkata and walks the index-scope adapter
+    registry dynamically, so indexes added to
+    ``fundamentals.index_scopes`` are picked up with no code change here.
+    Per-index failures are logged and the remaining indexes still run; the
+    scheduler simply waits for the next daily window (no rapid retry loops).
+    """
+    from fundamentals.index_scopes import supported_index_scopes
+
+    tz = ZoneInfo("Asia/Kolkata")
+    now_fn = now_fn or (lambda: datetime.now(tz))
+    sleep_fn = sleep_fn or asyncio.sleep
+    if sync_fn is None:
+        def sync_fn(index_key):
+            from fundamentals.ingestion import SyncConfig, SyncScope, run_fundamentals_sync
+
+            return run_fundamentals_sync(
+                SyncConfig(scope=SyncScope(scope_type="index", scope_value=index_key), mode="incremental")
+            )
+
+    set_component_status("fundamentals_scheduler", "healthy", detail="Nightly fundamentals scheduler started")
+    while True:
+        try:
+            now = now_fn()
+            next_run = now.replace(hour=sync_hour, minute=0, second=0, microsecond=0)
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            sleep_sec = max(1, int((next_run - now).total_seconds()))
+            set_meta(
+                "fundamentals_scheduler",
+                {
+                    "next_run": next_run.isoformat(),
+                    "sleep_seconds": sleep_sec,
+                    "index_scopes": supported_index_scopes(),
+                },
+            )
+            if heartbeat_enabled:
+                heartbeat("fundamentals_scheduler", detail="Sleeping until next fundamentals sync window", meta={"next_run": next_run.isoformat()})
+            await sleep_fn(sleep_sec)
+
+            scopes = supported_index_scopes()
+            failed_scopes = []
+            set_component_status("fundamentals_scheduler", "running", detail=f"Nightly fundamentals sync for {scopes}")
+            for index_key in scopes:
+                try:
+                    result = await sync_fn(index_key)
+                    set_meta("fundamentals_scheduler", {
+                        "last_index": index_key,
+                        "last_result": result,
+                        "last_success_at": datetime.utcnow().isoformat(),
+                    })
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Per-index isolation: one failing universe never blocks the others.
+                    failed_scopes.append(index_key)
+                    logging.error("[SCHED] Fundamentals nightly sync failed for %s: %s", index_key, e, exc_info=True)
+                    set_component_status("fundamentals_scheduler", "degraded", detail=f"{index_key}: {e}")
+            if failed_scopes:
+                set_component_status(
+                    "fundamentals_scheduler",
+                    "degraded",
+                    detail=f"Nightly fundamentals sync window completed with failures for {failed_scopes}",
+                    meta={"failed_scopes": failed_scopes},
+                )
+            else:
+                set_component_status("fundamentals_scheduler", "healthy", detail=f"Nightly fundamentals sync window completed for {scopes}")
+        except asyncio.CancelledError:
+            set_component_status("fundamentals_scheduler", "stopped", detail="Nightly fundamentals scheduler cancelled")
+            break
+        except Exception as e:
+            logging.error("[SCHED] Fundamentals scheduler loop error: %s", e, exc_info=True)
+            set_component_status("fundamentals_scheduler", "degraded", detail=str(e))
+
 async def _schedule_monthly_index_refresh() -> None:
     tz = ZoneInfo("Asia/Kolkata")
     source_lists = list_supported_index_source_lists()
-    persisted_month = None
     set_component_status("index_refresh_scheduler", "healthy", detail="Monthly index refresh scheduler started")
     while True:
         try:
-            persisted_state = await asyncio.to_thread(get_index_refresh_state, "Nifty50")
-            persisted_refresh_at = persisted_state.get("last_constituent_refresh_at")
-            if persisted_refresh_at:
-                persisted_month = persisted_refresh_at.astimezone(tz).strftime("%Y-%m")
             now = datetime.now(tz)
             next_run = now.replace(hour=6, minute=30, second=0, microsecond=0)
             if now >= next_run:
@@ -140,31 +301,34 @@ async def _schedule_monthly_index_refresh() -> None:
                 {
                     "next_run": next_run.isoformat(),
                     "sleep_seconds": sleep_sec,
-                    "last_success_month": persisted_month,
                     "source_lists": source_lists,
                 },
             )
             heartbeat(
                 "index_refresh_scheduler",
                 detail="Scheduler sleeping until next refresh window",
-                meta={"next_run": next_run.isoformat(), "last_success_month": persisted_month},
+                meta={"next_run": next_run.isoformat(), "source_lists": source_lists},
             )
             await asyncio.sleep(sleep_sec)
 
             month_key = datetime.now(tz).strftime("%Y-%m")
-            if month_key == persisted_month:
+            due_lists = []
+            for source_list in source_lists:
+                state = await asyncio.to_thread(get_index_refresh_state, source_list)
+                if index_refresh_is_due(state, month_key=month_key):
+                    due_lists.append(source_list)
+            if not due_lists:
                 continue
 
-            set_component_status("index_refresh_scheduler", "running", detail=f"Refreshing official index datasets for {month_key}")
-            result = await asyncio.to_thread(refresh_supported_indices, source_lists)
+            set_component_status("index_refresh_scheduler", "running", detail=f"Refreshing official index datasets for {due_lists}")
+            result = await asyncio.to_thread(refresh_supported_indices, due_lists)
             if result.get("status") == "error":
                 raise RuntimeError(json.dumps(result))
-            runtime_result = await asyncio.to_thread(refresh_live_metrics_for_indices, source_lists)
+            runtime_result = await asyncio.to_thread(refresh_live_metrics_for_indices, due_lists)
 
             set_meta(
                 "index_refresh_scheduler",
                 {
-                    "last_success_month": month_key,
                     "last_success_at": datetime.utcnow().isoformat(),
                     "last_result": result,
                     "last_runtime_result": runtime_result,
@@ -182,7 +346,7 @@ async def _schedule_monthly_index_refresh() -> None:
                 {
                     "last_failure_at": datetime.utcnow().isoformat(),
                     "last_error": str(e),
-                    "last_success_month": persisted_month,
+                    "last_success_month": None,
                 },
             )
             await asyncio.sleep(300)

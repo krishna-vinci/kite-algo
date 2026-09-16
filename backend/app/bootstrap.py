@@ -20,7 +20,7 @@ from backend.app.background import (
     _worker_runtime_recovery_exit_loop,
     _worker_runtime_recovery_runs_loop,
 )
-from backend.app.schedulers import daily_token_ready, _schedule_daily_token_refresh, _schedule_monthly_index_refresh
+from backend.app.schedulers import daily_token_ready, _schedule_daily_token_refresh, _schedule_exchange_calendar_refresh, _schedule_fundamentals_nightly_refresh, _schedule_monthly_index_refresh
 from backend.broker_api.broker_api import (
     run_headless_login_and_persist_system_token,
     schedule_daily_instruments_update,
@@ -32,10 +32,12 @@ from backend.broker_api.session.kite_auth import API_KEY, login_headless
 from backend.broker_api.session.kite_session import KiteSession, build_kite_client, get_system_access_token, make_account_id, rotate_broker_access_token
 from backend.broker_api.orders.market_runtime_client import MarketDataRuntime, market_runtime_enabled
 from backend.broker_api.options.options_greeks import prewarm_options_engine
+from backend.shared.runtime_stats import run_stats_sampler
 from backend.app.database import SessionLocal, database as async_db, get_db_connection
 from backend.journaling.runtime import JournalRuntimeWorker
 from backend.journaling.service import JournalService
 from backend.app.monitor import heartbeat, set_component_status, set_meta
+from backend.broker_api.market.daily_candle_finalization import schedule_daily_candle_finalization
 
 logger = logging.getLogger(__name__)
 market_data_runtime: MarketDataRuntime | None = None
@@ -62,6 +64,9 @@ async def combined_lifespan(app: FastAPI):
     scheduler_task = None
     daily_instruments_refresh_task = None
     index_refresh_task = None
+    calendar_refresh_task = None
+    fundamentals_sync_task = None
+    daily_candle_finalization_task = None
     order_runtime_task = None
     positions_runtime_task = None
     worker_protection_task = None
@@ -320,6 +325,9 @@ async def combined_lifespan(app: FastAPI):
         scheduler_task = asyncio.create_task(_schedule_daily_token_refresh())
         daily_instruments_refresh_task = asyncio.create_task(schedule_daily_instruments_update())
         index_refresh_task = asyncio.create_task(_schedule_monthly_index_refresh())
+        calendar_refresh_task = asyncio.create_task(_schedule_exchange_calendar_refresh())
+        fundamentals_sync_task = asyncio.create_task(_schedule_fundamentals_nightly_refresh())
+        daily_candle_finalization_task = asyncio.create_task(schedule_daily_candle_finalization())
         try:
             startup_index_result = await asyncio.to_thread(refresh_live_metrics_for_indices, ["Nifty50", "NiftyBank"])
             set_meta("index_runtime_startup_refresh", {"last_result": startup_index_result, "last_success_at": datetime.utcnow().isoformat()})
@@ -481,11 +489,28 @@ async def combined_lifespan(app: FastAPI):
 
     set_component_status("app", startup_status, detail=startup_detail)
 
+    stats_sampler_task = asyncio.create_task(
+        run_stats_sampler(
+            logging.getLogger("backend.app.bootstrap"),
+            interval_s=float(os.environ.get("APP_STATS_INTERVAL_S", "60")),
+            component="finance-app",
+        )
+    )
+
     yield
     
     # Cleanup on shutdown
     # Cancel token watcher first
     set_component_status("app", "stopping", detail="Application shutdown in progress")
+    try:
+        if 'stats_sampler_task' in locals() and stats_sampler_task:
+            stats_sampler_task.cancel()
+            try:
+                await stats_sampler_task
+            except (asyncio.CancelledError, Exception):
+                pass
+    except Exception:
+        pass
     try:
         if 'token_watcher_task' in locals() and token_watcher_task:
             token_watcher_task.cancel()
@@ -521,6 +546,38 @@ async def combined_lifespan(app: FastAPI):
             index_refresh_task.cancel()
             try:
                 await index_refresh_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel daily exchange calendar refresh scheduler
+    try:
+        if 'calendar_refresh_task' in locals() and calendar_refresh_task:
+            calendar_refresh_task.cancel()
+            try:
+                await calendar_refresh_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel nightly fundamentals refresh scheduler
+    try:
+        if 'fundamentals_sync_task' in locals() and fundamentals_sync_task:
+            fundamentals_sync_task.cancel()
+            try:
+                await fundamentals_sync_task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Cancel post-close daily candle finalization scheduler
+    try:
+        if 'daily_candle_finalization_task' in locals() and daily_candle_finalization_task:
+            daily_candle_finalization_task.cancel()
+            try:
+                await daily_candle_finalization_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
     except Exception:

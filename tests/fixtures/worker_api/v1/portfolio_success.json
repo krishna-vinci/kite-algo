@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "account_scope": "kite:SANITIZED",
+  "source": "kite_connect_portfolio",
+  "source_as_of": "2026-08-29T09:00:00+00:00",
+  "retrieved_at": "2026-08-29T09:00:01+00:00",
+  "component_times": {"funds": "2026-08-29T09:00:00+00:00"},
+  "coherent": true,
+  "coherence_skew_ms": 1,
+  "funds": {"equity": {"available": {"cash": 50000}}},
+  "holdings": [{"exchange": "NSE", "tradingsymbol": "SYNTH", "instrument_token": 101, "product": "CNC", "quantity": 2}],
+  "net_positions": [], "day_positions": [], "profile_capabilities": {"demat_consent": null}
+}

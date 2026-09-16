@@ -76,13 +76,36 @@ func NewHTTPHandler(svc *Service) http.Handler {
 			return
 		}
 		svc.instrumentsMu.Lock()
+		oldStore := svc.instruments
 		svc.instruments = newStore
 		svc.instrumentsMu.Unlock()
+		if oldStore != nil {
+			oldStore.Close()
+		}
 
-		log.Printf("instruments: reloaded %d instruments", newStore.Len())
+		log.Printf("instruments: reloaded generation=%s count=%d", newStore.Generation(), newStore.Len())
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status": "ok",
-			"count":  newStore.Len(),
+			"status":     "ok",
+			"count":      newStore.Len(),
+			"generation": newStore.Generation(),
+		})
+	})
+	mux.HandleFunc("/internal/market-runtime/instruments/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		svc.instrumentsMu.RLock()
+		store := svc.instruments
+		svc.instrumentsMu.RUnlock()
+		if store == nil {
+			writeError(w, http.StatusServiceUnavailable, "instrument store is not loaded")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":     "ok",
+			"generation": store.Generation(),
+			"count":      store.Len(),
 		})
 	})
 
@@ -101,6 +124,7 @@ func NewHTTPHandler(svc *Service) http.Handler {
 				writeError(w, http.StatusBadRequest, "exchange and symbol query params required")
 				return
 			}
+			symbol = strings.ToUpper(strings.TrimSpace(symbol))
 			key := exchange + ":" + symbol
 			if meta := store.BySymbol(key); meta != nil {
 				writeJSON(w, http.StatusOK, meta)

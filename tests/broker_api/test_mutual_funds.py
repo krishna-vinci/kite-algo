@@ -46,7 +46,7 @@ class MutualFundsServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch(
-            "broker_api.kite_mutual_funds.run_kite_write_action",
+            "backend.broker_api.mutual_funds.kite_mutual_funds.run_kite_write_action",
             AsyncMock(return_value="MF-ORDER-1"),
         ) as run_action:
             response = await mf_service.place_order(kite, request, corr_id="corr-1")

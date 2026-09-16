@@ -1,6 +1,7 @@
 import json
 import re
 import sys
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -652,6 +653,19 @@ def test_get_historical_candles_uses_worker_history_endpoint(captured_requests):
     }
 
 
+def test_get_historical_candles_preserves_timezone_aware_datetime_params(captured_requests):
+    offset = timezone(timedelta(hours=5, minutes=30))
+    client().get_historical_candles(
+        "NSE:INFY",
+        from_date=datetime(2026, 9, 1, 0, 0, tzinfo=offset),
+        to_date=datetime(2026, 9, 2, 23, 59, 59, tzinfo=offset),
+        ingest=False,
+        passthrough=True,
+    )
+    assert captured_requests[0]["kwargs"]["params"]["from"].endswith("+05:30")
+    assert captured_requests[0]["kwargs"]["params"]["to"].endswith("+05:30")
+
+
 def test_get_historical_candles_accepts_token(captured_requests):
     client().get_historical_candles(408065, timeframe="5minute", ingest=False)
 
@@ -1030,8 +1044,8 @@ def test_typed_models_and_exception_hierarchy():
             },
         }
     )
-    assert preview.preview.cost_contract.margin_required == "10.00"
-    assert preview.preview.cost_contract.charges_estimate == "2.50"
+    assert preview.preview.cost_contract.margin_required == 10.0
+    assert preview.preview.cost_contract.charges_estimate == 2.5
 
     order_result = WorkerOrderResult.model_validate({"mode": "paper", "result": {"status": "filled", "order": {"order_id": "PAPER-1"}}})
     assert order_result.result["order"]["order_id"].startswith("PAPER-")

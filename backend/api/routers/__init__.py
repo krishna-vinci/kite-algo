@@ -2,10 +2,23 @@
 from backend.api.routers.worker_auth import router as worker_auth_router
 from backend.api.routers.worker_execution import router as worker_execution_router
 from backend.api.routers.worker_market import router as worker_market_router
+from backend.api.routers.worker_notifications import router as worker_notifications_router
+from backend.api.routers.worker_universes import router as worker_universes_router
 from backend.api.routers.worker_protection import router as worker_protection_router
+from backend.api.routers.worker_screeners import router as worker_screeners_router
+from backend.api.routers.worker_signals import router as worker_signals_router
+from backend.api.routers.worker_workflows import router as worker_workflows_router
+from backend.api.routers.alerts_operator import router as alerts_operator_router
+from backend.api.routers.alerts_operator_platform import (
+    router as alerts_operator_platform_router,
+)
+from backend.api.routers.alerts_market_ws import router as alerts_market_ws_router
+from backend.api.routers.strategies import router as strategies_router
+from backend.api.routers.hosted_lifecycle import router as hosted_lifecycle_router
 from backend.api.routers.analytics import router as analytics_router
 from backend.api.routers.auth import router as auth_router
 from backend.api.routers.control import router as control_router
+from backend.api.routers.fundamentals import router as fundamentals_router
 from backend.api.routers.historical import router as historical_router
 from backend.api.routers.ingestion import router as ingestion_router
 from backend.api.routers.instruments import router as instruments_router
@@ -25,12 +38,23 @@ ALL_ROUTERS = [
     (instruments_router, "/api"),
     (historical_router, "/api"),
     (ingestion_router, "/api"),
+    (fundamentals_router, "/api"),
     (user_settings_router, "/api"),
     (marketwatch_router, "/api"),
     (worker_auth_router, "/api"),
     (worker_market_router, "/api"),
     (worker_execution_router, "/api"),
     (worker_protection_router, "/api"),
+    (worker_workflows_router, "/api"),
+    (worker_screeners_router, "/api"),
+    (worker_notifications_router, "/api"),
+    (worker_universes_router, "/api"),
+    (worker_signals_router, "/api"),
+    (alerts_operator_router, "/api"),
+    (alerts_operator_platform_router, "/api"),
+    (alerts_market_ws_router, "/api"),
+    (strategies_router, "/api"),
+    (hosted_lifecycle_router, "/api"),
     (control_router, "/api"),
     (journal_router, "/api"),
     (analytics_router, "/api"),

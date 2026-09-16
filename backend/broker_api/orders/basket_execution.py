@@ -217,7 +217,7 @@ class BasketExecutionStore:
                     updated_at = NOW(),
                     request_json = CASE
                         WHEN :error_message IS NULL THEN request_json
-                        ELSE jsonb_set(request_json, '{submit_error}', to_jsonb(:error_message::TEXT), true)
+                        ELSE jsonb_set(request_json, '{submit_error}', to_jsonb(CAST(:error_message AS TEXT)), true)
                     END
                 WHERE basket_execution_id = :basket_execution_id
                   AND leg_index = :leg_index

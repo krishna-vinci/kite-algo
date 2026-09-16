@@ -1,9 +1,7 @@
 "use client";
 
-import { TradingConsolePage } from "@/features/trading/components/trading-console-page";
-import { useTradingConsoleData } from "@/features/trading/hooks/use-trading-console-data";
+import { HostedStrategiesListPage } from "@/features/strategies/components/hosted-strategies-list-page";
 
 export default function StrategiesPage() {
-  const snapshot = useTradingConsoleData();
-  return <TradingConsolePage snapshot={snapshot} />;
+  return <HostedStrategiesListPage />;
 }

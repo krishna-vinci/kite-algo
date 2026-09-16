@@ -7,14 +7,14 @@ Kite Algo is a self-hosted algorithmic trading platform for Zerodha/Kite workflo
 ## Package status and install
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.5
+python3 -m pip install kite-algo-worker==0.13.0
 ```
 
 Extras:
 
 ```bash
-python3 -m pip install "kite-algo-worker[dataframe]==0.7.5"
-python3 -m pip install "kite-algo-worker[indicators]==0.7.5"
+python3 -m pip install "kite-algo-worker[dataframe]==0.13.0"
+python3 -m pip install "kite-algo-worker[indicators]==0.13.0"
 ```
 
 - base SDK: HTTP/WebSocket clients, typed models, order helpers
@@ -32,8 +32,13 @@ Pin to an immutable version in production.
 | Funds + run state | `get_funds(...)`, `get_run_funds(...)`, `get_run_health_snapshot(...)` |
 | Market data | `resolve_ticker(...)`, `search_tickers(...)`, `get_quotes(...)`, `stream_ticks(...)`, `get_candles(...)`, `stream_candles(...)`, `get_historical_candles(...)` |
 | Order types | equity/option market, limit, SL, SL-M across regular, AMO, CO, iceberg, auction varieties |
-| Order placement | `preview_order(...)`, `place_order(...)`, `cancel_order(...)`, `modify_order(...)`, order builders |
-| Basket execution | `preview_basket(...)`, `place_basket(...)` |
+| Order placement | `preview_order(...)`, `preview_order_snapshot(...)`, `place_order(...)`, `cancel_order(...)`, `modify_order(...)`, order builders |
+| Basket execution | `preview_basket(...)`, `preview_basket_snapshot(...)`, `place_basket(...)` |
+| Investment data (read-only) | `get_market_calendar(...)`, `get_market_calendar_status(...)`, `get_index_constituents(...)`, `get_index_constituent_status(...)`, `get_account_portfolio(...)` and their `*_snapshot(...)` typed variants |
+| Fundamentals (0.8.0) | `get_fundamentals_features(...)`, `get_fundamentals_status(...)`, `get_fundamentals_statements(...)`, `refresh_fundamentals(...)`, `export_fundamentals_csv(...)` |
+| Execution recovery | `get_order_history(...)`, `list_baskets(...)`, `get_basket(...)`, `list_execution_events(...)`, `stream_execution_events(...)` |
+| Bracket lifecycle | `create_bracket(...)`, `list_brackets(...)`, `get_bracket(...)`, `cancel_bracket(...)` |
+| Async parity | `AsyncKiteAlgoWorkerClient` supports the same worker HTTP operations as `KiteAlgoWorkerClient`; async streams use `async for` |
 | Safety + protection | `safety_check(...)`, `BackendProtection`, `update_backend_protection(...)`, `patch_risk(...)` |
 | Grouped P&L + monitoring | `get_run_pnl(...)`, `stream_run_pnl(...)`, `list_timeline(...)`, `log_decision_event(...)`, `stream_timeline(...)` |
 | Options namespace | `client.options.*`, resolver helpers, options run lifecycle |
@@ -452,6 +457,43 @@ preview = client.preview_order(
 
 **Response:** margin estimate, charges breakdown, validation warnings.
 
+### preview_order_snapshot(...) / preview_basket_snapshot(...)
+
+Typed variants of the preview endpoints. They call the same raw preview methods, validate the response into an `OrderPreview` model, and **never submit orders** — the backend preview endpoints are dry-run only.
+
+`paper` remains the durable simulated execution mode: it keeps isolated orders, trades, positions, funds, grouped run P&L, and journal-visible strategy attribution under the selected paper account scope without calling broker write APIs.
+
+```python
+from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient
+
+client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:18777", token="kwa_..."))
+
+preview = client.preview_order_snapshot(
+    "run_basic_equity_001",
+    {"exchange": "NSE", "tradingsymbol": "INFY", "transaction_type": "BUY",
+     "variety": "regular", "product": "CNC", "order_type": "MARKET", "quantity": 1},
+)
+contract = preview.preview.cost_contract
+print(contract.margin_required, contract.total_charges)
+
+basket_preview = client.preview_basket_snapshot(
+    "run_basic_equity_001",
+    [{"exchange": "NSE", "tradingsymbol": "INFY", "transaction_type": "BUY",
+      "variety": "regular", "product": "CNC", "order_type": "MARKET", "quantity": 1}],
+    all_or_none=True,
+)
+
+# Async client mirrors the same helpers:
+# preview = await async_client.preview_order_snapshot("run_basic_equity_001", order)
+# preview = await async_client.preview_basket_snapshot("run_basic_equity_001", orders)
+```
+
+Raw `preview_order(...)` / `preview_basket(...)` still return plain dictionaries for backward compatibility.
+
+**Itemized costs (`CostContract.itemized`)**: an `ItemizedCharges` model with optional float components — `brokerage`, `exchange_transaction_charge`, `stt`, `stamp_duty`, `sebi_charge`, `gst`. Unknown future charge keys returned by the server are preserved in `raw` and round-trip through `model_dump()`. Absent components stay `None` and are never reported as zero.
+
+**DP charge availability**: `dp_charge` is a float only when the backend could compute the depository charge. An absent or unavailable DP charge stays `None` (never `0.0`) and `dp_charge_status` explains why — e.g. `"unavailable"` or `"estimated"`. Treat `dp_charge is None` as "no DP charge information", not "no DP charge".
+
 ### place_order(...)
 
 | Field | Type | Required | Description |
@@ -531,6 +573,38 @@ basket = client.place_basket(
 - `all_or_none=True` means the entire basket is rejected if any leg fails validation
 - `dry_run=True` previews the basket without placing any orders — useful for live operations
 - Basket keys should be as deterministic as single-order keys
+
+### Execution recovery and brackets
+
+The acceptance response is not durable execution truth. After a restart,
+recover backend-owned state from order history, basket/bracket snapshots, and
+cursor-based execution events:
+
+```python
+baskets = client.list_baskets_snapshot("run_basic_equity_001")
+events = client.list_execution_events_snapshot("run_basic_equity_001", after_cursor=0)
+
+for basket in baskets.baskets:
+    print(basket.basket_execution_id, basket.status)
+
+for event in events.events:
+    print(event.cursor, event.event_type)
+```
+
+Bracket lifecycle helpers are `create_bracket(...)`, `list_brackets(...)`,
+`get_bracket(...)`, and `cancel_bracket(...)`. Use `get_order_history(...)` to
+inspect broker transitions rather than inferring fills from an intent response.
+The equivalent async stream uses `async for`:
+
+```python
+async for event in async_client.stream_execution_events(
+    "run_basic_equity_001", after_cursor=events.last_cursor
+):
+    print(event["event_type"])
+```
+
+`export_fundamentals_csv(...)` returns the server-generated CSV text; callers
+choose whether and where to write it.
 
 ## Safety and protection
 
@@ -678,6 +752,115 @@ SSE stream of timeline events.
 for event in client.stream_timeline("run_managed_001"):
     print(event["event_type"], event.get("summary"))
 ```
+
+## Investment data (read-only)
+
+`get_market_calendar(...)`, `get_market_calendar_status(...)`, `get_index_constituents(...)`, `get_index_constituent_status(...)`, and `get_account_portfolio(...)` are **read-only observation endpoints**. They expose official reference data and coherent account snapshots; calling them never enables live execution, never places orders, and never mutates backend state. Live trading still requires the explicit `KITE_ALGO_ENABLE_LIVE=1` gate and a `live` execution-mode run.
+
+Every method has a typed `*_snapshot(...)` variant built on `RawModelMixin`: known fields are typed, unknown additive server fields are preserved in `raw` and round-trip through `model_dump()`.
+
+### Market calendar and status
+
+```python
+calendar = client.get_market_calendar_snapshot("2026-09-01", "2026-12-31", exchange="NSE", segment="CM")
+for session in calendar.sessions:
+    print(session.session_date, session.session_type, session.opens_at, session.closes_at)
+
+status = client.get_market_calendar_status_snapshot(exchange="NSE", segment="CM")
+print(status.active_calendar_version, status.coverage_start, status.coverage_end, status.complete)
+```
+
+- Coverage comes exclusively from the active immutable calendar version. If a requested range is uncovered, the backend returns `503 CALENDAR_RANGE_UNCOVERED` and the SDK raises `CalendarRangeUncoveredError` — an uncovered date is never inferred to be a holiday.
+- `get_market_calendar_status_snapshot(...)` reports `complete` and `expiry_warning` (true when coverage ends within 45 days) plus refresh-state fields, so workers can distinguish "backend can serve this range" from "coverage is about to expire".
+
+### Index constituents and status
+
+```python
+snapshot = client.get_index_constituents_snapshot("Nifty500")
+for member in snapshot.members:
+    print(member.tradingsymbol, member.instrument_token, member.exchange)
+
+index_status = client.get_index_constituent_status_snapshot("Nifty500")
+print(index_status.complete, index_status.actual_member_count, index_status.next_attempt_at)
+```
+
+Status is per source list: success for `Nifty500` implies nothing about `Nifty50` or `NiftyBank`.
+
+### Account portfolio
+
+```python
+portfolio = client.get_account_portfolio_snapshot()  # or account_scope="kite:paper-a"
+print(portfolio.coherent, portfolio.coherence_skew_ms, len(portfolio.holdings), len(portfolio.net_positions))
+```
+
+A portfolio snapshot is evidence about the broker account at a point in time. It is not strategy ownership, not durable P&L history, and not an execution capability.
+
+### Data-unavailable errors
+
+Read surfaces fail closed with typed errors instead of fabricating data:
+
+| Error | Raised when |
+| --- | --- |
+| `WorkerDataUnavailableError` | A 503 response with `CALENDAR_UNAVAILABLE` or `PORTFOLIO_SNAPSHOT_UNAVAILABLE` |
+| `CalendarRangeUncoveredError` | A 503 response with `CALENDAR_RANGE_UNCOVERED` (subclass of `WorkerDataUnavailableError`) |
+| `UnsupportedSchemaVersionError` | A 422 response with `UNSUPPORTED_SCHEMA_VERSION` (subclass of `BrokerValidationError`) |
+| `AuthError` / `PermissionDeniedError` | 401 / 403 responses (unchanged) |
+
+Every `KiteAlgoWorkerError` exposes `status_code`, `response_body`, and a normalized `rejection_reason` taken from `response_body["rejection_reason"]` or `response_body["detail"]["rejection_reason"]`.
+
+```python
+from kite_algo_worker import CalendarRangeUncoveredError, KiteAlgoWorkerClient
+
+try:
+    calendar = client.get_market_calendar_snapshot("2024-01-01", "2024-03-31")
+except CalendarRangeUncoveredError as exc:
+    print(exc.status_code, exc.rejection_reason)  # 503 CALENDAR_RANGE_UNCOVERED
+```
+
+## Fundamentals (0.8.0)
+
+Screener.in-sourced company fundamentals, acquired, stored, and refreshed by the Kite Algo server. Consumers never scrape; they call the SDK. Responses are typed models carrying `schema_version`, `source: "screener"`, and `retrieved_at`.
+
+```python
+from datetime import datetime, timezone
+
+from kite_algo_worker import KiteAlgoWorkerClient, AlgoWorkerConfig
+
+client = KiteAlgoWorkerClient(AlgoWorkerConfig(base_url="http://localhost:18777", token="kwa_..."))
+
+# A single stock or an explicit list
+features = client.get_fundamentals_features(symbols=["RELIANCE", "TCS"])
+row = features.for_symbol("RELIANCE")   # case-insensitive lookup
+print(row.ttm_revenue, row.quarterly_revenue_yoy_pct, row.promoter_holding_pct)
+
+# A whole index universe (currently Nifty50 and Nifty500)
+features = client.get_fundamentals_features(index="Nifty500")
+print(len(features.features), features.missing_symbols)
+
+# Freshness and completeness inspection before use
+status = client.get_fundamentals_status(index="Nifty50")
+if not status.fresh_within("RELIANCE", hours=24.0, now=datetime.now(timezone.utc)):
+    run = client.refresh_fundamentals(symbols=["RELIANCE"], mode="incremental")
+    print(run.symbols_changed, run.symbols_failed)
+
+# Raw statement rows for one symbol
+statements = client.get_fundamentals_statements("RELIANCE", dataset="quarterly")
+for r in statements.rows:
+    print(r["period_end"], r["metric_name"], r["numeric_value"])
+
+# The async client mirrors every method:
+# features = await async_client.get_fundamentals_features(index="Nifty50")
+```
+
+**Scope rule:** scoped methods take exactly one of `symbols` (one or many) or `index` (currently `Nifty50` and `Nifty500`). Passing both or neither raises `ValueError` before any network call. Reads support either index. On-demand refresh is capped after scope resolution at 50 symbols, so `Nifty50` can be refreshed explicitly while `Nifty500` is refreshed by the nightly scheduler.
+
+**Models:** `FundamentalFeatures` (list of `FundamentalFeatureRow` plus `missing_symbols`), `FundamentalsStatus` (per-symbol `last_checked_at`/`last_success_at`/`last_error` plus `recent_runs`), `FundamentalsStatements`, and `FundamentalsSyncRun` (the only mutating response). Unknown additive server fields are preserved in `raw` and round-trip through `model_dump()`.
+
+**Freshness is your policy:** the server stores derived features per symbol and reports `last_success_at` per symbol; apply your own staleness thresholds with `status.fresh_within(...)` before trusting data in time-sensitive strategies.
+
+**Refresh economics and guardrails:** `refresh_fundamentals` is the only mutating fundamentals method and requires a worker token with `market:read`. The server sends HTTP conditional headers when the source provides validators and always uses a content fingerprint to avoid unchanged writes; screener.in currently omits ETag/Last-Modified on observed company pages, so fingerprints are the normal no-op path. Per-symbol failures are isolated, the resolved on-demand scope is capped at 50 symbols, and syncs are single-flighted — a second concurrent refresh raises `KiteAlgoWorkerError` with status `409` ("fundamentals sync already in progress"). The nightly scheduler refreshes every supported index universe at 02:00 IST.
+
+**Read-only guarantee:** all `get_fundamentals_*` methods are observation-only and never enable live execution; the live-mode gate of the platform is unaffected.
 
 ## Options workflows
 

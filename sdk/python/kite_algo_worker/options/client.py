@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Optional
 
+from .._shared import session_headers
 from .models import (
     OptionEntryPreviewRequest,
     OptionExecutionLeg,
@@ -206,12 +207,15 @@ class OptionWorkerClient:
         strategy_name: str,
         product: str,
         legs: Iterable[Mapping[str, Any]],
+        strategy_run_id: str | None = None,
         protection: Optional[Mapping[str, Any]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        session_nonce: str | None = None,
     ) -> dict[str, Any]:
         request_payload = OptionRunCreateRequest(
             strategy_name=strategy_name,
             product=product,
+            strategy_run_id=strategy_run_id,
             legs=[
                 leg if isinstance(leg, OptionExecutionLeg) else OptionExecutionLeg.model_validate(dict(leg))
                 for leg in legs
@@ -222,7 +226,12 @@ class OptionWorkerClient:
         payload = request_payload.model_dump(exclude_none=True)
         if request_payload.protection is None:
             payload.pop("protection", None)
-        return self._client._request("POST", "/worker/options/runs", json=payload)
+        return self._client._request(
+            "POST",
+            "/worker/options/runs",
+            json=payload,
+            headers=session_headers(session_nonce),
+        )
 
     def preview_run_entry(self, strategy_run_id: str, payload: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         return self._client._request("POST", f"/worker/options/runs/{strategy_run_id}/preview-entry", json=dict(payload or {}))

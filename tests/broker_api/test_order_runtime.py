@@ -14,6 +14,7 @@ from backend.broker_api.orders.order_runtime import (
     RealTimePositionsService,
     _acquire_advisory_lock_session,
     _close_locked_session,
+    ensure_order_runtime_schema_compatibility,
 )
 
 
@@ -197,16 +198,42 @@ class FakeRedis:
         return FakeRedisPipeline(self)
 
 
+class FakeCompatDB:
+    def __init__(self):
+        self.statements = []
+        self.commit = MagicMock()
+        self.rollback = MagicMock()
+        self.close = MagicMock()
+
+    def execute(self, statement, params=None):
+        self.statements.append(str(statement))
+        return FakeResult()
+
+
 class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_schema_compatibility_adds_processing_started_at_once(self):
+        fake_db = FakeCompatDB()
+
+        with patch("backend.broker_api.orders.order_runtime.SessionLocal", return_value=fake_db), patch(
+            "backend.broker_api.orders.order_runtime._ORDER_RUNTIME_SCHEMA_COMPAT_READY", False
+        ):
+            await ensure_order_runtime_schema_compatibility()
+            await ensure_order_runtime_schema_compatibility()
+
+        alter_calls = [sql for sql in fake_db.statements if "ADD COLUMN IF NOT EXISTS processing_started_at" in sql]
+        self.assertEqual(len(alter_calls), 1)
+        fake_db.commit.assert_called_once()
+        fake_db.rollback.assert_not_called()
+
     async def test_acquire_advisory_lock_retries_with_fresh_sessions(self):
         connections = [MagicMock(), MagicMock(), MagicMock()]
         sessions = [FakeLockSession(connection) for connection in connections]
 
-        with patch("broker_api.order_runtime.engine.connect", side_effect=connections), patch(
-            "broker_api.order_runtime.Session",
+        with patch("backend.broker_api.orders.order_runtime.engine.connect", side_effect=connections), patch(
+            "backend.broker_api.orders.order_runtime.Session",
             side_effect=sessions,
         ), patch(
-            "broker_api.order_runtime._try_advisory_lock",
+            "backend.broker_api.orders.order_runtime._try_advisory_lock",
             side_effect=[False, False, True],
         ):
             session = await _acquire_advisory_lock_session(99, timeout_seconds=1.0)
@@ -335,7 +362,7 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         }
         redis_client.hashes[service._ltp_key(account_id)] = {position_key: "90.0"}
 
-        with patch("broker_api.order_runtime.get_redis", return_value=redis_client):
+        with patch("backend.broker_api.orders.order_runtime.get_redis", return_value=redis_client):
             positions = await service.get_positions(account_id, corr_id="test")
 
         position = positions[position_key]
@@ -377,8 +404,8 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         redis_client.sets[service._token_keys_key(account_id, 12345)] = {position_key}
         publish_event = AsyncMock()
 
-        with patch("broker_api.order_runtime.get_redis", return_value=redis_client), patch(
-            "broker_api.order_runtime.publish_event",
+        with patch("backend.broker_api.orders.order_runtime.get_redis", return_value=redis_client), patch(
+            "backend.broker_api.orders.order_runtime.publish_event",
             publish_event,
         ):
             await service.process_ticks([{"instrument_token": 12345, "last_price": 120.0}], corr_id="tick")
@@ -401,14 +428,14 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         kite = SimpleNamespace(order_trades=MagicMock(return_value=[{"trade_id": "T1", "order_id": "OID-1"}]))
 
-        with patch("broker_api.order_runtime._acquire_advisory_lock_session", AsyncMock(return_value=db)), patch(
-            "broker_api.order_runtime._release_advisory_lock"
-        ), patch("broker_api.order_runtime._close_locked_session"), patch.object(
+        with patch("backend.broker_api.orders.order_runtime._acquire_advisory_lock_session", AsyncMock(return_value=db)), patch(
+            "backend.broker_api.orders.order_runtime._release_advisory_lock"
+        ), patch("backend.broker_api.orders.order_runtime._close_locked_session"), patch.object(
             runtime, "_store_trade_fills", return_value=1
         ), patch.object(
             runtime, "_apply_pending_trade_fills", return_value=1
-        ), patch("broker_api.order_runtime.asyncio.to_thread", _run_to_thread_inline), patch(
-            "broker_api.order_runtime.LiveJournalProjector"
+        ), patch("backend.broker_api.orders.order_runtime.asyncio.to_thread", _run_to_thread_inline), patch(
+            "backend.broker_api.orders.order_runtime.LiveJournalProjector"
         ) as projector_cls:
             projector = MagicMock()
             projector.project.return_value = {"projected": 1, "imported": 0}
@@ -452,14 +479,14 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         db = MagicMock()
         db.begin_nested.return_value = nullcontext()
 
-        with patch("broker_api.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
-            "broker_api.order_runtime._acquire_advisory_lock_session",
+        with patch("backend.broker_api.orders.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
+            "backend.broker_api.orders.order_runtime._acquire_advisory_lock_session",
             AsyncMock(return_value=db),
-        ), patch("broker_api.order_runtime._release_advisory_lock"), patch(
-            "broker_api.order_runtime._close_locked_session"
+        ), patch("backend.broker_api.orders.order_runtime._release_advisory_lock"), patch(
+            "backend.broker_api.orders.order_runtime._close_locked_session"
         ), patch.object(runtime, "_claim_pending_events", return_value=[row]), patch.object(
             runtime, "_upsert_projection_from_event"
-        ), patch("broker_api.order_runtime.publish_event", AsyncMock()) as publish_event:
+        ), patch("backend.broker_api.orders.order_runtime.publish_event", AsyncMock()) as publish_event:
             processed = await runtime.process_pending_events(batch_size=10)
 
         self.assertEqual(processed, 1)
@@ -488,14 +515,14 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         db = MagicMock()
         db.begin_nested.return_value = nullcontext()
 
-        with patch("broker_api.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
-            "broker_api.order_runtime._acquire_advisory_lock_session",
+        with patch("backend.broker_api.orders.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
+            "backend.broker_api.orders.order_runtime._acquire_advisory_lock_session",
             AsyncMock(return_value=db),
-        ), patch("broker_api.order_runtime._release_advisory_lock"), patch(
-            "broker_api.order_runtime._close_locked_session"
+        ), patch("backend.broker_api.orders.order_runtime._release_advisory_lock"), patch(
+            "backend.broker_api.orders.order_runtime._close_locked_session"
         ), patch.object(runtime, "_claim_pending_events", return_value=[row]), patch.object(
             runtime, "_upsert_projection_from_event"
-        ), patch("broker_api.order_runtime.publish_event", AsyncMock()) as publish_event:
+        ), patch("backend.broker_api.orders.order_runtime.publish_event", AsyncMock()) as publish_event:
             processed = await runtime.process_pending_events(batch_size=10)
 
         self.assertEqual(processed, 1)
@@ -537,14 +564,14 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         db = MagicMock()
         db.begin_nested.return_value = nullcontext()
 
-        with patch("broker_api.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
-            "broker_api.order_runtime._acquire_advisory_lock_session",
+        with patch("backend.broker_api.orders.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
+            "backend.broker_api.orders.order_runtime._acquire_advisory_lock_session",
             AsyncMock(return_value=db),
-        ), patch("broker_api.order_runtime._release_advisory_lock"), patch(
-            "broker_api.order_runtime._close_locked_session"
+        ), patch("backend.broker_api.orders.order_runtime._release_advisory_lock"), patch(
+            "backend.broker_api.orders.order_runtime._close_locked_session"
         ), patch.object(runtime, "_claim_pending_events", return_value=[row]), patch.object(
             runtime, "_upsert_projection_from_event"
-        ), patch("broker_api.order_runtime.publish_event", AsyncMock()) as publish_event:
+        ), patch("backend.broker_api.orders.order_runtime.publish_event", AsyncMock()) as publish_event:
             processed = await runtime.process_pending_events(batch_size=10)
 
         self.assertEqual(processed, 1)
@@ -587,14 +614,14 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         db = MagicMock()
         db.begin_nested.return_value = nullcontext()
 
-        with patch("broker_api.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
-            "broker_api.order_runtime._acquire_advisory_lock_session",
+        with patch("backend.broker_api.orders.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
+            "backend.broker_api.orders.order_runtime._acquire_advisory_lock_session",
             AsyncMock(return_value=db),
-        ), patch("broker_api.order_runtime._release_advisory_lock"), patch(
-            "broker_api.order_runtime._close_locked_session"
+        ), patch("backend.broker_api.orders.order_runtime._release_advisory_lock"), patch(
+            "backend.broker_api.orders.order_runtime._close_locked_session"
         ), patch.object(runtime, "_claim_pending_events", return_value=[row]), patch.object(
             runtime, "_upsert_projection_from_event"
-        ), patch("broker_api.order_runtime.publish_event", AsyncMock()) as publish_event:
+        ), patch("backend.broker_api.orders.order_runtime.publish_event", AsyncMock()) as publish_event:
             processed = await runtime.process_pending_events(batch_size=10)
 
         self.assertEqual(processed, 1)
@@ -625,14 +652,14 @@ class OrderRuntimeTests(unittest.IsolatedAsyncioTestCase):
         db = MagicMock()
         db.begin_nested.return_value = nullcontext()
 
-        with patch("broker_api.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
-            "broker_api.order_runtime._acquire_advisory_lock_session",
+        with patch("backend.broker_api.orders.order_runtime.ensure_order_runtime_schema_compatibility", AsyncMock()), patch(
+            "backend.broker_api.orders.order_runtime._acquire_advisory_lock_session",
             AsyncMock(return_value=db),
-        ), patch("broker_api.order_runtime._release_advisory_lock"), patch(
-            "broker_api.order_runtime._close_locked_session"
+        ), patch("backend.broker_api.orders.order_runtime._release_advisory_lock"), patch(
+            "backend.broker_api.orders.order_runtime._close_locked_session"
         ), patch.object(runtime, "_claim_pending_events", return_value=[row]), patch.object(
             runtime, "_upsert_projection_from_event"
-        ), patch("broker_api.order_runtime.publish_event", AsyncMock()) as publish_event:
+        ), patch("backend.broker_api.orders.order_runtime.publish_event", AsyncMock()) as publish_event:
             processed = await runtime.process_pending_events(batch_size=10)
 
         self.assertEqual(processed, 1)

@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -164,6 +165,18 @@ def parse_constituent_csv(text: str) -> List[Dict[str, str]]:
     return rows
 
 
+def is_tradable_constituent(item: Mapping[str, Any]) -> bool:
+    """Reject NSE's synthetic corporate-action placeholders from execution universes."""
+    symbol = str(item.get("symbol") or "").strip().upper()
+    isin_code = str(item.get("isin_code") or "").strip().upper()
+    company_name = str(item.get("company_name") or "").strip().lower()
+    return not (
+        symbol.startswith("DUMMY")
+        or isin_code.startswith("DUM")
+        or company_name.startswith("dummy ")
+    )
+
+
 def parse_top_holdings_csv(text: str) -> Dict[str, float]:
     reader = csv.DictReader(io.StringIO(text.strip()))
     weights: Dict[str, float] = {}
@@ -251,61 +264,78 @@ class NseDataClient:
         return dict(payload or {})
 
 
-def ensure_index_ingestion_schema(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS isin_code VARCHAR(32)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS series VARCHAR(32)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS source_url TEXT")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS weight_source VARCHAR(128)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS points_contribution NUMERIC(18, 4)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS last_refreshed_at TIMESTAMP WITH TIME ZONE")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_close NUMERIC(18, 6)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_index_weight NUMERIC(10, 4)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_freefloat_marketcap NUMERIC(20, 2)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_ff_factor NUMERIC(24, 10)")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS baseline_as_of_date DATE")
-        cur.execute("ALTER TABLE public.kite_ticker_tickers ADD COLUMN IF NOT EXISTS needs_weight_review BOOLEAN NOT NULL DEFAULT FALSE")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS public.index_refresh_state (
-                source_list VARCHAR(255) PRIMARY KEY,
-                last_constituent_refresh_at TIMESTAMP WITH TIME ZONE,
-                last_live_refresh_at TIMESTAMP WITH TIME ZONE,
-                added_symbols_json TEXT,
-                removed_symbols_json TEXT,
-                needs_review BOOLEAN NOT NULL DEFAULT FALSE,
-                last_error TEXT,
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+def _resolve_nse_instrument_map(
+    constituents: Sequence[Mapping[str, Any]],
+    rows: Sequence[Sequence[Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Resolve official NSE symbols to one current NSE instrument-master row.
+
+    Kite may suffix a cash-market trading symbol when the security moves to a
+    different series (for example ``SCHNEIDER-BE``).  An NSE index must never
+    fall back to an exact BSE symbol merely because the NSE row is suffixed.
+    """
+
+    candidates: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        tradingsymbol, instrument_token, exchange = row[:3]
+        last_updated = row[3] if len(row) > 3 else None
+        if str(exchange).strip().upper() != "NSE":
+            continue
+        value = {
+            "tradingsymbol": str(tradingsymbol),
+            "instrument_token": instrument_token,
+            "exchange": "NSE",
+            "_last_updated": last_updated,
+        }
+        for item in constituents:
+            official_symbol = str(item.get("symbol") or "").strip()
+            if tradingsymbol == official_symbol or str(tradingsymbol).startswith(
+                f"{official_symbol}-"
+            ):
+                candidates.setdefault(official_symbol, []).append(value)
+
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for item in constituents:
+        official_symbol = str(item.get("symbol") or "").strip()
+        matches = candidates.get(official_symbol, [])
+        dated = [candidate for candidate in matches if candidate.get("_last_updated") is not None]
+        if dated:
+            newest = max(candidate["_last_updated"] for candidate in dated)
+            matches = [candidate for candidate in matches if candidate.get("_last_updated") == newest]
+        exact = [candidate for candidate in matches if candidate["tradingsymbol"] == official_symbol]
+        selected = exact if exact else matches
+        if len(selected) > 1:
+            symbols = ", ".join(sorted(str(item["tradingsymbol"]) for item in selected))
+            raise RuntimeError(
+                f"Ambiguous NSE instrument mapping for {official_symbol}: {symbols}"
             )
-            """
-        )
-    conn.commit()
+        if selected:
+            resolved[official_symbol] = {
+                key: value for key, value in selected[0].items() if not key.startswith("_")
+            }
+    return resolved
 
 
-def _load_instrument_map(conn, symbols: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+def _load_instrument_map(
+    conn, constituents: Sequence[Mapping[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    symbols = [str(item.get("symbol") or "").strip() for item in constituents]
+    symbols = [symbol for symbol in symbols if symbol]
     if not symbols:
         return {}
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT tradingsymbol, instrument_token, exchange
+            SELECT tradingsymbol, instrument_token, exchange, last_updated
             FROM kite_instruments
             WHERE instrument_type = 'EQ'
-              AND exchange IN ('NSE', 'BSE')
-              AND tradingsymbol = ANY(%s)
-            ORDER BY tradingsymbol,
-                     CASE WHEN exchange = 'NSE' THEN 0 ELSE 1 END,
-                     instrument_token
+              AND exchange = 'NSE'
+              AND (tradingsymbol = ANY(%s) OR tradingsymbol LIKE ANY(%s))
+            ORDER BY tradingsymbol, instrument_token
             """,
-            (list(symbols),),
+            (symbols, [f"{symbol}-%" for symbol in symbols]),
         )
-        instrument_map: Dict[str, Dict[str, Any]] = {}
-        for row in cur.fetchall():
-            instrument_map.setdefault(
-                row[0],
-                {"tradingsymbol": row[0], "instrument_token": row[1], "exchange": row[2]},
-            )
-        return instrument_map
+        return _resolve_nse_instrument_map(constituents, cur.fetchall())
 
 
 def _load_existing_rows(conn, source_list: str) -> Dict[str, Dict[str, Any]]:
@@ -379,7 +409,6 @@ def get_index_refresh_state(source_list: str) -> Dict[str, Any]:
     normalized = normalize_source_list(source_list)
     conn = get_db_connection()
     try:
-        ensure_index_ingestion_schema(conn)
         return _load_refresh_state_row(conn, normalized)
     finally:
         conn.close()
@@ -392,14 +421,19 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
     client = client or NseDataClient()
     conn = get_db_connection()
     try:
-        ensure_index_ingestion_schema(conn)
         constituent_csv = client.fetch_text(config.constituent_csv_url, referer="https://www.nseindia.com/all-reports/", use_nse=True)
-        constituents = parse_constituent_csv(constituent_csv)
-        symbols = [row["symbol"] for row in constituents]
-        instrument_map = _load_instrument_map(conn, symbols)
+        constituents = [
+            item for item in parse_constituent_csv(constituent_csv)
+            if is_tradable_constituent(item)
+        ]
+        source_checksum = hashlib.sha256(constituent_csv.encode("utf-8")).hexdigest()
+        instrument_map = _load_instrument_map(conn, constituents)
         existing_rows = _load_existing_rows(conn, normalized)
         old_symbols = set(existing_rows.keys())
-        new_symbols = {symbol for symbol in symbols if symbol in instrument_map}
+        new_symbols = {
+            str(instrument["tradingsymbol"])
+            for instrument in instrument_map.values()
+        }
         added_symbols = sorted(new_symbols - old_symbols)
         removed_symbols = sorted(old_symbols - new_symbols)
         now_utc = datetime.now(timezone.utc)
@@ -412,16 +446,17 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
             if not instrument:
                 unmatched_symbols.append(symbol)
                 continue
-            existing = existing_rows.get(symbol, {})
+            resolved_symbol = str(instrument["tradingsymbol"])
+            existing = existing_rows.get(resolved_symbol, {})
             needs_review = bool(existing.get("needs_weight_review"))
-            if symbol in added_symbols:
+            if resolved_symbol in added_symbols:
                 needs_review = True
             if normalized in {SOURCE_LIST_NIFTY50, SOURCE_LIST_NIFTYBANK} and existing.get("baseline_ff_factor") is None:
                 needs_review = True
             prepared_rows.append(
                 {
                     "instrument_token": instrument["instrument_token"],
-                    "tradingsymbol": symbol,
+                    "tradingsymbol": resolved_symbol,
                     "company_name": item["company_name"],
                     "sector": item["industry"] or existing.get("sector"),
                     "exchange": instrument.get("exchange") or existing.get("exchange") or "NSE",
@@ -453,8 +488,14 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
                 }
             )
 
-        if not prepared_rows:
-            raise RuntimeError(f"No constituents prepared for {normalized}; keeping previous snapshot")
+        if unmatched_symbols:
+            raise RuntimeError(
+                f"Unmatched NSE constituents for {normalized}: {', '.join(sorted(unmatched_symbols))}"
+            )
+        if not prepared_rows or any(row["exchange"] != "NSE" for row in prepared_rows):
+            raise RuntimeError(
+                f"No complete NSE constituent snapshot prepared for {normalized}; keeping previous snapshot"
+            )
 
         with conn.cursor() as cur:
             cur.execute("DELETE FROM public.kite_ticker_tickers WHERE source_list = %s", (normalized,))
@@ -486,6 +527,12 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
                 needs_review=bool(added_symbols or removed_symbols or any(row["needs_weight_review"] for row in prepared_rows)),
                 constituent_refresh_at=now_utc,
             )
+            cur.execute(
+                """UPDATE public.index_refresh_state SET official_source_url=%s, source_checksum=%s,
+                    expected_member_count=%s, actual_member_count=%s, complete=%s, last_attempt_at=%s,
+                    last_success_at=%s, last_failure_at=NULL, next_attempt_at=NULL, last_error=NULL WHERE source_list=%s""",
+                (config.constituent_csv_url, source_checksum, len(constituents), len(prepared_rows), len(constituents) == len(prepared_rows), now_utc, now_utc, normalized),
+            )
         conn.commit()
 
         if normalized == SOURCE_LIST_NIFTY50:
@@ -512,6 +559,12 @@ def refresh_single_index_constituents(source_list: str, *, client: Optional[NseD
                 needs_review=True,
                 last_error=str(exc),
             )
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE public.index_refresh_state SET complete=FALSE, last_attempt_at=NOW(),
+                        last_failure_at=NOW(), next_attempt_at=NOW() + INTERVAL '5 minutes' WHERE source_list=%s""",
+                    (normalized,),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -540,7 +593,6 @@ def apply_manual_baseline_seed(
     client = client or NseDataClient()
     conn = get_db_connection()
     try:
-        ensure_index_ingestion_schema(conn)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 "SELECT instrument_token, tradingsymbol, close, baseline_close, baseline_ff_factor FROM public.kite_ticker_tickers WHERE source_list = %s",
@@ -775,7 +827,6 @@ def refresh_live_metrics(source_list: str, *, client: Optional[NseDataClient] = 
     client = client or NseDataClient()
     conn = get_db_connection()
     try:
-        ensure_index_ingestion_schema(conn)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
@@ -879,7 +930,6 @@ def ensure_fresh_live_metrics(source_list: str, *, max_age_seconds: int = 900) -
     normalized = normalize_source_list(source_list)
     conn = get_db_connection()
     try:
-        ensure_index_ingestion_schema(conn)
         with conn.cursor() as cur:
             cur.execute("SELECT MAX(last_updated) FROM public.kite_ticker_tickers WHERE source_list = %s", (normalized,))
             row = cur.fetchone()
@@ -941,4 +991,72 @@ def refresh_live_metrics_for_indices(source_lists: Optional[Iterable[str]] = Non
         "status": "success" if not failures else ("partial_success" if results else "error"),
         "results": results,
         "failures": failures,
+    }
+
+
+def get_worker_index_status(source_list: str) -> Dict[str, Any]:
+    """Return per-list readiness without treating another index as evidence."""
+    normalized = normalize_source_list(source_list)
+    state = get_index_refresh_state(normalized)
+    refreshed = state.get("last_success_at") or state.get("last_constituent_refresh_at")
+    requires_weight_review = normalized in {SOURCE_LIST_NIFTY50, SOURCE_LIST_NIFTYBANK}
+    review_blocked = requires_weight_review and bool(
+        state.get("needs_review") or state.get("pending_review_count")
+    )
+    return {
+        "schema_version": 1,
+        "source": state.get("official_source_url") or "nse_official_constituent_csv",
+        "source_as_of": refreshed.isoformat() if refreshed else None,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "source_list": normalized,
+        "last_success_at": refreshed.isoformat() if refreshed else None,
+        "last_failure": state.get("last_error"),
+        "next_attempt_at": state.get("next_attempt_at").isoformat() if state.get("next_attempt_at") else None,
+        "expected_member_count": state.get("expected_member_count"),
+        "actual_member_count": state.get("actual_member_count"),
+        "checksum": state.get("source_checksum"),
+        "complete": bool(state.get("complete") and refreshed and not state.get("last_error") and not review_blocked),
+    }
+
+
+def index_refresh_is_due(state: Mapping[str, Any], *, month_key: str, timezone_name: str = "Asia/Kolkata") -> bool:
+    """A list is ready only after its own complete success in the current month."""
+    refreshed = state.get("last_success_at") or state.get("last_constituent_refresh_at")
+    if not refreshed or not bool(state.get("complete")) or state.get("last_error"):
+        return True
+    if getattr(refreshed, "tzinfo", None) is None:
+        refreshed = refreshed.replace(tzinfo=timezone.utc)
+    from zoneinfo import ZoneInfo
+    return refreshed.astimezone(ZoneInfo(timezone_name)).strftime("%Y-%m") != month_key
+
+
+def get_worker_index_snapshot(source_list: str) -> Dict[str, Any]:
+    normalized = normalize_source_list(source_list)
+    status = get_worker_index_status(normalized)
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""SELECT instrument_token,tradingsymbol,exchange,company_name,sector,series,source_url,last_refreshed_at
+                FROM public.kite_ticker_tickers WHERE source_list=%s ORDER BY exchange,tradingsymbol,instrument_token""", (normalized,))
+            members = [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+    identities = [(row.get("exchange"), row.get("tradingsymbol"), row.get("instrument_token")) for row in members]
+    if not members or len(identities) != len(set(identities)):
+        raise RuntimeError("INDEX_UNIVERSE_INCOMPLETE")
+    complete = bool(status["complete"])
+    if not complete:
+        raise RuntimeError("INDEX_UNIVERSE_INCOMPLETE")
+    effective_date = str(status["source_as_of"])[:10]
+    return {
+        "schema_version": 1,
+        "source": status["source"],
+        "source_as_of": status["source_as_of"],
+        "effective_date": effective_date,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "source_list": normalized,
+        "complete": True,
+        "member_count": len(members),
+        "checksum": status["checksum"],
+        "members": members,
     }

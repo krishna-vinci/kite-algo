@@ -10,8 +10,14 @@ from sqlalchemy import text
 from backend.app.database import SessionLocal
 from backend.broker_api.orders.basket_execution import basket_execution_store
 from backend.broker_api.orders.bracket_runtime import bracket_runtime_store
-from backend.api.schemas.worker import WorkerBasketPreviewRequest, WorkerBracketCreateRequest, WorkerExitRequest, WorkerIntentRequest, WorkerOrderActionRequest, WorkerOrderModifyRequest, WorkerOrderPreviewRequest
+from backend.api.schemas.worker import WorkerBasketPreviewRequest, WorkerBracketCreateRequest, WorkerExitRequest, WorkerIntentRequest, WorkerOrderActionRequest, WorkerOrderModifyRequest, WorkerOrderPreviewRequest, WorkerProgressRequest, WorkerRunNotifyRequest
 from backend.api.routers.worker_shared import *
+from backend.api.services.hosted_attempt import (
+    enforce_hosted_attempt_authority,
+    hosted_job_for_run,
+    record_hosted_progress,
+)
+from backend.shared.serialization import _json_dumps
 from backend.api.routers.worker_protection import _build_worker_run_pnl_snapshot, validate_worker_run_safety_token
 from backend.algo_runtime.execution_attribution import build_execution_attribution, build_paper_execution_attribution
 
@@ -528,6 +534,7 @@ async def cancel_worker_order(request: Request, order_id: str, payload: WorkerOr
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     _require_live_run(run, feature="Order cancellation")
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
     corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-cancel-{uuid.uuid4()}"
@@ -550,6 +557,7 @@ async def modify_worker_order(request: Request, order_id: str, payload: WorkerOr
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     _require_live_run(run, feature="Order modification")
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
     corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-modify-{uuid.uuid4()}"
@@ -636,6 +644,7 @@ async def create_worker_bracket(request: Request, strategy_run_id: str, payload:
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     _require_live_run(run, feature="Bracket intents")
     await require_active_worker_run_session(request, run)
 
@@ -772,6 +781,7 @@ async def cancel_worker_bracket(request: Request, strategy_run_id: str, bracket_
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     _require_live_run(run, feature="Bracket intents")
     await require_active_worker_run_session(request, run)
 
@@ -803,6 +813,7 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     await require_active_worker_run_session(request, run)
     if str(run.get("status") or "open") != "open":
         raise HTTPException(status_code=409, detail="Worker intents can only be submitted for open strategy runs")
@@ -937,6 +948,7 @@ async def exit_worker_run(request: Request, strategy_run_id: str, payload: Worke
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
+    await enforce_hosted_attempt_authority(request, token, run)
     await require_active_worker_run_session(request, run)
     mode = str(run.get("execution_mode") or "").lower()
     _require_v1_mode(mode)
@@ -958,8 +970,86 @@ async def exit_worker_run(request: Request, strategy_run_id: str, payload: Worke
     return {"mode": "paper", "status": result_status, "result": result, "run": updated}
 
 
+async def report_worker_run_progress(request: Request, strategy_run_id: str, payload: WorkerProgressRequest):
+    """Accept a child-authenticated progress marker for a hosted attempt.
+
+    The note is length-bounded but not persisted; only the arrival time is
+    recorded. Progress requires a live attempt, a matching session nonce and the
+    child token's ``runs:progress`` action. It is the *only* writer of
+    ``last_progress_at`` — the supervisor heartbeat never writes it.
+    """
+    token = await require_worker_token(request)
+    _require_action(token, "runs:progress")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    await require_active_worker_run_session(request, run)
+    result = await record_hosted_progress(request, token, run)
+    return {"status": "ok", "strategy_run_id": strategy_run_id, "recorded": result["updated"]}
+
+
+async def notify_worker_run(request: Request, strategy_run_id: str, payload: WorkerRunNotifyRequest):
+    """Enqueue a run-scoped notification from a hosted child.
+
+    Authorization is the hosted strategy's **app owner** (derived from the
+    persisted job, never the account scope or the worker token). Requires the
+    ``notifications:publish`` action, a live hosted attempt and the session
+    nonce. Unknown/unauthorized/disabled channels are explicit errors and no
+    partial write occurs; provider acceptance is not confirmed receipt, and a
+    notification outcome never authorizes trading.
+    """
+    from backend.notifications.repository import RunNotificationError, SqlAlchemyNotificationRepository
+
+    token = await require_worker_token(request)
+    _require_action(token, "notifications:publish")
+    run = await _repo(request).get_run(strategy_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Strategy run not found")
+    _assert_run_access(token, run)
+    job = await hosted_job_for_run(request, run)
+    if job is None:
+        raise HTTPException(
+            status_code=403,
+            detail={"rejection_reason": "HOSTED_NOTIFY_UNSUPPORTED", "strategy_run_id": strategy_run_id},
+        )
+    await enforce_hosted_attempt_authority(request, token, run)
+    await require_active_worker_run_session(request, run)
+
+    repository = getattr(request.app.state, "notification_repository", None)
+    if repository is None:
+        factory = getattr(request.app.state, "alerts_session_factory", None)
+        if factory is None:
+            factory = SessionLocal
+        repository = SqlAlchemyNotificationRepository(factory)
+
+    try:
+        result = await asyncio.to_thread(
+            repository.enqueue_run_notification,
+            owner_id=str(job.owner_id),
+            run_id=strategy_run_id,
+            channel_names=list(payload.channels),
+            text=payload.text,
+            subject=payload.subject,
+            idempotency_key=payload.idempotency_key,
+        )
+    except RunNotificationError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"rejection_reason": exc.code, "message": exc.detail, "strategy_run_id": strategy_run_id},
+        ) from exc
+    return {
+        "strategy_run_id": strategy_run_id,
+        "status": result["status"],
+        "event_id": result["event_id"],
+        "delivery_count": result["delivery_count"],
+    }
+
+
 router.add_api_route("/worker/orders", list_worker_orders, methods=["GET"])
 router.add_api_route("/worker/trades", list_worker_trades, methods=["GET"])
+router.add_api_route("/worker/runs/{strategy_run_id}/progress", report_worker_run_progress, methods=["POST"])
+router.add_api_route("/worker/runs/{strategy_run_id}/notify", notify_worker_run, methods=["POST"])
 router.add_api_route("/worker/orders/{order_id}", get_worker_order, methods=["GET"])
 router.add_api_route("/worker/orders/{order_id}/history", get_worker_order_history, methods=["GET"])
 router.add_api_route("/worker/orders/{order_id}/cancel", cancel_worker_order, methods=["POST"])

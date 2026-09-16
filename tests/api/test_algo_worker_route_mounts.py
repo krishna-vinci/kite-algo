@@ -7,7 +7,7 @@ import types
 from fastapi import FastAPI
 from starlette.routing import Route, WebSocketRoute
 
-from tests.support.test_support import install_dependency_stubs
+from tests.support.test_support import install_dependency_stubs, iter_mounted_routes
 
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/kite_algo_test")
 
@@ -54,18 +54,24 @@ def test_generic_algo_worker_routes_are_mounted() -> None:
         ("DELETE", "/api/algo-workers/worker/runs/{strategy_run_id}/claim-session"),
         ("POST", "/api/algo-workers/worker/runs/{strategy_run_id}/heartbeat"),
         ("POST", "/api/algo-workers/worker/runs"),
+        ("GET", "/api/algo-workers/worker/runs"),
         ("GET", "/api/algo-workers/worker/runs/{strategy_run_id}"),
         ("GET", "/api/algo-workers/worker/runs/{strategy_run_id}/safety-check"),
         ("GET", "/api/algo-workers/worker/market/instruments/resolve"),
         ("GET", "/api/algo-workers/worker/market/instruments/search"),
         ("POST", "/api/algo-workers/worker/market/instruments/resolve"),
         ("POST", "/api/algo-workers/worker/market/quotes"),
+        ("POST", "/api/algo-workers/worker/indicators"),
         ("GET", "/api/algo-workers/worker/market/ticks/stream"),
         ("GET", "/api/algo-workers/worker/market/candles"),
         ("GET", "/api/algo-workers/worker/market/history"),
         ("GET", "/api/algo-workers/worker/market/candles/stream"),
         ("POST", "/api/algo-workers/worker/market/snapshot"),
         ("GET", "/api/algo-workers/worker/funds"),
+        ("GET", "/api/algo-workers/worker/account/portfolio"),
+        ("GET", "/api/algo-workers/worker/market/indices/{source_list}"),
+        ("GET", "/api/algo-workers/worker/market/indices/{source_list}/status"),
+        ("GET", "/api/algo-workers/worker/market/calendar"),
         ("GET", "/api/algo-workers/worker/runs/{strategy_run_id}/funds"),
         ("GET", "/api/algo-workers/worker/runs/{strategy_run_id}/pnl"),
         ("GET", "/api/algo-workers/worker/runs/{strategy_run_id}/pnl/stream"),
@@ -102,13 +108,13 @@ def test_generic_algo_worker_routes_are_mounted() -> None:
     mounted_http: set[tuple[str, str]] = set()
     mounted_ws: set[str] = set()
 
-    for route in app.router.routes:
+    for path, route in iter_mounted_routes(app.router):
         if isinstance(route, Route):
             for method in route.methods or set():
                 if method in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
-                    mounted_http.add((method, route.path))
+                    mounted_http.add((method, path))
         elif isinstance(route, WebSocketRoute):
-            mounted_ws.add(route.path)
+            mounted_ws.add(path)
 
     missing_http = sorted(expected_http - mounted_http)
     missing_ws = sorted(expected_ws - mounted_ws)

@@ -1,4 +1,6 @@
 import unittest
+from datetime import datetime, timezone
+from unittest.mock import Mock, patch
 
 from tests.support.test_support import install_dependency_stubs
 
@@ -9,16 +11,69 @@ from backend.broker_api.instruments.index_ingestion import (
     NIFTYBANK_MANUAL_BASELINES,
     SOURCE_LIST_NIFTY50,
     SOURCE_LIST_NIFTYBANK,
+    SOURCE_LIST_NIFTY500,
     compute_baseline_ff_factor,
     compute_live_weight,
     compute_points_contribution,
+    index_refresh_is_due,
+    get_index_refresh_state,
+    get_worker_index_snapshot,
+    get_worker_index_status,
+    is_tradable_constituent,
     normalize_source_list,
     parse_constituent_csv,
     parse_top_holdings_csv,
+    _resolve_nse_instrument_map,
 )
 
 
 class IndexIngestionHelpersTests(unittest.TestCase):
+    def test_nse_series_symbol_wins_over_exact_bse_symbol(self):
+        resolved = _resolve_nse_instrument_map(
+            [{"symbol": "SCHNEIDER", "series": "EQ"}],
+            [
+                ("SCHNEIDER", 136739588, "BSE"),
+                ("SCHNEIDER-BE", 7996929, "NSE"),
+            ],
+        )
+
+        self.assertEqual(
+            resolved["SCHNEIDER"],
+            {
+                "tradingsymbol": "SCHNEIDER-BE",
+                "instrument_token": 7996929,
+                "exchange": "NSE",
+            },
+        )
+
+    def test_ambiguous_nse_series_symbols_fail_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "Ambiguous NSE instrument mapping"):
+            _resolve_nse_instrument_map(
+                [{"symbol": "DEMO", "series": "EQ"}],
+                [
+                    ("DEMO-BE", 101, "NSE"),
+                    ("DEMO-SM", 202, "NSE"),
+                ],
+            )
+
+    def test_newer_nse_series_symbol_replaces_stale_exact_symbol(self):
+        resolved = _resolve_nse_instrument_map(
+            [{"symbol": "HEG", "series": "EQ"}],
+            [
+                ("HEG", 342017, "NSE", datetime(2026, 5, 8, tzinfo=timezone.utc)),
+                ("HEG-BE", 1886209, "NSE", datetime(2026, 9, 5, tzinfo=timezone.utc)),
+            ],
+        )
+
+        self.assertEqual(
+            resolved["HEG"],
+            {
+                "tradingsymbol": "HEG-BE",
+                "instrument_token": 1886209,
+                "exchange": "NSE",
+            },
+        )
+
     def test_parse_constituent_csv_extracts_official_fields(self):
         rows = parse_constituent_csv(
             "Company Name,Industry,Symbol,Series,ISIN Code\n"
@@ -29,6 +84,26 @@ class IndexIngestionHelpersTests(unittest.TestCase):
         self.assertEqual(rows[0]["symbol"], "HDFCBANK")
         self.assertEqual(rows[0]["series"], "EQ")
         self.assertEqual(rows[1]["isin_code"], "INE090A01021")
+
+    def test_nse_dummy_corporate_action_row_is_not_tradable(self):
+        self.assertFalse(
+            is_tradable_constituent(
+                {
+                    "symbol": "DUMMYHEG",
+                    "company_name": "Dummy HEG Ltd.",
+                    "isin_code": "DUM545A01024",
+                }
+            )
+        )
+        self.assertTrue(
+            is_tradable_constituent(
+                {
+                    "symbol": "HEG",
+                    "company_name": "H.E.G. Ltd.",
+                    "isin_code": "INE545A01024",
+                }
+            )
+        )
 
     def test_parse_top_holdings_csv(self):
         weights = parse_top_holdings_csv(
@@ -57,6 +132,117 @@ class IndexIngestionHelpersTests(unittest.TestCase):
 
     def test_default_niftybank_manual_baseline_contains_hdfcbank(self):
         self.assertEqual(NIFTYBANK_MANUAL_BASELINES["HDFCBANK"]["weight"], 25.77)
+
+    def test_nifty500_failure_is_due_even_when_nifty50_succeeded_this_month(self):
+        now_month = "2026-08"
+        nifty50 = {"last_success_at": datetime(2026, 8, 1, tzinfo=timezone.utc), "complete": True, "last_error": None}
+        nifty500 = {"last_success_at": None, "complete": False, "last_error": "download failed"}
+        self.assertFalse(index_refresh_is_due(nifty50, month_key=now_month))
+        self.assertTrue(index_refresh_is_due(nifty500, month_key=now_month))
+
+    def test_status_lookup_never_runs_runtime_schema_ddl(self):
+        connection = Mock()
+        expected = {"source_list": "Nifty500", "complete": False}
+        with (
+            patch(
+                "backend.broker_api.instruments.index_ingestion.get_db_connection",
+                return_value=connection,
+            ),
+            patch(
+                "backend.broker_api.instruments.index_ingestion._load_refresh_state_row",
+                return_value=expected,
+            ),
+        ):
+            self.assertEqual(get_index_refresh_state("Nifty500"), expected)
+        connection.close.assert_called_once()
+
+    def test_nifty500_readiness_does_not_require_legacy_weight_review(self):
+        base = {
+            "last_success_at": datetime(2026, 8, 29, tzinfo=timezone.utc),
+            "complete": True,
+            "last_error": None,
+            "needs_review": True,
+            "pending_review_count": 500,
+        }
+        with patch(
+            "backend.broker_api.instruments.index_ingestion.get_index_refresh_state",
+            return_value=base,
+        ):
+            self.assertTrue(get_worker_index_status(SOURCE_LIST_NIFTY500)["complete"])
+            self.assertFalse(get_worker_index_status(SOURCE_LIST_NIFTY50)["complete"])
+
+    def test_worker_snapshot_selects_and_preserves_nullable_sector(self):
+        rows = [
+            {
+                "exchange": "NSE",
+                "tradingsymbol": "HDFCBANK",
+                "instrument_token": 101,
+                "company_name": "HDFC Bank Ltd.",
+                "sector": "Financial Services",
+                "series": "EQ",
+                "source_url": "https://example.test/nifty500.csv",
+                "last_refreshed_at": datetime(2026, 9, 6, tzinfo=timezone.utc),
+            },
+            {
+                "exchange": "NSE",
+                "tradingsymbol": "SECTORLESS",
+                "instrument_token": 202,
+                "company_name": "Sectorless Ltd.",
+                "sector": None,
+                "series": "EQ",
+                "source_url": "https://example.test/nifty500.csv",
+                "last_refreshed_at": datetime(2026, 9, 6, tzinfo=timezone.utc),
+            },
+        ]
+
+        class _Cursor:
+            def __init__(self):
+                self.query = ""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, query, _params):
+                self.query = query
+
+            def fetchall(self):
+                return rows
+
+        class _Connection:
+            def __init__(self):
+                self.cursor_instance = _Cursor()
+
+            def cursor(self, **_kwargs):
+                return self.cursor_instance
+
+            def close(self):
+                return None
+
+        connection = _Connection()
+        status = {
+            "source": "nse_official_constituent_csv",
+            "source_as_of": "2026-09-06T00:00:00+00:00",
+            "complete": True,
+            "checksum": "a" * 64,
+        }
+        with (
+            patch(
+                "backend.broker_api.instruments.index_ingestion.get_db_connection",
+                return_value=connection,
+            ),
+            patch(
+                "backend.broker_api.instruments.index_ingestion.get_worker_index_status",
+                return_value=status,
+            ),
+        ):
+            snapshot = get_worker_index_snapshot(SOURCE_LIST_NIFTY500)
+
+        self.assertIn("sector", connection.cursor_instance.query)
+        self.assertEqual(snapshot["members"][0]["sector"], "Financial Services")
+        self.assertIsNone(snapshot["members"][1]["sector"])
 
 
 if __name__ == "__main__":

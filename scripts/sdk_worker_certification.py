@@ -15,8 +15,10 @@ SDK_ROOT = Path(__file__).resolve().parents[1] / "sdk" / "python"
 if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 
-from kite_algo_worker import AlgoWorkerConfig, KiteAlgoWorkerClient  # noqa: E402
+from kite_algo_worker import AlgoWorkerConfig, AsyncKiteAlgoWorkerClient, KiteAlgoWorkerClient  # noqa: E402
 from kite_algo_worker import NUMBA_AVAILABLE, StreamHealth, ta, wait_for_history, warmup_history  # noqa: E402
+from kite_algo_worker.endpoint_manifest import WORKER_HTTP_ENDPOINTS, WORKER_WEBSOCKET_PATHS  # noqa: E402
+from kite_algo_worker.options import AsyncOptionWorkerClient, OptionWorkerClient  # noqa: E402
 
 
 def _safe_number(value: Any) -> float | None:
@@ -164,6 +166,51 @@ def collect_sdk_surface_capability(client: KiteAlgoWorkerClient) -> dict[str, An
             and all(hasattr(options_client, name) for name in ("resolve_option_leg", "resolve_offset_leg", "resolve_delta_leg", "resolve_spread"))
         ),
         "amo_market_order_helper": hasattr(__import__("kite_algo_worker"), "amo_market_order"),
+        "execution_observability": all(
+            hasattr(client, name)
+            for name in (
+                "get_order_history",
+                "list_baskets",
+                "get_basket",
+                "create_bracket",
+                "list_brackets",
+                "get_bracket",
+                "cancel_bracket",
+                "list_execution_events",
+                "stream_execution_events",
+                "export_fundamentals_csv",
+            )
+        ),
+    }
+
+
+def _has_public_method(client_class: type, options_class: type, dotted_name: str) -> bool:
+    if dotted_name.startswith("options."):
+        return callable(getattr(options_class, dotted_name.split(".", 1)[1], None))
+    return callable(getattr(client_class, dotted_name, None))
+
+
+def collect_endpoint_coverage() -> dict[str, int]:
+    """Report measured manifest-to-client method coverage.
+
+    Keeping these counts derived from the manifest and class attributes makes
+    certification useful when a helper is accidentally removed: it reports the
+    deficit instead of claiming a static 77/77 result.
+    """
+
+    sync_count = sum(
+        _has_public_method(KiteAlgoWorkerClient, OptionWorkerClient, item.public_method)
+        for item in WORKER_HTTP_ENDPOINTS
+    )
+    async_count = sum(
+        _has_public_method(AsyncKiteAlgoWorkerClient, AsyncOptionWorkerClient, item.resolved_async_method)
+        for item in WORKER_HTTP_ENDPOINTS
+    )
+    return {
+        "worker_http_operations": len(WORKER_HTTP_ENDPOINTS),
+        "sync_http_operations": sync_count,
+        "async_http_operations": async_count,
+        "worker_websocket_routes": len(WORKER_WEBSOCKET_PATHS),
     }
 
 
@@ -198,6 +245,7 @@ def collect_certification_report(
         "preview": preview_report,
         "capabilities": {
             "async_client": True,
+            "endpoint_coverage": collect_endpoint_coverage(),
             "websocket_client": True,
             "preview_order": True,
             "list_orders": True,

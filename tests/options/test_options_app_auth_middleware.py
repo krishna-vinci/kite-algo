@@ -142,6 +142,11 @@ def test_worker_options_route_is_app_auth_exempt_but_needs_worker_bearer() -> No
     assert response.json()["detail"] == "Worker bearer token required"
 
 
+def test_alerts_worker_routes_are_app_auth_exempt_but_keep_worker_auth() -> None:
+    assert auth_exempt_path("/api/worker/workflows") is True
+    assert auth_exempt_path("/api/worker/notification-channels") is True
+
+
 def test_valid_worker_bearer_can_access_worker_options_without_app_cookie() -> None:
     client = TestClient(_build_app(worker_token="kwa_valid"))
     response = client.get(

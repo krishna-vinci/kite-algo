@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from backend.api.schemas.investment_worker import CalendarResponse, CalendarStatusResponse, IndexSnapshotResponse, IndexStatusResponse, PortfolioSnapshotResponse
+from backend.api.schemas.worker_indicators import WorkerIndicatorRequest
 from backend.api.services.market_data import WorkerInstrumentResolveRequest, WorkerMarketSnapshotRequest, WorkerQuoteRequest
 from backend.api.routers.worker_shared import *
 
@@ -14,6 +16,10 @@ def _optional_query_datetime(value: Any) -> Optional[datetime]:
     # FastAPI injects real datetimes during requests, but direct unit calls that
     # omit Query(...) parameters receive the Query object default.
     return value if isinstance(value, datetime) else None
+
+def _require_schema_version(value: int) -> None:
+    if value != 1:
+        raise HTTPException(status_code=422, detail={"rejection_reason": "UNSUPPORTED_SCHEMA_VERSION", "supported": [1]})
 
 async def resolve_worker_market_ticker(request: Request, symbol: str):
     token = await require_worker_token(request)
@@ -97,7 +103,7 @@ async def get_worker_market_history(
         raise HTTPException(status_code=422, detail="Use only one of from or from_date")
     if to_ts_value is not None and to_date_value is not None and to_ts_value != to_date_value:
         raise HTTPException(status_code=422, detail="Use only one of to or to_date")
-    return await _market_data_service(request).get_historical_candles(
+    response = await _market_data_service(request).get_historical_candles(
         symbol=symbol,
         instrument_token=instrument_token,
         timeframe=timeframe,
@@ -107,6 +113,22 @@ async def get_worker_market_history(
         passthrough=passthrough,
         background_tasks=background_tasks,
     )
+    if str(response.get("timeframe") or "").lower() != "day":
+        return response
+    from backend.app.database import get_db_connection
+    from backend.broker_api.market.exchange_calendar import CalendarUnavailable, assess_daily_completeness, get_calendar_sessions
+    start_day = resolved_from.date() if resolved_from else datetime.fromisoformat(str(response["from"])).date()
+    end_day = resolved_to.date() if resolved_to else datetime.fromisoformat(str(response["to"])).date()
+    conn = get_db_connection()
+    try:
+        calendar = await asyncio.to_thread(get_calendar_sessions, conn, exchange="NSE", segment="CM", from_date=start_day, to_date=end_day)
+    except CalendarUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"rejection_reason": str(exc)}) from exc
+    finally:
+        conn.close()
+    ingestion = response.get("ingestion") or {}
+    response.update(assess_daily_completeness(response.get("candles") or [], calendar, ingestion_status=str(ingestion.get("status") or "unknown")))
+    return response
 
 async def stream_worker_market_candles(
     request: Request,
@@ -151,6 +173,73 @@ async def get_worker_funds(request: Request, mode: str = Query("paper"), account
     from backend.api.routers.worker_protection import _build_worker_funds_snapshot
 
     return await _build_worker_funds_snapshot(request, account_scope=scope, mode=normalized_mode)
+
+async def get_worker_account_portfolio(request: Request, account_scope: Optional[str] = None, schema_version: int = Query(1, ge=1)):
+    _require_schema_version(schema_version)
+    token = await require_worker_token(request)
+    _require_action(token, "funds:read")
+    scope = str(account_scope or token.account_scope or "").strip()
+    if not scope or not _token_allows_account_scope(token, scope):
+        raise HTTPException(status_code=403, detail={"rejection_reason": "WORKER_ACCOUNT_SCOPE_NOT_ALLOWED"})
+    from backend.broker_api.account.portfolio_snapshot import PortfolioSnapshotUnavailable, build_portfolio_snapshot
+    try:
+        kite = await _load_live_kite_for_worker_account_scope(scope)
+        return await asyncio.to_thread(build_portfolio_snapshot, kite, scope)
+    except PortfolioSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"rejection_reason": "PORTFOLIO_SNAPSHOT_UNAVAILABLE", "reason": str(exc)}) from exc
+
+async def get_worker_index_constituents(request: Request, source_list: str, schema_version: int = Query(1, ge=1)):
+    _require_schema_version(schema_version)
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    from backend.broker_api.instruments.index_ingestion import get_worker_index_snapshot
+    try:
+        return await asyncio.to_thread(get_worker_index_snapshot, source_list)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail={"rejection_reason": str(exc)}) from exc
+
+async def get_worker_index_status(request: Request, source_list: str, schema_version: int = Query(1, ge=1)):
+    _require_schema_version(schema_version)
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    from backend.broker_api.instruments.index_ingestion import get_worker_index_status
+    try:
+        return await asyncio.to_thread(get_worker_index_status, source_list)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+async def get_worker_market_calendar_status(request: Request, exchange: str = "NSE", segment: str = "CM", schema_version: int = Query(1, ge=1)):
+    _require_schema_version(schema_version)
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    from backend.app.database import get_db_connection
+    from backend.broker_api.market.exchange_calendar import CalendarSchemaMigrationRequired, get_calendar_status
+    conn = get_db_connection()
+    try:
+        return await asyncio.to_thread(get_calendar_status, conn, exchange.upper(), segment.upper())
+    except CalendarSchemaMigrationRequired as exc:
+        raise HTTPException(status_code=503, detail={"rejection_reason": str(exc)}) from exc
+    finally:
+        conn.close()
+
+
+async def get_worker_market_calendar(request: Request, exchange: str = "NSE", segment: str = "CM", from_date: date = Query(..., alias="from"), to_date: date = Query(..., alias="to"), schema_version: int = Query(1, ge=1)):
+    _require_schema_version(schema_version)
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    if from_date > to_date:
+        raise HTTPException(status_code=422, detail="from must not be after to")
+    from backend.app.database import get_db_connection
+    from backend.broker_api.market.exchange_calendar import CalendarUnavailable, get_calendar_sessions
+    conn = get_db_connection()
+    try:
+        return await asyncio.to_thread(get_calendar_sessions, conn, exchange=exchange.upper(), segment=segment.upper(), from_date=from_date, to_date=to_date)
+    except CalendarUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"rejection_reason": str(exc)}) from exc
+    finally:
+        conn.close()
 
 async def get_worker_run_funds(request: Request, strategy_run_id: str):
     token = await require_worker_token(request)
@@ -236,6 +325,20 @@ async def delete_worker_gtt_trigger(request: Request, trigger_id: int):
         raise _normalize_worker_gtt_error(exc) from exc
 
 
+async def compute_worker_market_indicator(request: Request, payload: WorkerIndicatorRequest):
+    token = await require_worker_token(request)
+    _require_action(token, "market:read")
+    # Imported lazily so environments without the optional numerical stack can
+    # still import this router (tests, tooling); the backend runtime always
+    # has pandas/numpy.
+    from backend.api.services.indicators_service import compute_indicator
+
+    try:
+        return await asyncio.to_thread(compute_indicator, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 router.add_api_route("/worker/market/instruments/resolve", resolve_worker_market_ticker, methods=["GET"])
 router.add_api_route("/worker/market/instruments/search", search_worker_market_tickers, methods=["GET"])
 router.add_api_route("/worker/market/instruments/resolve", resolve_worker_market_tickers, methods=["POST"])
@@ -245,7 +348,13 @@ router.add_api_route("/worker/market/candles", get_worker_market_candles, method
 router.add_api_route("/worker/market/history", get_worker_market_history, methods=["GET"])
 router.add_api_route("/worker/market/candles/stream", stream_worker_market_candles, methods=["GET"])
 router.add_api_route("/worker/market/snapshot", get_worker_market_snapshot, methods=["POST"])
+router.add_api_route("/worker/indicators", compute_worker_market_indicator, methods=["POST"])
 router.add_api_route("/worker/funds", get_worker_funds, methods=["GET"])
+router.add_api_route("/worker/account/portfolio", get_worker_account_portfolio, methods=["GET"], response_model=PortfolioSnapshotResponse)
+router.add_api_route("/worker/market/indices/{source_list}", get_worker_index_constituents, methods=["GET"], response_model=IndexSnapshotResponse)
+router.add_api_route("/worker/market/indices/{source_list}/status", get_worker_index_status, methods=["GET"], response_model=IndexStatusResponse)
+router.add_api_route("/worker/market/calendar/status", get_worker_market_calendar_status, methods=["GET"], response_model=CalendarStatusResponse)
+router.add_api_route("/worker/market/calendar", get_worker_market_calendar, methods=["GET"], response_model=CalendarResponse)
 router.add_api_route("/worker/runs/{strategy_run_id}/funds", get_worker_run_funds, methods=["GET"])
 router.add_api_route("/worker/gtt/triggers", create_worker_gtt_trigger, methods=["POST"])
 router.add_api_route("/worker/gtt/triggers", list_worker_gtts, methods=["GET"])

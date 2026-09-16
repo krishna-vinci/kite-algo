@@ -60,12 +60,25 @@ func New(ctx context.Context, cfg config.Config) (*Service, error) {
 		log.Printf("market-runtime initial token read failed: %v", err)
 	}
 
-	// Load instrument metadata for tick enrichment (best-effort; graceful degradation).
+	// Load instrument metadata for tick enrichment (best-effort; graceful
+	// degradation). The initial load retries with backoff because the API
+	// container may still be running migrations when this service starts.
 	var instrumentsStore *instruments.Store
-	if instStore, err := instruments.LoadFromPostgres(ctx, cfg.PostgresDSN); err != nil {
-		log.Printf("instrument store load failed (tick enrichment disabled): %v", err)
-	} else {
-		instrumentsStore = instStore
+	for attempt := 1; attempt <= 5; attempt++ {
+		instStore, err := instruments.LoadFromPostgres(ctx, cfg.PostgresDSN)
+		if err == nil {
+			instrumentsStore = instStore
+			break
+		}
+		log.Printf("instrument store load attempt %d/5 failed: %v", attempt, err)
+		if attempt < 5 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Duration(attempt) * 3 * time.Second):
+			}
+		} else {
+			log.Printf("instrument store unavailable (tick enrichment disabled); recover via /internal/market-runtime/instruments/refresh")
+		}
 	}
 
 	s := &Service{
@@ -174,6 +187,11 @@ func (s *Service) Status() RuntimeStatus {
 	if s.exhausted {
 		overall = "exhausted"
 	}
+	ticksPublished, lastTickAt := s.publisher.TickStats()
+	var lastTickAtPtr *time.Time
+	if !lastTickAt.IsZero() {
+		lastTickAtPtr = &lastTickAt
+	}
 	return RuntimeStatus{
 		Status:              overall,
 		SystemSessionID:     s.config.SystemSessionID,
@@ -186,6 +204,8 @@ func (s *Service) Status() RuntimeStatus {
 		LastTokenRotateAt:   s.lastRotateAt,
 		Shards:              shards,
 		Exhausted:           s.exhausted,
+		TicksPublished:      ticksPublished,
+		LastTickAt:          lastTickAtPtr,
 		UpdatedAt:           time.Now().UTC(),
 	}
 }
@@ -247,14 +267,18 @@ func (s *Service) handleTick(tick kitemodels.Tick, shardID int) {
 	s.instrumentsMu.RUnlock()
 	if store != nil {
 		if meta := store.ByToken(normalized.InstrumentToken); meta != nil {
+			normalized.InstrumentID = meta.InstrumentID
 			normalized.Tradingsymbol = meta.Tradingsymbol
 			normalized.Exchange = meta.Exchange
+			normalized.Segment = meta.Segment
 			normalized.InstrumentType = meta.InstrumentType
+			normalized.OptionType = meta.OptionType
 			normalized.LotSize = meta.LotSize
 			normalized.TickSize = meta.TickSize
 			normalized.Strike = meta.Strike
 			normalized.Expiry = meta.Expiry
 			normalized.Underlying = meta.Underlying
+			normalized.CatalogGeneration = meta.Generation
 		}
 	}
 

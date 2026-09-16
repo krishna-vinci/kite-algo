@@ -14,7 +14,7 @@ Workers must only call the public worker API through the Python SDK. Never call 
 ## Install
 
 ```bash
-python3 -m pip install kite-algo-worker==0.7.5
+python3 -m pip install kite-algo-worker==0.13.0
 ```
 
 ## Environment variables
@@ -150,6 +150,27 @@ with client.run(config) as run:
 | `idempotency_key` | no | Deterministic exit key |
 | `dry_run` | no | Preview exit without placing orders (safe for live) |
 
+## Execution recovery and async parity
+
+The acceptance response is not durable execution truth. After a worker restart,
+inspect backend-owned state before resuming decisions:
+
+```python
+history = client.get_order_history("run_demo_001", "broker-order-id")
+baskets = client.list_baskets_snapshot("run_demo_001")
+events = client.list_execution_events_snapshot("run_demo_001", after_cursor=0)
+```
+
+Use `create_bracket(...)`, `list_brackets(...)`, `get_bracket(...)`, and
+`cancel_bracket(...)` for bracket lifecycle operations. Consume
+`stream_execution_events(...)` from the last cursor rather than inferring fills
+from an intent response. `export_fundamentals_csv(...)` returns server-generated
+CSV text for the caller to persist.
+
+`AsyncKiteAlgoWorkerClient` supports the same worker HTTP operations. Await JSON
+methods and consume its SSE helpers with `async for`; close the client after a
+worker loop exits.
+
 ## Order builder summary
 
 | Helper | Use for |
@@ -171,6 +192,32 @@ Backend protection objects declare thresholds the backend enforces automatically
 **Products:** `CNC`, `MIS`, `NRML`. **Sides:** `BUY`, `SELL`. Quantities and prices must be positive. Stale-worker limits: `30..86400` seconds.
 
 Use `update_backend_protection(...)` and `patch_risk(...)` to adjust thresholds at runtime.
+
+## Fundamentals data (0.8.0)
+
+Kite Algo owns screener.in acquisition, validation, storage, and refresh. Strategy workers must never scrape screener.in or query fundamentals tables directly.
+
+```python
+from datetime import datetime, timezone
+
+features = client.get_fundamentals_features(symbols=["RELIANCE", "TCS"])
+row = features.for_symbol("RELIANCE")
+
+status = client.get_fundamentals_status(symbols=["RELIANCE", "TCS"])
+if not status.fresh_within("RELIANCE", hours=24, now=datetime.now(timezone.utc)):
+    result = client.refresh_fundamentals(symbols=["RELIANCE"], mode="incremental")
+    if result.symbols_failed:
+        raise RuntimeError(result.failed_symbols)
+
+quarterly = client.get_fundamentals_statements("RELIANCE", dataset="quarterly")
+```
+
+- `get_fundamentals_features(...)`, `get_fundamentals_status(...)`, and `get_fundamentals_statements(...)` are read-only.
+- Scoped methods accept exactly one of `symbols` or `index`; supported index reads are `Nifty50` and `Nifty500`.
+- `refresh_fundamentals(...)` is the only mutating fundamentals method and requires a worker token with `market:read`.
+- The server caps on-demand refresh after scope resolution at 50 symbols. `Nifty50` fits; `Nifty500` is handled by the 02:00 IST nightly scheduler.
+- Incremental refresh skips fresh symbols and uses content fingerprints as the normal unchanged-data path.
+- `missing_symbols` and `last_success_at` are data-quality signals. Apply the strategy's own completeness and freshness policy before trading.
 
 ## Options flow summary
 

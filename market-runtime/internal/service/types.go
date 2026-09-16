@@ -44,14 +44,18 @@ type NormalizedTick struct {
 	IsTradable         bool             `json:"is_tradable"`
 	IsIndex            bool             `json:"is_index"`
 	// Instrument metadata enriched by the instrument store (omitempty when unavailable).
-	Tradingsymbol  string  `json:"tradingsymbol,omitempty"`
-	Exchange       string  `json:"exchange,omitempty"`
-	InstrumentType string  `json:"instrument_type,omitempty"`
-	LotSize        int32   `json:"lot_size,omitempty"`
-	TickSize       float64 `json:"tick_size,omitempty"`
-	Strike         float64 `json:"strike,omitempty"`
-	Expiry         string  `json:"expiry,omitempty"`
-	Underlying     string  `json:"underlying,omitempty"`
+	InstrumentID      string  `json:"instrument_id,omitempty"`
+	Tradingsymbol     string  `json:"tradingsymbol,omitempty"`
+	Exchange          string  `json:"exchange,omitempty"`
+	Segment           string  `json:"segment,omitempty"`
+	InstrumentType    string  `json:"instrument_type,omitempty"`
+	OptionType        string  `json:"option_type,omitempty"`
+	LotSize           int32   `json:"lot_size,omitempty"`
+	TickSize          float64 `json:"tick_size,omitempty"`
+	Strike            float64 `json:"strike,omitempty"`
+	Expiry            string  `json:"expiry,omitempty"`
+	Underlying        string  `json:"underlying,omitempty"`
+	CatalogGeneration string  `json:"catalog_generation,omitempty"`
 }
 
 type NormalizedOHLC struct {
@@ -101,6 +105,8 @@ type RuntimeStatus struct {
 	LastTokenRotateAt   *time.Time           `json:"last_token_rotate_at,omitempty"`
 	Shards              []ShardRuntimeStatus `json:"shards"`
 	Exhausted           bool                 `json:"exhausted"`
+	TicksPublished      uint64               `json:"ticks_published"`
+	LastTickAt          *time.Time           `json:"last_tick_at,omitempty"`
 	UpdatedAt           time.Time            `json:"updated_at"`
 }
 

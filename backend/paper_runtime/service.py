@@ -506,6 +506,50 @@ class PaperTradingService:
             "strategies": grouped,
         }
 
+    async def get_strategy_run_settlement_readonly(
+        self, account_scope: str, strategy_run_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read-only settlement evidence for a strategy run.
+
+        Unlike :meth:`get_strategy_run_pnl` this **does not call
+        ``ensure_account``** — reconciliation must not create account state. It
+        returns the durable run state plus the attributed order/pending-order
+        counts needed to distinguish confirmed-empty from unknown exposure and
+        settled from outstanding work. Returns ``None`` only for a blank run id.
+        """
+        normalized_strategy_run_id = str(strategy_run_id or "").strip()
+        if not normalized_strategy_run_id:
+            return None
+        run_state = await asyncio.to_thread(
+            self.run_state_service.get_run_state, account_scope, normalized_strategy_run_id
+        )
+        # Authoritative strategy-attributed order query (not a capped account-wide
+        # scan); ``coverage_complete`` is False when the result was truncated.
+        orders, coverage_complete = await asyncio.to_thread(
+            self.repository.list_orders_for_strategy,
+            account_scope,
+            normalized_strategy_run_id,
+            limit=5000,
+        )
+        pending_statuses = {
+            PaperOrderStatus.PENDING.value,
+            PaperOrderStatus.OPEN.value,
+            PaperOrderStatus.PARTIALLY_FILLED.value,
+        }
+        pending = [
+            order
+            for order in orders
+            if str(getattr(order.status, "value", order.status)) in pending_statuses
+        ]
+        return {
+            "account_scope": account_scope,
+            "strategy_run_id": normalized_strategy_run_id,
+            "run_state": run_state,
+            "order_count": len(orders),
+            "pending_order_count": len(pending),
+            "coverage_complete": bool(coverage_complete),
+        }
+
     async def get_strategy_run_pnl(self, account_scope: str, strategy_run_id: str) -> Dict[str, Any] | None:
         normalized_strategy_run_id = str(strategy_run_id or "").strip()
         if not normalized_strategy_run_id:

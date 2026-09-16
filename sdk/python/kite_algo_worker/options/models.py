@@ -44,9 +44,14 @@ class OptionRunCreateRequest(ModelMixin):
     legs: List["OptionExecutionLeg"] = field(default_factory=list)
     protection: Optional[Dict[str, Any]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Optional for backwards-compatible SDK callers; MCP-scoped creation
+    # supplies the explicit worker run ID.
+    strategy_run_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "strategy_name", str(self.strategy_name))
+        if self.strategy_run_id is not None:
+            object.__setattr__(self, "strategy_run_id", str(self.strategy_run_id).strip())
         product = str(self.product or "").strip().upper()
         object.__setattr__(self, "product", product)
         normalized_legs: List[OptionExecutionLeg] = []

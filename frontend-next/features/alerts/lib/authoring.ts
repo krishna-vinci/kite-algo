@@ -1,0 +1,837 @@
+/**
+ * Authoring model and pure helpers for the structured alert editor.
+ *
+ * The editor produces a canonical document; it does not invent a second format.
+ * `buildDocument` emits exactly the skeleton the SDK and the YAML renderer
+ * agree on, so the structured editor, the YAML tab and the canvas are three
+ * views of one definition (handoff §11).
+ *
+ * Everything here is pure and capability-driven: operator groups, bounds and
+ * the session/instrument rule all come from `GET /capabilities`, never from a
+ * hard-coded copy.
+ */
+
+import type { AlertsCapabilities } from "@/features/alerts/types";
+
+// ---------------------------------------------------------------------------
+// operands and conditions
+// ---------------------------------------------------------------------------
+
+export type OperandKind = "constant" | "field" | "indicator";
+
+export type Operand =
+  | { kind: "constant"; value: number }
+  | { kind: "field"; name: string }
+  | { kind: "indicator"; name: string; period?: number };
+
+export type Condition = {
+  left: Operand;
+  op: string;
+  right: Operand;
+  /**
+   * Constant-threshold condition hysteresis (Phase 4 F10): after matching, the
+   * condition stays matched until the value passes back beyond `release`.
+   * Dynamic/indicator thresholds are not implemented and are not modelled.
+   */
+  hysteresis?: { release: number } | null;
+};
+
+/** The document's shorthand operand form (handoff §11). */
+export function operandToDocument(operand: Operand): unknown {
+  switch (operand.kind) {
+    case "constant":
+      return operand.value;
+    case "field":
+      return { field: operand.name };
+    case "indicator":
+      return operand.period === undefined
+        ? { indicator: operand.name }
+        : { indicator: operand.name, period: operand.period };
+  }
+}
+
+export function conditionToDocument(condition: Condition): Record<string, unknown> {
+  const document: Record<string, unknown> = {
+    left: operandToDocument(condition.left),
+    op: condition.op,
+    right: operandToDocument(condition.right),
+  };
+  // Emitted only when set, so a condition without hysteresis cannot move a hash.
+  if (condition.hysteresis && Number.isFinite(condition.hysteresis.release)) {
+    document.hysteresis = { release: condition.hysteresis.release };
+  }
+  return document;
+}
+
+// ---------------------------------------------------------------------------
+// operator groups — the level-vs-crossing fix (handoff §7)
+// ---------------------------------------------------------------------------
+
+export type OperatorGroup = "level" | "crossing" | "pct" | "break_" | "range" | "other";
+
+export function operatorGroup(
+  op: string,
+  operators: AlertsCapabilities["operators"],
+): OperatorGroup {
+  const group = operators[op];
+  if (group === "level" || group === "crossing" || group === "pct" || group === "break_" || group === "range") {
+    return group;
+  }
+  return "other";
+}
+
+/**
+ * Plain-language labels. The point is to stop an operator choosing "is above /
+ * is below" (which reports current truth and never *becomes* true) while
+ * expecting a transition notification.
+ */
+export const OPERATOR_LABELS: Record<string, string> = {
+  gt: "is above a level",
+  gte: "is at or above a level",
+  lt: "is below a level",
+  lte: "is at or below a level",
+  crosses_above: "crosses above",
+  crosses_below: "crosses below",
+  rises_pct: "rises by %",
+  falls_pct: "falls by %",
+  breaks_prev_high: "breaks the previous day high",
+  breaks_prev_low: "breaks the previous day low",
+  within: "is within a range",
+};
+
+export function operatorLabel(op: string): string {
+  return OPERATOR_LABELS[op] ?? op;
+}
+
+/**
+ * True when every condition uses a level operator, i.e. nothing can *transition*.
+ *
+ * This mirrors the backend's `level_only_never_fires` warning so the UI can
+ * explain the problem inline while the operator is still editing. The server's
+ * warning remains the authority — this only saves a round trip, and the wizard
+ * always surfaces the server's issues too.
+ */
+export function isLevelOnly(
+  conditions: Condition[],
+  operators: AlertsCapabilities["operators"],
+): boolean {
+  if (conditions.length === 0) return false;
+  return conditions.every((condition) => operatorGroup(condition.op, operators) === "level");
+}
+
+/**
+ * Extra stage facts the backend's `level_only_never_fires` rule consults.
+ *
+ * The rule looks at EVERY group (`all` + `any` + `not`): a crossing operator in
+ * an OR group is still a transition, so warning on the `all` group alone
+ * produced false positives. `consecutive_bars` produces a transition;
+ * `reminder` and `notify_if_already_true` are legitimate ways for a level rule
+ * to notify, so all three suppress the warning — exactly as the compiler does.
+ */
+export type LevelOnlyContext = {
+  anyConditions?: Condition[];
+  notConditions?: Condition[];
+  notifyIfAlreadyTrue?: boolean;
+  consecutiveBars?: number | null;
+};
+
+/**
+ * The inline warning the wizard shows, mirroring the compiler's
+ * `level_only_never_fires` rule. Returns null when there is nothing to warn
+ * about. The server's warning remains the authority — this only saves a round
+ * trip, and the wizard always surfaces the server's issues too.
+ */
+export function levelOnlyWarning(
+  conditions: Condition[],
+  trigger: string,
+  operators: AlertsCapabilities["operators"],
+  context: LevelOnlyContext = {},
+): string | null {
+  const all = [
+    ...conditions,
+    ...(context.anyConditions ?? []),
+    ...(context.notConditions ?? []),
+  ];
+  if (all.length === 0) return null;
+  if (!all.every((condition) => operatorGroup(condition.op, operators) === "level")) return null;
+  // A stage-level construct that DOES produce a transition.
+  if (context.consecutiveBars != null) return null;
+  // `reminder` emits while the level holds; `notify_if_already_true` opts in at
+  // activation. Neither is a mistake, so neither warns.
+  if (trigger === "reminder" || context.notifyIfAlreadyTrue) return null;
+  return "Every condition is a level test, which reports whether something is currently true and never reports a change. With this trigger the alert will never notify. Choose a crossing operator (crosses above / crosses below), or set the trigger to reminder to notify while the level holds, or enable notify-if-already-true to opt in at activation.";
+}
+
+// ---------------------------------------------------------------------------
+// session / instrument compatibility (the compiler's own rule)
+// ---------------------------------------------------------------------------
+
+/**
+ * Mirrors `registry.session_accepts_exchange`. Case-insensitive on the exchange,
+ * exactly like the compiler, so the client check cannot disagree with it.
+ */
+export function sessionAcceptsExchange(
+  session: string,
+  exchange: string,
+  sessionExchanges: AlertsCapabilities["session_exchanges"],
+): boolean {
+  const accepted = sessionExchanges[session] ?? [];
+  return accepted.includes(exchange.toUpperCase());
+}
+
+/** Exchange of a qualified `EXCHANGE:SYMBOL` key. */
+/**
+ * The session a given exchange belongs to, when exactly one policy accepts it.
+ *
+ * The server publishes `session_exchanges`; the UI mirrors that map instead of
+ * hard-coding names, so an operator never has to know the word `mcx_commodity`.
+ * ``null`` means "more than one session accepts this exchange", where guessing
+ * would silently pick a policy.
+ */
+export function sessionForExchange(
+  exchange: string,
+  sessionExchanges: Record<string, string[]>,
+): string {
+  const wanted = exchange.trim().toUpperCase();
+  if (!wanted) return "";
+  const matches = Object.entries(sessionExchanges)
+    .filter(([, exchanges]) => exchanges.some((item) => item.trim().toUpperCase() === wanted))
+    .map(([session]) => session);
+  return matches.length === 1 ? matches[0] : "";
+}
+
+/** Human labels for the canonical session names (values are unchanged). */
+export const SESSION_LABELS: Record<string, string> = {
+  nse_equity: "NSE equities",
+  mcx_commodity: "MCX commodities",
+  currency: "Currency (CDS/BCD)",
+};
+
+export function sessionLabel(session: string): string {
+  return SESSION_LABELS[session] ?? session;
+}
+
+export function exchangeOf(instrumentKey: string): string {
+  const separator = instrumentKey.indexOf(":");
+  return separator === -1 ? "" : instrumentKey.slice(0, separator).toUpperCase();
+}
+
+/**
+ * One instrument as a qualified `EXCHANGE:SYMBOL` key.
+ *
+ * The canonical stored form is `{symbol, exchange}` (what `to_document_dict`
+ * emits); the authoring shorthand is the bare string. Both must be read, or the
+ * editor would show `[object Object]` for every real instrument.
+ */
+export function instrumentKeyFromDocument(raw: unknown): string {
+  if (typeof raw === "string") return raw;
+  if (raw && typeof raw === "object") {
+    const record = raw as Record<string, unknown>;
+    if (record.symbol && record.exchange) {
+      return `${String(record.exchange).toUpperCase()}:${String(record.symbol)}`;
+    }
+    if (typeof record.public_key === "string") return record.public_key;
+    if (typeof record.key === "string") return record.key;
+  }
+  return "";
+}
+
+export type IncompatibleInstrument = { instrumentKey: string; exchange: string };
+
+/** Instruments a session cannot carry. Empty means the pair is valid. */
+export function incompatibleInstruments(
+  session: string,
+  instrumentKeys: string[],
+  sessionExchanges: AlertsCapabilities["session_exchanges"],
+): IncompatibleInstrument[] {
+  return instrumentKeys
+    .filter((key) => !sessionAcceptsExchange(session, exchangeOf(key), sessionExchanges))
+    .map((key) => ({ instrumentKey: key, exchange: exchangeOf(key) }));
+}
+
+// ---------------------------------------------------------------------------
+// universe targeting
+// ---------------------------------------------------------------------------
+
+export type UniverseRefKind = "universe" | "index" | "watchlist";
+
+export type UniverseRefDraft = { kind: UniverseRefKind; name: string };
+
+export type UniverseDraft = {
+  union: UniverseRefDraft[];
+  exclude: UniverseRefDraft[];
+  deduplicate: boolean;
+};
+
+/**
+ * The typed reference form. The parser also accepts the shorthand
+ * (`{universe: name}`), but exactly one form is emitted so a document written
+ * here and one written by the SDK normalise identically.
+ */
+export function universeRefToDocument(ref: UniverseRefDraft): Record<string, unknown> {
+  return { kind: ref.kind, name: ref.name };
+}
+
+export function emptyUniverseDraft(): UniverseDraft {
+  return { union: [{ kind: "universe", name: "" }], exclude: [], deduplicate: true };
+}
+
+function isRefKind(value: unknown): value is UniverseRefKind {
+  return value === "universe" || value === "index" || value === "watchlist";
+}
+
+/** Parse either the typed or the shorthand reference form. */
+export function universeRefFromDocument(raw: unknown): UniverseRefDraft | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const record = raw as Record<string, unknown>;
+  if (typeof record.kind === "string" && isRefKind(record.kind)) {
+    return { kind: record.kind, name: String(record.name ?? "") };
+  }
+  for (const kind of ["universe", "index", "watchlist"] as const) {
+    if (kind in record) return { kind, name: String(record[kind] ?? "") };
+  }
+  return null;
+}
+
+export function refsFromDocument(raw: unknown): UniverseRefDraft[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(universeRefFromDocument).filter((ref): ref is UniverseRefDraft => ref !== null);
+}
+
+function universeToDocument(universe: UniverseDraft): Record<string, unknown> {
+  const document: Record<string, unknown> = {
+    union: universe.union
+      .filter((ref) => ref.name.trim() !== "")
+      .map(universeRefToDocument),
+  };
+  const exclude = universe.exclude
+    .filter((ref) => ref.name.trim() !== "")
+    .map(universeRefToDocument);
+  if (exclude.length > 0) document.exclude = exclude;
+  document.deduplicate = universe.deduplicate;
+  return document;
+}
+
+/**
+ * Client-side universe checks.
+ *
+ * Only the rules the UI can decide without the server are duplicated here; the
+ * compiler stays the authority and its issues are always shown too.
+ */
+export function universeDraftIssues(universe: UniverseDraft): string[] {
+  const issues: string[] = [];
+  const named = universe.union.filter((ref) => ref.name.trim() !== "");
+  if (named.length === 0) {
+    issues.push("A universe expression needs at least one reference.");
+  }
+  if (universe.union.some((ref) => ref.name.trim() === "")) {
+    issues.push("Every universe reference needs a name — an empty one is not a wildcard.");
+  }
+  return issues;
+}
+
+// ---------------------------------------------------------------------------
+// draft -> document
+// ---------------------------------------------------------------------------
+
+export type AlertTriggerDraft = {
+  id: string;
+  trigger: string;
+  channels: string[];
+  cooldown_s: number | null;
+  rearm_level: number | null;
+  rearm_direction: string | null;
+  reminder_interval_s: number | null;
+  notify_if_already_true: boolean;
+  max_per_session: number | null;
+};
+
+export type AlertTargeting = "instruments" | "universe";
+
+export type AlertDraft = {
+  name: string;
+  session: string;
+  clock: string;
+  timeframe: string;
+  targeting: AlertTargeting;
+  instruments: string[];
+  universe: UniverseDraft;
+  conditions: Condition[];
+  /** OR-combined with three-valued "unknown" propagation. */
+  anyConditions: Condition[];
+  /** Negated with three-valued "unknown" propagation. */
+  notConditions: Condition[];
+  /** N consecutive completed bars the `all` group must hold; null = not used. */
+  consecutiveBars: number | null;
+  /** The stage the edited conditions live on. Captured so an edit through the
+   * form cannot silently rename a stage (`px` -> whatever) and move the hash. */
+  stageId: string;
+  alert: AlertTriggerDraft;
+};
+
+export function emptyDraft(): AlertDraft {
+  return {
+    name: "",
+    session: "",
+    clock: "candle_close",
+    timeframe: "15minute",
+    targeting: "instruments",
+    instruments: [],
+    universe: emptyUniverseDraft(),
+    conditions: [{ left: { kind: "field", name: "close" }, op: "crosses_above", right: { kind: "constant", value: 0 } }],
+    anyConditions: [],
+    notConditions: [],
+    consecutiveBars: null,
+    stageId: "px",
+    alert: {
+      id: "a1",
+      trigger: "on_transition",
+      channels: [],
+      cooldown_s: null,
+      rearm_level: null,
+      rearm_direction: null,
+      reminder_interval_s: null,
+      notify_if_already_true: false,
+      max_per_session: null,
+    },
+  };
+}
+
+function deepClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/** Optional alert keys are emitted only when set, and cleared when unset, so an
+ * untouched field never moves the hash and clearing one actually removes it. */
+function applyOptional(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (value === null || value === undefined) delete target[key];
+  else target[key] = value;
+}
+
+function alertToDocument(alert: AlertTriggerDraft, stageId: string): Record<string, unknown> {
+  const document: Record<string, unknown> = {
+    id: alert.id,
+    source: stageId,
+    trigger: alert.trigger,
+    channels: alert.channels,
+  };
+  applyOptional(document, "cooldown_s", alert.cooldown_s);
+  applyOptional(document, "rearm_level", alert.rearm_level);
+  applyOptional(document, "rearm_direction", alert.rearm_direction);
+  applyOptional(document, "reminder_interval_s", alert.reminder_interval_s);
+  applyOptional(document, "max_per_session", alert.max_per_session);
+  if (alert.notify_if_already_true) document.notify_if_already_true = true;
+  return document;
+}
+
+function stageToDocument(draft: AlertDraft): Record<string, unknown> {
+  const stage: Record<string, unknown> = {
+    id: draft.stageId || "px",
+    type: "signal",
+    clock: draft.clock,
+    timeframe: effectiveTimeframe(draft.timeframe),
+    conditions: { all: draft.conditions.map(conditionToDocument) },
+  };
+  if (draft.anyConditions.length > 0) {
+    stage.any_conditions = draft.anyConditions.map(conditionToDocument);
+  }
+  if (draft.notConditions.length > 0) {
+    stage.not_conditions = draft.notConditions.map(conditionToDocument);
+  }
+  if (draft.consecutiveBars != null) stage.consecutive_bars = draft.consecutiveBars;
+  return stage;
+}
+
+/** Apply the modeled stage fields onto a stage inside an existing document. */
+function applyStageFields(stage: Record<string, unknown>, draft: AlertDraft): void {
+  stage.clock = draft.clock;
+  stage.timeframe = effectiveTimeframe(draft.timeframe);
+  stage.conditions = { all: draft.conditions.map(conditionToDocument) };
+  stage.any_conditions = draft.anyConditions.map(conditionToDocument);
+  stage.not_conditions = draft.notConditions.map(conditionToDocument);
+  if (draft.consecutiveBars != null) stage.consecutive_bars = draft.consecutiveBars;
+  else delete stage.consecutive_bars;
+}
+
+/**
+ * Build the canonical document from the draft.
+ *
+ * When `base` is provided (the edit path) the modeled fields are merged ONTO a
+ * deep clone of the loaded document rather than reconstructed from the draft.
+ * That is what makes the form lossless: an `expires_at`, a `message`, a
+ * `session_cap_reset`, indicator `source`/`offset` attributes, or any key this
+ * editor does not model survives a save untouched. Rebuilding from the partial
+ * model would silently delete them — and a no-op save would change the hash,
+ * which is exactly the failure the handoff warns about.
+ *
+ * With no base (the create path) there is nothing to preserve and the canonical
+ * skeleton is emitted.
+ */
+/**
+ * A timeframe the document can actually carry.
+ *
+ * The schema requires a non-empty timeframe on a stage even when the evaluation
+ * ignores it (a live-price rule), and an empty string is a parse error the server
+ * rightly refuses. A stored definition that predates the field, or one authored
+ * elsewhere without it, therefore has to be repaired on the way out rather than
+ * echoed back — echoing it made "Save changes" fail with a server error.
+ */
+export function effectiveTimeframe(value: string | null | undefined): string {
+  const text = String(value ?? "").trim();
+  return text === "" ? "day" : text;
+}
+
+export function buildDocument(
+  draft: AlertDraft,
+  base?: Record<string, unknown> | null,
+): Record<string, unknown> {
+  const useUniverse =
+    draft.targeting === "universe" && draft.universe.union.some((ref) => ref.name.trim() !== "");
+
+  if (!base) {
+    return {
+      version: 1,
+      name: draft.name,
+      session: draft.session,
+      instruments: useUniverse ? [] : draft.instruments,
+      universe: useUniverse ? universeToDocument(draft.universe) : null,
+      stages: [stageToDocument(draft)],
+      alerts: [alertToDocument(draft.alert, draft.stageId || "px")],
+    };
+  }
+
+  const document = deepClone(base);
+  document.version = typeof base.version === "number" ? base.version : 1;
+  document.name = draft.name;
+  document.session = draft.session;
+  document.instruments = useUniverse ? [] : draft.instruments;
+  document.universe = useUniverse ? universeToDocument(draft.universe) : null;
+
+  const stages = Array.isArray(document.stages)
+    ? (document.stages as Array<Record<string, unknown>>)
+    : [];
+  const stageId = draft.stageId || String(stages[0]?.id ?? "px");
+  let stage = stages.find((candidate) => candidate.id === stageId);
+  if (!stage) {
+    stage = { id: stageId, type: "signal" };
+    stages.push(stage);
+  }
+  document.stages = stages;
+  applyStageFields(stage, draft);
+
+  const alerts = Array.isArray(document.alerts)
+    ? (document.alerts as Array<Record<string, unknown>>)
+    : [];
+  let alert = alerts.find((candidate) => candidate.id === draft.alert.id);
+  if (!alert) {
+    alert = { id: draft.alert.id };
+    alerts.push(alert);
+  }
+  document.alerts = alerts;
+  alert.source = stageId;
+  alert.trigger = draft.alert.trigger;
+  alert.channels = draft.alert.channels;
+  applyOptional(alert, "cooldown_s", draft.alert.cooldown_s);
+  applyOptional(alert, "rearm_level", draft.alert.rearm_level);
+  applyOptional(alert, "rearm_direction", draft.alert.rearm_direction);
+  applyOptional(alert, "reminder_interval_s", draft.alert.reminder_interval_s);
+  applyOptional(alert, "max_per_session", draft.alert.max_per_session);
+  if (draft.alert.notify_if_already_true) alert.notify_if_already_true = true;
+  else delete alert.notify_if_already_true;
+
+  return document;
+}
+
+// ---------------------------------------------------------------------------
+// document -> draft (the edit path)
+// ---------------------------------------------------------------------------
+
+export type DraftFromDocument =
+  | { ok: true; draft: AlertDraft }
+  | { ok: false; reason: string };
+
+/** Operand attributes this editor does not model; any of them means "not editable here". */
+function operandHasUnmodeledAttributes(record: Record<string, unknown>): boolean {
+  if (record.source != null || record.offset != null) return true;
+  const params = record.params;
+  return Boolean(params && typeof params === "object" && Object.keys(params as object).length > 0);
+}
+
+export function operandFromDocument(raw: unknown): Operand | null {
+  if (typeof raw === "number") return { kind: "constant", value: raw };
+  if (raw === null || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+
+  // Authoring shorthand. The unmodeled-attribute guard applies here too: a
+  // shorthand operand carrying `source`/`offset`/`params` would otherwise be
+  // accepted and those attributes silently dropped on save, which the canonical
+  // `kind:` branches below already refuse.
+  if (!("kind" in record) && "field" in record) {
+    if (operandHasUnmodeledAttributes(record)) return null;
+    return { kind: "field", name: String(record.field) };
+  }
+  if (!("kind" in record) && "indicator" in record) {
+    if (operandHasUnmodeledAttributes(record)) return null;
+    const period = record.period;
+    return {
+      kind: "indicator",
+      name: String(record.indicator),
+      ...(typeof period === "number" ? { period } : {}),
+    };
+  }
+
+  // Serialized canonical form: {kind, name, value, params, source, offset}.
+  // This is what the backend actually STORES, so it must be handled or the
+  // structured editor would be unable to open a real document.
+  if (record.kind === "field") {
+    if (operandHasUnmodeledAttributes(record)) return null;
+    return { kind: "field", name: String(record.name ?? "") };
+  }
+  if (record.kind === "value" && typeof record.value === "number") {
+    if (operandHasUnmodeledAttributes(record)) return null;
+    return { kind: "constant", value: record.value };
+  }
+  if (record.kind === "indicator") {
+    if (record.source != null || record.offset != null) return null;
+    const params = (record.params ?? {}) as Record<string, unknown>;
+    const extra = Object.keys(params).filter((key) => key !== "period");
+    if (extra.length > 0) return null;
+    const operand: Operand = { kind: "indicator", name: String(record.name ?? "") };
+    if (typeof params.period === "number") operand.period = params.period;
+    return operand;
+  }
+  // Pair operands, arithmetic expressions, external operands and anything else
+  // are outside what the structured editor models.
+  return null;
+}
+
+/** The only condition keys the structured editor models and re-emits. */
+const CONDITION_KEYS = new Set(["left", "op", "right", "hysteresis"]);
+
+/**
+ * Parse one condition, returning a REASON when it cannot be represented.
+ *
+ * Shared by the alert and screener editors so both refuse the same constructs
+ * with the same wording, and so the two cannot drift apart.
+ */
+export function conditionFromDocument(
+  raw: unknown,
+): { ok: true; condition: Condition } | { ok: false; reason: string } {
+  if (typeof raw !== "object" || raw === null) {
+    return { ok: false, reason: "A condition is not in a form this editor understands." };
+  }
+  const record = raw as Record<string, unknown>;
+
+  // A condition this editor cannot fully represent must be REFUSED, not
+  // accepted-and-trimmed: `conditionToDocument` re-emits only left/op/right/
+  // hysteresis, so any additional key would silently disappear on save.
+  const extraKeys = Object.keys(record).filter(
+    (key) => !CONDITION_KEYS.has(key),
+  );
+  if (extraKeys.length > 0) {
+    return {
+      ok: false,
+      reason: `This condition carries field(s) the structured editor does not model (${extraKeys.join(
+        ", ",
+      )}); open it in the advanced editor so they are not dropped.`,
+    };
+  }
+
+  let hysteresis: { release: number } | null = null;
+  if (record.hysteresis) {
+    const rawHysteresis = record.hysteresis as Record<string, unknown>;
+    const extraHysteresisKeys = Object.keys(rawHysteresis).filter((key) => key !== "release");
+    if (extraHysteresisKeys.length > 0) {
+      return {
+        ok: false,
+        reason: `This condition's hysteresis carries field(s) the structured editor does not model (${extraHysteresisKeys.join(
+          ", ",
+        )}); only a constant release is supported.`,
+      };
+    }
+    if (typeof rawHysteresis.release === "number") {
+      hysteresis = { release: rawHysteresis.release };
+    } else {
+      return {
+        ok: false,
+        reason:
+          "This condition uses dynamic hysteresis (an operand release), which is not implemented; only a constant release is supported.",
+      };
+    }
+  }
+  const left = operandFromDocument(record.left);
+  const right = operandFromDocument(record.right);
+  if (!left || !right) {
+    return {
+      ok: false,
+      reason: "This condition uses a pair or expression operand, which this editor does not model yet.",
+    };
+  }
+  return {
+    ok: true,
+    condition: {
+      left,
+      op: String(record.op ?? ""),
+      right,
+      ...(hysteresis ? { hysteresis } : {}),
+    },
+  };
+}
+
+/**
+ * Rebuild an editable draft from a stored document.
+ *
+ * Returns a REASON when the definition uses anything the structured editor does
+ * not model (sequences, breadth, universes, several stages or alerts, `any`/
+ * `not` groups, pair operands, arithmetic). The caller must then offer the
+ * read-only/YAML view rather than open a form that would silently drop fields
+ * on save — losing a `sequence` because the form never showed it would be a
+ * data-destroying "success".
+ */
+export function documentToDraft(document: Record<string, unknown> | null): DraftFromDocument {
+  if (!document) return { ok: false, reason: "No definition is stored for this workflow." };
+
+  if (document.screener) {
+    return { ok: false, reason: "This is a screener; use the screener editor." };
+  }
+
+  const stages = Array.isArray(document.stages) ? document.stages : [];
+  if (stages.length !== 1) {
+    return { ok: false, reason: `This alert has ${stages.length} stages; this editor models exactly one.` };
+  }
+  const stage = stages[0] as Record<string, unknown>;
+  if (stage.type !== "signal") {
+    return { ok: false, reason: `Stage type '${String(stage.type)}' is not editable here.` };
+  }
+  if (stage.sequence || stage.breadth) {
+    return {
+      ok: false,
+      reason:
+        "This stage uses a sequence or a breadth condition, which the structured editor does not model. Use the advanced editor.",
+    };
+  }
+  // Canonical documents carry these as empty arrays even when unused.
+  const anyRaw = Array.isArray(stage.any_conditions) ? stage.any_conditions : [];
+  const notRaw = Array.isArray(stage.not_conditions) ? stage.not_conditions : [];
+  const anyConditions: Condition[] = [];
+  for (const raw of anyRaw) {
+    const parsed = conditionFromDocument(raw);
+    if (!parsed.ok) return { ok: false, reason: parsed.reason };
+    anyConditions.push(parsed.condition);
+  }
+  const notConditions: Condition[] = [];
+  for (const raw of notRaw) {
+    const parsed = conditionFromDocument(raw);
+    if (!parsed.ok) return { ok: false, reason: parsed.reason };
+    notConditions.push(parsed.condition);
+  }
+
+  const consecutiveBars =
+    typeof stage.consecutive_bars === "number"
+      ? stage.consecutive_bars
+      : null;
+
+  // The backend stores `conditions` in the canonical list form
+  // (`[{left, op, right}, ...]`), while a form-shaped fixture may wrap it as
+  // `{all: [...]}`. Accept both — refusing the canonical form would make the
+  // editor unable to open any real document.
+  const stageConditions = stage.conditions as unknown;
+  let allConditions: unknown[] | null = null;
+  if (Array.isArray(stageConditions)) {
+    allConditions = stageConditions;
+  } else if (stageConditions && typeof stageConditions === "object") {
+    const groups = stageConditions as Record<string, unknown>;
+    for (const key of ["any", "not"] as const) {
+      if (!Array.isArray(groups[key])) continue;
+      for (const raw of groups[key] as unknown[]) {
+        const parsed = conditionFromDocument(raw);
+        if (!parsed.ok) return { ok: false, reason: parsed.reason };
+        if (key === "any") anyConditions.push(parsed.condition);
+        else notConditions.push(parsed.condition);
+      }
+    }
+    if (Array.isArray(groups.all)) allConditions = groups.all;
+  }
+  if (allConditions === null) {
+    return {
+      ok: false,
+      reason: "Conditions must be a single 'all' group for this editor to represent them.",
+    };
+  }
+
+  const conditions: Condition[] = [];
+  for (const raw of allConditions) {
+    const parsed = conditionFromDocument(raw);
+    if (!parsed.ok) return { ok: false, reason: parsed.reason };
+    conditions.push(parsed.condition);
+  }
+  if (conditions.length === 0) {
+    return { ok: false, reason: "This stage has no conditions to edit." };
+  }
+
+  const alerts = Array.isArray(document.alerts) ? document.alerts : [];
+  if (alerts.length !== 1) {
+    return { ok: false, reason: `This alert has ${alerts.length} alerts; this editor models exactly one.` };
+  }
+  const alert = alerts[0] as Record<string, unknown>;
+
+  const rawUniverse =
+    typeof document.universe === "object" && document.universe !== null
+      ? (document.universe as Record<string, unknown>)
+      : null;
+
+  // `intersect` is a real document feature with no editor control here, so it
+  // is refused rather than dropped: silently removing a membership restriction
+  // would widen the scan on save.
+  if (rawUniverse && rawUniverse.intersect) {
+    return {
+      ok: false,
+      reason: "This alert intersects universe references, which this editor does not model yet.",
+    };
+  }
+
+  const union = rawUniverse ? refsFromDocument(rawUniverse.union ?? rawUniverse.refs) : [];
+  const exclude = rawUniverse ? refsFromDocument(rawUniverse.exclude) : [];
+  const targeting: AlertTargeting = rawUniverse && union.length > 0 ? "universe" : "instruments";
+
+  const instruments = Array.isArray(document.instruments)
+    ? document.instruments.map(instrumentKeyFromDocument).filter((key) => key !== "")
+    : [];
+
+  return {
+    ok: true,
+    draft: {
+      name: String(document.name ?? ""),
+      session: String(document.session ?? ""),
+      clock: stage.clock != null ? String(stage.clock) : "candle_close",
+      timeframe: stage.timeframe != null ? String(stage.timeframe) : "",
+      targeting,
+      instruments,
+      universe: {
+        union: union.length > 0 ? union : emptyUniverseDraft().union,
+        exclude,
+        deduplicate: rawUniverse ? rawUniverse.deduplicate !== false : true,
+      },
+      conditions,
+      anyConditions,
+      notConditions,
+      consecutiveBars,
+      stageId: String(stage.id ?? "px"),
+      alert: {
+        id: String(alert.id ?? "a1"),
+        trigger: String(alert.trigger ?? "on_transition"),
+        channels: Array.isArray(alert.channels) ? alert.channels.map(String) : [],
+        cooldown_s: typeof alert.cooldown_s === "number" ? alert.cooldown_s : null,
+        rearm_level: typeof alert.rearm_level === "number" ? alert.rearm_level : null,
+        rearm_direction:
+          alert.rearm_direction === "above" || alert.rearm_direction === "below"
+            ? alert.rearm_direction
+            : null,
+        reminder_interval_s:
+          typeof alert.reminder_interval_s === "number" ? alert.reminder_interval_s : null,
+        notify_if_already_true: Boolean(alert.notify_if_already_true),
+        max_per_session: typeof alert.max_per_session === "number" ? alert.max_per_session : null,
+      },
+    },
+  };
+}

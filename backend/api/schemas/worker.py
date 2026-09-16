@@ -67,6 +67,27 @@ class WorkerHeartbeatRequest(BaseModel):
     status: str = "healthy"
     metrics: Dict[str, Any] = Field(default_factory=dict)
 
+class WorkerProgressRequest(BaseModel):
+    """Child-reported progress marker for a hosted attempt.
+
+    The note is an optional short human label; it is length-bounded and is never
+    persisted or logged verbatim (only the arrival time is recorded).
+    """
+
+    note: Optional[str] = Field(default=None, max_length=200)
+
+class WorkerRunNotifyRequest(BaseModel):
+    """Run-scoped notification from a hosted child.
+
+    The caller supplies its own ``idempotency_key``; there is no process-local
+    sequence number, and a same-key/different-content request is a conflict.
+    """
+
+    text: str = Field(min_length=1, max_length=3800)
+    channels: List[str] = Field(min_length=1)
+    idempotency_key: str = Field(min_length=8, max_length=160)
+    subject: Optional[str] = Field(default=None, max_length=120)
+
 class WorkerRunCreateRequest(BaseModel):
     strategy_run_id: Optional[str] = None
     template_id: str = Field(min_length=1)
@@ -82,6 +103,33 @@ class WorkerRunCreateRequest(BaseModel):
     @classmethod
     def _clean_mode(cls, value: str) -> str:
         return str(value or "paper").strip().lower()
+
+
+class WorkerRunSummary(BaseModel):
+    """Public, token-scoped run listing fields.
+
+    Deliberately excludes worker token identifiers, metadata, and session
+    nonces.  The detail route remains the place for the richer run document.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_run_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    template_id: str = Field(min_length=1)
+    account_scope: str = Field(min_length=1)
+    execution_mode: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
+
+
+class WorkerRunListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: List[WorkerRunSummary] = Field(default_factory=list)
+    next_cursor: Optional[str] = None
 
 class WorkerRiskPatchRequest(BaseModel):
     patch: Dict[str, Any] = Field(default_factory=dict)

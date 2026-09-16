@@ -18,6 +18,8 @@ from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Qu
 from kiteconnect import KiteConnect
 from psycopg2.extras import execute_values
 from pydantic import BaseModel
+
+from backend.database_url import resolve_database_url
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -46,6 +48,7 @@ from backend.broker_api.session.kite_session import (
     rotate_broker_access_token,
     upsert_kite_session,
 )
+from backend.broker_api.instruments.catalog import CatalogRefreshPublisher, RefreshFailure
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -138,10 +141,7 @@ class PortfolioSnapshotCreate(BaseModel):
 
 
 # ───────── DATABASE SETUP ─────────
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    f"postgresql://{os.getenv('DB_USER', 'postgres')}:{os.getenv('DB_PASSWORD', 'postgres')}@{os.getenv('DB_HOST', 'postgres')}:{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME', 'postgres')}"
-)
+DATABASE_URL = resolve_database_url()
 
 # synchronous engine + session
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -335,7 +335,9 @@ async def sync_and_reindex_orchestrator(
     Orchestrates optional instrument refresh and backfill of underlying/option_type.
     """
     refreshed_count: Optional[int] = None
+    catalog_generation: Optional[str] = None
     backfilled_counts: Dict[str, int] = {"processed": 0, "updated": 0, "skipped": 0}
+    go_reload: Dict[str, object] = {"notified": False}
 
     try:
         # 1. Refresh instruments from broker
@@ -355,6 +357,7 @@ async def sync_and_reindex_orchestrator(
                     
                     # Call import_all_instruments directly
                     refresh_results = await import_all_instruments(kite_instance)
+                    catalog_generation = refresh_results.get("catalog_generation")
                     total_imported = 0
                     for res in refresh_results.get("results", []):
                         if "message" in res and "Imported" in res["message"]:
@@ -377,21 +380,51 @@ async def sync_and_reindex_orchestrator(
         backfilled_counts = await _parse_and_backfill_underlying(session, only_nulls=backfill_only_nulls)
         logger.info(f"Backfill completed: Processed {backfilled_counts['processed']}, Updated {backfilled_counts['updated']}, Skipped {backfilled_counts['skipped']}.")
 
-        # 3. Notify Go market-runtime to refresh instrument cache
+        # 3. Notify Go market-runtime to refresh instrument cache. The reload
+        # acknowledgement must identify the generation Go actually loaded
+        # (C3): a mismatch between the published generation and Go's cache is
+        # reported explicitly instead of being silently accepted.
         try:
             import httpx
             runtime_url = os.getenv("MARKET_RUNTIME_HTTP_URL", "http://market-runtime:8780")
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(f"{runtime_url}/internal/market-runtime/instruments/refresh")
                 if resp.status_code == 200:
-                    logger.info("Go instrument store refreshed successfully")
+                    payload = resp.json() if resp.content else {}
+                    go_generation = payload.get("generation")
+                    go_count = payload.get("count")
+                    go_reload = {
+                        "notified": True,
+                        "status": "ok",
+                        "generation": go_generation,
+                        "count": go_count,
+                        "matches_publication": (
+                            None if not go_generation or not catalog_generation
+                            else go_generation == catalog_generation
+                        ),
+                    }
+                    logger.info(
+                        "Go instrument store reloaded generation=%s count=%s",
+                        go_generation, go_count,
+                    )
+                    if catalog_generation and go_generation != catalog_generation:
+                        logger.warning(
+                            "Go cache generation %s does not match published "
+                            "catalog generation %s; Go is serving a stale "
+                            "instrument view",
+                            go_generation, catalog_generation,
+                        )
                 else:
+                    go_reload = {"notified": True, "status": f"http_{resp.status_code}"}
                     logger.warning(f"Go instrument store refresh returned {resp.status_code}")
         except Exception as e:
+            go_reload = {"notified": False, "status": "unreachable", "error": str(e)}
             logger.warning(f"Failed to notify Go market-runtime of instrument refresh: {e}")
 
         return {
             "refreshed": refreshed_count,
+            "catalog_generation": catalog_generation,
+            "go_reload": go_reload,
             "backfilled": backfilled_counts["processed"],
             "updated": backfilled_counts["updated"],
             "skipped": backfilled_counts["skipped"]
@@ -659,17 +692,38 @@ async def import_instruments_for_exchange(exchange: str, kite: KiteConnect):
 # ─────────── Instruments endpoints ───────────
 
 async def import_all_instruments(kite: KiteConnect = Depends(get_kite)):
-    """Import all instruments from major exchanges for internal maintenance flows."""
+    """Download, validate, and publish all configured exchange masters."""
     results = []
-    
+    exchange_records = {}
+    failures = []
+
     for exchange in KITE_INSTRUMENT_IMPORT_EXCHANGES:
         try:
-            result = await import_instruments_for_exchange(exchange, kite)
-            results.append(result)
+            exchange_records[exchange] = kite.instruments(exchange)
         except Exception as e:
-            results.append({"exchange": exchange, "error": str(e)})
-    
-    return {"message": "Imported all instruments", "results": results}
+            failures.append(RefreshFailure(exchange, str(e)))
+
+    refresh = CatalogRefreshPublisher().publish(exchange_records, failures)
+    for exchange in refresh.accepted_exchanges:
+        records = exchange_records[exchange]
+        try:
+            count = batch_upsert_instruments(records, batch_size=1000)
+            results.append({
+                "exchange": exchange,
+                "message": f"Imported {count} instruments for exchange {exchange}",
+            })
+        except Exception as exc:
+            results.append({"exchange": exchange, "error": str(exc)})
+    for failure in failures:
+        results.append({"exchange": failure.exchange, "error": failure.reason, "retained": True})
+
+    return {
+        "message": "Imported all instruments",
+        "catalog_generation": refresh.generation_id,
+        "catalog_status": refresh.status,
+        "catalog": refresh.to_dict(),
+        "results": results,
+    }
 
 async def _parse_and_backfill_underlying(session: Session, only_nulls: bool = True) -> Dict[str, int]:
     """

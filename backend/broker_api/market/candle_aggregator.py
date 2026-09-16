@@ -345,8 +345,12 @@ class CandleAggregator:
         seconds = INTERVAL_SECONDS[interval]
         
         if interval == 'day':
-            # Day candles start at 00:00 UTC
-            return ts.replace(hour=0, minute=0, second=0, microsecond=0)
+            # NSE trading days are defined in IST, not by the UTC date.
+            return (
+                ts.astimezone(IST)
+                .replace(hour=0, minute=0, second=0, microsecond=0)
+                .astimezone(timezone.utc)
+            )
         
         # For intraday intervals, align to interval boundaries
         epoch = int(ts.timestamp())
@@ -528,6 +532,7 @@ class CandleAggregator:
         async with self._subscription_lock:
             try:
                 desired_tokens = await self._get_watchlist_tokens()
+                desired_tokens.update(await self._get_alert_tokens())
                 desired_tokens.update(self._external_tokens())
                 await self._sync_market_runtime_subscriptions(desired_tokens)
                 self.subscribed_tokens = desired_tokens
@@ -566,6 +571,113 @@ class CandleAggregator:
                 db_session.close()
         except Exception as e:
             logger.error(f"Failed to fetch watchlist tokens: {e}", exc_info=True)
+            return set()
+
+    async def _get_alert_tokens(self) -> Set[int]:
+        """Broker tokens that ACTIVE alert subscriptions need candles for.
+
+        The alerts worker subscribes instruments under its own market-runtime
+        owner, but the aggregator builds candles only for the tokens it tracks
+        — and its original source was ``user_watchlists`` (plus in-process
+        external tokens, which nothing sets for the alerts path). Those two
+        sources are disjoint, so a candle-close workflow evaluated nothing at
+        all in production: no history in ``historical_candles`` and no live
+        completion ever published. Reading the platform's OWN active
+        subscriptions (rather than requiring an operator to mirror them into a
+        watchlist by hand) is what makes candle-close conditions — including
+        every Phase 4 breadth/advanced condition, which validation restricts to
+        that clock — actually run.
+
+        Only stages declared with ``clock: candle_close`` are included: an
+        LTP-only subscription needs no candle, and subscribing tokens nobody
+        reads would waste market-data quota.
+
+        Best-effort by construction: this runs on the aggregator's refresh
+        loop, so any failure returns what it resolved rather than raising.
+        """
+        try:
+            from backend.broker_api.instruments.catalog import (
+                CatalogUnavailableError,
+                InstrumentCatalog,
+                InstrumentNotFoundError,
+            )
+            from backend.workflows.parser import parse_workflow_dict
+
+            db_session = next(get_db())
+            try:
+                # Unqualified names, like the ORM models: PostgreSQL resolves
+                # them through search_path, which keeps the query working for a
+                # non-public schema too.
+                rows = db_session.execute(text(
+                    """
+                    SELECT DISTINCT s.revision_id, s.instrument_key, r.document
+                    FROM alert_subscriptions s
+                    JOIN workflow_revisions r ON r.id = s.revision_id
+                    JOIN workflows w ON w.id = r.workflow_id
+                    WHERE s.state = 'active'
+                      AND r.status = 'active'
+                      AND w.archived_at IS NULL
+                    """
+                )).fetchall()
+            finally:
+                db_session.close()
+
+            # Parse each revision once, and only keep instruments whose stage
+            # is actually dispatched on the candle clock.
+            candle_keys_by_revision: Dict[str, Set[str]] = {}
+            keys: Set[str] = set()
+            for revision_id, instrument_key, document in rows:
+                revision_key = str(revision_id)
+                cached = candle_keys_by_revision.get(revision_key)
+                if cached is None:
+                    cached = set()
+                    try:
+                        payload = document
+                        if isinstance(payload, str):
+                            # A JSON column read through raw SQL comes back as
+                            # text on SQLite (PostgreSQL decodes jsonb for us).
+                            payload = json.loads(payload) if payload.strip() else {}
+                        parsed = parse_workflow_dict(payload or {})
+                        cached = {
+                            stage.id for stage in parsed.stages
+                            if stage.clock == "candle_close"
+                        }
+                    except Exception:
+                        cached = set()
+                    candle_keys_by_revision[revision_key] = cached
+                if not cached:
+                    continue
+                keys.add(str(instrument_key))
+
+            if not keys:
+                return set()
+
+            catalog = InstrumentCatalog()
+            tokens: Set[int] = set()
+            for key in sorted(keys):
+                try:
+                    descriptor = catalog.resolve_public_key(key)
+                except (CatalogUnavailableError, InstrumentNotFoundError):
+                    # A key that is not in the catalog has no token to track.
+                    continue
+                except Exception:
+                    # Unexpected failures stay non-fatal (one bad key must not
+                    # drop every candle), but they are LOGGED: a silent `pass`
+                    # here is how this whole path stayed invisible before.
+                    logger.warning(
+                        "candle token lookup failed for %s", key, exc_info=True
+                    )
+                    continue
+                token = descriptor.broker_token
+                if isinstance(token, int) and token > 0:
+                    tokens.add(token)
+                else:
+                    logger.warning(
+                        "catalog returned no broker token for %s", key
+                    )
+            return tokens
+        except Exception as e:
+            logger.error(f"Failed to fetch active alert candle tokens: {e}", exc_info=True)
             return set()
 
     def _external_tokens(self) -> Set[int]:

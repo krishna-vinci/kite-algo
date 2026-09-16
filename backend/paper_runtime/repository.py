@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
@@ -176,6 +176,59 @@ class SqlAlchemyPaperRepository:
                 },
             ).fetchall()
             return [self._order_from_row(row) for row in rows]
+        finally:
+            db.close()
+
+    def list_orders_for_strategy(
+        self, account_scope: str, strategy_run_id: str, *, limit: int = 5000
+    ) -> Tuple[List[PaperOrder], bool]:
+        """Strategy-attributed order query with explicit coverage.
+
+        Filters in SQL on the strategy identity stored in ``metadata_json`` (so it
+        is not a capped account-wide scan filtered in Python). Returns
+        ``(orders, complete)`` where ``complete`` is False when the result was
+        truncated at ``limit`` — callers must treat incomplete coverage as
+        unknown, never as settled.
+        """
+        normalized = str(strategy_run_id or "").strip()
+        if not normalized:
+            return [], True
+        capped = max(1, int(limit))
+        db = self.session_factory()
+        try:
+            dialect = getattr(getattr(db, "bind", None), "dialect", None)
+            dialect_name = getattr(dialect, "name", "postgresql")
+            if dialect_name == "sqlite":
+                identity = (
+                    "COALESCE(json_extract(metadata_json, '$.strategy_run_id'), "
+                    "json_extract(metadata_json, '$.option_strategy_id'), "
+                    "json_extract(metadata_json, '$.strategy_id'), "
+                    "json_extract(metadata_json, '$.algo_instance_id')) = :strategy_run_id"
+                )
+            else:
+                identity = (
+                    "COALESCE(metadata_json ->> 'strategy_run_id', "
+                    "metadata_json ->> 'option_strategy_id', "
+                    "metadata_json ->> 'strategy_id', "
+                    "metadata_json ->> 'algo_instance_id') = :strategy_run_id"
+                )
+            rows = db.execute(
+                text(
+                    f"""
+                    SELECT account_scope, order_id, instrument_token, exchange, tradingsymbol, product, transaction_type, order_type,
+                           quantity, filled_quantity, pending_quantity, price, trigger_price, average_price, status,
+                           placed_at, updated_at, completed_at, metadata_json
+                    FROM public.paper_orders
+                    WHERE account_scope = :account_scope
+                      AND {identity}
+                    ORDER BY placed_at DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"account_scope": account_scope, "strategy_run_id": normalized, "limit": capped + 1},
+            ).fetchall()
+            complete = len(rows) <= capped
+            return [self._order_from_row(row) for row in rows[:capped]], complete
         finally:
             db.close()
 

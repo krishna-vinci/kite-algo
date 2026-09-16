@@ -1,0 +1,534 @@
+"use client";
+
+import Link from "next/link";
+import { AlertCircleIcon, PlayIcon } from "lucide-react";
+import { useState } from "react";
+
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Panel } from "@/components/operator/panel";
+import { SectionLabel } from "@/components/operator/section-label";
+import { StatusBadge } from "@/components/operator/status-badge";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { AlertsPageHeader } from "@/features/alerts/components/alerts-page-header";
+import {
+  useAlertsCapabilities,
+  useAlertsScreenerAttachments,
+  useAlertsScreenerDataStatus,
+  useAlertsScreenerMutations,
+  useAlertsScreenerRun,
+  useAlertsScreenerRuns,
+  useAlertsScreenerWarm,
+  useAlertsWorkflow,
+} from "@/features/alerts/hooks/use-alerts-queries";
+import { alertsErrorMessage, isNotFound } from "@/features/alerts/lib/errors";
+import { formatTimestamp } from "@/features/alerts/lib/format";
+import { readScreenerRun } from "@/features/alerts/lib/run-summary";
+import { newIdempotencyKey } from "@/lib/ids";
+
+function runStatusTone(status: string): "positive" | "warning" | "danger" | "neutral" {
+  if (status === "complete") return "positive";
+  if (status === "partial") return "warning";
+  if (status === "failed") return "danger";
+  return "neutral";
+}
+
+/** Compact rendering of a member's computed values (score inputs / outputs). */
+function summarizeValues(values: Record<string, unknown>): string {
+  const entries = Object.entries(values);
+  if (entries.length === 0) return "—";
+  return entries
+    .map(([key, value]) =>
+      typeof value === "number" ? `${key}=${Number(value).toFixed(2)}` : `${key}=${String(value)}`,
+    )
+    .join(" · ");
+}
+
+/** Coverage / data-freshness maps returned per run, rendered readably. */
+function summarizeRecord(record: Record<string, unknown> | null | undefined): string | null {
+  if (!record) return null;
+  const entries = Object.entries(record).filter(([, value]) => value !== null && value !== undefined);
+  if (entries.length === 0) return null;
+  return entries.map(([key, value]) => `${key}: ${String(value)}`).join(" · ");
+}
+
+function RunMembers({ runId, scope }: Readonly<{ runId: string; scope: string | null }>) {
+  const runQuery = useAlertsScreenerRun(runId, scope);
+  if (runQuery.isLoading) return <Skeleton className="h-32 w-full rounded-xl" />;
+  if (runQuery.error || !runQuery.data) {
+    // Previously returned null on any non-data state, so a failed member fetch
+    // rendered as nothing at all instead of as an error.
+    return (
+      <Alert variant="destructive">
+        <AlertCircleIcon />
+        <AlertTitle>Could not load run members</AlertTitle>
+        <AlertDescription>
+          {alertsErrorMessage(runQuery.error, "The run detail request failed.")}
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  const { members, member_count, run } = runQuery.data;
+  const coverage = summarizeRecord(run.coverage);
+  const freshness = summarizeRecord(run.data_freshness);
+
+  return (
+    <Panel tone="subtle">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-sm font-medium">Latest run</span>
+        <StatusBadge tone={runStatusTone(run.status)}>{run.status}</StatusBadge>
+        <span className="text-xs text-muted-foreground">{member_count} member rows</span>
+      </div>
+
+      <p className="mt-2 text-xs text-muted-foreground">{readScreenerRun(run).summary}</p>
+
+      {/* A partial run is NOT a complete membership replacement. */}
+      {run.status === "partial" ? (
+        <p className="mt-2 text-xs text-amber-300">
+          This run is PARTIAL: it is not a complete membership replacement, and a downstream
+          universe keeps the last complete revision until a complete run supersedes it.
+        </p>
+      ) : null}
+
+      {run.failure_reason ? (
+        <p className="mt-2 text-xs text-rose-300">Failure reason: {run.failure_reason}</p>
+      ) : null}
+
+      {/* Coverage and data freshness are what make "complete" verifiable rather
+          than asserted. */}
+      {coverage ? (
+        <p className="mt-2 text-xs text-muted-foreground">Coverage — {coverage}</p>
+      ) : null}
+      {freshness ? (
+        <p className="mt-1 text-xs text-muted-foreground">Data freshness — {freshness}</p>
+      ) : null}
+
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Rank</TableHead>
+            <TableHead>Instrument</TableHead>
+            <TableHead>Score</TableHead>
+            <TableHead>Values</TableHead>
+            <TableHead>Passed</TableHead>
+            <TableHead>Exclusion reason</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {members.map((member) => (
+            <TableRow key={member.instrument_key}>
+              <TableCell className="font-mono text-sm">{member.rank ?? "—"}</TableCell>
+              <TableCell className="font-mono text-sm">{member.instrument_key}</TableCell>
+              <TableCell className="text-sm">
+                {member.score === null ? "—" : member.score.toFixed(4)}
+              </TableCell>
+              <TableCell className="max-w-[22rem] truncate text-xs text-muted-foreground">
+                {summarizeValues(member.values)}
+              </TableCell>
+              <TableCell>
+                <Badge variant={member.passed ? "secondary" : "outline"}>
+                  {member.passed ? "passed" : "excluded"}
+                </Badge>
+              </TableCell>
+              {/* Carried through so the operator sees WHY, not just absence. */}
+              <TableCell className="text-xs text-muted-foreground">
+                {member.exclusion_reason ?? "—"}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </Panel>
+  );
+}
+
+function AttachmentBaselines({
+  workflowId,
+  scope,
+}: Readonly<{ workflowId: string; scope: string | null }>) {
+  const attachmentsQuery = useAlertsScreenerAttachments(workflowId, scope);
+
+  if (attachmentsQuery.isLoading) return <Skeleton className="h-32 w-full rounded-xl" />;
+  if (attachmentsQuery.error || !attachmentsQuery.data) {
+    return (
+      <Alert variant="destructive">
+        <AlertCircleIcon />
+        <AlertTitle>Attachment baselines unavailable</AlertTitle>
+        <AlertDescription>
+          {alertsErrorMessage(attachmentsQuery.error, "No data.")}
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  const { attachments, note, revision } = attachmentsQuery.data;
+
+  if (attachments.length === 0) {
+    return <p className="text-sm text-muted-foreground">This screener has no attachments.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <p className="text-xs text-muted-foreground">
+        Revision r{revision}. {note}
+      </p>
+      {attachments.map((attachment) => (
+        <Panel key={attachment.attachment_id} tone="subtle">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-mono text-sm">{attachment.attachment_id}</span>
+            <Badge variant="outline">{attachment.trigger ?? "—"}</Badge>
+            <span className="text-xs text-muted-foreground">
+              channels: {attachment.channels.join(", ") || "none"}
+            </span>
+          </div>
+
+          <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            {attachment.hysteresis.entry_rank !== null ? (
+              <li>entry rank ≤ {attachment.hysteresis.entry_rank}</li>
+            ) : null}
+            {attachment.hysteresis.exit_rank !== null ? (
+              <li>exit rank &gt; {attachment.hysteresis.exit_rank}</li>
+            ) : null}
+            {attachment.hysteresis.exit_after !== null ? (
+              <li>exit after {attachment.hysteresis.exit_after} absent runs</li>
+            ) : null}
+            {attachment.hysteresis.top_n !== null ? <li>top {attachment.hysteresis.top_n}</li> : null}
+            {attachment.hysteresis.rank_delta !== null ? (
+              <li>rank delta {attachment.hysteresis.rank_delta}</li>
+            ) : null}
+            <li>initial match: {attachment.hysteresis.initial_match ? "yes" : "silent baseline"}</li>
+          </ul>
+
+          {attachment.members.length === 0 ? (
+            <p className="mt-3 text-sm text-muted-foreground">
+              No baseline rows yet — this attachment has never seen a complete run and will only
+              initialize on the next one.
+            </p>
+          ) : (
+            <Table className="mt-3">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Instrument</TableHead>
+                  <TableHead>Present</TableHead>
+                  <TableHead>Last rank</TableHead>
+                  <TableHead>Consecutive absent</TableHead>
+                  <TableHead>Baseline from run</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {attachment.members.map((member) => (
+                  <TableRow key={member.instrument_key}>
+                    <TableCell className="font-mono text-sm">{member.instrument_key}</TableCell>
+                    <TableCell>
+                      <Badge variant={member.present ? "secondary" : "outline"}>
+                        {member.present ? "in" : "out"}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="text-sm">{member.last_rank ?? "—"}</TableCell>
+                    <TableCell className="text-sm">{member.consecutive_absent}</TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">
+                      {member.last_complete_run_id ? member.last_complete_run_id.slice(0, 8) : "—"}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </Panel>
+      ))}
+    </div>
+  );
+}
+
+export function ScreenerPage({
+  workflowId,
+  scope,
+}: Readonly<{ workflowId: string; scope: string | null }>) {
+  const workflowQuery = useAlertsWorkflow(workflowId, scope);
+  const capabilitiesQuery = useAlertsCapabilities(scope);
+  const runsQuery = useAlertsScreenerRuns(workflowId, scope);
+  const { trigger } = useAlertsScreenerMutations(workflowId, scope);
+  const dataStatus = useAlertsScreenerDataStatus(workflowId, scope);
+  const warm = useAlertsScreenerWarm(workflowId, scope);
+  // One key per run intent: a double click or a retry reuses it (the server
+  // returns the original run); the key is replaced only after a run is accepted,
+  // so the NEXT deliberate run is a new intent.
+  const [runKey, setRunKey] = useState(() => newIdempotencyKey("screener-run"));
+  const [candleNotice, setCandleNotice] = useState<string | null>(null);
+
+  const startRun = () => {
+    if (trigger.isPending) return;
+    trigger.mutate(runKey, {
+      onSuccess: (result) => {
+        // A retried request must reuse the key; the next deliberate run is a new
+        // intent, so the key is replaced only once this one is settled.
+        setRunKey(newIdempotencyKey("screener-run"));
+        if (result?.status !== "already_finalized") {
+          void dataStatus.refetch();
+        }
+      },
+    });
+  };
+  const [selectedRun, setSelectedRun] = useState<string | null>(null);
+  const [tab, setTab] = useState<"runs" | "baselines">("runs");
+
+  if (workflowQuery.isLoading) return <Skeleton className="h-96 w-full rounded-xl" />;
+
+  if (workflowQuery.error || !workflowQuery.data) {
+    const notFound = !workflowQuery.error || isNotFound(workflowQuery.error);
+    return (
+      <Alert variant="destructive">
+        <AlertCircleIcon />
+        <AlertTitle>{notFound ? "Screener not found" : "Could not load this screener"}</AlertTitle>
+        <AlertDescription>
+          {notFound
+            ? "This screener does not exist in the selected scope."
+            : alertsErrorMessage(workflowQuery.error, "The request failed.")}
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  const workflow = workflowQuery.data;
+  const runs = runsQuery.data?.runs ?? [];
+  const runsNote = runsQuery.data?.note;
+
+  return (
+    <div className="flex flex-col gap-6 pb-8">
+      <div>
+        <AlertsPageHeader
+          backHref="/alerts"
+          trail={[
+            { label: "Alerts", href: "/alerts" },
+            { label: "Screeners", href: "/alerts/screeners" },
+            { label: workflow.name },
+          ]}
+        />
+        <SectionLabel eyebrow="Screener" />
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <Badge variant="secondary">screener</Badge>
+          <span className="text-xs text-muted-foreground">
+            {workflow.instrument_summary ?? "no coverage"}
+          </span>
+          <Button asChild size="xs" variant="outline">
+            <Link href={`/alerts/${workflowId}`}>Open definition</Link>
+          </Button>
+          <Button asChild size="xs" variant="outline">
+            <Link href={`/alerts/screeners/${workflowId}/edit`}>Edit screener</Link>
+          </Button>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <Button
+          size="sm"
+          disabled={trigger.isPending}
+          onClick={startRun}
+        >
+          <PlayIcon className="size-4" aria-hidden />
+          {trigger.isPending ? "Starting…" : "Run now"}
+        </Button>
+        {trigger.error ? (
+          <span className="text-xs text-rose-300">
+            {alertsErrorMessage(trigger.error, "Manual run failed")}
+          </span>
+        ) : null}
+        {/* A repeated idempotency key returns the existing run instead of
+            executing a second scan; say so rather than looking like nothing
+            happened. */}
+        {trigger.data?.status === "already_finalized" ? (
+          <span className="text-xs text-amber-300">
+            This run already exists for that request; no second scan was started.
+          </span>
+        ) : null}
+        {trigger.data?.status && trigger.data.status !== "already_finalized" ? (
+          <span className="text-xs text-muted-foreground">
+            Run {trigger.data.run_id ? trigger.data.run_id.slice(0, 8) : ""} accepted (
+            {trigger.data.status}).
+          </span>
+        ) : null}
+      </div>
+
+      {/* Candle availability: the difference between "no candles yet" and "no
+          matches" has to be visible BEFORE a run, not inferred from an empty
+          result. */}
+      {dataStatus.data?.warming_supported ? (
+        <Panel tone={dataStatus.data.status === "complete" ? "subtle" : "default"}>
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-sm font-medium">Candle data</span>
+            <StatusBadge
+              tone={
+                dataStatus.data.status === "complete"
+                  ? "positive"
+                  : dataStatus.data.status === "warming"
+                    ? "warning"
+                    : "neutral"
+              }
+            >
+              {dataStatus.data.status === "complete"
+                ? "ready"
+                : dataStatus.data.status === "warming"
+                  ? "warming"
+                  : "unavailable"}
+            </StatusBadge>
+            {/* Zero members is NOT "ready": the universe has not been resolved
+                (or resolved to nothing), and a scan over it cannot rank. */}
+            <span className="text-xs text-muted-foreground">
+              {!dataStatus.data.member_count
+                ? "This universe has no resolved members yet"
+                : (dataStatus.data.members_needing_candles ?? 0) > 0
+                  ? `${dataStatus.data.members_needing_candles} of ${dataStatus.data.member_count} symbols still need ${dataStatus.data.required_bars} final daily candles`
+                  : `All ${dataStatus.data.member_count} symbols have the history this scan needs`}
+            </span>
+            {dataStatus.data.status === "unavailable" ? (
+              <Button asChild size="xs" variant="outline">
+                <Link href="/alerts/universes">Open universes</Link>
+              </Button>
+            ) : null}
+            {(dataStatus.data.members_needing_candles ?? 0) > 0 ? (
+              <Button size="xs" variant="outline" disabled={warm.isPending} onClick={() => warm.mutate(undefined, {
+                onSuccess: (result: { warmed: number; fresh: number; unavailable: number; skipped: number; duration_s: number }) =>
+                  setCandleNotice(
+                    `Fetched ${result.warmed} symbol(s); ${result.fresh} already had history` +
+                      (result.unavailable ? `, ${result.unavailable} unavailable` : "") +
+                      (result.skipped ? `, ${result.skipped} left for a follow-up call` : "") +
+                      ` (${result.duration_s.toFixed(1)}s).`,
+                  ),
+              })}>
+                {warm.isPending ? "Fetching…" : "Fetch candle history"}
+              </Button>
+            ) : null}
+          </div>
+          {warm.error ? (
+            <p className="mt-2 text-xs text-rose-300">
+              {alertsErrorMessage(warm.error, "Candle fetching failed")}
+            </p>
+          ) : null}
+          {candleNotice ? <p className="mt-2 text-xs text-muted-foreground">{candleNotice}</p> : null}
+          {dataStatus.data.note ? (
+            <p className="mt-1 text-xs text-muted-foreground">{dataStatus.data.note}</p>
+          ) : null}
+        </Panel>
+      ) : null}
+
+      <div role="tablist" aria-label="Screener sections" className="flex flex-wrap gap-2">
+        {([
+          ["runs", "Runs"],
+          ["baselines", "Attachment baselines"],
+        ] as const).map(([value, label]) => (
+          <button
+            key={value}
+            role="tab"
+            type="button"
+            aria-selected={tab === value}
+            onClick={() => setTab(value)}
+            className={
+              tab === value
+                ? "rounded-full border border-primary/60 bg-primary/10 px-3 py-1 text-xs text-primary"
+                : "rounded-full border border-border/60 px-3 py-1 text-xs text-muted-foreground hover:text-foreground"
+            }
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "runs" ? (
+        <div className="flex flex-col gap-4">
+          {runsQuery.isLoading ? (
+            <Skeleton className="h-40 w-full rounded-xl" />
+          ) : runsQuery.error ? (
+            // A failed run fetch is not "no runs". Show the failure.
+            <Alert variant="destructive">
+              <AlertCircleIcon />
+              <AlertTitle>Could not load runs</AlertTitle>
+              <AlertDescription>
+                {alertsErrorMessage(runsQuery.error, "The run history request failed.")}
+              </AlertDescription>
+            </Alert>
+          ) : runs.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No runs recorded yet.</p>
+          ) : (
+            <div className="rounded-xl border border-border/70 bg-card/60">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Status</TableHead>
+                    <TableHead>Created</TableHead>
+                    <TableHead>Completed</TableHead>
+                    <TableHead>Triggered by</TableHead>
+                    <TableHead>What happened</TableHead>
+                    <TableHead />
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {runs.map((run) => {
+                    const id = run.run_id;
+                    return (
+                      <TableRow key={id}>
+                        <TableCell>
+                          <StatusBadge tone={runStatusTone(run.status)}>{run.status}</StatusBadge>
+                        </TableCell>
+                        <TableCell className="text-sm text-muted-foreground">
+                          {formatTimestamp(run.created_at ?? null) ?? "—"}
+                        </TableCell>
+                        <TableCell className="text-sm text-muted-foreground">
+                          {run.status === "running"
+                            ? "running…"
+                            : formatTimestamp(run.completed_at ?? null) ?? "—"}
+                        </TableCell>
+                        <TableCell className="text-sm text-muted-foreground">
+                          {run.triggered_by ?? "—"}
+                        </TableCell>
+                        <TableCell className="max-w-[26rem] text-xs text-muted-foreground">
+                          {/* What happened, in words: a zero-evaluated run caused by
+                              missing candle data must not read like "no matches". */}
+                          {readScreenerRun(run).summary}
+                        </TableCell>
+                        <TableCell>
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            aria-expanded={selectedRun === id}
+                            onClick={() => setSelectedRun(selectedRun === id ? null : id)}
+                          >
+                            {selectedRun === id ? "Hide" : "Members"}
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+
+          {/* The runs-level caveat the server sends, shown on the list rather
+              than only inside an expanded member panel. */}
+          {runsNote ? <p className="text-xs text-muted-foreground">{runsNote}</p> : null}
+
+          {selectedRun ? <RunMembers runId={selectedRun} scope={scope} /> : null}
+
+          {/* Read from capabilities, not hard-coded: ties are broken by the
+              server's ranker, so the UI must report what it actually does. */}
+          <p className="text-xs text-muted-foreground">
+            Tie-break: {capabilitiesQuery.data?.capabilities.screener.tie_break ?? "…"} — equal
+            scores still have a stable order.
+          </p>
+        </div>
+      ) : (
+        <AttachmentBaselines workflowId={workflowId} scope={scope} />
+      )}
+    </div>
+  );
+}

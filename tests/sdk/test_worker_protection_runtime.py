@@ -243,7 +243,7 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         run = {"strategy_run_id": "run-1", "account_scope": "kite:paper-a"}
         state = {"triggered_rule": "basket_stoploss", "exit_idempotency_key": "backend-protection:run-1:g1:basket_stoploss:abc"}
 
-        with patch("api.control_plane.exit_control_strategy", new=AsyncMock(return_value={"status": "closed"})) as exit_mock:
+        with patch("backend.api.services.control_plane.exit_control_strategy", new=AsyncMock(return_value={"status": "closed"})) as exit_mock:
             result = await submit_worker_protection_exit(request, run, state)
 
         self.assertEqual(result["status"], "closed")

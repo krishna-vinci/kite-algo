@@ -82,6 +82,186 @@ CREATE INDEX IF NOT EXISTS idx_kite_indices_tradingsymbol
 CREATE INDEX IF NOT EXISTS idx_kite_indices_segment
   ON public.kite_indices (segment);
 
+-- =========================================
+-- Generation-aware instrument catalog
+-- =========================================
+
+CREATE TABLE IF NOT EXISTS public.instrument_catalog_generations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  status VARCHAR(16) NOT NULL CHECK (status IN ('staging', 'published', 'degraded', 'failed')),
+  requested_exchanges TEXT[] NOT NULL DEFAULT '{}',
+  accepted_exchanges TEXT[] NOT NULL DEFAULT '{}',
+  retained_exchanges TEXT[] NOT NULL DEFAULT '{}',
+  record_count INTEGER NOT NULL DEFAULT 0,
+  validation_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+  exchange_sources JSONB NOT NULL DEFAULT '{}'::jsonb,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  published_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.instrument_catalog_records (
+  instrument_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  identity_key TEXT NOT NULL UNIQUE,
+  public_key TEXT NOT NULL,
+  exchange VARCHAR(16) NOT NULL,
+  segment VARCHAR(32),
+  tradingsymbol VARCHAR(255) NOT NULL,
+  name VARCHAR(255),
+  instrument_type VARCHAR(32),
+  underlying VARCHAR(255),
+  option_type VARCHAR(10),
+  expiry DATE,
+  strike DOUBLE PRECISION,
+  tick_size DOUBLE PRECISION,
+  lot_size INTEGER,
+  lifecycle_status VARCHAR(16) NOT NULL DEFAULT 'active'
+    CHECK (lifecycle_status IN ('active', 'expired', 'retired')),
+  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  current_generation_id UUID REFERENCES public.instrument_catalog_generations(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.instrument_broker_mappings (
+  mapping_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  instrument_id UUID NOT NULL REFERENCES public.instrument_catalog_records(instrument_id),
+  broker VARCHAR(32) NOT NULL,
+  broker_exchange VARCHAR(16) NOT NULL,
+  broker_symbol VARCHAR(255) NOT NULL,
+  broker_token BIGINT NOT NULL,
+  broker_exchange_token BIGINT,
+  valid_from_generation UUID NOT NULL REFERENCES public.instrument_catalog_generations(id),
+  valid_to_generation UUID REFERENCES public.instrument_catalog_generations(id),
+  is_current BOOLEAN NOT NULL DEFAULT TRUE,
+  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (instrument_id, broker, valid_from_generation),
+  UNIQUE (broker, broker_token, valid_from_generation)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_instrument_mapping_current_broker_token
+  ON public.instrument_broker_mappings (broker, broker_token)
+  WHERE is_current;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_instrument_mapping_current_identity_broker
+  ON public.instrument_broker_mappings (instrument_id, broker)
+  WHERE is_current;
+
+CREATE TABLE IF NOT EXISTS public.instrument_catalog_staging (
+  generation_id UUID NOT NULL REFERENCES public.instrument_catalog_generations(id) ON DELETE CASCADE,
+  source_exchange VARCHAR(16) NOT NULL,
+  broker VARCHAR(32) NOT NULL,
+  broker_exchange VARCHAR(16) NOT NULL,
+  broker_symbol VARCHAR(255) NOT NULL,
+  broker_token BIGINT NOT NULL,
+  broker_exchange_token BIGINT,
+  identity_key TEXT NOT NULL,
+  public_key TEXT NOT NULL,
+  segment VARCHAR(32),
+  name VARCHAR(255),
+  instrument_type VARCHAR(32),
+  underlying VARCHAR(255),
+  option_type VARCHAR(10),
+  expiry DATE,
+  strike DOUBLE PRECISION,
+  tick_size DOUBLE PRECISION,
+  lot_size INTEGER,
+  raw_record JSONB NOT NULL DEFAULT '{}'::jsonb,
+  PRIMARY KEY (generation_id, broker, broker_token)
+);
+
+CREATE INDEX IF NOT EXISTS idx_instrument_catalog_public_key
+  ON public.instrument_catalog_records (public_key);
+CREATE INDEX IF NOT EXISTS idx_instrument_catalog_exchange_symbol
+  ON public.instrument_catalog_records (exchange, tradingsymbol);
+CREATE INDEX IF NOT EXISTS idx_instrument_catalog_derivative
+  ON public.instrument_catalog_records (underlying, option_type, expiry, strike);
+CREATE INDEX IF NOT EXISTS idx_instrument_catalog_current_generation
+  ON public.instrument_catalog_records (current_generation_id);
+CREATE INDEX IF NOT EXISTS idx_instrument_mapping_current_token
+  ON public.instrument_broker_mappings (broker, broker_token)
+  WHERE is_current;
+CREATE INDEX IF NOT EXISTS idx_instrument_staging_generation_exchange
+  ON public.instrument_catalog_staging (generation_id, source_exchange);
+CREATE INDEX IF NOT EXISTS idx_instrument_staging_identity
+  ON public.instrument_catalog_staging (generation_id, identity_key);
+
+DROP VIEW IF EXISTS public.instrument_catalog_published_v;
+CREATE VIEW public.instrument_catalog_published_v AS
+SELECT
+  r.instrument_id,
+  r.identity_key,
+  r.public_key,
+  r.exchange,
+  r.segment,
+  r.tradingsymbol,
+  r.name,
+  r.instrument_type,
+  r.underlying,
+  r.option_type,
+  r.expiry,
+  r.strike,
+  r.tick_size,
+  r.lot_size,
+  r.lifecycle_status,
+  r.current_generation_id AS catalog_generation,
+  m.broker,
+  m.broker_exchange,
+  m.broker_symbol,
+  m.broker_token,
+  m.broker_exchange_token,
+  g.status AS generation_status,
+  g.published_at,
+  g.validation_summary
+FROM public.instrument_catalog_records r
+JOIN public.instrument_catalog_generations g
+  ON g.id = r.current_generation_id
+ AND g.status IN ('published', 'degraded')
+ AND r.lifecycle_status <> 'retired'
+JOIN public.instrument_broker_mappings m
+  ON m.instrument_id = r.instrument_id
+ AND m.is_current = TRUE;
+
+-- =========================================
+-- Universe membership (alerts platform)
+-- Mirrors migration 20260909_000014_universe_membership.
+-- =========================================
+
+CREATE TABLE IF NOT EXISTS public.universes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id VARCHAR(255) NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  -- 'screener' is admitted since migration 20260911_000016 (Phase 4): the
+  -- Phase 3 dynamic-universe code path already supported it, but the original
+  -- CHECK rejected it on real PostgreSQL.
+  kind VARCHAR(16) NOT NULL CHECK (kind IN ('explicit', 'index', 'portfolio', 'screener')),
+  source_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (owner_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS public.universe_revisions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  universe_id UUID NOT NULL REFERENCES public.universes(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL,
+  expression JSONB NOT NULL DEFAULT '{}'::jsonb,
+  members TEXT[] NOT NULL DEFAULT '{}',
+  member_count INTEGER NOT NULL DEFAULT 0,
+  source_generation UUID,
+  coverage JSONB NOT NULL DEFAULT '{}'::jsonb,
+  resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (universe_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_universe_revisions_universe_resolved
+  ON public.universe_revisions (universe_id, resolved_at DESC);
+
 -- Table for single-user settings (e.g., marketwatch subscriptions)
 CREATE TABLE IF NOT EXISTS public.user_settings (
   owner_id           VARCHAR(255) PRIMARY KEY DEFAULT 'default',
@@ -1846,3 +2026,440 @@ CREATE TABLE IF NOT EXISTS public.journal_projection_state (
     cursor_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ============================================================================
+-- Screener runs and attachments (alerts Phase 3 F9).
+-- Mirrors migration 20260910_000015_screener_runs.
+-- ============================================================================
+
+-- Screener attachment events are WORKFLOW-level (no alert subscription);
+-- the delivery worker renders their context from event evidence.
+ALTER TABLE signal_events ALTER COLUMN subscription_id DROP NOT NULL;
+ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS workflow_id UUID;
+CREATE INDEX IF NOT EXISTS idx_signal_events_workflow
+    ON signal_events (workflow_id, fired_at DESC);
+
+-- Run-scoped notifications (hosted strategies): additive columns; no FK change.
+ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'workflow';
+ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS owner_id TEXT;
+ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS run_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_signal_events_run
+    ON signal_events (run_id, fired_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_events_owner
+    ON signal_events (owner_id);
+
+CREATE TABLE IF NOT EXISTS public.screener_run (
+    id UUID PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    workflow_id UUID NOT NULL,
+    workflow_revision_id UUID NOT NULL,
+    occurrence_key TEXT NOT NULL UNIQUE,
+    scheduled_for TIMESTAMPTZ NOT NULL,
+    triggered_by TEXT NOT NULL DEFAULT 'schedule',
+    status TEXT NOT NULL,
+    universe_revision INTEGER,
+    as_of TIMESTAMPTZ,
+    coverage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    data_freshness JSONB NOT NULL DEFAULT '{}'::jsonb,
+    failure_reason TEXT,
+    lease_owner TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_screener_run_workflow
+    ON public.screener_run (workflow_id, scheduled_for DESC);
+
+CREATE TABLE IF NOT EXISTS public.screener_run_member (
+    id BIGSERIAL PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES public.screener_run(id) ON DELETE CASCADE,
+    instrument_key TEXT NOT NULL,
+    passed BOOLEAN NOT NULL DEFAULT false,
+    exclusion_reason TEXT,
+    values JSONB NOT NULL DEFAULT '{}'::jsonb,
+    rank INTEGER,
+    score DOUBLE PRECISION
+);
+CREATE INDEX IF NOT EXISTS idx_screener_member_run
+    ON public.screener_run_member (run_id);
+
+CREATE TABLE IF NOT EXISTS public.screener_attachment_state (
+    id BIGSERIAL PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    workflow_id UUID NOT NULL,
+    workflow_revision_id UUID NOT NULL,
+    attachment_id TEXT NOT NULL,
+    instrument_key TEXT NOT NULL,
+    present BOOLEAN NOT NULL DEFAULT false,
+    last_complete_run_id UUID,
+    last_rank INTEGER,
+    consecutive_absent INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (owner_id, workflow_id, workflow_revision_id, attachment_id, instrument_key)
+);
+
+-- =========================================
+-- Alerts Phase 4 F10 — advanced conditions, breadth, session caps and
+-- external signal producers.
+-- Mirrors migration 20260911_000016_alerts_phase4.
+--
+-- Two classes of object: COMPUTED state (breadth threshold/contributions,
+-- session and suppression counters, expiring external values) which rebuilds
+-- on the next evaluation, and USER-AUTHORED configuration (external producer
+-- definitions, their schemas, their credentials) which does not.
+-- =========================================
+
+-- One breadth threshold row per (owner, workflow, revision, stage). Breadth
+-- state is deliberately NOT kept in per-subscription checkpoints: a
+-- workflow-level event cannot be governed by N per-instrument copies.
+CREATE TABLE IF NOT EXISTS public.alert_breadth_state (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id TEXT NOT NULL,
+  workflow_id UUID NOT NULL,
+  revision_id UUID NOT NULL,
+  stage_id TEXT NOT NULL,
+  -- Starts FALSE so the first legitimate crossing notifies.
+  satisfied BOOLEAN NOT NULL DEFAULT false,
+  crossing_seq BIGINT NOT NULL DEFAULT 0,
+  satisfied_since_ts TIMESTAMPTZ,
+  last_fired_ts TIMESTAMPTZ,
+  last_count INTEGER,
+  member_count INTEGER,
+  -- Never moves backwards; excludes future contributions from a count.
+  aggregation_watermark TIMESTAMPTZ,
+  membership_resolved_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (owner_id, workflow_id, revision_id, stage_id)
+);
+
+-- One row per contributing instrument holding its LATEST qualifying trigger,
+-- written with a guarded upsert so a late observation can never overwrite a
+-- newer contribution for the same instrument.
+CREATE TABLE IF NOT EXISTS public.alert_breadth_triggers (
+  id BIGSERIAL PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  workflow_id UUID NOT NULL,
+  revision_id UUID NOT NULL,
+  stage_id TEXT NOT NULL,
+  instrument_key TEXT NOT NULL,
+  last_trigger_ts TIMESTAMPTZ NOT NULL,
+  last_bar_ts TIMESTAMPTZ,
+  universe_revision INTEGER,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (owner_id, workflow_id, revision_id, stage_id, instrument_key)
+);
+CREATE INDEX IF NOT EXISTS idx_breadth_triggers_window
+    ON public.alert_breadth_triggers
+    (workflow_id, revision_id, stage_id, last_trigger_ts);
+
+-- Per-session notification cap, shared atomically across every instrument of
+-- one alert and counting LOGICAL notifications (one per signal event, never
+-- per channel delivery).
+CREATE TABLE IF NOT EXISTS public.alert_session_counters (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id TEXT NOT NULL,
+  workflow_id UUID NOT NULL,
+  revision_id UUID NOT NULL,
+  alert_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  first_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (owner_id, workflow_id, revision_id, alert_id, session_id)
+);
+
+-- Durable record of what was suppressed, so a skipped notification is
+-- inspectable rather than silent.
+CREATE TABLE IF NOT EXISTS public.alert_suppression_counters (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id TEXT NOT NULL,
+  workflow_id UUID NOT NULL,
+  revision_id UUID NOT NULL,
+  alert_id TEXT NOT NULL,
+  session_id TEXT,
+  reason TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  first_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_instrument_key TEXT,
+  last_stage_id TEXT,
+  UNIQUE (owner_id, workflow_id, revision_id, alert_id, session_id, reason)
+);
+CREATE INDEX IF NOT EXISTS idx_suppression_counters_workflow
+    ON public.alert_suppression_counters (workflow_id, reason);
+
+-- USER-AUTHORED configuration: producer identity, owner and value schema.
+CREATE TABLE IF NOT EXISTS public.external_signal_producers (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT true,
+  value_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
+  default_ttl_s INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  revoked_at TIMESTAMPTZ,
+  UNIQUE (owner_id, name)
+);
+
+-- Hash only: the raw secret is returned exactly once at issuance and is never
+-- retrievable, echoed in another response, or logged.
+CREATE TABLE IF NOT EXISTS public.external_signal_producer_credentials (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  producer_id UUID NOT NULL REFERENCES public.external_signal_producers(id) ON DELETE CASCADE,
+  token_id TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_producer_credentials_producer
+    ON public.external_signal_producer_credentials (producer_id, status);
+
+-- Expiring typed values. Durable acceptance precedes the 2xx response; the
+-- consuming stage samples them at its own candle clock, so a value can expire
+-- between evaluations (disclosed, never implied away).
+CREATE TABLE IF NOT EXISTS public.external_signal_values (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  producer_id UUID NOT NULL REFERENCES public.external_signal_producers(id) ON DELETE CASCADE,
+  owner_id TEXT NOT NULL,
+  instrument_key TEXT,
+  event_time TIMESTAMPTZ NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('accepted', 'late')),
+  value JSONB NOT NULL,
+  content_hash TEXT NOT NULL,
+  idempotency_key TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (producer_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_external_values_lookup
+    ON public.external_signal_values (producer_id, instrument_key, event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_external_values_expiry
+    ON public.external_signal_values (expires_at);
+
+-- Mirrors migration 20260912_000017_delivery_attempt_provider_id.
+-- Nullable and additive: the adapters already return a provider
+-- acknowledgement (Telegram message_id / ntfy X-Ntfy-Id) but it was discarded
+-- at write time, so "did the provider accept this, and under which id" could
+-- not be answered. Rows recorded before this column exists stay NULL rather
+-- than being backfilled with an invented value.
+ALTER TABLE public.delivery_attempts ADD COLUMN IF NOT EXISTS provider_id VARCHAR(128);
+
+-- Mirrors migration 20260912_000018_workflow_canvas_layout.
+-- Canvas node POSITIONS only, never node semantics: the canvas is another
+-- editor of the same canonical document, so nothing here can reach the
+-- canonical hash and a cosmetic move provably creates no revision.
+-- node_id is a namespaced identity ('stage:'/'alert:'/'channel:') because
+-- stage ids, alert ids and channel names are separate id spaces that may
+-- legally collide -- keyed bare, two different nodes could share one position.
+CREATE TABLE IF NOT EXISTS public.workflow_canvas_layout (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  workflow_id TEXT NOT NULL REFERENCES public.workflows(id) ON DELETE CASCADE,
+  node_id TEXT NOT NULL,
+  x DOUBLE PRECISION NOT NULL,
+  y DOUBLE PRECISION NOT NULL,
+  collapsed BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_canvas_layout_owner_workflow_node
+    UNIQUE (owner_id, workflow_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_canvas_layout_workflow
+    ON public.workflow_canvas_layout (owner_id, workflow_id);
+
+-- Mirrors migration 20260915_000019_hosted_strategy_foundation.
+-- Hosted-strategy store + immutable versions + (stored-only) schedules + a
+-- fenced job ledger. Purely additive; schema only, no execution path.
+--   * snapshots (params/capabilities/policy + effective max_duration_s /
+--     progress_deadline_s) live on jobs and schedules so a queued job is never
+--     reconstructed from mutable strategy defaults;
+--   * job_kind (continuous/finite) is SEPARATE from execution_mode
+--     (paper/dry_run); both are CHECK-constrained;
+--   * run_id is TEXT to match algo_worker_runs.strategy_run_id (TEXT);
+--   * lease_owner/lease_epoch/lease_until fence transitions, and
+--     status='recovery_required' blocks replacement until reconciliation.
+CREATE TABLE IF NOT EXISTS public.hosted_strategies (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    template_id TEXT NOT NULL,
+    description TEXT,
+    default_execution_mode TEXT NOT NULL DEFAULT 'paper',
+    default_job_kind TEXT NOT NULL DEFAULT 'finite',
+    default_account_scope TEXT NOT NULL,
+    max_duration_s INTEGER NOT NULL,
+    progress_deadline_s INTEGER NOT NULL,
+    stale_exit_policy TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_hosted_strategies_owner_name UNIQUE (owner_id, name),
+    CONSTRAINT uq_hosted_strategies_template UNIQUE (template_id),
+    CONSTRAINT uq_hosted_strategies_id_owner UNIQUE (id, owner_id),
+    CONSTRAINT ck_hosted_strategies_template_id CHECK (template_id = 'hosted:' || id),
+    CONSTRAINT ck_hosted_strategies_execution_mode CHECK (default_execution_mode IN ('paper', 'dry_run')),
+    CONSTRAINT ck_hosted_strategies_job_kind CHECK (default_job_kind IN ('continuous', 'finite')),
+    CONSTRAINT ck_hosted_strategies_max_duration CHECK (max_duration_s > 0),
+    CONSTRAINT ck_hosted_strategies_progress_deadline CHECK (progress_deadline_s > 0),
+    CONSTRAINT ck_hosted_strategies_stale_policy CHECK (stale_exit_policy IN ('none', 'exit_on_worker_stale')),
+    CONSTRAINT ck_hosted_strategies_status CHECK (status IN ('active', 'disabled'))
+);
+CREATE INDEX IF NOT EXISTS idx_hosted_strategies_owner
+    ON public.hosted_strategies (owner_id);
+
+CREATE TABLE IF NOT EXISTS public.hosted_strategy_versions (
+    id TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL REFERENCES public.hosted_strategies(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    parameters_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
+    capabilities_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_by TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_hosted_strategy_versions_number UNIQUE (strategy_id, version),
+    CONSTRAINT uq_hosted_strategy_versions_id_strategy UNIQUE (id, strategy_id),
+    CONSTRAINT ck_hosted_strategy_versions_number CHECK (version > 0)
+);
+CREATE INDEX IF NOT EXISTS idx_hosted_strategy_versions_strategy
+    ON public.hosted_strategy_versions (strategy_id, version DESC);
+
+CREATE TABLE IF NOT EXISTS public.hosted_strategy_schedules (
+    id TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    account_scope TEXT NOT NULL,
+    params_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    execution_mode TEXT NOT NULL,
+    job_kind TEXT NOT NULL,
+    policy_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    capabilities_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    max_duration_s INTEGER NOT NULL,
+    progress_deadline_s INTEGER NOT NULL,
+    schedule_kind TEXT NOT NULL,
+    at_time TEXT NOT NULL,
+    weekday INTEGER,
+    timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata',
+    window_end TEXT,
+    squareoff_at TEXT,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    manual_paused_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_hosted_strategy_schedules_strategy UNIQUE (strategy_id),
+    CONSTRAINT fk_hosted_strategy_schedules_strategy_owner
+        FOREIGN KEY (strategy_id, owner_id)
+        REFERENCES public.hosted_strategies (id, owner_id) ON DELETE CASCADE,
+    CONSTRAINT fk_hosted_strategy_schedules_version_strategy
+        FOREIGN KEY (version_id, strategy_id)
+        REFERENCES public.hosted_strategy_versions (id, strategy_id) ON DELETE RESTRICT,
+    CONSTRAINT ck_hosted_strategy_schedules_execution_mode CHECK (execution_mode IN ('paper', 'dry_run')),
+    CONSTRAINT ck_hosted_strategy_schedules_job_kind CHECK (job_kind IN ('continuous', 'finite')),
+    CONSTRAINT ck_hosted_strategy_schedules_kind CHECK (schedule_kind IN ('daily', 'weekly')),
+    CONSTRAINT ck_hosted_strategy_schedules_weekday CHECK (weekday IS NULL OR (weekday >= 0 AND weekday <= 6)),
+    CONSTRAINT ck_hosted_strategy_schedules_weekly_weekday CHECK (schedule_kind <> 'weekly' OR weekday IS NOT NULL),
+    CONSTRAINT ck_hosted_strategy_schedules_max_duration CHECK (max_duration_s > 0),
+    CONSTRAINT ck_hosted_strategy_schedules_progress_deadline CHECK (progress_deadline_s > 0)
+);
+
+CREATE TABLE IF NOT EXISTS public.strategy_jobs (
+    id TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    account_scope TEXT NOT NULL,
+    job_kind TEXT NOT NULL,
+    execution_mode TEXT NOT NULL,
+    desired_state TEXT NOT NULL DEFAULT 'started',
+    occurrence_key TEXT,
+    run_id TEXT,
+    token_id TEXT,
+    lease_owner TEXT,
+    lease_epoch BIGINT NOT NULL DEFAULT 0,
+    lease_until TIMESTAMPTZ,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'queued',
+    params_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    capabilities_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    policy_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    max_duration_s INTEGER NOT NULL,
+    progress_deadline_s INTEGER NOT NULL,
+    identity_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    last_progress_at TIMESTAMPTZ,
+    exit_code INTEGER,
+    log_ref TEXT,
+    handoff_at TIMESTAMPTZ,
+    last_error TEXT,
+    process_cleanup_state TEXT,
+    process_cleanup_at TIMESTAMPTZ,
+    process_cleanup_actor TEXT,
+    stop_requested_at TIMESTAMPTZ,
+    stop_requested_by TEXT,
+    logs_discarded BOOLEAN NOT NULL DEFAULT false,
+    logs_source TEXT,
+    recovery_required_at TIMESTAMPTZ,
+    reconciled_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_strategy_jobs_occurrence UNIQUE (occurrence_key),
+    CONSTRAINT fk_strategy_jobs_strategy_owner
+        FOREIGN KEY (strategy_id, owner_id)
+        REFERENCES public.hosted_strategies (id, owner_id) ON DELETE CASCADE,
+    CONSTRAINT fk_strategy_jobs_version_strategy
+        FOREIGN KEY (version_id, strategy_id)
+        REFERENCES public.hosted_strategy_versions (id, strategy_id) ON DELETE RESTRICT,
+    CONSTRAINT ck_strategy_jobs_job_kind CHECK (job_kind IN ('continuous', 'finite')),
+    CONSTRAINT ck_strategy_jobs_execution_mode CHECK (execution_mode IN ('paper', 'dry_run')),
+    CONSTRAINT ck_strategy_jobs_desired_state CHECK (desired_state IN ('started', 'paused', 'stopped')),
+    CONSTRAINT ck_strategy_jobs_attempt CHECK (attempt > 0),
+    CONSTRAINT ck_strategy_jobs_lease_epoch CHECK (lease_epoch >= 0),
+    CONSTRAINT ck_strategy_jobs_max_duration CHECK (max_duration_s > 0),
+    CONSTRAINT ck_strategy_jobs_progress_deadline CHECK (progress_deadline_s > 0),
+    CONSTRAINT ck_strategy_jobs_status CHECK (
+        status IN ('queued', 'starting', 'running', 'fencing', 'recovery_required', 'stopped', 'failed', 'hung')
+    ),
+    CONSTRAINT ck_strategy_jobs_process_cleanup_state CHECK (
+        process_cleanup_state IS NULL OR process_cleanup_state IN ('confirmed', 'unresolved')
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_jobs_lease
+    ON public.strategy_jobs (status, lease_until);
+CREATE INDEX IF NOT EXISTS idx_strategy_jobs_owner_strategy
+    ON public.strategy_jobs (owner_id, strategy_id);
+
+CREATE TABLE IF NOT EXISTS public.strategy_job_reconciliations (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES public.strategy_jobs(id) ON DELETE CASCADE,
+    strategy_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    run_id TEXT,
+    outcome TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    evidence_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    actor_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_strategy_job_reconciliations_outcome CHECK (outcome IN ('reconciled', 'blocked')),
+    CONSTRAINT ck_strategy_job_reconciliations_attempt CHECK (attempt > 0)
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_job_reconciliations_job
+    ON public.strategy_job_reconciliations (job_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.strategy_job_logs (
+    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES public.strategy_jobs(id) ON DELETE CASCADE,
+    attempt INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    byte_len INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_strategy_job_logs_seq UNIQUE (job_id, attempt, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_job_logs_job
+    ON public.strategy_job_logs (job_id, attempt, seq);
