@@ -6,6 +6,7 @@ import { useCallback, useMemo } from "react";
 
 import { alertsKeys } from "@/features/alerts/hooks/keys";
 import {
+  deleteAlertsWorkflow,
   activateAlertsWorkflow,
   archiveAlertsWorkflow,
   createAlertsProducer,
@@ -42,6 +43,7 @@ import {
   previewAlertsUniverse,
   resolveAlertsUniverse,
   resumeAlertsWorkflow,
+  setAlertsNotificationFrequency,
   revokeAlertsProducer,
   revokeAlertsProducerCredential,
   revokeAlertsToken,
@@ -222,6 +224,18 @@ export function useAlertsLifecycle(workflowId: string, scope: string | null) {
     }),
     archive: useMutation({
       mutationFn: () => archiveAlertsWorkflow(workflowId, scope),
+      onSuccess: invalidate,
+    }),
+    setFrequency: useMutation({
+      mutationFn: (payload: {
+        frequency: "once" | "repeated" | "reminder";
+        reminder_interval_s?: number | null;
+      }) => setAlertsNotificationFrequency(workflowId, payload, scope),
+      onSuccess: invalidate,
+    }),
+    remove: useMutation({
+      mutationFn: (keepHistory?: boolean) =>
+        deleteAlertsWorkflow(workflowId, { scope, keepHistory }),
       onSuccess: invalidate,
     }),
   };

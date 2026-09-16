@@ -47,6 +47,7 @@ from backend.api.schemas.workflows import (
     IssueEnvelope,
     PreviewResponse,
     WorkflowCreateRequest,
+    WorkflowFrequencyRequest,
     WorkflowPatchRequest,
     WorkflowValidateRequest,
     issue,
@@ -294,7 +295,14 @@ def _enrich_workflow(
     summary["has_universe"] = document.universe is not None
     summary["instrument_summary"] = _instrument_summary(keys, document)
     summary["alerts"] = [
-        {"id": alert.id, "source": alert.source, "trigger": alert.trigger}
+        {
+            "id": alert.id,
+            "source": alert.source,
+            "trigger": alert.trigger,
+            # Carried so the list can preselect the right notification frequency
+            # in its Repeat dialog instead of guessing from the trigger alone.
+            "reminder_interval_s": getattr(alert, "reminder_interval_s", None),
+        }
         for alert in document.alerts
     ]
     # A compact rule for the list row, so the operator reads "crosses above
@@ -689,6 +697,23 @@ async def operator_preview(
 # ---------------------------------------------------------------------------
 
 
+def _parse_document_or_422(payload: Any):
+    """Parse a caller-supplied document, reporting a bad one as 422.
+
+    A document that fails to PARSE (a missing non-empty field, a malformed
+    operand) is the caller's mistake, not a server fault. Without this the parse
+    error escaped as an unhandled exception, so the editor's save answered
+    "Internal Server Error" with no way for the UI to say what was wrong.
+    """
+    try:
+        return _document_from_payload(payload)
+    except WorkflowParseError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "issues": [item.model_dump() for item in _parse_issues(exc)]},
+        ) from exc
+
+
 @router.post("/workflows")
 async def create_workflow(
     request: Request,
@@ -698,7 +723,7 @@ async def create_workflow(
 ):
     """Create a workflow + first revision for the authorized scope."""
     enforce_same_origin(request)
-    document = _document_from_payload(payload)
+    document = _parse_document_or_422(payload)
     try:
         compiled = compile_document(document)
     except WorkflowValidationError as exc:
@@ -741,7 +766,7 @@ async def patch_workflow(
 ):
     """Add a draft revision under optimistic concurrency (409 on conflict)."""
     enforce_same_origin(request)
-    document = _document_from_payload(payload)
+    document = _parse_document_or_422(payload)
     try:
         compiled = compile_document(document)
     except WorkflowValidationError as exc:
@@ -752,7 +777,47 @@ async def patch_workflow(
                 "issues": [item.model_dump() for item in _validation_issues(exc)],
             },
         ) from exc
+    # A save that changes nothing is not a conflict and not a new revision: the
+    # platform's contract is that a no-op keeps the canonical semantics (the
+    # worker route has always done this). Without the check the insert hit the
+    # (workflow, canonical_hash) unique constraint and the operator saw the
+    # "this alert changed while you were editing" banner for their own no-op.
     repository = SqlAlchemyWorkflowRepository(session_factory)
+    with session_factory() as session:
+        existing = session.execute(
+            select(WorkflowRevision)
+            .where(WorkflowRevision.workflow_id == workflow_id)
+            .where(WorkflowRevision.canonical_hash == compiled.canonical_hash)
+            .order_by(WorkflowRevision.revision.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if existing is None:
+            has_any = session.execute(
+                select(WorkflowRevision.id)
+                .where(WorkflowRevision.workflow_id == workflow_id)
+                .limit(1)
+            ).first()
+            if has_any is None:
+                raise HTTPException(status_code=404, detail="Workflow has no revisions")
+        else:
+            # Revisions are content-addressed per workflow, so a definition that
+            # is already stored is not a new revision and definitely not a
+            # conflict: report which revision it is so the operator can activate
+            # it. This is what made "save without changing anything" (and going
+            # back to a previous definition) look like someone else's edit.
+            return {
+                "ok": True,
+                "workflow_id": workflow_id,
+                "changed": False,
+                "revision": int(existing.revision),
+                "revision_id": existing.id,
+                "revision_status": str(existing.status),
+                "canonical_hash": str(existing.canonical_hash),
+                "note": (
+                    "this definition is already stored as revision "
+                    f"{int(existing.revision)}; activate it to put it in force"
+                ),
+            }
     try:
         revision = repository.add_draft_revision(
             workflow_id,
@@ -1146,6 +1211,339 @@ async def activate_workflow(
             "A fresh activation is silent by design: an alert whose condition is "
             "already true initializes and does not notify unless the alert sets "
             "notify_if_already_true (spec E-9)."
+        ),
+    }
+
+
+#: Frequency → (trigger, reminder seconds). Mirrors the editor's three plain
+#: choices; "reminder" needs an interval because otherwise it means nothing.
+FREQUENCY_TRIGGERS = {
+    "once": ("once", None),
+    "repeated": ("on_transition", None),
+    "reminder": ("on_transition", None),
+}
+DEFAULT_REMINDER_INTERVAL_S = 900
+
+
+@router.post("/workflows/{workflow_id}/notification-frequency")
+async def set_notification_frequency(
+    request: Request,
+    workflow_id: str,
+    payload: WorkflowFrequencyRequest,
+    scope: str = Depends(require_operator_scope),
+    session_factory: Any = Depends(_alerts_db),
+):
+    """Change when an existing alert notifies, by writing a new revision.
+
+    The operator's complaint that motivated this: "once" was only settable at
+    creation, so an alert that fired once went quiet with no way to make it repeat
+    without rebuilding it. This applies the change to the STORED document (merging
+    onto it, so nothing else is lost), and if the alert is currently active it
+    activates the new revision right away so the change takes effect now.
+    """
+    from backend.workflows.service import EvaluationService
+
+    enforce_same_origin(request)
+    frequency = str(payload.frequency or "").strip().lower()
+    if frequency not in FREQUENCY_TRIGGERS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "ok": False,
+                "issues": [
+                    issue(
+                        "frequency",
+                        "bad_value",
+                        "frequency must be one of " + ", ".join(sorted(FREQUENCY_TRIGGERS)),
+                    ).model_dump()
+                ],
+            },
+        )
+    interval = payload.reminder_interval_s
+    if frequency == "reminder" and (interval is None or int(interval) <= 0):
+        interval = DEFAULT_REMINDER_INTERVAL_S
+    trigger_value = FREQUENCY_TRIGGERS[frequency][0]
+
+    with session_factory() as session:
+        workflow = session.get(WorkflowModel, workflow_id)
+        if workflow is None or workflow.owner_id != scope:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        revision = session.execute(
+            select(WorkflowRevision)
+            .where(WorkflowRevision.workflow_id == workflow_id)
+            .order_by(WorkflowRevision.revision.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if revision is None:
+            raise HTTPException(status_code=409, detail="Workflow has no revisions")
+        latest_revision = int(revision.revision)
+        stored = dict(revision.document or {})
+        active_revision_id = (
+            session.execute(
+                select(WorkflowRevision.id)
+                .where(WorkflowRevision.workflow_id == workflow_id)
+                .where(WorkflowRevision.status == "active")
+            ).scalars().first()
+        )
+
+    alerts = stored.get("alerts")
+    if not isinstance(alerts, list) or not alerts:
+        raise HTTPException(status_code=409, detail="Workflow has no alerts to change")
+    for alert in alerts:
+        if not isinstance(alert, dict):
+            continue
+        alert["trigger"] = trigger_value
+        alert["reminder_interval_s"] = int(interval) if frequency == "reminder" else None
+
+    try:
+        compiled = compile_document(parse_workflow_dict(stored))
+    except WorkflowParseError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "issues": [item.model_dump() for item in _parse_issues(exc)]},
+        ) from exc
+    except WorkflowValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "issues": [item.model_dump() for item in _validation_issues(exc)]},
+        ) from exc
+
+    repository = SqlAlchemyWorkflowRepository(session_factory)
+    with session_factory() as session:
+        existing_row = session.execute(
+            select(WorkflowRevision)
+            .where(WorkflowRevision.workflow_id == workflow_id)
+            .where(WorkflowRevision.canonical_hash == compiled.canonical_hash)
+            .order_by(WorkflowRevision.revision.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+    if existing_row is not None:
+        # This exact definition is already stored (asking for the frequency it
+        # already has, or returning to one used before). Revisions are
+        # content-addressed per workflow, so the honest move is to put that
+        # revision in force when the alert is live — not to write a duplicate the
+        # unique constraint refuses, and not to call it a conflict.
+        reused_activated = False
+        reused_error: Optional[str] = None
+        if active_revision_id is not None and active_revision_id != existing_row.id:
+            try:
+                activated_revision = repository.activate_revision(workflow_id, existing_row.id)
+                EvaluationService(repository, session_factory).ensure_subscriptions(
+                    activated_revision
+                )
+                reused_activated = True
+            except DomainConflict as exc:
+                reused_error = str(exc)
+        return {
+            "ok": True,
+            "workflow_id": workflow_id,
+            "changed": False,
+            "revision": int(existing_row.revision),
+            "revision_id": existing_row.id,
+            "frequency": frequency,
+            "trigger": trigger_value,
+            "reminder_interval_s": int(interval) if frequency == "reminder" else None,
+            "activated": reused_activated or active_revision_id == existing_row.id,
+            "activation_error": reused_error,
+            "subscriptions_created": 0,
+            "previous_revision": latest_revision,
+            "note": (
+                "the alert already notifies this way"
+                if int(existing_row.revision) == latest_revision
+                else f"revision {int(existing_row.revision)} already holds this frequency"
+            ),
+        }
+    expected = payload.expected_revision if payload.expected_revision is not None else latest_revision
+    try:
+        created_revision = repository.add_draft_revision(
+            workflow_id,
+            compiled.document.to_document_dict(),
+            compiled.canonical_hash,
+            expected_revision=expected,
+        )
+    except RevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "ok": False,
+                "rejection_reason": "REVISION_CONFLICT",
+                "message": str(exc),
+            },
+        ) from exc
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Workflow not found") from None
+
+    activated = False
+    activation_error: Optional[str] = None
+    subscriptions_created = 0
+    if active_revision_id is not None:
+        # The alert is switched on, so the change has to take effect now rather
+        # than waiting for someone to activate the revision by hand.
+        try:
+            activated_revision = repository.activate_revision(workflow_id, created_revision.id)
+            subscriptions_created = EvaluationService(
+                repository, session_factory
+            ).ensure_subscriptions(activated_revision)
+            activated = True
+        except DomainConflict as exc:
+            activation_error = str(exc)
+
+    return {
+        "ok": True,
+        "workflow_id": workflow_id,
+        "changed": True,
+        "revision": int(created_revision.revision),
+        "revision_id": created_revision.id,
+        "frequency": frequency,
+        "trigger": trigger_value,
+        "reminder_interval_s": int(interval) if frequency == "reminder" else None,
+        "activated": activated,
+        "activation_error": activation_error,
+        "subscriptions_created": subscriptions_created,
+        "previous_revision": latest_revision,
+    }
+
+
+#: Row-level state that belongs to a workflow and has no cascade from it. Each is
+#: deleted explicitly so a hard delete cannot leave orphans behind, and the order
+#: matters (children before parents).
+WORKFLOW_OWNED_TABLES = (
+    "alert_session_counters",
+    "alert_suppression_counters",
+    "alert_breadth_state",
+    "alert_breadth_triggers",
+    "screener_attachment_state",
+    "screener_run",
+)
+
+
+@router.delete("/workflows/{workflow_id}")
+async def delete_workflow(
+    request: Request,
+    workflow_id: str,
+    scope: str = Depends(require_operator_scope),
+    session_factory: Any = Depends(_alerts_db),
+    keep_history: bool = Query(
+        True,
+        description=(
+            "Keep the notification audit trail (signal events and delivery attempts) "
+            "with its workflow attribution, while removing the definition and its "
+            "evaluation state. Pass false to remove the history too."
+        ),
+    ),
+):
+    """Remove a workflow and stop it evaluating.
+
+    Archive is the reversible option; this is the one an operator asks for when an
+    alert was a mistake or a test. It is a real delete: the definition, its
+    revisions, its subscriptions and the counters that belong to it are removed in
+    one transaction, so nothing is left scheduled or half-referenced.
+
+    The notification history is a separate question and the default keeps it:
+    ``signal_events``/``deliveries`` are the record of what was actually sent, and
+    ``signal_events.workflow_id`` keeps it attributable after the definition is
+    gone (the subscription reference is detached, since that row no longer exists).
+    """
+    from sqlalchemy import bindparam, text as sql_text
+
+    enforce_same_origin(request)
+
+    with session_factory() as session:
+        workflow = session.get(WorkflowModel, workflow_id)
+        if workflow is None or workflow.owner_id != scope:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+        revision_ids = [
+            row[0]
+            for row in session.execute(
+                select(WorkflowRevision.id).where(WorkflowRevision.workflow_id == workflow_id)
+            ).all()
+        ]
+        subscription_ids: List[str] = []
+        if revision_ids:
+            # Expanding bind parameters keep this portable (SQLite in tests,
+            # PostgreSQL in production) without dialect branching.
+            statement = sql_text(
+                "SELECT id FROM alert_subscriptions WHERE revision_id IN :revisions"
+            ).bindparams(bindparam("revisions", expanding=True))
+            subscription_ids = [
+                row[0] for row in session.execute(statement, {"revisions": revision_ids}).all()
+            ]
+
+        removed: Dict[str, int] = {}
+        history = {"events_preserved": 0, "events_deleted": 0, "deliveries_deleted": 0}
+
+        if keep_history:
+            if subscription_ids:
+                statement = sql_text(
+                    "UPDATE signal_events SET subscription_id = NULL "
+                    "WHERE subscription_id IN :subscriptions"
+                ).bindparams(bindparam("subscriptions", expanding=True))
+                result = session.execute(statement, {"subscriptions": subscription_ids})
+                history["events_preserved"] = int(result.rowcount or 0)
+        else:
+            if subscription_ids:
+                result = session.execute(
+                    sql_text(
+                        "DELETE FROM deliveries WHERE event_id IN ("
+                        "SELECT id FROM signal_events WHERE workflow_id = :workflow_id)"
+                    ),
+                    {"workflow_id": workflow_id},
+                )
+                history["deliveries_deleted"] = int(result.rowcount or 0)
+            result = session.execute(
+                sql_text("DELETE FROM signal_events WHERE workflow_id = :workflow_id"),
+                {"workflow_id": workflow_id},
+            )
+            history["events_deleted"] = int(result.rowcount or 0)
+
+        if subscription_ids:
+            checkpoints = sql_text(
+                "DELETE FROM evaluation_checkpoints WHERE subscription_id IN :subscriptions"
+            ).bindparams(bindparam("subscriptions", expanding=True))
+            result = session.execute(checkpoints, {"subscriptions": subscription_ids})
+            removed["evaluation_checkpoints"] = int(result.rowcount or 0)
+            subscriptions = sql_text(
+                "DELETE FROM alert_subscriptions WHERE id IN :subscriptions"
+            ).bindparams(bindparam("subscriptions", expanding=True))
+            result = session.execute(subscriptions, {"subscriptions": subscription_ids})
+            removed["alert_subscriptions"] = int(result.rowcount or 0)
+
+        for table in WORKFLOW_OWNED_TABLES:
+            result = session.execute(
+                sql_text(f"DELETE FROM {table} WHERE workflow_id = :workflow_id"),
+                {"workflow_id": workflow_id},
+            )
+            if result.rowcount:
+                removed[table] = int(result.rowcount)
+
+        if revision_ids:
+            result = session.execute(
+                sql_text("DELETE FROM workflow_revisions WHERE workflow_id = :workflow_id"),
+                {"workflow_id": workflow_id},
+            )
+            removed["workflow_revisions"] = int(result.rowcount or 0)
+
+        session.execute(
+            sql_text("DELETE FROM workflows WHERE id = :workflow_id"),
+            {"workflow_id": workflow_id},
+        )
+        removed["workflows"] = 1
+        session.commit()
+
+    return {
+        "ok": True,
+        "workflow_id": workflow_id,
+        "name": workflow.name,
+        "deleted": removed,
+        "history": history,
+        "note": (
+            "The definition and its evaluation state are gone. "
+            + (
+                "The notification history is kept, attributed to this workflow."
+                if keep_history
+                else "The notification history was removed as well."
+            )
         ),
     }
 

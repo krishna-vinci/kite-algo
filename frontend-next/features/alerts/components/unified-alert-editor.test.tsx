@@ -427,3 +427,31 @@ describe("UnifiedAlertEditor", () => {
     expect(screen.getByText("Load the newer revision")).toBeTruthy();
   });
 });
+
+describe("existing-alert actions", () => {
+  it("reads the stored frequency back into a choice", async () => {
+    const { frequencyOf } = await import("@/features/alerts/lib/plain-language");
+    expect(frequencyOf({ trigger: "once", reminder_interval_s: null })).toBe("once");
+    expect(frequencyOf({ trigger: "on_transition", reminder_interval_s: null })).toBe("repeated");
+    expect(frequencyOf({ trigger: "on_transition", reminder_interval_s: 600 })).toBe("reminder");
+  });
+
+  it("reports what a frequency change actually did", async () => {
+    const { describeFrequencyResult } = await import("@/features/alerts/components/alert-actions");
+    expect(
+      describeFrequencyResult({ changed: true, trigger: "once", activated: true, revision: 4 }),
+    ).toContain("put in force");
+    expect(
+      describeFrequencyResult({ changed: true, trigger: "once", activated: false, revision: 4 }),
+    ).toContain("Activate it");
+    expect(
+      describeFrequencyResult({
+        changed: false,
+        trigger: "once",
+        activated: true,
+        revision: 1,
+        note: "the alert already notifies this way",
+      }),
+    ).toBe("the alert already notifies this way");
+  });
+});

@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   AlertCircleIcon,
   ArrowLeftIcon,
@@ -15,6 +16,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { RepeatIcon, TrashIcon } from "lucide-react";
 import { SectionLabel } from "@/components/operator/section-label";
 import { OPERATOR_LABELS, sessionLabel } from "@/features/alerts/lib/authoring";
 import { StatusBadge } from "@/components/operator/status-badge";
@@ -30,7 +32,12 @@ import {
   useMarketQuote,
   useQuotePresentation,
 } from "@/features/alerts/hooks/use-market-stream";
+import {
+  ChangeFrequencyDialog,
+  DeleteWorkflowDialog,
+} from "@/features/alerts/components/alert-actions";
 import { describeAlertState } from "@/features/alerts/lib/alert-state";
+import { frequencyOf } from "@/features/alerts/lib/plain-language";
 import { describeTarget, formatAge, formatPrice } from "@/features/alerts/lib/plain-language";
 import { WorkflowHealthPanel } from "@/features/alerts/components/workflow-health-panel";
 import { OperatorIssueList } from "@/features/alerts/components/operator-issue-list";
@@ -203,9 +210,12 @@ export function WorkflowDetailPage({
   workflowId,
   scope,
 }: Readonly<{ workflowId: string; scope: string | null }>) {
+  const router = useRouter();
   const workflowQuery = useAlertsWorkflow(workflowId, scope);
-  const { pause, resume, archive } = useAlertsLifecycle(workflowId, scope);
+  const { pause, resume, archive, setFrequency, remove } = useAlertsLifecycle(workflowId, scope);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [dialog, setDialog] = useState<"none" | "frequency" | "delete">("none");
+  const [deletedName, setDeletedName] = useState<string | null>(null);
 
   if (workflowQuery.isLoading) return <Skeleton className="h-96 w-full rounded-xl" />;
 
@@ -324,6 +334,11 @@ export function WorkflowDetailPage({
               </Button>
             )}
 
+            <Button variant="outline" size="sm" onClick={() => setDialog("frequency")}>
+              <RepeatIcon className="size-4" aria-hidden />
+              Repeat
+            </Button>
+
             {!archived ? (
               <Button
                 variant="outline"
@@ -334,6 +349,11 @@ export function WorkflowDetailPage({
                 Archive
               </Button>
             ) : null}
+
+            <Button variant="outline" size="sm" onClick={() => setDialog("delete")}>
+              <TrashIcon className="size-4" aria-hidden />
+              Delete
+            </Button>
           </div>
         </div>
       </div>
@@ -398,6 +418,61 @@ export function WorkflowDetailPage({
           <WorkflowDeliveriesPanel workflowId={workflowId} scope={scope} />
         </TabsContent>
       </Tabs>
+
+      {dialog === "frequency" ? (
+        <ChangeFrequencyDialog
+          name={workflow.name}
+          current={frequencyOf({
+            trigger: (workflow.alerts ?? [])[0]?.trigger ?? "once",
+            reminder_interval_s: (workflow.alerts ?? [])[0]?.reminder_interval_s ?? null,
+          })}
+          currentReminderSeconds={(workflow.alerts ?? [])[0]?.reminder_interval_s ?? 900}
+          pending={setFrequency.isPending}
+          result={setFrequency.data ?? null}
+          error={setFrequency.error}
+          onSubmit={(frequency, reminderSeconds) =>
+            setFrequency.mutate({
+              frequency,
+              reminder_interval_s: frequency === "reminder" ? reminderSeconds : null,
+            })
+          }
+          onClose={() => {
+            setFrequency.reset();
+            setDialog("none");
+          }}
+        />
+      ) : null}
+
+      {dialog === "delete" ? (
+        <DeleteWorkflowDialog
+          name={workflow.name}
+          active={isActive}
+          pending={remove.isPending}
+          result={remove.data ?? null}
+          error={remove.error}
+          onSubmit={() =>
+            remove.mutate(true, {
+              onSuccess: (result) => {
+                // The page it points at no longer exists: say so and go back to
+                // the list rather than leaving a dead link.
+                setDeletedName(result.name);
+                router.push("/alerts");
+              },
+            })
+          }
+          onClose={() => {
+            remove.reset();
+            setDialog("none");
+          }}
+        />
+      ) : null}
+
+      {deletedName ? (
+        <Alert role="status">
+          <AlertTitle>Deleted</AlertTitle>
+          <AlertDescription>“{deletedName}” and its revisions were removed.</AlertDescription>
+        </Alert>
+      ) : null}
     </div>
     </AlertsMarketStreamProvider>
   );

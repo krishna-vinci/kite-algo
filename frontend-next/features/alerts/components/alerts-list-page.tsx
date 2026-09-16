@@ -35,6 +35,10 @@ import {
 } from "@/components/ui/table";
 import { SectionLabel } from "@/components/operator/section-label";
 import { ScopeSelect } from "@/features/alerts/components/scope-select";
+import {
+  ChangeFrequencyDialog,
+  DeleteWorkflowDialog,
+} from "@/features/alerts/components/alert-actions";
 import { alertsKeys } from "@/features/alerts/hooks/keys";
 import {
   useAlertsScope,
@@ -52,7 +56,7 @@ import { describeAlertState, describeCoverage, describeLastChecked } from "@/fea
 import { alertsErrorMessage } from "@/features/alerts/lib/errors";
 import { summarizeList } from "@/features/alerts/lib/format";
 import { OPERATOR_LABELS } from "@/features/alerts/lib/authoring";
-import { describeRule, formatPrice } from "@/features/alerts/lib/plain-language";
+import { frequencyOf, describeRule, formatPrice } from "@/features/alerts/lib/plain-language";
 import type { AlertsWorkflowSummary } from "@/features/alerts/types";
 
 type Filter = "all" | "active" | "paused" | "draft" | "attention" | "archived";
@@ -178,8 +182,11 @@ function WorkflowRow({
     lastEvaluatedAt: workflow.freshness.last_evaluated_at ?? null,
     quote,
   });
-  const { pause, resume } = useAlertsLifecycle(workflow.workflow_id, scope);
+  const { pause, resume, setFrequency, remove } = useAlertsLifecycle(workflow.workflow_id, scope);
   const busy = pause.isPending || resume.isPending;
+  const [dialog, setDialog] = useState<"none" | "frequency" | "delete">("none");
+  const frequencyResult = setFrequency.data ?? null;
+  const deleteResult = remove.data ?? null;
 
   return (
     <>
@@ -235,6 +242,12 @@ function WorkflowRow({
                 <Link href={`/alerts/${workflow.workflow_id}/edit`}>Edit</Link>
               </Button>
             ) : null}
+            <Button size="xs" variant="outline" onClick={() => setDialog("frequency")}>
+              Repeat
+            </Button>
+            <Button size="xs" variant="ghost" onClick={() => setDialog("delete")}>
+              Delete
+            </Button>
             <Button
               size="xs"
               variant="ghost"
@@ -251,6 +264,48 @@ function WorkflowRow({
           ) : null}
         </TableCell>
       </TableRow>
+      {dialog === "frequency" ? (
+        <TableRow>
+          <TableCell colSpan={4} className="p-0">
+            <ChangeFrequencyDialog
+              name={workflow.name}
+              current={frequencyOf({
+                trigger: workflow.alerts[0]?.trigger ?? "once",
+                reminder_interval_s: workflow.alerts[0]?.reminder_interval_s ?? null,
+              })}
+              currentReminderSeconds={workflow.alerts[0]?.reminder_interval_s ?? 900}
+              pending={setFrequency.isPending}
+              result={frequencyResult}
+              error={setFrequency.error}
+              onSubmit={(frequency, reminderSeconds) =>
+                setFrequency.mutate({ frequency, reminder_interval_s: frequency === "reminder" ? reminderSeconds : null })
+              }
+              onClose={() => {
+                setFrequency.reset();
+                setDialog("none");
+              }}
+            />
+          </TableCell>
+        </TableRow>
+      ) : null}
+      {dialog === "delete" ? (
+        <TableRow>
+          <TableCell colSpan={4} className="p-0">
+            <DeleteWorkflowDialog
+              name={workflow.name}
+              active={lifecycle === "active"}
+              pending={remove.isPending}
+              result={deleteResult}
+              error={remove.error}
+              onSubmit={() => remove.mutate(true)}
+              onClose={() => {
+                remove.reset();
+                setDialog("none");
+              }}
+            />
+          </TableCell>
+        </TableRow>
+      ) : null}
       {showDiagnostics ? (
         <TableRow>
           <TableCell colSpan={4} className="bg-background/40 text-xs text-muted-foreground">

@@ -200,3 +200,16 @@ class ChannelTestResponse(BaseModel):
     status: str
     provider_id: Optional[str] = None
     detail: str = ""
+
+
+class WorkflowFrequencyRequest(BaseModel):
+    """Change how often an EXISTING alert notifies.
+
+    Deliberately narrow: the caller names a frequency, never a document. The
+    server merges the trigger into the stored revision, so the change cannot
+    silently drop the rest of a definition the client does not hold.
+    """
+
+    frequency: str
+    reminder_interval_s: Optional[int] = None
+    expected_revision: Optional[int] = None

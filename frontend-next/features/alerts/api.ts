@@ -196,6 +196,59 @@ export async function patchAlertsWorkflow(
   );
 }
 
+/**
+ * Change how often an existing alert notifies.
+ *
+ * The server merges the trigger into the stored definition (a new revision, or
+ * the existing revision when that exact definition was already stored) and, if the
+ * alert is live, puts the result in force — so an alert created as "once" can be
+ * made to repeat without rebuilding it.
+ */
+export async function setAlertsNotificationFrequency(
+  workflowId: string,
+  payload: { frequency: "once" | "repeated" | "reminder"; reminder_interval_s?: number | null; expected_revision?: number | null },
+  scope?: string | null,
+): Promise<{
+  ok: boolean;
+  workflow_id: string;
+  changed: boolean;
+  revision: number;
+  revision_id: string;
+  frequency: string;
+  trigger: string;
+  reminder_interval_s: number | null;
+  activated: boolean;
+  activation_error?: string | null;
+  note?: string;
+}> {
+  return apiFetch(
+    `${BASE}/workflows/${encodeURIComponent(workflowId)}/notification-frequency${scopeQuery(scope)}`,
+    { method: "POST", json: payload },
+  );
+}
+
+/** Remove a workflow and stop it evaluating (archive is the reversible option). */
+export async function deleteAlertsWorkflow(
+  workflowId: string,
+  params: { scope?: string | null; keepHistory?: boolean } = {},
+): Promise<{
+  ok: boolean;
+  workflow_id: string;
+  name: string;
+  deleted: Record<string, number>;
+  history: { events_preserved: number; events_deleted: number; deliveries_deleted: number };
+  note: string;
+}> {
+  const search = new URLSearchParams();
+  if (params.scope) search.set("scope", params.scope);
+  if (params.keepHistory === false) search.set("keep_history", "false");
+  const qs = search.toString();
+  return apiFetch(
+    `${BASE}/workflows/${encodeURIComponent(workflowId)}${qs ? `?${qs}` : ""}`,
+    { method: "DELETE" },
+  );
+}
+
 export async function activateAlertsWorkflow(
   workflowId: string,
   params: { revision?: number | null; scope?: string | null } = {},

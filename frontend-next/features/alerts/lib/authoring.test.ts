@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildDocument,
+  effectiveTimeframe,
   emptyDraft,
   exchangeOf,
   incompatibleInstruments,
@@ -275,5 +276,27 @@ describe("buildDocument", () => {
       }).alerts as Array<Record<string, unknown>>
     )[0];
     expect(alert.notify_if_already_true).toBe(true);
+  });
+});
+
+describe("timeframe repair", () => {
+  it("never writes an empty timeframe into a stage", () => {
+    // The schema requires a non-empty timeframe even for a live-price rule, and
+    // the parser rejects ''. A definition stored without one must be repaired on
+    // save instead of echoed back (which made the save fail with a server error).
+    const draft = { ...emptyDraft(), timeframe: "" };
+    const document = buildDocument(draft) as { stages: Array<{ timeframe?: string }> };
+    expect(document.stages[0].timeframe).toBe("day");
+
+    const merged = buildDocument(
+      { ...draft, timeframe: "" },
+      { version: 1, name: "x", session: "nse_equity", stages: [{ id: "px", type: "signal", clock: "ltp" }], alerts: [] },
+    ) as { stages: Array<{ timeframe?: string }> };
+    expect(merged.stages[0].timeframe).toBe("day");
+  });
+
+  it("keeps a real timeframe untouched", () => {
+    expect(effectiveTimeframe("15minute")).toBe("15minute");
+    expect(effectiveTimeframe(null)).toBe("day");
   });
 });

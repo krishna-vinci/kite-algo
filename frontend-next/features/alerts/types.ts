@@ -153,6 +153,8 @@ export type AlertsAlertRef = {
   id: string;
   source: string;
   trigger: string;
+  /** Present for a reminder alert; the list preselects its frequency from it. */
+  reminder_interval_s?: number | null;
 };
 
 export type AlertsWorkflowKind = "alert" | "screener";

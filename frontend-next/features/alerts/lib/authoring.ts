@@ -429,7 +429,7 @@ function stageToDocument(draft: AlertDraft): Record<string, unknown> {
     id: draft.stageId || "px",
     type: "signal",
     clock: draft.clock,
-    timeframe: draft.timeframe,
+    timeframe: effectiveTimeframe(draft.timeframe),
     conditions: { all: draft.conditions.map(conditionToDocument) },
   };
   if (draft.anyConditions.length > 0) {
@@ -445,7 +445,7 @@ function stageToDocument(draft: AlertDraft): Record<string, unknown> {
 /** Apply the modeled stage fields onto a stage inside an existing document. */
 function applyStageFields(stage: Record<string, unknown>, draft: AlertDraft): void {
   stage.clock = draft.clock;
-  stage.timeframe = draft.timeframe;
+  stage.timeframe = effectiveTimeframe(draft.timeframe);
   stage.conditions = { all: draft.conditions.map(conditionToDocument) };
   stage.any_conditions = draft.anyConditions.map(conditionToDocument);
   stage.not_conditions = draft.notConditions.map(conditionToDocument);
@@ -467,6 +467,20 @@ function applyStageFields(stage: Record<string, unknown>, draft: AlertDraft): vo
  * With no base (the create path) there is nothing to preserve and the canonical
  * skeleton is emitted.
  */
+/**
+ * A timeframe the document can actually carry.
+ *
+ * The schema requires a non-empty timeframe on a stage even when the evaluation
+ * ignores it (a live-price rule), and an empty string is a parse error the server
+ * rightly refuses. A stored definition that predates the field, or one authored
+ * elsewhere without it, therefore has to be repaired on the way out rather than
+ * echoed back — echoing it made "Save changes" fail with a server error.
+ */
+export function effectiveTimeframe(value: string | null | undefined): string {
+  const text = String(value ?? "").trim();
+  return text === "" ? "day" : text;
+}
+
 export function buildDocument(
   draft: AlertDraft,
   base?: Record<string, unknown> | null,

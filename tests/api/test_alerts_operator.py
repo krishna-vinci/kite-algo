@@ -1223,3 +1223,195 @@ def test_detail_reports_real_subscription_count_and_freshness(session_factory, m
     assert detail["freshness"]["subscription_count"] == detail["subscription_count"]
     # never evaluated yet is a real answer, not a placeholder zero
     assert detail["freshness"]["last_evaluated_at"] is None
+
+
+def test_an_unparsable_document_is_422_not_500(session_factory, monkeypatch):
+    """A malformed document is the caller's mistake, reported with issues.
+
+    Regression: `patch_workflow` parsed the payload outside any handler, so a
+    document the parser refused (here: an empty `timeframe`, which the earlier
+    editor echoed back from a stored definition) raised through to the client as
+    "Internal Server Error" — the save just failed with nothing actionable.
+    """
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    document = json.loads(json.dumps(DOCUMENT))
+    document["stages"][0]["timeframe"] = ""
+    created = client.post(f"{BASE}/workflows", json={"document": document})
+
+    assert created.status_code == 422, created.text
+    issues = created.json()["detail"]["issues"]
+    # the parser reports one parse issue; its message names the offending path
+    assert issues and "timeframe" in issues[0]["message"]
+
+    ok = client.post(f"{BASE}/workflows", json={"document": json.loads(json.dumps(DOCUMENT))}).json()
+    patched = client.patch(
+        f"{BASE}/workflows/{ok['workflow_id']}",
+        json={"document": document, "expected_revision": 1},
+    )
+    assert patched.status_code == 422, patched.text
+    assert "timeframe" in patched.json()["detail"]["issues"][0]["message"]
+
+
+def test_frequency_can_be_changed_after_creation(session_factory, monkeypatch):
+    """The reported gap: "once" was only settable at creation.
+
+    An alert created as "once" goes quiet after it fires, and there was no way to
+    make it repeat without rebuilding it. This changes the stored definition (a new
+    revision), keeps everything else in the document, and — because the alert is
+    live — activates it so the change takes effect immediately.
+    """
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    document = json.loads(json.dumps(DOCUMENT))
+    document["name"] = "frequency-change"
+    document["alerts"][0]["channels"] = ["ops-ntfy"]
+    created = client.post(f"{BASE}/workflows", json={"document": document}).json()
+    workflow_id = created["workflow_id"]
+    activated = client.post(f"{BASE}/workflows/{workflow_id}/activate").json()
+
+    # it starts as the document said
+    detail = client.get(f"{BASE}/workflows/{workflow_id}").json()
+    assert detail["document"]["alerts"][0]["trigger"] == "on_transition"
+
+    # asking for the frequency it already has is not a change and must not look
+    # like a conflict (or write a duplicate revision)
+    same = client.post(
+        f"{BASE}/workflows/{workflow_id}/notification-frequency",
+        json={"frequency": "repeated"},
+    )
+    assert same.status_code == 200, same.text
+    assert same.json()["changed"] is False
+    assert same.json()["trigger"] == "on_transition"
+
+    once_first = client.post(
+        f"{BASE}/workflows/{workflow_id}/notification-frequency",
+        json={"frequency": "once"},
+    ).json()
+    assert once_first["changed"] is True and once_first["trigger"] == "once"
+
+    # Going back to a frequency the workflow already used reuses that revision
+    # (revisions are content-addressed per workflow) and puts it back in force,
+    # rather than writing a duplicate the unique constraint would refuse.
+    repeated = client.post(
+        f"{BASE}/workflows/{workflow_id}/notification-frequency",
+        json={"frequency": "repeated"},
+    )
+    assert repeated.status_code == 200, repeated.text
+    body = repeated.json()
+    assert body["trigger"] == "on_transition" and body["reminder_interval_s"] is None
+    assert body["activated"] is True
+    assert body["changed"] is False and body["revision"] == 1
+    assert client.get(f"{BASE}/workflows/{workflow_id}").json()["document"]["alerts"][0][
+        "trigger"
+    ] == "on_transition"
+
+    # and forward again: a genuinely new state writes a new revision
+    reminder_first = client.post(
+        f"{BASE}/workflows/{workflow_id}/notification-frequency",
+        json={"frequency": "reminder", "reminder_interval_s": 900},
+    ).json()
+    assert reminder_first["changed"] is True and reminder_first["activated"] is True
+    assert reminder_first["revision"] > 1
+
+    detail = client.get(f"{BASE}/workflows/{workflow_id}").json()
+    stored_alert = detail["document"]["alerts"][0]
+    assert stored_alert["trigger"] == "on_transition"
+    # nothing else in the definition was dropped
+    assert stored_alert["channels"] == ["ops-ntfy"]
+    assert detail["document"]["stages"][0]["conditions"]
+
+    once_again = client.post(
+        f"{BASE}/workflows/{workflow_id}/notification-frequency",
+        json={"frequency": "once", "expected_revision": reminder_first["revision"]},
+    ).json()
+    assert once_again["trigger"] == "once"
+    assert client.get(f"{BASE}/workflows/{workflow_id}").json()["document"]["alerts"][0][
+        "trigger"
+    ] == "once"
+
+    reminder = client.post(
+        f"{BASE}/workflows/{workflow_id}/notification-frequency",
+        json={"frequency": "reminder", "reminder_interval_s": 600},
+    ).json()
+    assert reminder["reminder_interval_s"] == 600
+    assert reminder["activated"] is True
+
+
+def test_frequency_change_requires_a_known_choice_and_the_current_revision(
+    session_factory, monkeypatch
+):
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    document = json.loads(json.dumps(DOCUMENT))
+    document["name"] = "frequency-guards"
+    workflow_id = client.post(f"{BASE}/workflows", json={"document": document}).json()["workflow_id"]
+
+    bad = client.post(
+        f"{BASE}/workflows/{workflow_id}/notification-frequency",
+        json={"frequency": "every_full_moon"},
+    )
+    assert bad.status_code == 422
+    assert "frequency must be one of" in bad.json()["detail"]["issues"][0]["message"]
+
+    stale = client.post(
+        f"{BASE}/workflows/{workflow_id}/notification-frequency",
+        json={"frequency": "once", "expected_revision": 99},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["rejection_reason"] == "REVISION_CONFLICT"
+
+    # a draft alert is not activated behind the operator's back
+    draft_change = client.post(
+        f"{BASE}/workflows/{workflow_id}/notification-frequency",
+        json={"frequency": "reminder", "reminder_interval_s": 300},
+    ).json()
+    assert draft_change["activated"] is False
+    assert client.get(f"{BASE}/workflows/{workflow_id}").json()["lifecycle_state"] == "draft"
+
+
+def test_delete_removes_the_definition_and_stops_evaluation(session_factory, monkeypatch):
+    """Delete is the option an operator asks for when an alert was a mistake.
+
+    It must be a real delete (definition, revisions, subscriptions and the
+    counters that belong to the workflow), and it must not leave the workflow
+    evaluating or half-referenced.
+    """
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    document = json.loads(json.dumps(DOCUMENT))
+    document["name"] = "delete-me"
+    workflow_id = client.post(f"{BASE}/workflows", json={"document": document}).json()["workflow_id"]
+    client.post(f"{BASE}/workflows/{workflow_id}/activate")
+
+    detail = client.get(f"{BASE}/workflows/{workflow_id}").json()
+    assert detail["subscription_count"] >= 1
+
+    deleted = client.delete(f"{BASE}/workflows/{workflow_id}")
+    assert deleted.status_code == 200, deleted.text
+    body = deleted.json()
+    assert body["deleted"]["workflows"] == 1
+    assert body["deleted"]["workflow_revisions"] >= 1
+    assert body["deleted"]["alert_subscriptions"] >= 1
+
+    # it is gone from every surface
+    assert client.get(f"{BASE}/workflows/{workflow_id}").status_code == 404
+    assert client.get(f"{BASE}/workflows").json()["workflows"] == []
+    assert client.get(f"{BASE}/workflows", params={"include_archived": "true"}).json()["workflows"] == []
+    assert client.post(f"{BASE}/workflows/{workflow_id}/activate").status_code == 404
+    assert client.delete(f"{BASE}/workflows/{workflow_id}").status_code == 404
+
+
+def test_delete_is_owner_scoped(session_factory, monkeypatch):
+    """A delete must not be able to reach another owner's workflow."""
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    document = json.loads(json.dumps(DOCUMENT))
+    document["name"] = "foreign-delete"
+    workflow_id = client.post(f"{BASE}/workflows", json={"document": document}).json()["workflow_id"]
+
+    # a second session whose only authorized scope is a different one
+    monkeypatch.setenv(operator_service.ALERTS_OPERATOR_SCOPES_ENV, "app:someone-else")
+    other = _app(session_factory, monkeypatch=monkeypatch)
+    assert other.delete(f"{BASE}/workflows/{workflow_id}").status_code == 404
+    assert other.get(f"{BASE}/workflows/{workflow_id}").status_code == 404
+
+    monkeypatch.setenv(operator_service.ALERTS_OPERATOR_SCOPES_ENV, OPERATOR_SCOPE)
+    owner = _app(session_factory, monkeypatch=monkeypatch)
+    assert owner.get(f"{BASE}/workflows/{workflow_id}").status_code == 200
+    assert owner.delete(f"{BASE}/workflows/{workflow_id}").status_code == 200
