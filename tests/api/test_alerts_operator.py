@@ -445,7 +445,7 @@ def test_workflow_list_is_enriched(session_factory, monkeypatch):
     assert row["instruments"] == ["NSE:RELIANCE"]
     assert row["instrument_summary"] == "NSE:RELIANCE"
     assert row["alerts"] == [
-        {"id": "a1", "source": "px", "trigger": "on_transition"}
+        {"id": "a1", "source": "px", "trigger": "on_transition", "reminder_interval_s": None}
     ]
     assert row["latest_revision"]["revision"] == 1
     assert row["warnings"] == []
@@ -1415,3 +1415,93 @@ def test_delete_is_owner_scoped(session_factory, monkeypatch):
     owner = _app(session_factory, monkeypatch=monkeypatch)
     assert owner.get(f"{BASE}/workflows/{workflow_id}").status_code == 200
     assert owner.delete(f"{BASE}/workflows/{workflow_id}").status_code == 200
+
+
+def test_delete_keeps_the_notification_history_by_default(session_factory, monkeypatch):
+    """Deleting the definition must not silently erase what was already sent.
+
+    `signal_events`/`deliveries` are the record of real notifications, so the
+    default keeps them and detaches the subscription reference (that row is gone),
+    while the workflow attribution stays readable. `keep_history=false` is the
+    explicit opt-in to lose them.
+    """
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    document = json.loads(json.dumps(DOCUMENT))
+    document["name"] = "history-kept"
+    workflow_id = client.post(f"{BASE}/workflows", json={"document": document}).json()["workflow_id"]
+    client.post(f"{BASE}/workflows/{workflow_id}/activate")
+
+    from sqlalchemy import text as sql_text
+
+    with session_factory() as session:
+        subscription_id = session.execute(
+            sql_text(
+                "SELECT s.id FROM alert_subscriptions s "
+                "JOIN workflow_revisions r ON r.id = s.revision_id "
+                "WHERE r.workflow_id = :workflow_id LIMIT 1"
+            ),
+            {"workflow_id": workflow_id},
+        ).scalar_one()
+        event_id = "evt-delete-1"
+        session.execute(
+            sql_text(
+                "INSERT INTO signal_events (id, workflow_id, subscription_id, occurrence_key, "
+                "evidence, fired_at, source_kind, created_at) VALUES (:id, :workflow_id, "
+                ":subscription_id, :key, '{}', CURRENT_TIMESTAMP, 'workflow', CURRENT_TIMESTAMP)"
+            ),
+            {
+                "id": event_id,
+                "workflow_id": workflow_id,
+                "subscription_id": subscription_id,
+                "key": f"{workflow_id}:test",
+            },
+        )
+        session.execute(
+            sql_text(
+                "INSERT INTO deliveries (id, event_id, channel_id, status, attempts, created_at, "
+                "updated_at) VALUES ('dlv-delete-1', :event_id, 'ops-ntfy', 'pending', 0, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ),
+            {"event_id": event_id},
+        )
+        session.commit()
+
+    deleted = client.delete(f"{BASE}/workflows/{workflow_id}").json()
+    assert deleted["history"]["events_preserved"] == 1
+
+    with session_factory() as session:
+        row = session.execute(
+            sql_text("SELECT workflow_id, subscription_id FROM signal_events WHERE id = :id"),
+            {"id": event_id},
+        ).one()
+        assert row[0] == workflow_id  # still attributable
+        assert row[1] is None  # the subscription it referenced is gone
+        deliveries = session.execute(
+            sql_text("SELECT count(*) FROM deliveries WHERE event_id = :id"), {"id": event_id}
+        ).scalar_one()
+        assert deliveries == 1
+        checkpoints = session.execute(
+            sql_text(
+                "SELECT count(*) FROM evaluation_checkpoints WHERE subscription_id = :subscription_id"
+            ),
+            {"subscription_id": subscription_id},
+        ).scalar_one()
+        assert checkpoints == 0
+
+    # the explicit opt-in removes the history too
+    other = client.post(
+        f"{BASE}/workflows", json={"document": {**document, "name": "history-removed"}}
+    ).json()["workflow_id"]
+    with session_factory() as session:
+        session.execute(
+            sql_text(
+                "INSERT INTO signal_events (id, workflow_id, occurrence_key, evidence, fired_at, "
+                "source_kind, created_at) VALUES ('evt-delete-2', :workflow_id, :key, '{}', "
+                "CURRENT_TIMESTAMP, 'workflow', CURRENT_TIMESTAMP)"
+            ),
+            {"workflow_id": other, "key": f"{other}:test"},
+        )
+        session.commit()
+    assert client.delete(f"{BASE}/workflows/{other}", params={"keep_history": "false"}).json()[
+        "history"
+    ]["events_deleted"] == 1
