@@ -280,6 +280,36 @@ describe("UnifiedAlertEditor", () => {
     expect(screen.getByText(/Open the draft to retry activation/)).toBeTruthy();
   });
 
+  it("saves the destination that is shown, including a preselected one", async () => {
+    // Regression: the single enabled channel was rendered checked but never
+    // written into the draft, so the created alert had NO destination while the
+    // form looked complete.
+    vi.mocked(createAlertsWorkflow).mockResolvedValue({ workflow_id: "wf-1", ok: true } as never);
+
+    renderWithQuery(
+      <UnifiedAlertEditor scope="app:admin" mode={{ kind: "create" }} initialDraft={draftWithInstrument()} />,
+    );
+    fireEvent.click(await screen.findByText("Save draft"));
+
+    await waitFor(() => expect(createAlertsWorkflow).toHaveBeenCalledTimes(1));
+    const payload = vi.mocked(createAlertsWorkflow).mock.calls[0][0] as {
+      document: { alerts: Array<{ channels: string[] }> };
+    };
+    expect(payload.document.alerts[0].channels).toEqual(["telegram_ops"]);
+  });
+
+  it("saves no destination when the operator clears the only one", async () => {
+    vi.mocked(createAlertsWorkflow).mockResolvedValue({ workflow_id: "wf-1", ok: true } as never);
+    renderWithQuery(
+      <UnifiedAlertEditor scope="app:admin" mode={{ kind: "create" }} initialDraft={draftWithInstrument()} />,
+    );
+    const checkbox = (await screen.findByLabelText(/telegram_ops/)) as HTMLInputElement;
+    fireEvent.click(checkbox);
+    // an explicit "none" is a real choice, not a reason to re-derive the default
+    await waitFor(() => expect(screen.getByText(/Choose at least one destination/)).toBeTruthy());
+    expect((screen.getByText("Save draft").closest("button") as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("reuses one idempotency key when a save is retried", async () => {
     vi.mocked(createAlertsWorkflow).mockResolvedValue({ workflow_id: "wf-1", ok: true } as never);
     vi.mocked(activateAlertsWorkflow).mockRejectedValue(new Error("nope"));

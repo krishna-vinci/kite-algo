@@ -521,6 +521,13 @@ async def get_workflow(
         if workflow is None or workflow.owner_id != scope:
             raise HTTPException(status_code=404, detail="Workflow not found")
         payload = _enrich_workflow(session, workflow, session_factory)
+        # The detail view answers "is it armed, when was it last evaluated", so it
+        # cannot report the empty defaults the list placeholders start from —
+        # otherwise an alert with a live subscription reads as never evaluated.
+        payload["freshness"] = _freshness_for_workflows(session, [workflow.id]).get(
+            workflow.id, _empty_freshness()
+        )
+        payload["subscription_count"] = payload["freshness"].get("subscription_count", 0)
         active_id = (payload.get("active_revision") or {}).get("revision_id")
         latest_id = (payload.get("latest_revision") or {}).get("revision_id")
         revision = session.get(WorkflowRevision, active_id or latest_id)

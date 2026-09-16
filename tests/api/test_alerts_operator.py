@@ -1202,3 +1202,24 @@ def test_list_rows_report_the_effective_lifecycle(session_factory, monkeypatch):
     client.post(f"{BASE}/workflows/{workflow_id}/archive")
     rows = client.get(f"{BASE}/workflows", params={"include_archived": "true"}).json()["workflows"]
     assert next(item for item in rows if item["workflow_id"] == workflow_id)["lifecycle_state"] == "archived"
+
+
+def test_detail_reports_real_subscription_count_and_freshness(session_factory, monkeypatch):
+    """The detail page's state depends on this.
+
+    Regression: `_enrich_workflow` is a LIST placeholder and starts at zero, and
+    the detail route never refined it, so an activated alert with a live
+    subscription read as "never evaluated" forever on its own page.
+    """
+    client = _app(session_factory, monkeypatch=monkeypatch)
+    document = json.loads(json.dumps(DOCUMENT))
+    document["name"] = "detail-counts"
+    created = client.post(f"{BASE}/workflows", json={"document": document}).json()
+    workflow_id = created["workflow_id"]
+    client.post(f"{BASE}/workflows/{workflow_id}/activate")
+
+    detail = client.get(f"{BASE}/workflows/{workflow_id}").json()
+    assert detail["subscription_count"] >= 1
+    assert detail["freshness"]["subscription_count"] == detail["subscription_count"]
+    # never evaluated yet is a real answer, not a placeholder zero
+    assert detail["freshness"]["last_evaluated_at"] is None

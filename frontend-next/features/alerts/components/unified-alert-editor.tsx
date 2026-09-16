@@ -137,6 +137,10 @@ export function UnifiedAlertEditor({
   const [draft, setDraft] = useState<AlertDraft>(initialDraft);
   const [view, setView] = useState<"form" | "code">(conversionError ? "code" : "form");
   const [nameTouched, setNameTouched] = useState(Boolean(initialDraft.name));
+  // Channels follow the same rule as the name: the derived default is what the
+  // operator sees, so it must be what gets saved — until they change it, after
+  // which their choice (including "none") is the truth.
+  const [channelsTouched, setChannelsTouched] = useState(initialDraft.alert.channels.length > 0);
   const [expectedRevision, setExpectedRevision] = useState(
     isEdit ? mode.expectedRevision : 1,
   );
@@ -152,7 +156,7 @@ export function UnifiedAlertEditor({
   const capabilities = capabilitiesQuery.data?.capabilities;
   const enabledChannels = (channelsQuery.data?.channels ?? []).filter((channel) => channel.enabled);
   const channels = draft.alert.channels;
-  const selectedChannels = channels.length
+  const selectedChannels = channelsTouched
     ? channels
     : enabledChannels.length === 1
       ? [enabledChannels[0].name]
@@ -234,6 +238,10 @@ export function UnifiedAlertEditor({
     ...draft,
     session: inference.session || draft.session,
     name: effectiveName,
+    // Destinations are part of the definition, so the selection the operator can
+    // see (including a single preselected channel) is what gets validated and
+    // saved — not only the value they happened to click.
+    alert: { ...draft.alert, channels: selectedChannels },
   };
 
   const updateCondition = (patch: Partial<AlertDraft["conditions"][number]>) => {
@@ -893,7 +901,8 @@ export function UnifiedAlertEditor({
                       id={`destination-${channel.channel_id}`}
                       type="checkbox"
                       checked={selectedChannels.includes(channel.name)}
-                      onChange={(event) =>
+                      onChange={(event) => {
+                        setChannelsTouched(true);
                         setDraft({
                           ...draft,
                           alert: {
@@ -902,8 +911,8 @@ export function UnifiedAlertEditor({
                               ? [...selectedChannels, channel.name]
                               : selectedChannels.filter((name) => name !== channel.name),
                           },
-                        })
-                      }
+                        });
+                      }}
                     />
                     {channel.name} · {channel.provider}
                   </label>
