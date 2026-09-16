@@ -14,8 +14,8 @@ Give this pack to an external coding agent when you want worker code written in 
 
 - Package name: `kite-algo-worker`
 - SDK version described by this pack: `0.13.0`
-- Current public PyPI release: `0.7.7`
-- Pending release tag: `kite-algo-worker-v0.13.0`
+- Current public PyPI release: `0.13.0`
+- Release tag: `kite-algo-worker-v0.13.0`
 - SDK tag convention: `kite-algo-worker-vX.Y.Z`
 
 Canonical public install:
