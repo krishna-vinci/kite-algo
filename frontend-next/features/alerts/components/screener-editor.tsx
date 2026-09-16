@@ -79,7 +79,7 @@ export function ScreenerEditor({ scope, initialDraft, baseDocument, edit }: Scre
     [draft, baseDocument],
   );
   const issues = useMemo(() => screenerDraftIssues(draft), [draft]);
-  // One key per creation attempt; retries reuse it (see alert-wizard).
+  // One key per creation attempt; retries reuse it (see the alert editor).
   const [idempotencyKey] = useState(() => newIdempotencyKey("screener"));
 
   const saveMutation = useMutation({

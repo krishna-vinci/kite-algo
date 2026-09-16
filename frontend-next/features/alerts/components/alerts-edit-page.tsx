@@ -1,35 +1,29 @@
 "use client";
 
-import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+/**
+ * Edit path — the same authoring page as creation.
+ *
+ * A stored definition the structured form cannot represent is not a reason to
+ * open a different product (or to save something lossy): the editor opens on its
+ * Code view tab with the reason shown, and the document is preserved exactly as
+ * it is stored. Everything else is edited in place, with the modeled fields
+ * merged onto the loaded document so unmodeled keys survive a save.
+ */
+
 import { AlertCircleIcon } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
-import { AdvancedDefinitionEditor } from "@/features/alerts/components/advanced-definition-editor";
-import { AlertWizard } from "@/features/alerts/components/alert-wizard";
+import { UnifiedAlertEditor } from "@/features/alerts/components/unified-alert-editor";
 import { useAlertsWorkflow } from "@/features/alerts/hooks/use-alerts-queries";
-import { documentToDraft } from "@/features/alerts/lib/authoring";
+import { AlertsMarketStreamProvider } from "@/features/alerts/hooks/use-market-stream";
+import { documentToDraft, emptyDraft } from "@/features/alerts/lib/authoring";
 
-/**
- * Edit path.
- *
- * Two lossless routes, never a lossy one:
- *   - If the stored definition is fully representable, the structured form is
- *     opened, and it merges the modeled fields onto the LOADED document, so
- *     keys it does not model survive a save.
- *   - If it is not representable, the advanced YAML/JSON editor is opened
- *     instead of a form that would silently drop a `sequence`, a pair operand
- *     or an unmodeled key. Opening a lossy form would look like a successful
- *     save while destroying data.
- */
 export function AlertsEditPage({
   workflowId,
   scope,
 }: Readonly<{ workflowId: string; scope: string | null }>) {
   const workflowQuery = useAlertsWorkflow(workflowId, scope);
-  const searchParams = useSearchParams();
-  const forceAdvanced = searchParams?.get("advanced") === "1";
 
   if (workflowQuery.isLoading) return <Skeleton className="h-96 w-full rounded-xl" />;
 
@@ -52,34 +46,32 @@ export function AlertsEditPage({
   const expectedRevision =
     workflow.latest_revision?.revision ?? workflow.active_revision?.revision ?? 1;
 
-  if (!conversion.ok || forceAdvanced) {
-    return (
-      <AdvancedDefinitionEditor
-        workflowId={workflowId}
-        scope={scope}
-        name={workflow.name}
-        expectedRevision={expectedRevision}
-        initialYaml={workflow.yaml ?? null}
-        initialDocument={workflow.document}
-        reason={conversion.ok ? undefined : conversion.reason}
-      />
-    );
-  }
+  // Code view carries the real document when the form cannot represent it; the
+  // draft only supplies the page's chrome (name/session) in that case.
+  const stored = (workflow.document ?? {}) as { session?: unknown };
+  const initialDraft = conversion.ok
+    ? conversion.draft
+    : {
+        ...emptyDraft(),
+        name: workflow.name,
+        session: typeof stored.session === "string" ? stored.session : "",
+      };
 
   return (
-    <div className="flex flex-col gap-3">
-      <p className="text-xs text-muted-foreground">
-        Editing in the structured form. It keeps every field the form does not model.{" "}
-        <Link href={`/alerts/${workflowId}/edit?advanced=1`} className="underline">
-          Edit as YAML/JSON instead
-        </Link>
-      </p>
-      <AlertWizard
+    <AlertsMarketStreamProvider scope={scope}>
+      <UnifiedAlertEditor
         scope={scope}
-        initialDraft={conversion.draft}
-        baseDocument={workflow.document}
-        edit={{ workflowId, expectedRevision }}
+        mode={{
+          kind: "edit",
+          workflowId,
+          expectedRevision,
+          baseDocument: workflow.document ?? null,
+          workflowName: workflow.name,
+          yaml: workflow.yaml ?? null,
+        }}
+        initialDraft={initialDraft}
+        conversionError={conversion.ok ? undefined : conversion.reason}
       />
-    </div>
+    </AlertsMarketStreamProvider>
   );
 }
