@@ -7,7 +7,7 @@ import types
 from fastapi import FastAPI
 from starlette.routing import Route, WebSocketRoute
 
-from tests.support.test_support import install_dependency_stubs
+from tests.support.test_support import install_dependency_stubs, iter_mounted_routes
 
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/kite_algo_test")
 
@@ -108,13 +108,13 @@ def test_generic_algo_worker_routes_are_mounted() -> None:
     mounted_http: set[tuple[str, str]] = set()
     mounted_ws: set[str] = set()
 
-    for route in app.router.routes:
+    for path, route in iter_mounted_routes(app.router):
         if isinstance(route, Route):
             for method in route.methods or set():
                 if method in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
-                    mounted_http.add((method, route.path))
+                    mounted_http.add((method, path))
         elif isinstance(route, WebSocketRoute):
-            mounted_ws.add(route.path)
+            mounted_ws.add(path)
 
     missing_http = sorted(expected_http - mounted_http)
     missing_ws = sorted(expected_ws - mounted_ws)

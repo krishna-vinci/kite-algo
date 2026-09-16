@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-from tests.support.test_support import install_dependency_stubs
+from tests.support.test_support import install_dependency_stubs, iter_mounted_routes
 
 os.environ.setdefault("APP_ENV", "development")
 os.environ.setdefault("APP_ALLOW_INSECURE_DEV_AUTH", "true")
@@ -46,10 +46,10 @@ def test_worker_http_manifest_matches_mounted_openapi() -> None:
 
 def test_worker_websocket_manifest_matches_mounted_routes() -> None:
     mounted = {
-        route.path.removeprefix("/api/algo-workers")
-        for route in app.routes
+        path.removeprefix("/api/algo-workers")
+        for path, route in iter_mounted_routes(app.router)
         if route.__class__.__name__ == "APIWebSocketRoute"
-        and route.path.startswith("/api/algo-workers/worker/")
+        and path.startswith("/api/algo-workers/worker/")
     }
 
     assert mounted == set(WORKER_WEBSOCKET_PATHS)

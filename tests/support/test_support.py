@@ -20,6 +20,26 @@ def _stub_module(name: str, **attrs) -> types.ModuleType:
     return module
 
 
+def iter_mounted_routes(router, prefix: str = ""):
+    """Yield ``(full_path, route)`` for every route mounted under ``router``.
+
+    fastapi <= 0.135 flattened ``include_router()`` into ``app.router.routes``.
+    From 0.141 an included router is instead held behind an ``_IncludedRouter``
+    wrapper whose routes live on ``original_router``, under the prefix kept in
+    ``include_context``. A flat walk therefore finds NONE of the worker routes
+    on 0.141, which turns a "is this mounted" assertion into a misleading
+    "nothing is mounted" failure. Descending through the wrapper keeps one
+    assertion working on both registration shapes.
+    """
+    for route in getattr(router, "routes", []):
+        nested = getattr(route, "original_router", None)
+        if nested is None:
+            yield prefix + (getattr(route, "path", "") or ""), route
+            continue
+        context = getattr(route, "include_context", None)
+        yield from iter_mounted_routes(nested, prefix + (getattr(context, "prefix", "") or ""))
+
+
 def install_dependency_stubs(*, stub_kite_orders: bool = True) -> None:
     os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
