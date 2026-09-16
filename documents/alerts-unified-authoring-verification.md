@@ -109,3 +109,72 @@ waiting for the session to close or faking the clock.
   bounded member prices only when the members are resolved.
 - The timeframe selector lists the capability payload's timeframes; a deployment
   that supports only the daily bar therefore offers a shorter list.
+
+---
+
+## 7. Follow-up: post-creation changes (frequency), delete, and the conflict report
+
+Three issues reported after using the redesigned pages. Two were real defects; one
+was a missing capability.
+
+### 7.1 "Load the newer revision" appeared not to work
+
+The banner was honest, but the save behind it was failing with
+`Internal Server Error`, so the conflict could never be resolved. Two causes:
+
+1. the stored definition had an empty `timeframe` (the schema requires a
+   non-empty one even for a live-price rule, and the parser rejects `''`), and the
+   editor echoed it straight back. The API then let the parse error escape as a 500
+   with no actionable message.
+2. a save that changed nothing was inserted as a duplicate canonical hash, hit the
+   `(workflow_id, canonical_hash)` unique constraint, and surfaced as
+   "this alert changed while you were editing" — for the operator's own no-op.
+
+Fixes: the editor repairs an empty timeframe on write; both writers answer **422
+with issues** for a document that does not parse; the PATCH route short-circuits a
+no-op by reporting which revision already holds that definition (matching the
+worker route's `changed: false` contract).
+
+Verified live (revision bumped from another client, then saved from the browser):
+banner → **Load the newer revision** → banner clears, the entered value survives →
+**Save changes** → revision written and the page shows the alert with the new
+level.
+
+### 7.2 Changing the frequency of an existing alert
+
+`POST /workflows/{id}/notification-frequency {frequency}` merges the trigger into
+the stored definition (new revision) and, when the alert is live, activates the
+result. Revisions are content-addressed per workflow, so a frequency the workflow
+already used reuses that revision and puts it back in force, and asking for the
+frequency it already has answers "the alert already notifies this way" instead of
+pretending to change something. **Repeat** is now an action on both the list row
+and the detail page, opening the same three plain choices (with the reminder
+interval), preselected from what is stored.
+
+Verified live: the row dialog preselected "Once when it happens" for an alert
+created that way, changing it reported "Saved as revision 6 and put in force", the
+dialog then preselected the new choice, and saving it again reported the no-op.
+
+### 7.3 Deleting an alert
+
+`DELETE /workflows/{id}` removes the definition, its revisions, its subscriptions
+and the workflow-owned counters in one transaction, so nothing is left scheduled
+or half-referenced. Archive stays the reversible option; the confirmation dialog
+says what delete does and what it keeps. The notification record is kept by
+default (`signal_events.workflow_id` stays attributable, the subscription
+reference is detached), and `?keep_history=false` removes it explicitly.
+
+Verified live: deleting removed the alert from the list, the detail endpoint
+returns 404 and a second delete is 404; the workflow's revisions, subscriptions and
+checkpoints were gone from the database. A workflow belonging to another operator
+that was visible on the same list was deliberately left untouched — the delete
+dialog was cancelled once its name showed it was not this session's test alert.
+
+### 7.4 Tests added in this follow-up
+
+Operator API (53 passed): frequency change + guards + no-op/reuse contract, delete
++ owner scoping + history contract (a signal event and its delivery survive with
+attribution, checkpoints do not; `keep_history=false` removes them), unparsable
+document is 422. Frontend: `effectiveTimeframe` repair on both write paths,
+frequency result wording, and the existing suites (354 passed, 2 pre-existing
+reference-page failures).
