@@ -1,6 +1,7 @@
 """Smoke-test only a disposable MCP image; never connect to a real worker.
 
-Run: python3 scripts/check_mcp_http_docker.py --image kite-algo-mcp:latest
+Targets the Go adapter image (mcp/go/Dockerfile). Run:
+    python3 scripts/check_mcp_http_docker.py --image kite-algo-mcp:latest
 Creates/stops its own ephemeral containers. Credentials are random test values,
 passed by environment name (not command arguments). No live trading calls.
 """
@@ -43,7 +44,8 @@ def check(image: str, profile: str) -> dict:
         while True:
             try:
                 with urllib.request.urlopen(url + "/healthz", timeout=2) as response:
-                    assert json.load(response) == {"status": "ok"}
+                    # Plain liveness body; the Go adapter serves "ok", not JSON.
+                    assert response.read().decode().strip() == "ok"
                 break
             except (OSError, urllib.error.URLError):
                 if time.monotonic() > deadline:
@@ -74,9 +76,26 @@ def check(image: str, profile: str) -> dict:
         assert init["result"]["serverInfo"]["name"] == "kite-algo-mcp"
         listing = request("tools/list", token=client_token)
         names = {tool["name"] for tool in listing["result"]["tools"]}
-        assert ("place_order" in names) == (profile in {"paper", "live"})
-        assert ("create_gtt" in names) == (profile == "live")
-        assert "refresh_fundamentals" not in names
+        assert names, "adapter listed no tools"
+        assert all(tool.get("inputSchema") for tool in listing["result"]["tools"]), "a tool has no inputSchema"
+
+        # The Go adapter registers the whole catalog and gates per call rather
+        # than per listing, so a profile's reach is whichever tools are not
+        # refused with `tool_disabled`. A reachable tool fails later against
+        # the intentionally unreachable backend instead.
+        def refused(tool: str) -> bool:
+            result = request("tools/call", {"name": tool, "arguments": {}}, token=client_token)
+            body = json.loads(result["result"]["content"][0]["text"])
+            return body.get("error", {}).get("code") == "tool_disabled"
+
+        reach = {
+            "place_order": profile in {"paper", "live"},
+            "create_gtt": profile == "live",
+            "refresh_fundamentals": False,
+        }
+        for tool, should_be_reachable in reach.items():
+            assert refused(tool) is not should_be_reachable, f"{tool} gating is wrong for the {profile} profile"
+
         assert docker("exec", container, "id", "-u") == "10001"
         assert client_token not in json.dumps(init) + json.dumps(listing)
         return {"profile": profile, "tools": len(names), "authentication": "passed",

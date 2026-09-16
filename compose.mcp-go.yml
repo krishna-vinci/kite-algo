@@ -1,6 +1,7 @@
-# Go MCP adapter — the active MCP service since the Phase 3 cutover (2026-09-11).
-# The Python `mcp` service in compose.yml is retired (zero requests in 48h before
-# retirement); do not start both — they would fight over KITE_MCP_HOST_PORT.
+# Go MCP adapter — the only MCP service since the Phase 3 cutover (2026-09-11).
+# The Python adapter was retired after zero requests in the 48h before the
+# cutover; its compose service, image and package are gone. This overlay exists
+# because compose.yml carries the core stack and the MCP adapter is optional.
 # Usage:
 #   docker compose -f compose.yml -f compose.mcp-go.yml --profile mcp up -d mcp-go
 services:

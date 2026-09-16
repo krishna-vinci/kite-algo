@@ -129,37 +129,6 @@ services:
       retries: 5
       start_period: 30s
 
-  mcp:
-    profiles: [mcp]
-    build:
-      context: .
-      dockerfile: mcp/Dockerfile
-    restart: unless-stopped
-    init: true
-    environment:
-      KITE_MCP_TRANSPORT: http
-      KITE_MCP_HOST: 0.0.0.0
-      KITE_MCP_PORT: "8788"
-      KITE_MCP_API_URL: http://finance-app:8777
-      KITE_MCP_ALLOW_INSECURE_BACKEND_HTTP: "true"
-      KITE_MCP_WORKER_TOKEN: ${KITE_MCP_WORKER_TOKEN:-}
-      KITE_MCP_HTTP_TOKEN: ${KITE_MCP_HTTP_TOKEN:-}
-      KITE_MCP_ALLOWED_HOSTS: ${KITE_MCP_ALLOWED_HOSTS:-}
-      KITE_MCP_ALLOWED_ORIGINS: ${KITE_MCP_ALLOWED_ORIGINS:-}
-      KITE_MCP_PROFILE: ${KITE_MCP_PROFILE:-read}
-      KITE_MCP_ALLOW_DATA_REFRESH: ${KITE_MCP_ALLOW_DATA_REFRESH:-false}
-    ports:
-      - "${KITE_MCP_BIND_ADDRESS:-0.0.0.0}:${KITE_MCP_HOST_PORT:-18788}:8788"
-    depends_on:
-      finance-app:
-        condition: service_healthy
-    read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop: [ALL]
-    security_opt:
-      - no-new-privileges:true
-
   frontend-next:
     build:
       context: ./frontend-next
