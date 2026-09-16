@@ -61,6 +61,7 @@ import {
   validateAlertsWorkflow,
 } from "@/features/alerts/api";
 import { useAlertsCapabilities, useAlertsChannels } from "@/features/alerts/hooks/use-alerts-queries";
+import { useDefinitionValidation } from "@/features/alerts/hooks/use-definition-validation";
 import { useMarketQuote, useQuotePresentation } from "@/features/alerts/hooks/use-market-stream";
 import {
   OPERATOR_LABELS,
@@ -323,6 +324,40 @@ export function UnifiedAlertEditor({
   const ready = issues.length === 0;
   const pending = save.isPending;
 
+  // Background validation: only a draft that is complete enough to mean anything
+  // is sent, and the live price is the preview sample.
+  const validationDocument = ready
+    ? buildDocument(effectiveDraft, mode.kind === "edit" ? baseDocument : null)
+    : null;
+  const validation = useDefinitionValidation({
+    scope,
+    document: validationDocument,
+    enabled: ready,
+    quote,
+    instrumentKey: primaryInstrument,
+    clock: draft.clock,
+    crossed: Boolean(target?.alreadyBeyond),
+  });
+
+  const validationTone: Record<string, "positive" | "warning" | "danger" | "neutral"> = {
+    ready: "positive",
+    crossed: "warning",
+    checking: "neutral",
+    incomplete: "neutral",
+    invalid: "danger",
+    unavailable: "warning",
+    "no-data": "neutral",
+  };
+  const validationLabel: Record<string, string> = {
+    ready: "Valid",
+    crossed: "Already past the level",
+    checking: "Checking…",
+    incomplete: "Waiting for the required fields",
+    invalid: "Needs attention",
+    unavailable: "Validation unavailable",
+    "no-data": "No market data yet",
+  };
+
   if (capabilitiesQuery.isLoading) {
     return <p className="text-sm text-muted-foreground">Loading alert options…</p>;
   }
@@ -529,6 +564,7 @@ export function UnifiedAlertEditor({
               </p>
             ) : null}
 
+            <SectionIssues issues={validation.bySection.instrument} />
             {inference.error ? (
               <p className="text-xs text-rose-300" role="alert">
                 {inference.error}
@@ -640,6 +676,7 @@ export function UnifiedAlertEditor({
               <p className="text-xs text-muted-foreground">
                 {EVALUATION_OPTIONS.find((option) => option.value === draft.clock)?.hint}
               </p>
+              <SectionIssues issues={validation.bySection.evaluation} />
             </div>
 
             {needsTimeframe(draft) ? (
@@ -663,6 +700,7 @@ export function UnifiedAlertEditor({
               </div>
             ) : null}
 
+            <SectionIssues issues={validation.bySection.rule} />
             <details className="rounded-lg border border-border/60 px-3 py-2">
               <summary className="cursor-pointer text-xs text-muted-foreground">
                 All conditions and groups
@@ -704,6 +742,7 @@ export function UnifiedAlertEditor({
               })}
             </div>
             <p className="text-xs text-muted-foreground">{describeFrequency(draft.alert)}</p>
+            <SectionIssues issues={validation.bySection.frequency} />
 
             <details
               className="rounded-lg border border-border/60 px-3 py-2"
@@ -869,6 +908,7 @@ export function UnifiedAlertEditor({
             <p className="text-xs text-muted-foreground">
               Delivery is accepted by the provider, which is not proof anyone has read it.
             </p>
+            <SectionIssues issues={validation.bySection.destinations} />
           </Panel>
 
           {/* ---------------------------------------------------------- name */}
@@ -883,6 +923,7 @@ export function UnifiedAlertEditor({
               }}
               placeholder="Generated from the definition"
             />
+            <SectionIssues issues={validation.bySection.other} />
           </Panel>
         </>
       )}
@@ -910,25 +951,76 @@ export function UnifiedAlertEditor({
                 ? "Save and activate latest"
                 : "Create and activate"}
           </Button>
-          {issues.length ? (
-            <ul className="flex flex-1 flex-col text-xs text-muted-foreground" role="status">
-              {issues.map((issue) => (
-                <li key={issue} className="flex items-center gap-1">
-                  <ArrowRightIcon className="size-3" aria-hidden />
-                  {issue}
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <span className="flex items-center gap-1 text-xs text-emerald-400">
-              <CheckIcon className="size-3" aria-hidden />
-              Ready to save · {evaluationLabel(draft.clock)}
+          <div className="flex flex-1 flex-col gap-1 text-xs">
+            <span className="flex items-center gap-2">
+              <StatusBadge tone={validationTone[validation.state] ?? "neutral"}>
+                {validationLabel[validation.state] ?? validation.state}
+              </StatusBadge>
+              <span className="text-muted-foreground">
+                {evaluationLabel(draft.clock)}
+                {validation.previewSentence ? ` · ${validation.previewSentence}` : ""}
+              </span>
             </span>
-          )}
+            {issues.length ? (
+              <ul className="flex flex-col text-muted-foreground" role="status">
+                {issues.map((issue) => (
+                  <li key={issue} className="flex items-center gap-1">
+                    <ArrowRightIcon className="size-3" aria-hidden />
+                    {issue}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {validation.error ? (
+              <span className="text-amber-300" role="status">
+                {validation.error} Your draft is untouched.
+              </span>
+            ) : null}
+            {sectionsWithIssues(validation.bySection).length > 0 ? (
+              <ul className="flex flex-col text-rose-300" role="alert">
+                {sectionsWithIssues(validation.bySection).map(([section, messages]) => (
+                  <li key={section}>
+                    <span className="font-medium">{SECTION_LABELS[section]}: </span>
+                    {messages.join(" ")}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
         </div>
       </div>
     </div>
   );
+}
+
+/** Server-reported problems for one section, shown where they can be fixed. */
+function SectionIssues({ issues }: { issues: string[] | undefined }) {
+  if (!issues || issues.length === 0) return null;
+  return (
+    <ul className="flex flex-col gap-1 text-xs text-rose-300" role="alert">
+      {issues.map((issue) => (
+        <li key={issue} className="flex items-start gap-1">
+          <AlertCircleIcon className="mt-0.5 size-3 shrink-0" aria-hidden />
+          {issue}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+const SECTION_LABELS: Record<string, string> = {
+  instrument: "Instrument",
+  rule: "Condition",
+  evaluation: "Evaluation",
+  frequency: "Notification frequency",
+  destinations: "Destinations",
+  other: "Definition",
+};
+
+function sectionsWithIssues(
+  bySection: Record<string, string[]>,
+): Array<[string, string[]]> {
+  return Object.entries(bySection).filter(([, messages]) => messages.length > 0);
 }
 
 /**

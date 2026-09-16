@@ -123,20 +123,24 @@ export async function fetchAlertsWorkflow(
 export async function validateAlertsWorkflow(
   payload: { document?: Record<string, unknown>; yaml_text?: string },
   scope?: string | null,
+  options: { signal?: AbortSignal } = {},
 ): Promise<AlertsValidateResponse> {
   return apiFetch<AlertsValidateResponse>(`${BASE}/workflows/validate${scopeQuery(scope)}`, {
     method: "POST",
     json: payload,
+    signal: options.signal,
   });
 }
 
 export async function previewAlertsWorkflow(
   payload: { document?: Record<string, unknown>; yaml_text?: string; observations?: unknown[] },
   scope?: string | null,
+  options: { signal?: AbortSignal } = {},
 ): Promise<AlertsPreviewResponse> {
   return apiFetch<AlertsPreviewResponse>(`${BASE}/workflows/preview${scopeQuery(scope)}`, {
     method: "POST",
     json: payload,
+    signal: options.signal,
   });
 }
 
