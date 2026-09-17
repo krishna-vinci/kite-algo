@@ -644,3 +644,492 @@ class InflightEnumerationTests(SettlementTestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Four-axis settlement assessment (D-3, D-5)
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid
+from datetime import datetime, timedelta, timezone
+
+NOW = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+
+
+def _iso(dt):
+    return dt.isoformat()
+
+
+class AssessmentTestCase(SettlementTestCase):
+    """Fixture extensions for the four axes: plans, reservations, approvals."""
+
+    def setUp(self):
+        super().setUp()
+        from backend.strategies.settlement import ExecutionBarrier
+
+        self.service = self._service()
+
+    def _service(self):
+        from backend.strategies.settlement import SettlementService
+
+        return SettlementService(session_factory=self.factory)
+
+    def _proposal_and_plan(self, plan_id="plan-1", *, proposal_id=None, strategy=STRATEGY, account=ACCOUNT):
+        proposal_id = proposal_id or f"prop-{plan_id}"
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT OR IGNORE INTO strategy_proposals "
+                    "(proposal_id, strategy_id, account_id, evaluation_id, evaluation_kind, "
+                    " strategy_run_id, target_kind, payload, payload_sha256, status) "
+                    "VALUES (:pid, :strategy, :account, :eid, 'run_now', 'run-1', "
+                    " 'single_instrument', '{}', 'sha', 'validated')"
+                ),
+                {"pid": proposal_id, "strategy": strategy, "account": account, "eid": f"eval-{plan_id}"},
+            )
+            session.execute(
+                text(
+                    "INSERT OR IGNORE INTO strategy_plans "
+                    "(plan_id, proposal_id, strategy_id, account_id, plan_kind, plan_hash, "
+                    " logical_plan, resolved_plan, pinned_catalog_generation) "
+                    "VALUES (:plan_id, :pid, :strategy, :account, 'single_instrument', 'h', "
+                    " '{}', '{}', '11111111-1111-1111-1111-111111111111')"
+                ),
+                {"plan_id": plan_id, "pid": proposal_id, "strategy": strategy, "account": account},
+            )
+            session.commit()
+
+    def _reservation(self, plan_id, status="active", *, reservation_id="res-1", strategy=STRATEGY, account=ACCOUNT):
+        self._proposal_and_plan(plan_id)
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategy_reservations "
+                    "(reservation_id, plan_id, strategy_id, account_id, evaluation_id, "
+                    " execution_environment, status, reserved_notional_inr, valid_until) "
+                    "VALUES (:rid, :plan_id, :strategy, :account, :eid, 'live', :status, 1000.0, :until)"
+                ),
+                {
+                    "rid": reservation_id,
+                    "plan_id": plan_id,
+                    "strategy": strategy,
+                    "account": account,
+                    "eid": f"eval-{plan_id}",
+                    "status": status,
+                    "until": _iso(NOW + timedelta(hours=1)),
+                },
+            )
+            session.commit()
+
+    def _approval(self, status="active", *, approval_id="appr-1", plan_id="plan-1", strategy=STRATEGY, account=ACCOUNT):
+        self._reservation(plan_id, "consumed", reservation_id=f"res-for-{approval_id}", strategy=strategy, account=account)
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategy_approvals "
+                    "(approval_id, plan_id, strategy_id, account_id, reservation_id, plan_hash, "
+                    " exposure_snapshot_version, reconciliation_version, catalog_generation, "
+                    " actor_id, status, valid_from, valid_until) "
+                    "VALUES (:aid, :plan_id, :strategy, :account, :rid, 'h', 1, 0, "                " '11111111-1111-1111-1111-111111111111', 'app:o', :status, :from, :until)"
+                ),
+                {
+                    "aid": approval_id,
+                    "rid": f"res-for-{approval_id}",
+                    "plan_id": plan_id,
+                    "strategy": strategy,
+                    "account": account,
+                    "status": status,
+                    "from": _iso(NOW - timedelta(minutes=5)),
+                    "until": _iso(NOW + timedelta(minutes=55)),
+                },
+            )
+            session.commit()
+
+    def _archived_strategy(self):
+        with self.factory() as session:
+            session.execute(
+                text("UPDATE strategies SET status = 'archived' WHERE id = :sid"), {"sid": STRATEGY}
+            )
+            session.commit()
+
+    def _axis(self, service_result):
+        return service_result["axes"]
+
+
+class QuiescenceAxisTests(AssessmentTestCase):
+    def test_valid_proof_satisfies_the_quiescence_axis(self):
+        self.barrier.record_proof(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        result = self.service.assess(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV
+        )
+        axis = self._axis(result)["quiescence"]
+        self.assertEqual(axis["state"], "satisfied")
+        self.assertTrue(axis["satisfied"])
+
+    def test_no_proof_is_unknown_never_failed(self):
+        self.barrier.record_work_event(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV, event="work_created"
+        )
+        result = self.service.assess(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV
+        )
+        axis = self._axis(result)["quiescence"]
+        self.assertEqual(axis["state"], "unknown")
+        self.assertFalse(axis["satisfied"])
+
+    def test_work_after_the_proof_makes_quiescence_unknown(self):
+        self.barrier.record_proof(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.barrier.record_work_event(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV, event="work_created"
+        )
+        result = self.service.assess(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV
+        )
+        self.assertEqual(self._axis(result)["quiescence"]["state"], "unknown")
+
+    def test_proof_older_than_the_required_transition_is_unknown(self):
+        """Run settlement's floor: the proof must postdate the run's terminal move."""
+        self.barrier.record_proof(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        result = self.service.assess(
+            account_id=ACCOUNT,
+            strategy_id=STRATEGY,
+            execution_environment=ENV,
+            proof_not_before=datetime.now(timezone.utc) + timedelta(seconds=5),
+        )
+        axis = self._axis(result)["quiescence"]
+        self.assertEqual(axis["state"], "unknown")
+        self.assertEqual(axis["detail"].get("reason"), "proof_predates_required_transition")
+
+
+class FlatnessAxisTests(AssessmentTestCase):
+    def test_open_book_with_fresh_broker_truth_is_failed(self):
+        self._book_row()
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.account_positions "
+                    "(account_id, instrument_token, product, net_quantity, updated_at) "
+                    "VALUES (:account, 738561, 'CNC', 100, :at)"
+                ),
+                {"account": ACCOUNT, "at": _iso(datetime.now(timezone.utc))},
+            )
+            session.commit()
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        axis = self._axis(result)["attribution_scoped_flatness"]
+        self.assertEqual(axis["state"], "failed")
+        self.assertEqual(axis["detail"]["open_legs"], 1)
+
+    def test_stale_broker_snapshot_is_unknown_even_with_an_open_book(self):
+        """Refresh-before-decide: a stale snapshot cannot decide anything."""
+        self._book_row()
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.account_positions "
+                    "(account_id, instrument_token, product, net_quantity, updated_at) "
+                    "VALUES (:account, 738561, 'CNC', 100, :at)"
+                ),
+                {"account": ACCOUNT, "at": _iso(datetime.now(timezone.utc) - timedelta(seconds=600))},
+            )
+            session.commit()
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        axis = self._axis(result)["attribution_scoped_flatness"]
+        self.assertEqual(axis["state"], "unknown")
+        self.assertEqual(axis["detail"].get("reason"), "stale_broker_snapshot")
+
+    def test_zero_book_is_flat_scoped_to_this_strategy(self):
+        """Shared line (G2 rule): another strategy holding the instrument — the
+        broker aggregate is non-zero at that coordinate — never unsettles THIS
+        zero book. Account flatness (or its absence) never substitutes."""
+        from backend.strategies.attribution_models import Strategy
+
+        with self.factory() as session:
+            session.add(Strategy(id="stg-B", owner_id="app:o", name="B", account_scope=ACCOUNT, status="active"))
+            session.commit()
+        self._book_row(strategy="stg-B", qty=500)  # another strategy's line
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.account_positions "
+                    "(account_id, instrument_token, product, net_quantity, updated_at) "
+                    "VALUES (:account, 738561, 'CNC', 500, :at)"
+                ),
+                {"account": ACCOUNT, "at": _iso(datetime.now(timezone.utc))},
+            )
+            session.commit()
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        axis = self._axis(result)["attribution_scoped_flatness"]
+        self.assertEqual(axis["state"], "satisfied")
+        self.assertEqual(axis["detail"]["open_legs"], 0)
+
+    def test_open_book_is_failed_even_when_the_account_coordinate_is_flat(self):
+        """Account flatness never substitutes: the strategy's OWN book governs."""
+        self._book_row()
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.account_positions "
+                    "(account_id, instrument_token, product, net_quantity, updated_at) "
+                    "VALUES (:account, 738561, 'CNC', 0, :at)"
+                ),
+                {"account": ACCOUNT, "at": _iso(datetime.now(timezone.utc))},
+            )
+            session.commit()
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        axis = self._axis(result)["attribution_scoped_flatness"]
+        self.assertEqual(axis["state"], "failed")
+
+    def test_paper_flatness_uses_paper_positions(self):
+        result = self.service.assess(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment="paper"
+        )
+        axis = self._axis(result)["attribution_scoped_flatness"]
+        self.assertEqual(axis["state"], "satisfied")
+
+    def test_paper_open_position_is_failed(self):
+        self._book_row(env="paper")
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.paper_positions "
+                    "(account_scope, instrument_token, product, net_quantity, updated_at) "
+                    "VALUES (:account, 738561, 'CNC', 100, :at)"
+                ),
+                {"account": ACCOUNT, "at": _iso(datetime.now(timezone.utc))},
+            )
+            session.commit()
+        result = self.service.assess(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment="paper"
+        )
+        self.assertEqual(self._axis(result)["attribution_scoped_flatness"]["state"], "failed")
+
+    def test_broker_snapshot_max_age_is_configurable(self):
+        """SETTLEMENT_BROKER_SNAPSHOT_MAX_AGE_SECONDS: default 60, overridable."""
+        import os
+        from unittest.mock import patch
+
+        self._book_row()
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.account_positions "
+                    "(account_id, instrument_token, product, net_quantity, updated_at) "
+                    "VALUES (:account, 738561, 'CNC', 100, :at)"
+                ),
+                {"account": ACCOUNT, "at": _iso(datetime.now(timezone.utc) - timedelta(seconds=10))},
+            )
+            session.commit()
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._axis(result)["attribution_scoped_flatness"]["state"], "failed")
+        with patch.dict(os.environ, {"SETTLEMENT_BROKER_SNAPSHOT_MAX_AGE_SECONDS": "5"}):
+            result = self.service.assess(
+                account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV
+            )
+        axis = self._axis(result)["attribution_scoped_flatness"]
+        self.assertEqual(axis["state"], "unknown")
+        self.assertEqual(axis["detail"].get("reason"), "stale_broker_snapshot")
+
+
+class DomainTerminalAxisTests(AssessmentTestCase):
+    def test_open_run_is_failed(self):
+        self._bind("run-1")
+        self._run("run-1", status="open")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        axis = self._axis(result)["terminal_domain_state"]
+        self.assertEqual(axis["state"], "failed")
+        self.assertIn("run-1", axis["detail"]["non_terminal_runs"])
+
+    def test_closed_run_is_terminal(self):
+        self._bind("run-1")
+        self._run("run-1", status="closed")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._axis(result)["terminal_domain_state"]["state"], "satisfied")
+
+    def test_running_job_is_failed(self):
+        self._job("job-1", "running")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        axis = self._axis(result)["terminal_domain_state"]
+        self.assertEqual(axis["state"], "failed")
+        self.assertIn("job-1", axis["detail"]["non_terminal_jobs"])
+
+    def test_stopped_job_is_terminal(self):
+        self._job("job-1", "stopped")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._axis(result)["terminal_domain_state"]["state"], "satisfied")
+
+    def test_job_of_another_environment_does_not_block(self):
+        self._job("job-paper", "running", mode="paper")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._axis(result)["terminal_domain_state"]["state"], "satisfied")
+
+    def test_plan_without_reservation_is_non_terminal(self):
+        self._proposal_and_plan("plan-1")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        axis = self._axis(result)["terminal_domain_state"]
+        self.assertEqual(axis["state"], "failed")
+        self.assertIn("plan-1", axis["detail"]["non_terminal_plans"])
+
+    def test_plan_with_active_reservation_is_non_terminal(self):
+        self._reservation("plan-1", status="active")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._axis(result)["terminal_domain_state"]["state"], "failed")
+
+    def test_plan_with_consumed_reservation_is_terminal(self):
+        self._reservation("plan-1", status="consumed")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._axis(result)["terminal_domain_state"]["state"], "satisfied")
+
+    def test_plan_with_expired_reservation_is_terminal(self):
+        self._reservation("plan-1", status="expired")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._axis(result)["terminal_domain_state"]["state"], "satisfied")
+
+class NoAuthorityAxisTests(AssessmentTestCase):
+    def test_active_approval_is_failed(self):
+        self._approval(status="active")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        axis = self._axis(result)["no_live_evaluation_authority"]
+        self.assertEqual(axis["state"], "failed")
+        self.assertIn("appr-1", axis["detail"]["active_approvals"])
+
+    def test_revoked_approval_is_not_authority(self):
+        self._approval(status="revoked")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._axis(result)["no_live_evaluation_authority"]["state"], "satisfied")
+
+    def test_active_strategy_with_no_runs_keeps_no_authority_satisfied(self):
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._axis(result)["no_live_evaluation_authority"]["state"], "satisfied")
+
+    def test_open_run_on_active_strategy_is_failed(self):
+        self._bind("run-1")
+        self._run("run-1", status="open")
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._axis(result)["no_live_evaluation_authority"]["state"], "failed")
+
+    def test_archived_strategy_has_no_authority_even_with_open_run(self):
+        self._bind("run-1")
+        self._run("run-1", status="open")
+        self._archived_strategy()
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._axis(result)["no_live_evaluation_authority"]["state"], "satisfied")
+
+
+class RollupAndPersistenceTests(AssessmentTestCase):
+    def test_all_axes_satisfied_roll_up_to_settled(self):
+        self.barrier.record_proof(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(result["overall"], "settled")
+
+    def test_any_failed_axis_makes_the_assessment_unsettled(self):
+        self._book_row()
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.account_positions "
+                    "(account_id, instrument_token, product, net_quantity, updated_at) "
+                    "VALUES (:account, 738561, 'CNC', 100, :at)"
+                ),
+                {"account": ACCOUNT, "at": _iso(datetime.now(timezone.utc))},
+            )
+            session.commit()
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(result["overall"], "unsettled")
+
+    def test_any_unknown_axis_makes_the_assessment_unknown(self):
+        self.barrier.record_work_event(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV, event="work_created"
+        )
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(result["overall"], "unknown")
+
+    def test_failed_takes_precedence_over_unknown(self):
+        self._book_row()
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.account_positions "
+                    "(account_id, instrument_token, product, net_quantity, updated_at) "
+                    "VALUES (:account, 738561, 'CNC', 100, :at)"
+                ),
+                {"account": ACCOUNT, "at": _iso(datetime.now(timezone.utc))},
+            )
+            session.commit()
+        self.barrier.record_work_event(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV, event="work_created"
+        )
+        result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        states = {name: axis["state"] for name, axis in result["axes"].items()}
+        self.assertIn("failed", states.values())
+        self.assertIn("unknown", states.values())
+        self.assertEqual(result["overall"], "unsettled")
+
+    def test_assessments_are_append_only_snapshots_with_digests(self):
+        self.barrier.record_proof(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        first = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        second = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertNotEqual(first["assessment_id"], second["assessment_id"])
+        self.assertEqual(first["overall"], "settled")
+        self.assertEqual(second["overall"], "settled")
+        for axis in second["axes"].values():
+            self.assertTrue(axis["evidence_digest"])
+        self.assertTrue(second["evidence_digest"])
+        self.assertEqual(second["barrier_version"], 0)
+        latest = self.service.latest_assessment(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV
+        )
+        self.assertEqual(latest["assessment_id"], second["assessment_id"])
+
+    def test_settled_assessment_is_detectably_stale_after_a_barrier_bump(self):
+        """Late fill (work_created) invalidates: the snapshot says which version."""
+        self.barrier.record_proof(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        settled = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(settled["overall"], "settled")
+        self.barrier.record_work_event(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV,
+            event="work_created", ref="fill:late-1",
+        )
+        latest = self.service.latest_assessment(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV
+        )
+        current = self.barrier.state(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV
+        )["barrier_version"]
+        self.assertTrue(latest["stale"])
+        self.assertEqual(latest["barrier_version"], 0)
+        self.assertEqual(current, 1)
+
+    def test_domain_adapter_registry_hook_participates_in_the_rollup(self):
+        from backend.strategies import settlement as settlement_module
+
+        def failing_adapter(*, account_id, strategy_id, execution_environment, db):
+            return [
+                {
+                    "name": "domain:option_runs",
+                    "state": "failed",
+                    "detail": {"reason": "phase-scope: none required now"},
+                }
+            ]
+
+        settlement_module.register_domain_adapter(failing_adapter)
+        try:
+            result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+            self.assertIn("domain:option_runs", result["axes"])
+            self.assertEqual(result["overall"], "unsettled")
+        finally:
+            settlement_module.settlement_domain_adapters.clear()
+
+    def test_adapter_failure_is_unknown_never_satisfied(self):
+        from backend.strategies import settlement as settlement_module
+
+        def broken_adapter(**kwargs):
+            raise RuntimeError("adapter exploded")
+
+        settlement_module.register_domain_adapter(broken_adapter)
+        try:
+            result = self.service.assess(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+            axis = result["axes"]["domain:broken_adapter"]
+            self.assertEqual(axis["state"], "unknown")
+            self.assertEqual(result["overall"], "unknown")
+        finally:
+            settlement_module.settlement_domain_adapters.clear()
