@@ -370,7 +370,11 @@ def _hosted_payload(**overrides):
     return body
 
 
-class OwnerStrategyApiTests(unittest.IsolatedAsyncioTestCase):
+class _OwnerApiHarness(unittest.IsolatedAsyncioTestCase):
+    """Shared harness: an app mounting only the strategies router, with the
+    attribution store and worker-token fake wired into app state."""
+
+
     async def asyncSetUp(self):
         self.engine = create_engine(
             "sqlite+pysqlite:///:memory:",
@@ -497,6 +501,8 @@ class OwnerStrategyApiTests(unittest.IsolatedAsyncioTestCase):
         assert response.status_code == 200, response.text
         return response.json()
 
+
+class OwnerStrategyApiTests(_OwnerApiHarness):
     # -- backward compatibility ----------------------------------------------
 
     async def test_legacy_hosted_create_keeps_working_and_writes_canonical_atomically(self):
@@ -1008,6 +1014,106 @@ class TestStrategyBookClosure(unittest.IsolatedAsyncioTestCase):
         request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)))
         legs = await _live_run_legs(request, {"strategy_run_id": "run-legacy", "account_scope": "kite:A"})
         self.assertEqual([leg["net_quantity"] for leg in legs], [7])
+
+
+class AdjustmentApiTests(_OwnerApiHarness):
+    """Task 5 API: reclassification is account-owner-only and append-only."""
+
+    def _line(self, delta=-10):
+        return {
+            "instrument_token": 738561, "exchange": "NSE", "tradingsymbol": "RELIANCE",
+            "product": "CNC", "quantity_delta": delta,
+        }
+
+    def _body(self, **overrides):
+        body = {"reason_code": "owner_claimed_manual_exit", "lines": [self._line()]}
+        body.update(overrides)
+        return body
+
+    async def test_owner_can_record_an_adjustment(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+            response = await client.post(f"{BASE}/{sid}/adjustments", json=self._body())
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertEqual(body["strategy_id"], sid)
+            self.assertEqual(body["adjustment_kind"], "owner_reclassification")
+            self.assertEqual(body["created_by"], "app:admin")
+            self.assertEqual([line["quantity_delta"] for line in body["lines"]], [-10])
+        finally:
+            self._stop_patches()
+
+    async def test_reclassification_is_owner_only(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+        finally:
+            self._stop_patches()
+
+        # Cross-owner: non-disclosing 404, never a 403 with existence leak.
+        client = self._client(username="other")
+        try:
+            response = await client.post(f"{BASE}/{sid}/adjustments", json=self._body())
+            self.assertEqual(response.status_code, 404)
+        finally:
+            self._stop_patches()
+
+        # A worker bearer token cannot reach the owner surface at all.
+        client = self._client(username=None)
+        try:
+            response = await client.post(
+                f"{BASE}/{sid}/adjustments", json=self._body(),
+                headers={"Authorization": "Bearer kwa_something"},
+            )
+            self.assertEqual(response.status_code, 401)
+        finally:
+            self._stop_patches()
+
+    async def test_unknown_and_archived_strategy_refused(self):
+        client = self._client()
+        try:
+            response = await client.post(f"{BASE}/stg-missing/adjustments", json=self._body())
+            self.assertEqual(response.status_code, 404)
+
+            created = await self._create(client)
+            sid = created["strategy_id"]
+            await client.patch(f"{BASE}/{sid}/status", json={"status": "archived"})
+            archived = await client.post(f"{BASE}/{sid}/adjustments", json=self._body())
+            self.assertEqual(archived.status_code, 409)
+            self.assertEqual(archived.json()["detail"]["rejection_reason"], "STRATEGY_ARCHIVED")
+        finally:
+            self._stop_patches()
+
+    async def test_unbalanced_and_unknown_fields_are_refused(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+            # A zero-delta line moves nothing: refused before any row is written.
+            zero = await client.post(
+                f"{BASE}/{sid}/adjustments", json=self._body(lines=[self._line(0)])
+            )
+            self.assertEqual(zero.status_code, 422)
+            self.assertEqual(
+                zero.json()["detail"]["rejection_reason"], "ADJUSTMENT_LINE_ZERO_DELTA"
+            )
+
+            # extra="forbid": the two contracts cannot blur.
+            extra = await client.post(
+                f"{BASE}/{sid}/adjustments", json={**self._body(), "quantity_delta": 5}
+            )
+            self.assertEqual(extra.status_code, 422)
+            empty = await client.post(f"{BASE}/{sid}/adjustments", json=self._body(lines=[]))
+            self.assertEqual(empty.status_code, 422)
+        finally:
+            self._stop_patches()
+
+        with self.factory() as session:
+            rows = session.execute(text("SELECT COUNT(*) FROM strategy_attribution_adjustments")).scalar()
+        self.assertEqual(rows, 0)
 
 
 if __name__ == "__main__":

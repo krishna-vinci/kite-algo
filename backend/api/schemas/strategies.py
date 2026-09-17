@@ -8,6 +8,7 @@ strategy would act on), not an owner.
 from __future__ import annotations
 
 from enum import Enum
+from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -148,6 +149,60 @@ class PositionListResponse(BaseModel):
     strategy_id: str
     environment: str
     positions: List[PositionRow] = Field(default_factory=list)
+
+
+class AdjustmentLineRequest(BaseModel):
+    """One signed quantity move between the manual residual and this strategy.
+
+    ``quantity_delta`` is the quantity **credited to the strategy**: claiming a
+    ``-10`` unattributed fill is ``-10``, which lowers the strategy's book by 10
+    and raises the manual residual by 10 toward zero.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    trade_ref: Optional[str] = Field(default=None, max_length=255)
+    instrument_token: int
+    exchange: str = Field(min_length=1, max_length=32)
+    tradingsymbol: str = Field(min_length=1, max_length=255)
+    product: str = Field(min_length=1, max_length=32)
+    quantity_delta: int
+    #: Omitted defaults to the adjustment's creation time — never the fill's.
+    effective_at: Optional[datetime] = None
+
+
+class AdjustmentCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason_code: str = Field(min_length=1, max_length=120)
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    lines: List[AdjustmentLineRequest] = Field(min_length=1)
+
+
+class AdjustmentLineResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    line_no: int
+    instrument_token: int
+    exchange: str
+    tradingsymbol: str
+    product: str
+    quantity_delta: int
+    effective_at: Optional[str] = None
+
+
+class AdjustmentResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    adjustment_id: str
+    strategy_id: str
+    account_id: str
+    adjustment_kind: str
+    reason_code: str
+    created_by: str
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+    lines: List[AdjustmentLineResponse] = Field(default_factory=list)
 
 
 class RebuildResponse(BaseModel):

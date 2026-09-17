@@ -24,7 +24,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.strategies.attribution import SqlAttributionStore
+from backend.strategies.attribution import SqlAttributionStore, StrategyAttributionService
 from backend.strategies.account_truth import AccountTruthService, AccountTruthStore
 
 
@@ -54,6 +54,44 @@ class AccountTruthTestCase(unittest.TestCase):
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("ATTACH DATABASE ':memory:' AS public")
+            # No catalog mappings: facts stay explicit unresolved raw rows,
+            # which is a real production state and keeps delta arithmetic legible.
+            cursor.execute(
+                """
+                CREATE TABLE public.instrument_catalog_generations (
+                    id TEXT PRIMARY KEY, status TEXT, published_at TEXT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.instrument_broker_mappings (
+                    mapping_id TEXT PRIMARY KEY, instrument_id TEXT, broker TEXT, broker_exchange TEXT,
+                    broker_symbol TEXT, broker_token TEXT, valid_from_generation TEXT,
+                    valid_to_generation TEXT, is_current INTEGER
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.live_order_intents (
+                    intent_id TEXT PRIMARY KEY, client_order_ref TEXT NOT NULL,
+                    account_id TEXT NOT NULL, strategy_run_id TEXT NOT NULL, broker_order_id TEXT,
+                    basket_execution_id TEXT, basket_leg_index INTEGER, bracket_intent_id TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.order_trade_fills (
+                    account_id TEXT NOT NULL, order_id TEXT NOT NULL, trade_id TEXT NOT NULL,
+                    instrument_token BIGINT, exchange TEXT, tradingsymbol TEXT, product TEXT,
+                    transaction_type TEXT, quantity INTEGER, price NUMERIC, fill_timestamp TEXT,
+                    payload_json TEXT, PRIMARY KEY (account_id, trade_id)
+                )
+                """
+            )
             cursor.execute(
                 """
                 CREATE TABLE public.worker_live_execution_links (
@@ -419,6 +457,112 @@ class FreezeRefusalTests(unittest.TestCase):
         self.assertEqual(detail["manual_quantity"], -30)
         self.assertIn("unexplained", detail["message"])
         self.assertIn("30", detail["message"])
+
+
+class AdjustmentFoldTests(AccountTruthTestCase):
+    """Task 5: append-only reclassifications fold into the strategy book once."""
+
+    def _strategy(self, sid="stg-1", account="kite:A"):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategies (id, owner_id, name, account_scope) "
+                    "VALUES (:sid, 'app:o', :name, :account)"
+                ),
+                {"sid": sid, "name": f"Strategy {sid}", "account": account},
+            )
+            session.commit()
+
+    def _attribution(self):
+        return StrategyAttributionService(SqlAttributionStore(session_factory=self.factory))
+
+    def _publish(self, sid="stg-1", account="kite:A"):
+        return asyncio.run(
+            self._attribution().publish(
+                account_id=account, strategy_id=sid, execution_environment="live"
+            )
+        )
+
+    def _book(self, sid="stg-1", account="kite:A"):
+        return asyncio.run(
+            self._attribution().open_positions(
+                account_id=account, strategy_id=sid, execution_environment="live"
+            )
+        )
+
+    def _line(self, delta=-10, token=738561, symbol="RELIANCE"):
+        return {
+            "instrument_token": token, "exchange": "NSE", "tradingsymbol": symbol,
+            "product": "CNC", "quantity_delta": delta,
+        }
+
+    def test_adjustment_folds_into_projection_and_clears_manual(self):
+        """Walkthrough 7 case 1 completed: the owner claims the manual -10."""
+        self._strategy()
+        self.store.ingest_trades(
+            account_id="kite:A", trades=[self._trade("T-MANUAL", order_id="OID-M", side="SELL", qty=10)]
+        )
+        self.assertEqual(self.store.manual_residual_by_coordinate(account_id="kite:A")[_coord()], -10)
+
+        self.store.create_reclassification(
+            account_id="kite:A", strategy_id="stg-1", owner_id="app:o",
+            reason_code="owner_claimed_manual_exit", created_by="app:owner",
+            lines=[self._line(-10)],
+        )
+        self._publish()
+
+        positions = self._book()
+        self.assertEqual([p["net_quantity"] for p in positions], [-10])
+        # The manual book moved the opposite way by construction.
+        self.assertEqual(self.store.manual_residual_by_coordinate(account_id="kite:A")[_coord()], 0)
+
+    def test_adjustment_survives_rebuild_without_double_application(self):
+        self._strategy()
+        self.store.create_reclassification(
+            account_id="kite:A", strategy_id="stg-1", owner_id="app:o",
+            reason_code="owner_claimed", created_by="app:o", lines=[self._line(-10)],
+        )
+        self._publish()
+        first = [p["net_quantity"] for p in self._book()]
+        self._publish()  # rebuild
+        second = [p["net_quantity"] for p in self._book()]
+        self.assertEqual(first, second)
+        self.assertEqual(second, [-10])
+
+    def test_correcting_line_reverses_by_appending(self):
+        self._strategy()
+        first = self.store.create_reclassification(
+            account_id="kite:A", strategy_id="stg-1", owner_id="app:o",
+            reason_code="owner_claimed", created_by="app:o", lines=[self._line(-10)],
+        )
+        self.store.create_reclassification(
+            account_id="kite:A", strategy_id="stg-1", owner_id="app:o",
+            reason_code="correction", created_by="app:o",
+            evidence={"corrects_adjustment_id": first["adjustment_id"]},
+            lines=[self._line(+10)],
+        )
+        self._publish()
+        # The correction is a NEW line: the original is never rewritten, and the
+        # two lines net to flat.
+        with self.factory() as session:
+            count = session.execute(
+                text("SELECT COUNT(*) FROM strategy_attribution_adjustment_lines")
+            ).scalar()
+        self.assertEqual(count, 2)
+        self.assertEqual(self._book(), [])
+
+    def test_adjustment_lines_have_no_mutation_path(self):
+        for method in ("update_reclassification", "delete_reclassification", "revoke_adjustment"):
+            self.assertFalse(hasattr(self.store, method), method)
+
+    def test_effective_at_defaults_to_adjustment_time(self):
+        self._strategy()
+        record = self.store.create_reclassification(
+            account_id="kite:A", strategy_id="stg-1", owner_id="app:o",
+            reason_code="owner_claimed", created_by="app:o", lines=[self._line(-10)],
+        )
+        # Never the original fill's timestamp: order is when the owner decided.
+        self.assertEqual(record["lines"][0]["effective_at"], record["created_at"])
 
 
 if __name__ == "__main__":

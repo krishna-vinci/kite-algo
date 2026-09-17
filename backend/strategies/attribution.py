@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
@@ -46,6 +47,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from backend.shared.serialization import _json_dumps, _row_mapping
 from backend.strategies.attribution_models import (
     Strategy,
+    StrategyAttributionAdjustment,
+    StrategyAttributionAdjustmentLine,
     StrategyPositionProjection,
     StrategyProjectionState,
     StrategyRunBinding,
@@ -368,6 +371,137 @@ class SqlAttributionStore:
         finally:
             if owns_db:
                 session.close()
+
+    # ------------------------------------------------------- adjustments (G4+)
+
+    def create_reclassification(
+        self,
+        *,
+        account_id: str,
+        strategy_id: str,
+        owner_id: str,
+        reason_code: str,
+        created_by: str,
+        lines: Sequence[Dict[str, Any]],
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Insert one append-only reclassification adjustment and its lines.
+
+        Header and lines commit in ONE transaction. There is no update or delete
+        path: a correction is a new opposite-sign adjustment referencing the
+        original in ``evidence``. ``quantity_delta`` is the signed quantity
+        credited to the strategy, so the manual residual moves the opposite way
+        by construction — the manual book is the implicit counterparty.
+
+        An omitted ``effective_at`` defaults to the adjustment's creation time,
+        never the original fill's timestamp: the fold order is "when the owner
+        decided", not "when the human traded".
+        """
+        adjustment_id = str(uuid.uuid4())
+        created_at = _utcnow()
+        session = self.session_factory()
+        try:
+            session.add(
+                StrategyAttributionAdjustment(
+                    adjustment_id=adjustment_id,
+                    account_id=account_id,
+                    adjustment_kind="owner_reclassification",
+                    reason_code=reason_code,
+                    created_by=created_by,
+                    evidence=dict(evidence or {}),
+                )
+            )
+            stored_lines = []
+            for index, line in enumerate(lines, start=1):
+                effective_at = line.get("effective_at") or created_at
+                session.add(
+                    StrategyAttributionAdjustmentLine(
+                        adjustment_id=adjustment_id,
+                        line_no=index,
+                        strategy_id=strategy_id,
+                        owner_id=owner_id,
+                        account_id=account_id,
+                        instrument_token=int(line["instrument_token"]),
+                        exchange=str(line["exchange"]),
+                        tradingsymbol=str(line["tradingsymbol"]),
+                        product=str(line["product"]),
+                        quantity_delta=int(line["quantity_delta"]),
+                        effective_at=effective_at,
+                    )
+                )
+                stored_lines.append(
+                    {
+                        "line_no": index,
+                        "instrument_token": int(line["instrument_token"]),
+                        "exchange": str(line["exchange"]),
+                        "tradingsymbol": str(line["tradingsymbol"]),
+                        "product": str(line["product"]),
+                        "quantity_delta": int(line["quantity_delta"]),
+                        "effective_at": effective_at,
+                    }
+                )
+            session.commit()
+            return {
+                "adjustment_id": adjustment_id,
+                "strategy_id": strategy_id,
+                "account_id": account_id,
+                "adjustment_kind": "owner_reclassification",
+                "reason_code": reason_code,
+                "created_by": created_by,
+                "evidence": dict(evidence or {}),
+                "created_at": created_at,
+                "lines": stored_lines,
+            }
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def iter_adjustment_facts(
+        self, *, account_id: str, strategy_id: str, db: Optional[Any] = None
+    ) -> List[TradeFact]:
+        """Adjustment lines as fold facts for one strategy's **live** book.
+
+        Stable source identity ``adjustment:<adjustment_id>:<line_no>`` is what
+        makes double application across rebuilds structurally impossible: every
+        full recompute folds each line exactly once. Lines are live-book facts in
+        V1, which is why the environment is assigned rather than stored.
+        """
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            rows = session.execute(
+                select(StrategyAttributionAdjustmentLine)
+                .where(
+                    StrategyAttributionAdjustmentLine.account_id == account_id,
+                    StrategyAttributionAdjustmentLine.strategy_id == strategy_id,
+                )
+                .order_by(
+                    StrategyAttributionAdjustmentLine.adjustment_id,
+                    StrategyAttributionAdjustmentLine.line_no,
+                )
+            ).scalars().all()
+        except SQLAlchemyError:
+            return []
+        finally:
+            if owns_db:
+                session.close()
+        return [
+            TradeFact(
+                source_key=f"adjustment:{row.adjustment_id}:{row.line_no}",
+                strategy_run_id=f"adjustment:{row.adjustment_id}",
+                execution_environment="live",
+                instrument_token=int(row.instrument_token),
+                exchange=str(row.exchange),
+                tradingsymbol=str(row.tradingsymbol),
+                product=str(row.product),
+                signed_quantity=int(row.quantity_delta),
+                effective_at=row.effective_at,
+                pinned_generation=None,
+            )
+            for row in rows
+        ]
 
     # ------------------------------------------------------- strategy closure
 
@@ -1159,6 +1293,13 @@ class StrategyAttributionService:
                     owned_orders=owned_orders,
                     bound_run_ids=bound_run_ids,
                     db=db,
+                )
+                # Append-only owner reclassifications enter the live book as
+                # immutable facts with stable source identity, so every rebuild
+                # folds each line exactly once (D-3). They are not runs, so they
+                # are deliberately not subject to the bound-run filter.
+                facts = list(facts) + self.store.iter_adjustment_facts(
+                    account_id=account_id, strategy_id=strategy_id, db=db
                 )
             else:
                 # Paper and dry_run share the paper-shaped sources but are never

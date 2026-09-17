@@ -403,6 +403,20 @@ class AccountTruthStore:
             return set()
         return {str(row[0]) for row in rows}
 
+    # --------------------------------------------------------- adjustments
+
+    def create_reclassification(self, **kwargs: Any) -> Dict[str, Any]:
+        """Append-only owner reclassification, implemented with the attribution store.
+
+        The adjustment tables are attribution state (they move quantity between
+        the manual residual and a strategy book), so the single implementation
+        lives beside the fold that consumes them; this delegates so callers have
+        one account-truth surface.
+        """
+        from backend.strategies.attribution import SqlAttributionStore
+
+        return SqlAttributionStore(session_factory=self.session_factory).create_reclassification(**kwargs)
+
     # --------------------------------------------------------- reconciliation
 
     def broker_quantities(self, *, account_id: str, db: Optional[Any] = None) -> Dict[Coordinate, int]:

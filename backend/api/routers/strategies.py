@@ -31,6 +31,9 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
 from backend.api.schemas.strategies import (
+    AdjustmentCreateRequest,
+    AdjustmentLineResponse,
+    AdjustmentResponse,
     ExternalAdapterRequest,
     ExternalAdapterResponse,
     ExternalStrategyCreateRequest,
@@ -590,6 +593,82 @@ async def revoke_grant(
         raise HTTPException(status_code=404, detail="Grant not found")
     return GrantResponse(
         strategy_id=strategy_id, token_id=token_id, granted_by=owner, revoked=True
+    )
+
+
+@router.post("/{strategy_id}/adjustments", response_model=AdjustmentResponse)
+async def create_adjustment(
+    strategy_id: str,
+    request: Request,
+    payload: AdjustmentCreateRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Record an append-only owner reclassification (account owner only).
+
+    Same authorization as grant issuance: the acting app user must own the
+    canonical strategy and be authorized on its account. Original fills are never
+    rewritten — the correction is a new line, and a reversal is a new
+    opposite-sign adjustment referencing this one in ``evidence``.
+    """
+    enforce_same_origin(request)
+    hosted = _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    account_scope = str(canonical.account_scope)
+    if not is_account_authorized(account_scope):
+        raise HTTPException(status_code=403, detail="Account scope is not authorized for this operator")
+    if str(canonical.status) == "archived":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "STRATEGY_ARCHIVED",
+                "strategy_id": strategy_id,
+                "message": "An archived strategy preserves history and accepts no new adjustments.",
+            },
+        )
+
+    lines = []
+    for line in payload.lines:
+        if int(line.quantity_delta) == 0:
+            raise HTTPException(
+                status_code=422,
+                detail={"rejection_reason": "ADJUSTMENT_LINE_ZERO_DELTA", "line_no": len(lines) + 1},
+            )
+        lines.append(line.model_dump())
+
+    record = _attribution_store(request).create_reclassification(
+        account_id=account_scope,
+        strategy_id=strategy_id,
+        owner_id=owner,
+        reason_code=payload.reason_code,
+        created_by=owner,
+        lines=lines,
+        evidence=dict(payload.evidence or {}),
+    )
+    _ = hosted  # ownership already asserted above
+    return AdjustmentResponse(
+        adjustment_id=record["adjustment_id"],
+        strategy_id=strategy_id,
+        account_id=record["account_id"],
+        adjustment_kind=record["adjustment_kind"],
+        reason_code=record["reason_code"],
+        created_by=record["created_by"],
+        evidence=dict(record["evidence"]),
+        created_at=_iso(record["created_at"]),
+        lines=[
+            AdjustmentLineResponse(
+                line_no=line["line_no"],
+                instrument_token=line["instrument_token"],
+                exchange=line["exchange"],
+                tradingsymbol=line["tradingsymbol"],
+                product=line["product"],
+                quantity_delta=line["quantity_delta"],
+                effective_at=_iso(line["effective_at"]),
+            )
+            for line in record["lines"]
+        ],
     )
 
 
