@@ -350,6 +350,18 @@ class SqlAlchemyAlgoWorkerRepository:
     async def list_exiting_recovery_runs(self) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(self._list_exiting_recovery_runs_sync)
 
+    async def get_strategy_book_for_run(self, *, strategy_run_id: str) -> Optional[Dict[str, Any]]:
+        """The run's strategy book, or ``None`` when the run is unbound.
+
+        One helper shared by flatness, exposure display and exit sizing so a
+        strategy-bound run is never measured against the account net (R3 §10,
+        D-5). Unbound (legacy) runs return ``None`` and keep run-scoped behavior.
+        """
+        from backend.strategies.attribution import SqlAttributionStore
+
+        store = SqlAttributionStore(session_factory=self.session_factory)
+        return await asyncio.to_thread(store.open_positions_for_run, strategy_run_id=strategy_run_id)
+
     async def list_live_strategy_open_legs(self, *, strategy_run_id: str, account_id: str) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(self._list_live_strategy_open_legs_sync, strategy_run_id, account_id)
 

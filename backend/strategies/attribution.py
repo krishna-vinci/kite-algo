@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import bindparam, delete, select, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from backend.shared.serialization import _json_dumps, _row_mapping
 from backend.strategies.attribution_models import (
@@ -367,6 +368,118 @@ class SqlAttributionStore:
         finally:
             if owns_db:
                 session.close()
+
+    # ------------------------------------------------------- strategy closure
+
+    def run_binding(self, *, strategy_run_id: str, db: Optional[Any] = None) -> Optional[Dict[str, str]]:
+        """The run's trusted binding, or ``None`` when the run is unbound.
+
+        ``None`` is the legacy signal: an unbound run keeps run-scoped behavior
+        and is never silently re-scoped to a strategy.
+        """
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            row = session.execute(
+                select(StrategyRunBinding).where(
+                    StrategyRunBinding.strategy_run_id == strategy_run_id
+                )
+            ).scalar_one_or_none()
+        except SQLAlchemyError:
+            # A database predating the binding table behaves as unbound.
+            return None
+        finally:
+            if owns_db:
+                session.close()
+        if row is None:
+            return None
+        return {
+            "strategy_id": str(row.strategy_id),
+            "owner_id": str(row.owner_id),
+            "account_id": str(row.account_id),
+            "execution_environment": str(row.execution_environment),
+        }
+
+    def open_positions_for_run(self, *, strategy_run_id: str, db: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+        """The run's **strategy book**, or ``None`` when the run is unbound.
+
+        This is the single source flatness, exposure display and exit sizing read
+        for a strategy-bound run (R3 §10, D-5): account flatness never substitutes
+        for strategy flatness, so a strategy is flat even while the account still
+        holds another strategy's quantity on the same line.
+
+        ``broker_net_quantity`` is carried per leg for the one-sided exit guard
+        only — never as a flatness gate here. The read is lock-free: the
+        projection is only ever mutated by ``recompute_publish``.
+        """
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            binding = self.run_binding(strategy_run_id=strategy_run_id, db=session)
+            if binding is None:
+                return None
+            rows = session.execute(
+                select(StrategyPositionProjection)
+                .where(
+                    StrategyPositionProjection.account_id == binding["account_id"],
+                    StrategyPositionProjection.strategy_id == binding["strategy_id"],
+                    StrategyPositionProjection.execution_environment
+                    == binding["execution_environment"],
+                    StrategyPositionProjection.net_quantity != 0,
+                )
+                .order_by(
+                    StrategyPositionProjection.identity_kind,
+                    StrategyPositionProjection.identity_key,
+                    StrategyPositionProjection.product,
+                )
+            ).scalars().all()
+            broker_nets = self._broker_nets_by_coordinate(session, account_id=binding["account_id"])
+            legs = [
+                {
+                    "journal_run_id": None,
+                    "account_id": binding["account_id"],
+                    "instrument_token": int(row.instrument_token),
+                    "exchange": str(row.exchange),
+                    "tradingsymbol": str(row.tradingsymbol),
+                    "product": str(row.product),
+                    "net_quantity": int(row.net_quantity),
+                    "identity_kind": str(row.identity_kind),
+                    "identity_key": str(row.identity_key),
+                    "broker_net_quantity": broker_nets.get(
+                        (int(row.instrument_token), str(row.product))
+                    ),
+                }
+                for row in rows
+            ]
+            return {
+                "strategy_id": binding["strategy_id"],
+                "account_id": binding["account_id"],
+                "execution_environment": binding["execution_environment"],
+                "legs": legs,
+            }
+        finally:
+            if owns_db:
+                session.close()
+
+    @staticmethod
+    def _broker_nets_by_coordinate(session: Any, *, account_id: str) -> Dict[Tuple[int, str], int]:
+        """Broker net per ``(instrument_token, product)`` for the exit guard."""
+        try:
+            rows = session.execute(
+                text(
+                    """
+                    SELECT instrument_token, product, net_quantity
+                    FROM public.account_positions
+                    WHERE account_id = :account_id
+                    """
+                ),
+                {"account_id": account_id},
+            ).fetchall()
+        except SQLAlchemyError:
+            # Broker positions are the secondary constraint; their absence must
+            # not block a strategy-book read.
+            return {}
+        return {(int(row[0]), str(row[1])): int(row[2] or 0) for row in rows}
 
     def canonical_strategy(
         self, *, strategy_id: str, owner_id: Optional[str] = None, db: Optional[Any] = None

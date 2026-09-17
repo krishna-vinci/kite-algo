@@ -49,6 +49,7 @@ __all__ = [
     "_extract_ws_token",
     "_journal_service",
     "_live_broker_positions_for_attribution",
+    "_live_run_legs",
     "_load_live_kite_for_account",
     "_load_live_kite_for_worker_account_scope",
     "_market_data_service",
@@ -551,6 +552,26 @@ async def _live_broker_positions_for_attribution(
             }
         )
     return exposure
+
+async def _live_run_legs(request: Any, run: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Open legs for a run: the strategy book when bound, else run-scoped links.
+
+    Strategy flatness is measured on the strategy's own book, never on the
+    account net and never on a single run's links — a strategy's earlier run may
+    have opened the position this run must now size an exit for (R3 §10, D-5).
+    An unbound (legacy) run keeps today's run-scoped behavior exactly.
+    """
+    repo = _repo(request)
+    getter = getattr(repo, "get_strategy_book_for_run", None)
+    if getter is not None:
+        book = await getter(strategy_run_id=str(run.get("strategy_run_id") or ""))
+        if book is not None:
+            return list(book.get("legs") or [])
+    return await repo.list_live_strategy_open_legs(
+        strategy_run_id=str(run["strategy_run_id"]),
+        account_id=str(run.get("account_scope") or ""),
+    )
+
 
 async def _refresh_live_account_state(*, kite: Any, account_id: str, corr_id: str) -> Dict[str, Any]:
     from backend.broker_api.orders import order_event_runtime, realtime_positions_service

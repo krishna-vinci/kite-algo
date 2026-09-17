@@ -351,7 +351,7 @@ async def _exit_live_worker_run(*, request: Request, token: WorkerToken, run: Di
     kite = await asyncio.to_thread(_load_live_kite_for_account, account_id)
     corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-live-exit-{uuid.uuid4()}"
     refresh_result = await _refresh_live_account_state(kite=kite, account_id=account_id, corr_id=corr_id)
-    legs = await _repo(request).list_live_strategy_open_legs(strategy_run_id=strategy_run_id, account_id=account_id)
+    legs = await _live_run_legs(request, run)
 
     if not legs:
         attribution_refs = await _worker_run_live_attribution_refs(request, run)
@@ -444,7 +444,7 @@ async def _exit_live_worker_run(*, request: Request, token: WorkerToken, run: Di
     planned_exit["order_result"] = result_payload
 
     post_refresh = await _refresh_live_account_state(kite=kite, account_id=account_id, corr_id=corr_id)
-    remaining_legs = await _repo(request).list_live_strategy_open_legs(strategy_run_id=strategy_run_id, account_id=account_id)
+    remaining_legs = await _live_run_legs(request, run)
     planned_exit["post_submit_refresh"] = post_refresh
     planned_exit["remaining_legs"] = remaining_legs
 

@@ -840,5 +840,175 @@ class OwnerStrategyApiTests(unittest.IsolatedAsyncioTestCase):
             self._stop_patches()
 
 
+# ---------------------------------------------------------------------------
+# G2 — closure correctness from the strategy book
+# ---------------------------------------------------------------------------
+
+
+class _BookRepo:
+    """Repo surface consumed by flatness: the strategy book plus broker legs."""
+
+    def __init__(self, *, book, run_legs=(), broker_positions=()):
+        self._book = book
+        self._run_legs = list(run_legs)
+        self._broker_positions = list(broker_positions)
+
+    async def get_strategy_book_for_run(self, *, strategy_run_id):
+        return self._book
+
+    async def list_live_strategy_open_legs(self, *, strategy_run_id, account_id):
+        return [dict(leg) for leg in self._run_legs]
+
+    async def list_live_strategy_broker_positions(self, *, strategy_run_id, account_id):
+        return [dict(pos) for pos in self._broker_positions]
+
+
+def _leg(*, token=738561, product="CNC", qty, net=0):
+    return {
+        "journal_run_id": None, "account_id": "kite:A", "instrument_token": token,
+        "exchange": "NSE", "tradingsymbol": "RELIANCE", "product": product,
+        "net_quantity": qty, "broker_net_quantity": net,
+    }
+
+
+class TestStrategyBookClosure(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from backend.strategies.attribution import SqlAttributionStore
+
+        self.engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(self.engine)
+        self.factory = sessionmaker(bind=self.engine, expire_on_commit=False)
+        self.store = SqlAttributionStore(session_factory=self.factory)
+
+    def tearDown(self):
+        self.engine.dispose()
+
+    def _seed(self, *, sid="stg-A", account="kite:A", run_id="run-A", env="live"):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategies (id, owner_id, name, account_scope) "
+                    "VALUES (:sid, 'app:o', :name, :account)"
+                ),
+                {"sid": sid, "name": f"Strategy {sid}", "account": account},
+            )
+            session.commit()
+        self.store.bind_run(
+            strategy_run_id=run_id, strategy_id=sid, owner_id="app:o", account_id=account,
+            execution_environment=env, bound_by="t", binding_source="hosted_job",
+        )
+
+    def _project(self, *, sid="stg-A", account="kite:A", env="live", rows=()):
+        self.store.recompute_publish(
+            account_id=account, strategy_id=sid, execution_environment=env,
+            resolve_and_fold=lambda db, bound: (list(rows), f"sha-{len(rows)}"),
+        )
+
+    def _row(self, *, identity="uuid-a", qty=100):
+        return {
+            "identity_kind": "canonical", "identity_key": identity,
+            "canonical_instrument_id": identity, "instrument_token": 738561,
+            "exchange": "NSE", "tradingsymbol": "RELIANCE", "product": "CNC",
+            "net_quantity": qty, "unresolved_reason": None,
+        }
+
+    # -- the helper ----------------------------------------------------------
+
+    def test_open_positions_for_run_resolves_binding_to_the_strategy_book(self):
+        self._seed()
+        self._project(rows=[self._row(qty=100)])
+        book = self.store.open_positions_for_run(strategy_run_id="run-A")
+        self.assertEqual(book["strategy_id"], "stg-A")
+        self.assertEqual(book["execution_environment"], "live")
+        self.assertEqual([leg["net_quantity"] for leg in book["legs"]], [100])
+        self.assertIn("broker_net_quantity", book["legs"][0])
+
+    def test_open_positions_for_run_returns_none_for_unbound_run(self):
+        # An unbound (legacy) run has no strategy book: callers must keep
+        # today's run-scoped behavior rather than silently re-scoping it.
+        self.assertEqual(self.store.open_positions_for_run(strategy_run_id="run-legacy"), None)
+
+    # -- flatness ------------------------------------------------------------
+
+    async def test_flatness_uses_strategy_book_when_bound(self):
+        """G2 acceptance: A flat while B holds the same broker line."""
+        from backend.api.services.runtime_recovery import load_live_run_flatness
+
+        self._seed()
+        # A's own book is flat (nothing published). The ACCOUNT still holds
+        # quantity, and that quantity belongs to strategy B.
+        repo = _BookRepo(
+            book={"strategy_id": "stg-A", "account_id": "kite:A", "execution_environment": "live", "legs": []},
+            broker_positions=[{"instrument_token": 738561, "product": "CNC", "quantity": 40}],
+        )
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)))
+        result = await load_live_run_flatness(request, {"strategy_run_id": "run-A", "account_scope": "kite:A"})
+        self.assertTrue(result["is_flat"], result)
+        self.assertEqual(result["remaining_legs"], [])
+        # The account net is reported for the one-sided exit guard, never as a
+        # flatness gate for a bound run.
+        self.assertIn("broker_positions", result)
+
+    async def test_flatness_strategy_book_not_flat_reports_remaining(self):
+        from backend.api.services.runtime_recovery import load_live_run_flatness
+
+        self._seed()
+        repo = _BookRepo(
+            book={
+                "strategy_id": "stg-A", "account_id": "kite:A", "execution_environment": "live",
+                "legs": [_leg(qty=100), _leg(token=738562, qty=-10)],
+            },
+        )
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)))
+        result = await load_live_run_flatness(request, {"strategy_run_id": "run-A", "account_scope": "kite:A"})
+        self.assertFalse(result["is_flat"])
+        self.assertEqual([leg["net_quantity"] for leg in result["remaining_legs"]], [100, -10])
+        self.assertEqual(result["reason"], "strategy book exposure remains")
+
+    async def test_unbound_run_keeps_run_scoped_flatness(self):
+        """Legacy pin: an unbound run behaves exactly as before."""
+        from backend.api.services.runtime_recovery import load_live_run_flatness
+
+        repo = _BookRepo(book=None, run_legs=[], broker_positions=[])
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)))
+        flat = await load_live_run_flatness(request, {"strategy_run_id": "run-legacy", "account_scope": "kite:A"})
+        self.assertTrue(flat["is_flat"])
+
+        repo = _BookRepo(book=None, run_legs=[_leg(qty=5)])
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)))
+        not_flat = await load_live_run_flatness(request, {"strategy_run_id": "run-legacy", "account_scope": "kite:A"})
+        self.assertFalse(not_flat["is_flat"])
+        self.assertEqual(not_flat["reason"], "broker exposure remains")
+
+    # -- exit sizing ---------------------------------------------------------
+
+    async def test_exit_sizing_uses_strategy_book_across_runs(self):
+        """A strategy's earlier run opened the position: sizing must see it."""
+        from backend.api.routers.worker_shared import _live_run_legs
+
+        self._seed()
+        self._project(rows=[self._row(qty=100)])
+        # run-B is a *different* run of the same strategy with no links of its
+        # own; sizing from run-scoped links would size zero.
+        self.store.bind_run(
+            strategy_run_id="run-B", strategy_id="stg-A", owner_id="app:o", account_id="kite:A",
+            execution_environment="live", bound_by="t", binding_source="hosted_job",
+        )
+        repo = _BookRepo(book=self.store.open_positions_for_run(strategy_run_id="run-B"), run_legs=[])
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)))
+        legs = await _live_run_legs(request, {"strategy_run_id": "run-B", "account_scope": "kite:A"})
+        self.assertEqual([leg["net_quantity"] for leg in legs], [100])
+
+        # An unbound run still sizes from its own links.
+        repo = _BookRepo(book=None, run_legs=[_leg(qty=7)])
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(algo_worker_repository=repo)))
+        legs = await _live_run_legs(request, {"strategy_run_id": "run-legacy", "account_scope": "kite:A"})
+        self.assertEqual([leg["net_quantity"] for leg in legs], [7])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -50,6 +50,28 @@ async def load_live_run_flatness(request: Any, run: Dict[str, Any]) -> Dict[str,
     if not strategy_run_id or not account_id:
         return {"is_flat": False, "remaining_legs": [], "broker_positions": [], "reason": "missing run identity"}
 
+    # A strategy-bound run is measured on ITS OWN book (R3 §10, D-5): the account
+    # net is the one-sided exit guard, never a flatness gate — otherwise a
+    # strategy would never look flat while another strategy held the same line.
+    get_book = getattr(repo, "get_strategy_book_for_run", None)
+    if get_book is not None:
+        book = await get_book(strategy_run_id=strategy_run_id)
+        if book is not None:
+            remaining_legs = list(book.get("legs") or [])
+            is_flat = not remaining_legs
+            return {
+                "is_flat": is_flat,
+                "remaining_legs": remaining_legs,
+                "broker_positions": [],
+                "strategy_book": {
+                    "strategy_id": book.get("strategy_id"),
+                    "execution_environment": book.get("execution_environment"),
+                },
+                "refresh": {},
+                "reason": "flat" if is_flat else "strategy book exposure remains",
+            }
+
+    # Unbound (legacy) runs keep the run-scoped behavior exactly.
     remaining_legs = await repo.list_live_strategy_open_legs(strategy_run_id=strategy_run_id, account_id=account_id)
     broker_positions = await repo.list_live_strategy_broker_positions(strategy_run_id=strategy_run_id, account_id=account_id)
 
