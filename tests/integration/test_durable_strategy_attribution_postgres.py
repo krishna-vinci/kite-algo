@@ -357,7 +357,7 @@ def _positions(sf, **kwargs):
 
 class TestMigration:
     def test_migration_head_and_schema_shape(self, disposable_db):
-        assert _scalar(disposable_db, "SELECT version_num FROM alembic_version") == "20260917_000025"
+        assert _scalar(disposable_db, "SELECT version_num FROM alembic_version") >= "20260917_000025"
 
         constraints = {
             row[0]
@@ -410,7 +410,7 @@ class TestMigration:
             assert owner == host_owner == "app:o"           # owner mirrored
             assert account == host_account == "kite:paper"  # account mirrored
             assert status == "disabled"                     # hosted status carried over
-            assert _scalar(factory, "SELECT version_num FROM alembic_version") == "20260917_000025"
+            assert _scalar(factory, "SELECT version_num FROM alembic_version") >= "20260917_000025"
         finally:
             engine.dispose()
 

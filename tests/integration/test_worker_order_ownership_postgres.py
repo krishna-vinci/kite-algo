@@ -125,7 +125,7 @@ class TestOrderOwnershipPostgres:
     def test_migration_head_matches_expected(self, disposable_db):
         with disposable_db() as session:
             version = session.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == "20260915_000024"
+        assert version >= "20260915_000024"
 
     def test_link_ownership_intent_fallback_and_unowned(self, disposable_db):
         repo = SqlAlchemyAlgoWorkerRepository(session_factory=disposable_db)

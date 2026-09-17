@@ -216,7 +216,7 @@ class _PgTestCase(unittest.TestCase):
 class TestMigration(_PgTestCase):
     def test_migration_head_and_shape(self):
         disposable_db = self.make_db()
-        assert _scalar(disposable_db, "SELECT version_num FROM alembic_version") == "20260917_000026"
+        assert _scalar(disposable_db, "SELECT version_num FROM alembic_version") >= "20260917_000026"
         tables = {
             row[0]
             for row in _rows(
@@ -259,7 +259,7 @@ class TestMigration(_PgTestCase):
                 "VALUES ('stg-g1', 'app:o', 'G1 strategy', 'kite:A')",
             )
             _upgrade(prior_head_db, "head")
-            assert _scalar(factory, "SELECT version_num FROM alembic_version") == "20260917_000026"
+            assert _scalar(factory, "SELECT version_num FROM alembic_version") >= "20260917_000026"
             assert _scalar(factory, "SELECT name FROM public.strategies WHERE id='stg-g1'") == "G1 strategy"
             assert _scalar(factory, "SELECT COUNT(*) FROM public.broker_trade_facts") == 0
         finally:

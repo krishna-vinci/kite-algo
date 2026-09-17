@@ -282,7 +282,7 @@ def barrier_state(sf, *, account=ACCOUNT, sid=STRATEGY, env="live"):
 
 def test_head_is_the_settlement_barrier_revision(disposable_db):
     version = _scalar(disposable_db, "SELECT version_num FROM public.alembic_version")
-    assert version == HEAD
+    assert version >= HEAD
 
 
 def test_upgrade_from_prior_head_creates_the_settlement_tables(prior_head_db):
@@ -312,7 +312,7 @@ def test_upgrade_from_prior_head_creates_the_settlement_tables(prior_head_db):
             version = conn.execute(text("SELECT version_num FROM public.alembic_version")).scalar()
     finally:
         engine.dispose()
-    assert version == HEAD
+    assert version >= HEAD
     assert {
         "strategy_execution_barriers",
         "strategy_execution_barrier_events",

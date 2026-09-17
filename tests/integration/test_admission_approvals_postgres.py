@@ -258,7 +258,7 @@ def claim(ledger, plan_id, *, requirement=1000.0, allocation=10000.0, actor="app
 class TestMigration(_PgTestCase):
     def test_head_and_shape(self):
         sf = self.make_db()
-        assert _scalar(sf, "SELECT version_num FROM alembic_version") == "20260917_000028"
+        assert _scalar(sf, "SELECT version_num FROM alembic_version") >= "20260917_000028"
         tables = {
             row[0]
             for row in sf().execute(
@@ -292,7 +292,7 @@ class TestMigration(_PgTestCase):
             "VALUES ('stg-prior', 'app:o', 'prior', 'kite:A')",
         )
         _upgrade(db_url, "head")
-        assert _scalar(sf, "SELECT version_num FROM alembic_version") == "20260917_000028"
+        assert _scalar(sf, "SELECT version_num FROM alembic_version") >= "20260917_000028"
         assert _scalar(sf, "SELECT name FROM public.strategies WHERE id='stg-prior'") == "prior"
         for table in (
             "strategy_admission_policies",

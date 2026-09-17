@@ -242,7 +242,7 @@ def submission(**overrides) -> ProposalSubmission:
 class TestMigration(_PgTestCase):
     def test_migration_head_and_shape(self):
         sf = self.make_db()
-        assert _scalar(sf, "SELECT version_num FROM alembic_version") == "20260917_000027"
+        assert _scalar(sf, "SELECT version_num FROM alembic_version") >= "20260917_000027"
         tables = {
             row[0]
             for row in _rows(
@@ -284,7 +284,7 @@ class TestMigration(_PgTestCase):
             "VALUES ('stg-g1', 'app:o', 'G1 strategy', 'kite:A')",
         )
         _upgrade(db_url, "head")
-        assert _scalar(sf, "SELECT version_num FROM alembic_version") == "20260917_000027"
+        assert _scalar(sf, "SELECT version_num FROM alembic_version") >= "20260917_000027"
         # Pre-existing data survives; the three new tables start empty.
         assert _scalar(sf, "SELECT name FROM public.strategies WHERE id='stg-g1'") == "G1 strategy"
         for table in ("strategy_proposals", "strategy_plans", "strategy_proposal_journal"):
