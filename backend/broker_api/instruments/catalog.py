@@ -957,3 +957,163 @@ class InstrumentCatalog:
                 "validation_summary": _row_value(attempt, "validation_summary", {}) or {},
             }
         return health
+
+
+class PinnedInstrumentCatalog:
+    """Catalog content as of one published generation (R3 §7).
+
+    The published view (:attr:`InstrumentCatalog.VIEW`) always resolves whatever
+    the catalog says *now*, which is correct for discovery and wrong for a frozen
+    plan: resolution must happen once, against the generation that was published
+    when the decision was validated, and downstream execution must never
+    reinterpret a plan against a newer generation.
+
+    Content as of generation ``G`` is the mapping rows whose
+    ``valid_from_generation`` was published at or before ``G`` and whose
+    ``valid_to_generation`` is either unset or was published after ``G`` — the
+    same window rule G1 fact resolution uses, keyed by generation instead of fact
+    time (``backend/strategies/attribution.py`` ``resolve_fact_identity``).
+
+    This class deliberately raises nothing: it returns ``None``/empty for a
+    missing or unpublished generation so the caller decides whether that is a
+    refusal (the proposal domain) or simply "no catalog".
+    """
+
+    def __init__(
+        self,
+        db: Optional[Session | Callable[[], Session]] = None,
+        *,
+        broker: str = "kite",
+        generation: Optional[str] = None,
+    ):
+        self.db = db
+        self.broker = broker.lower()
+        self.generation = str(generation) if generation else None
+
+    @contextmanager
+    def _session_scope(self) -> Iterator[Session]:
+        if callable(self.db):
+            session = self.db()
+            try:
+                yield session
+            finally:
+                session.close()
+            return
+        if self.db is not None:
+            yield self.db
+            return
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    def _query(self, sql: str, params: Dict[str, Any]) -> List[Mapping[str, Any]]:
+        try:
+            with self._session_scope() as db:
+                return list(db.execute(text(sql), params).mappings().all())
+        except CatalogError:
+            raise
+        except Exception as exc:
+            raise CatalogUnavailableError(f"instrument catalog query failed: {exc}") from exc
+
+    def generation_row(self, generation_id: Optional[str] = None) -> Optional[Mapping[str, Any]]:
+        """The generation row, or ``None`` when the id is unknown."""
+        candidate = str(generation_id or self.generation or "")
+        if not candidate:
+            return None
+        rows = self._query(
+            """
+            SELECT id, status, published_at
+            FROM public.instrument_catalog_generations
+            WHERE id = :generation
+            """,
+            {"generation": candidate},
+        )
+        return rows[0] if rows else None
+
+    def current_published_generation(self) -> Optional[str]:
+        """Newest generation with ``status='published'`` and a publication time."""
+        rows = self._query(
+            """
+            SELECT id
+            FROM public.instrument_catalog_generations
+            WHERE status = 'published' AND published_at IS NOT NULL
+            ORDER BY published_at DESC
+            LIMIT 1
+            """,
+            {},
+        )
+        return str(rows[0]["id"]) if rows else None
+
+    def mappings_as_of(self, published_at: Any, **filters: Any) -> List[Mapping[str, Any]]:
+        """Mapping rows alive at ``published_at``, joined to their record."""
+        return self._mapping_query(published_at, **filters)
+
+    def _mapping_query(self, published_at: Any, **filters: Any) -> List[Mapping[str, Any]]:
+        clauses = ["m.broker = :broker", "g_from.published_at <= :published_at",
+                   "(g_to.published_at IS NULL OR g_to.published_at > :published_at)"]
+        params: Dict[str, Any] = {"broker": self.broker, "published_at": published_at}
+        if filters.get("broker_token") is not None:
+            clauses.append("m.broker_token = :broker_token")
+            params["broker_token"] = int(filters["broker_token"])
+        if filters.get("broker_exchange"):
+            clauses.append("m.broker_exchange = :broker_exchange")
+            params["broker_exchange"] = str(filters["broker_exchange"]).upper()
+        if filters.get("broker_symbol"):
+            clauses.append("UPPER(m.broker_symbol) = :broker_symbol")
+            params["broker_symbol"] = str(filters["broker_symbol"]).upper()
+        if filters.get("instrument_id"):
+            clauses.append("m.instrument_id = :instrument_id")
+            params["instrument_id"] = str(filters["instrument_id"])
+        return self._query(
+            f"""
+            SELECT m.instrument_id,
+                   m.broker_exchange,
+                   m.broker_symbol,
+                   m.broker_token,
+                   m.valid_from_generation,
+                   m.valid_to_generation,
+                   r.exchange,
+                   r.tradingsymbol,
+                   r.lifecycle_status
+            FROM public.instrument_broker_mappings m
+            JOIN public.instrument_catalog_generations g_from
+              ON g_from.id = m.valid_from_generation
+            LEFT JOIN public.instrument_catalog_generations g_to
+              ON g_to.id = m.valid_to_generation
+            JOIN public.instrument_catalog_records r
+              ON r.instrument_id = m.instrument_id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY m.instrument_id
+            LIMIT 2
+            """,
+            params,
+        )
+
+    def lifecycle_for_instrument(self, instrument_id: str) -> Optional[str]:
+        """Lifecycle at *read* time — the retiring check is about now, not the pin."""
+        rows = self._query(
+            """
+            SELECT lifecycle_status
+            FROM public.instrument_catalog_records
+            WHERE instrument_id = :instrument_id
+            """,
+            {"instrument_id": str(instrument_id)},
+        )
+        return str(rows[0]["lifecycle_status"]) if rows else None
+
+    def canonical_instrument(self, instrument_id: str) -> Optional[Mapping[str, Any]]:
+        """Canonical identity as of *now* — used by invalidation, never by resolution."""
+        return self.lifecycle_row(instrument_id)
+
+    def lifecycle_row(self, instrument_id: str) -> Optional[Mapping[str, Any]]:
+        rows = self._query(
+            """
+            SELECT instrument_id, exchange, tradingsymbol, lifecycle_status, current_generation_id
+            FROM public.instrument_catalog_records
+            WHERE instrument_id = :instrument_id
+            """,
+            {"instrument_id": str(instrument_id)},
+        )
+        return rows[0] if rows else None
