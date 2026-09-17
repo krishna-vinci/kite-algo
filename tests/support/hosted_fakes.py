@@ -37,6 +37,8 @@ class FakeWorkerRepository:
         self.runs: Dict[str, Dict[str, Any]] = {}
         self.created_runs: List[Dict[str, Any]] = []
         self.revoked: List[str] = []
+        #: strategy_run_id -> RunBindingInput recorded by create_run_with_binding.
+        self.bindings: Dict[str, Any] = {}
 
     # -- tokens -------------------------------------------------------------
 
@@ -114,6 +116,22 @@ class FakeWorkerRepository:
         self.runs[strategy_run_id] = run
         self.created_runs.append(dict(run))
         return dict(run)
+
+    async def create_run_with_binding(
+        self, token: WorkerToken, payload, *, strategy_run_id: str, binding=None
+    ) -> Dict[str, Any]:
+        """Mirror of the real path: run + trusted binding in one call.
+
+        The binding is recorded only after the run insert succeeds, so the fake
+        models the store's single-transaction semantics.
+        """
+        run = await self.create_run(token, payload, strategy_run_id=strategy_run_id)
+        if binding is not None:
+            self.bindings[strategy_run_id] = binding
+        return run
+
+    async def active_grants(self, *, token_id: str, account_id: str) -> List[Dict[str, Any]]:
+        return []
 
     async def get_run(self, strategy_run_id: str) -> Optional[Dict[str, Any]]:
         run = self.runs.get(strategy_run_id)
