@@ -171,6 +171,12 @@ class TargetWeightsCompiler(TargetCompiler):
                     "instrument_id": mapping["instrument_id"],
                     "exchange": mapping["exchange"],
                     "tradingsymbol": mapping["tradingsymbol"],
+                    # The full broker coordinate, not just the symbol: derived
+                    # invalidation resolves each leg's coordinate against the
+                    # newest generation, and a leg missing its exchange cannot be
+                    # compared at all — it would read as "unmapped" and invalidate
+                    # a plan that nothing had actually changed.
+                    "broker_exchange": mapping["broker_exchange"],
                     "broker_symbol": mapping["broker_symbol"],
                     "broker_token": mapping["broker_token"],
                     "target_weight": weight,

@@ -26,6 +26,8 @@ import backend.strategies.attribution_models  # noqa: F401  registers the propos
 G1 = "11111111-1111-1111-1111-111111111111"
 G2 = "22222222-2222-2222-2222-222222222222"
 G_STAGING = "33333333-3333-3333-3333-333333333333"
+G3 = "44444444-4444-4444-4444-444444444444"
+T3 = "2026-09-15T00:00:00+00:00"
 INST_OLD = "aaaaaaaa-0000-0000-0000-000000000001"
 INST_NEW = "bbbbbbbb-0000-0000-0000-000000000002"
 INST_OTHER = "cccccccc-0000-0000-0000-000000000003"
@@ -789,6 +791,78 @@ class ProposalStoreTests(ProposalTestCase):
         self.assertEqual(
             [event for event, _ in self._journal()], ["received", "validation_refused"]
         )
+
+
+class TargetWeightsPlanTests(ProposalTestCase):
+    """D-6 end to end: a weights plan persists its scope and stays valid."""
+
+    REV = "eeeeeeee-0000-0000-0000-0000000000bb"
+
+    def setUp(self):
+        super().setUp()
+        self.seed_generation(G1, "published", T1)
+        self.seed_generation(G2, "published", T2)
+        for index, member in enumerate(("RELIANCE", "INFY", "TCS")):
+            self.seed_record(f"inst-{member}", symbol=member, generation=G1)
+            self.seed_mapping(f"map-{member}", f"inst-{member}", token=100 + index,
+                              symbol=member, valid_from=G1, is_current=1)
+        self.seed_universe_revision(self.REV, ["RELIANCE", "INFY", "TCS"])
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategies (id, owner_id, name, account_scope, status) "
+                    "VALUES ('stg-W', 'app:o', 'Weights', 'kite:A', 'active')"
+                )
+            )
+            session.commit()
+
+    def _submit(self, generation=G1):
+        from backend.strategies.proposals import ProposalStore, ProposalSubmission
+
+        payload = {
+            "universe_revision_id": self.REV,
+            "target_weights": {"RELIANCE": 0.5, "INFY": 0.25},
+        }
+        if generation is not None:
+            payload["catalog_generation"] = generation
+        return ProposalStore(session_factory=self.factory).submit(
+            ProposalSubmission(
+                strategy_id="stg-W", account_id="kite:A", evaluation_id="eval-w",
+                evaluation_kind="run_now", strategy_run_id="run-1",
+                target_kind="target_weights", payload=payload,
+            )
+        )
+
+    def test_weights_plan_persists_its_scope(self):
+        result = self._submit()
+        self.assertEqual(result["status"], "validated", result)
+        plan = result["plan"]
+        # The DB CHECK requires both scope columns for this kind, so a validated
+        # plan proves they were written.
+        self.assertEqual(plan["pinned_universe_revision_id"], self.REV)
+        self.assertEqual(plan["pinned_member_hash"], member_hash(["RELIANCE", "INFY", "TCS"]))
+        self.assertEqual(plan["pinned_catalog_generation"], G1)
+        # Every member, with the omission an explicit zero.
+        weights = {leg["tradingsymbol"]: leg["target_weight"] for leg in plan["resolved_plan"]["legs"]}
+        self.assertEqual(weights, {"RELIANCE": 0.5, "INFY": 0.25, "TCS": 0.0})
+
+    def test_weights_plan_records_the_coordinate_invalidation_needs(self):
+        from backend.strategies.proposals import plan_invalidation_state
+
+        plan = self._submit()["plan"]
+        leg = plan["resolved_plan"]["legs"][0]
+        # Invalidation resolves each leg's broker coordinate; a leg without its
+        # exchange cannot be compared at all.
+        self.assertTrue(leg.get("broker_exchange"), leg)
+
+        # An unrelated newer generation must leave a weights plan VALID.
+        self.seed_generation(G3, "published", T3)
+        self.seed_record("inst-OTHER", symbol="WIPRO", generation=G3)
+        self.seed_mapping("map-OTHER", "inst-OTHER", token=900, symbol="WIPRO", valid_from=G3,
+                          is_current=1)
+        state = plan_invalidation_state(plan, session_factory=self.factory)
+        self.assertEqual(state["state"], "valid", state)
+        self.assertEqual(state["reason"], "CATALOG_GENERATION_UNRELATED")
 
 
 if __name__ == "__main__":

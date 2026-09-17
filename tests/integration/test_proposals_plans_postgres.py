@@ -696,6 +696,102 @@ class TestInvalidation(_PgTestCase):
         assert _scalar(sf, "SELECT COUNT(*) FROM public.strategy_plans") == 1
 
 
+class TestTargetWeightsPlan(_PgTestCase):
+    """D-6 end to end on real PostgreSQL: the scope persists and stays valid."""
+
+    REV = "eeeeeeee-0000-0000-0000-0000000000cc"
+    #: ``instrument_id`` is a native UUID column, so members need real uuids.
+    INSTRUMENTS = {
+        "RELIANCE": "d0000000-0000-0000-0000-000000000001",
+        "INFY": "d0000000-0000-0000-0000-000000000002",
+        "TCS": "d0000000-0000-0000-0000-000000000003",
+    }
+    TCS_NEW = "d0000000-0000-0000-0000-0000000000ff"
+
+    def _seed(self, sf):
+        seed_generation(sf, G1, T1)
+        for index, member in enumerate(("RELIANCE", "INFY", "TCS")):
+            instrument_id = self.INSTRUMENTS[member]
+            seed_record(sf, instrument_id, symbol=member, generation=G1)
+            seed_mapping(sf, instrument_id, token=100 + index, symbol=member, valid_from=G1)
+        universe_id = str(uuid.uuid4())
+        _exec(
+            sf,
+            "INSERT INTO public.universes (id, owner_id, name, kind) "
+            "VALUES (:uid, 'app:o', 'momentum', 'explicit')",
+            {"uid": universe_id},
+        )
+        _exec(
+            sf,
+            "INSERT INTO public.universe_revisions "
+            "(id, universe_id, revision, expression, members, member_count, "
+            " source_generation, coverage) "
+            "VALUES (:id, :uid, 1, '{}'::jsonb, :members, 3, :gen, '{}'::jsonb)",
+            {
+                "id": self.REV,
+                "uid": universe_id,
+                "members": ["RELIANCE", "INFY", "TCS"],
+                "gen": G1,
+            },
+        )
+        seed_strategy(sf, sid="stg-W")
+
+    def _submit(self, sf, *, generation=G1):
+        return ProposalStore(session_factory=sf).submit(
+            submission(
+                strategy_id="stg-W",
+                evaluation_id="eval-w",
+                target_kind="target_weights",
+                payload={
+                    "universe_revision_id": self.REV,
+                    "target_weights": {"RELIANCE": 0.5, "INFY": 0.25},
+                    "catalog_generation": generation,
+                },
+            )
+        )
+
+    def test_weights_plan_persists_scope_and_survives_unrelated_generation(self):
+        sf = self.make_db()
+        self._seed(sf)
+        result = self._submit(sf)
+        assert result["status"] == "validated", result
+        plan = result["plan"]
+
+        # The CHECK constraint requires both scope columns for this kind, so a
+        # validated plan on real PostgreSQL proves they were written.
+        assert plan["pinned_universe_revision_id"] == self.REV
+        assert plan["pinned_member_hash"]
+        assert _scalar(
+            sf,
+            "SELECT pinned_universe_revision_id FROM public.strategy_plans",
+        ) == self.REV
+        weights = {leg["tradingsymbol"]: leg["target_weight"] for leg in plan["resolved_plan"]["legs"]}
+        assert weights == {"RELIANCE": 0.5, "INFY": 0.25, "TCS": 0.0}
+
+        # An unrelated newer generation must NOT invalidate a weights plan: the
+        # legs carry the full broker coordinate invalidation compares against.
+        seed_generation(sf, G2, T2)
+        seed_record(sf, INST_NEW, symbol="WIPRO", generation=G2)
+        seed_mapping(sf, INST_NEW, token=900, symbol="WIPRO", valid_from=G2)
+        state = plan_invalidation_state(plan, session_factory=sf)
+        assert state["state"] == "valid", state
+        assert state["reason"] == "CATALOG_GENERATION_UNRELATED"
+
+        # ...while re-mapping one of ITS members does invalidate it.
+        seed_generation(sf, G3, T3)
+        seed_record(sf, self.TCS_NEW, symbol="TCS", generation=G3)
+        _exec(
+            sf,
+            "UPDATE public.instrument_broker_mappings SET is_current = FALSE, valid_to_generation = :g3 "
+            "WHERE instrument_id = :old",
+            {"g3": G3, "old": self.INSTRUMENTS["TCS"]},
+        )
+        seed_mapping(sf, self.TCS_NEW, token=102, symbol="TCS", valid_from=G3)
+        invalidated = plan_invalidation_state(plan, session_factory=sf)
+        assert invalidated["state"] == "invalidated", invalidated
+        assert [change["reason"] for change in invalidated["changes"]] == ["COORDINATE_REMAPPED"]
+
+
 # ---------------------------------------------------------------------------
 # 7. journal completeness
 # ---------------------------------------------------------------------------
