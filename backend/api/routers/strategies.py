@@ -25,15 +25,25 @@ this slice, and this docstring does not claim otherwise.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from pydantic import ValidationError
 
 from backend.api.schemas.strategies import (
+    ExternalAdapterRequest,
+    ExternalAdapterResponse,
+    ExternalStrategyCreateRequest,
+    GrantRequest,
+    GrantResponse,
     HostedStrategyOptionsResponse,
     JobDetailResponse,
     JobListResponse,
     JobSummaryResponse,
+    PositionListResponse,
+    PositionRow,
+    ProductStatusUpdateRequest,
+    RebuildResponse,
     ReconciliationActionRequest,
     ReconciliationActionResponse,
     ReconciliationAuditResponse,
@@ -56,6 +66,7 @@ from backend.api.schemas.strategies import (
     VersionCreateRequest,
     VersionListResponse,
     VersionResponse,
+    parse_strategy_create,
 )
 from backend.api.services.csrf import enforce_same_origin
 from backend.api.services.hosted_strategy_authz import (
@@ -65,6 +76,11 @@ from backend.api.services.hosted_strategy_authz import (
 )
 from backend.app.auth import AppUser, require_app_user
 from backend.strategies import service
+from backend.strategies.attribution import (
+    EXECUTION_ENVIRONMENTS,
+    SqlAttributionStore,
+    StrategyAttributionService,
+)
 from backend.strategies.reconciliation import assess, evidence_digest
 from backend.strategies.repository import (
     SqlAlchemyStrategyRepository,
@@ -117,7 +133,9 @@ def _iso(value: Any) -> Optional[str]:
     return str(value)
 
 
-def _strategy_out(row: Any) -> StrategyResponse:
+def _strategy_out(
+    row: Any, *, product_status: Optional[str] = None, adapter_kinds: Optional[List[str]] = None
+) -> StrategyResponse:
     return StrategyResponse(
         strategy_id=row.id,
         owner_id=row.owner_id,
@@ -131,9 +149,77 @@ def _strategy_out(row: Any) -> StrategyResponse:
         progress_deadline_s=row.progress_deadline_s,
         stale_exit_policy=row.stale_exit_policy,
         status=row.status,
+        product_status=product_status or "active",
+        adapter_kinds=list(adapter_kinds or ["hosted"]),
         created_at=_iso(row.created_at),
         updated_at=_iso(row.updated_at),
     )
+
+
+def _canonical_out(row: Any, *, adapter_kinds: Optional[List[str]] = None) -> StrategyResponse:
+    """Response for a strategy that has no hosted adapter (external-only).
+
+    Canonical fields are the product truth; the hosted-adapter-only fields are
+    empty rather than invented.
+    """
+    return StrategyResponse(
+        strategy_id=row.id,
+        owner_id=row.owner_id,
+        name=row.name,
+        template_id="",
+        description=None,
+        default_execution_mode="",
+        default_job_kind="",
+        default_account_scope=row.account_scope,
+        max_duration_s=0,
+        progress_deadline_s=0,
+        stale_exit_policy="",
+        status="active",
+        product_status=row.status,
+        adapter_kinds=list(adapter_kinds or ["external"]),
+        created_at=_iso(row.created_at),
+        updated_at=_iso(row.updated_at),
+    )
+
+
+def _attribution_store(request: Request) -> "SqlAttributionStore":
+    """The attribution store for this app (wired in the app factory)."""
+    store = getattr(request.app.state, "attribution_store", None)
+    if store is None:
+        from backend.app.database import SessionLocal
+
+        store = SqlAttributionStore(session_factory=SessionLocal)
+        request.app.state.attribution_store = store
+    return store
+
+
+def _attribution_service(request: Request) -> "StrategyAttributionService":
+    """The attribution service for this app (wired in the app factory)."""
+    service_ = getattr(request.app.state, "attribution_service", None)
+    if service_ is None:
+        service_ = StrategyAttributionService(_attribution_store(request))
+        request.app.state.attribution_service = service_
+    return service_
+
+
+def _worker_repository(request: Request):
+    from backend.api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository
+
+    repo = getattr(request.app.state, "algo_worker_repository", None)
+    if repo is None:
+        repo = SqlAlchemyAlgoWorkerRepository()
+        request.app.state.algo_worker_repository = repo
+    return repo
+
+
+def _environment_param(environment: Optional[str]) -> str:
+    value = str(environment or "live").strip().lower()
+    if value not in EXECUTION_ENVIRONMENTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"environment must be one of {', '.join(EXECUTION_ENVIRONMENTS)}",
+        )
+    return value
 
 
 def _version_out(row: Any) -> VersionResponse:
@@ -227,28 +313,59 @@ def _audit_out(row: Any) -> ReconciliationAuditResponse:
 @router.post("", response_model=StrategyResponse)
 async def create_strategy(
     request: Request,
-    payload: StrategyCreateRequest,
+    payload: Dict[str, Any] = Body(...),
     owner: str = Depends(require_strategy_owner),
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
 ):
+    """Create one canonical strategy with exactly one compute adapter.
+
+    Backward compatible: the legacy hosted payload (no ``kind``) keeps its
+    request and response contract and writes canonical + hosted adapter
+    atomically. ``kind: "external"`` creates the canonical strategy with an
+    external adapter instead, and does not accept hosted-only fields.
+    """
     enforce_same_origin(request)
     try:
-        name = service.validate_name(payload.name)
+        parsed = parse_strategy_create(payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    if isinstance(parsed, ExternalStrategyCreateRequest):
+        try:
+            name = service.validate_name(parsed.name)
+            account_scope = authorize_account_scope(parsed.account_scope)
+        except service.StrategyValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            row = repo.create_external_strategy(
+                owner_id=owner,
+                name=name,
+                account_scope=account_scope,
+                description=parsed.description,
+                config=dict(parsed.external_config or {}),
+                created_by=owner,
+            )
+        except StrategyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _canonical_out(row, adapter_kinds=["external"])
+
+    try:
+        name = service.validate_name(parsed.name)
         # Shape/mode first (422 for a malformed scope), then authorization.
-        account_scope = service.validate_account_scope(payload.account_scope, payload.execution_mode)
-        if payload.execution_mode not in service.ALLOWED_EXECUTION_MODES:
+        account_scope = service.validate_account_scope(parsed.account_scope, parsed.execution_mode)
+        if parsed.execution_mode not in service.ALLOWED_EXECUTION_MODES:
             raise service.StrategyValidationError(
                 f"execution_mode must be one of {', '.join(service.ALLOWED_EXECUTION_MODES)}"
             )
-        if payload.job_kind not in service.ALLOWED_JOB_KINDS:
+        if parsed.job_kind not in service.ALLOWED_JOB_KINDS:
             raise service.StrategyValidationError(
                 f"job_kind must be one of {', '.join(service.ALLOWED_JOB_KINDS)}"
             )
         # Validate the policy inputs before persisting (explicit config).
         service.build_policy_snapshot(
-            stale_exit_policy=payload.stale_exit_policy,
-            max_duration_s=payload.max_duration_s,
-            progress_deadline_s=payload.progress_deadline_s,
+            stale_exit_policy=parsed.stale_exit_policy,
+            max_duration_s=parsed.max_duration_s,
+            progress_deadline_s=parsed.progress_deadline_s,
         )
     except service.StrategyValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -261,15 +378,17 @@ async def create_strategy(
         row = repo.create_strategy(
             owner_id=owner,
             name=name,
-            description=payload.description,
-            execution_mode=payload.execution_mode,
-            job_kind=payload.job_kind,
+            description=parsed.description,
+            execution_mode=parsed.execution_mode,
+            job_kind=parsed.job_kind,
             account_scope=account_scope,
-            max_duration_s=payload.max_duration_s,
-            progress_deadline_s=payload.progress_deadline_s,
-            stale_exit_policy=payload.stale_exit_policy,
+            max_duration_s=parsed.max_duration_s,
+            progress_deadline_s=parsed.progress_deadline_s,
+            stale_exit_policy=parsed.stale_exit_policy,
         )
     except StrategyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except StrategyIdentityError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _strategy_out(row)
 
@@ -279,7 +398,18 @@ async def list_strategies(
     owner: str = Depends(require_strategy_owner),
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
 ):
-    return StrategyListResponse(strategies=[_strategy_out(row) for row in repo.list_strategies(owner)])
+    statuses = repo.list_product_statuses(owner)
+    kinds = repo.adapter_kinds(owner)
+    return StrategyListResponse(
+        strategies=[
+            _strategy_out(
+                row,
+                product_status=statuses.get(row.id),
+                adapter_kinds=kinds.get(row.id),
+            )
+            for row in repo.list_strategies(owner)
+        ]
+    )
 
 
 @router.get("/options", response_model=HostedStrategyOptionsResponse)
@@ -303,7 +433,14 @@ async def get_strategy(
     owner: str = Depends(require_strategy_owner),
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
 ):
-    return _strategy_out(_owned_strategy(repo, owner, strategy_id))
+    row = _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    kinds = repo.adapter_kinds(owner).get(strategy_id, ["hosted"])
+    return _strategy_out(
+        row,
+        product_status=canonical.status if canonical is not None else None,
+        adapter_kinds=kinds,
+    )
 
 
 @router.patch("/{strategy_id}", response_model=StrategyResponse)
@@ -314,16 +451,217 @@ async def update_strategy(
     owner: str = Depends(require_strategy_owner),
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
 ):
-    """Minimal metadata update / disable. Immutable versions are untouched."""
+    """Minimal metadata update / scheduling disable.
+
+    ``status`` here keeps its existing meaning — hosted **scheduling**
+    enablement — and is deliberately distinct from the canonical product status
+    written by ``PATCH /{strategy_id}/status``. Immutable versions are untouched.
+    """
     enforce_same_origin(request)
     fields = payload.model_dump(exclude_unset=True)
     try:
         row = repo.update_strategy(owner, strategy_id, **fields)
     except service.StrategyValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StrategyIdentityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if row is None:
         raise HTTPException(status_code=404, detail="Strategy not found")
-    return _strategy_out(row)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    return _strategy_out(
+        row,
+        product_status=canonical.status if canonical is not None else None,
+        adapter_kinds=repo.adapter_kinds(owner).get(strategy_id),
+    )
+
+
+@router.patch("/{strategy_id}/status", response_model=StrategyResponse)
+async def update_product_status(
+    strategy_id: str,
+    request: Request,
+    payload: ProductStatusUpdateRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Set the canonical PRODUCT status. Archiving preserves all history."""
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    row = repo.set_product_status(owner, strategy_id, payload.status)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    hosted = repo.get_strategy(owner, strategy_id)
+    return _strategy_out(
+        hosted,
+        product_status=row.status,
+        adapter_kinds=repo.adapter_kinds(owner).get(strategy_id),
+    )
+
+
+@router.post("/{strategy_id}/adapters/external", response_model=ExternalAdapterResponse)
+async def create_external_adapter(
+    strategy_id: str,
+    request: Request,
+    payload: ExternalAdapterRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Attach an external compute adapter to an owner's canonical strategy."""
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    row = repo.create_external_adapter(
+        owner_id=owner,
+        strategy_id=strategy_id,
+        config=dict(payload.config or {}),
+        created_by=owner,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    return ExternalAdapterResponse(
+        adapter_id=row.id,
+        strategy_id=row.strategy_id,
+        status=row.status,
+        config=dict(row.config_json or {}),
+    )
+
+
+@router.post("/{strategy_id}/grants", response_model=GrantResponse)
+async def create_grant(
+    strategy_id: str,
+    request: Request,
+    payload: GrantRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Issue a token→strategy grant (owner only).
+
+    Verifies the actor owns the strategy, the token exists, is active, and its
+    account scope EXACTLY matches the canonical strategy account. A worker token
+    is a credential, never an owner: no worker-auth route reaches this surface.
+    """
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
+    tokens = {str(item.get("token_id")): item for item in await _worker_repository(request).list_tokens()}
+    token = tokens.get(payload.token_id)
+    if token is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"rejection_reason": "TOKEN_NOT_FOUND", "token_id": payload.token_id},
+        )
+    if str(token.get("status") or "") != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={"rejection_reason": "TOKEN_NOT_ACTIVE", "token_id": payload.token_id},
+        )
+    if str(token.get("account_scope") or "") != str(canonical.account_scope):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "TOKEN_ACCOUNT_MISMATCH",
+                "token_id": payload.token_id,
+                "strategy_account_scope": str(canonical.account_scope),
+            },
+        )
+
+    _attribution_store(request).grant_strategy(
+        token_id=payload.token_id, strategy_id=strategy_id, granted_by=owner
+    )
+    return GrantResponse(strategy_id=strategy_id, token_id=payload.token_id, granted_by=owner)
+
+
+@router.delete("/{strategy_id}/grants/{token_id}", response_model=GrantResponse)
+async def revoke_grant(
+    strategy_id: str,
+    token_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Revoke a grant by stamping ``revoked_at``. History is never deleted."""
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    revoked = _attribution_store(request).revoke_grant(
+        token_id=token_id, strategy_id=strategy_id
+    )
+    if not revoked:
+        raise HTTPException(status_code=404, detail="Grant not found")
+    return GrantResponse(
+        strategy_id=strategy_id, token_id=token_id, granted_by=owner, revoked=True
+    )
+
+
+@router.get("/{strategy_id}/positions", response_model=PositionListResponse)
+async def list_positions(
+    strategy_id: str,
+    request: Request,
+    environment: Optional[str] = Query(default=None),
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """The strategy's projected book for one environment (default ``live``).
+
+    Unresolved rows are returned with their ``unresolved_reason``: exposure that
+    could not be mapped to a canonical instrument is surfaced, never hidden.
+    """
+    hosted = _owned_strategy(repo, owner, strategy_id)
+    env = _environment_param(environment)
+    rows = await _attribution_service(request).open_positions(
+        account_id=str(hosted.default_account_scope),
+        strategy_id=strategy_id,
+        execution_environment=env,
+    )
+    return PositionListResponse(
+        strategy_id=strategy_id,
+        environment=env,
+        positions=[
+            PositionRow(
+                identity_kind=row["identity_kind"],
+                identity_key=row["identity_key"],
+                product=row["product"],
+                instrument_token=row["instrument_token"],
+                exchange=row["exchange"],
+                tradingsymbol=row["tradingsymbol"],
+                net_quantity=row["net_quantity"],
+                unresolved_reason=row.get("unresolved_reason"),
+            )
+            for row in rows
+        ],
+    )
+
+
+@router.post("/{strategy_id}/positions/rebuild", response_model=RebuildResponse)
+async def rebuild_positions(
+    strategy_id: str,
+    request: Request,
+    environment: Optional[str] = Query(default=None),
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Explicit full recompute of one book (the operational remedy for anomalies).
+
+    G1 adds no scheduler: publication is on-demand, and a rebuild is always a
+    full recompute rather than an incremental patch.
+    """
+    enforce_same_origin(request)
+    hosted = _owned_strategy(repo, owner, strategy_id)
+    env = _environment_param(environment)
+    result = await _attribution_service(request).publish(
+        account_id=str(hosted.default_account_scope),
+        strategy_id=strategy_id,
+        execution_environment=env,
+    )
+    return RebuildResponse(
+        strategy_id=strategy_id,
+        execution_environment=env,
+        projection_version=int(result["projection_version"]),
+        unchanged=bool(result["unchanged"]),
+        folded_facts=int(result.get("folded_facts") or 0),
+        unresolved=list(result.get("unresolved") or []),
+        anomalies=list(result.get("anomalies") or []),
+    )
 
 
 @router.post("/{strategy_id}/versions", response_model=VersionResponse)

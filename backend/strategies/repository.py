@@ -36,6 +36,7 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from backend.strategies.attribution_models import ExternalStrategyAdapter, Strategy
 from backend.strategies.models import (
     HostedStrategy,
     HostedStrategySchedule,
@@ -147,12 +148,188 @@ class SqlAlchemyStrategyRepository:
         )
         session = self._session()
         try:
+            # Canonical identity and the hosted adapter are written together: the
+            # adapter is only a compute adapter over the canonical strategy, so a
+            # partial write would be identity drift. The canonical row goes first
+            # so the adapter's composite FK is satisfied on PostgreSQL.
+            session.add(
+                Strategy(
+                    id=strategy_id,
+                    owner_id=owner_id,
+                    name=name,
+                    account_scope=account_scope,
+                    status="active",
+                )
+            )
+            session.flush()
             session.add(row)
             session.commit()
             return row
         except IntegrityError as exc:
             session.rollback()
             raise StrategyConflict("a strategy with this name already exists") from exc
+        finally:
+            session.close()
+
+    def get_canonical_strategy(self, owner_id: str, strategy_id: str) -> Optional[Strategy]:
+        """The canonical product identity for one owner-scoped strategy."""
+        session = self._session()
+        try:
+            return session.execute(
+                select(Strategy).where(
+                    Strategy.id == strategy_id,
+                    Strategy.owner_id == owner_id,
+                )
+            ).scalar_one_or_none()
+        finally:
+            session.close()
+
+    def list_product_statuses(self, owner_id: str) -> Dict[str, str]:
+        """``{strategy_id: canonical product status}`` for one owner."""
+        session = self._session()
+        try:
+            rows = session.execute(
+                select(Strategy.id, Strategy.status).where(Strategy.owner_id == owner_id)
+            ).all()
+            return {str(row[0]): str(row[1]) for row in rows}
+        finally:
+            session.close()
+
+    def adapter_kinds(self, owner_id: str) -> Dict[str, List[str]]:
+        """``{strategy_id: [adapter kinds]}`` for one owner's strategies.
+
+        A strategy is one product with one or more compute adapters; the UI needs
+        to know which, not to infer it.
+        """
+        session = self._session()
+        try:
+            hosted = session.execute(
+                select(HostedStrategy.id).where(HostedStrategy.owner_id == owner_id)
+            ).scalars().all()
+            external = session.execute(
+                select(ExternalStrategyAdapter.strategy_id)
+                .join(Strategy, Strategy.id == ExternalStrategyAdapter.strategy_id)
+                .where(Strategy.owner_id == owner_id)
+            ).scalars().all()
+            kinds: Dict[str, List[str]] = {str(sid): [] for sid in hosted}
+            for sid in hosted:
+                kinds.setdefault(str(sid), []).append("hosted")
+            for sid in external:
+                kinds.setdefault(str(sid), []).append("external")
+            return kinds
+        finally:
+            session.close()
+
+    def set_product_status(
+        self, owner_id: str, strategy_id: str, status: str
+    ) -> Optional[Strategy]:
+        """Set the canonical PRODUCT status (independent of scheduling)."""
+        session = self._session()
+        try:
+            row = session.execute(
+                select(Strategy).where(
+                    Strategy.id == strategy_id, Strategy.owner_id == owner_id
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                session.rollback()
+                return None
+            row.status = status
+            session.commit()
+            return row
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def create_external_adapter(
+        self,
+        *,
+        owner_id: str,
+        strategy_id: str,
+        config: Dict[str, Any],
+        created_by: str,
+    ) -> Optional[ExternalStrategyAdapter]:
+        """Attach an external compute adapter to an owner's canonical strategy."""
+        session = self._session()
+        try:
+            strategy = session.execute(
+                select(Strategy).where(
+                    Strategy.id == strategy_id, Strategy.owner_id == owner_id
+                )
+            ).scalar_one_or_none()
+            if strategy is None:
+                session.rollback()
+                return None
+            existing = session.execute(
+                select(ExternalStrategyAdapter).where(
+                    ExternalStrategyAdapter.strategy_id == strategy_id
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                existing.config_json = dict(config)
+                session.commit()
+                return existing
+            row = ExternalStrategyAdapter(
+                id=f"ext_{strategy_id}",
+                strategy_id=strategy_id,
+                status="active",
+                config_json=dict(config),
+                created_by=created_by,
+            )
+            session.add(row)
+            session.commit()
+            return row
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def create_external_strategy(
+        self,
+        *,
+        owner_id: str,
+        name: str,
+        account_scope: str,
+        description: Optional[str],
+        config: Dict[str, Any],
+        created_by: str,
+    ) -> Strategy:
+        """Create a canonical strategy with only an external compute adapter."""
+        strategy_id = service.new_strategy_id()
+        session = self._session()
+        try:
+            session.add(
+                Strategy(
+                    id=strategy_id,
+                    owner_id=owner_id,
+                    name=name,
+                    account_scope=account_scope,
+                    status="active",
+                )
+            )
+            session.flush()
+            session.add(
+                ExternalStrategyAdapter(
+                    id=f"ext_{strategy_id}",
+                    strategy_id=strategy_id,
+                    status="active",
+                    config_json=dict(config),
+                    created_by=created_by,
+                )
+            )
+            session.commit()
+            return session.execute(
+                select(Strategy).where(Strategy.id == strategy_id)
+            ).scalar_one()
+        except IntegrityError as exc:
+            session.rollback()
+            raise StrategyConflict("a strategy with this name already exists") from exc
+        except Exception:
+            session.rollback()
+            raise
         finally:
             session.close()
 
@@ -188,10 +365,14 @@ class SqlAlchemyStrategyRepository:
         *,
         description: Any = _UNSET,
         status: Any = _UNSET,
+        name: Any = _UNSET,
     ) -> Optional[HostedStrategy]:
         """Minimal owner-scoped metadata update. Versions are never touched.
 
         Returns ``None`` for a foreign/missing id (router renders 404).
+
+        A rename writes the canonical product name and the hosted compatibility
+        mirror in the **same transaction**, so the two can never drift.
         """
         if status is not _UNSET and status not in ("active", "disabled"):
             raise service.StrategyValidationError("status must be 'active' or 'disabled'")
@@ -205,6 +386,18 @@ class SqlAlchemyStrategyRepository:
                 row.description = description
             if status is not _UNSET:
                 row.status = status
+            if name is not _UNSET:
+                canonical = session.execute(
+                    select(Strategy).where(Strategy.id == strategy_id)
+                ).scalar_one_or_none()
+                if canonical is None:
+                    # A hosted adapter without canonical identity is drift, which
+                    # is refused rather than papered over.
+                    raise StrategyIdentityError(
+                        "hosted strategy has no canonical identity"
+                    )
+                row.name = name
+                canonical.name = name
             session.commit()
             return row
         except Exception:

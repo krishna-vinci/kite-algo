@@ -7,12 +7,25 @@ strategy would act on), not an owner.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from enum import Enum
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class StrategyCreateRequest(BaseModel):
+class StrategyCreateKind(str, Enum):
+    HOSTED = "hosted"
+    EXTERNAL = "external"
+
+
+class HostedStrategyCreateRequest(BaseModel):
+    """The existing hosted create contract, unchanged, plus the optional
+    discriminator. Field names are the CURRENT request-schema names — per-run
+    ``execution_mode`` and ``job_kind`` (NOT the ``hosted_strategies``
+    strategy-level ``default_job_kind`` column name) — with the existing
+    defaults and bounds, so the legacy frontend payload keeps validating
+    byte-for-byte."""
+
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=120)
@@ -24,19 +37,129 @@ class StrategyCreateRequest(BaseModel):
     max_duration_s: int = Field(gt=0, le=7 * 24 * 3600)
     progress_deadline_s: int = Field(gt=0, le=7 * 24 * 3600)
     stale_exit_policy: str = Field(min_length=1)
+    #: ABSENT in the legacy payload (which means hosted); an explicit "hosted" is
+    #: accepted identically.
+    kind: Optional[Literal[StrategyCreateKind.HOSTED]] = None
+
+
+class ExternalStrategyCreateRequest(BaseModel):
+    """Discriminated external request.
+
+    Hosted-only fields (``execution_mode``, ``job_kind``, progress deadlines,
+    stale-exit policy) are neither required nor accepted: ``extra="forbid"``
+    makes supplying them a 422, so the two contracts cannot blur.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal[StrategyCreateKind.EXTERNAL]
+    name: str = Field(min_length=1, max_length=120)
+    account_scope: str = Field(min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=2000)
+    external_config: Dict[str, Any] = Field(default_factory=dict)
+
+
+StrategyCreateRequest = HostedStrategyCreateRequest
+
+
+def parse_strategy_create(
+    payload: Dict[str, Any],
+) -> Union[HostedStrategyCreateRequest, ExternalStrategyCreateRequest]:
+    """Validate one create payload against exactly one of the two contracts."""
+    if payload.get("kind") == StrategyCreateKind.EXTERNAL.value:
+        return ExternalStrategyCreateRequest.model_validate(payload)
+    # Legacy payload (no kind, or kind == "hosted") keeps the hosted contract,
+    # including its required fields and validation errors.
+    return HostedStrategyCreateRequest.model_validate(payload)
 
 
 class StrategyUpdateRequest(BaseModel):
     """Minimal metadata update. Versions are immutable and never touched here.
 
     Fields are applied only when provided (PATCH semantics). Omitting a field
-    leaves it unchanged; an explicit ``null`` description clears it.
+    leaves it unchanged; an explicit ``null`` description clears it. ``status``
+    here means hosted **scheduling** enablement, never canonical product status.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     description: Optional[str] = Field(default=None, max_length=2000)
     status: Optional[str] = None
+
+
+class ProductStatusUpdateRequest(BaseModel):
+    """Canonical PRODUCT status (``active`` | ``disabled`` | ``archived``).
+
+    Archiving preserves every binding and projection row; there is no delete.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["active", "disabled", "archived"]
+
+
+class ExternalAdapterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExternalAdapterResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    adapter_id: str
+    strategy_id: str
+    status: str
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class GrantRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token_id: str = Field(min_length=1, max_length=128)
+
+
+class GrantResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str
+    token_id: str
+    granted_by: str
+    revoked: bool = False
+
+
+class PositionRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    identity_kind: str
+    identity_key: str
+    product: str
+    instrument_token: int
+    exchange: str
+    tradingsymbol: str
+    net_quantity: int
+    unresolved_reason: Optional[str] = None
+
+
+class PositionListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str
+    environment: str
+    positions: List[PositionRow] = Field(default_factory=list)
+
+
+class RebuildResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str
+    execution_environment: str
+    projection_version: int
+    unchanged: bool
+    folded_facts: int = 0
+    unresolved: List[Dict[str, Any]] = Field(default_factory=list)
+    anomalies: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class VersionCreateRequest(BaseModel):
@@ -63,7 +186,12 @@ class StrategyResponse(BaseModel):
     max_duration_s: int
     progress_deadline_s: int
     stale_exit_policy: str
+    #: Hosted SCHEDULING enablement (the existing field, unchanged meaning).
     status: str
+    #: Canonical PRODUCT status — additive; never written by PATCH /{id}.
+    product_status: str = "active"
+    #: Which compute adapters this one product has ("hosted" / "external").
+    adapter_kinds: List[str] = Field(default_factory=list)
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 

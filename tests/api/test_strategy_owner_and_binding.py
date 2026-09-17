@@ -326,5 +326,436 @@ class TrustedRunBindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.repo.bindings["run-stamp"].execution_environment, "paper")
 
 
+# ---------------------------------------------------------------------------
+# Owner-facing canonical strategy API (Task 6)
+# ---------------------------------------------------------------------------
+
+import httpx  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+from sqlalchemy import create_engine, event, text  # noqa: E402
+from sqlalchemy.orm import sessionmaker  # noqa: E402
+from sqlalchemy.pool import StaticPool  # noqa: E402
+
+from backend.api.routers import strategies as strategies_router  # noqa: E402
+from backend.app.auth import AppUser  # noqa: E402
+from backend.strategies.attribution import SqlAttributionStore  # noqa: E402
+import backend.strategies.attribution_models  # noqa: E402,F401  registers the attribution tables
+from backend.workflows.repository import Base  # noqa: E402
+
+BASE = "/api/strategies"
+
+
+class _FakeWorkerTokens:
+    """Just enough of the worker repository for grant issuance."""
+
+    def __init__(self, tokens=()):
+        self.tokens = {t["token_id"]: dict(t) for t in tokens}
+
+    async def list_tokens(self):
+        return [dict(t) for t in self.tokens.values()]
+
+
+def _hosted_payload(**overrides):
+    body = {
+        "name": "momentum",
+        "description": "monthly",
+        "execution_mode": "paper",
+        "job_kind": "finite",
+        "account_scope": "kite:paper",
+        "max_duration_s": 21600,
+        "progress_deadline_s": 600,
+        "stale_exit_policy": "exit_on_worker_stale",
+    }
+    body.update(overrides)
+    return body
+
+
+class OwnerStrategyApiTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+
+        @event.listens_for(self.engine, "connect")
+        def _attach_public(dbapi_connection, connection_record):
+            _ = connection_record
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("ATTACH DATABASE ':memory:' AS public")
+            # Empty fact tables: the attribution store reads them through
+            # ``public.``-qualified SQL, and an empty book must rebuild cleanly.
+            cursor.execute(
+                """
+                CREATE TABLE public.order_trade_fills (
+                    account_id TEXT NOT NULL, order_id TEXT NOT NULL, trade_id TEXT NOT NULL,
+                    instrument_token BIGINT, exchange TEXT, tradingsymbol TEXT, product TEXT,
+                    transaction_type TEXT, quantity INTEGER, fill_timestamp TEXT, payload_json TEXT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.worker_live_execution_links (
+                    link_id INTEGER PRIMARY KEY AUTOINCREMENT, strategy_run_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL, broker_order_id TEXT NOT NULL, trade_id TEXT,
+                    client_order_ref TEXT, basket_execution_id TEXT, basket_leg_index INTEGER,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.live_order_intents (
+                    intent_id TEXT PRIMARY KEY, client_order_ref TEXT NOT NULL,
+                    account_id TEXT NOT NULL, strategy_run_id TEXT NOT NULL, broker_order_id TEXT,
+                    basket_execution_id TEXT, basket_leg_index INTEGER, bracket_intent_id TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.paper_orders (
+                    account_scope TEXT NOT NULL, order_id TEXT NOT NULL, instrument_token BIGINT,
+                    exchange TEXT, tradingsymbol TEXT, product TEXT, metadata_json TEXT,
+                    PRIMARY KEY (account_scope, order_id)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.paper_trades (
+                    account_scope TEXT NOT NULL, trade_id TEXT NOT NULL, order_id TEXT NOT NULL,
+                    transaction_type TEXT, quantity INTEGER, trade_timestamp TEXT,
+                    PRIMARY KEY (account_scope, trade_id)
+                )
+                """
+            )
+            cursor.close()
+
+        Base.metadata.create_all(self.engine)
+        self.factory = sessionmaker(bind=self.engine, expire_on_commit=False)
+        self.store = SqlAttributionStore(session_factory=self.factory)
+        self.tokens = _FakeWorkerTokens(
+            [
+                {"token_id": "worker-ok", "name": "ok", "account_scope": "kite:paper", "status": "active"},
+                {"token_id": "worker-other", "name": "other", "account_scope": "kite:OTHER", "status": "active"},
+                {"token_id": "worker-revoked", "name": "rev", "account_scope": "kite:paper", "status": "revoked"},
+            ]
+        )
+
+    async def asyncTearDown(self):
+        self.engine.dispose()
+
+    def _client(self, *, username="admin", monkeypatch=None):
+        from unittest.mock import patch as _patch
+
+        from backend.app import auth as auth_module
+
+        user = AppUser(username=username, role="admin") if username else None
+        app = FastAPI()
+        app.include_router(strategies_router.router, prefix="/api")
+        app.dependency_overrides[strategies_router._strategies_db] = lambda: self.factory
+        app.state.attribution_store = self.store
+        app.state.algo_worker_repository = self.tokens
+        self._patch = _patch.object(auth_module, "get_optional_app_user", lambda _request: user)
+        self._patch.start()
+        from backend.api.routers import strategies as router_module
+
+        self._env = _patch.dict(
+            "os.environ", {"HOSTED_STRATEGY_ACCOUNT_SCOPES": "kite:paper"}
+        )
+        self._env.start()
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+    def _stop_patches(self):
+        self._patch.stop()
+        self._env.stop()
+
+    async def _create(self, client, **overrides):
+        response = await client.post(BASE, json=_hosted_payload(**overrides))
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    # -- backward compatibility ----------------------------------------------
+
+    async def test_legacy_hosted_create_keeps_working_and_writes_canonical_atomically(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+        finally:
+            self._stop_patches()
+
+        # Existing response shape is preserved...
+        self.assertEqual(created["template_id"], f"hosted:{created['strategy_id']}")
+        self.assertEqual(created["owner_id"], "app:admin")
+        self.assertEqual(created["name"], "momentum")
+        # ...and canonical fields are additive.
+        self.assertEqual(created["product_status"], "active")
+
+        with self.factory() as session:
+            canonical = session.execute(
+                text("SELECT id, owner_id, name, account_scope, status FROM strategies")
+            ).fetchall()
+            hosted = session.execute(
+                text("SELECT id, owner_id, name, default_account_scope FROM hosted_strategies")
+            ).fetchall()
+        self.assertEqual(len(canonical), 1)
+        self.assertEqual(len(hosted), 1)
+        self.assertEqual(canonical[0][0], hosted[0][0])          # same id
+        self.assertEqual(canonical[0][1], hosted[0][1])          # same owner
+        self.assertEqual(canonical[0][2], hosted[0][2])          # same name
+        self.assertEqual(canonical[0][3], hosted[0][3])          # same account
+
+    async def test_get_and_list_include_canonical_fields_additively(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+            fetched = (await client.get(f"{BASE}/{sid}")).json()
+            listed = (await client.get(BASE)).json()["strategies"][0]
+        finally:
+            self._stop_patches()
+
+        for body in (fetched, listed):
+            # existing fields keep their names and shape
+            for key in ("strategy_id", "owner_id", "name", "template_id", "status",
+                        "default_execution_mode", "default_account_scope"):
+                self.assertIn(key, body)
+            # additive canonical fields
+            self.assertIn("product_status", body)
+            self.assertIn("adapter_kinds", body)
+        self.assertEqual(listed["adapter_kinds"], ["hosted"])
+        self.assertEqual(listed["status"], "active")
+        self.assertEqual(listed["product_status"], "active")
+
+    async def test_rename_updates_both_sides_in_one_transaction(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+            response = await client.patch(f"{BASE}/{sid}", json={"name": "renamed", "description": "x"})
+            self.assertEqual(response.status_code, 200, response.text)
+        finally:
+            self._stop_patches()
+
+        with self.factory() as session:
+            canonical_name = session.execute(
+                text("SELECT name FROM strategies WHERE id=:sid"), {"sid": sid}
+            ).scalar()
+            hosted_name = session.execute(
+                text("SELECT name FROM hosted_strategies WHERE id=:sid"), {"sid": sid}
+            ).scalar()
+        self.assertEqual(canonical_name, "renamed")
+        self.assertEqual(hosted_name, "renamed")
+
+    async def test_name_drift_is_refused_by_the_repository_boundary(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+        finally:
+            self._stop_patches()
+
+        # A hosted adapter with no canonical identity is drift and is refused
+        # rather than silently renamed on one side only.
+        with self.factory() as session:
+            session.execute(text("DELETE FROM strategies WHERE id=:sid"), {"sid": sid})
+            session.commit()
+        repo = strategies_router.SqlAlchemyStrategyRepository(self.factory)
+        with self.assertRaises(Exception):
+            repo.update_strategy("app:admin", sid, name="drifted")
+
+    # -- status semantics -----------------------------------------------------
+
+    async def test_product_status_independent_of_scheduling_status(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+
+            # PATCH /{id} keeps its existing meaning: hosted SCHEDULING enablement.
+            patched = (await client.patch(f"{BASE}/{sid}", json={"status": "disabled"})).json()
+            self.assertEqual(patched["status"], "disabled")
+            self.assertEqual(patched["product_status"], "active")
+
+            # PATCH /{id}/status writes only the canonical PRODUCT status.
+            archived = (await client.patch(f"{BASE}/{sid}/status", json={"status": "archived"})).json()
+            self.assertEqual(archived["product_status"], "archived")
+            self.assertEqual(archived["status"], "disabled")
+
+            # Archive preserves history: the strategy is still readable.
+            self.assertEqual((await client.get(f"{BASE}/{sid}")).status_code, 200)
+            # There is no delete route.
+            self.assertIn((await client.delete(f"{BASE}/{sid}")).status_code, (404, 405))
+        finally:
+            self._stop_patches()
+
+    # -- discriminated create -------------------------------------------------
+
+    async def test_create_schema_discrimination(self):
+        client = self._client()
+        try:
+            # kind: "hosted" behaves exactly as the legacy payload.
+            explicit = await client.post(BASE, json=_hosted_payload(name="explicit-hosted", kind="hosted"))
+            self.assertEqual(explicit.status_code, 200, explicit.text)
+
+            # External creation needs only name/account/config.
+            external = await client.post(
+                BASE,
+                json={"kind": "external", "name": "ext-one", "account_scope": "kite:paper",
+                      "external_config": {"endpoint": "https://worker.example"}},
+            )
+            self.assertEqual(external.status_code, 200, external.text)
+            body = external.json()
+            self.assertEqual(body["name"], "ext-one")
+
+            # Hosted-only fields are rejected on an external request.
+            mixed = await client.post(
+                BASE,
+                json={"kind": "external", "name": "ext-two", "account_scope": "kite:paper",
+                      "job_kind": "finite"},
+            )
+            self.assertEqual(mixed.status_code, 422)
+
+            # Unknown kind and unknown fields are 422.
+            self.assertEqual(
+                (await client.post(BASE, json=_hosted_payload(kind="banana"))).status_code, 422
+            )
+            self.assertEqual(
+                (await client.post(BASE, json={**_hosted_payload(), "owner_id": "app:x"})).status_code, 422
+            )
+        finally:
+            self._stop_patches()
+
+        # The external strategy exists canonically with an external adapter and
+        # no hosted adapter.
+        with self.factory() as session:
+            rows = session.execute(
+                text("SELECT id, name FROM strategies WHERE name='ext-one'")
+            ).fetchall()
+            adapters = session.execute(
+                text("SELECT strategy_id FROM external_strategy_adapters")
+            ).fetchall()
+            hosted = session.execute(text("SELECT id FROM hosted_strategies")).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual([r[0] for r in adapters], [rows[0][0]])
+        self.assertNotIn(rows[0][0], [r[0] for r in hosted])
+
+    # -- grants ---------------------------------------------------------------
+
+    async def test_grant_issuance_owner_verification(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+
+            # The token must exist, be active, and match the canonical account.
+            mismatch = await client.post(f"{BASE}/{sid}/grants", json={"token_id": "worker-other"})
+            self.assertEqual(mismatch.status_code, 409)
+            self.assertEqual(mismatch.json()["detail"]["rejection_reason"], "TOKEN_ACCOUNT_MISMATCH")
+
+            revoked = await client.post(f"{BASE}/{sid}/grants", json={"token_id": "worker-revoked"})
+            self.assertEqual(revoked.status_code, 409)
+
+            unknown = await client.post(f"{BASE}/{sid}/grants", json={"token_id": "worker-nope"})
+            self.assertEqual(unknown.status_code, 404)
+
+            issued = await client.post(f"{BASE}/{sid}/grants", json={"token_id": "worker-ok"})
+            self.assertEqual(issued.status_code, 200, issued.text)
+            self.assertEqual(issued.json()["token_id"], "worker-ok")
+        finally:
+            self._stop_patches()
+
+        # The grant actually authorizes on the read path...
+        grants = self.store.active_grants(token_id="worker-ok", account_id="kite:paper")
+        self.assertEqual([g["strategy_id"] for g in grants], [sid])
+
+        # ...and a cross-owner actor cannot issue one.
+        client = self._client(username="other")
+        try:
+            self.assertEqual(
+                (await client.post(f"{BASE}/{sid}/grants", json={"token_id": "worker-ok"})).status_code, 404
+            )
+        finally:
+            self._stop_patches()
+
+    async def test_revoked_grant_and_revoked_token_authorize_nothing(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+            issued = await client.post(f"{BASE}/{sid}/grants", json={"token_id": "worker-ok"})
+            self.assertEqual(issued.status_code, 200, issued.text)
+
+            revoked = await client.delete(f"{BASE}/{sid}/grants/worker-ok")
+            self.assertEqual(revoked.status_code, 200, revoked.text)
+            self.assertTrue(revoked.json()["revoked"])
+
+            missing = await client.delete(f"{BASE}/{sid}/grants/worker-absent")
+            self.assertEqual(missing.status_code, 404)
+        finally:
+            self._stop_patches()
+
+        self.assertEqual(self.store.active_grants(token_id="worker-ok", account_id="kite:paper"), [])
+        # Revocation is a stamp, never a delete: history survives.
+        with self.factory() as session:
+            rows = session.execute(
+                text("SELECT revoked_at FROM worker_token_strategy_grants WHERE token_id='worker-ok'")
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0][0])
+
+    async def test_worker_bearer_token_cannot_reach_the_owner_surface(self):
+        client = self._client(username=None)
+        try:
+            headers = {"Authorization": "Bearer kwa_something"}
+            self.assertEqual((await client.post(BASE, json=_hosted_payload(), headers=headers)).status_code, 401)
+            for path, method in (
+                (f"{BASE}/stg-1/status", "patch"),
+                (f"{BASE}/stg-1/grants", "post"),
+                (f"{BASE}/stg-1/adapters/external", "post"),
+                (f"{BASE}/stg-1/positions", "get"),
+                (f"{BASE}/stg-1/positions/rebuild", "post"),
+            ):
+                if method == "get":
+                    response = await client.get(path, headers=headers)
+                else:
+                    response = await getattr(client, method)(path, json={}, headers=headers)
+                self.assertEqual(response.status_code, 401, f"{method} {path}")
+        finally:
+            self._stop_patches()
+
+    # -- positions ------------------------------------------------------------
+
+    async def test_positions_read_and_rebuild_are_owner_scoped(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+
+            empty = await client.get(f"{BASE}/{sid}/positions")
+            self.assertEqual(empty.status_code, 200, empty.text)
+            self.assertEqual(empty.json()["positions"], [])
+            self.assertEqual(empty.json()["environment"], "live")
+
+            rebuilt = await client.post(f"{BASE}/{sid}/positions/rebuild?environment=paper")
+            self.assertEqual(rebuilt.status_code, 200, rebuilt.text)
+            self.assertEqual(rebuilt.json()["execution_environment"], "paper")
+
+            bad_env = await client.post(f"{BASE}/{sid}/positions/rebuild?environment=banana")
+            self.assertEqual(bad_env.status_code, 422)
+        finally:
+            self._stop_patches()
+
+        client = self._client(username="other")
+        try:
+            self.assertEqual((await client.get(f"{BASE}/{sid}/positions")).status_code, 404)
+        finally:
+            self._stop_patches()
+
+
 if __name__ == "__main__":
     unittest.main()
