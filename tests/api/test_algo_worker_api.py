@@ -326,6 +326,8 @@ class _FakeWorkerRepository:
         self.live_order_attribution_refs = {}
         self.live_order_ownership = {}
         self.live_broker_positions = {}
+        #: strategy_run_id -> RunBindingInput recorded by create_run_with_binding.
+        self.bindings = {}
 
     async def claim_run_session(self, strategy_run_id, *, freshness_seconds, claimed_without_heartbeat_seconds):
         _ = (freshness_seconds, claimed_without_heartbeat_seconds)
@@ -415,6 +417,21 @@ class _FakeWorkerRepository:
         }
         self.runs[strategy_run_id] = run
         return dict(run)
+
+    async def create_run_with_binding(self, token, payload, *, strategy_run_id, binding=None):
+        """Mirror of the real path: run + binding recorded for the same call.
+
+        Only recorded when the write succeeds, so the fake models the store's
+        single-transaction semantics (a failed binding leaves no run behind).
+        """
+        run = await self.create_run(token, payload, strategy_run_id=strategy_run_id)
+        if binding is not None:
+            self.bindings[strategy_run_id] = binding
+        return run
+
+    async def active_grants(self, *, token_id, account_id):
+        return []
+
     async def get_run(self, strategy_run_id):
         run = self.runs.get(strategy_run_id)
         return dict(run) if run else None

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import uuid
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from backend.api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository, WorkerToken, WORKER_RUN_STALE_ACTION_SECONDS, WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS
 from backend.api.schemas.worker import WorkerIntentRequest, WorkerRunCreateRequest, _parse_csv_int_values, _parse_csv_values
+from backend.api.services.hosted_attempt import is_hosted_template_id
 from backend.api.services.market_data import WorkerMarketDataService
 from backend.api.services.safety import build_safety_fingerprint, build_signed_safety_token, option_run_status_blocks_trading, verify_signed_safety_token
 from backend.algo_runtime.account_scope import parse_account_scope
@@ -21,6 +23,7 @@ from backend.app.auth import require_app_user
 from backend.app.database import SessionLocal
 from backend.journaling.service import JournalService
 from backend.shared.serialization import _json_default, _json_dumps, _json_loads, _row_mapping, _to_float, _to_int, _utcnow, _hash_token, _query_int_param
+from backend.strategies.attribution import RunBindingFailed, RunBindingInput
 
 logger = logging.getLogger(__name__)
 
@@ -637,12 +640,59 @@ def _validate_decision_related_ref(
     )
 
 
+async def _resolve_grant_binding(
+    request: Any,
+    token: WorkerToken,
+    payload: WorkerRunCreateRequest,
+    *,
+    strategy_run_id: str,
+) -> Optional[RunBindingInput]:
+    """Resolve an external run's binding from the token's persisted grants.
+
+    A worker token is a credential, not a strategy owner: it can only act for a
+    strategy an owner has granted it, on the strategy's own account. No grant and
+    no explicit selection is the explicit legacy-compatibility path (``None``) —
+    never a heuristic guess.
+    """
+    selected = str(getattr(payload, "strategy_id", None) or "").strip()
+    grants = await _repo(request).active_grants(
+        token_id=token.token_id, account_id=payload.account_scope
+    )
+    if selected:
+        grant = next((item for item in grants if item["strategy_id"] == selected), None)
+        if grant is None:
+            # Refused *before* any run is created, so a selection can never leave
+            # an orphan run behind.
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "rejection_reason": "STRATEGY_NOT_GRANTED",
+                    "strategy_id": selected,
+                    "strategy_run_id": strategy_run_id,
+                },
+            )
+    elif len(grants) == 1:
+        grant = grants[0]
+    else:
+        return None
+
+    return RunBindingInput(
+        strategy_id=str(grant["strategy_id"]),
+        owner_id=str(grant["owner_id"]),
+        account_id=str(grant["account_scope"]),
+        execution_environment=payload.execution_mode,
+        bound_by=f"worker:{token.token_id}",
+        binding_source="external_run_create",
+    )
+
+
 async def create_worker_run_for_token(
     request: Request,
     token: WorkerToken,
     payload: WorkerRunCreateRequest,
     *,
     strategy_run_id: Optional[str] = None,
+    binding: Optional[RunBindingInput] = None,
 ) -> Dict[str, Any]:
     """Create a worker run bound to ``token``.
 
@@ -652,6 +702,11 @@ async def create_worker_run_for_token(
     run. It is deliberately NOT a bare INSERT: callers must already hold a token
     that scopes the account/template/mode, and this function re-validates all of
     them.
+
+    Strategy identity is resolved **server-side only**: a hosted run binds from
+    its persisted job (the descriptor the supervisor derived), an external run
+    binds only from an owner-issued token grant, and a run with neither is
+    explicitly legacy/unattributed. Payload metadata is never identity.
     """
     _require_v1_mode(payload.execution_mode)
     try:
@@ -688,6 +743,28 @@ async def create_worker_run_for_token(
         payload = payload.model_copy(update={"runtime_state": runtime_state})
 
     strategy_run_id = strategy_run_id or payload.strategy_run_id or f"run_{uuid.uuid4().hex}"
+
+    hosted_run = is_hosted_template_id(payload.template_id)
+    if hosted_run:
+        if binding is None:
+            # A hosted run must always bind. Reaching here means the supervisor
+            # did not derive a descriptor from the persisted job — a server-side
+            # invariant violation, never a silent legacy run.
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "rejection_reason": "HOSTED_RUN_BINDING_FAILED",
+                    "strategy_run_id": strategy_run_id,
+                    "message": "hosted runs must bind from their persisted job",
+                },
+            )
+    elif binding is None:
+        binding = await _resolve_grant_binding(request, token, payload, strategy_run_id=strategy_run_id)
+
+    if binding is not None:
+        # The environment is the run's own server-validated execution mode: a
+        # caller cannot move a run into another book by claiming one.
+        binding = replace(binding, execution_environment=payload.execution_mode)
 
     metadata = dict(payload.metadata or {})
     runtime_state = dict(payload.runtime_state or {})
@@ -739,7 +816,29 @@ async def create_worker_run_for_token(
         )
 
     try:
-        return await _repo(request).create_run(token, payload, strategy_run_id=strategy_run_id)
+        created = await _repo(request).create_run_with_binding(
+            token, payload, strategy_run_id=strategy_run_id, binding=binding
+        )
+    except RunBindingFailed as exc:
+        logger.warning(
+            "algo_worker_run_binding_failed",
+            extra={
+                "strategy_run_id": strategy_run_id,
+                "account_scope": payload.account_scope,
+                "execution_mode": payload.execution_mode,
+                "template_id": payload.template_id,
+                "hosted": hosted_run,
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "rejection_reason": (
+                    "HOSTED_RUN_BINDING_FAILED" if hosted_run else "RUN_BINDING_FAILED"
+                ),
+                "strategy_run_id": strategy_run_id,
+            },
+        ) from exc
     except IntegrityError as exc:
         logger.warning(
             "algo_worker_run_create_conflict",
@@ -762,3 +861,16 @@ async def create_worker_run_for_token(
             },
         )
         raise HTTPException(status_code=503, detail="Worker run persistence unavailable") from exc
+
+    # Attribution is reported explicitly, so a caller can tell a bound run from
+    # the legacy/unattributed compatibility path without inferring it.
+    attribution: Any = (
+        {
+            "strategy_id": binding.strategy_id,
+            "execution_environment": binding.execution_environment,
+            "binding_source": binding.binding_source,
+        }
+        if binding is not None
+        else "legacy_unattributed"
+    )
+    return {**dict(created), "strategy_attribution": attribution}

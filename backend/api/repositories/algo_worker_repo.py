@@ -180,7 +180,42 @@ class SqlAlchemyAlgoWorkerRepository:
         return await asyncio.to_thread(self._record_heartbeat_sync, token_id, payload)
 
     async def create_run(self, token: WorkerToken, payload: WorkerRunCreateRequest, *, strategy_run_id: str) -> Dict[str, Any]:
-        return await asyncio.to_thread(self._create_run_sync, token, payload, strategy_run_id)
+        """Create a run with no strategy binding (the legacy-compatible path)."""
+        return await self.create_run_with_binding(
+            token, payload, strategy_run_id=strategy_run_id, binding=None
+        )
+
+    async def create_run_with_binding(
+        self,
+        token: WorkerToken,
+        payload: WorkerRunCreateRequest,
+        *,
+        strategy_run_id: str,
+        binding: Optional["RunBindingInput"] = None,
+    ) -> Dict[str, Any]:
+        """Insert the run and its trusted strategy binding atomically.
+
+        One session/transaction: a crash or failure leaves **neither** row.
+        ``binding=None`` is the explicit legacy-compatibility path.
+        """
+        from backend.strategies.attribution import SqlAttributionStore
+
+        store = SqlAttributionStore(session_factory=self.session_factory)
+        await asyncio.to_thread(
+            store.create_run_with_binding,
+            token=token,
+            payload=payload,
+            strategy_run_id=strategy_run_id,
+            binding=binding,
+        )
+        return await asyncio.to_thread(self._get_run_sync, strategy_run_id)
+
+    async def active_grants(self, *, token_id: str, account_id: str) -> List[Dict[str, str]]:
+        """Active token→strategy grants whose canonical account matches exactly."""
+        from backend.strategies.attribution import SqlAttributionStore
+
+        store = SqlAttributionStore(session_factory=self.session_factory)
+        return await asyncio.to_thread(store.active_grants, token_id=token_id, account_id=account_id)
 
     async def get_run(self, strategy_run_id: str) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self._get_run_sync, strategy_run_id)

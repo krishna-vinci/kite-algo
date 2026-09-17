@@ -93,6 +93,10 @@ class WorkerRunCreateRequest(BaseModel):
     template_id: str = Field(min_length=1)
     account_scope: str = Field(min_length=1)
     execution_mode: str = "paper"
+    #: Optional *selection* among the token's granted canonical strategies. It
+    #: can never invent a strategy: an ungranted id is refused, and a token with
+    #: no grant falls back to the explicit legacy/unattributed path.
+    strategy_id: Optional[str] = None
     summary_fields: List[Dict[str, Any]] = Field(default_factory=list)
     risk_schema: List[Dict[str, Any]] = Field(default_factory=list)
     allowed_actions: List[str] = Field(default_factory=lambda: ["edit_risk", "exit_strategy"])

@@ -44,9 +44,11 @@ from sqlalchemy import delete, select, text
 
 from backend.shared.serialization import _json_dumps, _row_mapping
 from backend.strategies.attribution_models import (
+    Strategy,
     StrategyPositionProjection,
     StrategyProjectionState,
     StrategyRunBinding,
+    WorkerTokenStrategyGrant,
 )
 
 #: The immutable book dimension. Equal to the run's persisted execution mode.
@@ -136,6 +138,15 @@ class AttributionFold:
                 )
             totals[key] = totals.get(key, 0) + int(fact.signed_quantity)
         return {key: quantity for key, quantity in sorted(totals.items()) if quantity != 0}
+
+
+class RunBindingFailed(RuntimeError):
+    """A run was inserted but its mandatory binding could not be written.
+
+    Raised only from :meth:`SqlAttributionStore.create_run_with_binding`. The run
+    insert happens first, so any failure after it is a binding failure, and the
+    caller's transaction is rolled back — neither row survives.
+    """
 
 
 @dataclass(frozen=True)
@@ -243,6 +254,144 @@ class SqlAttributionStore:
             if owns_db:
                 session.close()
 
+    # ------------------------------------------------------------------ grants
+
+    def active_grants(
+        self, *, token_id: str, account_id: str, db: Optional[Any] = None
+    ) -> List[Dict[str, str]]:
+        """Active token→strategy grants for one account.
+
+        A grant authorizes a token for a canonical strategy only while it is
+        unrevoked **and** the strategy's canonical account matches the requested
+        account exactly. A grant for another account is treated as absent — the
+        account check is a join condition, not a caller convention.
+        """
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            rows = session.execute(
+                select(
+                    Strategy.id,
+                    Strategy.owner_id,
+                    Strategy.account_scope,
+                )
+                .join(WorkerTokenStrategyGrant, WorkerTokenStrategyGrant.strategy_id == Strategy.id)
+                .where(
+                    WorkerTokenStrategyGrant.token_id == token_id,
+                    WorkerTokenStrategyGrant.revoked_at.is_(None),
+                    Strategy.account_scope == account_id,
+                )
+                .order_by(Strategy.id)
+            ).all()
+            return [
+                {
+                    "strategy_id": str(row[0]),
+                    "owner_id": str(row[1]),
+                    "account_scope": str(row[2]),
+                }
+                for row in rows
+            ]
+        finally:
+            if owns_db:
+                session.close()
+
+    def grant_strategy(
+        self,
+        *,
+        token_id: str,
+        strategy_id: str,
+        granted_by: str,
+        db: Optional[Any] = None,
+    ) -> None:
+        """Issue (or re-issue) a token→strategy grant.
+
+        Re-issuing clears a previous revocation; the row is never deleted, so
+        the grant history survives revocation.
+        """
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            existing = session.execute(
+                select(WorkerTokenStrategyGrant).where(
+                    WorkerTokenStrategyGrant.token_id == token_id,
+                    WorkerTokenStrategyGrant.strategy_id == strategy_id,
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                session.add(
+                    WorkerTokenStrategyGrant(
+                        token_id=token_id,
+                        strategy_id=strategy_id,
+                        granted_by=granted_by,
+                    )
+                )
+            else:
+                existing.revoked_at = None
+                existing.granted_by = granted_by
+                existing.granted_at = _utcnow()
+            session.flush()
+            if owns_db:
+                session.commit()
+        except Exception:
+            if owns_db:
+                session.rollback()
+            raise
+        finally:
+            if owns_db:
+                session.close()
+
+    def revoke_grant(
+        self, *, token_id: str, strategy_id: str, db: Optional[Any] = None
+    ) -> bool:
+        """Revoke a grant by stamping ``revoked_at``. History is never deleted."""
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            grant = session.execute(
+                select(WorkerTokenStrategyGrant).where(
+                    WorkerTokenStrategyGrant.token_id == token_id,
+                    WorkerTokenStrategyGrant.strategy_id == strategy_id,
+                )
+            ).scalar_one_or_none()
+            if grant is None:
+                return False
+            grant.revoked_at = _utcnow()
+            session.flush()
+            if owns_db:
+                session.commit()
+            return True
+        except Exception:
+            if owns_db:
+                session.rollback()
+            raise
+        finally:
+            if owns_db:
+                session.close()
+
+    def canonical_strategy(
+        self, *, strategy_id: str, owner_id: Optional[str] = None, db: Optional[Any] = None
+    ) -> Optional[Dict[str, str]]:
+        """Read one canonical strategy row (optionally owner-scoped)."""
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            query = select(Strategy).where(Strategy.id == strategy_id)
+            if owner_id is not None:
+                query = query.where(Strategy.owner_id == owner_id)
+            row = session.execute(query).scalar_one_or_none()
+            if row is None:
+                return None
+            return {
+                "strategy_id": str(row.id),
+                "owner_id": str(row.owner_id),
+                "name": str(row.name),
+                "account_scope": str(row.account_scope),
+                "status": str(row.status),
+            }
+        finally:
+            if owns_db:
+                session.close()
+
     def create_run_with_binding(
         self,
         *,
@@ -296,16 +445,21 @@ class SqlAttributionStore:
                 },
             ).fetchone()
             if binding is not None:
-                self.bind_run(
-                    strategy_run_id=strategy_run_id,
-                    strategy_id=binding.strategy_id,
-                    owner_id=binding.owner_id,
-                    account_id=binding.account_id,
-                    execution_environment=binding.execution_environment,
-                    bound_by=binding.bound_by,
-                    binding_source=binding.binding_source,
-                    db=session,
-                )
+                try:
+                    self.bind_run(
+                        strategy_run_id=strategy_run_id,
+                        strategy_id=binding.strategy_id,
+                        owner_id=binding.owner_id,
+                        account_id=binding.account_id,
+                        execution_environment=binding.execution_environment,
+                        bound_by=binding.bound_by,
+                        binding_source=binding.binding_source,
+                        db=session,
+                    )
+                except Exception as exc:
+                    # The run insert already ran, so any failure here is a
+                    # binding failure; the caller's rollback removes both rows.
+                    raise RunBindingFailed(str(exc)) from exc
             session.commit()
             result = _row_mapping(row) if row is not None else {}
             return {

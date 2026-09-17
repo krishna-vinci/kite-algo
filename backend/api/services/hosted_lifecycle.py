@@ -49,6 +49,7 @@ from backend.api.routers.worker_shared import (
 )
 from backend.api.schemas.worker import WorkerRunCreateRequest, WorkerTokenCreateRequest
 from backend.strategies import service as strategy_service
+from backend.strategies.attribution import RunBindingInput
 from backend.strategies.models import StrategyJob
 from backend.strategies.redaction import redact_text
 from backend.strategies.repository import SqlAlchemyStrategyRepository
@@ -402,7 +403,23 @@ async def prepare_launch(
     )
 
     try:
-        await create_worker_run_for_token(request, child_token, run_payload, strategy_run_id=run_id)
+        await create_worker_run_for_token(
+            request,
+            child_token,
+            run_payload,
+            strategy_run_id=run_id,
+            # Identity comes from the PERSISTED JOB, never from run metadata
+            # (`metadata.hosted_strategy_id` is informational only and is not
+            # proof of anything).
+            binding=RunBindingInput(
+                strategy_id=job.strategy_id,
+                owner_id=job.owner_id,
+                account_id=job.account_scope,
+                execution_environment=job.execution_mode,
+                bound_by="supervisor",
+                binding_source="hosted_job",
+            ),
+        )
     except Exception as exc:
         await _abort(
             "run_create_failed",
