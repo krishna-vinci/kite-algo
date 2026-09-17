@@ -541,6 +541,18 @@ class StrategyPlan(Base):
             name="fk_plans_strategy_canonical",
             ondelete="RESTRICT",
         ),
+        # Declared because ``strategy_proposals`` IS in this metadata: it orders
+        # the unit of work so the envelope is written before the plan that
+        # references it. The FK to ``instrument_catalog_generations`` stays
+        # undeclared for the same reason the platform FKs do — that table has no
+        # ORM model here, so the database (migration and schema.sql) is the
+        # enforcement point.
+        ForeignKeyConstraint(
+            ["proposal_id"],
+            ["strategy_proposals.proposal_id"],
+            name="fk_plans_proposal",
+            ondelete="RESTRICT",
+        ),
         Index("idx_plans_strategy", "strategy_id", "created_at"),
     )
 

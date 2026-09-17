@@ -359,6 +359,11 @@ class ProposalStore:
             )
 
             plan_view: Optional[Dict[str, Any]] = None
+            # The envelope must reach the database before the plan that
+            # references it. Flushing here makes that ordering explicit rather
+            # than depending on the unit of work's table sort — still ONE
+            # transaction, so a later failure still leaves no plan behind.
+            session.flush()
             if refusal is not None:
                 session.add(
                     StrategyProposalJournal(
