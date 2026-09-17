@@ -446,3 +446,128 @@ class StrategyAttributionAdjustmentLine(Base):
             "product",
         ),
     )
+
+
+class StrategyProposal(Base):
+    """The durable envelope of one market decision (R3 §6).
+
+    ``UNIQUE (strategy_id, evaluation_id)`` is the whole cardinality contract:
+    one evaluation identity creates at most one envelope, whose payload is stored
+    verbatim beside its ``payload_sha256`` so "same evaluation, different
+    decision" stays decidable after the fact. Trigger-immutable.
+    """
+
+    __tablename__ = "strategy_proposals"
+
+    proposal_id = Column(Text, primary_key=True)
+    strategy_id = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    evaluation_id = Column(Text, nullable=False)
+    evaluation_kind = Column(Text, nullable=False)
+    job_id = Column(Text, nullable=True)
+    strategy_run_id = Column(Text, nullable=False)
+    target_kind = Column(Text, nullable=False)
+    payload = Column(JSON, nullable=False)
+    payload_sha256 = Column(Text, nullable=False)
+    status = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("strategy_id", "evaluation_id", name="uq_proposals_strategy_evaluation"),
+        CheckConstraint(
+            "evaluation_kind IN ('scheduled_occurrence', 'run_now')",
+            name="ck_proposals_evaluation_kind",
+        ),
+        CheckConstraint(
+            "target_kind IN ('single_instrument', 'target_weights')",
+            name="ck_proposals_target_kind",
+        ),
+        CheckConstraint("status IN ('received', 'validated', 'refused')", name="ck_proposals_status"),
+        CheckConstraint(
+            "evaluation_kind <> 'scheduled_occurrence' OR job_id IS NOT NULL",
+            name="ck_proposals_scheduled_requires_job",
+        ),
+        ForeignKeyConstraint(
+            ["strategy_id", "account_id"],
+            ["strategies.id", "strategies.account_scope"],
+            name="fk_proposals_strategy_canonical",
+            ondelete="RESTRICT",
+        ),
+        Index("idx_proposals_strategy", "strategy_id", "created_at"),
+    )
+
+
+class StrategyPlan(Base):
+    """The immutable resolved artifact: logical + resolved + the pin (R3 §7).
+
+    Resolution happens once, against ``pinned_catalog_generation``. Invalidation
+    is derived at read time (a newer generation that re-maps a pinned instrument
+    or retires its record), never stored, so a plan is never rewritten when the
+    catalog moves — and an unrelated generation change leaves it valid.
+
+    ``pinned_catalog_generation`` is ``Text`` here per the portability precedent
+    (the migration and ``schema.sql`` keep the native ``UUID`` and the FK: a plan
+    can never point at a generation that does not exist).
+    """
+
+    __tablename__ = "strategy_plans"
+
+    plan_id = Column(Text, primary_key=True)
+    proposal_id = Column(Text, nullable=False)
+    strategy_id = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    plan_kind = Column(Text, nullable=False)
+    plan_hash = Column(Text, nullable=False)
+    logical_plan = Column(JSON, nullable=False)
+    resolved_plan = Column(JSON, nullable=False)
+    pinned_universe_revision_id = Column(Text, nullable=True)
+    pinned_member_hash = Column(Text, nullable=True)
+    pinned_catalog_generation = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("proposal_id", name="uq_plans_proposal"),
+        CheckConstraint(
+            "plan_kind IN ('single_instrument', 'target_weights')", name="ck_plans_plan_kind"
+        ),
+        CheckConstraint(
+            "plan_kind <> 'target_weights' OR "
+            "(pinned_universe_revision_id IS NOT NULL AND pinned_member_hash IS NOT NULL)",
+            name="ck_plans_target_weights_scope",
+        ),
+        ForeignKeyConstraint(
+            ["strategy_id", "account_id"],
+            ["strategies.id", "strategies.account_scope"],
+            name="fk_plans_strategy_canonical",
+            ondelete="RESTRICT",
+        ),
+        Index("idx_plans_strategy", "strategy_id", "created_at"),
+    )
+
+
+class StrategyProposalJournal(Base):
+    """Append-only trail of what happened to an evaluation (R3 §19).
+
+    It duplicates no state: the envelope and the plan are the truth, the journal
+    is the sequence. A correction is a NEW event; a refusal is terminal.
+    """
+
+    __tablename__ = "strategy_proposal_journal"
+
+    id = Column(Text, primary_key=True)
+    strategy_id = Column(Text, nullable=False)
+    evaluation_id = Column(Text, nullable=True)
+    proposal_id = Column(Text, nullable=True)
+    event = Column(Text, nullable=False)
+    reason_code = Column(Text, nullable=True)
+    detail = Column(JSON, nullable=False, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "event IN ('received', 'idempotent_retry', 'conflict', "
+            "'validation_refused', 'plan_created')",
+            name="ck_proposal_journal_event",
+        ),
+        Index("idx_proposal_journal_strategy", "strategy_id", "created_at"),
+    )

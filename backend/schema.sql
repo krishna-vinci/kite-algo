@@ -2766,3 +2766,124 @@ DROP TRIGGER IF EXISTS trg_strategy_attribution_adjustment_lines_immutable
 CREATE TRIGGER trg_strategy_attribution_adjustment_lines_immutable
     BEFORE UPDATE OR DELETE ON public.strategy_attribution_adjustment_lines
     FOR EACH ROW EXECUTE FUNCTION forbid_strategy_attribution_adjustment_mutation();
+
+-- ---------------------------------------------------------------------------
+-- Proposal envelopes, frozen plans and the proposal journal (G5 / R3 §6, §7)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS public.strategy_proposals (
+    proposal_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    evaluation_id TEXT NOT NULL,
+    evaluation_kind TEXT NOT NULL,
+    job_id TEXT,
+    strategy_run_id TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- One evaluation identity creates at most one envelope; a continuous job may
+    -- hold many evaluations, so nothing limits evaluations per job.
+    CONSTRAINT uq_proposals_strategy_evaluation UNIQUE (strategy_id, evaluation_id),
+    CONSTRAINT ck_proposals_evaluation_kind
+        CHECK (evaluation_kind IN ('scheduled_occurrence', 'run_now')),
+    CONSTRAINT ck_proposals_target_kind
+        CHECK (target_kind IN ('single_instrument', 'target_weights')),
+    CONSTRAINT ck_proposals_status CHECK (status IN ('received', 'validated', 'refused')),
+    -- A scheduled occurrence always names the job that produced it.
+    CONSTRAINT ck_proposals_scheduled_requires_job
+        CHECK (evaluation_kind <> 'scheduled_occurrence' OR job_id IS NOT NULL),
+    CONSTRAINT fk_proposals_strategy_canonical
+        FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_proposals_strategy
+    ON public.strategy_proposals (strategy_id, created_at);
+
+CREATE TABLE IF NOT EXISTS public.strategy_plans (
+    plan_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    proposal_id UUID NOT NULL,
+    strategy_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    plan_kind TEXT NOT NULL,
+    plan_hash TEXT NOT NULL,
+    logical_plan JSONB NOT NULL,
+    resolved_plan JSONB NOT NULL,
+    pinned_universe_revision_id TEXT,
+    pinned_member_hash TEXT,
+    pinned_catalog_generation UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Exactly one frozen plan per proposal envelope.
+    CONSTRAINT uq_plans_proposal UNIQUE (proposal_id),
+    CONSTRAINT ck_plans_plan_kind
+        CHECK (plan_kind IN ('single_instrument', 'target_weights')),
+    -- A full-snapshot plan cannot honour "omission means target zero" without
+    -- both its revision and its member hash.
+    CONSTRAINT ck_plans_target_weights_scope
+        CHECK (plan_kind <> 'target_weights'
+               OR (pinned_universe_revision_id IS NOT NULL AND pinned_member_hash IS NOT NULL)),
+    CONSTRAINT fk_plans_proposal FOREIGN KEY (proposal_id)
+        REFERENCES public.strategy_proposals (proposal_id) ON DELETE RESTRICT,
+    -- A plan can never point at a generation that does not exist.
+    CONSTRAINT fk_plans_pinned_generation FOREIGN KEY (pinned_catalog_generation)
+        REFERENCES public.instrument_catalog_generations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_plans_strategy_canonical
+        FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_plans_strategy
+    ON public.strategy_plans (strategy_id, created_at);
+
+CREATE TABLE IF NOT EXISTS public.strategy_proposal_journal (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_id TEXT NOT NULL,
+    evaluation_id TEXT,
+    proposal_id UUID,
+    event TEXT NOT NULL,
+    reason_code TEXT,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_proposal_journal_event CHECK (
+        event IN ('received', 'idempotent_retry', 'conflict', 'validation_refused', 'plan_created')
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_proposal_journal_strategy
+    ON public.strategy_proposal_journal (strategy_id, created_at);
+
+-- Insert-only enforcement: envelopes, plans and the journal are immutable facts.
+-- A correction is a NEW journal event; a refused evaluation is terminal.
+CREATE OR REPLACE FUNCTION forbid_strategy_proposal_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_proposals are immutable (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_strategy_proposals_immutable ON public.strategy_proposals;
+CREATE TRIGGER trg_strategy_proposals_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_proposals
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_proposal_mutation();
+
+CREATE OR REPLACE FUNCTION forbid_strategy_plan_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_plans are immutable (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_strategy_plans_immutable ON public.strategy_plans;
+CREATE TRIGGER trg_strategy_plans_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_plans
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_plan_mutation();
+
+CREATE OR REPLACE FUNCTION forbid_strategy_proposal_journal_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_proposal_journal is append-only (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_strategy_proposal_journal_immutable
+    ON public.strategy_proposal_journal;
+CREATE TRIGGER trg_strategy_proposal_journal_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_proposal_journal
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_proposal_journal_mutation();
