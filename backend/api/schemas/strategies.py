@@ -617,3 +617,50 @@ class ApprovalRequestModel(BaseModel):
 
     reservation_id: str = Field(min_length=1, max_length=64)
     validity_seconds: int = Field(default=900, gt=0, le=86400)
+
+
+# ---------------------------------------------------------------------------
+# Settlement evidence surfaces (G7): owner read + assess trigger
+# ---------------------------------------------------------------------------
+
+
+class SettlementAxisResponse(BaseModel):
+    """One settlement axis (R3 §16): satisfied/failed/unknown plus its digest."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    satisfied: bool
+    state: str
+    evidence_digest: str
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SettlementAssessmentResponse(BaseModel):
+    """An append-only assessment SNAPSHOT (D-5), never a settlement state.
+
+    ``stale`` is derived at read time by comparing the snapshot's
+    ``barrier_version`` with the barrier's current version: a later work event
+    (a late fill) makes a ``settled`` snapshot detectably stale.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    assessment_id: str
+    strategy_id: str
+    account_id: str
+    execution_environment: str
+    overall: str
+    barrier_version: int
+    axes: Dict[str, SettlementAxisResponse] = Field(default_factory=dict)
+    evidence_digest: str
+    created_at: Optional[str] = None
+    stale: bool = False
+
+
+class SettlementAssessRequest(BaseModel):
+    """Owner trigger for one assessment. Nothing else is configurable here:
+    the axes, the barrier and the rollup are the platform's, not the caller's."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    environment: Optional[str] = None

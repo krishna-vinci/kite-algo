@@ -441,6 +441,32 @@ class _OwnerApiHarness(unittest.IsolatedAsyncioTestCase):
             # unresolved raw identities, which is a real production state.
             cursor.execute(
                 """
+                CREATE TABLE public.algo_worker_runs (
+                    strategy_run_id TEXT PRIMARY KEY, token_id TEXT, template_id TEXT,
+                    account_scope TEXT, execution_mode TEXT, status TEXT NOT NULL DEFAULT 'open'
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.account_positions (
+                    account_id TEXT NOT NULL, instrument_token BIGINT NOT NULL,
+                    product TEXT NOT NULL, exchange TEXT, tradingsymbol TEXT,
+                    net_quantity INT NOT NULL DEFAULT 0, updated_at TEXT,
+                    PRIMARY KEY (account_id, instrument_token, product)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.strategy_jobs (
+                    id TEXT PRIMARY KEY, strategy_id TEXT NOT NULL, owner_id TEXT,
+                    account_scope TEXT, execution_mode TEXT, status TEXT NOT NULL DEFAULT 'queued'
+                )
+                """
+            )
+            cursor.execute(
+                """
                 CREATE TABLE public.instrument_catalog_generations (
                     id TEXT PRIMARY KEY, status TEXT, published_at TEXT
                 )
@@ -1684,3 +1710,182 @@ class AdmissionOwnerApiTests(_ProposalApiHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Task 5 (G7): owner settlement evidence surfaces
+# ---------------------------------------------------------------------------
+
+
+class SettlementApiTests(_OwnerApiHarness):
+    """GET /settlement and POST /settlement/assess: owner-only, account-authorized,
+    worker-proof, and honest about staleness (a settled snapshot is not a state)."""
+
+    def _barrier(self):
+        from backend.strategies.settlement import ExecutionBarrier
+
+        return ExecutionBarrier(session_factory=self.factory)
+
+    async def _assess(self, client, sid, **body):
+        return await client.post(f"{BASE}/{sid}/settlement/assess", json=body)
+
+    async def test_owner_can_assess_and_read_the_snapshot(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+
+            # No proof yet: the snapshot is honest (quiescence unknown ⇒ unknown),
+            # and it is persisted so the read surface has something to return.
+            assessed = await self._assess(client, sid)
+            self.assertEqual(assessed.status_code, 200, assessed.text)
+            body = assessed.json()
+            self.assertEqual(body["overall"], "unknown")
+            self.assertEqual(body["strategy_id"], sid)
+            self.assertEqual(body["account_id"], "kite:paper")
+            self.assertEqual(body["execution_environment"], "live")
+            self.assertFalse(body["stale"])
+            for axis in (
+                "quiescence",
+                "attribution_scoped_flatness",
+                "terminal_domain_state",
+                "no_live_evaluation_authority",
+            ):
+                self.assertIn(axis, body["axes"])
+                self.assertIn("state", body["axes"][axis])
+                self.assertIn("evidence_digest", body["axes"][axis])
+            self.assertEqual(body["axes"]["quiescence"]["state"], "unknown")
+
+            # Read back the latest snapshot.
+            fetched = await client.get(f"{BASE}/{sid}/settlement")
+            self.assertEqual(fetched.status_code, 200, fetched.text)
+            self.assertEqual(fetched.json()["assessment_id"], body["assessment_id"])
+            self.assertEqual(fetched.json()["overall"], "unknown")
+        finally:
+            self._stop_patches()
+
+    async def test_valid_proof_settles_and_a_later_work_event_marks_it_stale(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+
+            barrier = self._barrier()
+            barrier.record_proof(
+                account_id="kite:paper", strategy_id=sid, execution_environment="live"
+            )
+            settled = await self._assess(client, sid)
+            self.assertEqual(settled.status_code, 200, settled.text)
+            self.assertEqual(settled.json()["overall"], "settled")
+            self.assertFalse(settled.json()["stale"])
+
+            # A late fill (work_created) invalidates: the snapshot is detectably
+            # stale on read — it is never rewritten into a fresh-looking state.
+            barrier.record_work_event(
+                account_id="kite:paper", strategy_id=sid, execution_environment="live",
+                event="work_created", ref="fill:late-1",
+            )
+            fetched = await client.get(f"{BASE}/{sid}/settlement")
+            self.assertEqual(fetched.status_code, 200)
+            self.assertTrue(fetched.json()["stale"])
+            self.assertEqual(fetched.json()["overall"], "settled")  # snapshot, not state
+        finally:
+            self._stop_patches()
+
+    async def test_read_without_any_assessment_is_404(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+            response = await client.get(f"{BASE}/{sid}/settlement")
+            self.assertEqual(response.status_code, 404, response.text)
+        finally:
+            self._stop_patches()
+
+    async def test_surfaces_are_owner_scoped_and_cross_owner_is_404(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+            await self._assess(client, sid)
+        finally:
+            self._stop_patches()
+
+        client = self._client(username="other")
+        try:
+            self.assertEqual(
+                (await client.get(f"{BASE}/{sid}/settlement")).status_code, 404
+            )
+            self.assertEqual(
+                (await self._assess(client, sid)).status_code, 404
+            )
+        finally:
+            self._stop_patches()
+
+    async def test_worker_bearer_token_cannot_reach_settlement_surfaces(self):
+        client = self._client(username=None)
+        try:
+            headers = {"Authorization": "Bearer kwa_something"}
+            self.assertEqual(
+                (await client.get(f"{BASE}/stg-1/settlement", headers=headers)).status_code, 401
+            )
+            self.assertEqual(
+                (await client.post(f"{BASE}/stg-1/settlement/assess", json={}, headers=headers)).status_code,
+                401,
+            )
+        finally:
+            self._stop_patches()
+
+    async def test_unauthorized_account_is_403(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+            # Move the canonical strategy's account out of the authorized scopes:
+            # ownership holds, account authorization does not.
+            with self.factory() as session:
+                session.execute(
+                    text("UPDATE strategies SET account_scope = 'kite:OTHER' WHERE id = :sid"),
+                    {"sid": sid},
+                )
+                session.commit()
+            self.assertEqual(
+                (await client.get(f"{BASE}/{sid}/settlement")).status_code, 403
+            )
+            self.assertEqual((await self._assess(client, sid)).status_code, 403)
+        finally:
+            self._stop_patches()
+
+    async def test_environment_is_validated_and_unknown_fields_are_refused(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+            self.assertEqual(
+                (await client.get(f"{BASE}/{sid}/settlement?environment=banana")).status_code, 422
+            )
+            self.assertEqual(
+                (await self._assess(client, sid, environment="banana")).status_code, 422
+            )
+            self.assertEqual(
+                (await self._assess(client, sid, environment="paper", bogus=True)).status_code, 422
+            )
+            paper = await self._assess(client, sid, environment="paper")
+            self.assertEqual(paper.status_code, 200, paper.text)
+            self.assertEqual(paper.json()["execution_environment"], "paper")
+        finally:
+            self._stop_patches()
+
+    async def test_assess_enforces_same_origin(self):
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+            response = await client.post(
+                f"{BASE}/{sid}/settlement/assess",
+                json={},
+                headers={"Origin": "http://evil.example"},
+            )
+            self.assertEqual(response.status_code, 403)
+        finally:
+            self._stop_patches()

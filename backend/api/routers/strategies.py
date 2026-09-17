@@ -67,6 +67,9 @@ from backend.api.schemas.strategies import (
     ReconciliationAuditResponse,
     ReconciliationAssessmentResponse,
     ReconciliationInspectionResponse,
+    SettlementAssessRequest,
+    SettlementAssessmentResponse,
+    SettlementAxisResponse,
     JobLogEntryResponse,
     JobLogsResponse,
     RunNotificationEventResponse,
@@ -1739,3 +1742,103 @@ async def get_job_notifications(
             )
         )
     return RunNotificationListResponse(job_id=job.id, run_id=job.run_id, events=payload_events)
+
+
+# ---------------------------------------------------------------------------
+# Settlement evidence (G7) — owner read + assessment trigger
+# ---------------------------------------------------------------------------
+
+
+def _settlement_service(session_factory: Any):
+    from backend.strategies.settlement import SettlementService
+
+    return SettlementService(session_factory=session_factory)
+
+
+def _authorized_strategy_account(
+    repo: SqlAlchemyStrategyRepository, owner: str, strategy_id: str
+) -> str:
+    """Ownership + account authorization for the settlement surfaces.
+
+    Same discipline as every money-adjacent surface in this router: cross-owner
+    is 404 (no existence leak); a canonical account outside the operator's
+    authorized scopes is 403. The account comes from the canonical strategy,
+    never from the caller.
+    """
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    account_scope = str(canonical.account_scope)
+    authorize_account_scope(account_scope)
+    return account_scope
+
+
+def _settlement_out(assessment: Dict[str, Any]) -> SettlementAssessmentResponse:
+    return SettlementAssessmentResponse(
+        assessment_id=str(assessment["assessment_id"]),
+        strategy_id=str(assessment["strategy_id"]),
+        account_id=str(assessment["account_id"]),
+        execution_environment=str(assessment["execution_environment"]),
+        overall=str(assessment["overall"]),
+        barrier_version=int(assessment["barrier_version"]),
+        axes={
+            name: SettlementAxisResponse(**axis) for name, axis in (assessment.get("axes") or {}).items()
+        },
+        evidence_digest=str(assessment["evidence_digest"]),
+        created_at=_iso(assessment.get("created_at")),
+        stale=bool(assessment.get("stale")),
+    )
+
+
+@router.get("/{strategy_id}/settlement", response_model=SettlementAssessmentResponse)
+async def get_strategy_settlement(
+    strategy_id: str,
+    environment: Optional[str] = Query(default=None),
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """The latest settlement assessment snapshot for one book (D-5).
+
+    Read-only: the axes and the rollup travel with their evidence digests, and
+    ``stale`` is derived on read against the barrier's CURRENT version — a
+    ``settled`` snapshot after new work reads as stale, never as fresh.
+    """
+    _owned_strategy(repo, owner, strategy_id)
+    account_scope = _authorized_strategy_account(repo, owner, strategy_id)
+    env = _environment_param(environment)
+    latest = _settlement_service(session_factory).latest_assessment(
+        account_id=account_scope, strategy_id=strategy_id, execution_environment=env
+    )
+    if latest is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No settlement assessment for this strategy and environment",
+        )
+    return _settlement_out(latest)
+
+
+@router.post("/{strategy_id}/settlement/assess", response_model=SettlementAssessmentResponse)
+async def assess_strategy_settlement(
+    strategy_id: str,
+    request: Request,
+    payload: SettlementAssessRequest = Body(default=SettlementAssessRequest()),
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Trigger one four-axis assessment and return the appended snapshot.
+
+    Owner action: the assessment appends evidence, it never mutates the
+    barrier, the books or any blocked state — releasing attribution, claims or
+    reconciliation blocks stays the consumers' decision, and ``unknown`` never
+    releases.
+    """
+    enforce_same_origin(request)
+    account_scope = _authorized_strategy_account(repo, owner, strategy_id)
+    env = _environment_param(payload.environment)
+    assessment = _settlement_service(session_factory).assess(
+        account_id=account_scope, strategy_id=strategy_id, execution_environment=env
+    )
+    return _settlement_out(assessment)
