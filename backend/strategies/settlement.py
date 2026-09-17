@@ -439,6 +439,12 @@ class ExecutionBarrier:
         owns_db = db is None
         session = db or self.session_factory()
         try:
+            # Work transitions serialize against proofs on the SAME book lock:
+            # a bump can never land inside another transaction's proof window.
+            # Correctness does not depend on this (version arithmetic invalidates
+            # any proof a mid-flight bump could race), but the serialization keeps
+            # the barrier's history linear per book.
+            self._lock_barrier(session, account_id, strategy_id, execution_environment)
             version = self._bump_version(session, account_id, strategy_id, execution_environment)
             session.add(
                 StrategyExecutionBarrierEvent(

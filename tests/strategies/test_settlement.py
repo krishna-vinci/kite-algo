@@ -504,6 +504,25 @@ class ProofTests(SettlementTestCase):
             type(self.barrier)._lock_barrier = staticmethod(original)
         self.assertEqual(calls, [(ACCOUNT, STRATEGY, ENV)])
 
+    def test_work_events_take_the_same_book_lock(self):
+        """Work bumps serialize on the book lock too: no bump inside a proof window."""
+        calls = []
+
+        original = type(self.barrier)._lock_barrier
+
+        def _spy(session, account_id, strategy_id, execution_environment):
+            calls.append((account_id, strategy_id, execution_environment))
+            return original(session, account_id, strategy_id, execution_environment)
+
+        type(self.barrier)._lock_barrier = staticmethod(_spy)
+        try:
+            self.barrier.record_work_event(
+                account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV, event="work_created"
+            )
+        finally:
+            type(self.barrier)._lock_barrier = staticmethod(original)
+        self.assertEqual(calls, [(ACCOUNT, STRATEGY, ENV)])
+
 
 class InflightEnumerationTests(SettlementTestCase):
     def _enumerate(self):
