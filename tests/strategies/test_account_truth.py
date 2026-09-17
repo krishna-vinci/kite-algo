@@ -574,5 +574,36 @@ class AdjustmentFoldTests(AccountTruthTestCase):
         self.assertEqual(record["lines"][0]["effective_at"], record["created_at"])
 
 
+class ReconciliationVersionTests(ReconciliationTests):
+    """D-8: the counter an approval pins, bumped with the state it describes."""
+
+    def test_version_bumps_only_when_classification_changes(self):
+        self._seed_broker(qty=90)
+        self._seed_book(qty=100)
+        service = self._service(max_attempts=1)
+
+        # First check establishes the classification: nothing to compare against,
+        # so the version moves (the account's reconciliation state changed).
+        first = asyncio.run(service.reconcile_account("kite:A"))
+        version_after_first = self.store.reconciliation_version(account_id="kite:A")
+        self.assertEqual(version_after_first, 1)
+        self.assertEqual(first["reconciliation_version"], 1)
+
+        # A second identical check changes nothing and must NOT bump: a stable
+        # account must not invalidate approvals just because time passed.
+        second = asyncio.run(service.reconcile_account("kite:A"))
+        self.assertEqual(self.store.reconciliation_version(account_id="kite:A"), 1)
+        self.assertIsNone(second["reconciliation_version"])
+
+        # A real change bumps it — and monotonically.
+        self._seed_broker(qty=95)
+        third = asyncio.run(service.reconcile_account("kite:A"))
+        self.assertEqual(self.store.reconciliation_version(account_id="kite:A"), 2)
+        self.assertEqual(third["reconciliation_version"], 2)
+
+    def test_version_is_zero_before_any_reconciliation(self):
+        self.assertEqual(self.store.reconciliation_version(account_id="kite:never"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -53,6 +53,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from backend.strategies.attribution_models import (
     AccountIngestState,
+    AccountReconciliationVersion,
     BrokerTradeFact,
     StrategyAttributionAdjustmentLine,
     StrategyPositionProjection,
@@ -404,6 +405,51 @@ class AccountTruthStore:
             return set()
         return {str(row[0]) for row in rows}
 
+    # ------------------------------------------------- reconciliation version
+
+    def reconciliation_version(self, *, account_id: str, db: Optional[Any] = None) -> int:
+        """The account's monotonic reconciliation version (0 when never bumped)."""
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            row = session.execute(
+                select(AccountReconciliationVersion).where(
+                    AccountReconciliationVersion.account_id == str(account_id)
+                )
+            ).scalar_one_or_none()
+        finally:
+            if owns_db:
+                session.close()
+        return int(row.version) if row is not None else 0
+
+    def bump_reconciliation_version(self, *, account_id: str, db: Optional[Any] = None) -> int:
+        """Increment the counter, or create it at 1. Caller owns the transaction."""
+        session = db or self.session_factory()
+        owns_db = db is None
+        try:
+            row = session.execute(
+                select(AccountReconciliationVersion).where(
+                    AccountReconciliationVersion.account_id == str(account_id)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = AccountReconciliationVersion(account_id=str(account_id), version=1)
+                session.add(row)
+            else:
+                row.version = int(row.version or 0) + 1
+                row.updated_at = _utcnow()
+            session.flush()
+            if owns_db:
+                session.commit()
+            return int(row.version)
+        except SQLAlchemyError:
+            if owns_db:
+                session.rollback()
+            return 0
+        finally:
+            if owns_db:
+                session.close()
+
     # --------------------------------------------------------- adjustments
 
     def create_reclassification(self, **kwargs: Any) -> Dict[str, Any]:
@@ -714,6 +760,10 @@ class ReconciliationService:
 
         coordinates: Set[Coordinate] = set(broker) | set(attributed) | set(manual)
         results: List[Dict[str, Any]] = []
+        # One session for every state write plus the version bump: the D-8 counter
+        # must commit with the classification it describes, never beside it.
+        session = self.store.session_factory()
+        changed = False
         for coordinate in sorted(coordinates):
             broker_quantity = int(broker.get(coordinate, 0))
             attributed_quantity = int(attributed.get(coordinate, 0))
@@ -780,7 +830,16 @@ class ReconciliationService:
                 refresh_attempts=attempts,
                 resolved=divergence == ALIGNED,
                 owner_notified_at=notified_at if divergence == UNEXPLAINED else None,
+                db=session,
             )
+            if (
+                str(prior.get("divergence_class") or "") != divergence
+                or int(prior.get("residual_quantity") or 0) != residual
+            ):
+                # Any coordinate whose classification or residual moved makes the
+                # account's reconciliation version stale — which is what
+                # invalidates an approval that pinned it (D-8).
+                changed = True
             results.append(
                 {
                     "coordinate": coordinate,
@@ -793,10 +852,20 @@ class ReconciliationService:
                     "owner_notified_at": notified_at,
                 }
             )
+
+        # ONE transaction: the version is bumped in the same commit as the state
+        # it describes, so a reader can never see a version that disagrees with
+        # the classification it claims to summarise.
+        version = None
+        if changed:
+            version = self.store.bump_reconciliation_version(account_id=account_id, db=session)
+        await self._run_async(session.commit)
+        await self._run_async(session.close)
         return {
             "account_id": account_id,
             "coordinates": results,
             "frozen": [row["coordinate"] for row in results if row["divergence_class"] != ALIGNED],
+            "reconciliation_version": version,
         }
 
     def _classify(self, *, residual: int, attempts: int, ingest_state: Dict[str, Any]) -> str:

@@ -2887,3 +2887,138 @@ DROP TRIGGER IF EXISTS trg_strategy_proposal_journal_immutable
 CREATE TRIGGER trg_strategy_proposal_journal_immutable
     BEFORE UPDATE OR DELETE ON public.strategy_proposal_journal
     FOR EACH ROW EXECUTE FUNCTION forbid_strategy_proposal_journal_mutation();
+
+-- ---------------------------------------------------------------------------
+-- Admission policies, durable reservations, approvals (G9+G10+G6 / R3 §8, §6)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS public.strategy_admission_policies (
+    strategy_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    allocation_inr DOUBLE PRECISION,
+    per_instrument_notional_inr DOUBLE PRECISION,
+    gross_notional_inr DOUBLE PRECISION,
+    max_open_instruments INTEGER,
+    admissions_per_window INTEGER,
+    admission_window_seconds INTEGER,
+    daily_loss_budget_inr DOUBLE PRECISION,
+    updated_by TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- A NULL axis means "not enforced", which is different from zero and stays
+    -- distinguishable. allocation_inr is REQUIRED for a live strategy, enforced
+    -- by the service because a paper-only strategy may legitimately have none.
+    CONSTRAINT ck_sap_allocation_non_negative
+        CHECK (allocation_inr IS NULL OR allocation_inr >= 0),
+    CONSTRAINT ck_sap_admissions_per_window
+        CHECK (admissions_per_window IS NULL OR admissions_per_window > 0),
+    CONSTRAINT fk_sap_strategy_canonical
+        FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS public.strategy_reservations (
+    reservation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id UUID NOT NULL,
+    strategy_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    evaluation_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    reserved_notional_inr DOUBLE PRECISION NOT NULL,
+    margin_evidence JSONB,
+    margin_as_of TIMESTAMPTZ,
+    valid_until TIMESTAMPTZ NOT NULL,
+    renewed_at TIMESTAMPTZ,
+    released_at TIMESTAMPTZ,
+    release_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- One plan claims capacity once, ever.
+    CONSTRAINT uq_reservations_plan UNIQUE (plan_id),
+    CONSTRAINT ck_res_execution_environment
+        CHECK (execution_environment IN ('live', 'paper', 'dry_run')),
+    CONSTRAINT ck_res_status CHECK (status IN (
+        'active', 'renewed', 'consumed', 'released', 'expired', 'action_required'
+    )),
+    -- A reservation is MUTABLE (it has a lifecycle), which is why it carries no
+    -- insert-only trigger; the append-only record lives in the event log below.
+    CONSTRAINT ck_res_notional_non_negative CHECK (reserved_notional_inr >= 0),
+    CONSTRAINT fk_res_plan FOREIGN KEY (plan_id)
+        REFERENCES public.strategy_plans (plan_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_res_strategy_canonical
+        FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_reservations_account_status
+    ON public.strategy_reservations (account_id, status);
+
+CREATE TABLE IF NOT EXISTS public.strategy_reservation_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    reservation_id UUID NOT NULL,
+    event TEXT NOT NULL,
+    actor_id TEXT,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_res_event CHECK (event IN (
+        'created', 'renewed', 'advanced', 'consumed', 'released', 'expired',
+        'action_required', 'disposition_confirmed'
+    )),
+    CONSTRAINT fk_res_event_reservation FOREIGN KEY (reservation_id)
+        REFERENCES public.strategy_reservations (reservation_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_reservation_events
+    ON public.strategy_reservation_events (reservation_id, created_at);
+
+CREATE TABLE IF NOT EXISTS public.strategy_approvals (
+    approval_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id UUID NOT NULL,
+    strategy_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    reservation_id UUID NOT NULL,
+    plan_hash TEXT NOT NULL,
+    exposure_snapshot_version BIGINT NOT NULL,
+    exposure_snapshot_hash TEXT,
+    reconciliation_version BIGINT NOT NULL,
+    catalog_generation UUID NOT NULL,
+    session_product_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    actor_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    valid_from TIMESTAMPTZ NOT NULL,
+    valid_until TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_appr_status CHECK (status IN ('active', 'expired', 'superseded', 'revoked')),
+    CONSTRAINT fk_appr_plan FOREIGN KEY (plan_id)
+        REFERENCES public.strategy_plans (plan_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_appr_reservation FOREIGN KEY (reservation_id)
+        REFERENCES public.strategy_reservations (reservation_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_appr_strategy_canonical
+        FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
+-- At most ONE active approval per plan, enforced by the database: a concurrent
+-- double-approval resolves to a unique violation, never to two live approvals.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_approvals_plan_active
+    ON public.strategy_approvals (plan_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_approvals_strategy
+    ON public.strategy_approvals (strategy_id, created_at);
+
+-- The counter an approval pins, so divergence discovered AFTER approval
+-- invalidates it. Bumped inside reconcile_account in the same transaction as the
+-- state write, so the version can never disagree with the classification.
+CREATE TABLE IF NOT EXISTS public.account_reconciliation_versions (
+    account_id TEXT PRIMARY KEY,
+    version BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Append-only event log; the reservation row itself is mutable by design.
+CREATE OR REPLACE FUNCTION forbid_strategy_reservation_event_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_reservation_events are append-only (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_strategy_reservation_events_immutable
+    ON public.strategy_reservation_events;
+CREATE TRIGGER trg_strategy_reservation_events_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_reservation_events
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_reservation_event_mutation();

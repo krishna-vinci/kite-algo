@@ -583,3 +583,197 @@ class StrategyProposalJournal(Base):
         ),
         Index("idx_proposal_journal_strategy", "strategy_id", "created_at"),
     )
+
+
+class StrategyAdmissionPolicy(Base):
+    """The recorded basis for every admission decision (G9).
+
+    ``allocation_inr`` is REQUIRED for a live strategy and enforced by the
+    service, not the database: a paper-only strategy may legitimately have none,
+    and 0 is a real limit that must stay distinguishable from NULL ("not
+    enforced"). Without a recorded allocation, capital enforcement would be
+    unenforceable the moment someone asked what the limit was.
+    """
+
+    __tablename__ = "strategy_admission_policies"
+
+    strategy_id = Column(Text, primary_key=True)
+    account_id = Column(Text, nullable=False)
+    allocation_inr = Column(Float, nullable=True)
+    per_instrument_notional_inr = Column(Float, nullable=True)
+    gross_notional_inr = Column(Float, nullable=True)
+    max_open_instruments = Column(Integer, nullable=True)
+    admissions_per_window = Column(Integer, nullable=True)
+    admission_window_seconds = Column(Integer, nullable=True)
+    daily_loss_budget_inr = Column(Float, nullable=True)
+    updated_by = Column(Text, nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "allocation_inr IS NULL OR allocation_inr >= 0", name="ck_sap_allocation_non_negative"
+        ),
+        CheckConstraint(
+            "admissions_per_window IS NULL OR admissions_per_window > 0",
+            name="ck_sap_admissions_per_window",
+        ),
+        ForeignKeyConstraint(
+            ["strategy_id", "account_id"],
+            ["strategies.id", "strategies.account_scope"],
+            name="fk_sap_strategy_canonical",
+            ondelete="RESTRICT",
+        ),
+    )
+
+
+class StrategyReservation(Base):
+    """A durable capacity claim against one plan (G10).
+
+    Mutable by design — a reservation has a lifecycle — so unlike every other
+    table in this campaign it carries no insert-only trigger. The append-only
+    record is :class:`StrategyReservationEvent`. ``UNIQUE (plan_id)`` makes one
+    plan claim capacity once, ever.
+    """
+
+    __tablename__ = "strategy_reservations"
+
+    reservation_id = Column(Text, primary_key=True)
+    plan_id = Column(Text, nullable=False)
+    strategy_id = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    evaluation_id = Column(Text, nullable=False)
+    execution_environment = Column(Text, nullable=False)
+    status = Column(Text, nullable=False, server_default="active")
+    reserved_notional_inr = Column(Float, nullable=False)
+    margin_evidence = Column(JSON, nullable=True)
+    margin_as_of = Column(DateTime(timezone=True), nullable=True)
+    valid_until = Column(DateTime(timezone=True), nullable=False)
+    renewed_at = Column(DateTime(timezone=True), nullable=True)
+    released_at = Column(DateTime(timezone=True), nullable=True)
+    release_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("plan_id", name="uq_reservations_plan"),
+        CheckConstraint(
+            "execution_environment IN ('live', 'paper', 'dry_run')",
+            name="ck_res_execution_environment",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'renewed', 'consumed', 'released', 'expired', "
+            "'action_required')",
+            name="ck_res_status",
+        ),
+        CheckConstraint("reserved_notional_inr >= 0", name="ck_res_notional_non_negative"),
+        # Declared because both tables are in this metadata: it orders the unit of
+        # work. The composite FK to ``strategies`` is declared too, matching the
+        # G1 precedent; the FK to ``strategy_plans`` is what the migration and
+        # schema.sql carry for the database's own enforcement.
+        ForeignKeyConstraint(
+            ["plan_id"],
+            ["strategy_plans.plan_id"],
+            name="fk_res_plan",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["strategy_id", "account_id"],
+            ["strategies.id", "strategies.account_scope"],
+            name="fk_res_strategy_canonical",
+            ondelete="RESTRICT",
+        ),
+        Index("idx_reservations_account_status", "account_id", "status"),
+    )
+
+
+class StrategyReservationEvent(Base):
+    """Append-only record of every reservation transition. Trigger-immutable."""
+
+    __tablename__ = "strategy_reservation_events"
+
+    id = Column(Text, primary_key=True)
+    reservation_id = Column(Text, nullable=False)
+    event = Column(Text, nullable=False)
+    actor_id = Column(Text, nullable=True)
+    detail = Column(JSON, nullable=False, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "event IN ('created', 'renewed', 'advanced', 'consumed', 'released', "
+            "'expired', 'action_required', 'disposition_confirmed')",
+            name="ck_res_event",
+        ),
+        ForeignKeyConstraint(
+            ["reservation_id"],
+            ["strategy_reservations.reservation_id"],
+            name="fk_res_event_reservation",
+            ondelete="RESTRICT",
+        ),
+        Index("idx_reservation_events", "reservation_id", "created_at"),
+    )
+
+
+class StrategyApproval(Base):
+    """The owner's authorisation, bound to every structural pin (G6).
+
+    At most one ``active`` row per plan — the partial unique index
+    ``uq_approvals_plan_active`` is the real contract, so a concurrent
+    double-approval cannot produce two live approvals. Superseding inserts a NEW
+    row and marks the old one superseded; approvals are never rewritten.
+    """
+
+    __tablename__ = "strategy_approvals"
+
+    approval_id = Column(Text, primary_key=True)
+    plan_id = Column(Text, nullable=False)
+    strategy_id = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    reservation_id = Column(Text, nullable=False)
+    plan_hash = Column(Text, nullable=False)
+    exposure_snapshot_version = Column(BigInteger, nullable=False)
+    exposure_snapshot_hash = Column(Text, nullable=True)
+    reconciliation_version = Column(BigInteger, nullable=False)
+    catalog_generation = Column(Text, nullable=False)
+    session_product_snapshot = Column(JSON, nullable=False, server_default=text("'{}'"))
+    actor_id = Column(Text, nullable=False)
+    status = Column(Text, nullable=False, server_default="active")
+    valid_from = Column(DateTime(timezone=True), nullable=False)
+    valid_until = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'expired', 'superseded', 'revoked')", name="ck_appr_status"
+        ),
+        ForeignKeyConstraint(
+            ["plan_id"], ["strategy_plans.plan_id"], name="fk_appr_plan", ondelete="RESTRICT"
+        ),
+        ForeignKeyConstraint(
+            ["reservation_id"],
+            ["strategy_reservations.reservation_id"],
+            name="fk_appr_reservation",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["strategy_id", "account_id"],
+            ["strategies.id", "strategies.account_scope"],
+            name="fk_appr_strategy_canonical",
+            ondelete="RESTRICT",
+        ),
+        Index("idx_approvals_strategy", "strategy_id", "created_at"),
+    )
+
+
+class AccountReconciliationVersion(Base):
+    """Monotonic counter of an account's reconciliation state (D-8).
+
+    An approval pins the value so divergence discovered *after* approval
+    invalidates it — which is the whole point: the owner approved a book that was
+    aligned, and if it stops being aligned the approval must say so.
+    """
+
+    __tablename__ = "account_reconciliation_versions"
+
+    account_id = Column(Text, primary_key=True)
+    version = Column(BigInteger, nullable=False, server_default="0")
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
