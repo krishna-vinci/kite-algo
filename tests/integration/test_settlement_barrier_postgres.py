@@ -510,15 +510,12 @@ def test_concurrent_proof_and_work_serialize_on_the_book_lock(disposable_db):
     seed_binding(sf)
     barrier = ExecutionBarrier(session_factory=sf)
 
-    proof_done = threading.Event()
-
     def _proof():
         # Holds the book lock for its whole transaction: the work transaction
         # below must wait for it (or run entirely before it).
         outcome["proof"] = barrier.record_proof(
             account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment="live"
         )
-        proof_done.set()
 
     def _work():
         # Non-terminal order + its work transition in ONE transaction.
@@ -578,7 +575,6 @@ def test_concurrent_proof_and_work_serialize_on_the_book_lock(disposable_db):
     else:
         assert proof.reason == "inflight_work_present"
         assert not state["proof_valid"]
-    _ = proof_done
 
 
 # ---------------------------------------------------------------------------
