@@ -37,6 +37,62 @@ def _worker_protection_squareoff_schedule() -> dict[str, str]:
         logging.warning("Invalid WORKER_PROTECTION_SQUAREOFF_SCHEDULE_JSON; using defaults", exc_info=True)
         return defaults
 
+async def _account_ingest_loop(app: FastAPI):
+    """Bounded account-wide fill ingestion, one cycle per interval.
+
+    Account truth cannot be assembled on demand at exit time: a fill the platform
+    never tracked must already be persisted before reconciliation can tell a
+    missing-ingest divergence from a real one. Each account is isolated, so one
+    broker error leaves that account's ingest state ``stale`` without stalling
+    the others.
+    """
+    from backend.strategies.account_truth import AccountTruthService, AccountTruthStore
+
+    interval = max(
+        5.0,
+        float(os.getenv("ACCOUNT_INGEST_INTERVAL_SECONDS", "60")),
+    )
+
+    def _accounts() -> list:
+        raw = str(os.getenv("ACCOUNT_INGEST_ACCOUNT_SCOPES", "") or "")
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    store = getattr(app.state, "account_truth_store", None)
+    if store is None:
+        store = AccountTruthStore()
+        app.state.account_truth_store = store
+    service = getattr(app.state, "account_truth_service", None)
+    if service is None:
+        service = AccountTruthService(store)
+        app.state.account_truth_service = service
+
+    set_component_status("account_ingest", "healthy", detail="Account ingest runtime started")
+    while True:
+        try:
+            account_ids = await asyncio.to_thread(_accounts)
+            if account_ids:
+                results = await service.ingest_accounts(account_ids)
+                errors = sorted(a for a, r in results.items() if r.get("error"))
+                heartbeat(
+                    "account_ingest",
+                    detail="Ingested account-wide fill truth",
+                    meta={"accounts": len(results), "failed": errors, "interval_seconds": interval},
+                )
+            else:
+                heartbeat(
+                    "account_ingest",
+                    detail="No accounts configured for ingest",
+                    meta={"interval_seconds": interval},
+                )
+        except asyncio.CancelledError:
+            set_component_status("account_ingest", "stopped", detail="Account ingest runtime cancelled")
+            break
+        except Exception as exc:
+            logging.warning("Account ingest loop failed: %s", exc, exc_info=True)
+            set_component_status("account_ingest", "degraded", detail=str(exc))
+        await asyncio.sleep(interval)
+
+
 def ensure_attribution_state(app: FastAPI) -> None:
     """Wire the attribution store and service into app state (idempotent).
 

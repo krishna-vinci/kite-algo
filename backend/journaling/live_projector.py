@@ -29,32 +29,18 @@ def _cost_contract(value: Any) -> ExecutionCostContract:
     return ExecutionCostContract(charges_status=ChargesStatus.UNAVAILABLE)
 
 
-def _is_reducing_fill(*, net_quantity: int, side: str, quantity: int) -> bool:
-    normalized = str(side or "").upper()
-    if net_quantity > 0 and normalized == "SELL":
-        return quantity <= abs(net_quantity)
-    if net_quantity < 0 and normalized == "BUY":
-        return quantity <= abs(net_quantity)
-    return False
-
-
 def resolve_external_fill_run(*, repository: JournalRepository, fill: Dict[str, Any]) -> Dict[str, str]:
-    candidates = repository.find_open_live_runs_for_instrument(
-        account_id=str(fill["account_id"]),
-        instrument_token=int(fill["instrument_token"]),
-        product=str(fill["product"]),
-    )
-    reducing_candidates = [
-        candidate
-        for candidate in candidates
-        if _is_reducing_fill(
-            net_quantity=int(candidate.get("net_quantity") or 0),
-            side=str(fill.get("transaction_type") or ""),
-            quantity=int(fill.get("quantity") or 0),
-        )
-    ]
-    if len(reducing_candidates) == 1:
-        return {"resolution": "external_exit", "run_id": str(reducing_candidates[0]["run_id"])}
+    """Every untagged fill is broker-imported truth, never a guessed strategy exit.
+
+    This used to attach an untagged reducing fill to the *only* matching open run
+    — a unique-candidate heuristic. That rule is deliberately gone: "exactly one
+    open run happens to hold this instrument" is not evidence of ownership, and
+    guessing here silently credits (or debits) a strategy with a human's trade.
+    An untagged fill is unattributed; it becomes manual/imported exposure and is
+    surfaced by reconciliation, where the account owner can reclassify it with an
+    audited, append-only adjustment (R3 §17).
+    """
+    _ = (repository, fill)
     return {"resolution": "broker_import", "run_id": ""}
 
 
@@ -76,20 +62,13 @@ class LiveJournalProjector:
                 contract = _cost_contract(intent.get("cost_contract_json"))
                 projected += 1
             else:
+                # Untagged: imported broker activity, never a guessed strategy exit.
                 resolved = resolve_external_fill_run(repository=self.repository, fill=fill)
-                if resolved["resolution"] == "external_exit" and resolved.get("run_id"):
-                    run_id = resolved["run_id"]
-                    source_type = SourceType.LIVE_FILL
-                    contract = _cost_contract(None)
-                    resolution = "external_exit"
-                    external_exit += 1
-                    projected += 1
-                else:
-                    run_id = self.repository.ensure_imported_broker_run(account_id=str(fill["account_id"]))
-                    source_type = SourceType.BROKER_IMPORT
-                    contract = _cost_contract(None)
-                    resolution = "broker_import"
-                    imported += 1
+                run_id = self.repository.ensure_imported_broker_run(account_id=str(fill["account_id"]))
+                source_type = SourceType.BROKER_IMPORT
+                contract = _cost_contract(None)
+                resolution = resolved["resolution"]
+                imported += 1
 
             fees = contract.brokerage + contract.exchange_txn_charge
             taxes = contract.stt + contract.stamp_duty + contract.sebi_charge + contract.gst

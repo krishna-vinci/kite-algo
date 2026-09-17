@@ -15,6 +15,7 @@ from backend.api.repositories.algo_worker_repo import (
     WORKER_SESSION_CLAIM_WITHOUT_HEARTBEAT_SECONDS,
 )
 from backend.app.background import (
+    _account_ingest_loop,
     _bracket_executor_loop,
     _worker_protection_loop,
     _worker_runtime_recovery_exit_loop,
@@ -470,6 +471,11 @@ async def combined_lifespan(app: FastAPI):
         # Durable strategy attribution: construct the shared store/service up
         # front. Publication stays on-demand (no loop is started here).
         ensure_attribution_state(app)
+
+        if os.getenv("ACCOUNT_INGEST_ENABLED", "true").lower() in {"1", "true", "yes"}:
+            account_ingest_task = asyncio.create_task(_account_ingest_loop(app))
+        else:
+            set_component_status("account_ingest", "disabled", detail="Account ingest disabled by ACCOUNT_INGEST_ENABLED")
 
         if os.getenv("WORKER_PROTECTION_ENABLED", "true").lower() in {"1", "true", "yes"}:
             worker_protection_task = asyncio.create_task(_worker_protection_loop(app))
