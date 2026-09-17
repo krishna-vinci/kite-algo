@@ -50,6 +50,7 @@ __all__ = [
     "_journal_service",
     "_live_broker_positions_for_attribution",
     "_live_run_legs",
+    "_assert_not_frozen",
     "_load_live_kite_for_account",
     "_load_live_kite_for_worker_account_scope",
     "_market_data_service",
@@ -552,6 +553,40 @@ async def _live_broker_positions_for_attribution(
             }
         )
     return exposure
+
+async def _assert_not_frozen(request: Any, *, account_id: str, orders: List[Dict[str, Any]]) -> None:
+    """Refuse exposure-increasing live orders on a frozen coordinate.
+
+    Freezing is per ``(account, exchange, tradingsymbol, product)`` and
+    asymmetric: a coordinate whose truth is reconciling admits risk-reducing
+    orders and refuses everything that would add exposure, with the named reason
+    ``RECONCILIATION_FREEZE``. A database without persisted reconciliation state
+    has nothing frozen, which is the pre-G4 behavior.
+    """
+    store = getattr(request.app.state, "account_truth_store", None)
+    if store is None or not orders:
+        return
+    from backend.strategies.account_truth import ALIGNED, coordinate_of, reconciliation_refusal
+
+    state = await asyncio.to_thread(store.reconciliation_state, account_id=account_id)
+    if not state:
+        return
+    nets = await asyncio.to_thread(store.broker_quantities, account_id=account_id)
+    for order in orders:
+        coordinate = coordinate_of(order)
+        entry = state.get(coordinate)
+        if not entry or str(entry.get("divergence_class")) == ALIGNED:
+            continue
+        refusal = reconciliation_refusal(
+            account_id=account_id,
+            coordinate=coordinate,
+            divergence_class=str(entry.get("divergence_class")),
+            side=str(order.get("transaction_type") or ""),
+            net_quantity=int(nets.get(coordinate, 0)),
+        )
+        if refusal is not None:
+            raise HTTPException(status_code=403, detail=refusal)
+
 
 async def _live_run_legs(request: Any, run: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Open legs for a run: the strategy book when bound, else run-scoped links.

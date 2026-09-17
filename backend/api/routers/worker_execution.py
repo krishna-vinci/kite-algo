@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from sqlalchemy import text
 from backend.app.database import SessionLocal
@@ -35,6 +35,11 @@ async def _submit_live_worker_intent(*, request: Request, token: WorkerToken, ru
     if payload.intent_type == "place_order":
         order_payload = payload.payload.get("order") or payload.payload
         req = PlaceOrderRequest.model_validate(_inject_live_attribution(order_payload, attribution))
+        await _assert_not_frozen(
+            request,
+            account_id=str(run["account_scope"]),
+            orders=[req.model_dump(mode="json")],
+        )
         result = await orders_service.place_order(
             kite,
             req,
@@ -50,6 +55,11 @@ async def _submit_live_worker_intent(*, request: Request, token: WorkerToken, ru
         orders = [_inject_live_attribution(order, attribution) for order in basket_payload.get("orders") or []]
         basket_payload["orders"] = orders
         req = BasketOrderRequest.model_validate(basket_payload)
+        await _assert_not_frozen(
+            request,
+            account_id=str(run["account_scope"]),
+            orders=[dict(order) for order in basket_payload.get("orders") or []],
+        )
         basket_execution_id = _live_basket_execution_id(
             strategy_run_id=str(run["strategy_run_id"]),
             idempotency_key=payload.idempotency_key,
@@ -205,7 +215,19 @@ def _inject_live_attribution(order_payload: Dict[str, Any], attribution: Dict[st
     order["attribution"] = dict(attribution)
     return order
 
-def _validate_live_exit_legs(legs: List[Dict[str, Any]]) -> None:
+def _validate_live_exit_legs(
+    legs: List[Dict[str, Any]],
+    *,
+    reconciliation_detail: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+) -> None:
+    """One-sided broker-net guard on an exit sized from the strategy book.
+
+    The arithmetic is deliberately unchanged: an exit sized to attributed
+    quantity can exceed the broker net when a manual residual has already
+    reduced it. What is new is that the refusal names the reconciliation state,
+    so walkthrough-7 case 2 is explicit instead of looking like a broker
+    inconsistency.
+    """
     for leg in legs:
         net_quantity = int(leg.get("net_quantity") or 0)
         broker_net_quantity = leg.get("broker_net_quantity")
@@ -218,15 +240,48 @@ def _validate_live_exit_legs(legs: List[Dict[str, Any]]) -> None:
             )
         broker_net = int(broker_net_quantity or 0)
         if net_quantity > 0 and broker_net < net_quantity:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Live exit cannot proceed because broker net quantity for {leg.get('tradingsymbol')} is lower than the attributed long quantity",
-            )
+            detail: Any = f"Live exit cannot proceed because broker net quantity for {leg.get('tradingsymbol')} is lower than the attributed long quantity"
+            if reconciliation_detail is not None:
+                detail = reconciliation_detail(leg) or detail
+            raise HTTPException(status_code=409, detail=detail)
         if net_quantity < 0 and broker_net > net_quantity:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Live exit cannot proceed because broker net quantity for {leg.get('tradingsymbol')} is lower than the attributed short quantity",
-            )
+            detail = f"Live exit cannot proceed because broker net quantity for {leg.get('tradingsymbol')} is lower than the attributed short quantity"
+            if reconciliation_detail is not None:
+                detail = reconciliation_detail(leg) or detail
+            raise HTTPException(status_code=409, detail=detail)
+
+def _exit_reconciliation_detail(request: Request, account_id: str):
+    """Name the reconciliation state when a full exit is blocked by a manual residual.
+
+    Returns ``None`` when the account has no persisted classification, so the
+    guard's message is unchanged wherever reconciliation has nothing to say.
+    """
+    store = getattr(request.app.state, "account_truth_store", None)
+    if store is None:
+        return None
+    try:
+        state = store.reconciliation_state(account_id=account_id)
+    except Exception:  # noqa: BLE001 - a display detail must never mask the guard
+        return None
+    if not state:
+        return None
+    from backend.strategies.account_truth import coordinate_of, unresolved_exit_detail
+
+    def _detail(leg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        entry = state.get(coordinate_of(leg))
+        if not entry:
+            return None
+        manual = int(entry.get("manual_quantity") or 0)
+        if manual >= 0:
+            return None
+        return unresolved_exit_detail(
+            divergence_class=str(entry.get("divergence_class")),
+            manual_quantity=manual,
+            broker_net=int(entry.get("broker_quantity") or 0),
+        )
+
+    return _detail
+
 
 def _live_exit_orders_from_legs(legs: List[Dict[str, Any]], attribution: Dict[str, Any]) -> List[Dict[str, Any]]:
     orders: List[Dict[str, Any]] = []
@@ -387,7 +442,7 @@ async def _exit_live_worker_run(*, request: Request, token: WorkerToken, run: Di
         )
         return {"mode": "live", "status": "closed", "message": "Live worker run is already flat", "run": updated}
 
-    _validate_live_exit_legs(legs)
+    _validate_live_exit_legs(legs, reconciliation_detail=_exit_reconciliation_detail(request, account_id))
     exit_idempotency_key = _live_exit_idempotency_key(
         strategy_run_id=strategy_run_id,
         legs=legs,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -383,6 +384,49 @@ async def _unattributed_bucket(
             positions.append(serialized)
     realized = sum(to_float(item.get("realized_pnl")) for item in positions)
     unrealized = sum(to_float(item.get("unrealized_pnl")) for item in positions)
+
+    # G4: when reconciliation has persisted a classification, the display reads
+    # it instead of leaving the operator to infer divergence from arithmetic.
+    # The inline subtraction above stays the fallback, so aligned data renders
+    # identically whether or not the reconciliation cycle has run.
+    reconciliation: list[Dict[str, Any]] = []
+    manual_by_coordinate: list[Dict[str, Any]] = []
+    store = getattr(request.app.state, "account_truth_store", None)
+    if store is not None and broker_account_id:
+        try:
+            state = await asyncio.to_thread(
+                store.reconciliation_state, account_id=broker_account_id
+            )
+            manual = await asyncio.to_thread(
+                store.manual_residual_by_coordinate, account_id=broker_account_id
+            )
+        except Exception:  # noqa: BLE001 - display parity outranks surfacing state
+            state, manual = {}, {}
+        reconciliation = [
+            {
+                "instrument_token": coordinate[0],
+                "exchange": coordinate[1],
+                "tradingsymbol": coordinate[2],
+                "product": coordinate[3],
+                "divergence_class": str(entry.get("divergence_class")),
+                "broker_quantity": int(entry.get("broker_quantity") or 0),
+                "attributed_quantity": int(entry.get("attributed_quantity") or 0),
+                "manual_quantity": int(entry.get("manual_quantity") or 0),
+                "residual_quantity": int(entry.get("residual_quantity") or 0),
+            }
+            for coordinate, entry in sorted(state.items())
+        ]
+        manual_by_coordinate = [
+            {
+                "instrument_token": coordinate[0],
+                "exchange": coordinate[1],
+                "tradingsymbol": coordinate[2],
+                "product": coordinate[3],
+                "manual_quantity": int(quantity),
+            }
+            for coordinate, quantity in sorted(manual.items())
+        ]
+
     return {
         "display_name": "Manual / unattributed broker exposure",
         "positions": positions,
@@ -390,6 +434,8 @@ async def _unattributed_bucket(
         "realized_pnl": realized,
         "unrealized_pnl": unrealized,
         "net_pnl": realized + unrealized,
+        "reconciliation": reconciliation,
+        "manual_quantity_by_coordinate": manual_by_coordinate,
     }
 
 

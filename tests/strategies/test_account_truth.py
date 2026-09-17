@@ -17,13 +17,20 @@ store reads are ``public.``-qualified.
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.strategies.account_truth import AccountTruthStore, AccountTruthService
+from backend.strategies.attribution import SqlAttributionStore
+from backend.strategies.account_truth import AccountTruthService, AccountTruthStore
+
+
+async def _inline(func, /, **kwargs):
+    """Run the store call inline so the service logic is what is under test."""
+    return func(**kwargs)
 from backend.workflows.repository import Base
 import backend.strategies.models  # noqa: F401  registers the hosted tables on Base
 import backend.strategies.attribution_models  # noqa: F401  registers the attribution/truth tables
@@ -203,6 +210,215 @@ class IngestServiceTests(AccountTruthTestCase):
         self.assertEqual(self.store.ingest_state(account_id="kite:BROKEN")["status"], "stale")
         self.assertEqual(self.store.fact_count(account_id="kite:A"), 1)
         self.assertEqual(self.store.fact_count(account_id="kite:C"), 1)
+
+
+class ReconciliationTests(AccountTruthTestCase):
+    """G4: classification, the bounded refresh, the freeze and escalation."""
+
+    def _seed_broker(self, *, qty, token=738561, symbol="RELIANCE", product="CNC", exchange="NSE"):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.account_positions (
+                        account_id TEXT NOT NULL, instrument_token BIGINT NOT NULL,
+                        exchange TEXT NOT NULL DEFAULT '', tradingsymbol TEXT NOT NULL DEFAULT '',
+                        product TEXT NOT NULL, net_quantity BIGINT NOT NULL,
+                        PRIMARY KEY (account_id, instrument_token, product)
+                    )
+                    """
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.account_positions "
+                    "(account_id, instrument_token, exchange, tradingsymbol, product, net_quantity) "
+                    "VALUES ('kite:A', :token, :exchange, :symbol, :product, :qty) "
+                    "ON CONFLICT (account_id, instrument_token, product) DO UPDATE SET net_quantity = :qty"
+                ),
+                {"token": token, "exchange": exchange, "symbol": symbol, "product": product, "qty": qty},
+            )
+            session.commit()
+
+    def _seed_book(self, *, qty, sid="stg-1", token=738561, symbol="RELIANCE"):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategies (id, owner_id, name, account_scope) "
+                    "VALUES (:sid, 'app:o', :name, 'kite:A')"
+                ),
+                {"sid": sid, "name": f"Strategy {sid}"},
+            )
+            session.commit()
+        recomputed = SqlAttributionStore(session_factory=self.factory)
+        import uuid as _uuid
+
+        identity = str(_uuid.uuid4())
+        recomputed.recompute_publish(
+            account_id="kite:A", strategy_id=sid, execution_environment="live",
+            resolve_and_fold=lambda db, bound: (
+                [{
+                    "identity_kind": "canonical", "identity_key": identity,
+                    "canonical_instrument_id": identity, "instrument_token": token,
+                    "exchange": "NSE", "tradingsymbol": symbol, "product": "CNC",
+                    "net_quantity": qty, "unresolved_reason": None,
+                }],
+                f"sha-{sid}-{qty}",
+            ),
+        )
+
+    def _service(self, **kwargs):
+        from backend.strategies.account_truth import ReconciliationService
+
+        return ReconciliationService(self.store, run_async=_inline, **kwargs)
+
+    def test_aligned_when_identity_holds(self):
+        self._seed_broker(qty=100)
+        self._seed_book(qty=100)
+        report = asyncio.run(self._service().reconcile_account("kite:A"))
+        self.assertEqual([c["divergence_class"] for c in report["coordinates"]], ["aligned"])
+        self.assertEqual(report["coordinates"][0]["residual_quantity"], 0)
+        self.assertEqual(report["frozen"], [])
+
+    def test_pending_ingest_then_aligned_after_refresh(self):
+        """A missing fill is `pending_ingest`, and ingesting it re-aligns."""
+        self._seed_broker(qty=90)
+        self._seed_book(qty=100)
+        missing = [self._trade("T-MISSING", order_id="OID-M", side="SELL", qty=10)]
+
+        class _Ingest:
+            def __init__(self):
+                self.calls = 0
+
+            async def ingest_account(self, account_id):
+                self.calls += 1
+                # The bounded refresh is what finds the missing truth.
+                self.store.ingest_trades(account_id=account_id, trades=missing)
+                return {"account_id": account_id, "inserted": 1}
+
+        ingest = _Ingest()
+        ingest.store = self.store
+        service = self._service(ingest_service=ingest, max_attempts=3)
+        first = asyncio.run(service.reconcile_account("kite:A"))
+        self.assertEqual(first["coordinates"][0]["divergence_class"], "pending_ingest")
+
+        # Now that the fill is ingested, the identity holds (100 = 100 + 0 - ...).
+        # The 10 the human sold is manual, so broker 90 == attributed 100 + manual -10.
+        second = asyncio.run(service.reconcile_account("kite:A"))
+        self.assertEqual(second["coordinates"][0]["divergence_class"], "aligned")
+        self.assertEqual(second["coordinates"][0]["manual_quantity"], -10)
+        self.assertEqual(second["frozen"], [])
+
+    def test_unexplained_after_bounded_attempts_escalates_once(self):
+        self._seed_broker(qty=90)
+        self._seed_book(qty=100)  # no fill will ever arrive for the missing 10
+        notifications = []
+
+        def notifier(account_id, divergence, coordinate, detail):
+            notifications.append((account_id, divergence, coordinate))
+            return True
+
+        service = self._service(max_attempts=2, notifier=notifier)
+        for _ in range(5):
+            asyncio.run(service.reconcile_account("kite:A"))
+
+        state = self.store.reconciliation_state(account_id="kite:A")[_coord()]
+        self.assertEqual(state["divergence_class"], "unexplained")
+        # Idempotent escalation: duplicate checks never re-notify.
+        self.assertEqual(len(notifications), 1)
+        self.assertIsNotNone(state["owner_notified_at"])
+
+    def test_failed_dispatch_leaves_the_stamp_unset_for_retry(self):
+        self._seed_broker(qty=90)
+        self._seed_book(qty=100)
+        sent = []
+
+        def failing(account_id, divergence, coordinate, detail):
+            sent.append(1)
+            return False  # e.g. no channel resolved
+
+        service = self._service(max_attempts=1, notifier=failing)
+        asyncio.run(service.reconcile_account("kite:A"))
+        asyncio.run(service.reconcile_account("kite:A"))
+        state = self.store.reconciliation_state(account_id="kite:A")[_coord()]
+        # Classification and the freeze never depend on notification success.
+        self.assertEqual(state["divergence_class"], "unexplained")
+        self.assertIsNone(state["owner_notified_at"])
+        self.assertEqual(len(sent), 2)  # retried on the later check
+
+    def test_freeze_is_coordinate_scoped(self):
+        self._seed_broker(qty=90)
+        self._seed_broker(qty=50, token=408065, symbol="INFY")
+        self._seed_book(qty=100)
+        self._seed_book(qty=50, sid="stg-2", token=408065, symbol="INFY")
+        service = self._service(max_attempts=1)
+        asyncio.run(service.reconcile_account("kite:A"))
+        self.assertEqual(
+            self.store.is_frozen_coordinate(account_id="kite:A", coordinate=_coord()),
+            "unexplained",
+        )
+        # A different instrument on the same account trades freely.
+        self.assertIsNone(
+            self.store.is_frozen_coordinate(account_id="kite:A", coordinate=_coord(token=408065, symbol="INFY"))
+        )
+
+
+class FreezeRefusalTests(unittest.TestCase):
+    """The freeze decision itself: asymmetric, named and coordinate-scoped."""
+
+    def test_freeze_refuses_exposure_increasing_live_order(self):
+        from backend.strategies.account_truth import reconciliation_refusal
+
+        refusal = reconciliation_refusal(
+            account_id="kite:A", coordinate=_coord(), divergence_class="unexplained",
+            side="BUY", net_quantity=40,
+        )
+        self.assertIsNotNone(refusal)
+        self.assertEqual(refusal["rejection_reason"], "RECONCILIATION_FREEZE")
+        self.assertEqual(refusal["coordinate"]["tradingsymbol"], "RELIANCE")
+        self.assertEqual(refusal["divergence_class"], "unexplained")
+        # pending_ingest freezes too — an uncertain residual is never harmless.
+        self.assertIsNotNone(
+            reconciliation_refusal(
+                account_id="kite:A", coordinate=_coord(), divergence_class="pending_ingest",
+                side="BUY", net_quantity=40,
+            )
+        )
+
+    def test_reducing_exit_permitted_under_freeze(self):
+        from backend.strategies.account_truth import reconciliation_refusal
+
+        self.assertIsNone(
+            reconciliation_refusal(
+                account_id="kite:A", coordinate=_coord(), divergence_class="unexplained",
+                side="SELL", net_quantity=100,
+            )
+        )
+        self.assertIsNone(
+            reconciliation_refusal(
+                account_id="kite:A", coordinate=_coord(), divergence_class="unexplained",
+                side="BUY", net_quantity=-100,
+            )
+        )
+        # Aligned admits everything.
+        self.assertIsNone(
+            reconciliation_refusal(
+                account_id="kite:A", coordinate=_coord(), divergence_class="aligned",
+                side="BUY", net_quantity=0,
+            )
+        )
+
+    def test_negative_manual_residual_blocks_full_exit_with_named_reason(self):
+        """Walkthrough 7 case 2: broker 70, the strategy owns 100."""
+        from backend.strategies.account_truth import unresolved_exit_detail
+
+        detail = unresolved_exit_detail(
+            divergence_class="unexplained", manual_quantity=-30, broker_net=70
+        )
+        self.assertEqual(detail["rejection_reason"], "MANUAL_RESIDUAL_BLOCKS_FULL_EXIT")
+        self.assertEqual(detail["manual_quantity"], -30)
+        self.assertIn("unexplained", detail["message"])
+        self.assertIn("30", detail["message"])
 
 
 if __name__ == "__main__":
