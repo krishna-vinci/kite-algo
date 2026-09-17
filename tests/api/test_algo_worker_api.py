@@ -3926,6 +3926,91 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.detail.get("rejection_reason"), "ORDER_OWNERSHIP_CONFLICT")
         orders.modify_order.assert_not_awaited()
 
+    async def test_cancel_stale_hosted_attempt_refused_before_mutation(self):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from backend.workflows.repository import Base
+        import backend.strategies.models  # noqa: F401  # registers strategy_jobs on Base.metadata
+
+        # StaticPool + check_same_thread=False so the in-memory schema is shared
+        # with the worker thread that asyncio.to_thread uses for the lookup.
+        engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(bind=engine)
+
+        token = WorkerToken(
+            token_id="child-token",
+            name="hosted-child",
+            account_scope="kite:AB1234",
+            allowed_modes=["paper", "live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=["hosted:stg1"],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs["run-hosted"] = {
+            "strategy_run_id": "run-hosted",
+            "token_id": "child-token",
+            "template_id": "hosted:stg1",
+            "account_scope": "kite:AB1234",
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {},
+        }
+        repo.live_order_ownership[("kite:AB1234", "OID-1")] = self._owned("OID-1", run_id="run-hosted")
+        request = self._request(repo)
+        request.app.state.strategies_session_factory = factory
+        orders = self._orders_service(cancel_order=AsyncMock(return_value={"order_id": "OID-1"}))
+        request.app.state.algo_worker_orders_service = orders
+
+        with self.assertRaises(HTTPException) as ctx:
+            await cancel_worker_order(request, "OID-1", WorkerOrderActionRequest(strategy_run_id="run-hosted"))
+
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertEqual(ctx.exception.detail.get("rejection_reason"), "HOSTED_ATTEMPT_UNKNOWN")
+        orders.cancel_order.assert_not_awaited()
+
+    async def test_cancel_cross_account_token_non_disclosing_and_refused(self):
+        # Pre-existing behavior, pinned: a token for another account is refused
+        # 403 by _assert_run_access before any ownership evidence is read.
+        repo = self._live_run_repo(account="kite:AB1234")
+        repo.token = WorkerToken(
+            token_id="worker-other",
+            name="other-worker",
+            account_scope="kite:OTHER",
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        request = self._request(repo)
+        orders = self._orders_service(cancel_order=AsyncMock(return_value={"order_id": "OID-1"}))
+        request.app.state.algo_worker_orders_service = orders
+
+        with self.assertRaises(HTTPException) as ctx:
+            await cancel_worker_order(request, "OID-1", WorkerOrderActionRequest(strategy_run_id="run-live"))
+
+        self.assertEqual(ctx.exception.status_code, 403)
+        orders.cancel_order.assert_not_awaited()
+
+    async def test_cancel_unknown_and_unowned_share_identical_refusal(self):
+        # Unknown order and another run's order must be indistinguishable.
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-B")] = self._owned("OID-B", run_id="run-other")
+        request = self._request(repo)
+        request.app.state.algo_worker_orders_service = self._orders_service(
+            cancel_order=AsyncMock(return_value={"order_id": "OID"}),
+        )
+        details = []
+        for order_id in ("OID-UNKNOWN", "OID-B"):
+            with self.assertRaises(HTTPException) as ctx:
+                await cancel_worker_order(request, order_id, WorkerOrderActionRequest(strategy_run_id="run-live"))
+            details.append((ctx.exception.status_code, ctx.exception.detail))
+        self.assertEqual(details[0], details[1])
+        self.assertEqual(details[0], (404, "Order not found for strategy run"))
+
     async def test_worker_preview_order_returns_margin_and_charges(self):
         token = WorkerToken(
             token_id="worker-live",
