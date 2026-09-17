@@ -152,6 +152,7 @@ class PinnedCatalogRead:
         catalog: Optional[PinnedInstrumentCatalog] = None,
         broker: str = "kite",
     ) -> None:
+        self.session_factory = session_factory
         self._catalog = catalog or PinnedInstrumentCatalog(
             session_factory, broker=broker, generation=generation
         )

@@ -18,6 +18,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from backend.strategies.compiler.base import member_hash
 from backend.workflows.repository import Base
 import backend.strategies.models  # noqa: F401  registers the hosted tables on Base
 import backend.strategies.attribution_models  # noqa: F401  registers the proposal tables
@@ -174,6 +175,30 @@ class ProposalTestCase(unittest.TestCase):
                     "vf": valid_from,
                     "vt": valid_to,
                     "cur": is_current,
+                },
+            )
+            session.commit()
+
+    def seed_universe_revision(self, revision_id, members, *, universe_id="uni-1", revision=1,
+                               source_generation=G1):
+        import json as _json
+
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.universe_revisions "
+                    "(id, universe_id, revision, members, member_count, source_generation, coverage, "
+                    " resolved_at, created_at) "
+                    "VALUES (:id, :universe_id, :revision, :members, :count, :gen, '{}', "
+                    " '2026-09-01T00:00:00+00:00', '2026-09-01T00:00:00+00:00')"
+                ),
+                {
+                    "id": revision_id,
+                    "universe_id": universe_id,
+                    "revision": revision,
+                    "members": _json.dumps(sorted(members)),
+                    "count": len(members),
+                    "gen": source_generation,
                 },
             )
             session.commit()
@@ -392,6 +417,136 @@ class PlanHashTests(ProposalTestCase):
             ),
             first,
         )
+
+
+class TargetWeightsTests(ProposalTestCase):
+    """D-6: the scope is the pinned revision, so omission means zero."""
+
+    REV = "dddddddd-0000-0000-0000-0000000000aa"
+
+    def _seed_members(self, members=("RELIANCE", "INFY", "TCS")):
+        for index, member in enumerate(members):
+            self.seed_record(f"inst-{member}", symbol=member, generation=G2)
+            self.seed_mapping(f"map-{member}", f"inst-{member}", token=100 + index, symbol=member,
+                              valid_from=G2, is_current=1)
+
+    def _pinned(self, generation=G2):
+        from backend.strategies.compiler.base import PinnedCatalogRead
+
+        return PinnedCatalogRead(session_factory=self.factory, generation=generation)
+
+    def _compile(self, payload, generation=G2):
+        from backend.strategies.compiler import compile_resolved_plan
+
+        return compile_resolved_plan("target_weights", payload, self._pinned(generation))
+
+    def test_full_snapshot_omission_means_zero(self):
+        self.seed_generation(G2, "published", T2)
+        self._seed_members()
+        self.seed_universe_revision(self.REV, ["RELIANCE", "INFY", "TCS"])
+
+        plan = self._compile(
+            {
+                "universe_revision_id": self.REV,
+                "target_weights": {"RELIANCE": 0.5, "INFY": 0.25},
+            }
+        )
+        # All three members are present; the omitted one is an explicit zero.
+        weights = {leg["tradingsymbol"]: leg["target_weight"] for leg in plan.resolved["legs"]}
+        self.assertEqual(weights, {"RELIANCE": 0.5, "INFY": 0.25, "TCS": 0.0})
+        tcs = next(leg for leg in plan.resolved["legs"] if leg["tradingsymbol"] == "TCS")
+        self.assertTrue(tcs["explicit_zero"])
+        self.assertEqual(plan.universe_revision_id, self.REV)
+        self.assertEqual(plan.member_hash, member_hash(["RELIANCE", "INFY", "TCS"]))
+
+    def test_out_of_scope_instrument_untouched(self):
+        self.seed_generation(G2, "published", T2)
+        self._seed_members()
+        # A mapped instrument that is NOT a member of the pinned revision.
+        self.seed_record("inst-OTHER", symbol="WIPRO", generation=G2)
+        self.seed_mapping("map-OTHER", "inst-OTHER", token=900, symbol="WIPRO", valid_from=G2,
+                          is_current=1)
+        self.seed_universe_revision(self.REV, ["RELIANCE", "INFY", "TCS"])
+
+        plan = self._compile(
+            {"universe_revision_id": self.REV, "target_weights": {"RELIANCE": 1.0}}
+        )
+        symbols = [leg["tradingsymbol"] for leg in plan.resolved["legs"]]
+        self.assertEqual(sorted(symbols), ["INFY", "RELIANCE", "TCS"])
+        # No zero row is invented for an instrument outside the scope.
+        self.assertNotIn("WIPRO", symbols)
+
+        # And a weight FOR an out-of-scope instrument is a malformed payload: the
+        # scope is the snapshot, so there is no defined meaning for it.
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self._compile(
+                {"universe_revision_id": self.REV, "target_weights": {"WIPRO": 0.5}}
+            )
+        self.assertEqual(ctx.exception.reason_code, "UNIVERSE_MEMBER_UNRESOLVED")
+        self.assertEqual(ctx.exception.detail["outside_scope"], ["WIPRO"])
+
+    def test_universe_revision_and_member_hash_pinned(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.seed_generation(G2, "published", T2)
+        self._seed_members()
+        self.seed_universe_revision(self.REV, ["RELIANCE", "INFY", "TCS"])
+
+        plan = self._compile(
+            {"universe_revision_id": self.REV, "target_weights": {"INFY": 1.0}}
+        )
+        self.assertEqual(plan.resolved["universe_revision_id"], self.REV)
+        self.assertEqual(plan.resolved["member_hash"], member_hash(["RELIANCE", "INFY", "TCS"]))
+        self.assertEqual(plan.resolved["catalog_generation"], G2)
+
+        # A payload built against different membership must not resolve against
+        # this revision's scope.
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self._compile(
+                {
+                    "universe_revision_id": self.REV,
+                    "member_hash": member_hash(["RELIANCE", "INFY"]),
+                    "target_weights": {"RELIANCE": 1.0},
+                }
+            )
+        self.assertEqual(ctx.exception.reason_code, "UNIVERSE_MEMBER_UNRESOLVED")
+
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self._compile(
+                {
+                    "universe_revision_id": self.REV,
+                    "members": ["RELIANCE", "INFY"],
+                    "target_weights": {"RELIANCE": 1.0},
+                }
+            )
+        self.assertEqual(ctx.exception.reason_code, "UNIVERSE_MEMBER_UNRESOLVED")
+
+        # An unknown revision is refused, never silently treated as empty.
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self._compile(
+                {"universe_revision_id": "no-such-revision", "target_weights": {}}
+            )
+        self.assertEqual(ctx.exception.reason_code, "UNIVERSE_REVISION_UNKNOWN")
+
+    def test_weights_resolution_uses_pinned_generation(self):
+        self.seed_remapped_catalog()
+        self.seed_universe_revision(self.REV, ["RELIANCE"], source_generation=G1)
+
+        at_g1 = self._compile(
+            {"universe_revision_id": self.REV, "target_weights": {"RELIANCE": 1.0}},
+            generation=G1,
+        )
+        at_g2 = self._compile(
+            {"universe_revision_id": self.REV, "target_weights": {"RELIANCE": 1.0}},
+            generation=G2,
+        )
+        # The SAME revision resolves differently per pin — which is exactly why the
+        # generation is part of the scope and of the plan hash.
+        self.assertEqual(at_g1.resolved["legs"][0]["instrument_id"], INST_OLD)
+        self.assertEqual(at_g2.resolved["legs"][0]["instrument_id"], INST_NEW)
+        self.assertEqual(at_g1.resolved["catalog_generation"], G1)
 
 
 if __name__ == "__main__":
