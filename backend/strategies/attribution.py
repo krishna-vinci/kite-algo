@@ -37,14 +37,37 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
+
+from sqlalchemy import delete, select, text
+
+from backend.shared.serialization import _json_dumps, _row_mapping
+from backend.strategies.attribution_models import (
+    StrategyPositionProjection,
+    StrategyProjectionState,
+    StrategyRunBinding,
+)
 
 #: The immutable book dimension. Equal to the run's persisted execution mode.
 EXECUTION_ENVIRONMENTS = ("live", "paper", "dry_run")
 
 #: Named condition for exposure that could not be mapped to a canonical instrument.
 UNRESOLVED_INSTRUMENT_IDENTITY = "UNRESOLVED_INSTRUMENT_IDENTITY"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_datetime(value: Any) -> datetime:
+    """Parse a DB timestamp into an aware datetime (SQLite returns strings)."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if value is None:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+    parsed = datetime.fromisoformat(str(value))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -113,3 +136,644 @@ class AttributionFold:
                 )
             totals[key] = totals.get(key, 0) + int(fact.signed_quantity)
         return {key: quantity for key, quantity in sorted(totals.items()) if quantity != 0}
+
+
+@dataclass(frozen=True)
+class RunBindingInput:
+    """The trusted run-to-strategy binding descriptor.
+
+    Derived server-side — from the persisted strategy job for hosted runs, from
+    the token's persisted grant for external runs — never from a run-create
+    payload, which is untrusted input. ``execution_environment`` is the run's own
+    server-validated execution mode; the database composite FKs make an
+    owner/account/environment mismatch impossible even if a caller lies.
+    """
+
+    strategy_id: str
+    owner_id: str
+    account_id: str
+    execution_environment: str
+    bound_by: str
+    binding_source: str
+
+
+class SqlAttributionStore:
+    """Durable binding + fact-source + publication store.
+
+    New-table writes go through the ORM on the shared ``Base`` (portable to the
+    SQLite test database); reads of platform fact tables use the codebase's
+    ``public.``-qualified Core SQL. All reads a recompute performs happen on the
+    session ``recompute_publish`` opened, strictly after its advisory lock.
+    """
+
+    def __init__(self, session_factory: Optional[Callable[[], Any]] = None) -> None:
+        if session_factory is None:
+            from backend.app.database import SessionLocal
+
+            session_factory = SessionLocal
+        self.session_factory = session_factory
+
+    # ------------------------------------------------------------------ binding
+
+    def bind_run(
+        self,
+        *,
+        strategy_run_id: str,
+        strategy_id: str,
+        owner_id: str,
+        account_id: str,
+        execution_environment: str,
+        bound_by: str,
+        binding_source: str,
+        db: Optional[Any] = None,
+    ) -> None:
+        """INSERT one immutable binding.
+
+        There is no update path: a second binding for the same run collides on
+        the primary key, and a PostgreSQL trigger refuses UPDATE/DELETE outright.
+        Account/owner/environment disagreement is refused by the composite FKs,
+        not by this method.
+        """
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            session.add(
+                StrategyRunBinding(
+                    strategy_run_id=strategy_run_id,
+                    strategy_id=strategy_id,
+                    owner_id=owner_id,
+                    account_id=account_id,
+                    execution_environment=execution_environment,
+                    bound_by=bound_by,
+                    binding_source=binding_source,
+                )
+            )
+            session.flush()
+            if owns_db:
+                session.commit()
+        except Exception:
+            if owns_db:
+                session.rollback()
+            raise
+        finally:
+            if owns_db:
+                session.close()
+
+    def bound_run_ids(
+        self,
+        *,
+        account_id: str,
+        strategy_id: str,
+        execution_environment: str,
+        db: Optional[Any] = None,
+    ) -> Set[str]:
+        """Run ids bound to this strategy **in this environment only**."""
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            rows = session.execute(
+                select(StrategyRunBinding.strategy_run_id).where(
+                    StrategyRunBinding.account_id == account_id,
+                    StrategyRunBinding.strategy_id == strategy_id,
+                    StrategyRunBinding.execution_environment == execution_environment,
+                )
+            ).scalars().all()
+            return {str(row) for row in rows}
+        finally:
+            if owns_db:
+                session.close()
+
+    def create_run_with_binding(
+        self,
+        *,
+        token: Any,
+        payload: Any,
+        strategy_run_id: str,
+        binding: Optional[RunBindingInput],
+    ) -> Dict[str, Any]:
+        """Insert the run and its mandatory binding in ONE session/transaction.
+
+        A crash or failure leaves **neither** row. ``binding=None`` is the
+        explicit legacy-compatibility path: the run is created unattributed.
+        """
+        session = self.session_factory()
+        try:
+            # The run table uses JSONB on PostgreSQL; plain text parameters on
+            # SQLite keep the JSON intact there (CAST(x AS JSONB) would coerce
+            # to NUMERIC and silently corrupt the payload in the test database).
+            postgres = session.bind.dialect.name == "postgresql"
+
+            def _json_param(name: str) -> str:
+                return f"CAST(:{name} AS JSONB)" if postgres else f":{name}"
+
+            row = session.execute(
+                text(
+                    f"""
+                    INSERT INTO public.algo_worker_runs (
+                        strategy_run_id, token_id, template_id, account_scope, execution_mode,
+                        status, summary_fields_json, risk_schema_json, allowed_actions_json,
+                        runtime_state_json, metadata_json
+                    ) VALUES (
+                        :strategy_run_id, :token_id, :template_id, :account_scope, :execution_mode,
+                        'open', {_json_param("summary_fields_json")}, {_json_param("risk_schema_json")},
+                        {_json_param("allowed_actions_json")}, {_json_param("runtime_state_json")},
+                        {_json_param("metadata_json")}
+                    )
+                    RETURNING *
+                    """
+                ),
+                {
+                    "strategy_run_id": strategy_run_id,
+                    "token_id": token.token_id,
+                    "template_id": payload.template_id,
+                    "account_scope": payload.account_scope,
+                    "execution_mode": payload.execution_mode,
+                    "summary_fields_json": _json_dumps(payload.summary_fields),
+                    "risk_schema_json": _json_dumps(payload.risk_schema),
+                    "allowed_actions_json": _json_dumps(payload.allowed_actions),
+                    "runtime_state_json": _json_dumps(payload.runtime_state),
+                    "metadata_json": _json_dumps(payload.metadata),
+                },
+            ).fetchone()
+            if binding is not None:
+                self.bind_run(
+                    strategy_run_id=strategy_run_id,
+                    strategy_id=binding.strategy_id,
+                    owner_id=binding.owner_id,
+                    account_id=binding.account_id,
+                    execution_environment=binding.execution_environment,
+                    bound_by=binding.bound_by,
+                    binding_source=binding.binding_source,
+                    db=session,
+                )
+            session.commit()
+            result = _row_mapping(row) if row is not None else {}
+            return {
+                "strategy_run_id": str(result.get("strategy_run_id") or strategy_run_id),
+                "token_id": str(result.get("token_id") or token.token_id),
+                "template_id": str(result.get("template_id") or payload.template_id),
+                "account_scope": str(result.get("account_scope") or payload.account_scope),
+                "execution_mode": str(result.get("execution_mode") or payload.execution_mode),
+                "status": str(result.get("status") or "open"),
+            }
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    # -------------------------------------------------------------- ownership
+
+    def resolve_owned_orders(
+        self, *, account_id: str, db: Optional[Any] = None
+    ) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+        """Map broker order id -> owning strategy run, surfacing corruption.
+
+        Execution links are authoritative; a placed live intent is a fallback
+        only when no execution link exists. Multiple distinct owners within
+        either source, or a link-versus-intent disagreement, are corruption: the
+        order is **excluded** from the owned map and reported as an anomaly.
+        Never picks a row silently.
+        """
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            link_rows = session.execute(
+                text(
+                    """
+                    SELECT broker_order_id, strategy_run_id
+                    FROM public.worker_live_execution_links
+                    WHERE account_id = :account_id
+                      AND broker_order_id IS NOT NULL
+                    """
+                ),
+                {"account_id": account_id},
+            ).fetchall()
+            intent_rows = session.execute(
+                text(
+                    """
+                    SELECT broker_order_id, strategy_run_id
+                    FROM public.live_order_intents
+                    WHERE account_id = :account_id
+                      AND broker_order_id IS NOT NULL
+                    """
+                ),
+                {"account_id": account_id},
+            ).fetchall()
+        finally:
+            if owns_db:
+                session.close()
+
+        def _owners(rows: Sequence[Any]) -> Dict[str, Set[str]]:
+            grouped: Dict[str, Set[str]] = {}
+            for row in rows:
+                values = list(row)
+                order_id = str(values[0] or "").strip()
+                run_id = str(values[1] or "").strip()
+                if not order_id or not run_id:
+                    continue
+                grouped.setdefault(order_id, set()).add(run_id)
+            return grouped
+
+        link_owners = _owners(link_rows)
+        intent_owners = _owners(intent_rows)
+
+        owned: Dict[str, str] = {}
+        anomalies: List[Dict[str, Any]] = []
+        for order_id in sorted(set(link_owners) | set(intent_owners)):
+            links = link_owners.get(order_id, set())
+            intents = intent_owners.get(order_id, set())
+            if len(links) > 1 or len(intents) > 1:
+                anomalies.append(
+                    {
+                        "broker_order_id": order_id,
+                        "kind": "multi_owner",
+                        "runs": sorted(links | intents),
+                    }
+                )
+                continue
+            link_owner = next(iter(links), None)
+            intent_owner = next(iter(intents), None)
+            if link_owner is not None and intent_owner is not None and link_owner != intent_owner:
+                anomalies.append(
+                    {
+                        "broker_order_id": order_id,
+                        "kind": "link_intent_disagreement",
+                        "runs": sorted({link_owner, intent_owner}),
+                    }
+                )
+                continue
+            owner = link_owner or intent_owner
+            if owner is not None:
+                owned[order_id] = owner
+        return owned, anomalies
+
+    # ------------------------------------------------------------ fact sources
+
+    def iter_live_trade_facts(
+        self,
+        *,
+        account_id: str,
+        owned_orders: Dict[str, str],
+        bound_run_ids: Set[str],
+        db: Optional[Any] = None,
+    ) -> List[TradeFact]:
+        """All fills of owned orders whose run is bound **in the live book**.
+
+        Trade links never gate inclusion: a failed link upsert must not hide a
+        real fill. Facts are deduplicated by the durable broker fill identity
+        ``(account_id, trade_id)``.
+        """
+        if not owned_orders:
+            return []
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            rows = session.execute(
+                text(
+                    """
+                    SELECT otf.order_id, otf.trade_id,
+                           otf.instrument_token,
+                           COALESCE(NULLIF(otf.exchange, ''), otf.payload_json ->> 'exchange')       AS exchange,
+                           COALESCE(NULLIF(otf.tradingsymbol, ''), otf.payload_json ->> 'tradingsymbol') AS tradingsymbol,
+                           COALESCE(NULLIF(otf.product, ''), otf.payload_json ->> 'product')         AS product,
+                           CASE WHEN UPPER(COALESCE(NULLIF(otf.transaction_type, ''), otf.payload_json ->> 'transaction_type')) = 'BUY'
+                                THEN otf.quantity ELSE -otf.quantity END                              AS signed_quantity,
+                           otf.fill_timestamp
+                    FROM public.order_trade_fills otf
+                    WHERE otf.account_id = :account_id
+                      AND otf.order_id = ANY(:owned_order_ids)
+                    ORDER BY otf.fill_timestamp ASC, otf.trade_id ASC
+                    """
+                ),
+                {"account_id": account_id, "owned_order_ids": list(owned_orders)},
+            ).fetchall()
+        finally:
+            if owns_db:
+                session.close()
+
+        facts: List[TradeFact] = []
+        seen: Set[str] = set()
+        for row in rows:
+            values = _row_mapping(row)
+            trade_id = str(values.get("trade_id") or "").strip()
+            order_id = str(values.get("order_id") or "").strip()
+            if not trade_id or trade_id in seen:
+                continue
+            seen.add(trade_id)
+            run_id = owned_orders.get(order_id)
+            if not run_id or run_id not in bound_run_ids:
+                continue
+            facts.append(
+                TradeFact(
+                    source_key=f"trade:{trade_id}",
+                    strategy_run_id=run_id,
+                    execution_environment="live",
+                    instrument_token=int(values.get("instrument_token") or 0),
+                    exchange=str(values.get("exchange") or ""),
+                    tradingsymbol=str(values.get("tradingsymbol") or ""),
+                    product=str(values.get("product") or ""),
+                    signed_quantity=int(values.get("signed_quantity") or 0),
+                    effective_at=_as_datetime(values.get("fill_timestamp")),
+                    pinned_generation=None,
+                )
+            )
+        return facts
+
+    def iter_paper_trade_facts(
+        self,
+        *,
+        account_scope: str,
+        bound_run_ids: Set[str],
+        db: Optional[Any] = None,
+    ) -> List[TradeFact]:
+        """Paper fills of runs bound in the paper book, deduplicated by trade id.
+
+        Paper rebuilds consume only paper bindings and paper trades; a paper
+        trade can never appear in a live fold.
+        """
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            rows = session.execute(
+                text(
+                    """
+                    SELECT pt.trade_id, po.instrument_token, po.exchange, po.tradingsymbol, po.product,
+                           CASE WHEN UPPER(pt.transaction_type) = 'BUY' THEN pt.quantity ELSE -pt.quantity END AS signed_quantity,
+                           pt.trade_timestamp,
+                           COALESCE(po.metadata_json -> 'attribution' ->> 'strategy_run_id',
+                                    po.metadata_json ->> 'strategy_run_id') AS strategy_run_id
+                    FROM public.paper_trades pt
+                    INNER JOIN public.paper_orders po
+                      ON po.account_scope = pt.account_scope AND po.order_id = pt.order_id
+                    WHERE pt.account_scope = :account_scope
+                    ORDER BY pt.trade_timestamp ASC, pt.trade_id ASC
+                    """
+                ),
+                {"account_scope": account_scope},
+            ).fetchall()
+        finally:
+            if owns_db:
+                session.close()
+
+        facts: List[TradeFact] = []
+        seen: Set[str] = set()
+        for row in rows:
+            values = _row_mapping(row)
+            trade_id = str(values.get("trade_id") or "").strip()
+            run_id = str(values.get("strategy_run_id") or "").strip()
+            if not trade_id or trade_id in seen:
+                continue
+            seen.add(trade_id)
+            if not run_id or run_id not in bound_run_ids:
+                continue
+            facts.append(
+                TradeFact(
+                    source_key=f"paper:{trade_id}",
+                    strategy_run_id=run_id,
+                    execution_environment="paper",
+                    instrument_token=int(values.get("instrument_token") or 0),
+                    exchange=str(values.get("exchange") or ""),
+                    tradingsymbol=str(values.get("tradingsymbol") or ""),
+                    product=str(values.get("product") or ""),
+                    signed_quantity=int(values.get("signed_quantity") or 0),
+                    effective_at=_as_datetime(values.get("trade_timestamp")),
+                    pinned_generation=None,
+                )
+            )
+        return facts
+
+    # ----------------------------------------------------- identity resolution
+
+    def resolve_fact_identity(self, fact: TradeFact, *, db: Optional[Any] = None) -> PositionKey:
+        """Resolve ONE fact to its position key. Never grouped.
+
+        The mapping interval is selected by **this fact's own** ``effective_at``
+        (or its pinned generation), never by today's ``is_current`` mapping, so a
+        token re-mapped to a different instrument across generations yields two
+        genuinely distinct positions. The matched mapping must also agree with
+        the fill's exchange/symbol evidence; a contradiction is unresolved
+        (``evidence_mismatch``), never silently accepted.
+
+        Unresolved facts keep an explicit catalog-evidence era identity, so facts
+        from the same era net across dates while facts from distinct known eras
+        never merge.
+        """
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            params: Dict[str, Any] = {
+                "broker_token": str(fact.instrument_token),
+                "effective_at": fact.effective_at,
+            }
+            pinned_clause = ""
+            if fact.pinned_generation:
+                params["pinned_generation"] = fact.pinned_generation
+                pinned_clause = "AND m.valid_from_generation = :pinned_generation"
+            rows = session.execute(
+                text(
+                    f"""
+                    SELECT m.instrument_id,
+                           m.broker_exchange,
+                           m.broker_symbol,
+                           m.valid_from_generation,
+                           m.valid_to_generation
+                    FROM public.instrument_broker_mappings m
+                    JOIN public.instrument_catalog_generations g_from ON g_from.id = m.valid_from_generation
+                    LEFT JOIN public.instrument_catalog_generations g_to ON g_to.id = m.valid_to_generation
+                    WHERE m.broker = 'kite'
+                      AND m.broker_token = :broker_token
+                      {pinned_clause}
+                      AND g_from.published_at <= :effective_at
+                      AND (g_to.published_at IS NULL OR g_to.published_at > :effective_at)
+                    """
+                ),
+                params,
+            ).fetchall()
+
+            active_generation = None
+            if not rows:
+                active_row = session.execute(
+                    text(
+                        """
+                        SELECT id
+                        FROM public.instrument_catalog_generations
+                        WHERE published_at IS NOT NULL
+                          AND published_at <= :effective_at
+                        ORDER BY published_at DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"effective_at": fact.effective_at},
+                ).fetchone()
+                active_generation = str(list(active_row)[0]) if active_row is not None else None
+        finally:
+            if owns_db:
+                session.close()
+
+        raw_tuple = (
+            f"kite:{fact.instrument_token}|{fact.exchange}|{fact.tradingsymbol}|{fact.product}"
+        )
+
+        if rows:
+            candidates = {str(_row_mapping(row).get("instrument_id") or "") for row in rows}
+            candidates.discard("")
+            evidence_ok = any(
+                str(_row_mapping(row).get("broker_exchange") or "").strip() == str(fact.exchange).strip()
+                and str(_row_mapping(row).get("broker_symbol") or "").strip() == str(fact.tradingsymbol).strip()
+                for row in rows
+            )
+            if len(candidates) == 1 and evidence_ok:
+                return PositionKey(
+                    fact.execution_environment, "canonical", next(iter(candidates)), fact.product
+                )
+            if not evidence_ok and len(candidates) == 1:
+                reason = "evidence_mismatch"
+            else:
+                reason = "mapping_ambiguous"
+            era = self._era_from_rows(rows, fact)
+        else:
+            reason = "mapping_missing"
+            era = f"gen:{active_generation}" if active_generation else "pre-catalog"
+
+        return PositionKey(
+            fact.execution_environment, "raw", f"raw:{raw_tuple}|era={era}", fact.product
+        )
+
+    @staticmethod
+    def _era_from_rows(rows: Sequence[Any], fact: TradeFact) -> str:
+        """Catalog-evidence era for an unresolved fact (never date-derived)."""
+        if fact.pinned_generation:
+            return f"gen:{fact.pinned_generation}"
+        eras = {
+            f"interval:{_row_mapping(row).get('valid_from_generation') or 'pre-catalog'}.."
+            f"{_row_mapping(row).get('valid_to_generation') or ''}"
+            for row in rows
+        }
+        return sorted(eras)[0] if eras else "pre-catalog"
+
+    # ------------------------------------------------------------ publication
+
+    def recompute_publish(
+        self,
+        *,
+        account_id: str,
+        strategy_id: str,
+        execution_environment: str,
+        resolve_and_fold: Callable[[Any, Set[str]], Tuple[List[Dict[str, Any]], str]],
+        on_before_commit: Optional[Callable[[], None]] = None,
+    ) -> Dict[str, Any]:
+        """The single supported publication path.
+
+        One transaction: begin -> advisory lock for
+        ``(account, strategy, environment)`` -> read bound runs -> run the
+        caller's pipeline **on that same session** -> replace rows -> advance
+        ``projection_version`` -> optional hook -> commit. Because the lock is
+        taken before the snapshot by construction, an older snapshot cannot
+        overwrite a newer rebuild. Any exception rolls back and fully retains the
+        previous projection and version.
+
+        There is deliberately no out-of-transaction snapshot path: publication
+        outside this transaction is unsupported and fails closed.
+        """
+        session = self.session_factory()
+        try:
+            self._lock_projection(session, account_id, strategy_id, execution_environment)
+            bound = self.bound_run_ids(
+                account_id=account_id,
+                strategy_id=strategy_id,
+                execution_environment=execution_environment,
+                db=session,
+            )
+            rows, content_sha256 = resolve_and_fold(session, bound)
+
+            state = session.execute(
+                select(StrategyProjectionState).where(
+                    StrategyProjectionState.account_id == account_id,
+                    StrategyProjectionState.strategy_id == strategy_id,
+                    StrategyProjectionState.execution_environment == execution_environment,
+                )
+            ).scalar_one_or_none()
+
+            if state is not None and state.content_sha256 == content_sha256:
+                if on_before_commit is not None:
+                    on_before_commit()
+                session.commit()
+                return {
+                    "projection_version": int(state.projection_version or 0),
+                    "content_sha256": content_sha256,
+                    "unchanged": True,
+                }
+
+            projection_version = int(state.projection_version or 0) + 1 if state is not None else 1
+
+            session.execute(
+                delete(StrategyPositionProjection).where(
+                    StrategyPositionProjection.account_id == account_id,
+                    StrategyPositionProjection.strategy_id == strategy_id,
+                    StrategyPositionProjection.execution_environment == execution_environment,
+                )
+            )
+            for row in rows:
+                session.add(
+                    StrategyPositionProjection(
+                        account_id=account_id,
+                        strategy_id=strategy_id,
+                        execution_environment=execution_environment,
+                        identity_kind=str(row["identity_kind"]),
+                        identity_key=str(row["identity_key"]),
+                        product=str(row["product"]),
+                        canonical_instrument_id=row.get("canonical_instrument_id"),
+                        instrument_token=int(row["instrument_token"]),
+                        exchange=str(row["exchange"]),
+                        tradingsymbol=str(row["tradingsymbol"]),
+                        net_quantity=int(row["net_quantity"]),
+                        unresolved_reason=row.get("unresolved_reason"),
+                        projection_version=projection_version,
+                    )
+                )
+
+            if state is None:
+                session.add(
+                    StrategyProjectionState(
+                        account_id=account_id,
+                        strategy_id=strategy_id,
+                        execution_environment=execution_environment,
+                        projection_version=projection_version,
+                        content_sha256=content_sha256,
+                        last_rebuild_at=_utcnow(),
+                    )
+                )
+            else:
+                state.projection_version = projection_version
+                state.content_sha256 = content_sha256
+                state.last_rebuild_at = _utcnow()
+
+            session.flush()
+            if on_before_commit is not None:
+                on_before_commit()
+            session.commit()
+            return {
+                "projection_version": projection_version,
+                "content_sha256": content_sha256,
+                "unchanged": False,
+            }
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    @staticmethod
+    def _lock_projection(session: Any, account_id: str, strategy_id: str, execution_environment: str) -> None:
+        """Serialize recomputes for one book. PostgreSQL only; SQLite no-op.
+
+        ``pg_advisory_xact_lock`` is transaction-scoped, so the lock is held from
+        here until commit — strictly before the fact snapshot is taken.
+        """
+        if session.bind.dialect.name != "postgresql":
+            return
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"{account_id}:{strategy_id}:{execution_environment}"},
+        )
