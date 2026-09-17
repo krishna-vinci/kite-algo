@@ -2790,7 +2790,7 @@ CREATE TABLE IF NOT EXISTS public.strategy_proposals (
     CONSTRAINT ck_proposals_evaluation_kind
         CHECK (evaluation_kind IN ('scheduled_occurrence', 'run_now')),
     CONSTRAINT ck_proposals_target_kind
-        CHECK (target_kind IN ('single_instrument', 'target_weights')),
+        CHECK (target_kind IN ('single_instrument', 'target_weights', 'intent_bundle')),
     CONSTRAINT ck_proposals_status CHECK (status IN ('received', 'validated', 'refused')),
     -- A scheduled occurrence always names the job that produced it.
     CONSTRAINT ck_proposals_scheduled_requires_job
@@ -2818,7 +2818,7 @@ CREATE TABLE IF NOT EXISTS public.strategy_plans (
     -- Exactly one frozen plan per proposal envelope.
     CONSTRAINT uq_plans_proposal UNIQUE (proposal_id),
     CONSTRAINT ck_plans_plan_kind
-        CHECK (plan_kind IN ('single_instrument', 'target_weights')),
+        CHECK (plan_kind IN ('single_instrument', 'target_weights', 'intent_bundle')),
     -- A full-snapshot plan cannot honour "omission means target zero" without
     -- both its revision and its member hash.
     CONSTRAINT ck_plans_target_weights_scope
@@ -3118,3 +3118,41 @@ DROP TRIGGER IF EXISTS trg_settlement_assessments_immutable
 CREATE TRIGGER trg_settlement_assessments_immutable
     BEFORE UPDATE OR DELETE ON public.strategy_settlement_assessments
     FOR EACH ROW EXECUTE FUNCTION forbid_settlement_assessment_mutation();
+
+-- =========================================
+-- Plan execution event trail (Project 6, Phase 6 / D-3)
+-- Mirrors alembic revision 20260917_000030. Purely additive: nothing above is
+-- altered except the two plan-kind vocabularies above, which gain
+-- 'intent_bundle' (D-6) — the allowed set only grows.
+-- =========================================
+
+-- The append-only trail of one plan's execution. It is the ONLY execution
+-- state the schema carries: a step's current state is DERIVED from its rows
+-- (submitted -> filled | rejected | failed; no_op is terminal in itself), so
+-- execution history can never be rewritten into something that did not happen.
+CREATE TABLE IF NOT EXISTS public.strategy_plan_execution_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    plan_id UUID NOT NULL REFERENCES public.strategy_plans (plan_id) ON DELETE RESTRICT,
+    step_no INTEGER NOT NULL,
+    event TEXT NOT NULL CHECK (event IN ('submitted','filled','rejected','failed','no_op')),
+    paper_order_id TEXT,
+    filled_quantity INTEGER,
+    refusal_reason TEXT,
+    actor_id TEXT NOT NULL,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_plan_exec_events
+    ON public.strategy_plan_execution_events (plan_id, step_no, created_at);
+
+CREATE OR REPLACE FUNCTION forbid_strategy_plan_execution_event_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_plan_execution_events are append-only (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_strategy_plan_execution_events_immutable
+    ON public.strategy_plan_execution_events;
+CREATE TRIGGER trg_strategy_plan_execution_events_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_plan_execution_events
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_plan_execution_event_mutation();

@@ -479,7 +479,7 @@ class StrategyProposal(Base):
             name="ck_proposals_evaluation_kind",
         ),
         CheckConstraint(
-            "target_kind IN ('single_instrument', 'target_weights')",
+            "target_kind IN ('single_instrument', 'target_weights', 'intent_bundle')",
             name="ck_proposals_target_kind",
         ),
         CheckConstraint("status IN ('received', 'validated', 'refused')", name="ck_proposals_status"),
@@ -528,7 +528,8 @@ class StrategyPlan(Base):
     __table_args__ = (
         UniqueConstraint("proposal_id", name="uq_plans_proposal"),
         CheckConstraint(
-            "plan_kind IN ('single_instrument', 'target_weights')", name="ck_plans_plan_kind"
+            "plan_kind IN ('single_instrument', 'target_weights', 'intent_bundle')",
+            name="ck_plans_plan_kind",
         ),
         CheckConstraint(
             "plan_kind <> 'target_weights' OR "
@@ -903,4 +904,61 @@ class StrategySettlementAssessment(Base):
             "execution_environment",
             "created_at",
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plan execution event trail (Phase 6 / Project 6, D-3)
+# ---------------------------------------------------------------------------
+
+
+#: Execution event vocabulary (mirrors ``ck_spee_event``).
+PLAN_EXECUTION_EVENTS = ("submitted", "filled", "rejected", "failed", "no_op")
+
+#: Plan kinds that name something the executor can act on. ``target_weights``
+#: stays a valid plan kind (full-snapshot semantics) but the paper executor of
+#: this phase refuses to execute it; ``intent_bundle`` is the Phase 6 addition
+#: (D-6): explicit per-leg single-instrument actions.
+EXECUTABLE_PLAN_KINDS = ("single_instrument", "intent_bundle")
+
+
+class StrategyPlanExecutionEvent(Base):
+    """Append-only trail of one plan's execution (D-3). **Insert-only by trigger.**
+
+    The trail is the ONLY execution state the schema carries: the current state
+    of a step is derived from its rows (``submitted`` → ``filled`` | ``rejected``
+    | ``failed``; ``no_op`` is terminal in itself), so execution history can
+    never be rewritten into something that did not happen. Every refusal is an
+    event with its named reason, and every paper order the executor submits is
+    linked by ``paper_order_id`` — the fill-to-attribution chain end to end.
+    """
+
+    __tablename__ = "strategy_plan_execution_events"
+
+    id = Column(Text, primary_key=True)
+    plan_id = Column(Text, nullable=False)
+    step_no = Column(Integer, nullable=False)
+    event = Column(Text, nullable=False)
+    paper_order_id = Column(Text, nullable=True)
+    filled_quantity = Column(Integer, nullable=True)
+    refusal_reason = Column(Text, nullable=True)
+    actor_id = Column(Text, nullable=False)
+    detail = Column(JSON, nullable=False, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "event IN ('submitted', 'filled', 'rejected', 'failed', 'no_op')",
+            name="ck_spee_event",
+        ),
+        # Declared because ``strategy_plans`` IS in this metadata: it orders the
+        # unit of work so a plan exists before its first execution event. The
+        # ON DELETE RESTRICT keeps the trail attached to its plan forever.
+        ForeignKeyConstraint(
+            ["plan_id"],
+            ["strategy_plans.plan_id"],
+            name="fk_plan_exec_plan",
+            ondelete="RESTRICT",
+        ),
+        Index("idx_plan_exec_events", "plan_id", "step_no", "created_at"),
     )
