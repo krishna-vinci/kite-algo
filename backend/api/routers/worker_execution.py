@@ -269,6 +269,77 @@ def _live_basket_execution_id(*, strategy_run_id: str, idempotency_key: str) -> 
     digest = hashlib.sha1(f"{strategy_run_id}:{idempotency_key}".encode("utf-8")).hexdigest()[:20]
     return f"bex_{digest}"
 
+async def _require_worker_order_ownership(
+    request: Request, run: Dict[str, Any], order_id: str, parent_order_id: Optional[str]
+) -> None:
+    """Prove the target order belongs to the run before a live mutation.
+
+    Strict precedence (caller input is NEVER evidence):
+      1. ownership conflict               -> 409, observable, no mutation
+      2. target owned by requesting run   -> authorized directly
+      3. target owned by ANOTHER run      -> non-disclosing 404, STOP — the
+         parent path is never attempted for a durably-owned-elsewhere target
+      4. target unowned                   -> broker-parent path, which must
+         verify EVERY element: parent durably owned by the run; lookup
+         performed for the requested target; returned order_id equals the
+         requested target; returned parent_order_id equals the supplied
+         parent; malformed/missing/inconsistent/failed reads refuse.
+    Reads (order_snapshot) are permitted during proof; the mutation itself
+    must never run when proof fails.
+    """
+    from backend.broker_api.orders import OrdersService
+
+    strategy_run_id = str(run["strategy_run_id"])
+    account_id = str(run["account_scope"])
+    target = str(order_id or "").strip()
+
+    def _conflict() -> HTTPException:
+        return HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "ORDER_OWNERSHIP_CONFLICT",
+                "strategy_run_id": strategy_run_id,
+                "order_id": target,
+            },
+        )
+
+    def _not_found() -> HTTPException:
+        return HTTPException(status_code=404, detail="Order not found for strategy run")
+
+    ownership = await _repo(request).get_live_order_ownership(account_id=account_id, broker_order_id=target)
+    if ownership["status"] == "conflict":
+        raise _conflict()                                                    # precedence 1
+    if ownership["status"] == "owned":
+        if ownership["strategy_run_id"] == strategy_run_id:
+            return                                                            # precedence 2
+        raise _not_found()                                                    # precedence 3 — STOP
+
+    # precedence 4: target unowned — authoritative broker-parent proof only.
+    if parent_order_id:
+        parent = str(parent_order_id).strip()
+        parent_ownership = await _repo(request).get_live_order_ownership(account_id=account_id, broker_order_id=parent)
+        if parent_ownership["status"] == "conflict":
+            raise _conflict()
+        if parent_ownership["status"] == "owned" and parent_ownership["strategy_run_id"] == strategy_run_id:
+            kite = await asyncio.to_thread(_load_live_kite_for_account, account_id)
+            corr_id = f"worker-order-ownership-{uuid.uuid4()}"
+            orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+            try:
+                snapshot = await asyncio.to_thread(orders_service.order_snapshot, kite, target, corr_id)
+                payload = _serialize_model(snapshot) if not isinstance(snapshot, dict) else dict(snapshot)
+            except Exception:
+                raise _not_found()                                            # failed read refuses
+            if not isinstance(payload, dict):
+                raise _not_found()                                            # malformed read refuses
+            returned_order_id = str(payload.get("order_id") or "").strip()
+            returned_parent = str(payload.get("parent_order_id") or "").strip()
+            if returned_order_id == target and returned_parent == parent:
+                return                                                        # authoritative child relationship proven
+            # malformed, inconsistent, or missing fields: refuse safely.
+            raise _not_found()
+
+    raise _not_found()
+
 async def _exit_live_worker_run(*, request: Request, token: WorkerToken, run: Dict[str, Any], payload: WorkerExitRequest) -> Dict[str, Any]:
     from backend.broker_api.orders import BasketOrderRequest, OrdersService
 
@@ -536,6 +607,7 @@ async def cancel_worker_order(request: Request, order_id: str, payload: WorkerOr
     _assert_run_access(token, run)
     await enforce_hosted_attempt_authority(request, token, run)
     _require_live_run(run, feature="Order cancellation")
+    await _require_worker_order_ownership(request, run, order_id, payload.parent_order_id)
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
     corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-cancel-{uuid.uuid4()}"
     orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()

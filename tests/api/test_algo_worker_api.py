@@ -3619,6 +3619,261 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ctx.exception.status_code, 403)
 
+    def _live_run_repo(self, run_id="run-live", account="kite:AB1234"):
+        token = WorkerToken(
+            token_id="worker-live",
+            name="live-worker",
+            account_scope=account,
+            allowed_modes=["live"],
+            allowed_actions=sorted(DEFAULT_WORKER_ACTIONS),
+            allowed_templates=[],
+        )
+        repo = _FakeWorkerRepository(token=token)
+        repo.runs[run_id] = {
+            "strategy_run_id": run_id,
+            "token_id": "worker-live",
+            "template_id": "mean_reversion",
+            "account_scope": account,
+            "execution_mode": "live",
+            "status": "open",
+            "metadata": {"strategy_family": "indicator_strategy", "strategy_name": "Mean Reversion"},
+        }
+        return repo
+
+    @staticmethod
+    def _owned(order_id, run_id="run-live", source="link"):
+        return {"status": "owned", "strategy_run_id": run_id, "source": source}
+
+    @staticmethod
+    def _orders_service(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    async def test_cancel_direct_owned_target_succeeds(self):
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-1")] = self._owned("OID-1")
+        request = self._request(repo)
+        orders = self._orders_service(cancel_order=AsyncMock(return_value={"order_id": "OID-1"}))
+        request.app.state.algo_worker_orders_service = orders
+
+        with patch(
+            "backend.api.routers.worker_execution._load_live_kite_for_account",
+            return_value=SimpleNamespace(access_token="token"),
+        ):
+            response = await cancel_worker_order(request, "OID-1", WorkerOrderActionRequest(strategy_run_id="run-live"))
+
+        self.assertEqual(response["order_id"], "OID-1")
+        orders.cancel_order.assert_awaited_once()
+
+    async def test_cancel_direct_cross_run_target_fails_without_mutation(self):
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-B")] = self._owned("OID-B", run_id="run-other")
+        request = self._request(repo)
+        orders = self._orders_service(cancel_order=AsyncMock(return_value={"order_id": "OID-B"}))
+        request.app.state.algo_worker_orders_service = orders
+
+        with self.assertRaises(HTTPException) as ctx:
+            await cancel_worker_order(request, "OID-B", WorkerOrderActionRequest(strategy_run_id="run-live"))
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.detail, "Order not found for strategy run")
+        orders.cancel_order.assert_not_awaited()
+
+    async def test_cancel_manual_or_unknown_target_fails_without_mutation(self):
+        repo = self._live_run_repo()  # OID-MANUAL maps to nothing
+        request = self._request(repo)
+        orders = self._orders_service(cancel_order=AsyncMock(return_value={"order_id": "OID-MANUAL"}))
+        request.app.state.algo_worker_orders_service = orders
+
+        with self.assertRaises(HTTPException) as ctx:
+            await cancel_worker_order(request, "OID-MANUAL", WorkerOrderActionRequest(strategy_run_id="run-live"))
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.detail, "Order not found for strategy run")
+        orders.cancel_order.assert_not_awaited()
+
+    async def test_cancel_owned_parent_plus_unrelated_target_fails(self):
+        # Parent P is owned; the target's authoritative snapshot reports a
+        # DIFFERENT parent (or none) — the caller's pairing is not proof.
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-P")] = self._owned("OID-P")
+        request = self._request(repo)
+        orders = self._orders_service(
+            cancel_order=AsyncMock(return_value={"order_id": "OID-X"}),
+            order_snapshot=lambda kite, order_id, corr_id: {"order_id": "OID-X", "parent_order_id": "OID-OTHER"},
+        )
+        request.app.state.algo_worker_orders_service = orders
+
+        with patch(
+            "backend.api.routers.worker_execution._load_live_kite_for_account",
+            return_value=SimpleNamespace(access_token="token"),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await cancel_worker_order(
+                    request, "OID-X", WorkerOrderActionRequest(strategy_run_id="run-live", parent_order_id="OID-P"),
+                )
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        orders.cancel_order.assert_not_awaited()
+
+    async def test_cancel_genuine_child_with_authoritative_parent_succeeds(self):
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-P")] = self._owned("OID-P")
+        request = self._request(repo)
+        orders = self._orders_service(
+            cancel_order=AsyncMock(return_value={"order_id": "OID-CHILD"}),
+            order_snapshot=lambda kite, order_id, corr_id: {"order_id": "OID-CHILD", "parent_order_id": "OID-P"},
+        )
+        request.app.state.algo_worker_orders_service = orders
+
+        with patch(
+            "backend.api.routers.worker_execution._load_live_kite_for_account",
+            return_value=SimpleNamespace(access_token="token"),
+        ):
+            response = await cancel_worker_order(
+                request, "OID-CHILD", WorkerOrderActionRequest(strategy_run_id="run-live", parent_order_id="OID-P"),
+            )
+
+        self.assertEqual(response["order_id"], "OID-CHILD")
+        orders.cancel_order.assert_awaited_once()
+
+    async def test_cancel_caller_lying_about_parent_fails(self):
+        # The real parent is OID-Q (not owned); the caller claims owned OID-P.
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-P")] = self._owned("OID-P")
+        request = self._request(repo)
+        orders = self._orders_service(
+            cancel_order=AsyncMock(return_value={"order_id": "OID-CHILD"}),
+            order_snapshot=lambda kite, order_id, corr_id: {"order_id": "OID-CHILD", "parent_order_id": "OID-Q"},
+        )
+        request.app.state.algo_worker_orders_service = orders
+
+        with patch(
+            "backend.api.routers.worker_execution._load_live_kite_for_account",
+            return_value=SimpleNamespace(access_token="token"),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await cancel_worker_order(
+                    request, "OID-CHILD", WorkerOrderActionRequest(strategy_run_id="run-live", parent_order_id="OID-P"),
+                )
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        orders.cancel_order.assert_not_awaited()
+
+    async def test_cancel_child_relation_unestablishable_fails(self):
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-P")] = self._owned("OID-P")
+
+        def _unknown(kite, order_id, corr_id):
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        request = self._request(repo)
+        orders = self._orders_service(cancel_order=AsyncMock(return_value={"order_id": "OID-X"}), order_snapshot=_unknown)
+        request.app.state.algo_worker_orders_service = orders
+
+        with patch(
+            "backend.api.routers.worker_execution._load_live_kite_for_account",
+            return_value=SimpleNamespace(access_token="token"),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await cancel_worker_order(
+                    request, "OID-X", WorkerOrderActionRequest(strategy_run_id="run-live", parent_order_id="OID-P"),
+                )
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        orders.cancel_order.assert_not_awaited()
+
+    async def test_cancel_link_intent_disagreement_fails_observably(self):
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-D")] = {
+            "status": "conflict", "strategy_run_id": None, "source": None,
+        }
+        request = self._request(repo)
+        orders = self._orders_service(cancel_order=AsyncMock(return_value={"order_id": "OID-D"}))
+        request.app.state.algo_worker_orders_service = orders
+
+        with self.assertRaises(HTTPException) as ctx:
+            await cancel_worker_order(request, "OID-D", WorkerOrderActionRequest(strategy_run_id="run-live"))
+
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.detail.get("rejection_reason"), "ORDER_OWNERSHIP_CONFLICT")
+        orders.cancel_order.assert_not_awaited()
+
+    async def test_cancel_target_owned_by_other_run_refused_even_with_owned_parent_and_confirmed_child(self):
+        # The decisive precedence test: the target is durably owned by run B,
+        # the caller's parent IS owned by run A, and the broker genuinely
+        # confirms the target is that parent's child. Run A must STILL be
+        # refused — durable ownership elsewhere stops before the parent path.
+        # (Would incorrectly succeed under a fall-through-to-parent design.)
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-CHILD")] = self._owned("OID-CHILD", run_id="run-other")
+        repo.live_order_ownership[("kite:AB1234", "OID-P")] = self._owned("OID-P")
+        request = self._request(repo)
+        orders = self._orders_service(
+            cancel_order=AsyncMock(return_value={"order_id": "OID-CHILD"}),
+            order_snapshot=lambda kite, order_id, corr_id: {"order_id": "OID-CHILD", "parent_order_id": "OID-P"},
+        )
+        request.app.state.algo_worker_orders_service = orders
+
+        with self.assertRaises(HTTPException) as ctx:
+            await cancel_worker_order(
+                request, "OID-CHILD", WorkerOrderActionRequest(strategy_run_id="run-live", parent_order_id="OID-P"),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.detail, "Order not found for strategy run")
+        orders.cancel_order.assert_not_awaited()
+
+    async def test_cancel_snapshot_returning_different_order_id_refused(self):
+        # A snapshot that comes back for a DIFFERENT order than requested is
+        # inconsistent evidence and must refuse, even when the parent matches.
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-P")] = self._owned("OID-P")
+        request = self._request(repo)
+        orders = self._orders_service(
+            cancel_order=AsyncMock(return_value={"order_id": "OID-X"}),
+            order_snapshot=lambda kite, order_id, corr_id: {"order_id": "OID-OTHER", "parent_order_id": "OID-P"},
+        )
+        request.app.state.algo_worker_orders_service = orders
+
+        with patch(
+            "backend.api.routers.worker_execution._load_live_kite_for_account",
+            return_value=SimpleNamespace(access_token="token"),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await cancel_worker_order(
+                    request, "OID-X", WorkerOrderActionRequest(strategy_run_id="run-live", parent_order_id="OID-P"),
+                )
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        orders.cancel_order.assert_not_awaited()
+
+    async def test_cancel_malformed_snapshot_refused(self):
+        # Malformed payloads (missing order_id / parent fields, or non-dict
+        # garbage) must refuse safely rather than authorize.
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-P")] = self._owned("OID-P")
+        for malformed in ({"parent_order_id": "OID-P"},  # missing order_id
+                          {"order_id": "OID-X"},          # missing parent
+                          None):                          # garbage read
+            request = self._request(repo)
+            orders = self._orders_service(
+                cancel_order=AsyncMock(return_value={"order_id": "OID-X"}),
+                order_snapshot=lambda kite, order_id, corr_id, _m=malformed: _m,
+            )
+            request.app.state.algo_worker_orders_service = orders
+
+            with patch(
+                "backend.api.routers.worker_execution._load_live_kite_for_account",
+                return_value=SimpleNamespace(access_token="token"),
+            ):
+                with self.assertRaises(HTTPException) as ctx:
+                    await cancel_worker_order(
+                        request, "OID-X", WorkerOrderActionRequest(strategy_run_id="run-live", parent_order_id="OID-P"),
+                    )
+
+            self.assertEqual(ctx.exception.status_code, 404)
+            orders.cancel_order.assert_not_awaited()
+
     async def test_worker_preview_order_returns_margin_and_charges(self):
         token = WorkerToken(
             token_id="worker-live",
