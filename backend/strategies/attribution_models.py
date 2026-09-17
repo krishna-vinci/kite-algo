@@ -40,6 +40,7 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -271,5 +272,177 @@ class StrategyProjectionState(Base):
             ["strategy_id", "account_id"],
             ["strategies.id", "strategies.account_scope"],
             ondelete="RESTRICT",
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Account truth (Phase 2 / G2+G3+G4)
+# ---------------------------------------------------------------------------
+
+
+class BrokerTradeFact(Base):
+    """Account-wide ingested fill fact, keyed by durable broker identity.
+
+    Insert-only (a BEFORE UPDATE OR DELETE trigger in the migration raises):
+    a bad ingest generation is corrected by ingesting the missing truth, never
+    by editing or deleting history. Deduplicated by ``(account_id, trade_id)``,
+    so re-ingesting a page of trades is a no-op.
+
+    A fact is *tracked* when an execution link claims its order, and *manual*
+    (unattributed) otherwise — that distinction is derived, never stored here.
+    """
+
+    __tablename__ = "broker_trade_facts"
+
+    fact_id = Column(Text, primary_key=True)
+    account_id = Column(Text, nullable=False)
+    trade_id = Column(Text, nullable=False)
+    broker_order_id = Column(Text, nullable=False)
+    instrument_token = Column(BigInteger, nullable=False)
+    exchange = Column(Text, nullable=False)
+    tradingsymbol = Column(Text, nullable=False)
+    product = Column(Text, nullable=False)
+    transaction_type = Column(Text, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    fill_price = Column(Float, nullable=True)
+    trade_timestamp = Column(DateTime(timezone=True), nullable=True)
+    ingest_generation = Column(BigInteger, nullable=False)
+    ingested_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("account_id", "trade_id", name="uq_broker_trade_facts_account_trade"),
+        CheckConstraint("transaction_type IN ('BUY', 'SELL')", name="ck_btf_transaction_type"),
+        CheckConstraint("quantity > 0", name="ck_btf_quantity"),
+        Index(
+            "idx_btf_account_coord",
+            "account_id",
+            "instrument_token",
+            "exchange",
+            "tradingsymbol",
+            "product",
+        ),
+    )
+
+
+class AccountIngestState(Base):
+    """Per-account ingest cursor/generation.
+
+    Distinguishes "we have not looked yet" from "we looked and the mismatch is
+    real", which is what makes ``pending_ingest`` honest rather than a guess.
+    """
+
+    __tablename__ = "account_ingest_state"
+
+    account_id = Column(Text, primary_key=True)
+    last_orders_fetch_at = Column(DateTime(timezone=True), nullable=True)
+    last_complete_ingest_at = Column(DateTime(timezone=True), nullable=True)
+    ingest_generation = Column(BigInteger, nullable=False, server_default="0")
+    status = Column(Text, nullable=False, server_default="idle")
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('idle', 'refreshing', 'stale')", name="ck_ais_status"),
+    )
+
+
+class StrategyReconciliationState(Base):
+    """Persisted per-coordinate divergence classification.
+
+    ``residual_quantity`` is ``broker - attributed - manual``: zero when
+    aligned. Both ``pending_ingest`` and ``unexplained`` freeze new exposure on
+    the coordinate; only persistent ``unexplained`` escalates to the owner, and
+    ``owner_notified_at`` is written at most once.
+    """
+
+    __tablename__ = "strategy_reconciliation_state"
+
+    account_id = Column(Text, primary_key=True)
+    instrument_token = Column(BigInteger, primary_key=True)
+    exchange = Column(Text, primary_key=True)
+    tradingsymbol = Column(Text, primary_key=True)
+    product = Column(Text, primary_key=True)
+    divergence_class = Column(Text, nullable=False)
+    broker_quantity = Column(BigInteger, nullable=False)
+    attributed_quantity = Column(BigInteger, nullable=False)
+    manual_quantity = Column(BigInteger, nullable=False)
+    residual_quantity = Column(BigInteger, nullable=False)
+    refresh_attempts = Column(Integer, nullable=False, server_default="0")
+    last_checked_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    owner_notified_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "divergence_class IN ('aligned', 'pending_ingest', 'unexplained')",
+            name="ck_srs_divergence_class",
+        ),
+    )
+
+
+class StrategyAttributionAdjustment(Base):
+    """Append-only owner reclassification header. Trigger-immutable."""
+
+    __tablename__ = "strategy_attribution_adjustments"
+
+    adjustment_id = Column(Text, primary_key=True)
+    account_id = Column(Text, nullable=False)
+    adjustment_kind = Column(Text, nullable=False)
+    reason_code = Column(Text, nullable=False)
+    created_by = Column(Text, nullable=False)
+    evidence = Column(JSON, nullable=False, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "adjustment_kind IN ('owner_reclassification')", name="ck_saa_adjustment_kind"
+        ),
+        Index("idx_saa_account", "account_id", "created_at"),
+    )
+
+
+class StrategyAttributionAdjustmentLine(Base):
+    """One signed quantity move between the manual residual and a strategy book.
+
+    ``quantity_delta`` is the signed quantity **credited to the strategy**: a
+    claimed ``-10`` fill is ``delta = -10``, which lowers the strategy's book by
+    10 and raises the manual residual by 10 toward zero. The manual book is the
+    implicit counterparty, so a line is a balanced transfer by construction; a
+    correction is a new opposite-sign line referencing the original in
+    ``evidence``.
+
+    Lines are **live-book facts in V1** — there is deliberately no
+    ``execution_environment`` column, and the fold assigns ``'live'``.
+    """
+
+    __tablename__ = "strategy_attribution_adjustment_lines"
+
+    adjustment_id = Column(Text, primary_key=True)
+    line_no = Column(Integer, primary_key=True)
+    strategy_id = Column(Text, nullable=False)
+    owner_id = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    instrument_token = Column(BigInteger, nullable=False)
+    exchange = Column(Text, nullable=False)
+    tradingsymbol = Column(Text, nullable=False)
+    product = Column(Text, nullable=False)
+    quantity_delta = Column(Integer, nullable=False)
+    effective_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("quantity_delta <> 0", name="ck_saal_quantity_delta"),
+        # Owner/account integrity mirrors strategy_run_bindings exactly.
+        ForeignKeyConstraint(
+            ["strategy_id", "owner_id", "account_id"],
+            ["strategies.id", "strategies.owner_id", "strategies.account_scope"],
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "idx_saal_strategy_coord",
+            "strategy_id",
+            "instrument_token",
+            "exchange",
+            "tradingsymbol",
+            "product",
         ),
     )

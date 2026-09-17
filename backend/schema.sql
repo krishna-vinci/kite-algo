@@ -2638,3 +2638,131 @@ CREATE TABLE IF NOT EXISTS public.strategy_projection_state (
         FOREIGN KEY (strategy_id, account_id)
         REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
 );
+
+-- =========================================
+-- Strategy account truth (G2+G3+G4)
+-- =========================================
+-- Mirrors alembic revision 20260917_000026. Purely additive: nothing above is
+-- altered. Ingested facts and adjustments are insert-only; reconciliation state
+-- persists the per-coordinate classification so the freeze and the UI read
+-- truth rather than recomputing it inline.
+
+CREATE TABLE IF NOT EXISTS public.broker_trade_facts (
+    fact_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id TEXT NOT NULL,
+    trade_id TEXT NOT NULL,
+    broker_order_id TEXT NOT NULL,
+    instrument_token BIGINT NOT NULL,
+    exchange TEXT NOT NULL,
+    tradingsymbol TEXT NOT NULL,
+    product TEXT NOT NULL,
+    transaction_type TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    fill_price DOUBLE PRECISION,
+    trade_timestamp TIMESTAMPTZ,
+    ingest_generation BIGINT NOT NULL,
+    ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_broker_trade_facts_account_trade UNIQUE (account_id, trade_id),
+    CONSTRAINT ck_btf_transaction_type CHECK (transaction_type IN ('BUY', 'SELL')),
+    CONSTRAINT ck_btf_quantity CHECK (quantity > 0)
+);
+CREATE INDEX IF NOT EXISTS idx_btf_account_coord ON public.broker_trade_facts
+    (account_id, instrument_token, exchange, tradingsymbol, product);
+
+CREATE TABLE IF NOT EXISTS public.account_ingest_state (
+    account_id TEXT PRIMARY KEY,
+    last_orders_fetch_at TIMESTAMPTZ,
+    last_complete_ingest_at TIMESTAMPTZ,
+    ingest_generation BIGINT NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'idle',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_ais_status CHECK (status IN ('idle', 'refreshing', 'stale'))
+);
+
+CREATE TABLE IF NOT EXISTS public.strategy_reconciliation_state (
+    account_id TEXT NOT NULL,
+    instrument_token BIGINT NOT NULL,
+    exchange TEXT NOT NULL,
+    tradingsymbol TEXT NOT NULL,
+    product TEXT NOT NULL,
+    divergence_class TEXT NOT NULL,
+    broker_quantity BIGINT NOT NULL,
+    attributed_quantity BIGINT NOT NULL,
+    manual_quantity BIGINT NOT NULL,
+    residual_quantity BIGINT NOT NULL,
+    refresh_attempts INTEGER NOT NULL DEFAULT 0,
+    last_checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    owner_notified_at TIMESTAMPTZ,
+    resolved_at TIMESTAMPTZ,
+    PRIMARY KEY (account_id, instrument_token, exchange, tradingsymbol, product),
+    CONSTRAINT ck_srs_divergence_class CHECK (
+        divergence_class IN ('aligned', 'pending_ingest', 'unexplained')
+    )
+);
+
+CREATE TABLE IF NOT EXISTS public.strategy_attribution_adjustments (
+    adjustment_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id TEXT NOT NULL,
+    adjustment_kind TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_saa_adjustment_kind CHECK (adjustment_kind IN ('owner_reclassification'))
+);
+CREATE INDEX IF NOT EXISTS idx_saa_account
+    ON public.strategy_attribution_adjustments (account_id, created_at);
+
+CREATE TABLE IF NOT EXISTS public.strategy_attribution_adjustment_lines (
+    adjustment_id UUID NOT NULL
+        REFERENCES public.strategy_attribution_adjustments(adjustment_id) ON DELETE RESTRICT,
+    line_no INTEGER NOT NULL,
+    strategy_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    instrument_token BIGINT NOT NULL,
+    exchange TEXT NOT NULL,
+    tradingsymbol TEXT NOT NULL,
+    product TEXT NOT NULL,
+    quantity_delta INTEGER NOT NULL,
+    effective_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (adjustment_id, line_no),
+    CONSTRAINT ck_saal_quantity_delta CHECK (quantity_delta <> 0),
+    -- Owner/account integrity mirrors strategy_run_bindings exactly.
+    CONSTRAINT fk_saal_strategy_canonical
+        FOREIGN KEY (strategy_id, owner_id, account_id)
+        REFERENCES public.strategies (id, owner_id, account_scope) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_saal_strategy_coord
+    ON public.strategy_attribution_adjustment_lines
+    (strategy_id, instrument_token, exchange, tradingsymbol, product);
+
+-- Insert-only enforcement, same pattern as strategy_run_bindings.
+CREATE OR REPLACE FUNCTION forbid_broker_trade_fact_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'broker_trade_facts are immutable (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_broker_trade_facts_immutable ON public.broker_trade_facts;
+CREATE TRIGGER trg_broker_trade_facts_immutable
+    BEFORE UPDATE OR DELETE ON public.broker_trade_facts
+    FOR EACH ROW EXECUTE FUNCTION forbid_broker_trade_fact_mutation();
+
+CREATE OR REPLACE FUNCTION forbid_strategy_attribution_adjustment_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_attribution_adjustments are immutable (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_strategy_attribution_adjustments_immutable
+    ON public.strategy_attribution_adjustments;
+CREATE TRIGGER trg_strategy_attribution_adjustments_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_attribution_adjustments
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_attribution_adjustment_mutation();
+
+DROP TRIGGER IF EXISTS trg_strategy_attribution_adjustment_lines_immutable
+    ON public.strategy_attribution_adjustment_lines;
+CREATE TRIGGER trg_strategy_attribution_adjustment_lines_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_attribution_adjustment_lines
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_attribution_adjustment_mutation();
