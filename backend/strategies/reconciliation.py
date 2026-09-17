@@ -44,6 +44,7 @@ __all__ = [
     "ReconciliationAssessment",
     "ReconciliationEvidence",
     "assess",
+    "barrier_quiescence_state",
     "evidence_digest",
 ]
 
@@ -101,12 +102,55 @@ class ReconciliationEvidence:
     #: assessment and commit.
     settlement_watermark: Optional[str] = None
     #: Whether execution quiescence is established by a durable barrier/version.
-    #: There is no such barrier today, so this is ``unverified`` and a
-    #: trading-capable attempt stays blocked.
+    #: Set through :func:`barrier_quiescence_state`: ``verified`` only when a
+    #: valid settlement-barrier proof covers the strategy book at assessment
+    #: time; every other case — including an unreadable barrier — stays
+    #: ``unverified`` and a trading-capable attempt stays blocked.
     quiescence_state: str = "unverified"  # verified | unverified
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def barrier_quiescence_state(
+    *,
+    account_id: str,
+    strategy_id: Optional[str],
+    execution_environment: str,
+    barrier: Optional[Any] = None,
+    db: Optional[Any] = None,
+) -> str:
+    """Map the settlement barrier onto the reconciliation axis (D-4).
+
+    ``verified`` ONLY when a valid durable proof covers the strategy book
+    ``(account_id, strategy_id, execution_environment)`` at the moment this is
+    called — i.e. the barrier's ``quiet_since_version`` equals its current
+    ``barrier_version``. Every other case maps to ``unverified``:
+
+    - an unattributed job (no canonical strategy id) has no book to prove
+      quiescence for, so it can never verify;
+    - an unreadable barrier is unverified, never verified — fail closed;
+    - any work event after the proof invalidates it by version arithmetic.
+
+    This is the one place the "durable execution-settlement barrier" the
+    blocking logic below waits for is allowed to say ``verified``.
+    """
+    if not strategy_id:
+        return "unverified"
+    try:
+        if barrier is None:
+            from backend.strategies.settlement import ExecutionBarrier
+
+            barrier = ExecutionBarrier()
+        state = barrier.state(
+            account_id=account_id,
+            strategy_id=str(strategy_id),
+            execution_environment=execution_environment,
+            db=db,
+        )
+    except Exception:  # noqa: BLE001 - an unreadable barrier is unverified
+        return "unverified"
+    return "verified" if bool(state.get("proof_valid")) else "unverified"
 
 
 def evidence_digest(evidence: ReconciliationEvidence) -> str:
@@ -243,10 +287,11 @@ def assess(evidence: ReconciliationEvidence) -> ReconciliationAssessment:
 
     # Case 3: trading-capable with settled work, flat exposure, revoked authority.
     # Evidence-integrity blockers (process cleanup, authority) come first; then
-    # proven execution quiescence. There is no durable execution-settlement
-    # barrier in the platform today, so quiescence cannot be established and
-    # trading-capable reconciliation stays blocked (a terminal job label and two
-    # matching reads are NOT proof that already-admitted work cannot complete).
+    # proven execution quiescence. Quiescence is established ONLY by a durable
+    # settlement-barrier proof (D-4, via ``barrier_quiescence_state``): a
+    # terminal job label and two matching reads are NOT proof that
+    # already-admitted work cannot complete afterwards, so a trading-capable
+    # attempt whose book has no valid proof stays blocked.
     blockers += process_blockers + authority_blockers
     if evidence.exposure_state != "flat":
         blockers += _exposure_blockers(evidence)

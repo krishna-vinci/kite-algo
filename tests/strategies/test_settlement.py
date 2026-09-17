@@ -1133,3 +1133,175 @@ class RollupAndPersistenceTests(AssessmentTestCase):
             self.assertEqual(result["overall"], "unknown")
         finally:
             settlement_module.settlement_domain_adapters.clear()
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation consumes the barrier (D-4)
+# ---------------------------------------------------------------------------
+
+
+class BarrierQuiescenceStateTests(AssessmentTestCase):
+    def _state(self, *, strategy_id=STRATEGY, env=ENV, account=ACCOUNT, barrier=None):
+        from backend.strategies.reconciliation import barrier_quiescence_state
+
+        return barrier_quiescence_state(
+            account_id=account,
+            strategy_id=strategy_id,
+            execution_environment=env,
+            barrier=barrier or self.barrier,
+        )
+
+    def test_valid_proof_verifies(self):
+        self.barrier.record_proof(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.assertEqual(self._state(), "verified")
+
+    def test_no_proof_stays_unverified(self):
+        self.assertEqual(self._state(), "unverified")
+
+    def test_work_after_the_proof_stays_unverified(self):
+        self.barrier.record_proof(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV)
+        self.barrier.record_work_event(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV, event="work_created"
+        )
+        self.assertEqual(self._state(), "unverified")
+
+    def test_unattributed_job_can_never_be_verified(self):
+        self.assertEqual(self._state(strategy_id=None), "unverified")
+
+    def test_unreadable_barrier_is_unverified_never_verified(self):
+        engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        try:
+            broken = self._barrier()
+            object.__setattr__(broken, "session_factory", sessionmaker(bind=engine))
+            self.assertEqual(self._state(barrier=broken), "unverified")
+        finally:
+            engine.dispose()
+
+
+class ReconciliationIntegrationTests(AssessmentTestCase):
+    """Trading-capable reconciliation unblocks ONLY on a valid barrier proof."""
+
+    def _collect(self, collector, job):
+        import asyncio
+
+        return asyncio.run(collector.collect(job))
+
+    def _job(self):
+        from types import SimpleNamespace
+
+        from backend.strategies import service as strategy_service
+
+        return SimpleNamespace(
+            id="hsj_1",
+            strategy_id=STRATEGY,
+            attempt=1,
+            status="recovery_required",
+            desired_state="started",
+            execution_mode="paper",
+            account_scope=ACCOUNT,
+            run_id="run-1",
+            token_id="worker_1",
+            handoff_at=datetime.now(timezone.utc),
+            reconciled_at=None,
+            process_cleanup_state="confirmed",
+            process_cleanup_at=datetime.now(timezone.utc),
+            process_cleanup_actor="sup-1",
+            capabilities_snapshot=strategy_service.build_capabilities_snapshot(trade=True),
+        )
+
+    def _collector(self):
+        from backend.strategies.reconciliation_service import ReconciliationEvidenceCollector
+
+        class _Worker:
+            async def get_run(self, run_id):
+                return {"status": "closed", "runtime_state": {}}
+
+            async def get_token_status(self, token_id):
+                return "revoked"
+
+        class _Paper:
+            async def get_strategy_run_settlement_readonly(self, account_scope, run_id):
+                return {
+                    "account_scope": ACCOUNT,
+                    "strategy_run_id": "run-1",
+                    "run_state": {
+                        "strategy_run_id": "run-1",
+                        "is_stale": False,
+                        "last_event_at": "2026-09-17T10:00:00+00:00",
+                        "positions": [],
+                    },
+                    "order_count": 2,
+                    "pending_order_count": 0,
+                    "coverage_complete": True,
+                }
+
+        return ReconciliationEvidenceCollector(
+            worker_repo=_Worker(),
+            paper_runtime=_Paper(),
+            settlement_barrier=self.barrier,
+        )
+
+    def test_collector_sets_verified_only_on_a_valid_proof(self):
+        from backend.strategies.reconciliation import (
+            BLOCK_EXECUTION_QUIESCENCE_UNVERIFIED,
+            CASE_TRADING_SETTLED_FLAT,
+            assess,
+        )
+
+        job = self._job()
+        collector = self._collector()
+
+        # No proof yet: the trading-capable attempt stays blocked.
+        evidence = self._collect(collector, job)
+        self.assertEqual(evidence.quiescence_state, "unverified")
+        result = assess(evidence)
+        self.assertFalse(result.allowed)
+        self.assertIn(BLOCK_EXECUTION_QUIESCENCE_UNVERIFIED, result.blocking_reasons)
+
+        # A valid proof at assessment time verifies — and unblocks the attempt.
+        self.barrier.record_proof(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment="paper")
+        evidence = self._collect(collector, job)
+        self.assertEqual(evidence.quiescence_state, "verified")
+        result = assess(evidence)
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.case, CASE_TRADING_SETTLED_FLAT)
+
+    def test_work_after_collection_invalidates_the_next_assessment(self):
+        """The proof covers the book at assessment time; later work re-blocks."""
+        from backend.strategies.reconciliation import (
+            BLOCK_EXECUTION_QUIESCENCE_UNVERIFIED,
+            assess,
+        )
+
+        job = self._job()
+        collector = self._collector()
+        self.barrier.record_proof(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment="paper")
+        evidence = self._collect(collector, job)
+        self.assertEqual(evidence.quiescence_state, "verified")
+
+        self.barrier.record_work_event(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment="paper", event="work_created"
+        )
+        re_evidence = self._collect(collector, job)
+        self.assertEqual(re_evidence.quiescence_state, "unverified")
+        result = assess(re_evidence)
+        self.assertFalse(result.allowed)
+        self.assertIn(BLOCK_EXECUTION_QUIESCENCE_UNVERIFIED, result.blocking_reasons)
+
+    def test_digest_stability_is_preserved(self):
+        """D-4 keeps the digest discipline: recomputation is stable, states differ."""
+        from backend.strategies.reconciliation import evidence_digest
+
+        job = self._job()
+        collector = self._collector()
+        unverified = self._collect(collector, job)
+        self.assertEqual(evidence_digest(unverified), evidence_digest(unverified))
+
+        self.barrier.record_proof(account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment="paper")
+        verified = self._collect(collector, job)
+        # quiescence_state is one of the digest's axes: the state move re-digests.
+        self.assertNotEqual(evidence_digest(unverified), evidence_digest(verified))

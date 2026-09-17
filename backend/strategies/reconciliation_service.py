@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend.strategies import service as strategy_service
-from backend.strategies.reconciliation import ReconciliationEvidence
+from backend.strategies.reconciliation import ReconciliationEvidence, barrier_quiescence_state
 
 __all__ = ["ReconciliationEvidenceCollector"]
 
@@ -37,10 +37,15 @@ class ReconciliationEvidenceCollector:
         worker_repo: Any,
         paper_runtime: Any = None,
         option_status_reader: Optional[Callable[[str, str], Optional[str]]] = None,
+        settlement_barrier: Optional[Any] = None,
     ) -> None:
         self._worker = worker_repo
         self._paper = paper_runtime
         self._option_status = option_status_reader
+        # The settlement barrier (D-4) backs ``quiescence_state``: ``verified``
+        # only on a valid proof for the job's strategy book. ``None`` means the
+        # default store is constructed lazily on first use.
+        self._settlement_barrier = settlement_barrier
 
     @staticmethod
     def _capabilities(job) -> Tuple[bool, List[str]]:
@@ -158,8 +163,21 @@ class ReconciliationEvidenceCollector:
         launched = job.handoff_at is not None
         trade_capable, cap_notes = self._capabilities(job)
         notes.extend(cap_notes)
+        quiescence_state = "unverified"
         if trade_capable:
-            notes.append("no_execution_settlement_barrier_quiescence_unverified")
+            # D-4: quiescence is barrier-backed now — ``verified`` only when a
+            # valid proof covers this job's strategy book at collection time.
+            quiescence_state = barrier_quiescence_state(
+                account_id=str(job.account_scope or ""),
+                strategy_id=str(job.strategy_id or "") or None,
+                execution_environment=str(job.execution_mode or ""),
+                barrier=self._settlement_barrier,
+            )
+            notes.append(
+                "no_execution_settlement_barrier_quiescence_unverified"
+                if quiescence_state != "verified"
+                else "execution_settlement_barrier_quiescence_verified"
+            )
 
         run: Optional[Dict[str, Any]] = None
         if job.run_id:
@@ -233,7 +251,7 @@ class ReconciliationEvidenceCollector:
             unavailable=sorted(set(unavailable)),
             notes=notes,
             settlement_watermark=watermark,
-            quiescence_state="unverified",
+            quiescence_state=quiescence_state,
         )
 
 
