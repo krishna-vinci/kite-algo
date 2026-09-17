@@ -324,6 +324,7 @@ class _FakeWorkerRepository:
         self.touched = []
         self.live_open_legs = {}
         self.live_order_attribution_refs = {}
+        self.live_order_ownership = {}
         self.live_broker_positions = {}
 
     async def claim_run_session(self, strategy_run_id, *, freshness_seconds, claimed_without_heartbeat_seconds):
@@ -483,6 +484,14 @@ class _FakeWorkerRepository:
             "broker_order_ids": list(refs.get("broker_order_ids", [])),
             "client_order_refs": list(refs.get("client_order_refs", [])),
         }
+
+    async def get_live_order_ownership(self, *, account_id, broker_order_id):
+        return dict(
+            self.live_order_ownership.get(
+                (account_id, broker_order_id),
+                {"status": "unowned", "strategy_run_id": None, "source": None},
+            )
+        )
 
     async def list_live_strategy_broker_positions(self, *, strategy_run_id, account_id):
         return [dict(item) for item in self.live_broker_positions.get(strategy_run_id, [])]
@@ -5170,6 +5179,33 @@ def test_worker_investment_read_routes_reject_unsupported_schema_version():
             response = client.get(f"{route}&schema_version=2" if "?" in route else f"{route}?schema_version=2", headers=_INVESTMENT_AUTH)
             assert response.status_code == 422, route
             assert response.json()["detail"]["rejection_reason"] == "UNSUPPORTED_SCHEMA_VERSION", route
+
+
+class AlgoWorkerOrderOwnershipLookupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_live_order_ownership_exists_and_fake_honors_contract(self):
+        from backend.api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository
+
+        self.assertTrue(hasattr(SqlAlchemyAlgoWorkerRepository, "get_live_order_ownership"))
+
+        repo = _FakeWorkerRepository()
+        repo.live_order_ownership[("kite:AB1234", "OID-1")] = {
+            "status": "owned", "strategy_run_id": "run-live", "source": "link",
+        }
+        repo.live_order_ownership[("kite:AB1234", "OID-B")] = {
+            "status": "conflict", "strategy_run_id": None, "source": None,
+        }
+        self.assertEqual(
+            await repo.get_live_order_ownership(account_id="kite:AB1234", broker_order_id="OID-1"),
+            {"status": "owned", "strategy_run_id": "run-live", "source": "link"},
+        )
+        self.assertEqual(
+            await repo.get_live_order_ownership(account_id="kite:AB1234", broker_order_id="OID-X"),
+            {"status": "unowned", "strategy_run_id": None, "source": None},
+        )
+        self.assertEqual(
+            (await repo.get_live_order_ownership(account_id="kite:AB1234", broker_order_id="OID-B"))["status"],
+            "conflict",
+        )
 
 
 if __name__ == "__main__":

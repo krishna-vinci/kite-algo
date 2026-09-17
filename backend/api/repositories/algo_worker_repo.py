@@ -321,6 +321,18 @@ class SqlAlchemyAlgoWorkerRepository:
     async def get_live_order_attribution_refs(self, *, strategy_run_id: str, account_id: str) -> Dict[str, List[str]]:
         return await asyncio.to_thread(self._get_live_order_attribution_refs_sync, strategy_run_id, account_id)
 
+    async def get_live_order_ownership(self, *, account_id: str, broker_order_id: str) -> Dict[str, Any]:
+        """Conflict-aware ownership resolution for one broker order on an account.
+
+        Returns ``{"status": "owned"|"unowned"|"conflict", "strategy_run_id": ...,
+        "source": "link"|"intent"|None}``. Links are authoritative; the placed
+        live-order intent is a fallback only when no execution link exists.
+        Multiple distinct owners within a source, or a link-versus-intent
+        disagreement, are corruption: ``status="conflict"`` so callers fail
+        closed observably. Never picks a row silently.
+        """
+        return await asyncio.to_thread(self._get_live_order_ownership_sync, account_id, broker_order_id)
+
     async def list_live_strategy_broker_positions(self, *, strategy_run_id: str, account_id: str) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(self._list_live_strategy_broker_positions_sync, strategy_run_id, account_id)
 
@@ -1442,6 +1454,53 @@ class SqlAlchemyAlgoWorkerRepository:
                 "broker_order_ids": broker_order_ids,
                 "client_order_refs": client_order_refs,
             }
+        finally:
+            db.close()
+
+    def _get_live_order_ownership_sync(self, account_id: str, broker_order_id: str) -> Dict[str, Any]:
+        db = self.session_factory()
+        try:
+            link_owners = {
+                str(row[0] or "")
+                for row in db.execute(
+                    text(
+                        """
+                        SELECT DISTINCT strategy_run_id
+                        FROM public.worker_live_execution_links
+                        WHERE account_id = :account_id
+                          AND broker_order_id = :broker_order_id
+                        """
+                    ),
+                    {"account_id": account_id, "broker_order_id": broker_order_id},
+                ).fetchall()
+                if str(row[0] or "")
+            }
+            intent_owners = {
+                str(row[0] or "")
+                for row in db.execute(
+                    text(
+                        """
+                        SELECT DISTINCT strategy_run_id
+                        FROM public.live_order_intents
+                        WHERE account_id = :account_id
+                          AND broker_order_id = :broker_order_id
+                        """
+                    ),
+                    {"account_id": account_id, "broker_order_id": broker_order_id},
+                ).fetchall()
+                if str(row[0] or "")
+            }
+            if len(link_owners) > 1 or len(intent_owners) > 1:
+                return {"status": "conflict", "strategy_run_id": None, "source": None}
+            link_owner = next(iter(link_owners), None)
+            intent_owner = next(iter(intent_owners), None)
+            if link_owner is not None and intent_owner is not None and link_owner != intent_owner:
+                return {"status": "conflict", "strategy_run_id": None, "source": None}
+            if link_owner is not None:
+                return {"status": "owned", "strategy_run_id": link_owner, "source": "link"}
+            if intent_owner is not None:
+                return {"status": "owned", "strategy_run_id": intent_owner, "source": "intent"}
+            return {"status": "unowned", "strategy_run_id": None, "source": None}
         finally:
             db.close()
 
