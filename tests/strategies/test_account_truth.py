@@ -334,11 +334,20 @@ class ReconciliationTests(AccountTruthTestCase):
                 self.store.ingest_trades(account_id=account_id, trades=missing)
                 return {"account_id": account_id, "inserted": 1}
 
+        # Without a refresh available the mismatch can only be pending, never
+        # silently "unexplained" — a fresh mismatch may still be missing truth.
+        pending = asyncio.run(self._service(max_attempts=3).reconcile_account("kite:A"))
+        self.assertEqual(pending["coordinates"][0]["divergence_class"], "pending_ingest")
+        self.assertEqual(pending["frozen"], [_coord()])
+
         ingest = _Ingest()
         ingest.store = self.store
         service = self._service(ingest_service=ingest, max_attempts=3)
         first = asyncio.run(service.reconcile_account("kite:A"))
-        self.assertEqual(first["coordinates"][0]["divergence_class"], "pending_ingest")
+        # The bounded refresh found the missing fill, so this same check already
+        # re-aligns — the freeze never lags a cycle behind the truth that lifts it.
+        self.assertEqual(ingest.calls, 1)
+        self.assertEqual(first["coordinates"][0]["divergence_class"], "aligned")
 
         # Now that the fill is ingested, the identity holds (100 = 100 + 0 - ...).
         # The 10 the human sold is manual, so broker 90 == attributed 100 + manual -10.

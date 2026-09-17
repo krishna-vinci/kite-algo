@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Set, Tuple
 
@@ -272,7 +273,7 @@ class AccountTruthStore:
                     continue
                 session.add(
                     BrokerTradeFact(
-                        fact_id=f"btf_{account_id}_{trade_id}",
+                        fact_id=str(uuid.uuid4()),
                         account_id=account_id,
                         trade_id=trade_id,
                         broker_order_id=order_id,
@@ -724,11 +725,36 @@ class ReconciliationService:
             if residual != 0:
                 attempts += 1
                 # Bounded refresh: each uncertain check is one ingest attempt.
+                # A successful refresh can *resolve* the mismatch, so the numbers
+                # are re-read before classifying — otherwise a lifted freeze would
+                # lag a whole cycle behind the truth that lifted it.
                 if attempts <= self.max_attempts and self._ingest is not None:
                     await self._ingest.ingest_account(account_id)
                     ingest_state = await self._run_async(
                         self.store.ingest_state, account_id=account_id
                     )
+                    broker_quantity = int(
+                        (
+                            await self._run_async(
+                                self.store.broker_quantities, account_id=account_id
+                            )
+                        ).get(coordinate, 0)
+                    )
+                    attributed_quantity = int(
+                        (
+                            await self._run_async(
+                                self.store.attributed_quantities, account_id=account_id
+                            )
+                        ).get(coordinate, 0)
+                    )
+                    manual_quantity = int(
+                        (
+                            await self._run_async(
+                                self.store.manual_residual_by_coordinate, account_id=account_id
+                            )
+                        ).get(coordinate, 0)
+                    )
+                    residual = broker_quantity - attributed_quantity - manual_quantity
 
             divergence = self._classify(
                 residual=residual, attempts=attempts, ingest_state=ingest_state
