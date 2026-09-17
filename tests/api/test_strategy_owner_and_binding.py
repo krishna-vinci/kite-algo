@@ -433,6 +433,24 @@ class OwnerStrategyApiTests(unittest.IsolatedAsyncioTestCase):
                 )
                 """
             )
+            # No catalog generations/mappings: tokens resolve as explicit
+            # unresolved raw identities, which is a real production state.
+            cursor.execute(
+                """
+                CREATE TABLE public.instrument_catalog_generations (
+                    id TEXT PRIMARY KEY, status TEXT, published_at TEXT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.instrument_broker_mappings (
+                    mapping_id TEXT PRIMARY KEY, instrument_id TEXT, broker TEXT, broker_exchange TEXT,
+                    broker_symbol TEXT, broker_token TEXT, valid_from_generation TEXT,
+                    valid_to_generation TEXT, is_current INTEGER
+                )
+                """
+            )
             cursor.close()
 
         Base.metadata.create_all(self.engine)
@@ -753,6 +771,71 @@ class OwnerStrategyApiTests(unittest.IsolatedAsyncioTestCase):
         client = self._client(username="other")
         try:
             self.assertEqual((await client.get(f"{BASE}/{sid}/positions")).status_code, 404)
+        finally:
+            self._stop_patches()
+
+    # -- app-state wiring -----------------------------------------------------
+
+    async def test_wired_attribution_state_publishes_binding_into_positions_read(self):
+        """After a run binds, publishing makes the book visible at the owner read.
+
+        Exercises the app-state-wired store/service end to end: a bound run's
+        fill is folded per fact, and because no catalog mapping exists for the
+        token the exposure stays an explicit unresolved raw row rather than being
+        silently attributed.
+        """
+        from backend.app.background import ensure_attribution_state
+
+        client = self._client()
+        try:
+            created = await self._create(client)
+            sid = created["strategy_id"]
+
+            # A run binds in the live book; its fill is a real durable fact.
+            self.store.bind_run(
+                strategy_run_id="run-wired", strategy_id=sid, owner_id="app:admin",
+                account_id="kite:paper", execution_environment="live",
+                bound_by="supervisor", binding_source="hosted_job",
+            )
+            with self.factory() as session:
+                session.execute(
+                    text(
+                        "INSERT INTO public.worker_live_execution_links "
+                        "(strategy_run_id, account_id, broker_order_id) "
+                        "VALUES ('run-wired', 'kite:paper', 'OID-WIRED')"
+                    )
+                )
+                session.execute(
+                    text(
+                        "INSERT INTO public.order_trade_fills "
+                        "(account_id, order_id, trade_id, instrument_token, exchange, tradingsymbol, "
+                        " product, transaction_type, quantity, fill_timestamp, payload_json) "
+                        "VALUES ('kite:paper', 'OID-WIRED', 'T-1', 738561, 'NSE', 'RELIANCE', "
+                        " 'CNC', 'BUY', 100, '2026-09-17T10:00:00+00:00', '{}')"
+                    )
+                )
+                session.commit()
+
+            # The app factory wires the store/service into app state.
+            app = client._transport.app  # type: ignore[attr-defined]
+            ensure_attribution_state(app)
+            self.assertIsNotNone(getattr(app.state, "attribution_store", None))
+            self.assertIsNotNone(getattr(app.state, "attribution_service", None))
+
+            rebuilt = await client.post(f"{BASE}/{sid}/positions/rebuild?environment=live")
+            self.assertEqual(rebuilt.status_code, 200, rebuilt.text)
+            self.assertEqual(rebuilt.json()["folded_facts"], 1)
+
+            listed = await client.get(f"{BASE}/{sid}/positions?environment=live")
+            self.assertEqual(listed.status_code, 200, listed.text)
+            positions = listed.json()["positions"]
+            self.assertEqual(len(positions), 1)
+            self.assertEqual(positions[0]["net_quantity"], 100)
+            self.assertEqual(positions[0]["instrument_token"], 738561)
+            # No catalog mapping exists for this token: the row must say so
+            # rather than pretend to be resolved.
+            self.assertEqual(positions[0]["identity_kind"], "raw")
+            self.assertEqual(positions[0]["unresolved_reason"], "mapping_missing")
         finally:
             self._stop_patches()
 

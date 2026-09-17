@@ -19,6 +19,7 @@ from backend.app.background import (
     _worker_protection_loop,
     _worker_runtime_recovery_exit_loop,
     _worker_runtime_recovery_runs_loop,
+    ensure_attribution_state,
 )
 from backend.app.schedulers import daily_token_ready, _schedule_daily_token_refresh, _schedule_exchange_calendar_refresh, _schedule_fundamentals_nightly_refresh, _schedule_monthly_index_refresh
 from backend.broker_api.broker_api import (
@@ -465,6 +466,10 @@ async def combined_lifespan(app: FastAPI):
         except Exception as e:
             logging.error("Failed to initialize modular algo runtime: %s", e, exc_info=True)
             set_component_status("algo_runtime", "degraded", detail=str(e))
+
+        # Durable strategy attribution: construct the shared store/service up
+        # front. Publication stays on-demand (no loop is started here).
+        ensure_attribution_state(app)
 
         if os.getenv("WORKER_PROTECTION_ENABLED", "true").lower() in {"1", "true", "yes"}:
             worker_protection_task = asyncio.create_task(_worker_protection_loop(app))

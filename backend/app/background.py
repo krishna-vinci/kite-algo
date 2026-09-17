@@ -37,6 +37,32 @@ def _worker_protection_squareoff_schedule() -> dict[str, str]:
         logging.warning("Invalid WORKER_PROTECTION_SQUAREOFF_SCHEDULE_JSON; using defaults", exc_info=True)
         return defaults
 
+def ensure_attribution_state(app: FastAPI) -> None:
+    """Wire the attribution store and service into app state (idempotent).
+
+    G1 adds **no scheduler and no loop**: publication is on-demand through the
+    service, and the owner-facing rebuild endpoint is the operational remedy.
+    This only constructs the long-lived objects so every request shares one
+    store/service bound to the app's session factory.
+
+    Injected state wins, so tests can supply a SQLite-backed store.
+    """
+    from backend.strategies.attribution import SqlAttributionStore, StrategyAttributionService
+
+    store = getattr(app.state, "attribution_store", None)
+    if store is None:
+        repo = getattr(app.state, "algo_worker_repository", None)
+        session_factory = getattr(repo, "session_factory", None)
+        store = (
+            SqlAttributionStore(session_factory=session_factory)
+            if session_factory is not None
+            else SqlAttributionStore()
+        )
+        app.state.attribution_store = store
+    if getattr(app.state, "attribution_service", None) is None:
+        app.state.attribution_service = StrategyAttributionService(store)
+
+
 async def _worker_protection_loop(app: FastAPI):
     from types import SimpleNamespace
 
@@ -53,6 +79,7 @@ async def _worker_protection_loop(app: FastAPI):
     if repo is None:
         repo = SqlAlchemyAlgoWorkerRepository()
         app.state.algo_worker_repository = repo
+    ensure_attribution_state(app)
     runtime = WorkerProtectionRuntime(
         repo=repo,
         pnl_loader=lambda run: load_worker_run_pnl_for_protection(request, run),

@@ -40,7 +40,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import bindparam, delete, select, text
 
 from backend.shared.serialization import _json_dumps, _row_mapping
 from backend.strategies.attribution_models import (
@@ -583,9 +583,16 @@ class SqlAttributionStore:
         owns_db = db is None
         session = db or self.session_factory()
         try:
-            rows = session.execute(
-                text(
-                    """
+            # ``= ANY(:array)`` is PostgreSQL; other dialects (the SQLite test
+            # database) need an expanding IN list. Both read the same rows.
+            if session.bind.dialect.name == "postgresql":
+                ownership_predicate = "otf.order_id = ANY(:owned_order_ids)"
+                params: Dict[str, Any] = {
+                    "account_id": account_id,
+                    "owned_order_ids": list(owned_orders),
+                }
+                statement = text(
+                    f"""
                     SELECT otf.order_id, otf.trade_id,
                            otf.instrument_token,
                            COALESCE(NULLIF(otf.exchange, ''), otf.payload_json ->> 'exchange')       AS exchange,
@@ -596,12 +603,30 @@ class SqlAttributionStore:
                            otf.fill_timestamp
                     FROM public.order_trade_fills otf
                     WHERE otf.account_id = :account_id
-                      AND otf.order_id = ANY(:owned_order_ids)
+                      AND {ownership_predicate}
                     ORDER BY otf.fill_timestamp ASC, otf.trade_id ASC
                     """
-                ),
-                {"account_id": account_id, "owned_order_ids": list(owned_orders)},
-            ).fetchall()
+                )
+            else:
+                ownership_predicate = "otf.order_id IN :owned_order_ids"
+                params = {"account_id": account_id}
+                statement = text(
+                    f"""
+                    SELECT otf.order_id, otf.trade_id,
+                           otf.instrument_token,
+                           COALESCE(NULLIF(otf.exchange, ''), json_extract(otf.payload_json, '$.exchange'))       AS exchange,
+                           COALESCE(NULLIF(otf.tradingsymbol, ''), json_extract(otf.payload_json, '$.tradingsymbol')) AS tradingsymbol,
+                           COALESCE(NULLIF(otf.product, ''), json_extract(otf.payload_json, '$.product'))         AS product,
+                           CASE WHEN UPPER(COALESCE(NULLIF(otf.transaction_type, ''), json_extract(otf.payload_json, '$.transaction_type'))) = 'BUY'
+                                THEN otf.quantity ELSE -otf.quantity END                              AS signed_quantity,
+                           otf.fill_timestamp
+                    FROM public.order_trade_fills otf
+                    WHERE otf.account_id = :account_id
+                      AND {ownership_predicate}
+                    ORDER BY otf.fill_timestamp ASC, otf.trade_id ASC
+                    """
+                ).bindparams(bindparam("owned_order_ids", value=list(owned_orders), expanding=True))
+            rows = session.execute(statement, params).fetchall()
         finally:
             if owns_db:
                 session.close()
