@@ -59,6 +59,22 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _json_safe(value: Any) -> Any:
+    """Make evidence JSON-storable: the quote's timestamp becomes an ISO string.
+
+    ``margin_as_of`` is the typed column; the JSON blob keeps the full quote
+    verbatim but must not carry a raw datetime, which SQLite cannot serialize.
+    """
+    if isinstance(value, datetime):
+        parsed = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return parsed.isoformat()
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def _as_datetime(value: Any) -> Optional[datetime]:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
@@ -221,7 +237,7 @@ class ReservationLedger:
                 execution_environment=str(request.execution_environment),
                 status="active",
                 reserved_notional_inr=float(request.requirement_inr),
-                margin_evidence=dict(request.margin_evidence or {}) or None,
+                margin_evidence=_json_safe(request.margin_evidence) or None,
                 margin_as_of=request.margin_as_of,
                 valid_until=request.valid_until,
             )

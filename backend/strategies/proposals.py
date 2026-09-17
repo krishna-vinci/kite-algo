@@ -138,6 +138,14 @@ class ProposalStore:
             ).scalar_one_or_none()
             return self._plan_view(row) if row is not None else None
 
+    def get_plan(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        """One frozen plan by its own id (the admission/approval entry point)."""
+        with self.session_factory() as session:
+            row = session.execute(
+                select(StrategyPlan).where(StrategyPlan.plan_id == str(plan_id))
+            ).scalar_one_or_none()
+            return self._plan_view(row) if row is not None else None
+
     def list_proposals(self, *, strategy_id: str, limit: int = 50) -> list:
         with self.session_factory() as session:
             rows = session.execute(

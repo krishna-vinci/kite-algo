@@ -33,6 +33,15 @@ from backend.strategies.compiler.base import (
 DEFAULT_WEIGHT = 0.0
 
 
+def _as_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class TargetWeightsCompiler(TargetCompiler):
     target_kind = "target_weights"
 
@@ -137,6 +146,10 @@ class TargetWeightsCompiler(TargetCompiler):
                         },
                     )
 
+        reference_prices = payload.get("reference_prices")
+        if reference_prices is not None and not isinstance(reference_prices, Mapping):
+            raise ValidationRefusal("PAYLOAD_INVALID", {"missing_fields": ["reference_prices"]})
+
         normalized: Dict[str, float] = {}
         for key, value in weights.items():
             try:
@@ -180,6 +193,12 @@ class TargetWeightsCompiler(TargetCompiler):
                     "broker_symbol": mapping["broker_symbol"],
                     "broker_token": mapping["broker_token"],
                     "target_weight": weight,
+                    # Per-member price for admission's notional arithmetic.
+                    "reference_price": (
+                        None
+                        if not reference_prices
+                        else _as_optional_float(reference_prices.get(member))
+                    ),
                     # Omission inside the scope is an explicit zero, not an absence.
                     "explicit_zero": weight == 0.0,
                 }

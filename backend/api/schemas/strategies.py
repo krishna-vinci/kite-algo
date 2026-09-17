@@ -518,3 +518,102 @@ class HostedStrategyOptionsResponse(BaseModel):
     job_kinds: List[str] = Field(default_factory=list)
     stale_exit_policies: List[str] = Field(default_factory=list)
     hosted_execution_only: bool = True
+
+
+class AdmissionPolicyRequest(BaseModel):
+    """The recorded basis for admission. ``extra="forbid"`` at the boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    allocation_inr: Optional[float] = Field(default=None, ge=0)
+    per_instrument_notional_inr: Optional[float] = Field(default=None, ge=0)
+    gross_notional_inr: Optional[float] = Field(default=None, ge=0)
+    max_open_instruments: Optional[int] = Field(default=None, ge=0)
+    admissions_per_window: Optional[int] = Field(default=None, gt=0)
+    admission_window_seconds: Optional[int] = Field(default=None, gt=0)
+    daily_loss_budget_inr: Optional[float] = Field(default=None, ge=0)
+
+
+class AdmissionPolicyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str
+    account_id: str
+    allocation_inr: Optional[float] = None
+    per_instrument_notional_inr: Optional[float] = None
+    gross_notional_inr: Optional[float] = None
+    max_open_instruments: Optional[int] = None
+    admissions_per_window: Optional[int] = None
+    admission_window_seconds: Optional[int] = None
+    daily_loss_budget_inr: Optional[float] = None
+    updated_by: str = ""
+
+
+class AdmissionVerdictResponse(BaseModel):
+    """A preview verdict. A preview is NOT a reservation (R3 §8)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    admitted: bool
+    rejection_reason: Optional[str] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReservationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reservation_id: str
+    plan_id: str
+    strategy_id: str
+    account_id: str
+    evaluation_id: str
+    execution_environment: str
+    status: str
+    reserved_notional_inr: float
+    margin_evidence: Dict[str, Any] = Field(default_factory=dict)
+    margin_as_of: Optional[str] = None
+    valid_until: Optional[str] = None
+    renewed_at: Optional[str] = None
+    released_at: Optional[str] = None
+    release_reason: Optional[str] = None
+
+
+class ReservationListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reservations: List[ReservationResponse] = Field(default_factory=list)
+
+
+class ApprovalResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: str
+    plan_id: str
+    strategy_id: str
+    account_id: str
+    reservation_id: str
+    plan_hash: str
+    exposure_snapshot_version: int
+    exposure_snapshot_hash: Optional[str] = None
+    reconciliation_version: int
+    catalog_generation: str
+    session_product_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    actor_id: str
+    status: str
+    valid_from: Optional[str] = None
+    valid_until: Optional[str] = None
+    #: Derived at read time, never stored.
+    structural_validity: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ApprovalListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approvals: List[ApprovalResponse] = Field(default_factory=list)
+
+
+class ApprovalRequestModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reservation_id: str = Field(min_length=1, max_length=64)
+    validity_seconds: int = Field(default=900, gt=0, le=86400)

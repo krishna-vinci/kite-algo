@@ -101,6 +101,12 @@ class ApprovalInputError(ApprovalError):
     reason_code = "APPROVAL_INPUT_INVALID"
 
 
+class ApprovalNotRequired(ApprovalError):
+    """Paper and dry-run plans are exempt from approval (D-1)."""
+
+    reason_code = "APPROVAL_NOT_REQUIRED"
+
+
 class ReservationNotActive(ApprovalError):
     """Approval carries the reservation identity, so it cannot authorise work
     whose capacity was released or expired."""
@@ -113,6 +119,7 @@ class ApprovalRequest:
     plan: Mapping[str, Any]
     actor_id: str
     reservation_id: str
+    execution_environment: str = "live"
     validity_seconds: int = DEFAULT_APPROVAL_VALIDITY_SECONDS
     session_product_snapshot: Optional[Dict[str, Any]] = None
     margin_evidence: Optional[Dict[str, Any]] = None
@@ -214,6 +221,17 @@ class ApprovalService:
         plan_id = str(plan.get("plan_id") or "")
         if not plan_id or not strategy_id:
             raise ApprovalInputError({"message": "plan_id and strategy_id are required"})
+
+        if str(request.execution_environment).lower() != "live":
+            # Approval authority expires with a live evaluation; paper and dry-run
+            # are exempt, and recording an approval for them would be misleading.
+            raise ApprovalNotRequired(
+                {
+                    "strategy_id": strategy_id,
+                    "execution_environment": str(request.execution_environment),
+                    "message": "Paper and dry-run plans are exempt from approval.",
+                }
+            )
 
         owner = self.owner_of(strategy_id)
         if owner is None:

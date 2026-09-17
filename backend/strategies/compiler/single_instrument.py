@@ -65,6 +65,12 @@ class SingleInstrumentCompiler(TargetCompiler):
                 },
             )
 
+        reference_price = payload.get("reference_price")
+        try:
+            reference_price = None if reference_price is None else float(reference_price)
+        except (TypeError, ValueError) as exc:
+            raise ValidationRefusal("PAYLOAD_INVALID", {"reason": str(exc)}) from exc
+
         logical: Dict[str, Any] = {
             "target_kind": self.target_kind,
             "instrument_token": broker_token,
@@ -86,6 +92,9 @@ class SingleInstrumentCompiler(TargetCompiler):
                     "broker_token": mapping["broker_token"],
                     "product": product,
                     "signed_quantity": target_quantity,
+                    # Carried so admission's notional arithmetic has a price from
+                    # the plan itself, with no new market-data dependency (D-2).
+                    "reference_price": reference_price,
                 }
             ],
         }

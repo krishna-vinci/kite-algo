@@ -634,6 +634,11 @@ class _ProposalApiHarness(_OwnerApiHarness):
         )
         return repo, RAW_WORKER_TOKEN
 
+    def _stop_patches(self):
+        for patcher in (getattr(self, "_margin", None), getattr(self, "_patch", None), getattr(self, "_env", None)):
+            if patcher is not None:
+                patcher.stop()
+
     def _proposal_client(self, *, repo, username="admin"):
         from unittest.mock import patch as _patch
 
@@ -649,6 +654,14 @@ class _ProposalApiHarness(_OwnerApiHarness):
         app.state.attribution_store = self.store
         app.state.algo_worker_repository = repo
         app.state.proposal_store = _proposal_store(self.factory)
+        from datetime import datetime, timezone
+
+        self._margin = _patch.object(
+            strategies_module,
+            "_live_margin_evidence",
+            lambda _scope, _plan: {"usable": 10_000_000.0, "as_of": datetime.now(timezone.utc)},
+        )
+        self._margin.start()
         self._patch = _patch.object(auth_module, "get_optional_app_user", lambda _request: user)
         self._patch.start()
         self._env = _patch.dict(
@@ -682,6 +695,8 @@ class _ProposalApiHarness(_OwnerApiHarness):
                 "tradingsymbol": "RELIANCE",
                 "product": "CNC",
                 "target_quantity": 10,
+                # Admission's allocation arithmetic needs a price from the plan.
+                "reference_price": 100.0,
             },
         }
         body.update(overrides)
@@ -1475,6 +1490,175 @@ class WorkerProposalSubmissionTests(_ProposalApiHarness):
                     path, headers={"Authorization": f"Bearer {raw_token}"}
                 )
                 self.assertEqual(response.status_code, 401)
+        finally:
+            self._stop_patches()
+
+
+class AdmissionOwnerApiTests(_ProposalApiHarness):
+    """Task 5 (G9+G10+G6): owner surfaces, read-only previews, workers refused."""
+
+    async def _submitted(self):
+        """A validated live plan plus its ids, reached through the worker route."""
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+        await self._bind_run(sid, run_id="run-bound")
+        repo, raw_token = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            response = await client.post(
+                PROPOSALS_BASE,
+                json=self._payload(strategy_id=sid),
+                headers={"Authorization": f"Bearer {raw_token}"},
+            )
+            self.assertEqual(response.status_code, 201, response.text)
+        finally:
+            self._stop_patches()
+        return sid, response.json()["plan"]["plan_id"]
+
+    def _with_env(self, client):
+        return client
+
+    async def test_admission_preview_does_not_reserve(self):
+        sid, plan_id = await self._submitted()
+        repo, _ = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            # No policy yet: the preview reports the named refusal.
+            preview = await client.post(f"{BASE}/{sid}/plans/{plan_id}/admission")
+            self.assertEqual(preview.status_code, 200, preview.text)
+            body = preview.json()
+            self.assertFalse(body["admitted"])
+            self.assertEqual(body["rejection_reason"], "ADMISSION_POLICY_MISSING")
+
+            # A preview is NOT a reservation: nothing was written.
+            with self.factory() as session:
+                reservations = session.execute(
+                    text("SELECT COUNT(*) FROM strategy_reservations")
+                ).scalar()
+            self.assertEqual(reservations, 0)
+
+            # Record a policy, preview again: admitted, and still nothing reserved.
+            policy = await client.put(
+                f"{BASE}/{sid}/admission-policy", json={"allocation_inr": 100000.0}
+            )
+            self.assertEqual(policy.status_code, 200, policy.text)
+            self.assertEqual(policy.json()["allocation_inr"], 100000.0)
+
+            admitted = await client.post(f"{BASE}/{sid}/plans/{plan_id}/admission")
+            self.assertEqual(admitted.status_code, 200, admitted.text)
+            self.assertTrue(admitted.json()["admitted"], admitted.text)
+            with self.factory() as session:
+                reservations = session.execute(
+                    text("SELECT COUNT(*) FROM strategy_reservations")
+                ).scalar()
+            self.assertEqual(reservations, 0)
+        finally:
+            self._stop_patches()
+
+    async def test_reserve_then_approve_then_revoke(self):
+        sid, plan_id = await self._submitted()
+        repo, _ = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            await client.put(f"{BASE}/{sid}/admission-policy", json={"allocation_inr": 100000.0})
+            reserved = await client.post(f"{BASE}/{sid}/plans/{plan_id}/reserve")
+            self.assertEqual(reserved.status_code, 200, reserved.text)
+            reservation = reserved.json()
+            self.assertEqual(reservation["status"], "active")
+
+            # One plan claims capacity once: a second reserve is idempotent.
+            again = await client.post(f"{BASE}/{sid}/plans/{plan_id}/reserve")
+            self.assertEqual(again.json()["reservation_id"], reservation["reservation_id"])
+
+            listed = await client.get(f"{BASE}/{sid}/reservations")
+            self.assertEqual(len(listed.json()["reservations"]), 1)
+
+            approved = await client.post(
+                f"{BASE}/{sid}/plans/{plan_id}/approval",
+                json={"reservation_id": reservation["reservation_id"], "validity_seconds": 600},
+            )
+            self.assertEqual(approved.status_code, 200, approved.text)
+            approval = approved.json()
+            self.assertTrue(approval["structural_validity"]["valid"], approval["structural_validity"])
+
+            # A duplicate approval with identical pins adds nothing.
+            duplicate = await client.post(
+                f"{BASE}/{sid}/plans/{plan_id}/approval",
+                json={"reservation_id": reservation["reservation_id"]},
+            )
+            self.assertEqual(duplicate.status_code, 409)
+            self.assertEqual(
+                duplicate.json()["detail"]["rejection_reason"], "APPROVAL_ALREADY_ACTIVE"
+            )
+
+            history = await client.get(f"{BASE}/{sid}/approvals")
+            self.assertEqual(len(history.json()["approvals"]), 1)
+
+            revoked = await client.post(f"{BASE}/{sid}/plans/{plan_id}/approval/revoke")
+            self.assertEqual(revoked.status_code, 200, revoked.text)
+            self.assertEqual(revoked.json()["status"], "revoked")
+        finally:
+            self._stop_patches()
+
+    async def test_reserve_refuses_when_capacity_is_committed(self):
+        sid, plan_id = await self._submitted()
+        repo, _ = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            # A tiny allocation that the plan cannot fit inside.
+            await client.put(f"{BASE}/{sid}/admission-policy", json={"allocation_inr": 1.0})
+            refused = await client.post(f"{BASE}/{sid}/plans/{plan_id}/reserve")
+            self.assertEqual(refused.status_code, 409)
+            self.assertEqual(refused.json()["detail"]["rejection_reason"], "ALLOCATION_EXCEEDED")
+        finally:
+            self._stop_patches()
+
+    async def test_workers_and_foreign_owners_are_refused(self):
+        sid, plan_id = await self._submitted()
+        repo, raw_token = self._worker_repo()
+
+        # A worker token cannot reach the owner surface at all.
+        client = self._proposal_client(repo=repo, username=None)
+        try:
+            for path in (
+                f"{BASE}/{sid}/plans/{plan_id}/admission",
+                f"{BASE}/{sid}/plans/{plan_id}/reserve",
+            ):
+                response = await client.post(
+                    path, headers={"Authorization": f"Bearer {raw_token}"},
+                    json={"reservation_id": "x"},
+                )
+                self.assertEqual(response.status_code, 401, path)
+        finally:
+            self._stop_patches()
+
+        # A different app user gets a non-disclosing 404 from the owner check.
+        client = self._proposal_client(repo=repo, username="someone-else")
+        try:
+            response = await client.post(f"{BASE}/{sid}/plans/{plan_id}/reserve")
+            self.assertEqual(response.status_code, 404)
+            listed = await client.get(f"{BASE}/{sid}/reservations")
+            self.assertEqual(listed.status_code, 404)
+        finally:
+            self._stop_patches()
+
+    async def test_request_models_forbid_extra_fields(self):
+        sid, _ = await self._submitted()
+        repo, _ = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            drifted = await client.put(
+                f"{BASE}/{sid}/admission-policy",
+                json={"allocation_inr": 10.0, "surprise": 1},
+            )
+            self.assertEqual(drifted.status_code, 422)
+            negative = await client.put(
+                f"{BASE}/{sid}/admission-policy", json={"allocation_inr": -5.0}
+            )
+            self.assertEqual(negative.status_code, 422)
         finally:
             self._stop_patches()
 

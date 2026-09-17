@@ -545,5 +545,23 @@ class StructuralValidityTests(ApprovalTestCase):
         self.assertFalse(state["valid"])
 
 
+class ExemptionTests(ApprovalTestCase):
+    def test_paper_and_dry_run_are_approval_exempt(self):
+        from backend.strategies.approvals import ApprovalNotRequired, ApprovalRequest
+
+        reservation = self.reserve()
+        for environment in ("paper", "dry_run"):
+            with self.assertRaises(ApprovalNotRequired) as ctx:
+                self.approvals.approve(
+                    ApprovalRequest(
+                        plan=self.plan(), actor_id="app:owner",
+                        reservation_id=reservation["reservation_id"],
+                        execution_environment=environment,
+                    ),
+                    now=NOW,
+                )
+            self.assertEqual(ctx.exception.reason_code, "APPROVAL_NOT_REQUIRED")
+
+
 if __name__ == "__main__":
     unittest.main()

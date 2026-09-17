@@ -38,9 +38,17 @@ from backend.api.schemas.proposals import (
     ProposalRow,
 )
 from backend.api.schemas.strategies import (
+    AdmissionPolicyRequest,
+    AdmissionPolicyResponse,
+    AdmissionVerdictResponse,
     AdjustmentCreateRequest,
     AdjustmentLineResponse,
     AdjustmentResponse,
+    ApprovalListResponse,
+    ApprovalRequestModel,
+    ApprovalResponse,
+    ReservationListResponse,
+    ReservationResponse,
     ExternalAdapterRequest,
     ExternalAdapterResponse,
     ExternalStrategyCreateRequest,
@@ -615,6 +623,317 @@ def _proposal_store(request: Request, session_factory: Any):
     if store is None:
         store = ProposalStore(session_factory=session_factory)
     return store
+
+
+# ---------------------------------------------------------------------------
+# Admission, reservations and approvals (G9+G10+G6) — owner surfaces
+# ---------------------------------------------------------------------------
+
+
+def _admission_service(session_factory: Any):
+    from backend.strategies.admission import AdmissionService
+
+    return AdmissionService(session_factory=session_factory)
+
+
+def _reservation_ledger(session_factory: Any):
+    from backend.strategies.reservations import ReservationLedger
+
+    return ReservationLedger(session_factory=session_factory)
+
+
+def _approval_service(session_factory: Any):
+    from backend.strategies.approvals import ApprovalService
+
+    return ApprovalService(session_factory=session_factory)
+
+
+def _plan_or_404(store: Any, *, owner: str, repo: Any, strategy_id: str, plan_id: str) -> Dict[str, Any]:
+    _owned_strategy(repo, owner, strategy_id)
+    plan = store.get_plan(plan_id)
+    if plan is None or str(plan["strategy_id"]) != str(strategy_id):
+        raise HTTPException(status_code=404, detail="Plan not found")
+    return plan
+
+
+def _live_margin_evidence(account_scope: str, plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Authoritative live margin for the plan's legs, or ``None``.
+
+    ``None`` is a real answer here: admission refuses MARGIN_UNAVAILABLE rather
+    than assuming headroom, which is the fail-closed behaviour D-9 requires. The
+    quote's timestamp travels with it so admission can refuse a stale one.
+    """
+    try:
+        from datetime import datetime, timezone
+
+        from backend.api.routers.worker_shared import _load_live_kite_for_account
+        from backend.broker_api.orders.models import OrderMarginInput
+        from backend.broker_api.orders.service import OrdersService
+
+        legs = list((plan.get("resolved_plan") or {}).get("legs") or [])
+        if not legs:
+            return None
+        items = []
+        for leg in legs:
+            quantity = abs(float(leg.get("signed_quantity", leg.get("target_weight", 0.0)) or 0.0))
+            if quantity <= 0:
+                continue
+            items.append(
+                OrderMarginInput(
+                    exchange=str(leg.get("broker_exchange") or leg.get("exchange") or "NSE"),
+                    tradingsymbol=str(leg.get("broker_symbol") or leg.get("tradingsymbol") or ""),
+                    transaction_type="BUY" if float(leg.get("signed_quantity") or 0) >= 0 else "SELL",
+                    variety="regular",
+                    product=str(leg.get("product") or "CNC"),
+                    order_type="MARKET",
+                    quantity=quantity,
+                    price=float(leg.get("reference_price") or 0),
+                )
+            )
+        if not items:
+            return None
+        kite = _load_live_kite_for_account(account_scope)
+        quotes = OrdersService().order_margins(kite, items, f"admission-{account_scope}", None)
+        usable = sum(float(getattr(quote, "total", 0.0) or 0.0) for quote in quotes)
+        return {
+            "usable": usable,
+            "as_of": datetime.now(timezone.utc),
+            "legs": [str(getattr(quote, "tradingsymbol", "") or "") for quote in quotes],
+        }
+    except Exception:  # noqa: BLE001 - unavailable evidence is not headroom
+        return None
+
+
+@router.put("/{strategy_id}/admission-policy", response_model=AdmissionPolicyResponse)
+async def put_admission_policy(
+    strategy_id: str,
+    request: Request,
+    payload: AdmissionPolicyRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Record the admission policy for this strategy.
+
+    The policy is the *recorded basis* for every verdict: without a stored
+    allocation there is nothing to enforce against, which is why a live strategy
+    with no policy row is refused ADMISSION_POLICY_MISSING rather than treated as
+    unlimited.
+    """
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    account_scope = str(canonical.account_scope)
+    authorize_account_scope(account_scope)
+    policy = _admission_service(session_factory).upsert_policy(
+        strategy_id=strategy_id,
+        account_id=account_scope,
+        updated_by=owner,
+        **payload.model_dump(),
+    )
+    return AdmissionPolicyResponse(**policy)
+
+
+@router.get("/{strategy_id}/admission-policy", response_model=AdmissionPolicyResponse)
+async def get_admission_policy(
+    strategy_id: str,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    _owned_strategy(repo, owner, strategy_id)
+    policy = _admission_service(session_factory).policy_for(strategy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Admission policy not found")
+    return AdmissionPolicyResponse(**policy)
+
+
+@router.post("/{strategy_id}/plans/{plan_id}/admission", response_model=AdmissionVerdictResponse)
+async def preview_admission(
+    strategy_id: str,
+    plan_id: str,
+    request: Request,
+    execution_environment: str = "live",
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Preview the admission verdict. **A preview is not a reservation.**
+
+    Nothing is written: the owner sees exactly what admission would decide, and
+    the capacity claim only happens through ``/reserve``.
+    """
+    enforce_same_origin(request)
+    plan = _plan_or_404(_proposal_store(request, session_factory), owner=owner, repo=repo,
+                        strategy_id=strategy_id, plan_id=plan_id)
+    environment = str(execution_environment or "live").lower()
+    service = _admission_service(session_factory)
+    margin = _live_margin_evidence(str(plan["account_id"]), plan) if environment == "live" else None
+    verdict = service.evaluate(plan, execution_environment=environment, margin_evidence=margin)
+    return AdmissionVerdictResponse(**verdict.as_dict())
+
+
+@router.post("/{strategy_id}/plans/{plan_id}/reserve", response_model=ReservationResponse)
+async def reserve_plan(
+    strategy_id: str,
+    plan_id: str,
+    request: Request,
+    execution_environment: str = "live",
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Admit and claim capacity in one transaction; first claim wins."""
+    from backend.strategies.reservations import ClaimRequest, ReservationError
+
+    enforce_same_origin(request)
+    plan = _plan_or_404(_proposal_store(request, session_factory), owner=owner, repo=repo,
+                        strategy_id=strategy_id, plan_id=plan_id)
+    environment = str(execution_environment or "live").lower()
+    service = _admission_service(session_factory)
+    margin = _live_margin_evidence(str(plan["account_id"]), plan) if environment == "live" else None
+    verdict = service.evaluate(plan, execution_environment=environment, margin_evidence=margin)
+    if not verdict.admitted:
+        raise HTTPException(status_code=409, detail=verdict.as_dict())
+
+    policy = service.policy_for(strategy_id) or {}
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        return ReservationResponse(
+            **_reservation_ledger(session_factory).claim(
+                ClaimRequest(
+                    plan_id=plan_id,
+                    strategy_id=strategy_id,
+                    account_id=str(plan["account_id"]),
+                    evaluation_id=str(plan.get("evaluation_id") or plan_id),
+                    execution_environment=environment,
+                    requirement_inr=float(verdict.detail.get("plan_requirement_inr") or 0.0),
+                    valid_until=datetime.now(timezone.utc) + timedelta(seconds=900),
+                    allocation_inr=policy.get("allocation_inr"),
+                    margin_evidence=margin,
+                    margin_as_of=(margin or {}).get("as_of"),
+                    actor_id=owner,
+                )
+            )
+        )
+    except ReservationError as exc:
+        raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
+
+
+@router.get("/{strategy_id}/reservations", response_model=ReservationListResponse)
+async def list_reservations(
+    strategy_id: str,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    _owned_strategy(repo, owner, strategy_id)
+    rows = _reservation_ledger(session_factory).list_for_strategy(strategy_id=strategy_id)
+    return ReservationListResponse(reservations=[ReservationResponse(**row) for row in rows])
+
+
+@router.post("/{strategy_id}/plans/{plan_id}/approval", response_model=ApprovalResponse)
+async def approve_plan(
+    strategy_id: str,
+    plan_id: str,
+    request: Request,
+    payload: ApprovalRequestModel,
+    execution_environment: str = "live",
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Record the owner's authorisation, bound to every structural pin."""
+    from backend.strategies.admission import session_product_snapshot
+    from backend.strategies.approvals import ApprovalError, ApprovalRequest
+
+    enforce_same_origin(request)
+    plan = _plan_or_404(_proposal_store(request, session_factory), owner=owner, repo=repo,
+                        strategy_id=strategy_id, plan_id=plan_id)
+    products = [
+        str(leg.get("product") or "")
+        for leg in (plan.get("resolved_plan") or {}).get("legs") or []
+        if leg.get("product")
+    ]
+    try:
+        approval = _approval_service(session_factory).approve(
+            ApprovalRequest(
+                plan=plan,
+                actor_id=owner,
+                reservation_id=payload.reservation_id,
+                validity_seconds=payload.validity_seconds,
+                execution_environment=execution_environment,
+                session_product_snapshot=session_product_snapshot(products),
+            )
+        )
+    except ApprovalError as exc:
+        status = 403 if exc.reason_code == "APPROVAL_ACTOR_NOT_OWNER" else 409
+        raise HTTPException(status_code=status, detail=exc.as_detail()) from exc
+    return ApprovalResponse(
+        **approval,
+        structural_validity=_approval_service(session_factory).structural_validity(plan, approval),
+    )
+
+
+@router.post("/{strategy_id}/plans/{plan_id}/approval/revoke", response_model=ApprovalResponse)
+async def revoke_plan_approval(
+    strategy_id: str,
+    plan_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Revoke the plan's active approval. Owner-only, and terminal."""
+    from backend.strategies.approvals import ApprovalError
+
+    enforce_same_origin(request)
+    plan = _plan_or_404(_proposal_store(request, session_factory), owner=owner, repo=repo,
+                        strategy_id=strategy_id, plan_id=plan_id)
+    service = _approval_service(session_factory)
+    active = service.active_for_plan(plan_id)
+    if active is None:
+        raise HTTPException(status_code=404, detail="No active approval for this plan")
+    try:
+        revoked = service.revoke(active["approval_id"], actor_id=owner)
+    except ApprovalError as exc:
+        status = 403 if exc.reason_code == "APPROVAL_ACTOR_NOT_OWNER" else 409
+        raise HTTPException(status_code=status, detail=exc.as_detail()) from exc
+    return ApprovalResponse(
+        **revoked, structural_validity=service.structural_validity(plan, revoked)
+    )
+
+
+@router.get("/{strategy_id}/approvals", response_model=ApprovalListResponse)
+async def list_approvals(
+    strategy_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Approval history with **derived** structural validity per row.
+
+    Approvals are never rewritten, so what changed is the answer to "does this
+    still hold" — computed on read against the current pins.
+    """
+    _owned_strategy(repo, owner, strategy_id)
+    service = _approval_service(session_factory)
+    store = _proposal_store(request, session_factory)
+    rows = service.list_for_strategy(strategy_id=strategy_id)
+    out = []
+    for row in rows:
+        plan = store.get_plan(str(row["plan_id"]))
+        validity = (
+            service.structural_validity(plan, row)
+            if plan is not None
+            else {"valid": False, "mismatched_pins": ["PLAN_NOT_FOUND"], "detail": {}}
+        )
+        out.append(ApprovalResponse(**row, structural_validity=validity))
+    return ApprovalListResponse(approvals=out)
 
 
 @router.get("/{strategy_id}/proposals", response_model=ProposalListResponse)
