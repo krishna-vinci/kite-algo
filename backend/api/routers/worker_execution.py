@@ -631,6 +631,7 @@ async def modify_worker_order(request: Request, order_id: str, payload: WorkerOr
     _assert_run_access(token, run)
     await enforce_hosted_attempt_authority(request, token, run)
     _require_live_run(run, feature="Order modification")
+    await _require_worker_order_ownership(request, run, order_id, payload.parent_order_id)
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
     corr_id = request.headers.get("X-Correlation-ID") or request.headers.get("x-correlation-id") or f"algo-worker-modify-{uuid.uuid4()}"
     orders_service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()

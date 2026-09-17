@@ -3874,6 +3874,58 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ctx.exception.status_code, 404)
             orders.cancel_order.assert_not_awaited()
 
+    async def test_modify_direct_cross_run_target_fails_without_mutation(self):
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-B")] = self._owned("OID-B", run_id="run-other")
+        request = self._request(repo)
+        orders = self._orders_service(modify_order=AsyncMock(return_value={"order_id": "OID-B"}))
+        request.app.state.algo_worker_orders_service = orders
+
+        with self.assertRaises(HTTPException) as ctx:
+            await modify_worker_order(
+                request, "OID-B", WorkerOrderModifyRequest(strategy_run_id="run-live", price=1500.0),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.detail, "Order not found for strategy run")
+        orders.modify_order.assert_not_awaited()
+
+    async def test_modify_owned_target_succeeds(self):
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-1")] = self._owned("OID-1")
+        request = self._request(repo)
+        orders = self._orders_service(modify_order=AsyncMock(return_value={"order_id": "OID-1"}))
+        request.app.state.algo_worker_orders_service = orders
+
+        with patch(
+            "backend.api.routers.worker_execution._load_live_kite_for_account",
+            return_value=SimpleNamespace(access_token="token"),
+        ):
+            response = await modify_worker_order(
+                request, "OID-1", WorkerOrderModifyRequest(strategy_run_id="run-live", price=1500.0),
+            )
+
+        self.assertEqual(response["order_id"], "OID-1")
+        orders.modify_order.assert_awaited_once()
+
+    async def test_modify_link_intent_disagreement_fails_observably(self):
+        repo = self._live_run_repo()
+        repo.live_order_ownership[("kite:AB1234", "OID-D")] = {
+            "status": "conflict", "strategy_run_id": None, "source": None,
+        }
+        request = self._request(repo)
+        orders = self._orders_service(modify_order=AsyncMock(return_value={"order_id": "OID-D"}))
+        request.app.state.algo_worker_orders_service = orders
+
+        with self.assertRaises(HTTPException) as ctx:
+            await modify_worker_order(
+                request, "OID-D", WorkerOrderModifyRequest(strategy_run_id="run-live", price=1500.0),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.detail.get("rejection_reason"), "ORDER_OWNERSHIP_CONFLICT")
+        orders.modify_order.assert_not_awaited()
+
     async def test_worker_preview_order_returns_margin_and_charges(self):
         token = WorkerToken(
             token_id="worker-live",
