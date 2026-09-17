@@ -2463,3 +2463,178 @@ CREATE TABLE IF NOT EXISTS public.strategy_job_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_job_logs_job
     ON public.strategy_job_logs (job_id, attempt, seq);
+
+-- =========================================
+-- Durable strategy attribution (G1)
+-- =========================================
+-- Canonical strategy identity plus two compute adapters (hosted, external).
+-- Mirrors alembic revision 20260917_000025. Bindings are trigger-immutable and
+-- ON DELETE RESTRICT in both directions, so attribution history outlives
+-- operational run rows and deleting a strategy with history is refused.
+
+CREATE TABLE IF NOT EXISTS public.strategies (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    account_scope TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    journal_template_id UUID REFERENCES public.journal_strategy_templates(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_strategies_owner_name UNIQUE (owner_id, name),
+    -- Composite targets for database-enforced integrity: bindings reference
+    -- (id, owner_id, account_scope); projection and state reference
+    -- (id, account_scope) for account agreement.
+    CONSTRAINT uq_strategies_id_owner_account UNIQUE (id, owner_id, account_scope),
+    CONSTRAINT uq_strategies_id_account UNIQUE (id, account_scope),
+    CONSTRAINT ck_strategies_status CHECK (status IN ('active', 'disabled', 'archived'))
+);
+
+-- Backfill: canonical row per hosted strategy, SAME id (IDs preserved).
+INSERT INTO public.strategies (id, owner_id, name, account_scope, status)
+SELECT hs.id, hs.owner_id, hs.name, hs.default_account_scope,
+       CASE hs.status WHEN 'disabled' THEN 'disabled' ELSE 'active' END
+FROM public.hosted_strategies hs
+ON CONFLICT (id) DO NOTHING;
+
+-- Hosted adapter now references the canonical strategy INCLUDING owner and
+-- account, so hosted identity cannot drift from canonical identity.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_hosted_strategies_canonical'
+    ) THEN
+        ALTER TABLE public.hosted_strategies
+            ADD CONSTRAINT fk_hosted_strategies_canonical
+            FOREIGN KEY (id, owner_id, default_account_scope)
+            REFERENCES public.strategies (id, owner_id, account_scope)
+            ON DELETE RESTRICT;
+    END IF;
+END $$;
+
+-- Composite FK target for binding environment integrity: a binding's
+-- execution_environment must equal the run's persisted execution_mode.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'uq_algo_worker_runs_id_mode'
+    ) THEN
+        ALTER TABLE public.algo_worker_runs
+            ADD CONSTRAINT uq_algo_worker_runs_id_mode
+            UNIQUE (strategy_run_id, execution_mode);
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS public.external_strategy_adapters (
+    id TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL REFERENCES public.strategies(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL DEFAULT 'active',
+    config_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_by TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_external_adapters_status CHECK (status IN ('active', 'disabled'))
+);
+CREATE INDEX IF NOT EXISTS idx_external_adapters_strategy
+    ON public.external_strategy_adapters (strategy_id);
+
+CREATE TABLE IF NOT EXISTS public.worker_token_strategy_grants (
+    token_id TEXT NOT NULL REFERENCES public.algo_worker_tokens(token_id) ON DELETE CASCADE,
+    strategy_id TEXT NOT NULL REFERENCES public.strategies(id) ON DELETE RESTRICT,
+    granted_by TEXT NOT NULL,
+    granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ,
+    PRIMARY KEY (token_id, strategy_id)
+);
+CREATE INDEX IF NOT EXISTS idx_grants_strategy
+    ON public.worker_token_strategy_grants (strategy_id);
+
+CREATE TABLE IF NOT EXISTS public.strategy_run_bindings (
+    strategy_run_id TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    bound_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    bound_by TEXT NOT NULL,
+    binding_source TEXT NOT NULL,
+    CONSTRAINT ck_binding_source CHECK (
+        binding_source IN ('hosted_job', 'external_run_create', 'audited_mapping', 'legacy_compat')
+    ),
+    CONSTRAINT ck_binding_environment CHECK (execution_environment IN ('live', 'paper', 'dry_run')),
+    -- Owner/account integrity: the binding's owner and account must equal the
+    -- canonical strategy's (composite FK — mismatch is impossible).
+    CONSTRAINT fk_strategy_run_bindings_canonical
+        FOREIGN KEY (strategy_id, owner_id, account_id)
+        REFERENCES public.strategies (id, owner_id, account_scope) ON DELETE RESTRICT,
+    -- Environment integrity: the binding's environment must equal the run's
+    -- persisted execution_mode (composite FK).
+    CONSTRAINT fk_strategy_run_bindings_run_mode
+        FOREIGN KEY (strategy_run_id, execution_environment)
+        REFERENCES public.algo_worker_runs (strategy_run_id, execution_mode) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_run_bindings_strategy
+    ON public.strategy_run_bindings (strategy_id);
+CREATE INDEX IF NOT EXISTS idx_strategy_run_bindings_account_env
+    ON public.strategy_run_bindings (account_id, strategy_id, execution_environment);
+
+-- Database-enforced immutability: INSERT-only. Audited legacy mapping adds NEW
+-- rows; a mistaken binding requires the dedicated ownership-transfer protocol
+-- (outside G1) which will itself append, never mutate.
+CREATE OR REPLACE FUNCTION forbid_strategy_run_binding_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_run_bindings are immutable (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_strategy_run_bindings_immutable ON public.strategy_run_bindings;
+CREATE TRIGGER trg_strategy_run_bindings_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_run_bindings
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_run_binding_mutation();
+
+CREATE TABLE IF NOT EXISTS public.strategy_position_projection (
+    account_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    identity_kind TEXT NOT NULL,
+    identity_key TEXT NOT NULL,
+    product TEXT NOT NULL,
+    canonical_instrument_id UUID,
+    instrument_token BIGINT NOT NULL,
+    exchange TEXT NOT NULL,
+    tradingsymbol TEXT NOT NULL,
+    net_quantity INTEGER NOT NULL,
+    unresolved_reason TEXT,
+    projection_version BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, strategy_id, execution_environment, identity_kind, identity_key, product),
+    CONSTRAINT ck_spp_environment CHECK (execution_environment IN ('live', 'paper', 'dry_run')),
+    CONSTRAINT ck_spp_identity_kind CHECK (identity_kind IN ('canonical', 'raw')),
+    CONSTRAINT ck_spp_identity_consistency CHECK (
+        (identity_kind = 'canonical' AND canonical_instrument_id IS NOT NULL)
+        OR (identity_kind = 'raw' AND canonical_instrument_id IS NULL)
+    ),
+    -- Account agreement is database-enforced: a projection row's account must
+    -- equal the canonical strategy's account.
+    CONSTRAINT fk_spp_strategy_account
+        FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_spp_strategy
+    ON public.strategy_position_projection (account_id, strategy_id, execution_environment);
+
+CREATE TABLE IF NOT EXISTS public.strategy_projection_state (
+    account_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    projection_version BIGINT NOT NULL DEFAULT 0,
+    content_sha256 TEXT,
+    last_rebuild_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, strategy_id, execution_environment),
+    CONSTRAINT ck_sps_environment CHECK (execution_environment IN ('live', 'paper', 'dry_run')),
+    -- Account agreement is database-enforced, not merely a strategy_id FK.
+    CONSTRAINT fk_sps_strategy_account
+        FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
