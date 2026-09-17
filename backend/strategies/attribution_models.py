@@ -5,10 +5,12 @@ single ``Base.metadata.create_all`` (used throughout the test suite) registers
 every platform table, and so the Postgres migration
 ``20260917_000025_durable_strategy_attribution`` mirrors exactly these tables.
 
-The ORM uses ``JSON`` and ``Uuid(as_uuid=False)`` (portable to the SQLite test
-database). The Postgres migration and ``schema.sql`` use ``JSONB`` and native
-``UUID`` for the same columns — the established pattern in this repo (see
-``backend/strategies/models.py``).
+The ORM uses ``JSON`` and ``Text`` for the UUID-bearing columns (portable to
+the SQLite test database). The Postgres migration and ``schema.sql`` use
+``JSONB`` and native ``UUID`` for the same columns — the established pattern in
+this repo (see ``backend/strategies/models.py``). Readers treat the identifier
+as an opaque string, so a native ``UUID`` returned by PostgreSQL is handled by
+the same code path as the SQLite text form.
 
 Identity relations are **composite foreign keys**, so integrity is enforced by
 the database rather than by repository discipline:
@@ -45,7 +47,6 @@ from sqlalchemy import (
     JSON,
     Text,
     UniqueConstraint,
-    Uuid,
     func,
     text,
 )
@@ -82,7 +83,7 @@ class Strategy(Base):
     #: The broker account this strategy is bound to (e.g. ``kite:AB1234``).
     account_scope = Column(Text, nullable=False)
     status = Column(Text, nullable=False, server_default="active")
-    journal_template_id = Column(Uuid(as_uuid=False), nullable=True)
+    journal_template_id = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
@@ -213,7 +214,7 @@ class StrategyPositionProjection(Base):
     identity_kind = Column(Text, primary_key=True)
     identity_key = Column(Text, primary_key=True)
     product = Column(Text, primary_key=True)
-    canonical_instrument_id = Column(Uuid(as_uuid=False), nullable=True)
+    canonical_instrument_id = Column(Text, nullable=True)
     instrument_token = Column(BigInteger, nullable=False)
     exchange = Column(Text, nullable=False)
     tradingsymbol = Column(Text, nullable=False)

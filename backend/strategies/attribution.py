@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
@@ -632,6 +632,10 @@ class SqlAttributionStore:
             else:
                 reason = "mapping_ambiguous"
             era = self._era_from_rows(rows, fact)
+            if reason == "evidence_mismatch":
+                # Marked in the era so the reason stays recoverable from the
+                # identity alone; facts sharing this era still net together.
+                era = f"evidence-mismatch:{era}"
         else:
             reason = "mapping_missing"
             era = f"gen:{active_generation}" if active_generation else "pre-catalog"
@@ -777,3 +781,222 @@ class SqlAttributionStore:
             text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
             {"key": f"{account_id}:{strategy_id}:{execution_environment}"},
         )
+
+    # -------------------------------------------------------- unresolved facts
+
+    @staticmethod
+    def unresolved_reason_for(key: PositionKey) -> Optional[str]:
+        """Why a raw identity is unresolved, derived from its catalog-evidence era.
+
+        The store owns era semantics, so the reason lives beside them rather than
+        being encoded in the immutability key: an ``evidence_mismatch`` era is
+        explicit, a bare ``gen:``/``pre-catalog`` era means no mapping covered the
+        fact, and an ``interval:`` era means the window was found but ambiguous.
+        """
+        if key.identity_kind != "raw":
+            return None
+        era = str(key.identity_key).rsplit("|era=", 1)[-1]
+        if era.startswith("evidence-mismatch:"):
+            return "evidence_mismatch"
+        if era.startswith("gen:") or era == "pre-catalog":
+            return "mapping_missing"
+        return "mapping_ambiguous"
+
+
+class StrategyAttributionService:
+    """Full recompute, rebuild, open positions and unresolved surfacing.
+
+    Publication is on demand: G1 adds no scheduler and no background loop. The
+    projection is always a **full recompute** of the environment's book, so
+    ``rebuild`` and ``publish`` are the same operation and there is no
+    incremental cursor that a late fill could slip behind.
+    """
+
+    def __init__(self, store: SqlAttributionStore, *, run_async: Callable[..., Any] = None) -> None:
+        if run_async is None:
+            import asyncio
+
+            run_async = asyncio.to_thread
+        self.store = store
+        self._run_async = run_async
+
+    async def publish(self, *, account_id: str, strategy_id: str, execution_environment: str) -> Dict[str, Any]:
+        """Recompute and publish the book for one ``(account, strategy, env)``."""
+        return await self._run_async(
+            self._publish_sync,
+            account_id=account_id,
+            strategy_id=strategy_id,
+            execution_environment=execution_environment,
+        )
+
+    async def rebuild(self, *, account_id: str, strategy_id: str, execution_environment: str) -> Dict[str, Any]:
+        """Identical to :meth:`publish` — full recompute IS the V1 model."""
+        return await self.publish(
+            account_id=account_id,
+            strategy_id=strategy_id,
+            execution_environment=execution_environment,
+        )
+
+    async def open_positions(
+        self, *, account_id: str, strategy_id: str, execution_environment: str
+    ) -> List[Dict[str, Any]]:
+        """Non-zero rows for **that environment only**, ordered by identity.
+
+        Settlement and admission consumers call this with
+        ``execution_environment="live"``; the paper book is never visible to them.
+        """
+        return await self._run_async(
+            self._open_positions_sync,
+            account_id=account_id,
+            strategy_id=strategy_id,
+            execution_environment=execution_environment,
+        )
+
+    # ------------------------------------------------------------------ syncing
+
+    def _publish_sync(self, *, account_id: str, strategy_id: str, execution_environment: str) -> Dict[str, Any]:
+        captured: Dict[str, Any] = {"unresolved": [], "anomalies": [], "folded_facts": 0}
+
+        def _resolve_and_fold(db: Any, bound_run_ids: Set[str]) -> Tuple[List[Dict[str, Any]], str]:
+            anomalies: List[Dict[str, Any]] = []
+            if execution_environment == "live":
+                owned_orders, conflicts = self.store.resolve_owned_orders(account_id=account_id, db=db)
+                anomalies.extend(conflicts)
+                facts = self.store.iter_live_trade_facts(
+                    account_id=account_id,
+                    owned_orders=owned_orders,
+                    bound_run_ids=bound_run_ids,
+                    db=db,
+                )
+            else:
+                # Paper and dry_run share the paper-shaped sources but are never
+                # mixed: the binding filter keeps the books apart, and a dry-run
+                # fact is relabelled so it can never land in the paper book.
+                # The current dry-run path persists no fills, so this is normally
+                # empty; no simulated fills are manufactured here.
+                facts = self.store.iter_paper_trade_facts(
+                    account_scope=account_id,
+                    bound_run_ids=bound_run_ids,
+                    db=db,
+                )
+                if execution_environment == "dry_run":
+                    facts = [replace(fact, execution_environment="dry_run") for fact in facts]
+
+            captured["folded_facts"] = len(facts)
+
+            resolved: List[Tuple[TradeFact, PositionKey]] = []
+            representative: Dict[PositionKey, TradeFact] = {}
+            for fact in facts:
+                key = self.store.resolve_fact_identity(fact, db=db)
+                resolved.append((fact, key))
+                representative.setdefault(key, fact)
+
+            positions = AttributionFold.fold(resolved)
+
+            rows: List[Dict[str, Any]] = []
+            unresolved: List[Dict[str, Any]] = []
+            for key, quantity in positions.items():
+                fact = representative[key]
+                reason = SqlAttributionStore.unresolved_reason_for(key)
+                rows.append(
+                    {
+                        "identity_kind": key.identity_kind,
+                        "identity_key": key.identity_key,
+                        "canonical_instrument_id": (
+                            key.identity_key if key.identity_kind == "canonical" else None
+                        ),
+                        "instrument_token": fact.instrument_token,
+                        "exchange": fact.exchange,
+                        "tradingsymbol": fact.tradingsymbol,
+                        "product": key.product,
+                        "net_quantity": int(quantity),
+                        "unresolved_reason": reason,
+                    }
+                )
+                if reason is not None:
+                    unresolved.append(
+                        {
+                            "identity_kind": key.identity_kind,
+                            "identity_key": key.identity_key,
+                            "product": key.product,
+                            "net_quantity": int(quantity),
+                            "unresolved_reason": reason,
+                            "condition": UNRESOLVED_INSTRUMENT_IDENTITY,
+                        }
+                    )
+
+            rows.sort(key=lambda row: (row["identity_kind"], row["identity_key"], row["product"]))
+            unresolved.sort(key=lambda entry: (entry["identity_key"], entry["product"]))
+            captured["unresolved"] = unresolved
+            captured["anomalies"] = anomalies
+            return rows, _content_sha256(rows)
+
+        result = self.store.recompute_publish(
+            account_id=account_id,
+            strategy_id=strategy_id,
+            execution_environment=execution_environment,
+            resolve_and_fold=_resolve_and_fold,
+        )
+        return {
+            "strategy_id": strategy_id,
+            "execution_environment": execution_environment,
+            "folded_facts": captured["folded_facts"],
+            "projection_version": result["projection_version"],
+            "content_sha256": result["content_sha256"],
+            "unresolved": captured["unresolved"],
+            "anomalies": captured["anomalies"],
+            "unchanged": result["unchanged"],
+        }
+
+    def _open_positions_sync(
+        self, *, account_id: str, strategy_id: str, execution_environment: str
+    ) -> List[Dict[str, Any]]:
+        session = self.store.session_factory()
+        try:
+            rows = session.execute(
+                select(StrategyPositionProjection)
+                .where(
+                    StrategyPositionProjection.account_id == account_id,
+                    StrategyPositionProjection.strategy_id == strategy_id,
+                    StrategyPositionProjection.execution_environment == execution_environment,
+                    StrategyPositionProjection.net_quantity != 0,
+                )
+                .order_by(
+                    StrategyPositionProjection.identity_kind,
+                    StrategyPositionProjection.identity_key,
+                    StrategyPositionProjection.product,
+                )
+            ).scalars().all()
+            return [
+                {
+                    "account_id": str(row.account_id),
+                    "strategy_id": str(row.strategy_id),
+                    "execution_environment": str(row.execution_environment),
+                    "identity_kind": str(row.identity_kind),
+                    "identity_key": str(row.identity_key),
+                    "canonical_instrument_id": (
+                        str(row.canonical_instrument_id) if row.canonical_instrument_id else None
+                    ),
+                    "instrument_token": int(row.instrument_token),
+                    "exchange": str(row.exchange),
+                    "tradingsymbol": str(row.tradingsymbol),
+                    "product": str(row.product),
+                    "net_quantity": int(row.net_quantity),
+                    "unresolved_reason": row.unresolved_reason,
+                    "projection_version": int(row.projection_version),
+                }
+                for row in rows
+            ]
+        finally:
+            session.close()
+
+
+def _content_sha256(rows: Sequence[Dict[str, Any]]) -> str:
+    """Content hash over the row serialization.
+
+    Used **only** for idempotence (recognising an unchanged recompute). It is
+    never chronology evidence: a matching hash says "the facts produced the same
+    book", not "this snapshot is newer than another".
+    """
+    payload = json.dumps(list(rows), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

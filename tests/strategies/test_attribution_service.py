@@ -116,7 +116,12 @@ class StoreTestCase(unittest.TestCase):
     """SQLite fixture: attribution tables from the shared metadata, the run
     table in an attached ``public`` schema (the codebase's Core SQL is
     ``public.``-qualified), with foreign keys enforced so the composite-key
-    refusals behave as they do on PostgreSQL."""
+    refusals behave as they do on PostgreSQL.
+
+    A plain ``TestCase`` on purpose: the service tests drive the coroutine API
+    through ``asyncio.run``, and an ``async def`` method on a plain ``TestCase``
+    would silently return an un-awaited coroutine and "pass" without running.
+    """
 
     def setUp(self):
         self.engine = create_engine(
@@ -348,3 +353,136 @@ class RecomputePublishTests(StoreTestCase):
         self.assertEqual(len(seen_sessions), 1)  # one locked session carried snapshot AND publication
         self.assertFalse(hasattr(self.store, "publish_external_snapshot"))
         self.assertFalse(hasattr(self.store, "compute_source_version"))
+
+
+class ServiceTests(StoreTestCase):
+    def _service(self, live_facts=(), paper_facts=(), owned=None, conflicts=(), identity_resolver=None):
+        from backend.strategies.attribution import StrategyAttributionService
+
+        class _Stubbed(SqlAttributionStore):
+            def resolve_owned_orders(self, *, account_id, db=None):
+                return (dict(owned or {}), list(conflicts))
+
+            @staticmethod
+            def _unpack(items):
+                # ``_fact`` returns a (fact, expected key) pair; the store
+                # contract is a list of bare facts.
+                return [item[0] if isinstance(item, tuple) else item for item in items]
+
+            def iter_live_trade_facts(self, *, account_id, owned_orders, bound_run_ids, db=None):
+                return [f for f in self._unpack(live_facts) if f.strategy_run_id in bound_run_ids]
+
+            def iter_paper_trade_facts(self, *, account_scope, bound_run_ids, db=None):
+                return [f for f in self._unpack(paper_facts) if f.strategy_run_id in bound_run_ids]
+
+            def resolve_fact_identity(self, fact, *, db=None):
+                if identity_resolver is not None:
+                    return identity_resolver(fact)
+                # Stubbed canonical identity: the mapping tables are not part of
+                # this fixture (per-fact resolution across mapping eras is
+                # verified against real PostgreSQL).
+                return PositionKey(fact.execution_environment, "canonical", "uuid-a", fact.product)
+
+        if "run-a" not in self.store.bound_run_ids(
+            account_id="kite:A", strategy_id="stg-1", execution_environment="live"
+        ):
+            self.store.bind_run(strategy_run_id="run-a", strategy_id="stg-1", owner_id="app:o",
+                                account_id="kite:A", execution_environment="live",
+                                bound_by="t", binding_source="hosted_job")
+        return StrategyAttributionService(_Stubbed(session_factory=self.factory))
+
+    def test_same_strategy_across_runs_and_exit_of_one_strategy(self):
+        import asyncio
+        live = [_fact("t:1", "run-a", 60), _fact("t:2", "run-a2", 40)]
+        self.store.bind_run(strategy_run_id="run-a2", strategy_id="stg-1", owner_id="app:o",
+                            account_id="kite:A", execution_environment="live",
+                            bound_by="t", binding_source="hosted_job")
+        service = self._service(live_facts=live, owned={"OID-1": "run-a", "OID-2": "run-a2"})
+        asyncio.run(service.publish(account_id="kite:A", strategy_id="stg-1", execution_environment="live"))
+        positions = asyncio.run(service.open_positions(account_id="kite:A", strategy_id="stg-1",
+                                                       execution_environment="live"))
+        self.assertEqual([p["net_quantity"] for p in positions], [100])
+
+    def test_two_strategies_same_instrument_stay_separate(self):
+        import asyncio
+        with self.factory() as session:
+            session.execute(text("INSERT INTO strategies (id, owner_id, name, account_scope) VALUES ('stg-2', 'app:o', 'Other', 'kite:A')"))
+            session.commit()
+        service_a = self._service(live_facts=[_fact("t:1", "run-a", 100)], owned={"OID-1": "run-a"})
+        service_a.store.bind_run(strategy_run_id="run-b", strategy_id="stg-2", owner_id="app:o",
+                                 account_id="kite:A", execution_environment="live",
+                                 bound_by="t", binding_source="external_run_create")
+        service_b = self._service(live_facts=[_fact("t:2", "run-b", 40)], owned={"OID-2": "run-b"})
+        asyncio.run(service_a.publish(account_id="kite:A", strategy_id="stg-1", execution_environment="live"))
+        asyncio.run(service_b.publish(account_id="kite:A", strategy_id="stg-2", execution_environment="live"))
+        a = asyncio.run(service_a.open_positions(account_id="kite:A", strategy_id="stg-1",
+                                                 execution_environment="live"))
+        b = asyncio.run(service_b.open_positions(account_id="kite:A", strategy_id="stg-2",
+                                                 execution_environment="live"))
+        self.assertEqual([p["net_quantity"] for p in a], [100])
+        self.assertEqual([p["net_quantity"] for p in b], [40])
+
+    def test_paper_book_never_feeds_live_book_and_vice_versa(self):
+        import asyncio
+        # A paper BUY 100 and a live BUY 20 are separate books; and a paper
+        # BUY 100 plus a live SELL 100 cannot falsely appear flat.
+        self.store.bind_run(strategy_run_id="run-p", strategy_id="stg-1", owner_id="app:o",
+                            account_id="kite:A", execution_environment="paper",
+                            bound_by="t", binding_source="hosted_job")
+        service = self._service(
+            live_facts=[_fact("t:2", "run-a", 20), _fact("t:3", "run-a", 100, buy=False)],
+            paper_facts=[_fact("t:1", "run-p", 100, env="paper")],
+            owned={"OID-2": "run-a", "OID-3": "run-a"},
+        )
+        asyncio.run(service.publish(account_id="kite:A", strategy_id="stg-1", execution_environment="live"))
+        asyncio.run(service.publish(account_id="kite:A", strategy_id="stg-1", execution_environment="paper"))
+        live = asyncio.run(service.open_positions(account_id="kite:A", strategy_id="stg-1",
+                                                  execution_environment="live"))
+        paper = asyncio.run(service.open_positions(account_id="kite:A", strategy_id="stg-1",
+                                                   execution_environment="paper"))
+        self.assertEqual([(p["execution_environment"], p["net_quantity"]) for p in live], [("live", -80)])
+        self.assertEqual([(p["execution_environment"], p["net_quantity"]) for p in paper], [("paper", 100)])
+
+    def test_unbound_legacy_runs_contribute_nothing(self):
+        import asyncio
+        service = self._service(live_facts=[_fact("t:9", "run-legacy", 500)], owned={"OID-9": "run-legacy"})
+        asyncio.run(service.publish(account_id="kite:A", strategy_id="stg-1", execution_environment="live"))
+        self.assertEqual(asyncio.run(service.open_positions(account_id="kite:A", strategy_id="stg-1",
+                                                            execution_environment="live")), [])
+
+    def test_full_recompute_is_deterministic_and_idempotent(self):
+        import asyncio
+        live = [_fact("t:1", "run-a", 60), _fact("t:2", "run-a", 40)]
+        service = self._service(live_facts=live, owned={"OID-1": "run-a"})
+        r1 = asyncio.run(service.publish(account_id="kite:A", strategy_id="stg-1", execution_environment="live"))
+        r2 = asyncio.run(service.rebuild(account_id="kite:A", strategy_id="stg-1", execution_environment="live"))
+        self.assertTrue(r2["unchanged"])
+        self.assertEqual(r1["content_sha256"], r2["content_sha256"])
+
+    def test_conflicts_and_unresolved_are_surfaced_not_guessed(self):
+        import asyncio
+        service = self._service(live_facts=[_fact("t:1", "run-a", 100)], owned={},
+                                conflicts=[{"broker_order_id": "OID-X", "kind": "multi_owner"}])
+        report = asyncio.run(service.publish(account_id="kite:A", strategy_id="stg-1",
+                                             execution_environment="live"))
+        self.assertEqual([a["kind"] for a in report["anomalies"]], ["multi_owner"])
+
+    def test_unresolved_identity_stays_raw_and_explicit(self):
+        import asyncio
+        raw = lambda fact: PositionKey(  # noqa: E731
+            fact.execution_environment, "raw",
+            "raw:kite:738561|NSE|RELIANCE|CNC|era=gen:gen-7", fact.product,
+        )
+        service = self._service(live_facts=[_fact("t:1", "run-a", 100)], owned={"OID-1": "run-a"},
+                                identity_resolver=raw)
+        report = asyncio.run(service.publish(account_id="kite:A", strategy_id="stg-1",
+                                             execution_environment="live"))
+        positions = asyncio.run(service.open_positions(account_id="kite:A", strategy_id="stg-1",
+                                                       execution_environment="live"))
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["identity_kind"], "raw")
+        self.assertEqual(positions[0]["unresolved_reason"], "mapping_missing")
+        self.assertEqual(
+            [entry["condition"] for entry in report["unresolved"]],
+            ["UNRESOLVED_INSTRUMENT_IDENTITY"],
+        )
