@@ -653,6 +653,10 @@ def _plan_or_404(store: Any, *, owner: str, repo: Any, strategy_id: str, plan_id
     plan = store.get_plan(plan_id)
     if plan is None or str(plan["strategy_id"]) != str(strategy_id):
         raise HTTPException(status_code=404, detail="Plan not found")
+    # Every admission, reservation and approval writes state against an account,
+    # so the same account authorization the rest of this router applies must hold
+    # here too — the account comes from the plan, never from the caller.
+    authorize_account_scope(str(plan["account_id"]))
     return plan
 
 

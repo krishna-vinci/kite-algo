@@ -1645,6 +1645,25 @@ class AdmissionOwnerApiTests(_ProposalApiHarness):
         finally:
             self._stop_patches()
 
+    async def test_unlisted_account_is_refused(self):
+        """A plan on an account outside the operator allowlist writes nothing."""
+        from unittest.mock import patch as _patch
+
+        sid, plan_id = await self._submitted()
+        repo, _ = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            # The harness authorizes kite:paper; deny everything for this call.
+            with _patch.dict("os.environ", {"HOSTED_STRATEGY_ACCOUNT_SCOPES": "kite:elsewhere"}):
+                for path in (
+                    f"{BASE}/{sid}/plans/{plan_id}/admission",
+                    f"{BASE}/{sid}/plans/{plan_id}/reserve",
+                ):
+                    response = await client.post(path)
+                    self.assertEqual(response.status_code, 403, path)
+        finally:
+            self._stop_patches()
+
     async def test_request_models_forbid_extra_fields(self):
         sid, _ = await self._submitted()
         repo, _ = self._worker_repo()
