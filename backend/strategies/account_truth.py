@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import func, select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from backend.strategies.attribution_models import (
     AccountIngestState,
@@ -569,13 +569,31 @@ class AccountTruthStore:
         owner_notified_at: Optional[datetime] = None,
         db: Optional[Any] = None,
     ) -> None:
-        """Persist one coordinate's classification. Recomputed, never hand-set."""
+        """Persist one coordinate's classification. Recomputed, never hand-set.
+
+        Two concurrent reconciles can both observe "no row yet" for the same
+        coordinate. The insert therefore runs inside a SAVEPOINT: the loser of the
+        race re-reads the winner's row and updates it, instead of surfacing a
+        unique violation that would poison the caller's transaction. SQLite never
+        shows this race; PostgreSQL does.
+        """
         owns_db = db is None
         session = db or self.session_factory()
-        try:
-            residual = broker_quantity - attributed_quantity - manual_quantity
-            now = _utcnow()
-            row = session.execute(
+        residual = broker_quantity - attributed_quantity - manual_quantity
+        now = _utcnow()
+        values = {
+            "divergence_class": divergence_class,
+            "broker_quantity": broker_quantity,
+            "attributed_quantity": attributed_quantity,
+            "manual_quantity": manual_quantity,
+            "residual_quantity": residual,
+            "refresh_attempts": refresh_attempts,
+            "last_checked_at": now,
+            "resolved_at": now if resolved else None,
+        }
+
+        def _load() -> Optional[Any]:
+            return session.execute(
                 select(StrategyReconciliationState).where(
                     StrategyReconciliationState.account_id == account_id,
                     StrategyReconciliationState.instrument_token == coordinate[0],
@@ -584,23 +602,30 @@ class AccountTruthStore:
                     StrategyReconciliationState.product == coordinate[3],
                 )
             ).scalar_one_or_none()
+
+        try:
+            row = _load()
             if row is None:
-                row = StrategyReconciliationState(
-                    account_id=account_id,
-                    instrument_token=coordinate[0],
-                    exchange=coordinate[1],
-                    tradingsymbol=coordinate[2],
-                    product=coordinate[3],
-                )
-                session.add(row)
-            row.divergence_class = divergence_class
-            row.broker_quantity = broker_quantity
-            row.attributed_quantity = attributed_quantity
-            row.manual_quantity = manual_quantity
-            row.residual_quantity = residual
-            row.refresh_attempts = refresh_attempts
-            row.last_checked_at = now
-            row.resolved_at = now if resolved else None
+                try:
+                    with session.begin_nested():
+                        row = StrategyReconciliationState(
+                            account_id=account_id,
+                            instrument_token=coordinate[0],
+                            exchange=coordinate[1],
+                            tradingsymbol=coordinate[2],
+                            product=coordinate[3],
+                            **values,
+                        )
+                        session.add(row)
+                        session.flush()
+                except IntegrityError:
+                    # Lost the insert race: adopt the winner's row.
+                    row = _load()
+                    if row is None:
+                        raise
+
+            for field, value in values.items():
+                setattr(row, field, value)
             if owner_notified_at is not None and row.owner_notified_at is None:
                 # Escalation is stamped once and never cleared by later checks.
                 row.owner_notified_at = owner_notified_at
@@ -609,9 +634,13 @@ class AccountTruthStore:
                 session.commit()
         except SQLAlchemyError:
             # A database without the reconciliation table simply has no persisted
-            # state; classification still returns its verdict to the caller.
+            # state; classification still returns its verdict to the caller. A
+            # SHARED session must not swallow it — the caller owns that
+            # transaction and needs to see the failure.
             if owns_db:
                 session.rollback()
+            else:
+                raise
         finally:
             if owns_db:
                 session.close()
@@ -764,109 +793,119 @@ class ReconciliationService:
         # must commit with the classification it describes, never beside it.
         session = self.store.session_factory()
         changed = False
-        for coordinate in sorted(coordinates):
-            broker_quantity = int(broker.get(coordinate, 0))
-            attributed_quantity = int(attributed.get(coordinate, 0))
-            manual_quantity = int(manual.get(coordinate, 0))
-            residual = broker_quantity - attributed_quantity - manual_quantity
-            prior = previous.get(coordinate, {})
-            attempts = int(prior.get("refresh_attempts") or 0)
+        # Any failure rolls the shared session back and closes it: a concurrent
+        # insert race leaves no poisoned session behind for the next caller.
+        try:
+            for coordinate in sorted(coordinates):
+                broker_quantity = int(broker.get(coordinate, 0))
+                attributed_quantity = int(attributed.get(coordinate, 0))
+                manual_quantity = int(manual.get(coordinate, 0))
+                residual = broker_quantity - attributed_quantity - manual_quantity
+                prior = previous.get(coordinate, {})
+                attempts = int(prior.get("refresh_attempts") or 0)
 
-            if residual != 0:
-                attempts += 1
-                # Bounded refresh: each uncertain check is one ingest attempt.
-                # A successful refresh can *resolve* the mismatch, so the numbers
-                # are re-read before classifying — otherwise a lifted freeze would
-                # lag a whole cycle behind the truth that lifted it.
-                if attempts <= self.max_attempts and self._ingest is not None:
-                    await self._ingest.ingest_account(account_id)
-                    ingest_state = await self._run_async(
-                        self.store.ingest_state, account_id=account_id
-                    )
-                    broker_quantity = int(
-                        (
-                            await self._run_async(
-                                self.store.broker_quantities, account_id=account_id
-                            )
-                        ).get(coordinate, 0)
-                    )
-                    attributed_quantity = int(
-                        (
-                            await self._run_async(
-                                self.store.attributed_quantities, account_id=account_id
-                            )
-                        ).get(coordinate, 0)
-                    )
-                    manual_quantity = int(
-                        (
-                            await self._run_async(
-                                self.store.manual_residual_by_coordinate, account_id=account_id
-                            )
-                        ).get(coordinate, 0)
-                    )
-                    residual = broker_quantity - attributed_quantity - manual_quantity
+                if residual != 0:
+                    attempts += 1
+                    # Bounded refresh: each uncertain check is one ingest attempt.
+                    # A successful refresh can *resolve* the mismatch, so the numbers
+                    # are re-read before classifying — otherwise a lifted freeze would
+                    # lag a whole cycle behind the truth that lifted it.
+                    if attempts <= self.max_attempts and self._ingest is not None:
+                        await self._ingest.ingest_account(account_id)
+                        ingest_state = await self._run_async(
+                            self.store.ingest_state, account_id=account_id
+                        )
+                        broker_quantity = int(
+                            (
+                                await self._run_async(
+                                    self.store.broker_quantities, account_id=account_id
+                                )
+                            ).get(coordinate, 0)
+                        )
+                        attributed_quantity = int(
+                            (
+                                await self._run_async(
+                                    self.store.attributed_quantities, account_id=account_id
+                                )
+                            ).get(coordinate, 0)
+                        )
+                        manual_quantity = int(
+                            (
+                                await self._run_async(
+                                    self.store.manual_residual_by_coordinate, account_id=account_id
+                                )
+                            ).get(coordinate, 0)
+                        )
+                        residual = broker_quantity - attributed_quantity - manual_quantity
 
-            divergence = self._classify(
-                residual=residual, attempts=attempts, ingest_state=ingest_state
-            )
-            if divergence == ALIGNED:
-                attempts = 0
+                divergence = self._classify(
+                    residual=residual, attempts=attempts, ingest_state=ingest_state
+                )
+                if divergence == ALIGNED:
+                    attempts = 0
 
-            notified_at = prior.get("owner_notified_at")
-            if divergence == UNEXPLAINED and notified_at is None and self._notifier is not None:
-                # Escalate at most once; a failed dispatch leaves the stamp unset
-                # so a later check retries — classification never waits on it.
-                if self._notifier(account_id, divergence, coordinate, {"residual_quantity": residual}):
-                    notified_at = _utcnow()
+                notified_at = prior.get("owner_notified_at")
+                if divergence == UNEXPLAINED and notified_at is None and self._notifier is not None:
+                    # Escalate at most once; a failed dispatch leaves the stamp unset
+                    # so a later check retries — classification never waits on it.
+                    if self._notifier(account_id, divergence, coordinate, {"residual_quantity": residual}):
+                        notified_at = _utcnow()
 
-            await self._run_async(
-                self.store.upsert_reconciliation,
-                account_id=account_id,
-                coordinate=coordinate,
-                divergence_class=divergence,
-                broker_quantity=broker_quantity,
-                attributed_quantity=attributed_quantity,
-                manual_quantity=manual_quantity,
-                refresh_attempts=attempts,
-                resolved=divergence == ALIGNED,
-                owner_notified_at=notified_at if divergence == UNEXPLAINED else None,
-                db=session,
-            )
-            if (
-                str(prior.get("divergence_class") or "") != divergence
-                or int(prior.get("residual_quantity") or 0) != residual
-            ):
-                # Any coordinate whose classification or residual moved makes the
-                # account's reconciliation version stale — which is what
-                # invalidates an approval that pinned it (D-8).
-                changed = True
-            results.append(
-                {
-                    "coordinate": coordinate,
-                    "divergence_class": divergence,
-                    "broker_quantity": broker_quantity,
-                    "attributed_quantity": attributed_quantity,
-                    "manual_quantity": manual_quantity,
-                    "residual_quantity": residual,
-                    "refresh_attempts": attempts,
-                    "owner_notified_at": notified_at,
-                }
-            )
+                await self._run_async(
+                    self.store.upsert_reconciliation,
+                    account_id=account_id,
+                    coordinate=coordinate,
+                    divergence_class=divergence,
+                    broker_quantity=broker_quantity,
+                    attributed_quantity=attributed_quantity,
+                    manual_quantity=manual_quantity,
+                    refresh_attempts=attempts,
+                    resolved=divergence == ALIGNED,
+                    owner_notified_at=notified_at if divergence == UNEXPLAINED else None,
+                    db=session,
+                )
+                if (
+                    str(prior.get("divergence_class") or "") != divergence
+                    or int(prior.get("residual_quantity") or 0) != residual
+                ):
+                    # Any coordinate whose classification or residual moved makes the
+                    # account's reconciliation version stale — which is what
+                    # invalidates an approval that pinned it (D-8).
+                    changed = True
+                results.append(
+                    {
+                        "coordinate": coordinate,
+                        "divergence_class": divergence,
+                        "broker_quantity": broker_quantity,
+                        "attributed_quantity": attributed_quantity,
+                        "manual_quantity": manual_quantity,
+                        "residual_quantity": residual,
+                        "refresh_attempts": attempts,
+                        "owner_notified_at": notified_at,
+                    }
+                )
 
-        # ONE transaction: the version is bumped in the same commit as the state
-        # it describes, so a reader can never see a version that disagrees with
-        # the classification it claims to summarise.
-        version = None
-        if changed:
-            version = self.store.bump_reconciliation_version(account_id=account_id, db=session)
-        await self._run_async(session.commit)
-        await self._run_async(session.close)
-        return {
-            "account_id": account_id,
-            "coordinates": results,
-            "frozen": [row["coordinate"] for row in results if row["divergence_class"] != ALIGNED],
-            "reconciliation_version": version,
-        }
+            # ONE transaction: the version is bumped in the same commit as the state
+            # it describes, so a reader can never see a version that disagrees with
+            # the classification it claims to summarise.
+            version = None
+            if changed:
+                version = self.store.bump_reconciliation_version(account_id=account_id, db=session)
+            await self._run_async(session.commit)
+            await self._run_async(session.close)
+            return {
+                "account_id": account_id,
+                "coordinates": results,
+                "frozen": [row["coordinate"] for row in results if row["divergence_class"] != ALIGNED],
+                "reconciliation_version": version,
+            }
+        except Exception:
+            try:
+                session.rollback()
+            except SQLAlchemyError:
+                pass
+            session.close()
+            raise
 
     def _classify(self, *, residual: int, attempts: int, ingest_state: Dict[str, Any]) -> str:
         if residual == 0:
