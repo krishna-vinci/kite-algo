@@ -111,18 +111,23 @@ class ProposalTestCase(unittest.TestCase):
         self._register_orm_tables()
 
     def _register_orm_tables(self):
-        from backend.strategies.attribution_models import (  # noqa: F401
+        from backend.strategies.attribution_models import (
+            Strategy,
             StrategyPlan,
             StrategyProposal,
             StrategyProposalJournal,
         )
         from backend.workflows.repository import Base as _Base
 
-        _Base.metadata.create_all(self.engine, tables=[
-            StrategyProposal.__table__,
-            StrategyPlan.__table__,
-            StrategyProposalJournal.__table__,
-        ])
+        _Base.metadata.create_all(
+            self.engine,
+            tables=[
+                Strategy.__table__,
+                StrategyProposal.__table__,
+                StrategyPlan.__table__,
+                StrategyProposalJournal.__table__,
+            ],
+        )
 
     def tearDown(self):
         self.engine.dispose()
@@ -547,6 +552,243 @@ class TargetWeightsTests(ProposalTestCase):
         self.assertEqual(at_g1.resolved["legs"][0]["instrument_id"], INST_OLD)
         self.assertEqual(at_g2.resolved["legs"][0]["instrument_id"], INST_NEW)
         self.assertEqual(at_g1.resolved["catalog_generation"], G1)
+
+
+class ProposalStoreTests(ProposalTestCase):
+    """D-1: evaluation identity, idempotency, conflict, refusal, frozen plan."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed_generation(G2, "published", T2)
+        self.seed_record("inst-REL", symbol="RELIANCE", generation=G2)
+        self.seed_mapping("map-REL", "inst-REL", token=100, symbol="RELIANCE", valid_from=G2,
+                          is_current=1)
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategies (id, owner_id, name, account_scope, status) "
+                    "VALUES ('stg-A', 'app:o', 'Strategy A', 'kite:A', 'active')"
+                )
+            )
+            session.commit()
+
+    def _store(self):
+        from backend.strategies.proposals import ProposalStore
+
+        return ProposalStore(session_factory=self.factory)
+
+    def _submission(self, **overrides):
+        from backend.strategies.proposals import ProposalSubmission
+
+        values = {
+            "strategy_id": "stg-A",
+            "account_id": "kite:A",
+            "evaluation_id": "eval-1",
+            "evaluation_kind": "run_now",
+            "job_id": None,
+            "strategy_run_id": "run-1",
+            "target_kind": "single_instrument",
+            "payload": {
+                "instrument_token": 100,
+                "exchange": "NSE",
+                "tradingsymbol": "RELIANCE",
+                "product": "CNC",
+                "target_quantity": 10,
+            },
+        }
+        values.update(overrides)
+        return ProposalSubmission(**values)
+
+    def _journal(self):
+        with self.factory() as session:
+            return [
+                (str(row[0]), str(row[1] or ""))
+                for row in session.execute(
+                    text(
+                        "SELECT event, reason_code FROM strategy_proposal_journal "
+                        "WHERE strategy_id = 'stg-A' ORDER BY created_at, event"
+                    )
+                ).fetchall()
+            ]
+
+    def test_exact_retry_is_idempotent(self):
+        store = self._store()
+        first = store.submit(self._submission())
+        self.assertFalse(first["idempotent"])
+        self.assertEqual(first["status"], "validated")
+        self.assertIsNotNone(first["plan"])
+
+        second = store.submit(self._submission())
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(second["proposal_id"], first["proposal_id"])
+        # The envelope is not re-inserted and the plan is not re-created.
+        with self.factory() as session:
+            envelopes = session.execute(
+                text("SELECT COUNT(*) FROM strategy_proposals")
+            ).scalar()
+            plans = session.execute(text("SELECT COUNT(*) FROM strategy_plans")).scalar()
+        self.assertEqual((envelopes, plans), (1, 1))
+        self.assertEqual(second["plan"]["plan_id"], first["plan"]["plan_id"])
+        self.assertEqual([event for event, _ in self._journal()], ["received", "plan_created", "idempotent_retry"])
+
+    def test_different_payload_same_evaluation_conflicts(self):
+        from backend.strategies.proposals import ProposalConflict
+
+        store = self._store()
+        first = store.submit(self._submission())
+        with self.assertRaises(ProposalConflict) as ctx:
+            store.submit(
+                self._submission(
+                    payload={
+                        "instrument_token": 100,
+                        "exchange": "NSE",
+                        "tradingsymbol": "RELIANCE",
+                        "product": "CNC",
+                        "target_quantity": 999,
+                    }
+                )
+            )
+        self.assertEqual(ctx.exception.reason_code, "PROPOSAL_EVALUATION_CONFLICT")
+
+        # The original envelope is untouched, and nothing new was created.
+        with self.factory() as session:
+            count = session.execute(text("SELECT COUNT(*) FROM strategy_proposals")).scalar()
+        self.assertEqual(count, 1)
+        events = [event for event, _ in self._journal()]
+        self.assertIn("conflict", events)
+        # The conflict is journalled with a reason.
+        conflicts = [row for row in self._journal() if row[0] == "conflict"]
+        self.assertEqual(conflicts[0][1], "PROPOSAL_EVALUATION_CONFLICT")
+        self.assertIsNotNone(first["proposal_id"])
+
+    def test_continuous_job_many_evaluations(self):
+        store = self._store()
+        created = [
+            store.submit(
+                self._submission(
+                    evaluation_id=f"eval-{index}",
+                    evaluation_kind="scheduled_occurrence",
+                    job_id="job-1",
+                )
+            )
+            for index in range(3)
+        ]
+        self.assertEqual(len({item["proposal_id"] for item in created}), 3)
+        with self.factory() as session:
+            count = session.execute(text("SELECT COUNT(*) FROM strategy_proposals")).scalar()
+        self.assertEqual(count, 3)
+        # Nothing in the contract limits evaluations per job — that is what makes
+        # a continuous intraday strategy possible.
+        self.assertTrue(all(item["status"] == "validated" for item in created))
+
+    def test_scheduled_occurrence_requires_a_job(self):
+        from backend.strategies.proposals import ProposalStoreError
+
+        with self.assertRaises(ProposalStoreError):
+            self._store().submit(
+                self._submission(evaluation_id="eval-nojob", evaluation_kind="scheduled_occurrence")
+            )
+
+    def test_validation_refusal_ends_evaluation(self):
+        from backend.strategies.proposals import ProposalConflict
+
+        store = self._store()
+        refused = store.submit(
+            self._submission(
+                payload={
+                    "instrument_token": 424242,
+                    "exchange": "NSE",
+                    "tradingsymbol": "MISSING",
+                    "product": "CNC",
+                    "target_quantity": 5,
+                }
+            )
+        )
+        self.assertEqual(refused["status"], "refused")
+        self.assertIsNone(refused["plan"])
+        refusals = [row for row in self._journal() if row[0] == "validation_refused"]
+        self.assertEqual(refusals, [("validation_refused", "INSTRUMENT_UNRESOLVED")])
+
+        # The identity is spent: a corrected payload under the SAME evaluation_id
+        # conflicts, because the evaluation already ended.
+        with self.assertRaises(ProposalConflict):
+            store.submit(self._submission())
+        # A new evaluation_id is the only way forward — the platform never invents one.
+        retried = store.submit(self._submission(evaluation_id="eval-2"))
+        self.assertEqual(retried["status"], "validated")
+
+    def test_plan_creation_sets_validated_and_journals(self):
+        store = self._store()
+        result = store.submit(self._submission())
+        self.assertEqual(result["status"], "validated")
+        plan = result["plan"]
+        self.assertEqual(plan["plan_kind"], "single_instrument")
+        self.assertEqual(len(plan["plan_hash"]), 64)
+        self.assertEqual(plan["pinned_catalog_generation"], G2)
+        self.assertEqual(plan["resolved_plan"]["legs"][0]["instrument_id"], "inst-REL")
+        self.assertEqual(
+            [event for event, _ in self._journal()], ["received", "plan_created"]
+        )
+
+        # Exactly one plan per proposal: the UNIQUE constraint refuses a second.
+        with self.assertRaises(Exception):
+            with self.factory() as session:
+                session.execute(
+                    text(
+                        "INSERT INTO strategy_plans (plan_id, proposal_id, strategy_id, account_id, "
+                        " plan_kind, plan_hash, logical_plan, resolved_plan, pinned_catalog_generation) "
+                        "VALUES ('dup', :pid, 'stg-A', 'kite:A', 'single_instrument', 'h', '{}', '{}', :gen)"
+                    ),
+                    {"pid": plan["proposal_id"], "gen": G2},
+                )
+                session.commit()
+
+    def test_unpublished_generation_refusal(self):
+        self.seed_generation(G_STAGING, "staging", None)
+        result = self._store().submit(
+            self._submission(
+                payload={
+                    "instrument_token": 100,
+                    "exchange": "NSE",
+                    "tradingsymbol": "RELIANCE",
+                    "product": "CNC",
+                    "target_quantity": 10,
+                    "catalog_generation": G_STAGING,
+                }
+            )
+        )
+        self.assertEqual(result["status"], "refused")
+        self.assertIsNone(result["plan"])
+        refusals = [row for row in self._journal() if row[0] == "validation_refused"]
+        self.assertEqual(refusals, [("validation_refused", "CATALOG_GENERATION_NOT_PUBLISHED")])
+
+    def test_generation_defaults_to_current_published(self):
+        store = self._store()
+        result = store.submit(self._submission())
+        # No catalog_generation in the payload: validation pins what is published now
+        # and RECORDS it, so the plan is never resolved against a moving target.
+        self.assertEqual(result["plan"]["pinned_catalog_generation"], G2)
+        self.assertEqual(result["plan"]["resolved_plan"]["catalog_generation"], G2)
+
+    def test_store_transaction_atomic(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+        from backend.strategies.proposals import ProposalStore
+
+        class _Exploding:
+            def compile(self, payload, pinned):
+                raise ValidationRefusal("PAYLOAD_INVALID", {"reason": "boom"})
+
+        store = ProposalStore(session_factory=self.factory, compiler=_Exploding())
+        result = store.submit(self._submission())
+        self.assertEqual(result["status"], "refused")
+        with self.factory() as session:
+            plans = session.execute(text("SELECT COUNT(*) FROM strategy_plans")).scalar()
+            status = session.execute(text("SELECT status FROM strategy_proposals")).scalar()
+        # A failed compile leaves the refusal and NO plan.
+        self.assertEqual((plans, status), (0, "refused"))
+        self.assertEqual(
+            [event for event, _ in self._journal()], ["received", "validation_refused"]
+        )
 
 
 if __name__ == "__main__":
