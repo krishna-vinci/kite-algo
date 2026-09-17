@@ -71,3 +71,30 @@ conversation.
   - Phase 2 consumes G1 surfaces: `SqlAttributionStore`/`StrategyAttributionService`, `UNRESOLVED_INSTRUMENT_IDENTITY`, books dimension, `legacy_unattributed` runs (manual-book candidates), the G14 ownership lookup, and `worker_live_execution_links`/`live_order_intents` fact sources.
   - PG fixture pattern to reuse: `tests/integration/test_durable_strategy_attribution_postgres.py` (DATABASE_URL export around `command.upgrade`; per-test create/drop with zero-leftover verification).
   - Pre-existing worktree state to preserve untouched: ` M documents/hosted-strategies-architecture-r1.md`; untracked `.commandcode/`, `documents/architecture-flow.md`, `documents/hosted-strategies-architecture-r3.md`, `documents/hosted-strategies-implementation-roadmap.md`, `documents/hosted-strategies-proposal-draft.md`.
+
+---
+
+## Phase 2 — Project 2 / G2+G3+G4: strategy closure, account truth, manual book, reconciliation
+
+- **Status:** COMPLETE — gate PASSED (2026-09-17)
+- **Plan:** `docs/superpowers/plans/2026-09-17-strategy-closure-manual-book-reconciliation.md` (written this phase per the just-in-time method, from R3 §10/§17/§22; self-reviewed; single whole-phase delegation as directed by the campaign owner).
+- **Parity report:** `documents/hosted-strategies-project2-parity.md`
+- **Commits (unsigned, on `development`, not pushed):**
+  - `31dffc8` ingested fill facts, ingest state, reconciliation state, append-only adjustments schema (+ migration 20260917_000026, schema.sql mirror, ORM)
+  - `15c9964` strategy-book flatness, exposure and exit sizing for bound runs (G2)
+  - `813fefe` account-wide fill ingestion, manual residual, heuristic removal (G3)
+  - `ae8bf17` divergence classification, coordinate freeze, owner escalation (G4)
+  - `f19e0c1` append-only owner reclassification adjustments folded into strategy books
+  - `dd26fd9` PostgreSQL integration (13 tests)
+- **Migrations:** `20260917_000026` (down_revision `20260917_000025`, purely additive) → **next migration for Phase 3 is `20260917_000027`**.
+- **Requirements closed:** all five roadmap invariants — strategy-book closure (account flatness never substitutes); `Σ attributed + manual = broker` quantity-only invariant as a checked, classified state machine (`aligned`/`pending_ingest`/`unexplained`); immediate coordinate-scoped freeze with risk-reducing exits permitted; owner-only audited reclassification as append-only adjustments (original fills never rewritten); explicit negative-manual-residual exit refusal. Account-wide fill truth (tracked + untracked), manual residual book, unique-candidate heuristic removed, once-only owner escalation via the durable outbox.
+- **Test evidence:** 21 account-truth unit; 203 binding/worker/hosted API; 209+1 `tests/strategies`; **13/13 disposable-PG integration** (walkthrough 7 invariant, transitions, freeze symmetry, triggers, composite FK, rebuild-vs-adjustment concurrency, dedupe); skip proven without URL; `tests/journaling` 154 passed + 2 pre-existing `test_journal_filters` failures (proven unrelated by stash comparison); regression sets identical to the documented baseline; zero leftover disposable databases; `git diff --check` clean.
+- **Decisions / deviations:** single-writer ingest via `OrdersService.trades()` (order_runtime untouched); freeze as a pure decision function; post-refresh re-read lifts freezes in-check (both branches pinned); escalation recipients = `strategies.owner_id` on the account (no new owner model), failure-independent classification; `create_reclassification` delegates to the attribution store; ORM/new-tables + SQL/old-tables dual-engine pattern; `fact_id` real UUID.
+- **Limitations:** corporate-action detection deferred (Project 7 — a split currently classifies `unexplained` and freezes, fail-closed); reconciliation is live-book only; freeze covers worker live-placement paths; 2 pre-existing journaling test failures remain on the known list; escalation message targets strategy owners only (UI surfacing Phase 3+).
+- **Paper/live certification proven:** N/A — no new execution lane; real broker/real notifications NOT PROVEN.
+- **Next-phase input (Phase 3 = Project 3 / G5: typed proposal envelope, evaluation identity, immutable frozen plans, compiler interface, catalog/universe pinning):**
+  - Next migration `20260917_000027`; single head; mirror DDL in `backend/schema.sql`.
+  - Plan the whole phase first (one delegation). Read R3 §6 (proposal/evaluation lifecycle), §7 (frozen plan + catalog-generation model), §22 G5, and the roadmap Project 3 section against current source.
+  - Reuse: G1 canonical strategies + adapters, binding provenance, `strategies` owner model; the instrument catalog generations (`instrument_catalog_generations`/`instrument_broker_mappings`, `status='published'`, `published_at`) for pinning; ConfigDict(extra="forbid") request schemas; the disposable-PG fixture pattern; `run_id=f"reconciliation:{account_id}"` outbox precedent for non-run records.
+  - Known decision to carry: plans immutable and pinned to catalog/universe evidence (fixed architecture decision); unknown evidence fails closed for exposure-increasing work.
+  - Pre-existing worktree state to preserve untouched: ` M documents/hosted-strategies-architecture-r1.md`; untracked `.commandcode/`, `documents/architecture-flow.md`, `documents/hosted-strategies-architecture-r3.md`, `documents/hosted-strategies-implementation-roadmap.md`, `documents/hosted-strategies-proposal-draft.md`.
