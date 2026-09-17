@@ -467,3 +467,86 @@ class ProposalStore:
             session.rollback()
         finally:
             session.close()
+
+
+def plan_invalidation_state(
+    plan: Mapping[str, Any],
+    *,
+    session_factory: Optional[Callable[[], Any]] = None,
+    catalog: Optional[PinnedCatalogRead] = None,
+) -> Dict[str, Any]:
+    """Whether a frozen plan is still resolvable against the current catalog (D-5).
+
+    **Derived, never stored.** A plan is an immutable fact and is never rewritten
+    when the catalog moves; what changes is the answer to "does this plan still
+    mean what it meant". The rule is deliberately narrow, because invalidating on
+    any generation change would make every plan hostage to unrelated listings:
+
+    * the pinned generation is still the current one → ``valid``;
+    * a newer generation exists and **re-maps a pinned instrument's coordinate to
+      a different instrument**, or its record is no longer ``active``, or its
+      record is gone → ``invalidated``;
+    * a newer generation that changes nothing about the pinned instruments →
+      ``valid``. An unrelated catalog update must not invalidate a plan.
+
+    Nothing here mutates or deletes the plan: superseded plans stay queryable.
+    """
+    pinned_generation = str(plan.get("pinned_catalog_generation") or "")
+    factory = session_factory
+    read = catalog or PinnedCatalogRead(factory)
+    current = read.current_published_generation()
+
+    base = {
+        "pinned_catalog_generation": pinned_generation,
+        "current_catalog_generation": current,
+    }
+    if not current or str(current) == pinned_generation:
+        return {**base, "state": "valid", "reason": "CATALOG_GENERATION_CURRENT"}
+
+    # Compare against the newest content — the question is about now, not the pin.
+    latest = PinnedCatalogRead(factory, generation=str(current))
+    try:
+        latest.pin()
+    except ValidationRefusal:
+        return {**base, "state": "valid", "reason": "CATALOG_GENERATION_CURRENT"}
+
+    relevant: list = []
+    for leg in plan.get("resolved_plan", {}).get("legs", []):
+        instrument_id = str(leg.get("instrument_id") or "")
+        if not instrument_id:
+            continue
+        now = latest.resolve_symbol(
+            str(leg.get("broker_exchange") or ""), str(leg.get("broker_symbol") or "")
+        )
+        if now is None:
+            relevant.append({"instrument_id": instrument_id, "reason": "COORDINATE_UNMAPPED"})
+            continue
+        if str(now["instrument_id"]) != instrument_id:
+            relevant.append(
+                {
+                    "instrument_id": instrument_id,
+                    "reason": "COORDINATE_REMAPPED",
+                    "current_instrument_id": str(now["instrument_id"]),
+                }
+            )
+            continue
+        lifecycle = latest.lifecycle(instrument_id)
+        if lifecycle is None:
+            relevant.append({"instrument_id": instrument_id, "reason": "INSTRUMENT_RECORD_MISSING"})
+        elif lifecycle != "active":
+            relevant.append(
+                {
+                    "instrument_id": instrument_id,
+                    "reason": "INSTRUMENT_NOT_ACTIVE",
+                    "lifecycle_status": lifecycle,
+                }
+            )
+
+    if relevant:
+        return {
+            **base,
+            "state": "invalidated",
+            "reason": "PINNED_INSTRUMENT_CHANGED",
+            "changes": relevant,
+        }
+    return {**base, "state": "valid", "reason": "CATALOG_GENERATION_UNRELATED"}

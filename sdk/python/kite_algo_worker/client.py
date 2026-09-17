@@ -341,6 +341,17 @@ class KiteAlgoWorkerClient:
     def get_run_pnl_snapshot(self, strategy_run_id: str) -> WorkerRunPnlSnapshot:
         return WorkerRunPnlSnapshot.model_validate(self.get_run_pnl(strategy_run_id))
 
+    # -- proposals and frozen plans (G5) -----------------------------------
+
+    def submit_proposal(self, payload: JsonDict) -> JsonDict:
+        """Submit one evaluation's proposal (creates a frozen plan, places nothing)."""
+        return self._request("POST", "/worker/proposals", json=payload)
+
+    @property
+    def proposals(self) -> "_ProposalNamespace":
+        """Namespaced access: ``client.proposals.submit(payload)``."""
+        return _ProposalNamespace(self)
+
     def list_orders(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", "/worker/orders", params={"strategy_run_id": strategy_run_id})
 
@@ -1401,3 +1412,13 @@ def _get_or_create_run_with_validation(client: KiteAlgoWorkerClient, config: Run
                 )
             return existing
     return client.create_run_from_config(config)
+
+
+class _ProposalNamespace:
+    """Thin ergonomic facade over the proposal transport."""
+
+    def __init__(self, client: "KiteAlgoWorkerClient") -> None:
+        self._client = client
+
+    def submit(self, payload: JsonDict) -> JsonDict:
+        return self._client.submit_proposal(payload)

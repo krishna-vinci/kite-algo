@@ -502,6 +502,198 @@ class _OwnerApiHarness(unittest.IsolatedAsyncioTestCase):
         return response.json()
 
 
+# ---------------------------------------------------------------------------
+# Task 5 (G5): worker submission authority and owner read endpoints
+# ---------------------------------------------------------------------------
+
+PROPOSALS_BASE = "/api/algo-workers/worker/proposals"
+
+#: The raw bearer the fake token repository hashes on lookup.
+RAW_WORKER_TOKEN = "secret-token"
+
+
+class _FakeProposalWorkerRepo:
+    """Worker repository surface the submission route needs: token + run."""
+
+    def __init__(self, tokens=(), runs=()):
+        self.tokens = {t["token_id"]: dict(t) for t in tokens}
+        self.runs = {r["strategy_run_id"]: dict(r) for r in runs}
+        self.touched = []
+
+    async def get_token_by_hash(self, token_hash):
+        for token in self.tokens.values():
+            if token.get("token_hash") == token_hash:
+                return WorkerToken(**{k: v for k, v in token.items() if k != "token_hash"})
+        return None
+
+    async def touch_token(self, token_id):
+        self.touched.append(token_id)
+
+    async def get_run(self, strategy_run_id):
+        run = self.runs.get(strategy_run_id)
+        return dict(run) if run else None
+
+
+class _ProposalApiHarness(_OwnerApiHarness):
+    """Owner + worker routers over one SQLite app, with catalog rows seeded."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        from backend.strategies.attribution_models import (
+            Strategy,
+            StrategyPlan,
+            StrategyProposal,
+            StrategyProposalJournal,
+        )
+
+        Base.metadata.create_all(
+            self.engine,
+            tables=[
+                Strategy.__table__,
+                StrategyProposal.__table__,
+                StrategyPlan.__table__,
+                StrategyProposalJournal.__table__,
+            ],
+        )
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS public.instrument_catalog_records ("
+                    " instrument_id TEXT PRIMARY KEY, exchange TEXT, tradingsymbol TEXT,"
+                    " lifecycle_status TEXT NOT NULL DEFAULT 'active', current_generation_id TEXT)"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.instrument_catalog_generations (id, status, published_at) "
+                    "VALUES ('gen-2', 'published', '2026-09-10T00:00:00+00:00')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.instrument_catalog_records "
+                    "(instrument_id, exchange, tradingsymbol, lifecycle_status, current_generation_id) "
+                    "VALUES ('inst-REL', 'NSE', 'RELIANCE', 'active', 'gen-2')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.instrument_broker_mappings "
+                    "(mapping_id, instrument_id, broker, broker_exchange, broker_symbol, broker_token, "
+                    " valid_from_generation, is_current) "
+                    "VALUES ('map-REL', 'inst-REL', 'kite', 'NSE', 'RELIANCE', 100, 'gen-2', 1)"
+                )
+            )
+            session.commit()
+
+    def _worker_repo(self):
+        from backend.shared.serialization import _hash_token
+
+        # The route hashes the bearer before lookup, so the fake stores the hash
+        # while the test presents the raw token.
+        token_hash = _hash_token(RAW_WORKER_TOKEN)
+        repo = _FakeProposalWorkerRepo(
+            tokens=[
+                {
+                    "token_id": "worker-ok",
+                    "name": "ok",
+                    "account_scope": "kite:paper",
+                    "allowed_modes": ["paper", "live"],
+                    "allowed_actions": ["proposals:submit", "intents:submit"],
+                    "allowed_templates": [],
+                    "status": "active",
+                    "token_hash": token_hash,
+                }
+            ],
+            runs=[
+                {
+                    "strategy_run_id": "run-bound",
+                    "token_id": "worker-ok",
+                    "template_id": "hosted:stg-A",
+                    "account_scope": "kite:paper",
+                    "execution_mode": "paper",
+                    "status": "open",
+                },
+                {
+                    "strategy_run_id": "run-other-strategy",
+                    "token_id": "worker-ok",
+                    "template_id": "hosted:stg-A",
+                    "account_scope": "kite:paper",
+                    "execution_mode": "paper",
+                    "status": "open",
+                },
+                {
+                    "strategy_run_id": "run-unbound",
+                    "token_id": "worker-ok",
+                    "template_id": "hosted:stg-A",
+                    "account_scope": "kite:paper",
+                    "execution_mode": "paper",
+                    "status": "open",
+                },
+            ],
+        )
+        return repo, RAW_WORKER_TOKEN
+
+    def _proposal_client(self, *, repo, username="admin"):
+        from unittest.mock import patch as _patch
+
+        from backend.app import auth as auth_module
+        from backend.api.routers import strategies as strategies_module
+        from backend.api.routers import worker_proposals as worker_proposals_module
+
+        user = AppUser(username=username, role="admin") if username else None
+        app = FastAPI()
+        app.include_router(strategies_module.router, prefix="/api")
+        app.include_router(worker_proposals_module.router, prefix="/api")
+        app.dependency_overrides[strategies_module._strategies_db] = lambda: self.factory
+        app.state.attribution_store = self.store
+        app.state.algo_worker_repository = repo
+        app.state.proposal_store = _proposal_store(self.factory)
+        self._patch = _patch.object(auth_module, "get_optional_app_user", lambda _request: user)
+        self._patch.start()
+        self._env = _patch.dict(
+            "os.environ", {"HOSTED_STRATEGY_ACCOUNT_SCOPES": "kite:paper"}
+        )
+        self._env.start()
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+    async def _bind_run(self, strategy_id, *, run_id, account="kite:paper"):
+        self.store.bind_run(
+            strategy_run_id=run_id,
+            strategy_id=strategy_id,
+            owner_id="app:admin",
+            account_id=account,
+            execution_environment="paper",
+            bound_by="test",
+            binding_source="audited_mapping",
+        )
+
+    def _payload(self, **overrides):
+        body = {
+            "evaluation_id": "eval-1",
+            "evaluation_kind": "run_now",
+            "strategy_run_id": "run-bound",
+            "strategy_id": "stg-A",
+            "account_scope": "kite:paper",
+            "target_kind": "single_instrument",
+            "payload": {
+                "instrument_token": 100,
+                "exchange": "NSE",
+                "tradingsymbol": "RELIANCE",
+                "product": "CNC",
+                "target_quantity": 10,
+            },
+        }
+        body.update(overrides)
+        return body
+
+
+def _proposal_store(session_factory):
+    from backend.strategies.proposals import ProposalStore
+
+    return ProposalStore(session_factory=session_factory)
+
+
 class OwnerStrategyApiTests(_OwnerApiHarness):
     # -- backward compatibility ----------------------------------------------
 
@@ -1114,6 +1306,177 @@ class AdjustmentApiTests(_OwnerApiHarness):
         with self.factory() as session:
             rows = session.execute(text("SELECT COUNT(*) FROM strategy_attribution_adjustments")).scalar()
         self.assertEqual(rows, 0)
+
+
+class WorkerProposalSubmissionTests(_ProposalApiHarness):
+    """D-8: submission authority fails closed on the G1 binding."""
+
+    async def _setup_strategy(self, client):
+        created = await self._create(client)
+        return created["strategy_id"]
+
+    async def test_worker_submission_requires_bound_matching_run(self):
+        client = self._client()
+        try:
+            sid = await self._setup_strategy(client)
+        finally:
+            self._stop_patches()
+        await self._bind_run(sid, run_id="run-bound")
+        # A run bound to a DIFFERENT strategy, and a run bound to nothing at all.
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategies (id, owner_id, name, account_scope, status) "
+                    "VALUES ('stg-B', 'app:admin', 'B', 'kite:paper', 'active')"
+                )
+            )
+            session.commit()
+        await self._bind_run("stg-B", run_id="run-other-strategy")
+
+        repo, raw_token = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        headers = {"Authorization": f"Bearer {raw_token}"}
+        try:
+            ok = await client.post(
+                PROPOSALS_BASE, json=self._payload(strategy_id=sid), headers=headers
+            )
+            self.assertEqual(ok.status_code, 201, ok.text)
+            body = ok.json()
+            self.assertEqual(body["status"], "validated")
+            self.assertTrue(body["plan"]["plan_id"])
+            self.assertFalse(body["idempotent"])
+
+            # Bound to another strategy: refuse, never silently rebind.
+            mismatch = await client.post(
+                PROPOSALS_BASE, json=self._payload(strategy_id=sid, strategy_run_id="run-other-strategy",
+                                                   evaluation_id="eval-mismatch"),
+                headers=headers,
+            )
+            self.assertEqual(mismatch.status_code, 403)
+            self.assertEqual(mismatch.json()["detail"]["rejection_reason"], "AUTHORITY_MISMATCH")
+
+            # Unbound run: legacy runs cannot open authority.
+            unbound = await client.post(
+                PROPOSALS_BASE,
+                json=self._payload(strategy_id=sid, strategy_run_id="run-unbound",
+                                   evaluation_id="eval-unbound"),
+                headers=headers,
+            )
+            self.assertEqual(unbound.status_code, 403)
+            self.assertEqual(unbound.json()["detail"]["rejection_reason"], "AUTHORITY_MISMATCH")
+
+            # Missing / unknown run is a 404 from the shared run loader.
+            missing = await client.post(
+                PROPOSALS_BASE,
+                json=self._payload(strategy_id=sid, strategy_run_id="run-nope",
+                                   evaluation_id="eval-missing"),
+                headers=headers,
+            )
+            self.assertEqual(missing.status_code, 404)
+        finally:
+            self._stop_patches()
+
+        # A refused submission writes no envelope.
+        with self.factory() as session:
+            count = session.execute(text("SELECT COUNT(*) FROM strategy_proposals")).scalar()
+        self.assertEqual(count, 1)
+
+    async def test_worker_submission_rejects_unscoped_action_and_payload_drift(self):
+        client = self._client()
+        try:
+            sid = await self._setup_strategy(client)
+        finally:
+            self._stop_patches()
+        await self._bind_run(sid, run_id="run-bound")
+
+        repo, raw_token = self._worker_repo()
+        # Token without the action, and a token scoped to another account.
+        repo.tokens["worker-ok"]["allowed_actions"] = ["intents:submit"]
+        client = self._proposal_client(repo=repo)
+        try:
+            refused = await client.post(
+                PROPOSALS_BASE, json=self._payload(strategy_id=sid),
+                headers={"Authorization": f"Bearer {raw_token}"},
+            )
+            self.assertEqual(refused.status_code, 403)
+        finally:
+            self._stop_patches()
+
+        # extra="forbid": an unknown field is a 422, not a silent ignore.
+        repo, raw_token = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            drifted = await client.post(
+                PROPOSALS_BASE,
+                json={**self._payload(strategy_id=sid), "surprise": 1},
+                headers={"Authorization": f"Bearer {raw_token}"},
+            )
+            self.assertEqual(drifted.status_code, 422)
+            no_auth = await client.post(
+                PROPOSALS_BASE, json=self._payload(strategy_id=sid)
+            )
+            self.assertEqual(no_auth.status_code, 401)
+        finally:
+            self._stop_patches()
+
+    async def test_owner_read_endpoints(self):
+        client = self._client()
+        try:
+            sid = await self._setup_strategy(client)
+        finally:
+            self._stop_patches()
+        await self._bind_run(sid, run_id="run-bound")
+
+        repo, raw_token = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            submitted = await client.post(
+                PROPOSALS_BASE, json=self._payload(strategy_id=sid),
+                headers={"Authorization": f"Bearer {raw_token}"},
+            )
+            self.assertEqual(submitted.status_code, 201, submitted.text)
+            proposal_id = submitted.json()["proposal_id"]
+
+            listed = await client.get(f"{BASE}/{sid}/proposals")
+            self.assertEqual(listed.status_code, 200, listed.text)
+            body = listed.json()
+            self.assertEqual(len(body["proposals"]), 1)
+            self.assertEqual(body["proposals"][0]["proposal_id"], proposal_id)
+            self.assertEqual(body["proposals"][0]["status"], "validated")
+            # The journal trail is readable as evidence.
+            self.assertEqual(
+                [row["event"] for row in body["journal"]], ["received", "plan_created"]
+            )
+
+            plan = await client.get(f"{BASE}/{sid}/plans/{proposal_id}")
+            self.assertEqual(plan.status_code, 200, plan.text)
+            plan_body = plan.json()
+            self.assertEqual(plan_body["plan_kind"], "single_instrument")
+            # Derived, never stored: a plan read always reports current validity.
+            self.assertEqual(plan_body["invalidation_state"]["state"], "valid")
+            self.assertEqual(plan_body["invalidation_state"]["reason"], "CATALOG_GENERATION_CURRENT")
+
+            missing = await client.get(f"{BASE}/{sid}/plans/no-such-proposal")
+            self.assertEqual(missing.status_code, 404)
+        finally:
+            self._stop_patches()
+
+    async def test_worker_cannot_read_owner_endpoints(self):
+        client = self._client()
+        try:
+            sid = await self._setup_strategy(client)
+        finally:
+            self._stop_patches()
+        repo, raw_token = self._worker_repo()
+        client = self._proposal_client(repo=repo, username=None)
+        try:
+            for path in (f"{BASE}/{sid}/proposals", f"{BASE}/{sid}/plans/x"):
+                response = await client.get(
+                    path, headers={"Authorization": f"Bearer {raw_token}"}
+                )
+                self.assertEqual(response.status_code, 401)
+        finally:
+            self._stop_patches()
 
 
 if __name__ == "__main__":

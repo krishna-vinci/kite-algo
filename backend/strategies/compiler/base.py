@@ -238,29 +238,3 @@ class PinnedCatalogRead:
 
     def record(self, instrument_id: str) -> Optional[Mapping[str, Any]]:
         return self._catalog.lifecycle_row(str(instrument_id))
-
-    def current_mapping_for(
-        self, instrument_id: str, *, exchange: Optional[str] = None, symbol: Optional[str] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Where an instrument is mapped *now* — the invalidation comparison.
-
-        This is deliberately the current-only view: invalidation asks whether a
-        newer generation changed the meaning of a pinned instrument, so it must
-        read the newest content, not the pin.
-        """
-        self.pin()
-        rows = self._catalog.mappings_as_of(
-            self._latest_published_at(), instrument_id=str(instrument_id),
-            broker_exchange=exchange, broker_symbol=symbol,
-        )
-        if len(rows) != 1:
-            return None
-        row = rows[0]
-        return {"instrument_id": str(row["instrument_id"]), "broker_token": int(row["broker_token"])}
-
-    def _latest_published_at(self) -> Any:
-        current = self.current_published_generation()
-        if not current:
-            return self._published_at
-        row = self._catalog.generation_row(current)
-        return (row or {}).get("published_at")

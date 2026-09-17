@@ -30,6 +30,13 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
+from backend.strategies.proposals import plan_invalidation_state
+from backend.api.schemas.proposals import (
+    PlanResponse,
+    ProposalJournalRow,
+    ProposalListResponse,
+    ProposalRow,
+)
 from backend.api.schemas.strategies import (
     AdjustmentCreateRequest,
     AdjustmentLineResponse,
@@ -594,6 +601,67 @@ async def revoke_grant(
     return GrantResponse(
         strategy_id=strategy_id, token_id=token_id, granted_by=owner, revoked=True
     )
+
+
+# ---------------------------------------------------------------------------
+# Proposals and frozen plans (G5) — owner reads, deliberately read-only
+# ---------------------------------------------------------------------------
+
+
+def _proposal_store(request: Request, session_factory: Any):
+    from backend.strategies.proposals import ProposalStore
+
+    store = getattr(request.app.state, "proposal_store", None)
+    if store is None:
+        store = ProposalStore(session_factory=session_factory)
+    return store
+
+
+@router.get("/{strategy_id}/proposals", response_model=ProposalListResponse)
+async def list_strategy_proposals(
+    strategy_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """The durable proposal trail for one strategy, with its journal.
+
+    Read-only by design: an envelope is an immutable fact and the journal is its
+    sequence, so there is nothing here to edit, retry or delete.
+    """
+    _owned_strategy(repo, owner, strategy_id)
+    store = _proposal_store(request, session_factory)
+    return ProposalListResponse(
+        proposals=[ProposalRow(**row) for row in store.list_proposals(strategy_id=strategy_id)],
+        journal=[
+            ProposalJournalRow(**row) for row in store.journal(strategy_id=strategy_id)
+        ],
+    )
+
+
+@router.get("/{strategy_id}/plans/{proposal_id}", response_model=PlanResponse)
+async def get_strategy_plan(
+    strategy_id: str,
+    proposal_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """One frozen plan, plus its *derived* invalidation state.
+
+    The plan row is immutable; ``invalidation_state`` is computed on read against
+    the current catalog, so a superseded plan reports why it no longer holds
+    while the artifact itself is never rewritten.
+    """
+    _owned_strategy(repo, owner, strategy_id)
+    store = _proposal_store(request, session_factory)
+    plan = store.plan_for_proposal(proposal_id)
+    if plan is None or str(plan["strategy_id"]) != str(strategy_id):
+        raise HTTPException(status_code=404, detail="Plan not found")
+    state = plan_invalidation_state(plan, session_factory=session_factory)
+    return PlanResponse(**plan, invalidation_state=state)
 
 
 @router.post("/{strategy_id}/adjustments", response_model=AdjustmentResponse)

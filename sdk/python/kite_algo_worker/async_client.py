@@ -545,6 +545,17 @@ class AsyncKiteAlgoWorkerClient:
     async def list_timeline_snapshot(self, strategy_run_id: str, **params: Any) -> WorkerTimelineResponse:
         return WorkerTimelineResponse.model_validate(await self.list_timeline(strategy_run_id, **params))
 
+    # -- proposals and frozen plans (G5) -----------------------------------
+
+    async def submit_proposal(self, payload: JsonDict) -> JsonDict:
+        """Submit one evaluation's proposal (creates a frozen plan, places nothing)."""
+        return await self._request("POST", "/worker/proposals", json=payload)
+
+    @property
+    def proposals(self) -> "_AsyncProposalNamespace":
+        """Namespaced access: ``await client.proposals.submit(payload)``."""
+        return _AsyncProposalNamespace(self)
+
     async def list_orders(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", "/worker/orders", params={"strategy_run_id": strategy_run_id})
 
@@ -1260,3 +1271,13 @@ class AsyncKiteAlgoWorkerClient:
 
 
 __all__ = ["AsyncKiteAlgoWorkerClient"]
+
+
+class _AsyncProposalNamespace:
+    """Thin ergonomic facade over the proposal transport."""
+
+    def __init__(self, client: "AsyncKiteAlgoWorkerClient") -> None:
+        self._client = client
+
+    async def submit(self, payload: JsonDict) -> JsonDict:
+        return await self._client.submit_proposal(payload)
