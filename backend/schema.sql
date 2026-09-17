@@ -3022,3 +3022,99 @@ DROP TRIGGER IF EXISTS trg_strategy_reservation_events_immutable
 CREATE TRIGGER trg_strategy_reservation_events_immutable
     BEFORE UPDATE OR DELETE ON public.strategy_reservation_events
     FOR EACH ROW EXECUTE FUNCTION forbid_strategy_reservation_event_mutation();
+
+-- =========================================
+-- Settlement barrier and four-axis settlement evidence (G7, Phase 5)
+-- Mirrors alembic revision 20260917_000029. Purely additive: nothing above is
+-- altered. Quiescence is NEVER inferred from a quiet window or two identical
+-- reads: work transitions bump ``barrier_version`` in the same transaction as
+-- their event row, and a recorded proof pins ``quiet_since_version`` to the
+-- version it proved — so any later work event invalidates every prior proof
+-- by the plain inequality ``quiet_since_version <> barrier_version`` (D-1).
+-- =========================================
+
+CREATE TABLE IF NOT EXISTS public.strategy_execution_barriers (
+    account_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    barrier_version BIGINT NOT NULL DEFAULT 0,
+    quiet_since_version BIGINT,
+    last_proof_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, strategy_id, execution_environment),
+    CONSTRAINT ck_seb_environment
+        CHECK (execution_environment IN ('live', 'paper', 'dry_run'))
+);
+
+-- Append-only event log of the barrier (D-1). Work events carry the NEW bumped
+-- version; a ``proof_recorded`` row carries the CURRENT version — proofs do not
+-- change the version, work does.
+CREATE TABLE IF NOT EXISTS public.strategy_execution_barrier_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    version BIGINT NOT NULL,
+    event TEXT NOT NULL,
+    ref TEXT,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_sebe_event
+        CHECK (event IN ('work_created', 'work_resolved', 'proof_recorded')),
+    CONSTRAINT ck_sebe_environment
+        CHECK (execution_environment IN ('live', 'paper', 'dry_run'))
+);
+CREATE INDEX IF NOT EXISTS idx_barrier_events_key
+    ON public.strategy_execution_barrier_events
+    (account_id, strategy_id, execution_environment, created_at);
+CREATE INDEX IF NOT EXISTS idx_barrier_events_version
+    ON public.strategy_execution_barrier_events
+    (account_id, strategy_id, execution_environment, version);
+
+-- Append-only snapshot of one four-axis settlement assessment (R3 §16, D-5).
+-- An assessment records the ``barrier_version`` it was taken at plus per-axis
+-- digests, so a later barrier bump makes its staleness detectable.
+CREATE TABLE IF NOT EXISTS public.strategy_settlement_assessments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    overall TEXT NOT NULL,
+    barrier_version BIGINT NOT NULL,
+    axes JSONB NOT NULL,
+    evidence_digest TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_ssa_overall CHECK (overall IN ('settled', 'unsettled', 'unknown')),
+    CONSTRAINT ck_ssa_environment
+        CHECK (execution_environment IN ('live', 'paper', 'dry_run'))
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_assessments_key
+    ON public.strategy_settlement_assessments
+    (account_id, strategy_id, execution_environment, created_at);
+
+-- Both evidence surfaces are insert-only: a proof, a work event or an
+-- assessment is history, and rewriting history would make "settled" a state
+-- instead of the snapshot D-5 demands.
+CREATE OR REPLACE FUNCTION forbid_strategy_barrier_event_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_execution_barrier_events are append-only (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_strategy_barrier_events_immutable
+    ON public.strategy_execution_barrier_events;
+CREATE TRIGGER trg_strategy_barrier_events_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_execution_barrier_events
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_barrier_event_mutation();
+
+CREATE OR REPLACE FUNCTION forbid_settlement_assessment_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_settlement_assessments are append-only (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_settlement_assessments_immutable
+    ON public.strategy_settlement_assessments;
+CREATE TRIGGER trg_settlement_assessments_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_settlement_assessments
+    FOR EACH ROW EXECUTE FUNCTION forbid_settlement_assessment_mutation();

@@ -777,3 +777,130 @@ class AccountReconciliationVersion(Base):
     account_id = Column(Text, primary_key=True)
     version = Column(BigInteger, nullable=False, server_default="0")
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Settlement barrier and four-axis evidence (Phase 5 / G7)
+# ---------------------------------------------------------------------------
+
+
+#: Barrier event vocabulary (mirrors ``ck_sebe_event``).
+BARRIER_EVENTS = ("work_created", "work_resolved", "proof_recorded")
+
+#: Settlement overall rollup vocabulary (mirrors ``ck_ssa_overall``).
+SETTLEMENT_OVERALL = ("settled", "unsettled", "unknown")
+
+
+class StrategyExecutionBarrier(Base):
+    """The durable execution version per book ``(account, strategy, env)`` (D-1).
+
+    ``barrier_version`` is bumped ONLY by work transitions, in the same
+    transaction as their event row. A quiescence proof stamps
+    ``quiet_since_version = barrier_version`` without bumping the version, so
+    the invariant "any later work event invalidates every prior proof" is the
+    plain inequality ``quiet_since_version <> barrier_version`` — never a
+    quiet window and never two identical reads.
+    """
+
+    __tablename__ = "strategy_execution_barriers"
+
+    account_id = Column(Text, primary_key=True)
+    strategy_id = Column(Text, primary_key=True)
+    execution_environment = Column(Text, primary_key=True)
+    barrier_version = Column(BigInteger, nullable=False, server_default="0")
+    quiet_since_version = Column(BigInteger, nullable=True)
+    last_proof_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "execution_environment IN ('live', 'paper', 'dry_run')",
+            name="ck_seb_environment",
+        ),
+    )
+
+
+class StrategyExecutionBarrierEvent(Base):
+    """Append-only barrier event log. **Insert-only, enforced by a trigger.**
+
+    Each row records the barrier version at the moment of the event. Work
+    events carry the NEW (bumped) version; a ``proof_recorded`` row carries the
+    CURRENT version — proofs do not change the version, work does.
+    """
+
+    __tablename__ = "strategy_execution_barrier_events"
+
+    id = Column(Text, primary_key=True)
+    account_id = Column(Text, nullable=False)
+    strategy_id = Column(Text, nullable=False)
+    execution_environment = Column(Text, nullable=False)
+    version = Column(BigInteger, nullable=False)
+    event = Column(Text, nullable=False)
+    ref = Column(Text, nullable=True)
+    detail = Column(JSON, nullable=False, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "event IN ('work_created', 'work_resolved', 'proof_recorded')",
+            name="ck_sebe_event",
+        ),
+        CheckConstraint(
+            "execution_environment IN ('live', 'paper', 'dry_run')",
+            name="ck_sebe_environment",
+        ),
+        Index(
+            "idx_barrier_events_key",
+            "account_id",
+            "strategy_id",
+            "execution_environment",
+            "created_at",
+        ),
+        Index(
+            "idx_barrier_events_version",
+            "account_id",
+            "strategy_id",
+            "execution_environment",
+            "version",
+        ),
+    )
+
+
+class StrategySettlementAssessment(Base):
+    """Append-only snapshot of one four-axis settlement assessment (D-3, D-5).
+
+    An assessment is a **snapshot, not a state**: it records the
+    ``barrier_version`` it was taken at plus per-axis evidence digests, so a
+    later barrier bump (late fill, new work) makes its staleness detectable —
+    the platform re-assesses before acting. Trigger-immutable like every other
+    evidence surface in this campaign.
+    """
+
+    __tablename__ = "strategy_settlement_assessments"
+
+    id = Column(Text, primary_key=True)
+    account_id = Column(Text, nullable=False)
+    strategy_id = Column(Text, nullable=False)
+    execution_environment = Column(Text, nullable=False)
+    overall = Column(Text, nullable=False)
+    barrier_version = Column(BigInteger, nullable=False)
+    axes = Column(JSON, nullable=False)
+    evidence_digest = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "overall IN ('settled', 'unsettled', 'unknown')", name="ck_ssa_overall"
+        ),
+        CheckConstraint(
+            "execution_environment IN ('live', 'paper', 'dry_run')",
+            name="ck_ssa_environment",
+        ),
+        Index(
+            "idx_settlement_assessments_key",
+            "account_id",
+            "strategy_id",
+            "execution_environment",
+            "created_at",
+        ),
+    )
