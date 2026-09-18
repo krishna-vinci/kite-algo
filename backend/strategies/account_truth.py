@@ -765,6 +765,7 @@ class ReconciliationService:
         ingest_service: Optional["AccountTruthService"] = None,
         run_async: Optional[Callable[..., Any]] = None,
         notifier: Optional[Callable[[str, str, Coordinate, Dict[str, Any]], bool]] = None,
+        corporate_actions: Optional[Any] = None,
         max_attempts: Optional[int] = None,
     ) -> None:
         self.store = store or AccountTruthStore()
@@ -773,6 +774,7 @@ class ReconciliationService:
             run_async = asyncio.to_thread
         self._run_async = run_async
         self._notifier = notifier
+        self._corporate_actions = corporate_actions
         self.max_attempts = int(
             max_attempts
             if max_attempts is not None
@@ -841,6 +843,17 @@ class ReconciliationService:
                 divergence = self._classify(
                     residual=residual, attempts=attempts, ingest_state=ingest_state
                 )
+                if divergence == UNEXPLAINED and residual != 0:
+                    # A persistent divergence whose shape looks like a split is not
+                    # merely unexplained: it is a suspected corporate action, and it
+                    # must be recorded and frozen rather than quietly tolerated.
+                    self._detect_corporate_action(
+                        account_id=account_id,
+                        coordinate=coordinate,
+                        broker_quantity=broker_quantity,
+                        attributed_quantity=attributed_quantity,
+                        manual_quantity=manual_quantity,
+                    )
                 if divergence == ALIGNED:
                     attempts = 0
 
@@ -906,6 +919,40 @@ class ReconciliationService:
                 pass
             session.close()
             raise
+
+    def _detect_corporate_action(
+        self,
+        *,
+        account_id: str,
+        coordinate: Coordinate,
+        broker_quantity: int,
+        attributed_quantity: int,
+        manual_quantity: int,
+    ) -> None:
+        """Ask the detector about a persistent divergence. Never fatal.
+
+        Detection runs inside reconciliation because that is where the evidence
+        lands; a failure here must not stop the classification that already
+        happened, so it is swallowed and the divergence stands on its own.
+        """
+        detector = self._corporate_actions
+        if detector is None:
+            return
+        try:
+            detector.detect(
+                account_id=account_id,
+                coordinate={
+                    "instrument_token": coordinate[0],
+                    "exchange": coordinate[1],
+                    "tradingsymbol": coordinate[2],
+                    "product": coordinate[3],
+                },
+                broker_quantity=broker_quantity,
+                attributed_quantity=attributed_quantity,
+                manual_quantity=manual_quantity,
+            )
+        except Exception:  # noqa: BLE001 - detection never masks the classification
+            pass
 
     def _classify(self, *, residual: int, attempts: int, ingest_state: Dict[str, Any]) -> str:
         if residual == 0:
