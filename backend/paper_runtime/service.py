@@ -178,7 +178,7 @@ class PaperTradingService:
 
         if self._should_fill_immediately(order, request=request, market_snapshot=market_snapshot):
             fill_price = self._fill_price(order, market_snapshot=market_snapshot, fallback=reference_price)
-            return await self._fill_order(order=order, account=account, request=request, instrument=instrument, fill_price=fill_price, existing_position=existing_position)
+            return await self._fill_order_progressively(order=order, account=account, request=request, instrument=instrument, fill_price=fill_price, existing_position=existing_position)
 
         pending_order = order.model_copy(update={"status": PaperOrderStatus.OPEN, "updated_at": _utcnow()})
         pending_order = await asyncio.to_thread(self.repository.update_order, pending_order)
@@ -298,7 +298,7 @@ class PaperTradingService:
                 if not instrument:
                     continue
                 fill_price = self._fill_price(order, market_snapshot=tick, fallback=Decimal(str(tick.get("last_price") or 0)))
-                await self._fill_order(order=order, account=account, request=request, instrument=instrument, fill_price=fill_price, existing_position=existing_position)
+                await self._fill_order_progressively(order=order, account=account, request=request, instrument=instrument, fill_price=fill_price, existing_position=existing_position)
 
         positions = await asyncio.to_thread(self.repository.list_open_positions_for_instrument, instrument_token)
         for position in positions:
@@ -946,6 +946,102 @@ class PaperTradingService:
             updated_at=_utcnow(),
             metadata=metadata,
         )
+
+
+    async def _fill_order_progressively(
+        self,
+        *,
+        order: PaperOrder,
+        account: PaperAccount,
+        request: Dict[str, Any],
+        instrument: Dict[str, Any],
+        fill_price: Decimal,
+        existing_position: PaperPosition | None,
+    ) -> Dict[str, Any]:
+        """Fill the order, possibly across several tranches (G12).
+
+        With a fill ratio below 1 an order fills part of its remainder per attempt
+        and stays open, so the book moves the way a real one does: several
+        ``paper_trades`` rows, an unexecuted remainder, and an order the executor
+        must treat as in-flight rather than done.
+
+        The accounting is not re-implemented here: each tranche goes through the
+        existing full-fill path with the tranche's quantity, so position, margin,
+        charges, ledger entries and lot attribution all behave exactly as before.
+        Only the order row differs afterwards, because its status is what says
+        there is more to do.
+        """
+        from backend.paper_runtime.partial_fills import (
+            PaperFillProgressStore,
+            next_tranche,
+            partial_fill_ratio,
+        )
+
+        ratio = partial_fill_ratio()
+        if ratio >= 1.0 or not order.account_scope:
+            # 1.0 is the pre-existing behaviour: one instant, full fill.
+            return await self._fill_order(
+                order=order, account=account, request=request, instrument=instrument,
+                fill_price=fill_price, existing_position=existing_position,
+            )
+
+        store = getattr(self, "_fill_progress", None)
+        if store is None:
+            # Bind to the repository's session factory, not the ambient default:
+            # the service's database is whatever its repository was built with, and
+            # a store that reached for SessionLocal would write to a different one.
+            store = PaperFillProgressStore(
+                session_factory=getattr(self.repository, "session_factory", None)
+            )
+            self._fill_progress = store
+        progress = await asyncio.to_thread(
+            store.start,
+            account_scope=order.account_scope,
+            paper_order_id=order.order_id,
+            quantity=order.quantity,
+        )
+        remaining = int(progress.remaining_quantity or order.quantity)
+        tranche = next_tranche(remaining, ratio)
+
+        if tranche >= remaining:
+            result = await self._fill_order(
+                order=order, account=account, request=request, instrument=instrument,
+                fill_price=fill_price, existing_position=existing_position,
+            )
+            await asyncio.to_thread(
+                store.record_fill,
+                account_scope=order.account_scope,
+                paper_order_id=order.order_id,
+                filled_quantity=remaining,
+                quantity=order.quantity,
+            )
+            return result
+
+        tranche_order = order.model_copy(update={"quantity": tranche})
+        tranche_request = {**request, "quantity": tranche}
+        await self._fill_order(
+            order=tranche_order, account=account, request=tranche_request, instrument=instrument,
+            fill_price=fill_price, existing_position=existing_position,
+        )
+        updated = await asyncio.to_thread(
+            store.record_fill,
+            account_scope=order.account_scope,
+            paper_order_id=order.order_id,
+            filled_quantity=tranche,
+            quantity=order.quantity,
+        )
+        partly = order.model_copy(
+            update={
+                "status": PaperOrderStatus.PARTIALLY_FILLED,
+                "filled_quantity": int(updated.filled_quantity),
+                "pending_quantity": int(updated.remaining_quantity),
+                "average_price": fill_price,
+                "updated_at": _utcnow(),
+            }
+        )
+        partly = await asyncio.to_thread(self.repository.update_order, partly)
+        await publish_event("paper.orders.events", paper_order_event_payload(event_type="partially_filled", order=partly))
+        return {"mode": "paper", "status": "partially_filled", "order": partly.model_dump(mode="json")}
 
     async def _fill_order(
         self,

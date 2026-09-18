@@ -646,5 +646,173 @@ class TestCorporateActions(_PgTestCase):
         assert _scalar(sf, "SELECT COUNT(*) FROM public.strategy_corporate_action_events") == 0
 
 
+class TestPartialFills(_PgTestCase):
+    """Paper partial fills and the reservation consequence, on real PostgreSQL."""
+
+    def _executor_and_reservation(self, sf):
+        from backend.strategies.execution import PaperPlanExecutor
+        from backend.strategies.reservations import ClaimRequest, ReservationLedger
+
+        seed_world(sf)
+        for plan_id, proposal_id in ((str(uuid.uuid4()), str(uuid.uuid4())),):
+            _exec(
+                sf,
+                "INSERT INTO public.strategy_proposals "
+                "(proposal_id, strategy_id, account_id, evaluation_id, evaluation_kind, "
+                " strategy_run_id, target_kind, payload, payload_sha256, status) "
+                "VALUES (:pid, 'stg-A', 'kite:A', :eid, 'run_now', 'run-1', 'target_weights', "
+                " '{}'::jsonb, 'sha', 'validated')",
+                {"pid": proposal_id, "eid": f"eval-{plan_id}"},
+            )
+            _exec(
+                sf,
+                "INSERT INTO public.strategy_plans "
+                "(plan_id, proposal_id, strategy_id, account_id, plan_kind, plan_hash, "
+                " logical_plan, resolved_plan, pinned_catalog_generation, "
+                " pinned_universe_revision_id, pinned_member_hash) "
+                "VALUES (:lid, :pid, 'stg-A', 'kite:A', 'target_weights', 'h', '{}'::jsonb, "
+                " '{}'::jsonb, :gen, 'rev-1', 'mh-1')",
+                {"lid": plan_id, "pid": proposal_id, "gen": G1},
+            )
+        ledger = ReservationLedger(session_factory=sf)
+        reservation = ledger.claim(
+            ClaimRequest(
+                plan_id=plan_id, strategy_id="stg-A", account_id="kite:A",
+                evaluation_id=f"eval-{plan_id}", execution_environment="paper",
+                requirement_inr=1000.0, valid_until=NOW + timedelta(hours=1),
+                allocation_inr=10000.0, actor_id="app:owner",
+            ),
+            now=NOW,
+        )
+        executor = PaperPlanExecutor(session_factory=sf, ledger=ledger)
+        return executor, ledger, reservation
+
+    def test_progress_advances_across_tranches_and_completes(self):
+        from backend.paper_runtime.partial_fills import PaperFillProgressStore, next_tranche
+
+        sf = self.make_db()
+        store = PaperFillProgressStore(session_factory=sf)
+        progress = store.start(account_scope="kite:paper", paper_order_id="PAPER-1", quantity=100)
+        assert progress.status == "open"
+
+        attempts = 0
+        while not progress.is_complete and attempts < 20:
+            tranche = next_tranche(progress.remaining_quantity, 0.5)
+            progress = store.record_fill(
+                account_scope="kite:paper", paper_order_id="PAPER-1",
+                filled_quantity=tranche, quantity=100,
+            )
+            attempts += 1
+
+        assert progress.status == "filled"
+        assert progress.filled_quantity == 100
+        # The CHECKs hold throughout, and the row is the single source of progress.
+        assert _scalar(sf, "SELECT remaining_quantity FROM public.paper_order_fill_progress") == 0
+
+    def test_an_impossible_fill_cannot_be_recorded(self):
+        sf = self.make_db()
+        with pytest.raises(Exception):
+            _exec(
+                sf,
+                "INSERT INTO public.paper_order_fill_progress "
+                "(account_scope, paper_order_id, filled_quantity, remaining_quantity, status) "
+                "VALUES ('kite:paper', 'PAPER-1', -1, 10, 'open')",
+            )
+        with pytest.raises(Exception):
+            _exec(
+                sf,
+                "INSERT INTO public.paper_order_fill_progress "
+                "(account_scope, paper_order_id, filled_quantity, remaining_quantity, status) "
+                "VALUES ('kite:paper', 'PAPER-1', 0, 10, 'invented')",
+            )
+        with pytest.raises(Exception):
+            _exec(
+                sf,
+                "INSERT INTO public.paper_order_fill_progress "
+                "(account_scope, paper_order_id, filled_quantity, remaining_quantity, status) "
+                "VALUES ('kite:paper', 'PAPER-1', 0, 10, 'open')",
+            )
+            _exec(
+                sf,
+                "INSERT INTO public.paper_order_fill_progress "
+                "(account_scope, paper_order_id, filled_quantity, remaining_quantity, status) "
+                "VALUES ('kite:paper', 'PAPER-1', 0, 5, 'open')",
+            )
+
+    def test_verified_progress_renews_and_an_unresolved_remainder_holds(self):
+        sf = self.make_db()
+        executor, ledger, reservation = self._executor_and_reservation(sf)
+        rid = reservation["reservation_id"]
+
+        # Verified progress with more outstanding: capacity is extended.
+        executor._settle_reservation(
+            reservation, "worker:1", filled_ids=["PAPER-1"], partial_ids=["PAPER-1"],
+            failed=False, submitted_any=True,
+        )
+        assert ledger.get(rid)["status"] == "renewed"
+        assert ledger.held_notional(account_id="kite:A") == 1000.0
+
+        # An unresolved remainder with nothing proven: still held, and flagged.
+        executor._settle_reservation(
+            reservation, "worker:1", filled_ids=[], partial_ids=["PAPER-2"],
+            failed=False, submitted_any=True,
+        )
+        assert ledger.get(rid)["status"] == "action_required"
+        assert ledger.held_notional(account_id="kite:A") == 1000.0
+
+        # Only once nothing is outstanding does the capacity become exposure.
+        executor._settle_reservation(
+            reservation, "worker:1", filled_ids=["PAPER-1"], partial_ids=[],
+            failed=False, submitted_any=True,
+        )
+        assert ledger.get(rid)["status"] == "consumed"
+
+    def test_the_execution_trail_admits_a_partially_filled_step(self):
+        """The widened vocabulary is what lets a remainder be recorded at all."""
+        sf = self.make_db()
+        seed_world(sf)
+        plan_id = str(uuid.uuid4())
+        proposal_id = str(uuid.uuid4())
+        _exec(
+            sf,
+            "INSERT INTO public.strategy_proposals "
+            "(proposal_id, strategy_id, account_id, evaluation_id, evaluation_kind, "
+            " strategy_run_id, target_kind, payload, payload_sha256, status) "
+            "VALUES (:pid, 'stg-A', 'kite:A', :eid, 'run_now', 'run-1', 'target_weights', "
+            " '{}'::jsonb, 'sha', 'validated')",
+            {"pid": proposal_id, "eid": f"eval-{plan_id}"},
+        )
+        _exec(
+            sf,
+            "INSERT INTO public.strategy_plans "
+            "(plan_id, proposal_id, strategy_id, account_id, plan_kind, plan_hash, "
+            " logical_plan, resolved_plan, pinned_catalog_generation, "
+            " pinned_universe_revision_id, pinned_member_hash) "
+            "VALUES (:lid, :pid, 'stg-A', 'kite:A', 'target_weights', 'h', '{}'::jsonb, "
+            " '{}'::jsonb, :gen, 'rev-1', 'mh-1')",
+            {"lid": plan_id, "pid": proposal_id, "gen": G1},
+        )
+        _exec(
+            sf,
+            "INSERT INTO public.strategy_plan_execution_events "
+            "(id, plan_id, step_no, event, paper_order_id, filled_quantity, actor_id) "
+            "VALUES (gen_random_uuid(), :lid, 1, 'partially_filled', 'PAPER-1', 50, 'worker:1')",
+            {"lid": plan_id},
+        )
+        assert _scalar(
+            sf, "SELECT event FROM public.strategy_plan_execution_events WHERE plan_id = :l",
+            {"l": plan_id},
+        ) == "partially_filled"
+        # A value outside the widened vocabulary is still refused.
+        with pytest.raises(Exception):
+            _exec(
+                sf,
+                "INSERT INTO public.strategy_plan_execution_events "
+                "(id, plan_id, step_no, event, actor_id) "
+                "VALUES (gen_random_uuid(), :lid, 2, 'invented', 'worker:1')",
+                {"lid": plan_id},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -270,6 +270,7 @@ class ReservationLedger:
         *,
         actor_id: Optional[str] = None,
         extend_seconds: Optional[int] = None,
+        detail: Optional[Mapping[str, Any]] = None,
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """Extend an active reservation's validity and record the event.
@@ -286,6 +287,7 @@ class ReservationLedger:
             event="renewed",
             now=moment,
             actor_id=actor_id,
+            detail=detail,
         ) as row:
             row.status = "renewed"
             row.renewed_at = moment
@@ -448,7 +450,12 @@ class ReservationLedger:
             session.close()
 
     def require_action(
-        self, reservation_id: str, *, actor_id: Optional[str] = None, now: Optional[datetime] = None
+        self,
+        reservation_id: str,
+        *,
+        actor_id: Optional[str] = None,
+        detail: Optional[Mapping[str, Any]] = None,
+        now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """Flag an unresolved executing plan. Capacity stays held, deliberately."""
         moment = now or _utcnow()
@@ -458,6 +465,7 @@ class ReservationLedger:
             event="action_required",
             now=moment,
             actor_id=actor_id,
+            detail=detail,
         ) as row:
             row.status = "action_required"
         return self.get(reservation_id)

@@ -208,6 +208,21 @@ def upgrade() -> None:
         ["event_id", "created_at"],
     )
 
+    # A partially filled step is verified progress that is not completion, so the
+    # execution trail needs a vocabulary for it. Widened by replacing the CHECK,
+    # the same repair precedent as the schedule kinds above.
+    op.execute(
+        "ALTER TABLE public.strategy_plan_execution_events "
+        "DROP CONSTRAINT IF EXISTS ck_spee_event;"
+    )
+    op.execute(
+        """
+        ALTER TABLE public.strategy_plan_execution_events
+            ADD CONSTRAINT ck_spee_event
+            CHECK (event IN ('submitted', 'filled', 'partially_filled', 'rejected', 'failed', 'no_op'));
+        """
+    )
+
     op.execute(
         """
         CREATE FUNCTION forbid_strategy_corporate_action_log_mutation() RETURNS trigger AS $$
@@ -232,6 +247,17 @@ def downgrade() -> None:
         "ON public.strategy_corporate_action_event_log"
     )
     op.execute("DROP FUNCTION IF EXISTS forbid_strategy_corporate_action_log_mutation()")
+    op.execute(
+        "ALTER TABLE public.strategy_plan_execution_events "
+        "DROP CONSTRAINT IF EXISTS ck_spee_event;"
+    )
+    op.execute(
+        """
+        ALTER TABLE public.strategy_plan_execution_events
+            ADD CONSTRAINT ck_spee_event
+            CHECK (event IN ('submitted', 'filled', 'rejected', 'failed', 'no_op'));
+        """
+    )
     op.drop_index("idx_corporate_action_log_event", table_name="strategy_corporate_action_event_log")
     op.drop_table("strategy_corporate_action_event_log")
     op.drop_index("idx_corporate_action_account", table_name="strategy_corporate_action_events")

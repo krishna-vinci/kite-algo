@@ -3261,6 +3261,13 @@ CREATE TABLE IF NOT EXISTS public.strategy_corporate_action_event_log (
 CREATE INDEX IF NOT EXISTS idx_corporate_action_log_event
     ON public.strategy_corporate_action_event_log (event_id, created_at);
 
+-- A partially filled step is verified progress that is not completion, so the
+-- execution trail gains a vocabulary for it.
+ALTER TABLE public.strategy_plan_execution_events DROP CONSTRAINT IF EXISTS ck_spee_event;
+ALTER TABLE public.strategy_plan_execution_events
+    ADD CONSTRAINT ck_spee_event
+    CHECK (event IN ('submitted', 'filled', 'partially_filled', 'rejected', 'failed', 'no_op'));
+
 -- The parent row is mutable (a detection has a lifecycle); the log is not.
 CREATE OR REPLACE FUNCTION forbid_strategy_corporate_action_log_mutation() RETURNS trigger AS $$
 BEGIN

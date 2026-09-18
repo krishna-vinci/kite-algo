@@ -118,6 +118,7 @@ class ExecutionTestCase(unittest.TestCase):
             StrategyReservationEvent,
             StrategyRunBinding,
         )
+        from backend.strategies.attribution_models import PaperOrderFillProgress
 
         _Base.metadata.create_all(
             self.engine,
@@ -132,6 +133,9 @@ class ExecutionTestCase(unittest.TestCase):
                 StrategyReservationEvent.__table__,
                 StrategyExecutionBarrier.__table__,
                 StrategyExecutionBarrierEvent.__table__,
+                # The executor reads fill progress to decide whether a step is
+                # resolved, so the table must exist even when nothing writes to it.
+                PaperOrderFillProgress.__table__,
             ],
         )
         self.factory = sessionmaker(bind=self.engine, expire_on_commit=False)
@@ -368,7 +372,8 @@ class ExecutionEventSchemaTests(ExecutionTestCase):
         from backend.strategies.attribution_models import PLAN_EXECUTION_EVENTS
 
         self.assertEqual(
-            PLAN_EXECUTION_EVENTS, ("submitted", "filled", "rejected", "failed", "no_op")
+            PLAN_EXECUTION_EVENTS,
+            ("submitted", "filled", "partially_filled", "rejected", "failed", "no_op")
         )
 
     def test_an_event_references_a_real_plan(self):

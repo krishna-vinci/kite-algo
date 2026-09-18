@@ -40,7 +40,7 @@ from __future__ import annotations
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from sqlalchemy import select, text
 
@@ -110,6 +110,7 @@ class PaperPlanExecutor:
         ledger: Optional[ReservationLedger] = None,
         clock: Optional[Callable[[], datetime]] = None,
         paper_service_factory: Optional[Callable[[], Any]] = None,
+        fill_progress_store: Any = None,
     ) -> None:
         if session_factory is None:
             from backend.workflows.repository import SessionLocal
@@ -122,6 +123,11 @@ class PaperPlanExecutor:
         self.paper_service_factory = paper_service_factory
         self.barrier = barrier or ExecutionBarrier(session_factory=session_factory)
         self.ledger = ledger or ReservationLedger(session_factory=session_factory)
+        if fill_progress_store is None:
+            from backend.paper_runtime.partial_fills import PaperFillProgressStore
+
+            fill_progress_store = PaperFillProgressStore(session_factory=session_factory)
+        self.fill_progress = fill_progress_store
         self._clock = clock or _utcnow
         self._plan_locks: Dict[str, threading.Lock] = {}
         self._plan_locks_guard = threading.Lock()
@@ -181,6 +187,7 @@ class PaperPlanExecutor:
         failed = False
         filled = False
         submitted_any = False
+        partial_order_ids: List[str] = []
         counter = 0
 
         def _stamp() -> datetime:
@@ -215,14 +222,23 @@ class PaperPlanExecutor:
             submitted_any = True
             if submission["order_id"]:
                 order_ids.append(submission["order_id"])
-            if submission["outcome"]["event"] == "filled":
+            event = submission["outcome"]["event"]
+            if event in ("filled", "partially_filled"):
                 filled_ids.append(submission["order_id"] or "")
-            rejected = rejected or submission["outcome"]["event"] == "rejected"
-            failed = failed or submission["outcome"]["event"] == "failed"
-            filled = filled or submission["outcome"]["event"] == "filled"
+            if event == "partially_filled":
+                partial_order_ids.append(submission["order_id"] or "")
+            rejected = rejected or event == "rejected"
+            failed = failed or event == "failed"
+            filled = filled or event == "filled"
 
+        partial_ids = list(dict.fromkeys(partial_order_ids + self._open_remainders(filled_ids)))
         self._settle_reservation(
-            reservation, actor, filled_ids=filled_ids, failed=failed, submitted_any=submitted_any
+            reservation,
+            actor,
+            filled_ids=filled_ids,
+            partial_ids=partial_ids,
+            failed=failed,
+            submitted_any=submitted_any,
         )
 
         if failed:
@@ -571,6 +587,27 @@ class PaperPlanExecutor:
                 },
                 at=outcome_at,
             )
+        elif status == "partially_filled":
+            # Verified progress that is not completion: the order changed the book
+            # and still has a remainder. It is deliberately NOT recorded as
+            # work_resolved — an open remainder is in flight, and calling it
+            # resolved would assert a flatness the account does not have.
+            filled = int(order.get("filled_quantity") or 0)
+            outcome = self._record_event(
+                plan_id,
+                step_no=step_no,
+                event="partially_filled",
+                paper_order_id=order_id,
+                filled_quantity=filled,
+                actor_id=actor,
+                detail={
+                    "fill_price": str(order.get("average_price") or ""),
+                    "tradingsymbol": order.get("tradingsymbol"),
+                    "pending_quantity": order.get("pending_quantity"),
+                    "ref": ref,
+                },
+                at=outcome_at,
+            )
         elif status == "rejected":
             reason = str(result.get("reason") or "rejected by the paper runtime")
             self.barrier.record_work_event(
@@ -607,6 +644,23 @@ class PaperPlanExecutor:
 
     # ----------------------------------------------------------- reservation
 
+    def _open_remainders(self, order_ids: Sequence[str]) -> List[str]:
+        """Order ids whose paper fill left an unexecuted remainder.
+
+        An open remainder means the order has not finished changing the book, so
+        the plan is neither filled nor unfilled — which is exactly the state the
+        reservation lifecycle must not treat as 'done'.
+        """
+        if not order_ids:
+            return []
+        try:
+            remainders = self.fill_progress.open_remainder_for(
+                paper_order_ids=list(order_ids)
+            )
+        except Exception:  # noqa: BLE001 - unreadable progress is not proof of completion
+            return list(order_ids)
+        return [str(row.paper_order_id) for row in remainders]
+
     def _settle_reservation(
         self,
         reservation: Dict[str, Any],
@@ -615,17 +669,45 @@ class PaperPlanExecutor:
         filled_ids: List[str],
         failed: bool,
         submitted_any: bool,
+        partial_ids: Optional[Sequence[str]] = None,
     ) -> None:
         """Consume on fills, release terminal-unfilled on rejections, hold on doubt (D-4).
 
         A plan whose every step was ``no_op`` committed no capital, so its
         reservation stays exactly as admission left it — nothing happened.
+
+        Verified progress is the one thing that may extend or consume capacity,
+        and an unexecuted remainder is the one thing that may not release it: a
+        partially filled rebalance is unresolved work, so its capacity is renewed
+        when a tranche actually filled and flagged ``action_required`` when it did
+        not. Either way it is held — releasing on an open remainder would hand
+        back capacity that is still changing the book.
         """
         if reservation is None:
             return  # a risk-reducing-only bundle never held capacity
         reservation_id = str(reservation.get("reservation_id") or "")
         if not reservation_id:
             return
+
+        remainders = list(partial_ids or [])
+        if remainders:
+            if filled_ids:
+                # Verified progress: a tranche filled and more is outstanding.
+                self.ledger.renew(
+                    reservation_id,
+                    actor_id=actor,
+                    detail={"plan_id": reservation.get("plan_id"), "open_remainder": remainders},
+                )
+            else:
+                # Unresolved with nothing proven: hold and ask the owner rather
+                # than release capacity on a guess.
+                self.ledger.require_action(
+                    reservation_id,
+                    actor_id=actor,
+                    detail={"plan_id": reservation.get("plan_id"), "open_remainder": remainders},
+                )
+            return
+
         if filled_ids:
             self.ledger.consume(
                 reservation_id,

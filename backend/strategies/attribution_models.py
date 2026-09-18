@@ -913,7 +913,14 @@ class StrategySettlementAssessment(Base):
 
 
 #: Execution event vocabulary (mirrors ``ck_spee_event``).
-PLAN_EXECUTION_EVENTS = ("submitted", "filled", "rejected", "failed", "no_op")
+PLAN_EXECUTION_EVENTS = (
+    "submitted",
+    "filled",
+    "partially_filled",
+    "rejected",
+    "failed",
+    "no_op",
+)
 
 #: Plan kinds that name something the executor can act on. ``target_weights``
 #: stays a valid plan kind (full-snapshot semantics) but the paper executor of
@@ -948,7 +955,8 @@ class StrategyPlanExecutionEvent(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "event IN ('submitted', 'filled', 'rejected', 'failed', 'no_op')",
+            "event IN ('submitted', 'filled', 'partially_filled', 'rejected', 'failed', "
+            "'no_op')",
             name="ck_spee_event",
         ),
         # Declared because ``strategy_plans`` IS in this metadata: it orders the
