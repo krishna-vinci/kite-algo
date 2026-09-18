@@ -65,6 +65,16 @@ class SingleInstrumentCompiler(TargetCompiler):
                 },
             )
 
+        # MIS is intraday by policy: a multi-day MIS intent is refused at
+        # VALIDATION, never accepted and then liquidated by the 15:20 square-off.
+        from backend.strategies.mis_policy import hold_days_from, validate_intraday_scope
+
+        validate_intraday_scope(
+            product=product,
+            hold_days=hold_days_from(payload),
+            signed_quantity=target_quantity,
+        )
+
         reference_price = payload.get("reference_price")
         try:
             reference_price = None if reference_price is None else float(reference_price)

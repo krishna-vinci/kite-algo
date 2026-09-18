@@ -865,5 +865,59 @@ class TargetWeightsPlanTests(ProposalTestCase):
         self.assertEqual(state["reason"], "CATALOG_GENERATION_UNRELATED")
 
 
+class MisOvernightProposalTests(ProposalStoreTests):
+    """A MIS overnight refusal is a validation refusal, so it ends the evaluation."""
+
+    def _mis_submission(self, **overrides):
+        values = {
+            "strategy_id": "stg-A",
+            "account_id": "kite:A",
+            "evaluation_id": "eval-mis",
+            "evaluation_kind": "run_now",
+            "job_id": None,
+            "strategy_run_id": "run-1",
+            "target_kind": "single_instrument",
+            "payload": {
+                "instrument_token": 100,
+                "exchange": "NSE",
+                "tradingsymbol": "RELIANCE",
+                "product": "MIS",
+                "target_quantity": 10,
+                "reference_price": 100.0,
+                "hold_days": 3,
+            },
+        }
+        values.update(overrides)
+        from backend.strategies.proposals import ProposalSubmission
+
+        return ProposalSubmission(**values)
+
+    def test_a_multi_day_mis_proposal_is_refused_and_spends_the_evaluation(self):
+        from backend.strategies.proposals import ProposalConflict
+
+        store = self._store()
+        result = store.submit(self._mis_submission())
+        self.assertEqual(result["status"], "refused")
+        self.assertIsNone(result["plan"])
+        refusals = [row for row in self._journal() if row[0] == "validation_refused"]
+        self.assertEqual(refusals, [("validation_refused", "MIS_OVERNIGHT_REFUSED")])
+
+        # The identity is spent: a corrected retry needs a NEW evaluation_id,
+        # because the platform never invents one and never retries a refusal.
+        with self.assertRaises(ProposalConflict):
+            store.submit(self._mis_submission(payload={"instrument_token": 100,
+                "exchange": "NSE", "tradingsymbol": "RELIANCE", "product": "CNC",
+                "target_quantity": 10, "reference_price": 100.0, "hold_days": 3}))
+        corrected = store.submit(
+            self._mis_submission(
+                evaluation_id="eval-mis-2",
+                payload={"instrument_token": 100, "exchange": "NSE",
+                         "tradingsymbol": "RELIANCE", "product": "CNC",
+                         "target_quantity": 10, "reference_price": 100.0, "hold_days": 3},
+            )
+        )
+        self.assertEqual(corrected["status"], "validated")
+
+
 if __name__ == "__main__":
     unittest.main()
