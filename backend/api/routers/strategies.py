@@ -32,6 +32,9 @@ from pydantic import ValidationError
 
 from backend.strategies.proposals import plan_invalidation_state
 from backend.api.schemas.proposals import (
+    ExecutionEventRow,
+    ExecutionResponse,
+    ExecutionTrailResponse,
     PlanResponse,
     ProposalJournalRow,
     ProposalListResponse,
@@ -988,6 +991,104 @@ async def get_strategy_plan(
         raise HTTPException(status_code=404, detail="Plan not found")
     state = plan_invalidation_state(plan, session_factory=session_factory)
     return PlanResponse(**plan, invalidation_state=state)
+
+
+# ---------------------------------------------------------------------------
+# Plan execution (Phase 6 / Project 6, D-7) — paper only, owner-triggered
+# ---------------------------------------------------------------------------
+
+
+def _paper_plan_executor(request: Request, session_factory: Any):
+    """The paper plan executor, injectable for tests (app.state override)."""
+    from backend.strategies.execution import PaperPlanExecutor
+
+    executor = getattr(request.app.state, "paper_plan_executor", None)
+    if executor is not None:
+        return executor
+    paper = getattr(request.app.state, "paper_runtime_service", None)
+    if paper is None:
+        raise HTTPException(status_code=503, detail="Paper runtime is not available")
+    return PaperPlanExecutor(session_factory=session_factory, paper_service=paper)
+
+
+@router.post("/{strategy_id}/plans/{plan_id}/execute", response_model=ExecutionResponse)
+async def execute_plan(
+    strategy_id: str,
+    plan_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Execute one admitted paper plan through the paper runtime.
+
+    Paper accounts only, ever: the executor refuses anything else by name
+    (``PAPER_ONLY_EXECUTION``), and live enablement is a separate authorization
+    that does not exist yet. Execution CONSUMES the reservation on fills and
+    releases it ``terminal_unfilled`` on rejections; every transition — every
+    refusal included — lands in the append-only execution trail.
+    """
+    from backend.strategies.execution import ExecutionRefusal
+
+    enforce_same_origin(request)
+    plan = _plan_or_404(_proposal_store(request, session_factory), owner=owner, repo=repo,
+                        strategy_id=strategy_id, plan_id=plan_id)
+    executor = _paper_plan_executor(request, session_factory)
+    try:
+        result = await executor.execute(plan, actor=owner)
+    except ExecutionRefusal as exc:
+        raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
+    return ExecutionResponse(**result)
+
+
+@router.get("/{strategy_id}/plans/{plan_id}/executions", response_model=ExecutionTrailResponse)
+async def list_plan_executions(
+    strategy_id: str,
+    plan_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """The plan's append-only execution trail (D-3).
+
+    Read-only by design: the rows are facts, the current step state is derived
+    from them, and nothing here can rewrite what happened.
+    """
+    from sqlalchemy import select
+
+    from backend.strategies.attribution_models import StrategyPlanExecutionEvent
+
+    _owned_strategy(repo, owner, strategy_id)
+    plan = _proposal_store(request, session_factory).get_plan(plan_id)
+    if plan is None or str(plan["strategy_id"]) != str(strategy_id):
+        raise HTTPException(status_code=404, detail="Plan not found")
+    with session_factory() as session:
+        rows = session.execute(
+            select(StrategyPlanExecutionEvent)
+            .where(StrategyPlanExecutionEvent.plan_id == plan_id)
+            .order_by(
+                StrategyPlanExecutionEvent.created_at,
+                StrategyPlanExecutionEvent.step_no,
+                StrategyPlanExecutionEvent.id,
+            )
+        ).scalars().all()
+        events = [
+            ExecutionEventRow(
+                id=str(row.id),
+                plan_id=str(row.plan_id),
+                step_no=int(row.step_no),
+                event=str(row.event),
+                paper_order_id=row.paper_order_id,
+                filled_quantity=row.filled_quantity,
+                refusal_reason=row.refusal_reason,
+                actor_id=str(row.actor_id),
+                detail=dict(row.detail or {}),
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
+    return ExecutionTrailResponse(plan_id=plan_id, events=events)
 
 
 @router.post("/{strategy_id}/adjustments", response_model=AdjustmentResponse)

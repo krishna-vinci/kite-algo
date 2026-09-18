@@ -660,6 +660,10 @@ class _ProposalApiHarness(_OwnerApiHarness):
         )
         return repo, RAW_WORKER_TOKEN
 
+    def _wire_extra_state(self, app):
+        """Hook for subclasses that need more wired into app.state."""
+        return None
+
     def _stop_patches(self):
         for patcher in (getattr(self, "_margin", None), getattr(self, "_patch", None), getattr(self, "_env", None)):
             if patcher is not None:
@@ -680,6 +684,7 @@ class _ProposalApiHarness(_OwnerApiHarness):
         app.state.attribution_store = self.store
         app.state.algo_worker_repository = repo
         app.state.proposal_store = _proposal_store(self.factory)
+        self._wire_extra_state(app)
         from datetime import datetime, timezone
 
         self._margin = _patch.object(
@@ -1884,6 +1889,261 @@ class SettlementApiTests(_OwnerApiHarness):
             response = await client.post(
                 f"{BASE}/{sid}/settlement/assess",
                 json={},
+                headers={"Origin": "http://evil.example"},
+            )
+            self.assertEqual(response.status_code, 403)
+        finally:
+            self._stop_patches()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 (Project 6): owner execute + execution-trail surfaces (D-7)
+# ---------------------------------------------------------------------------
+
+
+class ExecutionOwnerApiTests(_ProposalApiHarness):
+    """POST .../plans/{plan_id}/execute and GET .../plans/{plan_id}/executions.
+
+    Paper-only by construction (the executor refuses anything else by name),
+    owner + account-authorized, worker-proof, and the trail is read-only.
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        from backend.strategies.attribution_models import (
+            StrategyExecutionBarrier,
+            StrategyExecutionBarrierEvent,
+            StrategyPlanExecutionEvent,
+            StrategyPositionProjection,
+            StrategyReservation,
+            StrategyReservationEvent,
+            StrategyRunBinding,
+        )
+
+        Base.metadata.create_all(
+            self.engine,
+            tables=[
+                StrategyRunBinding.__table__,
+                StrategyReservation.__table__,
+                StrategyReservationEvent.__table__,
+                StrategyPlanExecutionEvent.__table__,
+                StrategyPositionProjection.__table__,
+                StrategyExecutionBarrier.__table__,
+                StrategyExecutionBarrierEvent.__table__,
+            ],
+        )
+        # The shared catalog fixture predates the lot/instrument-type columns;
+        # widen it additively (fresh in-memory table per test, so always clean).
+        with self.factory() as session:
+            for ddl in (
+                "ALTER TABLE public.instrument_catalog_records ADD COLUMN lot_size INTEGER",
+                "ALTER TABLE public.instrument_catalog_records ADD COLUMN instrument_type TEXT",
+            ):
+                try:
+                    session.execute(text(ddl))
+                except Exception:  # noqa: BLE001 - column already present
+                    pass
+            session.commit()
+
+    def _stop_patches(self):
+        for patcher in (
+            getattr(self, "_margin", None),
+            getattr(self, "_patch", None),
+            getattr(self, "_env", None),
+            getattr(self, "_paper_patchers", None),
+        ):
+            if patcher is not None:
+                if isinstance(patcher, (list, tuple)):
+                    for one in patcher:
+                        one.stop()
+                else:
+                    patcher.stop()
+
+    def _wire_extra_state(self, app):
+        from unittest.mock import patch as _patch
+
+        from backend.strategies.execution import PaperPlanExecutor
+        from tests.strategies.test_execution import (
+            FakeInstrumentsRepository,
+            FakeMarketRuntime,
+            _FakePaperRepository,
+        )
+        from decimal import Decimal
+
+        from backend.paper_runtime.service import PaperTradingService
+
+        async def _inline_to_thread(func, /, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        # The paper runtime must not spawn threads or reach Redis in tests.
+        patchers = [
+            _patch("backend.paper_runtime.service.asyncio.to_thread", new=_inline_to_thread),
+            _patch("backend.paper_runtime.service.publish_event", autospec=True),
+        ]
+        for patcher in patchers:
+            patcher.start()
+        self._paper_patchers = patchers
+
+        paper_service = PaperTradingService(
+            repository=_FakePaperRepository(),
+            instruments_repository=FakeInstrumentsRepository(),
+            market_data_runtime=FakeMarketRuntime(),
+            default_starting_balance=Decimal("100000"),
+        )
+        app.state.paper_plan_executor = PaperPlanExecutor(
+            session_factory=self.factory, paper_service=paper_service
+        )
+
+    async def _admitted_plan(self, *, environment="paper"):
+        """A validated plan, a policy, and an active reservation on the account."""
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+        await self._bind_run(sid, run_id="run-bound")
+        repo, raw_token = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            submitted = await client.post(
+                PROPOSALS_BASE,
+                json=self._payload(strategy_id=sid),
+                headers={"Authorization": f"Bearer {raw_token}"},
+            )
+            self.assertEqual(submitted.status_code, 201, submitted.text)
+            plan_id = submitted.json()["plan"]["plan_id"]
+            policy = await client.put(
+                f"{BASE}/{sid}/admission-policy", json={"allocation_inr": 100000.0}
+            )
+            self.assertEqual(policy.status_code, 200, policy.text)
+            reserved = await client.post(
+                f"{BASE}/{sid}/plans/{plan_id}/reserve?execution_environment={environment}"
+            )
+            self.assertEqual(reserved.status_code, 200, reserved.text)
+        finally:
+            self._stop_patches()
+        return repo, sid, plan_id
+
+    async def test_owner_executes_an_admitted_paper_plan_and_reads_the_trail(self):
+        repo, sid, plan_id = await self._admitted_plan(environment="paper")
+        client = self._proposal_client(repo=repo)
+        try:
+            executed = await client.post(f"{BASE}/{sid}/plans/{plan_id}/execute")
+            self.assertEqual(executed.status_code, 200, executed.text)
+            body = executed.json()
+            self.assertEqual(body["plan_id"], plan_id)
+            self.assertEqual(body["status"], "filled")
+            (step,) = body["steps"]
+            self.assertEqual(step["event"], "filled")
+            self.assertEqual(step["filled_quantity"], 10)
+            self.assertTrue(step["paper_order_id"].startswith("PAPER-"))
+
+            # The event trail surface returns the append-only facts in order.
+            trail = await client.get(f"{BASE}/{sid}/plans/{plan_id}/executions")
+            self.assertEqual(trail.status_code, 200, trail.text)
+            events = trail.json()["events"]
+            self.assertEqual([row["event"] for row in events], ["submitted", "filled"])
+            self.assertEqual(events[1]["paper_order_id"], step["paper_order_id"])
+            self.assertEqual(events[1]["filled_quantity"], 10)
+
+            # The fill CONSUMED the reservation (D-4), visible on the owner surface.
+            listed = await client.get(f"{BASE}/{sid}/reservations")
+            self.assertEqual(listed.json()["reservations"][0]["status"], "consumed")
+
+            # A plan executes once, ever.
+            again = await client.post(f"{BASE}/{sid}/plans/{plan_id}/execute")
+            self.assertEqual(again.status_code, 409, again.text)
+            self.assertEqual(
+                again.json()["detail"]["rejection_reason"], "PLAN_ALREADY_EXECUTED"
+            )
+        finally:
+            self._stop_patches()
+
+    async def test_execute_without_a_reservation_is_a_named_409(self):
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+        await self._bind_run(sid, run_id="run-bound")
+        repo, raw_token = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            submitted = await client.post(
+                PROPOSALS_BASE,
+                json=self._payload(strategy_id=sid),
+                headers={"Authorization": f"Bearer {raw_token}"},
+            )
+            self.assertEqual(submitted.status_code, 201, submitted.text)
+            plan_id = submitted.json()["plan"]["plan_id"]
+
+            refused = await client.post(f"{BASE}/{sid}/plans/{plan_id}/execute")
+            self.assertEqual(refused.status_code, 409, refused.text)
+            self.assertEqual(
+                refused.json()["detail"]["rejection_reason"], "RESERVATION_REQUIRED"
+            )
+            # The named refusal is itself an event in the trail.
+            trail = await client.get(f"{BASE}/{sid}/plans/{plan_id}/executions")
+            self.assertEqual(
+                [row["refusal_reason"] for row in trail.json()["events"]],
+                ["RESERVATION_REQUIRED"],
+            )
+        finally:
+            self._stop_patches()
+
+    async def test_execute_of_a_live_reservation_refuses_paper_only(self):
+        repo, sid, plan_id = await self._admitted_plan(environment="live")
+        client = self._proposal_client(repo=repo)
+        try:
+            refused = await client.post(f"{BASE}/{sid}/plans/{plan_id}/execute")
+            self.assertEqual(refused.status_code, 409, refused.text)
+            self.assertEqual(
+                refused.json()["detail"]["rejection_reason"], "PAPER_ONLY_EXECUTION"
+            )
+        finally:
+            self._stop_patches()
+
+    async def test_execute_and_trail_are_worker_proof_and_cross_owner_404(self):
+        repo, sid, plan_id = await self._admitted_plan(environment="paper")
+        _, raw_token = self._worker_repo()
+
+        client = self._proposal_client(repo=repo, username=None)
+        try:
+            for method, path in (
+                ("post", f"{BASE}/{sid}/plans/{plan_id}/execute"),
+                ("get", f"{BASE}/{sid}/plans/{plan_id}/executions"),
+            ):
+                response = await getattr(client, method)(
+                    path, headers={"Authorization": f"Bearer {raw_token}"}
+                )
+                self.assertEqual(response.status_code, 401, path)
+        finally:
+            self._stop_patches()
+
+        client = self._proposal_client(repo=repo, username="someone-else")
+        try:
+            foreign_execute = await client.post(f"{BASE}/{sid}/plans/{plan_id}/execute")
+            self.assertEqual(foreign_execute.status_code, 404)
+            foreign_trail = await client.get(f"{BASE}/{sid}/plans/{plan_id}/executions")
+            self.assertEqual(foreign_trail.status_code, 404)
+        finally:
+            self._stop_patches()
+
+    async def test_trail_for_an_unknown_plan_is_404(self):
+        repo, sid, plan_id = await self._admitted_plan(environment="paper")
+        client = self._proposal_client(repo=repo)
+        try:
+            response = await client.get(f"{BASE}/{sid}/plans/no-such-plan/executions")
+            self.assertEqual(response.status_code, 404)
+        finally:
+            self._stop_patches()
+
+    async def test_execute_enforces_same_origin(self):
+        repo, sid, plan_id = await self._admitted_plan(environment="paper")
+        client = self._proposal_client(repo=repo)
+        try:
+            response = await client.post(
+                f"{BASE}/{sid}/plans/{plan_id}/execute",
                 headers={"Origin": "http://evil.example"},
             )
             self.assertEqual(response.status_code, 403)

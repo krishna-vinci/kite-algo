@@ -133,6 +133,23 @@ class PaperPlanExecutor:
         plan_id = str(plan.get("plan_id") or "")
         plan_kind = str(plan.get("plan_kind") or "")
         reservation = self.ledger.for_plan(plan_id)
+
+        # A plan executes once, ever. A committed ``submitted`` event is the
+        # proof of a prior execution attempt; this guard raises WITHOUT
+        # appending a trail event (the trail already tells that story, and a
+        # refusal row here would muddy its derivation). Refusal-only trails do
+        # NOT block a corrected retry — a refusal is evidence, not execution.
+        # The concurrent double-execute case is decided per step inside the
+        # locked submission transaction below.
+        if self._has_submission(plan_id):
+            raise ExecutionRefusal(
+                "PLAN_ALREADY_EXECUTED",
+                {
+                    "plan_id": plan_id,
+                    "message": "This plan already has an execution submission; a plan executes once",
+                },
+            )
+
         steps_spec = None
         try:
             envelope = self._envelope(plan)
@@ -155,20 +172,6 @@ class PaperPlanExecutor:
                 detail=exc.detail,
             )
             raise
-
-        # A plan executes once, ever. This guard raises WITHOUT appending a
-        # trail event: the trail already tells the story of the execution, and
-        # a refusal row here would muddy its derivation. (The concurrent
-        # double-execute case is decided per step inside the locked submission
-        # transaction below.)
-        if self._trail_event_count(plan_id) > 0:
-            raise ExecutionRefusal(
-                "PLAN_ALREADY_EXECUTED",
-                {
-                    "plan_id": plan_id,
-                    "message": "This plan already has an execution trail; a plan executes once",
-                },
-            )
         base = self._clock()
 
         outcomes: List[Dict[str, Any]] = []
@@ -442,6 +445,9 @@ class PaperPlanExecutor:
         """
         plan_id = str(plan.get("plan_id") or "")
         ref = f"plan:{plan_id}:step:{step_no}"
+        # The outcome row must sort strictly after its own submission row:
+        # created_at is the trail's only ordering, so never reuse the stamp.
+        outcome_at = at + timedelta(microseconds=1)
         with self._plan_lock(plan_id):
             with self.session_factory() as session:
                 if session.bind.dialect.name == "postgresql":
@@ -534,7 +540,7 @@ class PaperPlanExecutor:
                 event="failed",
                 actor_id=actor,
                 detail={"error": str(exc), "ref": ref},
-                at=at,
+                at=outcome_at,
             )
             return {"outcome": outcome, "order_id": None}
 
@@ -563,7 +569,7 @@ class PaperPlanExecutor:
                     "fill_price": str(order.get("average_price") or ""),
                     "tradingsymbol": order.get("tradingsymbol"),
                 },
-                at=at,
+                at=outcome_at,
             )
         elif status == "rejected":
             reason = str(result.get("reason") or "rejected by the paper runtime")
@@ -583,7 +589,7 @@ class PaperPlanExecutor:
                 refusal_reason="PAPER_ORDER_REJECTED",
                 actor_id=actor,
                 detail={"reason": reason, "ref": ref},
-                at=at,
+                at=outcome_at,
             )
         else:
             # Accepted-but-unterminal (or anything unknown): execution state is
@@ -595,7 +601,7 @@ class PaperPlanExecutor:
                 paper_order_id=order_id,
                 actor_id=actor,
                 detail={"runtime_status": status or "unknown", "ref": ref},
-                at=at,
+                at=outcome_at,
             )
         return {"outcome": outcome, "order_id": order_id}
 
@@ -706,16 +712,17 @@ class PaperPlanExecutor:
 
     # ------------------------------------------------------------- locking
 
-    def _trail_event_count(self, plan_id: str) -> int:
+    def _has_submission(self, plan_id: str) -> bool:
+        """Whether the plan has a committed ``submitted`` event (a real attempt)."""
         with self.session_factory() as session:
             row = session.execute(
                 text(
                     "SELECT COUNT(*) FROM strategy_plan_execution_events "
-                    "WHERE plan_id = :plan_id"
+                    "WHERE plan_id = :plan_id AND event = 'submitted'"
                 ),
                 {"plan_id": plan_id},
             ).fetchone()
-        return int(row[0] or 0) if row is not None else 0
+        return row is not None and int(row[0] or 0) > 0
 
     def _plan_lock(self, plan_id: str):
         """The in-process serialization point (PostgreSQL adds the advisory lock)."""

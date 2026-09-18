@@ -96,3 +96,57 @@ class ProposalListResponse(BaseModel):
 
     proposals: List[ProposalRow] = Field(default_factory=list)
     journal: List[ProposalJournalRow] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Plan execution (Phase 6 / Project 6, D-7)
+# ---------------------------------------------------------------------------
+
+
+class ExecutionStepOut(BaseModel):
+    """One derived step outcome as the executor returned it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_no: int
+    event: str
+    paper_order_id: Optional[str] = None
+    filled_quantity: Optional[int] = None
+    refusal_reason: Optional[str] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExecutionResponse(BaseModel):
+    """The result of one owner-triggered paper execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str
+    status: str
+    steps: List[ExecutionStepOut] = Field(default_factory=list)
+    reservation_id: Optional[str] = None
+    paper_order_ids: List[str] = Field(default_factory=list)
+
+
+class ExecutionEventRow(BaseModel):
+    """One append-only trail row (D-3): a fact, never a state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    plan_id: str
+    step_no: int
+    event: str
+    paper_order_id: Optional[str] = None
+    filled_quantity: Optional[int] = None
+    refusal_reason: Optional[str] = None
+    actor_id: str
+    detail: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Any = None
+
+
+class ExecutionTrailResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str
+    events: List[ExecutionEventRow] = Field(default_factory=list)
