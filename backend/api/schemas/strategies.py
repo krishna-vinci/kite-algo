@@ -664,3 +664,27 @@ class SettlementAssessRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     environment: Optional[str] = None
+
+
+class SquareoffEvidenceRow(BaseModel):
+    """One square-off outcome. Append-only evidence, never edited."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    account_id: str
+    strategy_id: str
+    strategy_run_id: str
+    product: str
+    session_date: Optional[str] = None
+    exchange: str
+    scheduled_at: Optional[str] = None
+    exit_claim_id: Optional[str] = None
+    outcome: str
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SquareoffEvidenceListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    squareoffs: List[SquareoffEvidenceRow] = Field(default_factory=list)

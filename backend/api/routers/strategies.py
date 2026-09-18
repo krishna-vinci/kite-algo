@@ -52,6 +52,8 @@ from backend.api.schemas.strategies import (
     ApprovalResponse,
     ReservationListResponse,
     ReservationResponse,
+    SquareoffEvidenceListResponse,
+    SquareoffEvidenceRow,
     ExternalAdapterRequest,
     ExternalAdapterResponse,
     ExternalStrategyCreateRequest,
@@ -831,6 +833,48 @@ async def reserve_plan(
         )
     except ReservationError as exc:
         raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
+
+
+@router.get("/{strategy_id}/squareoffs", response_model=SquareoffEvidenceListResponse)
+async def list_squareoffs(
+    strategy_id: str,
+    request: Request,
+    environment: str = "all",
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """The square-off evidence for one strategy. Owner-only, read-only.
+
+    Evidence is an append-only ledger of what the platform did, so there is
+    nothing here to edit. ``environment`` is validated rather than ignored: an
+    unrecognised value is a mistake, not "all".
+    """
+    _ = request
+    scope = str(environment or "all").lower()
+    if scope not in ("all", "paper", "dry_run", "live"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "rejection_reason": "ENVIRONMENT_INVALID",
+                "environment": scope,
+                "allowed": ["all", "paper", "dry_run", "live"],
+            },
+        )
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    authorize_account_scope(str(canonical.account_scope))
+
+    from backend.strategies.mis_squareoff import MisSquareoffEvidenceStore
+
+    rows = MisSquareoffEvidenceStore(session_factory=session_factory).for_strategy(
+        strategy_id=strategy_id
+    )
+    return SquareoffEvidenceListResponse(
+        squareoffs=[SquareoffEvidenceRow(**row) for row in rows]
+    )
 
 
 @router.get("/{strategy_id}/reservations", response_model=ReservationListResponse)

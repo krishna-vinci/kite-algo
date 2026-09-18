@@ -1713,6 +1713,82 @@ class AdmissionOwnerApiTests(_ProposalApiHarness):
             self._stop_patches()
 
 
+class SquareoffReadApiTests(_ProposalApiHarness):
+    """D-6: the owner read is owner-scoped, worker-proof and validated."""
+
+    async def test_owner_reads_square_off_evidence(self):
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+
+        from datetime import date, datetime, timezone
+
+        from backend.strategies.mis_squareoff import (
+            MisSquareoffEvidenceStore,
+            SquareoffRecord,
+        )
+
+        MisSquareoffEvidenceStore(session_factory=self.factory).record(
+            SquareoffRecord(
+                account_id="kite:paper", strategy_id=sid, strategy_run_id="run-1",
+                product="MIS", session_date=date(2026, 10, 15), exchange="NSE",
+                scheduled_at=datetime(2026, 10, 15, 9, 50, tzinfo=timezone.utc),
+                outcome="squared_off", exit_claim_id="claim-1", detail={"quantity": -40},
+            )
+        )
+
+        repo, _ = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            listed = await client.get(f"{BASE}/{sid}/squareoffs")
+            self.assertEqual(listed.status_code, 200, listed.text)
+            rows = listed.json()["squareoffs"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["outcome"], "squared_off")
+            self.assertEqual(rows[0]["exit_claim_id"], "claim-1")
+            self.assertEqual(rows[0]["product"], "MIS")
+
+            # An unrecognised environment is a mistake, not "all".
+            bad = await client.get(f"{BASE}/{sid}/squareoffs?environment=nope")
+            self.assertEqual(bad.status_code, 422)
+            self.assertEqual(bad.json()["detail"]["rejection_reason"], "ENVIRONMENT_INVALID")
+
+            # extra="forbid" on the response model is the contract; the query
+            # parameter surface stays closed to unknown values by validation.
+            for scope in ("all", "paper", "dry_run", "live"):
+                ok = await client.get(f"{BASE}/{sid}/squareoffs?environment={scope}")
+                self.assertEqual(ok.status_code, 200, scope)
+        finally:
+            self._stop_patches()
+
+    async def test_workers_and_foreign_owners_cannot_read_square_offs(self):
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+        repo, raw_token = self._worker_repo()
+
+        client = self._proposal_client(repo=repo, username=None)
+        try:
+            response = await client.get(
+                f"{BASE}/{sid}/squareoffs",
+                headers={"Authorization": f"Bearer {raw_token}"},
+            )
+            self.assertEqual(response.status_code, 401)
+        finally:
+            self._stop_patches()
+
+        client = self._proposal_client(repo=repo, username="someone-else")
+        try:
+            response = await client.get(f"{BASE}/{sid}/squareoffs")
+            self.assertEqual(response.status_code, 404)
+        finally:
+            self._stop_patches()
+
+
 if __name__ == "__main__":
     unittest.main()
 
