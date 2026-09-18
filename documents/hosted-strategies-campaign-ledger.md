@@ -193,3 +193,16 @@ conversation.
 - **Test evidence:** 39+ new unit tests; 569+1 sweep; **13/13 PG** (walkthrough 2, square-off failure, overnight refusal, schedules+override, tick certification); API baseline unchanged; single head; clean.
 - **Limitations:** synthetic tick source in the certification test (stated); live MIS closed pending separate authorization; overnight MIS/SLB permanent non-goals.
 - **Next-phase input (Phase 9 = Project 9: futures compiler, contract/lot resolution, margin admission, full-fill-gated rolls):** next migration `20260917_000033`. Read roadmap Project 9 + R3 §13 (futures and roll flow — roll is a parent operation; full-required-fill gating; D-decisions on roll release) + §22. Rolls: full-required-fill invariant (NOT basket all_or_none), contract/lot resolution via pinned catalog, margin admission via Phase 4. Preserve worktree state as always.
+---
+
+## Phase 9 — Project 9: futures contracts, full-fill-gated rolls, margin precheck
+
+- **Status:** COMPLETE — gate PASSED (2026-09-17). Relay delegation.
+- **Plan:** `docs/superpowers/plans/2026-09-17-futures-rolls.md`
+- **Parity report:** `documents/hosted-strategies-project9-parity.md`
+- **Commits (unsigned):** `67f3a47` schema (+ migration 20260917_000033), `609e72b` target_futures compiler, `f0becc8` roll state machine, `ed24bbf` margin precheck + expiry escalation + owner surfaces, `c42a90b` PG integration (13 tests).
+- **Requirements closed:** the roll invariant verbatim (acquire → prove-filled → release-close; old attribution until flat; both identities; stalled ⇒ action_required, never auto-reverse; NOT the basket flag — negative test + AST audit); pinned-generation futures contract resolution with lot semantics; peak-margin admission precheck with evidence; expiry-cutoff escalation; owner roll reads.
+- **Test evidence:** 46+ new unit tests; 617+1 sweep; **13/13 PG**; API baseline unchanged; single head; clean.
+- **Deviation:** freeze-quantity metadata does not exist in the catalog schema — limit from declared intent with `freeze_source: unavailable` visibility (the one plan-vs-source contradiction; catalog work item for the future).
+- **Limitations:** paper-only; live margin quotes future wiring; proportional release deliberately absent.
+- **Next-phase input (Phase 10 = Project 10 / G8, FINAL PHASE: option structures compiled into the existing option-run engine):** next migration `20260917_000034`. Read roadmap Project 10 + R3 §14 (walkthroughs 4–6; Appendices A/B), R3 §16 (expiry policy: cash-settlement evidence, exit_before_cutoff, allow_physical_settlement, settled terminal state on the Phase 5 barrier). The existing options engine is the execution engine (backend/options/** — protection runtime, exit builder, strategy compiler, execution planner); structure-aware enforced exits, hedge fill gating, expiry policy, settled state. Certify paper before removing the hosted live-options block. Preserve worktree state as always.
