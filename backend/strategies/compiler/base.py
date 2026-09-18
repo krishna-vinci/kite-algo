@@ -36,6 +36,9 @@ REFUSAL_REASONS = (
     "PAYLOAD_INVALID",
     "LEG_KIND_UNSUPPORTED",
     "MIS_OVERNIGHT_REFUSED",
+    "CONTRACT_UNRESOLVED",
+    "EXPIRY_UNAVAILABLE",
+    "FREEZE_LIMIT_EXCEEDED",
 )
 
 
@@ -233,6 +236,13 @@ class PinnedCatalogRead:
             "broker_symbol": str(row["broker_symbol"] or ""),
             "broker_token": int(row["broker_token"]),
             "lifecycle_status": str(row["lifecycle_status"] or ""),
+            # Derivative metadata, carried for the futures compiler. Additive: the
+            # equity compilers simply never read these keys.
+            "instrument_type": str(row.get("instrument_type") or ""),
+            "expiry": row.get("expiry"),
+            "lot_size": row.get("lot_size"),
+            "tick_size": row.get("tick_size"),
+            "underlying": str(row.get("underlying") or ""),
             "catalog_generation": self.pin(),
         }
 

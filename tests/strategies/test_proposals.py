@@ -61,7 +61,9 @@ class ProposalTestCase(unittest.TestCase):
                 CREATE TABLE public.instrument_catalog_records (
                     instrument_id TEXT PRIMARY KEY, exchange TEXT, tradingsymbol TEXT,
                     lifecycle_status TEXT NOT NULL DEFAULT 'active',
-                    current_generation_id TEXT
+                    current_generation_id TEXT,
+                    instrument_type TEXT, expiry TEXT, lot_size INTEGER, tick_size REAL,
+                    underlying TEXT
                 )
                 """
             )

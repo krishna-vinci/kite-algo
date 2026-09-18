@@ -1076,7 +1076,12 @@ class PinnedInstrumentCatalog:
                    m.valid_to_generation,
                    r.exchange,
                    r.tradingsymbol,
-                   r.lifecycle_status
+                   r.lifecycle_status,
+                   r.instrument_type,
+                   r.expiry,
+                   r.lot_size,
+                   r.tick_size,
+                   r.underlying
             FROM public.instrument_broker_mappings m
             JOIN public.instrument_catalog_generations g_from
               ON g_from.id = m.valid_from_generation

@@ -43,10 +43,10 @@ __all__ = [
 def _registry() -> Dict[str, TargetCompiler]:
     """Every shipped compiler, keyed by target kind.
 
-    Extended by later phases (futures Project 9, option structures Project 10).
-    Keeping this a plain dict makes an unshipped kind a refusal rather than a
-    silently missing feature.
+    Extended by later phases (option structures Project 10). Keeping this a plain
+    dict makes an unshipped kind a refusal rather than a silently missing feature.
     """
+    from backend.strategies.compiler.futures import FuturesCompiler
     from backend.strategies.compiler.intent_bundle import IntentBundleCompiler
     from backend.strategies.compiler.target_weights import TargetWeightsCompiler
 
@@ -54,6 +54,7 @@ def _registry() -> Dict[str, TargetCompiler]:
         SingleInstrumentCompiler.target_kind: SingleInstrumentCompiler(),
         TargetWeightsCompiler.target_kind: TargetWeightsCompiler(),
         IntentBundleCompiler.target_kind: IntentBundleCompiler(),
+        FuturesCompiler.target_kind: FuturesCompiler(),
     }
 
 

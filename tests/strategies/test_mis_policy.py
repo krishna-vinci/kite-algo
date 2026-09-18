@@ -53,7 +53,8 @@ class MisTestCase(unittest.TestCase):
                 CREATE TABLE public.instrument_catalog_records (
                     instrument_id TEXT PRIMARY KEY, exchange TEXT, tradingsymbol TEXT,
                     lifecycle_status TEXT NOT NULL DEFAULT 'active', lot_size INTEGER,
-                    instrument_type TEXT, current_generation_id TEXT
+                    instrument_type TEXT, current_generation_id TEXT,
+                    expiry TEXT, tick_size REAL, underlying TEXT
                 )
                 """
             )

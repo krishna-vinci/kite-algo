@@ -91,7 +91,8 @@ class ExecutionTestCase(unittest.TestCase):
                     lifecycle_status TEXT NOT NULL DEFAULT 'active',
                     instrument_type TEXT,
                     lot_size INTEGER,
-                    current_generation_id TEXT
+                    current_generation_id TEXT,
+                    expiry TEXT, tick_size REAL, underlying TEXT
                 )
                 """
             )

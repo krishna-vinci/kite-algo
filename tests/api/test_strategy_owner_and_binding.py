@@ -586,7 +586,9 @@ class _ProposalApiHarness(_OwnerApiHarness):
                 text(
                     "CREATE TABLE IF NOT EXISTS public.instrument_catalog_records ("
                     " instrument_id TEXT PRIMARY KEY, exchange TEXT, tradingsymbol TEXT,"
-                    " lifecycle_status TEXT NOT NULL DEFAULT 'active', current_generation_id TEXT)"
+                    " lifecycle_status TEXT NOT NULL DEFAULT 'active', current_generation_id TEXT,"
+                    " instrument_type TEXT, expiry TEXT, lot_size INTEGER, tick_size REAL,"
+                    " underlying TEXT)"
                 )
             )
             session.execute(
