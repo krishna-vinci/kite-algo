@@ -132,6 +132,10 @@ class HostedStrategySchedule(Base):
     schedule_kind = Column(Text, nullable=False)
     at_time = Column(Text, nullable=False)
     weekday = Column(Integer, nullable=True)
+    #: Monthly kind: the day of month the occurrence falls on.
+    day_of_month = Column(Integer, nullable=True)
+    #: Calendar kind: the explicit dates, as ISO date strings.
+    calendar_dates = Column(JSON, nullable=True)
     timezone = Column(Text, nullable=False, default="Asia/Kolkata")
     window_end = Column(Text, nullable=True)
     squareoff_at = Column(Text, nullable=True)
@@ -163,8 +167,20 @@ class HostedStrategySchedule(Base):
             name="ck_hosted_strategy_schedules_job_kind",
         ),
         CheckConstraint(
-            "schedule_kind IN ('daily', 'weekly')",
+            "schedule_kind IN ('daily', 'weekly', 'monthly', 'calendar')",
             name="ck_hosted_strategy_schedules_kind",
+        ),
+        CheckConstraint(
+            "day_of_month IS NULL OR (day_of_month >= 1 AND day_of_month <= 31)",
+            name="ck_hosted_strategy_schedules_day_of_month",
+        ),
+        CheckConstraint(
+            "schedule_kind <> 'monthly' OR day_of_month IS NOT NULL",
+            name="ck_hosted_strategy_schedules_monthly_day",
+        ),
+        CheckConstraint(
+            "schedule_kind <> 'calendar' OR calendar_dates IS NOT NULL",
+            name="ck_hosted_strategy_schedules_calendar_dates",
         ),
         CheckConstraint(
             "weekday IS NULL OR (weekday >= 0 AND weekday <= 6)",

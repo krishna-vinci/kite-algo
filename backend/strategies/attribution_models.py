@@ -962,3 +962,139 @@ class StrategyPlanExecutionEvent(Base):
         ),
         Index("idx_plan_exec_events", "plan_id", "step_no", "created_at"),
     )
+
+
+class StrategyScheduleOccurrence(Base):
+    """One materialised occurrence of a schedule (G11).
+
+    The schedule itself is the pre-existing ``hosted_strategy_schedules`` row; this
+    table records *which* occurrences existed and what happened to each.
+    ``UNIQUE (schedule_id, occurrence_key)`` is the fencing contract: two
+    schedulers racing the same tick collide on the index instead of double-firing,
+    and a missed occurrence is a row that says ``skipped`` with its reason — never
+    a silent gap in the record.
+    """
+
+    __tablename__ = "strategy_schedule_occurrences"
+
+    id = Column(Text, primary_key=True)
+    schedule_id = Column(Text, nullable=False)
+    strategy_id = Column(Text, nullable=False)
+    occurrence_key = Column(Text, nullable=False)
+    due_at = Column(DateTime(timezone=True), nullable=False)
+    status = Column(Text, nullable=False, server_default="pending")
+    fired_at = Column(DateTime(timezone=True), nullable=True)
+    evaluation_id = Column(Text, nullable=True)
+    skip_reason = Column(Text, nullable=True)
+    detail = Column(JSON, nullable=False, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'fired', 'skipped', 'expired')",
+            name="ck_sched_occurrence_status",
+        ),
+        UniqueConstraint("schedule_id", "occurrence_key", name="uq_schedule_occurrences_key"),
+        ForeignKeyConstraint(
+            ["schedule_id"],
+            ["hosted_strategy_schedules.id"],
+            name="fk_occurrence_schedule",
+            ondelete="CASCADE",
+        ),
+        Index("idx_schedule_occurrences_status", "status", "due_at"),
+    )
+
+
+class PaperOrderFillProgress(Base):
+    """A paper order's fill state (G12).
+
+    Until this table existed every paper fill was instant and full. Keeping the
+    progress in a side table rather than altering ``paper_orders`` means the
+    existing runtime is untouched: an order with no progress row behaves exactly
+    as it did before, and a rollback that drops this table leaves instant-full
+    fills rather than a broken runtime.
+    """
+
+    __tablename__ = "paper_order_fill_progress"
+
+    account_scope = Column(Text, primary_key=True)
+    paper_order_id = Column(Text, primary_key=True)
+    filled_quantity = Column(Integer, nullable=False, server_default="0")
+    remaining_quantity = Column(Integer, nullable=False, server_default="0")
+    status = Column(Text, nullable=False, server_default="open")
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('open', 'partially_filled', 'filled', 'cancelled')",
+            name="ck_pofp_status",
+        ),
+        CheckConstraint("filled_quantity >= 0", name="ck_pofp_filled_non_negative"),
+        CheckConstraint("remaining_quantity >= 0", name="ck_pofp_remaining_non_negative"),
+    )
+
+
+class StrategyCorporateActionEvent(Base):
+    """A detected suspected corporate action (G13, first delivery).
+
+    The row is MUTABLE because a detection has a lifecycle (detected → escalated
+    → resolved); the append-only record is
+    :class:`StrategyCorporateActionEventLog`. This mirrors
+    ``strategy_reservations`` + ``strategy_reservation_events`` exactly — one
+    pattern, documented, not half of two.
+    """
+
+    __tablename__ = "strategy_corporate_action_events"
+
+    id = Column(Text, primary_key=True)
+    account_id = Column(Text, nullable=False)
+    instrument_token = Column(BigInteger, nullable=False)
+    exchange = Column(Text, nullable=False)
+    tradingsymbol = Column(Text, nullable=False)
+    product = Column(Text, nullable=False)
+    action_kind = Column(Text, nullable=False)
+    evidence = Column(JSON, nullable=False, server_default=text("'{}'"))
+    status = Column(Text, nullable=False, server_default="detected")
+    resolved_adjustment_id = Column(Text, nullable=True)
+    detected_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    escalated_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "action_kind IN ('suspected_split', 'suspected_bonus', 'suspected_merger', "
+            "'unclassified')",
+            name="ck_scae_action_kind",
+        ),
+        CheckConstraint(
+            "status IN ('detected', 'escalated', 'resolved')", name="ck_scae_status"
+        ),
+        Index("idx_corporate_action_account", "account_id", "detected_at"),
+    )
+
+
+class StrategyCorporateActionEventLog(Base):
+    """Append-only log of a corporate-action detection's transitions."""
+
+    __tablename__ = "strategy_corporate_action_event_log"
+
+    id = Column(Text, primary_key=True)
+    event_id = Column(Text, nullable=False)
+    event = Column(Text, nullable=False)
+    actor_id = Column(Text, nullable=True)
+    detail = Column(JSON, nullable=False, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "event IN ('detected', 'escalated', 'freeze_confirmed', 'resolved')",
+            name="ck_scael_event",
+        ),
+        ForeignKeyConstraint(
+            ["event_id"],
+            ["strategy_corporate_action_events.id"],
+            name="fk_corporate_action_log_event",
+            ondelete="RESTRICT",
+        ),
+        Index("idx_corporate_action_log_event", "event_id", "created_at"),
+    )

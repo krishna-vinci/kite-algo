@@ -3156,3 +3156,120 @@ DROP TRIGGER IF EXISTS trg_strategy_plan_execution_events_immutable
 CREATE TRIGGER trg_strategy_plan_execution_events_immutable
     BEFORE UPDATE OR DELETE ON public.strategy_plan_execution_events
     FOR EACH ROW EXECUTE FUNCTION forbid_strategy_plan_execution_event_mutation();
+
+-- ---------------------------------------------------------------------------
+-- CNC scheduling, paper partial fills, corporate-action detection
+-- (G11+G12+G13 / R3 §11, §18)
+-- ---------------------------------------------------------------------------
+
+-- The stored schedule table gains the scheduled-portfolio kinds and the two
+-- configuration columns they need. Replacing the CHECK is the only way to widen
+-- it (same repair precedent as universes_kind_check in 20260911_000016), and a
+-- superset constraint cannot invalidate an existing row.
+ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted_strategy_schedules_kind;
+ALTER TABLE public.hosted_strategy_schedules
+    ADD CONSTRAINT ck_hosted_strategy_schedules_kind
+    CHECK (schedule_kind IN ('daily', 'weekly', 'monthly', 'calendar'));
+ALTER TABLE public.hosted_strategy_schedules ADD COLUMN IF NOT EXISTS day_of_month INTEGER;
+ALTER TABLE public.hosted_strategy_schedules ADD COLUMN IF NOT EXISTS calendar_dates JSONB;
+ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted_strategy_schedules_day_of_month;
+ALTER TABLE public.hosted_strategy_schedules
+    ADD CONSTRAINT ck_hosted_strategy_schedules_day_of_month
+    CHECK (day_of_month IS NULL OR (day_of_month >= 1 AND day_of_month <= 31));
+ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted_strategy_schedules_monthly_day;
+ALTER TABLE public.hosted_strategy_schedules
+    ADD CONSTRAINT ck_hosted_strategy_schedules_monthly_day
+    CHECK (schedule_kind <> 'monthly' OR day_of_month IS NOT NULL);
+ALTER TABLE public.hosted_strategy_schedules DROP CONSTRAINT IF EXISTS ck_hosted_strategy_schedules_calendar_dates;
+ALTER TABLE public.hosted_strategy_schedules
+    ADD CONSTRAINT ck_hosted_strategy_schedules_calendar_dates
+    CHECK (schedule_kind <> 'calendar' OR calendar_dates IS NOT NULL);
+
+CREATE TABLE IF NOT EXISTS public.strategy_schedule_occurrences (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    schedule_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    occurrence_key TEXT NOT NULL,
+    due_at TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    fired_at TIMESTAMPTZ,
+    evaluation_id TEXT,
+    skip_reason TEXT,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- The fencing contract: two schedulers racing one tick collide here instead
+    -- of double-firing, and a missed occurrence is a row that says 'skipped'.
+    CONSTRAINT uq_schedule_occurrences_key UNIQUE (schedule_id, occurrence_key),
+    CONSTRAINT ck_sched_occurrence_status
+        CHECK (status IN ('pending', 'fired', 'skipped', 'expired')),
+    CONSTRAINT fk_occurrence_schedule FOREIGN KEY (schedule_id)
+        REFERENCES public.hosted_strategy_schedules (id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_occurrences_status
+    ON public.strategy_schedule_occurrences (status, due_at);
+
+-- Additive to the runtime: an order with no progress row behaves exactly as it
+-- did when every paper fill was instant and full.
+CREATE TABLE IF NOT EXISTS public.paper_order_fill_progress (
+    account_scope TEXT NOT NULL,
+    paper_order_id TEXT NOT NULL,
+    filled_quantity INTEGER NOT NULL DEFAULT 0,
+    remaining_quantity INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'open',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_scope, paper_order_id),
+    CONSTRAINT ck_pofp_status
+        CHECK (status IN ('open', 'partially_filled', 'filled', 'cancelled')),
+    CONSTRAINT ck_pofp_filled_non_negative CHECK (filled_quantity >= 0),
+    CONSTRAINT ck_pofp_remaining_non_negative CHECK (remaining_quantity >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS public.strategy_corporate_action_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id TEXT NOT NULL,
+    instrument_token BIGINT NOT NULL,
+    exchange TEXT NOT NULL,
+    tradingsymbol TEXT NOT NULL,
+    product TEXT NOT NULL,
+    action_kind TEXT NOT NULL,
+    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'detected',
+    resolved_adjustment_id UUID,
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    escalated_at TIMESTAMPTZ,
+    resolved_at TIMESTAMPTZ,
+    CONSTRAINT ck_scae_action_kind CHECK (action_kind IN (
+        'suspected_split', 'suspected_bonus', 'suspected_merger', 'unclassified'
+    )),
+    CONSTRAINT ck_scae_status CHECK (status IN ('detected', 'escalated', 'resolved'))
+);
+CREATE INDEX IF NOT EXISTS idx_corporate_action_account
+    ON public.strategy_corporate_action_events (account_id, detected_at);
+
+CREATE TABLE IF NOT EXISTS public.strategy_corporate_action_event_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id UUID NOT NULL,
+    event TEXT NOT NULL,
+    actor_id TEXT,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_scael_event
+        CHECK (event IN ('detected', 'escalated', 'freeze_confirmed', 'resolved')),
+    CONSTRAINT fk_corporate_action_log_event FOREIGN KEY (event_id)
+        REFERENCES public.strategy_corporate_action_events (id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_corporate_action_log_event
+    ON public.strategy_corporate_action_event_log (event_id, created_at);
+
+-- The parent row is mutable (a detection has a lifecycle); the log is not.
+CREATE OR REPLACE FUNCTION forbid_strategy_corporate_action_log_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_corporate_action_event_log is append-only (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_strategy_corporate_action_log_immutable
+    ON public.strategy_corporate_action_event_log;
+CREATE TRIGGER trg_strategy_corporate_action_log_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_corporate_action_event_log
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_corporate_action_log_mutation();
