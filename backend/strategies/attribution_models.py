@@ -39,6 +39,7 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -1105,4 +1106,38 @@ class StrategyCorporateActionEventLog(Base):
             ondelete="RESTRICT",
         ),
         Index("idx_corporate_action_log_event", "event_id", "created_at"),
+    )
+
+
+class StrategySquareoffEvidence(Base):
+    """Append-only record of a MIS square-off and what it did (Project 8).
+
+    A failed square-off is recorded ``action_required`` and keeps reconciling —
+    explicitly NOT settlement. A broker auto-square-off observed afterwards is
+    ``missed_by_broker``: a fallback that happened, never the control that
+    decided. Trigger-immutable.
+    """
+
+    __tablename__ = "strategy_squareoff_evidence"
+
+    id = Column(Text, primary_key=True)
+    account_id = Column(Text, nullable=False)
+    strategy_id = Column(Text, nullable=False)
+    strategy_run_id = Column(Text, nullable=False)
+    product = Column(Text, nullable=False)
+    session_date = Column(Date, nullable=False)
+    exchange = Column(Text, nullable=False)
+    scheduled_at = Column(DateTime(timezone=True), nullable=False)
+    exit_claim_id = Column(Text, nullable=True)
+    outcome = Column(Text, nullable=False)
+    detail = Column(JSON, nullable=False, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('squared_off', 'action_required', 'missed_by_broker', "
+            "'stale_worker_exit')",
+            name="ck_sse_outcome",
+        ),
+        Index("idx_sse_run", "strategy_run_id", "session_date"),
     )

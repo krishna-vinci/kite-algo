@@ -3280,3 +3280,43 @@ DROP TRIGGER IF EXISTS trg_strategy_corporate_action_log_immutable
 CREATE TRIGGER trg_strategy_corporate_action_log_immutable
     BEFORE UPDATE OR DELETE ON public.strategy_corporate_action_event_log
     FOR EACH ROW EXECUTE FUNCTION forbid_strategy_corporate_action_log_mutation();
+
+-- ---------------------------------------------------------------------------
+-- MIS square-off evidence (Project 8 / R3 §12, §16)
+-- ---------------------------------------------------------------------------
+
+-- The platform owns MIS square-off timing; what was missing is the record. When a
+-- square-off fired, what it sized the exit to, and what happened — without it,
+-- "the square-off ran" is an assertion rather than evidence.
+CREATE TABLE IF NOT EXISTS public.strategy_squareoff_evidence (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    strategy_run_id TEXT NOT NULL,
+    product TEXT NOT NULL,
+    session_date DATE NOT NULL,
+    exchange TEXT NOT NULL,
+    scheduled_at TIMESTAMPTZ NOT NULL,
+    exit_claim_id TEXT,
+    outcome TEXT NOT NULL,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_sse_outcome CHECK (outcome IN (
+        'squared_off', 'action_required', 'missed_by_broker', 'stale_worker_exit'
+    ))
+);
+CREATE INDEX IF NOT EXISTS idx_sse_run
+    ON public.strategy_squareoff_evidence (strategy_run_id, session_date);
+
+-- A ledger of what the platform did, not state that gets edited.
+CREATE OR REPLACE FUNCTION forbid_strategy_squareoff_evidence_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_squareoff_evidence is append-only (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_strategy_squareoff_evidence_immutable
+    ON public.strategy_squareoff_evidence;
+CREATE TRIGGER trg_strategy_squareoff_evidence_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_squareoff_evidence
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_squareoff_evidence_mutation();
