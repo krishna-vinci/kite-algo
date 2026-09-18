@@ -16,6 +16,7 @@ from backend.api.repositories.algo_worker_repo import (
 )
 from backend.app.background import (
     _account_ingest_loop,
+    _strategy_schedule_loop,
     _bracket_executor_loop,
     _worker_protection_loop,
     _worker_runtime_recovery_exit_loop,
@@ -67,6 +68,7 @@ async def combined_lifespan(app: FastAPI):
     daily_instruments_refresh_task = None
     index_refresh_task = None
     calendar_refresh_task = None
+    strategy_schedule_task = None
     fundamentals_sync_task = None
     daily_candle_finalization_task = None
     order_runtime_task = None
@@ -328,6 +330,7 @@ async def combined_lifespan(app: FastAPI):
         daily_instruments_refresh_task = asyncio.create_task(schedule_daily_instruments_update())
         index_refresh_task = asyncio.create_task(_schedule_monthly_index_refresh())
         calendar_refresh_task = asyncio.create_task(_schedule_exchange_calendar_refresh())
+        strategy_schedule_task = asyncio.create_task(_strategy_schedule_loop(app))
         fundamentals_sync_task = asyncio.create_task(_schedule_fundamentals_nightly_refresh())
         daily_candle_finalization_task = asyncio.create_task(schedule_daily_candle_finalization())
         try:
@@ -563,6 +566,12 @@ async def combined_lifespan(app: FastAPI):
         pass
     # Cancel daily exchange calendar refresh scheduler
     try:
+        if 'strategy_schedule_task' in locals() and strategy_schedule_task:
+            strategy_schedule_task.cancel()
+            try:
+                await strategy_schedule_task
+            except asyncio.CancelledError:
+                pass
         if 'calendar_refresh_task' in locals() and calendar_refresh_task:
             calendar_refresh_task.cancel()
             try:

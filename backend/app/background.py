@@ -282,3 +282,47 @@ async def _bracket_executor_loop(app: FastAPI):
             wake_event.clear()
         except asyncio.TimeoutError:
             pass
+
+
+async def _strategy_schedule_loop(app: FastAPI):
+    """Materialise and fire scheduled portfolio occurrences (G11).
+
+    The loop is deliberately thin: :class:`ScheduleScheduler` owns the policy
+    (fencing, misfire grace, overlap) and this only drives it on an interval and
+    reports health. One schedule's failure is isolated inside the tick, so a bad
+    schedule cannot stall the others, and the loop never raises out of its
+    iteration — a scheduler that dies is worse than one that reports degraded.
+    """
+    from backend.strategies.scheduling import ScheduleScheduler
+
+    interval = max(5.0, float(os.getenv("STRATEGY_SCHEDULE_INTERVAL_SECONDS", "60")))
+
+    scheduler = getattr(app.state, "strategy_scheduler", None)
+    if scheduler is None:
+        scheduler = ScheduleScheduler()
+        app.state.strategy_scheduler = scheduler
+
+    set_component_status("strategy_scheduler", "healthy", detail="Strategy scheduler started")
+    while True:
+        try:
+            result = await asyncio.to_thread(scheduler.tick)
+            heartbeat(
+                "strategy_scheduler",
+                detail="Evaluated scheduled portfolio occurrences",
+                meta={
+                    "fired": len(result.get("fired") or []),
+                    "skipped": len(result.get("skipped") or []),
+                    "deferred": len(result.get("deferred") or []),
+                    "errors": len(result.get("errors") or []),
+                    "interval_seconds": interval,
+                },
+            )
+        except asyncio.CancelledError:
+            set_component_status(
+                "strategy_scheduler", "stopped", detail="Strategy scheduler cancelled"
+            )
+            break
+        except Exception as exc:
+            logging.warning("Strategy scheduler loop failed: %s", exc, exc_info=True)
+            set_component_status("strategy_scheduler", "degraded", detail=str(exc))
+        await asyncio.sleep(interval)
