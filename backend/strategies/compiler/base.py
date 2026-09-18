@@ -24,7 +24,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol
 
 from backend.broker_api.instruments.catalog import PinnedInstrumentCatalog
 
-#: Refusal vocabulary raised by validation and compilation.
+#: Refusal vocabulary raised by validation and compilation. ``LEG_KIND_UNSUPPORTED``
+#: arrived with the ``intent_bundle`` compiler (D-6): futures/option legs are
+#: Projects 9/10 and refuse at validation, never at execution time.
 REFUSAL_REASONS = (
     "CATALOG_GENERATION_NOT_PUBLISHED",
     "INSTRUMENT_UNRESOLVED",
@@ -32,6 +34,7 @@ REFUSAL_REASONS = (
     "UNIVERSE_REVISION_UNKNOWN",
     "TARGET_KIND_UNKNOWN",
     "PAYLOAD_INVALID",
+    "LEG_KIND_UNSUPPORTED",
 )
 
 

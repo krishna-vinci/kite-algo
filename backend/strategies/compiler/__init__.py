@@ -47,11 +47,13 @@ def _registry() -> Dict[str, TargetCompiler]:
     Keeping this a plain dict makes an unshipped kind a refusal rather than a
     silently missing feature.
     """
+    from backend.strategies.compiler.intent_bundle import IntentBundleCompiler
     from backend.strategies.compiler.target_weights import TargetWeightsCompiler
 
     return {
         SingleInstrumentCompiler.target_kind: SingleInstrumentCompiler(),
         TargetWeightsCompiler.target_kind: TargetWeightsCompiler(),
+        IntentBundleCompiler.target_kind: IntentBundleCompiler(),
     }
 
 

@@ -89,6 +89,7 @@ class ExecutionTestCase(unittest.TestCase):
                 CREATE TABLE public.instrument_catalog_records (
                     instrument_id TEXT PRIMARY KEY, exchange TEXT, tradingsymbol TEXT,
                     lifecycle_status TEXT NOT NULL DEFAULT 'active',
+                    instrument_type TEXT,
                     lot_size INTEGER,
                     current_generation_id TEXT
                 )
@@ -217,7 +218,17 @@ class ExecutionTestCase(unittest.TestCase):
             binding_source="hosted_job",
         )
 
-    def seed_book(self, *, token=738561, product="CNC", qty=0, sid=STRATEGY, account=ACCOUNT):
+    def seed_book(
+        self,
+        *,
+        token=738561,
+        product="CNC",
+        qty=0,
+        sid=STRATEGY,
+        account=ACCOUNT,
+        instrument_id=INST_ID,
+        symbol="RELIANCE",
+    ):
         with self.factory() as session:
             session.execute(
                 text(
@@ -226,15 +237,16 @@ class ExecutionTestCase(unittest.TestCase):
                     " product, canonical_instrument_id, instrument_token, exchange, tradingsymbol, "
                     " net_quantity, projection_version) "
                     "VALUES (:account, :sid, 'paper', 'canonical', :inst, :product, :inst, "
-                    " :token, 'NSE', 'RELIANCE', :qty, 1)"
+                    " :token, 'NSE', :symbol, :qty, 1)"
                 ),
                 {
                     "account": account,
                     "sid": sid,
-                    "inst": INST_ID,
+                    "inst": instrument_id,
                     "product": product,
                     "token": token,
                     "qty": qty,
+                    "symbol": symbol,
                 },
             )
             session.commit()
@@ -249,6 +261,49 @@ class ExecutionTestCase(unittest.TestCase):
                     "VALUES (:iid, 'NSE', 'RELIANCE', 'active', :lot, :gen)"
                 ),
                 {"iid": instrument_id, "lot": lot_size, "gen": G1},
+            )
+            session.commit()
+
+    def seed_catalog(
+        self,
+        *,
+        instrument_type="EQ",
+        symbol="RELIANCE",
+        token=738561,
+        instrument_id=INST_ID,
+    ):
+        """One published generation with one mapped record (compiler tests)."""
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT OR IGNORE INTO public.instrument_catalog_generations "
+                    "(id, status, published_at) VALUES (:gen, 'published', :at)"
+                ),
+                {"gen": G1, "at": "2026-09-01T00:00:00+00:00"},
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.instrument_catalog_records "
+                    "(instrument_id, exchange, tradingsymbol, lifecycle_status, instrument_type, "
+                    " current_generation_id) "
+                    "VALUES (:iid, 'NSE', :symbol, 'active', :kind, :gen)"
+                ),
+                {"iid": instrument_id, "symbol": symbol, "kind": instrument_type, "gen": G1},
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.instrument_broker_mappings "
+                    "(mapping_id, instrument_id, broker, broker_exchange, broker_symbol, broker_token, "
+                    " valid_from_generation, is_current) "
+                    "VALUES (:mid, :iid, 'kite', 'NSE', :symbol, :token, :gen, 1)"
+                ),
+                {
+                    "mid": f"map-{instrument_id}",
+                    "iid": instrument_id,
+                    "symbol": symbol,
+                    "token": token,
+                    "gen": G1,
+                },
             )
             session.commit()
 
@@ -916,6 +971,261 @@ class _FakePaperRepository:
         self.trades = {key: value for key, value in self.trades.items() if key[0] != account_scope}
         self.positions = {key: value for key, value in self.positions.items() if key[0] != account_scope}
         self.fund_ledger = [entry for entry in self.fund_ledger if entry.account_scope != account_scope]
+
+
+# ---------------------------------------------------------------------------
+# Task 3: the intent_bundle compiler and per-leg execution (D-6)
+# ---------------------------------------------------------------------------
+
+INST_B = "bbbbbbbb-0000-0000-0000-000000000002"
+TOKEN_B = 738562
+
+BUNDLE_LEGS = [
+    # Exposure-increasing leg (target +10, current 0).
+    dict(SINGLE_LEGS[0]),
+    # Risk-reducing leg on a second instrument.
+    {
+        "instrument_id": INST_B,
+        "exchange": "NSE",
+        "tradingsymbol": "TCS",
+        "broker_exchange": "NSE",
+        "broker_symbol": "TCS",
+        "broker_token": TOKEN_B,
+        "product": "CNC",
+        "signed_quantity": -10,
+        "reference_price": 1000.0,
+    },
+]
+
+
+def _bundle_payload(legs):
+    return {
+        "legs": [
+            {
+                "instrument_token": leg["broker_token"],
+                "exchange": leg["exchange"],
+                "tradingsymbol": leg["tradingsymbol"],
+                "product": leg["product"],
+                "target_quantity": leg["signed_quantity"],
+                "reference_price": leg["reference_price"],
+            }
+            for leg in legs
+        ]
+    }
+
+
+class IntentBundleCompilerTests(ExecutionTestCase):
+    """A bundle resolves to explicit per-leg single-instrument actions (D-6).
+
+    Compilation is the fail-closed gate for leg kinds: futures and option
+    structures are Projects 9/10, so a bundle leg whose catalog record is not a
+    cash-equity instrument refuses ``LEG_KIND_UNSUPPORTED`` — a refusal is
+    terminal at validation, and no plan that the executor could misread ever
+    freezes.
+    """
+
+    def _compile(self, legs, *, types=None):
+        from backend.strategies.compiler import compile_plan
+        from backend.strategies.compiler.base import PinnedCatalogRead
+
+        self.seed_catalog(instrument_id=INST_ID, symbol="RELIANCE", token=738561)
+        self.seed_catalog(
+            instrument_id=INST_B, symbol="TCS", token=TOKEN_B,
+            instrument_type=(types or {}).get(INST_B, "EQ"),
+        )
+        pinned = PinnedCatalogRead(session_factory=self.factory, generation=G1)
+        return compile_plan("intent_bundle", _bundle_payload(legs), pinned)
+
+    def test_a_bundle_resolves_to_per_leg_single_instrument_actions(self):
+        resolved = self._compile(BUNDLE_LEGS)
+        self.assertEqual(resolved["target_kind"], "intent_bundle")
+        self.assertEqual(resolved["catalog_generation"], G1)
+        self.assertEqual([leg["instrument_id"] for leg in resolved["legs"]], [INST_ID, INST_B])
+        self.assertEqual(
+            [leg["signed_quantity"] for leg in resolved["legs"]], [10, -10],
+        )
+        # Each leg is a complete single-instrument action: the executor consumes
+        # them exactly like standalone single_instrument legs.
+        for leg in resolved["legs"]:
+            for key in ("broker_exchange", "broker_symbol", "broker_token", "product", "reference_price"):
+                self.assertIn(key, leg)
+
+    def test_a_bundle_without_legs_is_invalid(self):
+        from backend.strategies.compiler.base import PinnedCatalogRead, ValidationRefusal
+
+        self.seed_catalog(instrument_id=INST_ID, symbol="RELIANCE", token=738561)
+        pinned = PinnedCatalogRead(session_factory=self.factory, generation=G1)
+        for payload in ({}, {"legs": []}):
+            with self.assertRaises(ValidationRefusal) as ctx:
+                from backend.strategies.compiler import compile_plan
+
+                compile_plan("intent_bundle", payload, pinned)
+            self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+
+    def test_an_unresolvable_leg_refuses_the_whole_bundle(self):
+        from backend.strategies.compiler.base import PinnedCatalogRead, ValidationRefusal
+
+        self.seed_catalog(instrument_id=INST_ID, symbol="RELIANCE", token=738561)
+        pinned = PinnedCatalogRead(session_factory=self.factory, generation=G1)
+        legs = [dict(BUNDLE_LEGS[0]), dict(BUNDLE_LEGS[1])]
+        legs[1]["broker_token"] = 999999  # no mapping for this token
+        with self.assertRaises(ValidationRefusal) as ctx:
+            from backend.strategies.compiler import compile_plan
+
+            compile_plan("intent_bundle", _bundle_payload(legs), pinned)
+        self.assertEqual(ctx.exception.reason_code, "INSTRUMENT_UNRESOLVED")
+
+    def test_a_futures_leg_refuses_by_name(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self._compile(BUNDLE_LEGS, types={INST_B: "FUT"})
+        self.assertEqual(ctx.exception.reason_code, "LEG_KIND_UNSUPPORTED")
+
+    def test_an_unknown_instrument_kind_fails_closed(self):
+        """Unknown evidence is not cash equity: refuse, never guess."""
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self._compile(BUNDLE_LEGS, types={INST_B: None})
+        self.assertEqual(ctx.exception.reason_code, "LEG_KIND_UNSUPPORTED")
+
+    def test_the_registry_admits_intent_bundle(self):
+        from backend.strategies.compiler import compiler_for
+        from backend.strategies.compiler.intent_bundle import IntentBundleCompiler
+
+        self.assertIsInstance(compiler_for("intent_bundle"), IntentBundleCompiler)
+
+
+class ExecutorBundleTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
+    """Per-leg outcomes are events; approval/reservation treat legs by risk (D-6)."""
+
+    def seed_bundle_plan(self, plan_id="plan-bundle", legs=None, *, sid=STRATEGY, account=ACCOUNT):
+        return self.seed_validated_plan(
+            plan_id, plan_kind="intent_bundle", legs=list(BUNDLE_LEGS if legs is None else legs),
+            sid=sid, account=account,
+        )
+
+    async def test_a_bundle_executes_per_leg_without_all_or_nothing(self):
+        self.seed_strategy()
+        self.seed_bundle_plan()
+        self.seed_binding()
+        self.claim_reservation(plan_id="plan-bundle", requirement=27000.0)  # 10x1500 + 10x1000 + headroom
+        self.seed_lot_size(1)
+        # Leg 2's coordinate is unmapped at the runtime: only THAT leg rejects.
+        self.seed_bundle_plan  # documented no-op to keep the seed block readable
+
+        class _MissingSecond(FakeInstrumentsRepository):
+            def get_instrument_by_exchange_symbol(self, exchange, tradingsymbol):
+                if tradingsymbol == "TCS":
+                    return None
+                return super().get_instrument_by_exchange_symbol(exchange, tradingsymbol)
+
+        paper = self.build_paper_service()
+        paper.instruments_repository = _MissingSecond()
+        executor = self.build_executor(paper_service=paper)
+        plan = _plan_view_for(self.factory, "plan-bundle")
+
+        result = await executor.execute(plan, actor=OWNER)
+
+        # Per-leg outcomes, NOT all-or-nothing: leg 1 filled while leg 2 rejected.
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual([step["event"] for step in result["steps"]], ["filled", "rejected"])
+        trail = self.events("plan-bundle")
+        self.assertEqual(
+            [(row["step_no"], row["event"]) for row in trail],
+            [(1, "submitted"), (1, "filled"), (2, "submitted"), (2, "rejected")],
+        )
+        self.assertEqual(trail[3]["refusal_reason"], "PAPER_ORDER_REJECTED")
+        # The fill consumed the reservation once, naming the filled order.
+        reservation = self.ledger.for_plan("plan-bundle")
+        self.assertEqual(reservation["status"], "consumed")
+        detail = self.ledger.events(reservation["reservation_id"])[-1]["detail"]
+        self.assertEqual(len(detail.get("paper_order_ids") or []), 1)
+
+    async def test_a_risk_reducing_bundle_needs_no_reservation(self):
+        """Capacity is reserved only when exposure increases (D-6); sells are exempt."""
+        self.seed_strategy()
+        self.seed_bundle_plan(legs=[dict(BUNDLE_LEGS[1])])  # a single SELL leg
+        self.seed_binding()
+        self.seed_lot_size(1)
+        from backend.strategies.reservations import ReservationLedger
+
+        self.assertIsNone(
+            ReservationLedger(session_factory=self.factory).for_plan("plan-bundle")
+        )
+
+        executor = self.build_executor()
+        plan = _plan_view_for(self.factory, "plan-bundle")
+
+        result = await executor.execute(plan, actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        (step,) = result["steps"]
+        self.assertEqual(step["event"], "filled")
+        self.assertEqual(step["filled_quantity"], 10)
+        # No reservation existed and none was created; the SELL side is honest.
+        self.assertIsNone(
+            ReservationLedger(session_factory=self.factory).for_plan("plan-bundle")
+        )
+        paper_order = list(executor._paper_service.repository.orders.values())[0]
+        self.assertEqual(paper_order.transaction_type, "sell")
+
+    async def test_a_bundle_with_an_increasing_leg_still_requires_a_reservation(self):
+        self.seed_strategy()
+        self.seed_bundle_plan()
+        self.seed_binding()
+        self.seed_lot_size(1)
+        # No reservation claimed at all.
+        from backend.strategies.execution import ExecutionRefusal
+
+        executor = self.build_executor()
+        plan = _plan_view_for(self.factory, "plan-bundle")
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(plan, actor=OWNER)
+        self.assertEqual(ctx.exception.reason_code, "RESERVATION_REQUIRED")
+        self.assertEqual(
+            [row["refusal_reason"] for row in self.events("plan-bundle")],
+            ["RESERVATION_REQUIRED"],
+        )
+
+    async def test_increasing_legs_share_one_reservation_and_the_fill_names_both(self):
+        self.seed_strategy()
+        legs = [
+            dict(BUNDLE_LEGS[0]),  # +10 RELIANCE
+            {
+                **BUNDLE_LEGS[1],
+                "signed_quantity": 10,  # +10 TCS: increasing too
+            },
+        ]
+        self.seed_bundle_plan(legs=legs)
+        self.seed_binding()
+        self.claim_reservation(plan_id="plan-bundle", requirement=27000.0)
+        self.seed_lot_size(1)
+
+        executor = self.build_executor()
+        plan = _plan_view_for(self.factory, "plan-bundle")
+
+        result = await executor.execute(plan, actor=OWNER)
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual([step["event"] for step in result["steps"]], ["filled", "filled"])
+
+        orders = list(executor._paper_service.repository.orders.values())
+        self.assertEqual(len(orders), 2)
+        reservation_id = self.ledger.for_plan("plan-bundle")["reservation_id"]
+        for order in orders:
+            self.assertEqual(order.metadata["reservation_id"], reservation_id)
+            self.assertEqual(order.metadata["plan_id"], "plan-bundle")
+        self.assertEqual(
+            sorted(order.metadata["step_no"] for order in orders), [1, 2]
+        )
+        # One reservation consumed once, naming BOTH filled orders (no double-spend).
+        self.assertEqual(self.ledger.for_plan("plan-bundle")["status"], "consumed")
+        detail = self.ledger.events(reservation_id)[-1]["detail"]
+        self.assertEqual(len(detail.get("paper_order_ids") or []), 2)
+        self.assertEqual(
+            self.reservation_events(reservation_id), ["created", "consumed"]
+        )
 
 
 def _plan_view_for(factory, plan_id):

@@ -133,10 +133,18 @@ class PaperPlanExecutor:
         plan_id = str(plan.get("plan_id") or "")
         plan_kind = str(plan.get("plan_kind") or "")
         reservation = self.ledger.for_plan(plan_id)
+        steps_spec = None
         try:
             envelope = self._envelope(plan)
-            self._preconditions(plan, envelope, reservation)
+            self._plan_preconditions(plan, envelope)
             binding = self._binding(envelope, plan)
+            steps_spec = self._plan_steps(plan, binding)
+            # Capacity is reserved only when exposure increases (D-6): a bundle
+            # whose every leg reduces risk needs no reservation, while any
+            # increasing leg demands the full active+paper+valid chain.
+            increasing = any(quantity > 0 for _, _, quantity, _ in steps_spec)
+            if increasing or reservation is not None:
+                self._reservation_preconditions(reservation)
         except ExecutionRefusal as exc:
             self._record_event(
                 plan_id,
@@ -148,7 +156,19 @@ class PaperPlanExecutor:
             )
             raise
 
-        steps_spec = self._plan_steps(plan, binding)
+        # A plan executes once, ever. This guard raises WITHOUT appending a
+        # trail event: the trail already tells the story of the execution, and
+        # a refusal row here would muddy its derivation. (The concurrent
+        # double-execute case is decided per step inside the locked submission
+        # transaction below.)
+        if self._trail_event_count(plan_id) > 0:
+            raise ExecutionRefusal(
+                "PLAN_ALREADY_EXECUTED",
+                {
+                    "plan_id": plan_id,
+                    "message": "This plan already has an execution trail; a plan executes once",
+                },
+            )
         base = self._clock()
 
         outcomes: List[Dict[str, Any]] = []
@@ -233,10 +253,8 @@ class PaperPlanExecutor:
             )
         return envelope
 
-    def _preconditions(
-        self, plan: Mapping[str, Any], envelope: Mapping[str, Any], reservation: Optional[Dict[str, Any]]
-    ) -> None:
-        """The fail-closed chain, in order. Every exit is named (D-2)."""
+    def _plan_preconditions(self, plan: Mapping[str, Any], envelope: Mapping[str, Any]) -> None:
+        """Plan-identity preconditions. Every exit is named (D-2)."""
         plan_id = str(plan.get("plan_id") or "")
 
         # 1. Only plan kinds the executor can act on. ``target_weights`` stays a
@@ -252,6 +270,10 @@ class PaperPlanExecutor:
                 "PLAN_NOT_VALIDATED",
                 {"plan_id": plan_id, "proposal_status": str(envelope.get("status") or "")},
             )
+
+    def _reservation_preconditions(self, reservation: Optional[Dict[str, Any]]) -> None:
+        """Reservation preconditions: admission consumed, paper, within validity."""
+        plan_id = str(reservation.get("plan_id") or "") if reservation else ""
         # 3. An active reservation must exist: execution CONSUMES admission (D-1).
         if reservation is None or str(reservation.get("status")) not in EXECUTABLE_RESERVATION_STATUSES:
             raise ExecutionRefusal(
@@ -430,16 +452,19 @@ class PaperPlanExecutor:
                 prior = session.execute(
                     text(
                         "SELECT COUNT(*) FROM strategy_plan_execution_events "
-                        "WHERE plan_id = :plan_id"
+                        "WHERE plan_id = :plan_id AND step_no = :step_no"
                     ),
-                    {"plan_id": plan_id},
+                    {"plan_id": plan_id, "step_no": int(step_no)},
                 ).scalar()
                 if int(prior or 0) > 0:
                     raise ExecutionRefusal(
                         "PLAN_ALREADY_EXECUTED",
                         {
                             "plan_id": plan_id,
-                            "message": "This plan already has an execution trail; a plan executes once",
+                            "step_no": int(step_no),
+                            "message": (
+                                "This step already has an execution trail; a plan executes once"
+                            ),
                         },
                     )
                 self._write_event(
@@ -453,7 +478,7 @@ class PaperPlanExecutor:
                         "tradingsymbol": leg.get("tradingsymbol"),
                         "side": side,
                         "quantity": quantity,
-                        "reservation_id": reservation["reservation_id"],
+                        "reservation_id": (reservation or {}).get("reservation_id"),
                         "strategy_run_id": binding["strategy_run_id"],
                     },
                     at=at,
@@ -474,7 +499,7 @@ class PaperPlanExecutor:
             "strategy_run_id": binding["strategy_run_id"],
             "strategy_id": str(plan.get("strategy_id") or ""),
             "plan_id": plan_id,
-            "reservation_id": reservation["reservation_id"],
+            "reservation_id": (reservation or {}).get("reservation_id"),
             "step_no": step_no,
             "execution_mode": PAPER_ENVIRONMENT,
             "source": "hosted_plan_execution",
@@ -485,7 +510,8 @@ class PaperPlanExecutor:
             "transaction_type": side,
             "product": str(leg.get("product") or ""),
             "order_type": "MARKET",
-            "quantity": int(quantity),
+            # The runtime's quantity is unsigned: the sign travels as the side.
+            "quantity": abs(int(quantity)),
         }
 
         outcome: Dict[str, Any]
@@ -497,7 +523,7 @@ class PaperPlanExecutor:
             if service is None:
                 raise RuntimeError("no paper runtime is wired into this executor")
             result = await service.place_order(
-                account_scope=str(reservation.get("account_id")),
+                account_scope=str(plan.get("account_id") or ""),
                 order_payload=order_payload,
                 attribution=attribution,
             )
@@ -589,6 +615,8 @@ class PaperPlanExecutor:
         A plan whose every step was ``no_op`` committed no capital, so its
         reservation stays exactly as admission left it — nothing happened.
         """
+        if reservation is None:
+            return  # a risk-reducing-only bundle never held capacity
         reservation_id = str(reservation.get("reservation_id") or "")
         if not reservation_id:
             return
@@ -677,6 +705,17 @@ class PaperPlanExecutor:
         return row
 
     # ------------------------------------------------------------- locking
+
+    def _trail_event_count(self, plan_id: str) -> int:
+        with self.session_factory() as session:
+            row = session.execute(
+                text(
+                    "SELECT COUNT(*) FROM strategy_plan_execution_events "
+                    "WHERE plan_id = :plan_id"
+                ),
+                {"plan_id": plan_id},
+            ).fetchone()
+        return int(row[0] or 0) if row is not None else 0
 
     def _plan_lock(self, plan_id: str):
         """The in-process serialization point (PostgreSQL adds the advisory lock)."""
