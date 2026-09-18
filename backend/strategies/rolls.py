@@ -28,7 +28,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from backend.strategies.attribution_models import (
@@ -225,6 +225,29 @@ class RollStateMachine:
         roll_id = str(uuid.uuid4())
         session = self.session_factory()
         try:
+            # Serialize opens for this strategy: the duplicate check is a
+            # read-then-write, and without the lock two concurrent evaluations could
+            # both pass it and open rolls that then fight over one transition.
+            if session.bind.dialect.name == "postgresql":
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                    {"key": f"roll-open:{strategy_id}:{old_instrument_id}"},
+                )
+                # Re-checked UNDER the lock, which is what makes the guard real.
+                racing = self.open_for(
+                    strategy_id=str(strategy_id), old_instrument_id=str(old_instrument_id)
+                )
+                if racing is not None:
+                    session.rollback()
+                    session.close()
+                    raise RollDuplicate(
+                        {
+                            "strategy_id": str(strategy_id),
+                            "old_instrument_id": str(old_instrument_id),
+                            "roll_id": racing["roll_id"],
+                            "message": "Another roll won the race for this contract",
+                        }
+                    )
             session.add(
                 StrategyRoll(
                     roll_id=roll_id,
