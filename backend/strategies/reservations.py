@@ -316,12 +316,19 @@ class ReservationLedger:
         return self.get(reservation_id)
 
     def consume(
-        self, reservation_id: str, *, actor_id: Optional[str] = None, now: Optional[datetime] = None
+        self,
+        reservation_id: str,
+        *,
+        actor_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+        detail: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Filled exposure stops being a reservation and becomes attributed exposure.
 
         ``consumed`` is terminal: no expiry, release or owner action may take the
-        capacity back, because it now backs a real position.
+        capacity back, because it now backs a real position. The executor (G10's
+        consumer) supplies the evidence — the plan and the paper order ids the
+        fill facts live behind — so the trail names what consumed the capacity.
         """
         moment = now or _utcnow()
         with self._transition(
@@ -330,6 +337,7 @@ class ReservationLedger:
             event="consumed",
             now=moment,
             actor_id=actor_id,
+            detail=detail,
         ) as row:
             row.status = "consumed"
         return self.get(reservation_id)

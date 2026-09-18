@@ -45,7 +45,7 @@ SINGLE_LEGS = [
         "broker_symbol": "RELIANCE",
         "broker_token": 738561,
         "product": "CNC",
-        "signed_quantity": 100,
+        "signed_quantity": 10,
         "reference_price": 1500.0,
     }
 ]
@@ -107,10 +107,14 @@ class ExecutionTestCase(unittest.TestCase):
 
         from backend.strategies.attribution_models import (
             Strategy,
+            StrategyExecutionBarrier,
+            StrategyExecutionBarrierEvent,
             StrategyPlan,
             StrategyPlanExecutionEvent,
             StrategyPositionProjection,
             StrategyProposal,
+            StrategyReservation,
+            StrategyReservationEvent,
             StrategyRunBinding,
         )
 
@@ -123,6 +127,10 @@ class ExecutionTestCase(unittest.TestCase):
                 StrategyPlan.__table__,
                 StrategyPlanExecutionEvent.__table__,
                 StrategyPositionProjection.__table__,
+                StrategyReservation.__table__,
+                StrategyReservationEvent.__table__,
+                StrategyExecutionBarrier.__table__,
+                StrategyExecutionBarrierEvent.__table__,
             ],
         )
         self.factory = sessionmaker(bind=self.engine, expire_on_commit=False)
@@ -178,8 +186,10 @@ class ExecutionTestCase(unittest.TestCase):
                 text(
                     "INSERT INTO strategy_plans "
                     "(plan_id, proposal_id, strategy_id, account_id, plan_kind, plan_hash, "
-                    " logical_plan, resolved_plan, pinned_catalog_generation) "
-                    "VALUES (:pid, :prop, :sid, :account, :kind, 'h', '{}', :resolved, :gen)"
+                    " logical_plan, resolved_plan, pinned_catalog_generation, "
+                    " pinned_universe_revision_id, pinned_member_hash) "
+                    "VALUES (:pid, :prop, :sid, :account, :kind, 'h', '{}', :resolved, :gen, "
+                    + ("'univ-1', 'm-hash-1')" if plan_kind == "target_weights" else "NULL, NULL)")
                 ),
                 {
                     "pid": plan_id,
@@ -360,6 +370,558 @@ class ExecutionEventSchemaTests(ExecutionTestCase):
             ).scalar()
         self.assertEqual(target_kind, "intent_bundle")
         self.assertEqual(plan_kind, "intent_bundle")
+
+
+# ---------------------------------------------------------------------------
+# Task 2: the paper executor (D-2, D-4, D-5)
+# ---------------------------------------------------------------------------
+
+
+class FakeInstrumentsRepository:
+    """Enough catalog truth for the paper runtime to price the pinned leg."""
+
+    def get_instrument_by_exchange_symbol(self, exchange, tradingsymbol):
+        if tradingsymbol == "MISSING":
+            return None
+        return {
+            "instrument_token": 738561,
+            "exchange": exchange,
+            "tradingsymbol": tradingsymbol,
+            "lot_size": 1,
+            "instrument_type": "EQ",
+            "last_price": 1500.0,
+        }
+
+
+class FakeMarketRuntime:
+    def __init__(self, last_price=1500.0):
+        self.last_price = last_price
+
+    async def get_tick(self, token):
+        return {"instrument_token": token, "last_price": self.last_price}
+
+    async def get_last_price(self, token):
+        return self.last_price
+
+
+class ExecutorTestCase(ExecutionTestCase):
+    """Adds the paper runtime fakes and the seeded execution context."""
+
+    def setUp(self):
+        from unittest.mock import patch
+
+        async def _inline_to_thread(func, /, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        # The paper runtime must not spawn threads or reach Redis in unit tests.
+        for patcher in (
+            patch("backend.paper_runtime.service.asyncio.to_thread", new=_inline_to_thread),
+            patch("backend.paper_runtime.service.publish_event", autospec=True),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        super().setUp()
+        self.runtime_calls = []
+
+    def build_paper_service(self, *, starting_balance="100000"):
+        from decimal import Decimal
+
+        from backend.paper_runtime.service import PaperTradingService
+
+        return PaperTradingService(
+            repository=_FakePaperRepository(),
+            instruments_repository=FakeInstrumentsRepository(),
+            market_data_runtime=FakeMarketRuntime(),
+            default_starting_balance=Decimal(starting_balance),
+        )
+
+    def build_executor(self, *, paper_service=None, now=NOW):
+        from backend.strategies.execution import PaperPlanExecutor
+
+        return PaperPlanExecutor(
+            session_factory=self.factory,
+            paper_service=paper_service or self.build_paper_service(),
+            # A fixed clock: validity is decided against the fixture's `now`,
+            # never the wall clock, so the suite stays deterministic.
+            clock=lambda: now,
+        )
+
+    def claim_reservation(
+        self,
+        plan_id="plan-1",
+        *,
+        environment="paper",
+        requirement=15000.0,
+        valid_for=3600,
+        now=NOW,
+        account=ACCOUNT,
+    ):
+        from backend.strategies.reservations import ClaimRequest, ReservationLedger
+
+        self.ledger = ReservationLedger(session_factory=self.factory)
+        return self.ledger.claim(
+            ClaimRequest(
+                plan_id=plan_id,
+                strategy_id=STRATEGY,
+                account_id=account,
+                evaluation_id=f"eval-{plan_id}",
+                execution_environment=environment,
+                requirement_inr=requirement,
+                valid_until=now + timedelta(seconds=valid_for),
+                allocation_inr=100000.0,
+                actor_id=OWNER,
+            ),
+            now=now,
+        )
+
+    def reservation_events(self, reservation_id):
+        return [row["event"] for row in self.ledger.events(reservation_id)]
+
+    def barrier_events(self, *, sid=STRATEGY, account=ACCOUNT, env="paper"):
+        from backend.strategies.attribution_models import StrategyExecutionBarrierEvent
+
+        with self.factory() as session:
+            rows = (
+                session.query(StrategyExecutionBarrierEvent)
+                .filter(
+                    StrategyExecutionBarrierEvent.account_id == account,
+                    StrategyExecutionBarrierEvent.strategy_id == sid,
+                    StrategyExecutionBarrierEvent.execution_environment == env,
+                )
+                .order_by(StrategyExecutionBarrierEvent.version)
+                .all()
+            )
+            return [(row.event, row.ref) for row in rows]
+
+    def book_net(self, *, token=738561, product="CNC", sid=STRATEGY, account=ACCOUNT):
+        from backend.strategies.attribution_models import StrategyPositionProjection
+
+        with self.factory() as session:
+            row = (
+                session.query(StrategyPositionProjection)
+                .filter(
+                    StrategyPositionProjection.account_id == account,
+                    StrategyPositionProjection.strategy_id == sid,
+                    StrategyPositionProjection.execution_environment == "paper",
+                    StrategyPositionProjection.instrument_token == token,
+                    StrategyPositionProjection.product == product,
+                )
+                .one_or_none()
+            )
+            return int(row.net_quantity) if row is not None else None
+
+
+class ExecutorPreconditionTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
+    """The precondition chain fails closed, in order, with named refusals (D-2)."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed_strategy()
+        self.seed_validated_plan()
+        self.seed_binding()
+        self.claim_reservation()
+
+    async def _refused(self, executor=None, plan_id="plan-1", **seed_overrides):
+        from backend.strategies.execution import ExecutionRefusal
+
+        executor = executor or self.build_executor()
+        plan = self._plan_view(plan_id)
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(plan, actor=OWNER)
+        return ctx.exception
+
+    def _plan_view(self, plan_id="plan-1"):
+        from backend.strategies.proposals import ProposalStore
+
+        return ProposalStore(session_factory=self.factory).get_plan(plan_id)
+
+    async def test_a_target_weights_plan_is_refused_by_name(self):
+        """No target_weights execution in this phase: the kind itself refuses."""
+        self.seed_validated_plan("plan-tw", plan_kind="target_weights", legs=[])
+        self.seed_binding(run_id="run-tw")
+        exc = await self._refused(plan_id="plan-tw")
+        self.assertEqual(exc.reason_code, "PLAN_KIND_UNSUPPORTED")
+        self.assertEqual(
+            [row["refusal_reason"] for row in self.events("plan-tw")],
+            ["PLAN_KIND_UNSUPPORTED"],
+        )
+
+    async def test_a_plan_whose_envelope_is_not_validated_is_refused(self):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE strategy_proposals SET status = 'refused' "
+                    "WHERE proposal_id = 'prop-plan-1'"
+                )
+            )
+            session.commit()
+        exc = await self._refused()
+        self.assertEqual(exc.reason_code, "PLAN_NOT_VALIDATED")
+
+    async def test_execution_without_a_reservation_is_refused(self):
+        self.ledger.release(
+            self.ledger.for_plan("plan-1")["reservation_id"], actor_id=OWNER
+        )
+        exc = await self._refused()
+        self.assertEqual(exc.reason_code, "RESERVATION_REQUIRED")
+
+    async def test_a_consumed_reservation_is_not_re_executable(self):
+        self.ledger.consume(self.ledger.for_plan("plan-1")["reservation_id"], actor_id=OWNER)
+        exc = await self._refused()
+        self.assertEqual(exc.reason_code, "RESERVATION_REQUIRED")
+
+    async def test_a_live_target_is_refused_paper_only(self):
+        """The executor refuses live by name — paper accounts only, ever."""
+        reservation = self.ledger.for_plan("plan-1")
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE strategy_reservations SET execution_environment = 'live' "
+                    "WHERE reservation_id = :rid"
+                ),
+                {"rid": reservation["reservation_id"]},
+            )
+            session.commit()
+        exc = await self._refused()
+        self.assertEqual(exc.reason_code, "PAPER_ONLY_EXECUTION")
+
+    async def test_an_expired_reservation_is_refused(self):
+        reservation = self.ledger.for_plan("plan-1")
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE strategy_reservations SET valid_until = :past "
+                    "WHERE reservation_id = :rid"
+                ),
+                {"rid": reservation["reservation_id"], "past": NOW - timedelta(hours=1)},
+            )
+            session.commit()
+        exc = await self._refused()
+        self.assertEqual(exc.reason_code, "RESERVATION_EXPIRED")
+
+    async def test_a_missing_run_binding_fails_closed(self):
+        with self.factory() as session:
+            session.execute(
+                text("DELETE FROM strategy_run_bindings WHERE strategy_run_id = :run"),
+                {"run": RUN_ID},
+            )
+            session.commit()
+        exc = await self._refused()
+        self.assertEqual(exc.reason_code, "STRATEGY_RUN_BINDING_MISSING")
+
+    async def test_a_binding_for_another_account_is_impossible_by_schema(self):
+        """Owner/account drift on the binding is refused by the composite FK.
+
+        The executor's ``ACCOUNT_SCOPE_MISMATCH`` guard stays as fail-closed
+        defense for integrity-violating stores; the database makes the state
+        unreachable where integrity holds (the live-binding test below drives
+        the same refusal branch through the reachable dimension).
+        """
+        with self.factory() as session:
+            with self.assertRaises(Exception):
+                session.execute(
+                    text(
+                        "UPDATE strategy_run_bindings SET account_id = 'kite:other' "
+                        "WHERE strategy_run_id = :run"
+                    ),
+                    {"run": RUN_ID},
+                )
+                session.rollback()
+
+    async def test_a_live_binding_is_a_paper_scope_mismatch(self):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE strategy_run_bindings SET execution_environment = 'live' "
+                    "WHERE strategy_run_id = :run"
+                ),
+                {"run": RUN_ID},
+            )
+            session.commit()
+        exc = await self._refused()
+        self.assertEqual(exc.reason_code, "ACCOUNT_SCOPE_MISMATCH")
+
+    async def test_every_precondition_refusal_is_an_event_with_its_name(self):
+        self.ledger.release(
+            self.ledger.for_plan("plan-1")["reservation_id"], actor_id=OWNER
+        )
+        await self._refused()
+        trail = self.events("plan-1")
+        self.assertEqual(len(trail), 1)
+        self.assertEqual(trail[0]["event"], "rejected")
+        self.assertEqual(trail[0]["refusal_reason"], "RESERVATION_REQUIRED")
+        self.assertEqual(trail[0]["actor_id"], OWNER)
+
+
+class ExecutorZeroDeltaTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
+    async def test_a_zero_delta_step_records_no_op_without_touching_the_runtime(self):
+        self.seed_strategy()
+        self.seed_validated_plan()
+        self.seed_binding()
+        self.claim_reservation()
+        self.seed_book(qty=10)  # already at target
+        self.seed_lot_size(1)
+
+        executed = []
+        paper = self.build_paper_service()
+        original = paper.place_order
+
+        async def _spy(**kwargs):
+            executed.append(kwargs)
+            return await original(**kwargs)
+
+        paper.place_order = _spy
+        executor = self.build_executor(paper_service=paper)
+        plan = _plan_view_for(self.factory, "plan-1")
+
+        result = await executor.execute(plan, actor=OWNER)
+
+        self.assertEqual(executed, [])  # the paper runtime was never touched
+        self.assertEqual(result["status"], "no_op")
+        trail = self.events("plan-1")
+        self.assertEqual([row["event"] for row in trail], ["no_op"])
+        self.assertEqual([row["step_no"] for row in trail], [1])
+        # Nothing happened, so the reservation is untouched and no work exists.
+        self.assertEqual(self.reservation_events(self.ledger.for_plan("plan-1")["reservation_id"]), ["created"])
+        self.assertEqual(self.barrier_events(), [])
+
+
+class ExecutorSubmissionTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
+    async def test_fill_submits_through_the_paper_runtime_and_consumes_the_reservation(self):
+        self.seed_strategy()
+        self.seed_validated_plan()  # target +10 @ 1500
+        self.seed_binding()
+        self.claim_reservation(requirement=15000.0)
+        self.seed_lot_size(1)
+        executor = self.build_executor()
+        plan = _plan_view_for(self.factory, "plan-1")
+
+        result = await executor.execute(plan, actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        (step,) = result["steps"]
+        self.assertEqual(step["event"], "filled")
+        self.assertEqual(step["filled_quantity"], 10)
+        self.assertTrue(step["paper_order_id"].startswith("PAPER-"))
+
+        # The paper runtime produced a real paper order carrying the BOUND run's
+        # attribution plus the plan/reservation/step refs.
+        from backend.paper_runtime.models import PaperOrderStatus
+
+        paper = executor._paper_service
+        (order,) = paper.repository.orders.values()
+        self.assertEqual(order.status, PaperOrderStatus.FILLED)
+        self.assertEqual(order.metadata["strategy_run_id"], RUN_ID)
+        self.assertEqual(order.metadata["plan_id"], "plan-1")
+        self.assertEqual(order.metadata["reservation_id"], self.ledger.for_plan("plan-1")["reservation_id"])
+        self.assertEqual(order.metadata["step_no"], 1)
+        self.assertEqual(order.quantity, 10)
+        self.assertEqual(order.transaction_type, "buy")
+
+        # The trail: submitted -> filled (derived state, append-only rows).
+        trail = self.events("plan-1")
+        self.assertEqual([row["event"] for row in trail], ["submitted", "filled"])
+        self.assertEqual(trail[1]["paper_order_id"], order.order_id)
+
+        # The fill CONSUMED the reservation (D-4) with the plan/order refs.
+        reservation = self.ledger.for_plan("plan-1")
+        self.assertEqual(reservation["status"], "consumed")
+        detail = self.ledger.events(reservation["reservation_id"])[-1]["detail"]
+        self.assertEqual(detail.get("plan_id"), "plan-1")
+        self.assertEqual(detail.get("paper_order_ids"), [order.order_id])
+
+        # The barrier recorded the work transitions (created on submission,
+        # resolved on fill) — observers, not a new settlement semantics (D-5).
+        self.assertEqual(
+            [event for event, _ in self.barrier_events()],
+            ["work_created", "work_resolved"],
+        )
+        self.assertEqual(self.barrier_events()[0][1], "plan:plan-1:step:1")
+
+    async def test_a_runtime_rejection_releases_the_reservation_terminal_unfilled(self):
+        self.seed_strategy()
+        self.seed_validated_plan()
+        self.seed_binding()
+        self.claim_reservation(requirement=15000.0)
+        self.seed_lot_size(1)
+        # A paper account that cannot fund the step: the runtime's own
+        # funds/margin admission is the paper admission for the leg.
+        executor = self.build_executor(paper_service=self.build_paper_service(starting_balance="100"))
+        plan = _plan_view_for(self.factory, "plan-1")
+
+        result = await executor.execute(plan, actor=OWNER)
+
+        self.assertEqual(result["status"], "rejected")
+        (step,) = result["steps"]
+        self.assertEqual(step["event"], "rejected")
+        self.assertEqual(step["refusal_reason"], "PAPER_ORDER_REJECTED")
+        self.assertTrue(step["detail"]["reason"])
+
+        trail = self.events("plan-1")
+        self.assertEqual([row["event"] for row in trail], ["submitted", "rejected"])
+        # The rejection RELEASED the unused capacity (D-4).
+        reservation = self.ledger.for_plan("plan-1")
+        self.assertEqual(reservation["status"], "released")
+        self.assertEqual(reservation["release_reason"], "terminal_unfilled")
+        self.assertEqual(
+            self.reservation_events(reservation["reservation_id"]), ["created", "released"]
+        )
+        # And the barrier work was resolved, not left dangling.
+        self.assertEqual(
+            [event for event, _ in self.barrier_events()],
+            ["work_created", "work_resolved"],
+        )
+
+    async def test_lot_size_floors_the_step_to_the_pinned_catalog_lot(self):
+        self.seed_strategy()
+        self.seed_validated_plan()  # target +10
+        self.seed_binding()
+        self.claim_reservation(requirement=15000.0)
+        self.seed_lot_size(4)  # pinned catalog says lots of 4: 10 -> 8
+        executor = self.build_executor()
+        plan = _plan_view_for(self.factory, "plan-1")
+
+        result = await executor.execute(plan, actor=OWNER)
+        self.assertEqual(result["status"], "filled")
+        (step,) = result["steps"]
+        self.assertEqual(step["filled_quantity"], 8)
+        paper = executor._paper_service
+        (order,) = paper.repository.orders.values()
+        self.assertEqual(order.quantity, 8)
+
+    async def test_a_broken_runtime_records_failed_and_holds_the_reservation(self):
+        """Unknown execution state holds capacity — it never releases on a guess."""
+        self.seed_strategy()
+        self.seed_validated_plan()
+        self.seed_binding()
+        self.claim_reservation(requirement=15000.0)
+        self.seed_lot_size(1)
+
+        class _ExplodingService:
+            async def place_order(self, **kwargs):
+                raise RuntimeError("runtime unavailable")
+
+        executor = self.build_executor(paper_service=_ExplodingService())
+        plan = _plan_view_for(self.factory, "plan-1")
+
+        result = await executor.execute(plan, actor=OWNER)
+        self.assertEqual(result["status"], "failed")
+        trail = self.events("plan-1")
+        self.assertEqual([row["event"] for row in trail], ["submitted", "failed"])
+        reservation = self.ledger.for_plan("plan-1")
+        self.assertEqual(reservation["status"], "active")  # held, not released
+        # The barrier keeps the work in flight honestly.
+        self.assertEqual([event for event, _ in self.barrier_events()], ["work_created"])
+
+
+class _FakePaperRepository:
+    """In-memory paper repository (the established fake from the runtime tests)."""
+
+    def __init__(self):
+        from decimal import Decimal
+
+        from backend.paper_runtime.models import PaperAccount
+
+        self.accounts = {}
+        self.orders = {}
+        self.trades = {}
+        self.positions = {}
+        self.position_lots = {}
+        self.fund_ledger = []
+        self._Decimal = Decimal
+        self._PaperAccount = PaperAccount
+
+    def get_account(self, account_scope):
+        return self.accounts.get(account_scope)
+
+    def upsert_account(self, account):
+        self.accounts[account.account_scope] = account
+        return account
+
+    def insert_order(self, order):
+        self.orders[(order.account_scope, order.order_id)] = order
+        return order
+
+    def update_order(self, order):
+        self.orders[(order.account_scope, order.order_id)] = order
+        return order
+
+    def get_position(self, account_scope, instrument_token, product):
+        return self.positions.get((account_scope, instrument_token, product))
+
+    def upsert_position(self, position):
+        self.positions[(position.account_scope, position.instrument_token, position.product)] = position
+        return position
+
+    def insert_trade(self, trade):
+        self.trades[(trade.account_scope, trade.trade_id)] = trade
+        return trade
+
+    def upsert_position_lot(self, lot):
+        self.position_lots[(lot.account_scope, lot.lot_id)] = lot
+        return lot
+
+    def list_open_position_lots(self, account_scope, instrument_token=None, product=None):
+        lots = [
+            lot
+            for lot in self.position_lots.values()
+            if lot.account_scope == account_scope and lot.remaining_quantity > 0
+        ]
+        if instrument_token is not None:
+            lots = [lot for lot in lots if lot.instrument_token == instrument_token]
+        if product is not None:
+            lots = [lot for lot in lots if lot.product == product]
+        return sorted(lots, key=lambda lot: lot.opened_at)
+
+    def list_pending_orders_for_instrument(self, instrument_token):
+        from backend.paper_runtime.models import PaperOrderStatus
+
+        return [
+            order
+            for order in self.orders.values()
+            if order.instrument_token == instrument_token
+            and order.status
+            in {PaperOrderStatus.PENDING, PaperOrderStatus.OPEN, PaperOrderStatus.PARTIALLY_FILLED}
+        ]
+
+    def list_open_positions_for_instrument(self, instrument_token):
+        return [
+            position
+            for position in self.positions.values()
+            if position.instrument_token == instrument_token and position.net_quantity != 0
+        ]
+
+    def list_orders(self, account_scope, limit=200, **kwargs):
+        return [order for order in self.orders.values() if order.account_scope == account_scope][:limit]
+
+    def list_trades(self, account_scope, limit=500, **kwargs):
+        return [trade for trade in self.trades.values() if trade.account_scope == account_scope][:limit]
+
+    def list_positions(self, account_scope, only_open=False, **kwargs):
+        items = [position for position in self.positions.values() if position.account_scope == account_scope]
+        if only_open:
+            items = [position for position in items if position.net_quantity != 0]
+        return items
+
+    def list_active_market_tokens(self):
+        return sorted({order.instrument_token for order in self.orders.values()})
+
+    def append_fund_ledger_entry(self, entry):
+        self.fund_ledger.append(entry)
+        return entry
+
+    def clear_account_scope(self, account_scope):
+        self.orders = {key: value for key, value in self.orders.items() if key[0] != account_scope}
+        self.trades = {key: value for key, value in self.trades.items() if key[0] != account_scope}
+        self.positions = {key: value for key, value in self.positions.items() if key[0] != account_scope}
+        self.fund_ledger = [entry for entry in self.fund_ledger if entry.account_scope != account_scope]
+
+
+def _plan_view_for(factory, plan_id):
+    from backend.strategies.proposals import ProposalStore
+
+    return ProposalStore(session_factory=factory).get_plan(plan_id)
 
 
 if __name__ == "__main__":
