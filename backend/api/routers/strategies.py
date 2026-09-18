@@ -52,6 +52,9 @@ from backend.api.schemas.strategies import (
     ApprovalResponse,
     ReservationListResponse,
     ReservationResponse,
+    RollEventRow,
+    RollListResponse,
+    RollResponse,
     SquareoffEvidenceListResponse,
     SquareoffEvidenceRow,
     ExternalAdapterRequest,
@@ -833,6 +836,76 @@ async def reserve_plan(
         )
     except ReservationError as exc:
         raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
+
+
+def _roll_view(machine: Any, roll: Dict[str, Any], *, with_events: bool = False) -> RollResponse:
+    """One roll. ``close_release_permitted`` is DERIVED from the state, never stored.
+
+    Exposing it means an operator can see the invariant holding rather than having
+    to infer it from a state name.
+    """
+    return RollResponse(
+        **roll,
+        events=[RollEventRow(**row) for row in machine.events(roll["roll_id"])]
+        if with_events
+        else [],
+        close_release_permitted=str(roll["state"]) == "releasing_old",
+    )
+
+
+@router.get("/{strategy_id}/rolls", response_model=RollListResponse)
+async def list_rolls(
+    strategy_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Every roll for one strategy, newest first. Owner-only, read-only."""
+    _ = request
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    authorize_account_scope(str(canonical.account_scope))
+
+    from backend.strategies.rolls import RollStateMachine
+
+    machine = RollStateMachine(session_factory=session_factory)
+    return RollListResponse(
+        rolls=[
+            _roll_view(machine, roll)
+            for roll in machine.list_for_strategy(strategy_id=strategy_id)
+        ]
+    )
+
+
+@router.get("/{strategy_id}/rolls/{roll_id}", response_model=RollResponse)
+async def get_roll(
+    strategy_id: str,
+    roll_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """One roll with its append-only trail. Owner-only, read-only."""
+    _ = request
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    authorize_account_scope(str(canonical.account_scope))
+
+    from backend.strategies.rolls import RollStateMachine
+
+    machine = RollStateMachine(session_factory=session_factory)
+    roll = machine.get(roll_id)
+    # Cross-strategy reads are non-disclosing: the roll exists, but not for this
+    # strategy, and the owner asked about this strategy.
+    if roll is None or str(roll["strategy_id"]) != str(strategy_id):
+        raise HTTPException(status_code=404, detail="Roll not found")
+    return _roll_view(machine, roll, with_events=True)
 
 
 @router.get("/{strategy_id}/squareoffs", response_model=SquareoffEvidenceListResponse)

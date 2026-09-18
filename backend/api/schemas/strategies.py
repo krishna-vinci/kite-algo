@@ -688,3 +688,40 @@ class SquareoffEvidenceListResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     squareoffs: List[SquareoffEvidenceRow] = Field(default_factory=list)
+
+
+class RollEventRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event: str
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RollResponse(BaseModel):
+    """A roll carries BOTH instrument identities through the whole transition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    roll_id: str
+    strategy_id: str
+    account_id: str
+    old_instrument_id: str
+    new_instrument_id: str
+    old_coordinate: Dict[str, Any] = Field(default_factory=dict)
+    new_coordinate: Dict[str, Any] = Field(default_factory=dict)
+    required_replacement_quantity: int
+    proven_filled_quantity: int
+    state: str
+    action_reason: Optional[str] = None
+    peak_margin_evidence: Dict[str, Any] = Field(default_factory=dict)
+    plan_id: Optional[str] = None
+    #: The append-only trail, ordered. Populated on the single-roll read.
+    events: List[RollEventRow] = Field(default_factory=list)
+    #: Derived at read time: whether the close step is reachable yet.
+    close_release_permitted: bool = False
+
+
+class RollListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rolls: List[RollResponse] = Field(default_factory=list)

@@ -1791,6 +1791,81 @@ class SquareoffReadApiTests(_ProposalApiHarness):
             self._stop_patches()
 
 
+class RollReadApiTests(_ProposalApiHarness):
+    """D-6: both identities, the lifecycle, and the trail — owner-only."""
+
+    async def test_owner_reads_rolls_and_their_trail(self):
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+
+        from backend.strategies.rolls import RollStateMachine
+
+        machine = RollStateMachine(session_factory=self.factory)
+        roll = machine.create(
+            strategy_id=sid, account_id="kite:paper",
+            old_instrument_id="old-contract", new_instrument_id="new-contract",
+            required_replacement_quantity=75,
+            old_coordinate={"product": "NRML"}, new_coordinate={"product": "NRML"},
+        )
+        machine.acquire(roll["roll_id"])
+        machine.prove_filled(roll["roll_id"], proven_quantity=30)
+
+        repo, raw_token = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            listed = await client.get(f"{BASE}/{sid}/rolls")
+            self.assertEqual(listed.status_code, 200, listed.text)
+            rows = listed.json()["rolls"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["old_instrument_id"], "old-contract")
+            self.assertEqual(rows[0]["new_instrument_id"], "new-contract")
+            self.assertEqual(rows[0]["state"], "action_required")
+            # The invariant is visible rather than inferred from a state name.
+            self.assertFalse(rows[0]["close_release_permitted"])
+
+            detail = await client.get(f"{BASE}/{sid}/rolls/{roll['roll_id']}")
+            self.assertEqual(detail.status_code, 200, detail.text)
+            body = detail.json()
+            self.assertEqual(
+                [row["event"] for row in body["events"]],
+                ["created", "acquired", "stalled"],
+            )
+            self.assertEqual(body["required_replacement_quantity"], 75)
+            self.assertEqual(body["proven_filled_quantity"], 30)
+
+            missing = await client.get(f"{BASE}/{sid}/rolls/no-such-roll")
+            self.assertEqual(missing.status_code, 404)
+        finally:
+            self._stop_patches()
+
+    async def test_workers_and_foreign_owners_cannot_read_rolls(self):
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+        repo, raw_token = self._worker_repo()
+
+        client = self._proposal_client(repo=repo, username=None)
+        try:
+            response = await client.get(
+                f"{BASE}/{sid}/rolls", headers={"Authorization": f"Bearer {raw_token}"}
+            )
+            self.assertEqual(response.status_code, 401)
+        finally:
+            self._stop_patches()
+
+        client = self._proposal_client(repo=repo, username="someone-else")
+        try:
+            response = await client.get(f"{BASE}/{sid}/rolls")
+            self.assertEqual(response.status_code, 404)
+        finally:
+            self._stop_patches()
+
+
 if __name__ == "__main__":
     unittest.main()
 

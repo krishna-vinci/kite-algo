@@ -52,6 +52,7 @@ ADMISSION_REFUSALS = (
     "SESSION_PRODUCT_INVALID",
     "MARGIN_UNAVAILABLE",
     "MARGIN_QUOTE_STALE",
+    "MARGIN_INSUFFICIENT",
 )
 
 #: Statuses that hold capacity. ``consumed`` is included deliberately: capital
@@ -106,12 +107,18 @@ def margin_max_age_seconds() -> float:
 class AdmissionService:
     """Reads policies and evidence; produces verdicts. Writes only policies."""
 
-    def __init__(self, session_factory: Optional[Callable[[], Any]] = None) -> None:
+    def __init__(
+        self,
+        session_factory: Optional[Callable[[], Any]] = None,
+        *,
+        margin_engine: Any = None,
+    ) -> None:
         if session_factory is None:
             from backend.workflows.repository import SessionLocal
 
             session_factory = SessionLocal
         self.session_factory = session_factory
+        self._margin_engine = margin_engine
 
     # -- policy -------------------------------------------------------------
 
@@ -292,6 +299,7 @@ class AdmissionService:
         now: Optional[datetime] = None,
         margin_evidence: Optional[Mapping[str, Any]] = None,
         paper_funds: Optional[Mapping[str, Any]] = None,
+        peak_capacity_inr: Optional[float] = None,
         realized_loss_inr: Optional[float] = None,
         catalog_state: Optional[Mapping[str, Any]] = None,
     ) -> AdmissionVerdict:
@@ -459,6 +467,32 @@ class AdmissionService:
         product_refusal = self._product_refusal(plan, environment=environment)
         if product_refusal is not None:
             return AdmissionVerdict(False, "SESSION_PRODUCT_INVALID", {**detail, **product_refusal})
+
+        # Futures precheck the PEAK, not a leg: a roll holds the old contract while
+        # the replacement is acquired, and discovering that shortfall at the broker
+        # is how a roll ends up half executed.
+        futures_legs = [
+            leg
+            for leg in (plan.get("resolved_plan") or {}).get("legs") or []
+            if str(leg.get("instrument_type") or "").upper() == "FUT"
+        ]
+        if futures_legs:
+            from backend.strategies.futures_margin import (
+                futures_peak_refusal,
+                peak_margin_evidence,
+            )
+
+            old_legs = list((plan.get("resolved_plan") or {}).get("old_legs") or [])
+            peak = peak_margin_evidence(
+                new_legs=futures_legs, old_legs=old_legs, margin_engine=self._margin_engine
+            )
+            detail["peak_margin"] = peak
+            # Compared against a MARGIN capacity the caller supplies, never against
+            # the notional allocation: those measure different things, and conflating
+            # them would refuse a plan the allocation permitted.
+            refusal = futures_peak_refusal(peak=peak, available_inr=peak_capacity_inr)
+            if refusal is not None:
+                return AdmissionVerdict(False, "MARGIN_INSUFFICIENT", {**detail, **refusal})
 
         if is_live:
             margin = dict(margin_evidence or {})
