@@ -3388,3 +3388,54 @@ DROP TRIGGER IF EXISTS trg_strategy_roll_events_immutable ON public.strategy_rol
 CREATE TRIGGER trg_strategy_roll_events_immutable
     BEFORE UPDATE OR DELETE ON public.strategy_roll_events
     FOR EACH ROW EXECUTE FUNCTION forbid_strategy_roll_event_mutation();
+
+-- ---------------------------------------------------------------------------
+-- Option structures: structure config and settlement evidence (Project 10 / G8)
+-- ---------------------------------------------------------------------------
+
+-- No CHECK is widened here. The plan expected the option-run state CHECK to gain
+-- 'settled', but option_run_states.status carries NO CHECK constraint in this
+-- source (the only option status CHECK is on option_strategy_runs, a different
+-- table with a four-value vocabulary). 'settled' is a Python-vocabulary addition
+-- on OptionRunStatus plus a settlement-adapter registration, not a DDL change.
+ALTER TABLE public.option_run_states ADD COLUMN IF NOT EXISTS structure_digest TEXT;
+ALTER TABLE public.option_run_states ADD COLUMN IF NOT EXISTS expiry_policy TEXT;
+ALTER TABLE public.option_run_states DROP CONSTRAINT IF EXISTS ck_option_run_states_expiry_policy;
+ALTER TABLE public.option_run_states
+    ADD CONSTRAINT ck_option_run_states_expiry_policy
+    CHECK (expiry_policy IS NULL OR expiry_policy IN (
+        'exit_before_cutoff', 'allow_cash_settlement', 'allow_physical_settlement'
+    ));
+
+-- Settlement is a claim about what happened at the exchange; a claim that can be
+-- edited is not evidence.
+CREATE TABLE IF NOT EXISTS public.option_settlement_evidence (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id TEXT NOT NULL,
+    option_run_id TEXT NOT NULL,
+    structure_digest TEXT NOT NULL,
+    settlement_kind TEXT NOT NULL,
+    evidence_source TEXT NOT NULL,
+    evidence_ref JSONB NOT NULL,
+    recorded_by TEXT NOT NULL,
+    adjustment_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_ose_settlement_kind CHECK (settlement_kind IN ('cash', 'physical')),
+    -- Only authoritative sources: "the position disappeared" is not one of them.
+    CONSTRAINT ck_ose_evidence_source
+        CHECK (evidence_source IN ('broker_ledger', 'contract_note', 'exchange_file'))
+);
+CREATE INDEX IF NOT EXISTS idx_ose_run
+    ON public.option_settlement_evidence (option_run_id);
+
+CREATE OR REPLACE FUNCTION forbid_option_settlement_evidence_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'option_settlement_evidence is append-only (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_option_settlement_evidence_immutable
+    ON public.option_settlement_evidence;
+CREATE TRIGGER trg_option_settlement_evidence_immutable
+    BEFORE UPDATE OR DELETE ON public.option_settlement_evidence
+    FOR EACH ROW EXECUTE FUNCTION forbid_option_settlement_evidence_mutation();

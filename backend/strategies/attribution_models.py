@@ -1218,3 +1218,37 @@ class StrategyRollEvent(Base):
         ),
         Index("idx_roll_events", "roll_id", "created_at"),
     )
+
+
+class OptionSettlementEvidence(Base):
+    """Append-only evidence that an option structure settled (Project 10 / G8).
+
+    Cash settlement applies an external adjustment ONLY with a row here, from an
+    authoritative source. Expiry time alone adjusts nothing, and neither does a
+    position disappearing from view: both are consistent with the position still
+    existing and simply not being visible.
+    """
+
+    __tablename__ = "option_settlement_evidence"
+
+    id = Column(Text, primary_key=True)
+    account_id = Column(Text, nullable=False)
+    option_run_id = Column(Text, nullable=False)
+    structure_digest = Column(Text, nullable=False)
+    settlement_kind = Column(Text, nullable=False)
+    evidence_source = Column(Text, nullable=False)
+    evidence_ref = Column(JSON, nullable=False)
+    recorded_by = Column(Text, nullable=False)
+    adjustment_id = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "settlement_kind IN ('cash', 'physical')", name="ck_ose_settlement_kind"
+        ),
+        CheckConstraint(
+            "evidence_source IN ('broker_ledger', 'contract_note', 'exchange_file')",
+            name="ck_ose_evidence_source",
+        ),
+        Index("idx_ose_run", "option_run_id"),
+    )

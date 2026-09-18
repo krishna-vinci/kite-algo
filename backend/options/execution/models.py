@@ -20,6 +20,9 @@ class OptionRunStatus(str, Enum):
     EXITING = "exiting"
     PARTIAL_EXIT = "partial_exit"
     EXITED = "exited"
+    #: Terminal. Reached only through evidence-gated settlement (Phase 10 / D-8),
+    #: never inferred from expiry time or from a position disappearing.
+    SETTLED = "settled"
 
 
 class OptionRunCreateRequest(BaseModel):
