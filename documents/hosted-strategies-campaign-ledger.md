@@ -154,3 +154,17 @@ conversation.
 - **Decisions:** work events also take the book lock; reconciliation flows through `reconciliation_service.py`; rollup failed-before-unknown; plans' terminality via reservation. **Process fix:** exact alembic head pins replaced with monotonic assertions permanently (universe-suite precedent).
 - **Limitations:** domain-adapter registry empty (CNC/MIS/futures/options interpret in P6/P8/P9/P10); settlement evidence not yet consumed by any release action; live broker snapshots NOT PROVEN.
 - **Next-phase input (Phase 6 = Project 6: paper single-instrument proposal execution end-to-end, Foundation B completion):** next migration `20260917_000030`. Wire the FULL chain on paper: proposal (Phase 3) → admission+reservation (Phase 4, paper evidence) → approval-exempt (paper) → plan execution against the PAPER runtime → attributed fills (G1 paper book) → reconciliation (Phase 2) → settlement assessment (Phase 5) with the CNC/single-instrument domain adapter. Execution consumes admission verdicts and approval validity for the FIRST time — the boundary that was deliberately left open in Phase 4. Preserve worktree state as always.
+
+---
+
+## Phase 6 — Project 6: paper single-instrument proposals end-to-end (Foundation B)
+
+- **Status:** COMPLETE — gate PASSED (2026-09-17). Executed via two subagent delegations (first interrupted mid-Task-2; resumed from exact state `a03ad89` + inherited test file).
+- **Plan:** `docs/superpowers/plans/2026-09-17-paper-execution.md` (D-1…D-7 binding).
+- **Parity report:** `documents/hosted-strategies-project6-parity.md`
+- **Commits (unsigned):** `a03ad89` schema (+ migration 20260917_000030), `51377bc` paper executor, `ad7394b` intent bundles, `a7c8442` owner surfaces, `66359d9` PG integration (12 tests).
+- **Requirements closed:** the full chain exercised for the first time — proposal → frozen plan → paper admission/reservation → execution through the existing paper runtime with bound-run attribution → G1-attributed paper book owner-visible → reservation consumed/released → barrier + settlement assessment. Named-refusal precondition chain; append-only execution events; exactly-one-submission; intent bundles per-leg; paper-only (`PAPER_ONLY_EXECUTION`).
+- **Test evidence:** 30 execution unit tests; 453+1 strategies+owner-API sweeps; **12/12 PG incl. the end-to-end acceptance**; API baseline unchanged; single head; clean.
+- **Decisions:** inherited-test arithmetic corrections (documented); schema-impossible test replaced; `PLAN_ALREADY_EXECUTED` keyed on committed submission.
+- **Limitations:** paper-only; no target_weights execution, no partial fills, no scheduler (all P7); owner-triggered execution; live enablement gated on separate authorization.
+- **Next-phase input (Phase 7 = Project 7: CNC target-weight portfolios, monthly/calendar scheduler, paper partial fills, corporate-action detection/freeze/escalation):** next migration `20260917_000031`. Roadmap: CNC lane on paper then certified before live; scheduler kinds monthly/calendar with misfire/overlap policy (G11 — schedule table stored-only at backend/strategies/models.py:115-181); paper partial fills (G12); corporate-action detection first-delivery = detect + freeze + account-owner escalation (G13; R3 §18: splits allocate across pre-action attributed quantity, adjustments model exists from Phase 2/4). Preserve worktree state as always.
