@@ -3320,3 +3320,71 @@ DROP TRIGGER IF EXISTS trg_strategy_squareoff_evidence_immutable
 CREATE TRIGGER trg_strategy_squareoff_evidence_immutable
     BEFORE UPDATE OR DELETE ON public.strategy_squareoff_evidence
     FOR EACH ROW EXECUTE FUNCTION forbid_strategy_squareoff_evidence_mutation();
+
+-- ---------------------------------------------------------------------------
+-- Futures rolls (Project 9 / R3 §13, locked decision 6)
+-- ---------------------------------------------------------------------------
+
+-- A roll is not two orders and not a basket: it is an ORDERED transition with a
+-- rule no order-level mechanism can express — the old contract's close step is
+-- released only once the FULL required replacement quantity is PROVEN filled,
+-- where proof is the strategy's attributed book on the new contract, not an
+-- order-status label.
+CREATE TABLE IF NOT EXISTS public.strategy_rolls (
+    roll_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    -- BOTH identities retained through the transition.
+    old_instrument_id TEXT NOT NULL,
+    new_instrument_id TEXT NOT NULL,
+    old_coordinate JSONB NOT NULL,
+    new_coordinate JSONB NOT NULL,
+    required_replacement_quantity INTEGER NOT NULL,
+    proven_filled_quantity INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'acquiring',
+    action_reason TEXT,
+    peak_margin_evidence JSONB,
+    plan_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_roll_state CHECK (state IN (
+        'acquiring', 'proving_filled', 'releasing_old', 'completed', 'action_required'
+    )),
+    CONSTRAINT ck_roll_required_positive CHECK (required_replacement_quantity > 0),
+    CONSTRAINT ck_roll_proven_non_negative CHECK (proven_filled_quantity >= 0),
+    CONSTRAINT fk_rolls_plan FOREIGN KEY (plan_id)
+        REFERENCES public.strategy_plans (plan_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_rolls_strategy_canonical
+        FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_rolls_strategy_state
+    ON public.strategy_rolls (strategy_id, state);
+
+-- The mutable parent has a lifecycle; the trail does not.
+CREATE TABLE IF NOT EXISTS public.strategy_roll_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    roll_id UUID NOT NULL,
+    event TEXT NOT NULL,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_roll_event CHECK (event IN (
+        'created', 'acquired', 'fill_proven', 'close_released', 'old_flat', 'completed',
+        'stalled', 'escalated'
+    )),
+    CONSTRAINT fk_roll_events_roll FOREIGN KEY (roll_id)
+        REFERENCES public.strategy_rolls (roll_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_roll_events
+    ON public.strategy_roll_events (roll_id, created_at);
+
+CREATE OR REPLACE FUNCTION forbid_strategy_roll_event_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'strategy_roll_events are append-only (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_strategy_roll_events_immutable ON public.strategy_roll_events;
+CREATE TRIGGER trg_strategy_roll_events_immutable
+    BEFORE UPDATE OR DELETE ON public.strategy_roll_events
+    FOR EACH ROW EXECUTE FUNCTION forbid_strategy_roll_event_mutation();

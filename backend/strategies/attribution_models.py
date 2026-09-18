@@ -1141,3 +1141,80 @@ class StrategySquareoffEvidence(Base):
         ),
         Index("idx_sse_run", "strategy_run_id", "session_date"),
     )
+
+
+class StrategyRoll(Base):
+    """A durable ordered roll: acquire → prove-filled → release-close (R3 §13).
+
+    The full-required-fill gate lives in the state machine, not in an order flag:
+    a roll releases the old contract's close step only once the replacement is
+    PROVEN filled on the strategy's attributed book. A partial or stalled
+    replacement marks the roll ``action_required`` with the old attribution intact
+    and never auto-reverses.
+    """
+
+    __tablename__ = "strategy_rolls"
+
+    roll_id = Column(Text, primary_key=True)
+    strategy_id = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    #: Both identities, retained through the whole transition.
+    old_instrument_id = Column(Text, nullable=False)
+    new_instrument_id = Column(Text, nullable=False)
+    old_coordinate = Column(JSON, nullable=False)
+    new_coordinate = Column(JSON, nullable=False)
+    required_replacement_quantity = Column(Integer, nullable=False)
+    proven_filled_quantity = Column(Integer, nullable=False, server_default="0")
+    state = Column(Text, nullable=False, server_default="acquiring")
+    action_reason = Column(Text, nullable=True)
+    peak_margin_evidence = Column(JSON, nullable=True)
+    plan_id = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('acquiring', 'proving_filled', 'releasing_old', 'completed', "
+            "'action_required')",
+            name="ck_roll_state",
+        ),
+        CheckConstraint(
+            "required_replacement_quantity > 0", name="ck_roll_required_positive"
+        ),
+        CheckConstraint("proven_filled_quantity >= 0", name="ck_roll_proven_non_negative"),
+        ForeignKeyConstraint(
+            ["strategy_id", "account_id"],
+            ["strategies.id", "strategies.account_scope"],
+            name="fk_rolls_strategy_canonical",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["plan_id"], ["strategy_plans.plan_id"], name="fk_rolls_plan", ondelete="RESTRICT"
+        ),
+        Index("idx_rolls_strategy_state", "strategy_id", "state"),
+    )
+
+
+class StrategyRollEvent(Base):
+    """Append-only trail of a roll's transitions. Trigger-immutable."""
+
+    __tablename__ = "strategy_roll_events"
+
+    id = Column(Text, primary_key=True)
+    roll_id = Column(Text, nullable=False)
+    event = Column(Text, nullable=False)
+    detail = Column(JSON, nullable=False, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "event IN ('created', 'acquired', 'fill_proven', 'close_released', 'old_flat', "
+            "'completed', 'stalled', 'escalated')",
+            name="ck_roll_event",
+        ),
+        ForeignKeyConstraint(
+            ["roll_id"], ["strategy_rolls.roll_id"], name="fk_roll_events_roll",
+            ondelete="RESTRICT",
+        ),
+        Index("idx_roll_events", "roll_id", "created_at"),
+    )
