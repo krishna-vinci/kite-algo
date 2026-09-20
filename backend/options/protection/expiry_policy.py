@@ -380,3 +380,103 @@ def register_option_settlement_adapter() -> None:
     if option_settlement_axes in settlement_domain_adapters:
         return
     register_domain_adapter(option_settlement_axes)
+
+
+class StructureExitSubmission:
+    """Submit a structure's exit orders through the durable claim path (gap C).
+
+    The verified gap this closes: a structure-aware rule could TRIGGER and the
+    evaluator could recommend exits, and nothing actually submitted them. A
+    recommendation is not a submission, and a protection rule that only recommends
+    is a rule that does not protect.
+
+    It goes through the claim path rather than issuing orders directly, for the
+    reason the claim path exists: an exit must be idempotent and observable, and a
+    second evaluation of the same trigger must not exit twice. The caller supplies
+    the claim function so the seam is testable without a live runtime, and the whole
+    chain is traced: evaluation -> trigger -> claim -> submission -> outcome.
+    """
+
+    def __init__(
+        self,
+        *,
+        claim: Optional[Callable[..., Any]] = None,
+        exit_builder: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        self._claim = claim
+        if exit_builder is None:
+            from backend.options.protection.exit_builder import build_structure_exit_orders
+
+            exit_builder = build_structure_exit_orders
+        self._exit_builder = exit_builder
+
+    async def submit(
+        self,
+        *,
+        run: Mapping[str, Any],
+        trigger: Mapping[str, Any],
+        legs: Any,
+        closed_short_quantities: Optional[Mapping[str, int]] = None,
+        structure_digest: str = "",
+    ) -> Dict[str, Any]:
+        """Build the structure's exits and submit them under one claim.
+
+        Refuses to submit when the evaluator did not trigger: an exit that fires
+        without a trigger is a liquidation nobody asked for.
+        """
+        if str((trigger or {}).get("status") or "") != "triggered":
+            return {
+                "submitted": False,
+                "reason": "not_triggered",
+                "claim_id": None,
+                "orders": [],
+            }
+
+        orders, detail = self._exit_builder(
+            legs, closed_short_quantities=dict(closed_short_quantities or {})
+        )
+        if not orders:
+            # Nothing to submit is a legitimate outcome: the structure is already
+            # where it should be, and an empty claim would be noise.
+            return {
+                "submitted": False,
+                "reason": "no_exit_orders",
+                "claim_id": None,
+                "orders": [],
+                "detail": detail,
+            }
+
+        if self._claim is None:
+            return {
+                "submitted": False,
+                "reason": "no_claim_path",
+                "claim_id": None,
+                "orders": orders,
+                "detail": detail,
+            }
+
+        result = await self._claim(
+            run=dict(run),
+            trigger=dict(trigger),
+            orders=orders,
+            idempotency_key=str((trigger or {}).get("exit_idempotency_key") or ""),
+            structure_digest=str(structure_digest),
+        )
+        payload = dict(result or {}) if isinstance(result, Mapping) else {"claim_id": result}
+        # The trace is the point: evaluation -> trigger -> claim -> submission ->
+        # outcome, so a reader can see which link actually failed.
+        return {
+            "submitted": bool(payload.get("accepted", True)),
+            "reason": str(payload.get("reason") or "submitted"),
+            "claim_id": (
+                str(payload.get("claim_id")) if payload.get("claim_id") else None
+            ),
+            "orders": orders,
+            "detail": detail,
+            "trace": {
+                "rule": str((trigger or {}).get("triggered_rule") or ""),
+                "structure_digest": str(structure_digest),
+                "order_count": len(orders),
+                "naked_short_quantity": detail.get("naked_short_quantity"),
+            },
+        }

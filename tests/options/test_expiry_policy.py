@@ -260,3 +260,95 @@ class EvidenceTests(ExpiryTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StructureSubmissionTests(ExpiryTestCase):
+    """Gap C: a triggered structure rule actually SUBMITS its exits (D-4)."""
+
+    def submission(self, *, claim=None):
+        from backend.options.protection.expiry_policy import StructureExitSubmission
+
+        return StructureExitSubmission(claim=claim)
+
+    def legs(self):
+        return [
+            {"tradingsymbol": "SHORT", "side": "SELL", "quantity": -75,
+             "exchange": "NFO", "product": "NRML"},
+            {"tradingsymbol": "HEDGE", "side": "BUY", "quantity": 75,
+             "exchange": "NFO", "product": "NRML"},
+        ]
+
+    def test_a_triggered_rule_submits_through_the_claim_path(self):
+        import asyncio
+
+        claims: list = []
+
+        async def claim(**kwargs):
+            claims.append(kwargs)
+            return {"claim_id": "claim-1", "accepted": True}
+
+        result = asyncio.run(
+            self.submission(claim=claim).submit(
+                run={"strategy_run_id": "run-1", "account_scope": "kite:A"},
+                trigger={"status": "triggered", "triggered_rule": "index_guard",
+                         "exit_idempotency_key": "key-1"},
+                legs=self.legs(),
+                closed_short_quantities={"SHORT": 75},
+                structure_digest="digest-1",
+            )
+        )
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["claim_id"], "claim-1")
+        # The whole chain is traced, so a reader can see which link failed.
+        self.assertEqual(result["trace"]["rule"], "index_guard")
+        self.assertEqual(result["trace"]["order_count"], 1)
+        self.assertEqual(claims[0]["idempotency_key"], "key-1")
+
+    def test_an_untriggered_rule_submits_nothing(self):
+        import asyncio
+
+        calls: list = []
+
+        async def claim(**kwargs):
+            calls.append(kwargs)
+            return {"claim_id": "c"}
+
+        result = asyncio.run(
+            self.submission(claim=claim).submit(
+                run={"strategy_run_id": "run-1"}, trigger={"status": "monitoring"},
+                legs=self.legs(),
+            )
+        )
+        # An exit that fires without a trigger is a liquidation nobody asked for.
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "not_triggered")
+        self.assertEqual(calls, [])
+
+    def test_a_missing_claim_path_reports_rather_than_pretending(self):
+        import asyncio
+
+        result = asyncio.run(
+            self.submission().submit(
+                run={"strategy_run_id": "run-1"},
+                trigger={"status": "triggered", "triggered_rule": "guard"},
+                legs=self.legs(),
+            )
+        )
+        # The orders are still built and reported: the seam is honest about not
+        # having a claim path rather than silently doing nothing.
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "no_claim_path")
+        self.assertTrue(result["orders"])
+
+    def test_nothing_to_submit_is_a_legitimate_outcome(self):
+        import asyncio
+
+        result = asyncio.run(
+            self.submission(claim=lambda **_: {"claim_id": "c"}).submit(
+                run={"strategy_run_id": "run-1"},
+                trigger={"status": "triggered", "triggered_rule": "guard"},
+                legs=[],
+            )
+        )
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "no_exit_orders")
