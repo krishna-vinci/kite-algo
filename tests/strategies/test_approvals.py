@@ -57,7 +57,8 @@ class ApprovalTestCase(unittest.TestCase):
                     lifecycle_status TEXT NOT NULL DEFAULT 'active',
                     current_generation_id TEXT,
                     instrument_type TEXT, expiry TEXT, lot_size INTEGER, tick_size REAL,
-                    underlying TEXT
+                    underlying TEXT,
+                    strike REAL, option_type TEXT
                 )
                 """
             )

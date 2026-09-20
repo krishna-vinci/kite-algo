@@ -50,7 +50,8 @@ class WeightsCompilerTestCase(unittest.TestCase):
                     instrument_id TEXT PRIMARY KEY, exchange TEXT, tradingsymbol TEXT,
                     lifecycle_status TEXT NOT NULL DEFAULT 'active', lot_size INTEGER,
                     current_generation_id TEXT,
-                    instrument_type TEXT, expiry TEXT, tick_size REAL, underlying TEXT
+                    instrument_type TEXT, expiry TEXT, tick_size REAL, underlying TEXT,
+                    strike REAL, option_type TEXT
                 )
                 """
             )

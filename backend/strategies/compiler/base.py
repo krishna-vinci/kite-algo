@@ -39,6 +39,9 @@ REFUSAL_REASONS = (
     "CONTRACT_UNRESOLVED",
     "EXPIRY_UNAVAILABLE",
     "FREEZE_LIMIT_EXCEEDED",
+    "OPTION_LEG_UNRESOLVED",
+    "SELECTION_POLICY_UNRESOLVABLE",
+    "PHYSICAL_SETTLEMENT_CAPABILITY_REQUIRED",
 )
 
 
@@ -243,6 +246,8 @@ class PinnedCatalogRead:
             "lot_size": row.get("lot_size"),
             "tick_size": row.get("tick_size"),
             "underlying": str(row.get("underlying") or ""),
+            "strike": row.get("strike"),
+            "option_type": str(row.get("option_type") or ""),
             "catalog_generation": self.pin(),
         }
 

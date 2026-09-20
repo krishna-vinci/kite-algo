@@ -48,6 +48,7 @@ def _registry() -> Dict[str, TargetCompiler]:
     """
     from backend.strategies.compiler.futures import FuturesCompiler
     from backend.strategies.compiler.intent_bundle import IntentBundleCompiler
+    from backend.strategies.compiler.option_structure import OptionStructureCompiler
     from backend.strategies.compiler.target_weights import TargetWeightsCompiler
 
     return {
@@ -55,6 +56,7 @@ def _registry() -> Dict[str, TargetCompiler]:
         TargetWeightsCompiler.target_kind: TargetWeightsCompiler(),
         IntentBundleCompiler.target_kind: IntentBundleCompiler(),
         FuturesCompiler.target_kind: FuturesCompiler(),
+        OptionStructureCompiler.target_kind: OptionStructureCompiler(),
     }
 
 
@@ -80,7 +82,22 @@ def compile_plan(
 
 
 def compile_resolved_plan(
-    target_kind: str, payload: Mapping[str, Any], pinned: PinnedCatalogRead
+    target_kind: str,
+    payload: Mapping[str, Any],
+    pinned: PinnedCatalogRead,
+    *,
+    chain_resolver: Any = None,
 ) -> ResolvedPlan:
-    """Compile and return both representations plus any scope the compiler pinned."""
-    return compiler_for(target_kind).compile(payload, pinned)
+    """Compile and return both representations plus any scope the compiler pinned.
+
+    ``chain_resolver`` is passed only to compilers that accept one (option
+    structures need chain access for selection policies); the others are called
+    with the two arguments they have always taken.
+    """
+    compiler = compiler_for(target_kind)
+    if chain_resolver is not None:
+        import inspect
+
+        if "chain_resolver" in inspect.signature(compiler.compile).parameters:
+            return compiler.compile(payload, pinned, chain_resolver=chain_resolver)
+    return compiler.compile(payload, pinned)

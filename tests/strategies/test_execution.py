@@ -92,7 +92,8 @@ class ExecutionTestCase(unittest.TestCase):
                     instrument_type TEXT,
                     lot_size INTEGER,
                     current_generation_id TEXT,
-                    expiry TEXT, tick_size REAL, underlying TEXT
+                    expiry TEXT, tick_size REAL, underlying TEXT,
+                    strike REAL, option_type TEXT
                 )
                 """
             )
