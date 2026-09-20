@@ -93,6 +93,48 @@ class WorkerProtectionRuntime:
             if claimed_result is None:
                 return False
             await self._publish_timeline_rows(claimed_result.get("timeline_events") or [])
+
+            structure = self._structure_identity(config)
+            if structure is not None:
+                # Structure-aware: the exits are built short-first with their fill
+                # proof and submitted through the claim path, and the outcome is
+                # recorded either way — never a pretend-submitted state.
+                recommended = list(
+                    claimed_state.get("recommended_exit_orders")
+                    or next_state.get("recommended_exit_orders")
+                    or []
+                )
+                structure_exit = await self._submit_structure_exit(
+                    run, claimed_state, structure, claim_id=claim_id,
+                    recommended_orders=recommended or None,
+                )
+                structure_state = {
+                    **claimed_state,
+                    "exit_submitted": bool(structure_exit.get("submitted")),
+                    "exit_submission_status": (
+                        "submitted" if structure_exit.get("submitted")
+                        else str(structure_exit.get("reason") or "not_submitted")
+                    ),
+                    "structure_exit": structure_exit,
+                }
+                persisted_structure = await self._persist_state(
+                    run,
+                    runtime_state,
+                    claimed_state,
+                    structure_state,
+                    expected_generation=structure_state.get("generation"),
+                    expected_exit_claim_id=claim_id,
+                )
+                if persisted_structure is None:
+                    persisted_structure = await self._persist_state(
+                        run, runtime_state, claimed_state, structure_state
+                    )
+                if persisted_structure is not None:
+                    await self._publish_timeline_rows(
+                        persisted_structure.get("timeline_events") or []
+                    )
+                return bool(structure_exit.get("submitted"))
+
             try:
                 exit_result = await self.exit_submitter(run, claimed_state)
             except Exception as exc:
@@ -333,6 +375,72 @@ class WorkerProtectionRuntime:
             if not strategy_run_id:
                 continue
             await publish_event(f"worker.execution.events:{strategy_run_id}", dict(row))
+
+    @staticmethod
+    def _structure_identity(config: Any) -> Optional[Dict[str, Any]]:
+        """The structure this run belongs to, or ``None``.
+
+        ``None`` on every run that is not part of an option structure, which is what
+        keeps their behaviour identical: the structure-aware branch is entered only
+        when a structure was actually declared.
+        """
+        structure = getattr(config, "structure", None)
+        if structure is None:
+            return None
+        payload = (
+            structure.model_dump() if hasattr(structure, "model_dump") else dict(structure)
+        )
+        if not str(payload.get("structure_digest") or ""):
+            return None
+        return payload
+
+    async def _submit_structure_exit(
+        self,
+        run: Dict[str, Any],
+        state: Dict[str, Any],
+        structure: Dict[str, Any],
+        *,
+        claim_id: str,
+        recommended_orders: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Submit a structure's exits through the SAME durable claim path (gap C).
+
+        The evaluator recommending orders is not a submission, and a protection rule
+        that only recommends is a rule that does not protect. The claim function
+        reuses ``exit_submitter`` — the path the generic exit already uses — so
+        idempotency and the single-claim-per-exit rule are inherited rather than
+        re-implemented.
+
+        Nothing here can decide silently: a missing seam or a failing claim is
+        returned as an outcome, and the caller records it as evidence.
+        """
+        try:
+            from backend.options.protection.expiry_policy import StructureExitSubmission
+        except Exception as exc:  # noqa: BLE001
+            return {"submitted": False, "reason": "seam_unavailable", "error": str(exc)}
+
+        async def claim(**kwargs: Any) -> Dict[str, Any]:
+            orders = list(kwargs.get("orders") or [])
+            result = await self.exit_submitter(run, {**state, "recommended_exit_orders": orders})
+            return {
+                "claim_id": claim_id,
+                "accepted": True,
+                "reason": "submitted",
+                "outcome": result,
+            }
+
+        seam = StructureExitSubmission(claim=claim)
+        try:
+            return await seam.submit(
+                run=run,
+                trigger=state,
+                legs=list(structure.get("legs") or []),
+                closed_short_quantities=dict(structure.get("closed_short_quantities") or {}),
+                structure_digest=str(structure.get("structure_digest") or ""),
+                recommended_orders=recommended_orders,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"submitted": False, "reason": "seam_failed", "error": str(exc)}
 
     def _idempotency_key(self, run: Dict[str, Any], state: Dict[str, Any]) -> str:
         generation = state.get("generation") or 1

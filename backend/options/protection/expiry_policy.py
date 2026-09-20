@@ -418,6 +418,7 @@ class StructureExitSubmission:
         legs: Any,
         closed_short_quantities: Optional[Mapping[str, int]] = None,
         structure_digest: str = "",
+        recommended_orders: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Build the structure's exits and submit them under one claim.
 
@@ -432,8 +433,12 @@ class StructureExitSubmission:
                 "orders": [],
             }
 
+        # The evaluator's recommendation is the raw material when it exists, so it
+        # is submitted rather than dropped — but it still goes through the
+        # short-first builder, because a recommendation is not an ordering.
+        material = list(recommended_orders) if recommended_orders else legs
         orders, detail = self._exit_builder(
-            legs, closed_short_quantities=dict(closed_short_quantities or {})
+            material, closed_short_quantities=dict(closed_short_quantities or {})
         )
         if not orders:
             # Nothing to submit is a legitimate outcome: the structure is already

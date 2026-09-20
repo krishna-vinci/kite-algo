@@ -192,6 +192,26 @@ class OperationalProtection(BaseModel):
         return self
 
 
+class StructureIdentity(BaseModel):
+    """The option structure a run belongs to (Phase 10 / D-4).
+
+    It rides beside run identity in the enforced runtime config, so a
+    structure-aware rule can submit its exits through the claim path with the
+    short-first ordering and the fill proof that structure requires — without the
+    generic exit path learning anything about options.
+
+    Absent on every other run, which is what keeps today's behaviour identical for
+    them: a config without a structure is validated and evaluated exactly as before.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    structure_digest: str
+    legs: List[Dict[str, Any]] = Field(default_factory=list)
+    #: Proven closure per short leg, read from fill quantities.
+    closed_short_quantities: Dict[str, int] = Field(default_factory=dict)
+
+
 class BackendProtectionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -201,6 +221,8 @@ class BackendProtectionConfig(BaseModel):
     positions: List[ProtectedPosition] = Field(default_factory=list)
     basket: Optional[BasketProtection] = None
     operations: OperationalProtection = Field(default_factory=OperationalProtection)
+    #: Present only for a run that belongs to an option structure.
+    structure: Optional[StructureIdentity] = None
 
     @field_validator("version")
     @classmethod

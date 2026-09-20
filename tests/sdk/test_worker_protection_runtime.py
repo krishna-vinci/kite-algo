@@ -53,6 +53,17 @@ class _Repo:
         return dict(self.runs[0])
 
 
+class _StructureRepo(_Repo):
+    """A paper run whose protection carries a STRUCTURE identity."""
+
+    def __init__(self, *, structure=None):
+        super().__init__()
+        protection = dict(self.runs[0]["runtime_state"]["backend_protection"])
+        if structure is not None:
+            protection["structure"] = structure
+        self.runs[0]["runtime_state"]["backend_protection"] = protection
+
+
 class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_runtime_submits_exit_and_persists_state_when_triggered(self):
         repo = _Repo()
@@ -71,6 +82,111 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repo.saved[-1][1]["backend_protection_state"]["triggered_rule"], "position_stoploss")
         self.assertEqual(repo.saved[-1][1]["backend_protection_state"]["action"], "exit_strategy")
         self.assertTrue(repo.saved[-1][1]["backend_protection_state"]["exit_submitted"])
+
+    async def test_a_structure_aware_trigger_claims_and_submits_through_the_seam(self):
+        """Gap C: a structure-aware trigger must actually SUBMIT its exits.
+
+        The evaluator recommending orders is not a submission, and a protection rule
+        that only recommends is a rule that does not protect.
+        """
+        structure = {
+            "structure_digest": "digest-abc",
+            "legs": [
+                {"tradingsymbol": "SHORT-CE", "side": "SELL", "quantity": -75,
+                 "exchange": "NFO", "product": "NRML", "structure_leg_id": "short"},
+                {"tradingsymbol": "HEDGE-CE", "side": "BUY", "quantity": 75,
+                 "exchange": "NFO", "product": "NRML", "structure_leg_id": "hedge",
+                 "hedge_for": "SHORT-CE"},
+            ],
+            "closed_short_quantities": {"SHORT-CE": 75},
+        }
+        repo = _StructureRepo(structure=structure)
+        exit_submitter = AsyncMock(return_value={"status": "closed"})
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": [
+                {"symbol": "NSE:INFY", "product": "CNC", "side": "BUY", "quantity": 1,
+                 "net_quantity": 1, "average_price": 100, "last_price": 94}
+            ]}),
+            exit_submitter=exit_submitter,
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result["triggered"], 1)
+        # The exit went through the SAME durable claim path the generic exit uses,
+        # so idempotency and single-claim-per-exit are inherited rather than
+        # re-implemented.
+        exit_submitter.assert_awaited_once()
+        state = repo.saved[-1][1]["backend_protection_state"]
+        self.assertTrue(state["exit_submitted"])
+        # And the whole chain is traced, so a reader can see which link ran.
+        trace = state["structure_exit"]
+        self.assertEqual(trace["trace"]["structure_digest"], "digest-abc")
+        self.assertEqual(trace["trace"]["order_count"], 1)  # the hedge releases
+        self.assertEqual(trace["trace"]["naked_short_quantity"], 0)
+        self.assertEqual(
+            [order["tradingsymbol"] for order in trace["orders"]], ["HEDGE-CE"]
+        )
+
+    async def test_a_structure_trigger_with_no_claim_path_records_the_failure(self):
+        """Fail-closed: an unavailable seam must not look like a submission."""
+        repo = _StructureRepo(structure={
+            "structure_digest": "digest-abc",
+            "legs": [{"tradingsymbol": "SHORT-CE", "side": "SELL", "quantity": -75,
+                      "exchange": "NFO", "product": "NRML"}],
+        })
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": [
+                {"symbol": "NSE:INFY", "product": "CNC", "side": "BUY", "quantity": 1,
+                 "net_quantity": 1, "average_price": 100, "last_price": 94}
+            ]}),
+            exit_submitter=AsyncMock(side_effect=RuntimeError("claim path down")),
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        # A failed submission is NOT counted as triggered, exactly as the generic
+        # path behaves for a failing submitter — the counter means "an exit was
+        # submitted", not "a rule fired".
+        self.assertEqual(result["triggered"], 0)
+        state = repo.saved[-1][1]["backend_protection_state"]
+        # And the failure is recorded as evidence rather than dropped: the run never
+        # reaches a pretend-submitted state.
+        self.assertNotEqual(state.get("exit_submission_status"), "submitted")
+        self.assertFalse(state["exit_submitted"])
+        self.assertEqual(state["exit_submission_status"], "seam_failed")
+        self.assertFalse(state["structure_exit"]["submitted"])
+
+    async def test_a_run_without_a_structure_keeps_todays_behaviour(self):
+        """Regression: the non-structure path is untouched, key for key."""
+        repo = _Repo()
+        exit_submitter = AsyncMock(return_value={"status": "closed"})
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": [
+                {"symbol": "NSE:INFY", "product": "CNC", "side": "BUY", "quantity": 1,
+                 "net_quantity": 1, "average_price": 100, "last_price": 94}
+            ]}),
+            exit_submitter=exit_submitter,
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result["triggered"], 1)
+        exit_submitter.assert_awaited_once()
+        state = repo.saved[-1][1]["backend_protection_state"]
+        self.assertTrue(state["exit_submitted"])
+        # No structure keys appear anywhere on a non-structure run.
+        self.assertNotIn("structure_exit", state)
+
 
     async def test_runtime_persists_error_without_breaking_loop(self):
         repo = _Repo()
