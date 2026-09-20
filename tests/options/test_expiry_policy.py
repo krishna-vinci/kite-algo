@@ -30,6 +30,16 @@ NOW = datetime(2026, 10, 15, 11, 0, tzinfo=timezone.utc)
 
 class ExpiryTestCase(unittest.TestCase):
     def setUp(self):
+        # ``settlement_domain_adapters`` is PROCESS-WIDE, and a test that registers
+        # into it leaks into every later test in the same run — the settlement
+        # assessment then picks up an option domain that reports ``unsettled`` for an
+        # account it knows nothing about, and the rollup becomes ``unknown`` for a
+        # book that is genuinely settled. Snapshotting here and restoring in
+        # tearDown keeps the registry exactly as the suite found it.
+        from backend.strategies import settlement as settlement_module
+
+        self._adapters_before = list(settlement_module.settlement_domain_adapters)
+
         self.engine = create_engine(
             "sqlite+pysqlite:///:memory:",
             connect_args={"check_same_thread": False},
@@ -51,6 +61,11 @@ class ExpiryTestCase(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop("OPTIONS_EXPIRY_WARNING_DAYS", None)
+        # Restore the registry IN PLACE: another module may hold a reference to the
+        # list, so rebinding would leave it looking at the mutated one.
+        from backend.strategies import settlement as settlement_module
+
+        settlement_module.settlement_domain_adapters[:] = list(self._adapters_before)
         self.engine.dispose()
 
     def policy(self):
