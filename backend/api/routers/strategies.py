@@ -52,6 +52,8 @@ from backend.api.schemas.strategies import (
     ApprovalResponse,
     ReservationListResponse,
     ReservationResponse,
+    OptionSettlementEvidenceRow,
+    OptionSettlementResponse,
     RollEventRow,
     RollListResponse,
     RollResponse,
@@ -850,6 +852,42 @@ def _roll_view(machine: Any, roll: Dict[str, Any], *, with_events: bool = False)
         if with_events
         else [],
         close_release_permitted=str(roll["state"]) == "releasing_old",
+    )
+
+
+@router.get(
+    "/{strategy_id}/option-runs/{option_run_id}/settlement",
+    response_model=OptionSettlementResponse,
+)
+async def get_option_run_settlement(
+    strategy_id: str,
+    option_run_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """A run's settlement evidence. Owner-only, read-only.
+
+    ``settled`` is DERIVED from whether authoritative evidence exists, not from a
+    stored flag: a stored flag could be set by something other than evidence, and
+    this endpoint's whole job is to show that it was not.
+    """
+    _ = request
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    authorize_account_scope(str(canonical.account_scope))
+
+    from backend.options.protection.expiry_policy import OptionSettlementService
+
+    service = OptionSettlementService(session_factory=session_factory)
+    rows = service.evidence_for(option_run_id=option_run_id)
+    return OptionSettlementResponse(
+        option_run_id=option_run_id,
+        settled=bool(rows),
+        evidence=[OptionSettlementEvidenceRow(**row) for row in rows],
     )
 
 

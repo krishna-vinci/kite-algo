@@ -725,3 +725,28 @@ class RollListResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     rolls: List[RollResponse] = Field(default_factory=list)
+
+
+class OptionSettlementEvidenceRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    account_id: str
+    option_run_id: str
+    structure_digest: str
+    settlement_kind: str
+    evidence_source: str
+    evidence_ref: Dict[str, Any] = Field(default_factory=dict)
+    recorded_by: str
+    adjustment_id: Optional[str] = None
+
+
+class OptionSettlementResponse(BaseModel):
+    """A run's settlement state, and the evidence that justifies it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    option_run_id: str
+    #: Derived, never stored: settled exactly when authoritative evidence exists.
+    settled: bool = False
+    evidence: List[OptionSettlementEvidenceRow] = Field(default_factory=list)

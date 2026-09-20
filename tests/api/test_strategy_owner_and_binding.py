@@ -1866,6 +1866,72 @@ class RollReadApiTests(_ProposalApiHarness):
             self._stop_patches()
 
 
+class OptionSettlementReadApiTests(_ProposalApiHarness):
+    """Task 7: settlement evidence is readable, and `settled` is DERIVED."""
+
+    async def test_owner_reads_settlement_evidence(self):
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+
+        from backend.options.protection.expiry_policy import OptionSettlementService
+
+        OptionSettlementService(session_factory=self.factory).settle(
+            account_id="kite:paper", option_run_id="run-opt-1", structure_digest="digest-1",
+            settlement_kind="cash", evidence_source="contract_note",
+            evidence_ref={"note_id": "CN-7"}, recorded_by="app:admin",
+        )
+
+        repo, _ = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            response = await client.get(
+                f"{BASE}/{sid}/option-runs/run-opt-1/settlement"
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertTrue(body["settled"])
+            self.assertEqual(len(body["evidence"]), 1)
+            self.assertEqual(body["evidence"][0]["evidence_source"], "contract_note")
+            self.assertEqual(body["evidence"][0]["structure_digest"], "digest-1")
+
+            # A run with no evidence reads as unsettled rather than 404: the
+            # question was answerable and the answer is "not yet".
+            empty = await client.get(f"{BASE}/{sid}/option-runs/run-opt-none/settlement")
+            self.assertEqual(empty.status_code, 200, empty.text)
+            self.assertFalse(empty.json()["settled"])
+            self.assertEqual(empty.json()["evidence"], [])
+        finally:
+            self._stop_patches()
+
+    async def test_workers_and_foreign_owners_cannot_read_settlement(self):
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+        repo, raw_token = self._worker_repo()
+
+        client = self._proposal_client(repo=repo, username=None)
+        try:
+            response = await client.get(
+                f"{BASE}/{sid}/option-runs/run-1/settlement",
+                headers={"Authorization": f"Bearer {raw_token}"},
+            )
+            self.assertEqual(response.status_code, 401)
+        finally:
+            self._stop_patches()
+
+        client = self._proposal_client(repo=repo, username="someone-else")
+        try:
+            response = await client.get(f"{BASE}/{sid}/option-runs/run-1/settlement")
+            self.assertEqual(response.status_code, 404)
+        finally:
+            self._stop_patches()
+
+
 if __name__ == "__main__":
     unittest.main()
 
