@@ -277,8 +277,12 @@ class TestRollInvariant(_PgTestCase):
         rid = roll["roll_id"]
         machine.acquire(rid)
 
-        # The replacement is only partly filled.
-        book(sf, NEW, 30)
+        # The replacement is only partly filled: the CONFIRMED execution is
+        # recorded against the roll (the durable proof - a book alone proves
+        # nothing about this roll).
+        machine.record_replacement_fill(
+            rid, paper_order_id="PAPER-PARTIAL", quantity=30, instrument_id=NEW
+        )
         stalled = machine.prove_filled(rid)
         assert stalled["state"] == "action_required"
         assert stalled["proven_filled_quantity"] == 30
@@ -298,7 +302,9 @@ class TestRollInvariant(_PgTestCase):
         ) == 0
 
         # The replacement completes and only then does the close become reachable.
-        book(sf, NEW, 50)
+        machine.record_replacement_fill(
+            rid, paper_order_id="PAPER-REST", quantity=50, instrument_id=NEW
+        )
         proven = machine.prove_filled(rid)
         assert proven["state"] == "releasing_old"
         assert proven["proven_filled_quantity"] == 80

@@ -218,3 +218,79 @@ conversation.
 - **Test evidence:** 80+ new unit tests; 3× byte-identical stable sweeps; **15/15 PG**; tests/api and tests/options baselines unchanged; single head `20260917_000034`; clean.
 - **Notable process catches:** baseline count DROPPING exposed a fixture SyntaxError masquerading as green; the flaky settlement test's real cause was a registry leak (orchestrator diagnosis corrected by the agent with reproduction).
 - **Final state of the campaign:** heads `20260915_000024` → `20260917_000034` (11 migrations, single head). All ten phases gated PASSED. Every lane paper-certified; every live path refuses in code pending the owner's separate deployment + live-market certification. Nothing pushed at any point.
+---
+
+## Correction 2026-09-21 (Bundle 2/4 + guard hardening)
+
+* **Phase/migration arithmetic:** phases 0..10 are ELEVEN phases; the original
+  phase migrations are 000025..000034 - TEN, not ten phases. Two further
+  migrations exist (`000035` plan-kind vocabulary, `000036` roll replacement-fill
+  event). Head at that time was `20260921_000036`; it has since moved on - the
+  current head is stated under "Correction 2026-09-21 (final integration bundle)"
+  and its acceptance correction pass below.
+* **Evidence classes:** entries below that were component- or route-only must not
+  be read as production-route or paper-demo proof. The **paper-demo** result of
+  THAT pass was
+  `examples/hosted_acceptance/evidence/acceptance-20260921T163451Z-final.json`
+  (single-instrument entry/exit with attributed fills and a verified durable
+  settlement proof); the final integration pass superseded it with
+  `acceptance-20260921T174124Z-final.json`, which additionally requires the
+  linked worker run to be closed. Earlier captures are kept as `*-partial-*.json`.
+* **Live:** nothing in this campaign is live-ready or live-verified. All live
+  gates remain closed; "live readiness" is deploy + market certification + removing
+  the paper-only gate is NOT accepted - see the closure report's blocker list.
+* **Trusted sequencing:** scheduled occurrences create pinned hosted jobs; a
+  released roll close is the only plan that may close an open roll's old leg.
+
+---
+
+## Correction 2026-09-21 (final integration bundle)
+
+* **Head is now `20260921_000037`** (adds `000037` plan↔option-run binding to
+  `000035`/`000036`). Campaign phases 0..10 are ELEVEN; the original phase
+  migrations 000025..000034 are TEN. Earlier "ten phases / ten migrations" and
+  any "current head 000036" statement are superseded.
+* **Options lane:** the frozen `option_structure` plan now binds (`phase`,
+  `option_run_id`, `worker_run_id`, canonical scope) to the existing durable
+  `OptionRunState` engine with a unique `plan_id` and a partial-unique entry
+  edge (migration `000037`). Entry creates the run from frozen inputs; exit
+  validates the reference (a caller reference is a lookup key, never authority)
+  and drives the existing lifecycle; the option-run id is NOT the hosted
+  worker-run id. Evidence class: PG constraint + SQLite/unit + production
+  executor path (`ExecutorOptionRunBindingTests`).
+* **Worker run terminal closure:** reconciliation closes the LINKED hosted worker
+  run (`closed` + `closed_at`) inside the same guarded transaction as the
+  unblock; a run that cannot be closed refuses the unblock. Evidence class:
+  disposable PG (`test_worker_run_terminal_closure_postgres.py`, 4) plus the
+  simple demo's new required axis `linked_worker_run_closed`.
+* **Live adapter:** an internal preparatory adapter exists (approval, live run
+  binding, evaluation authority freshness, reservation, admission, quote and
+  margin evidence, pre-dispatch barrier work, acceptance != fill). It is NOT
+  enablement: there is no route and no flag; the public live route still refuses
+  `PAPER_ONLY_EXECUTION`. Evidence class: disposable PG with a fake broker
+  boundary only. Named blockers remain in
+  `documents/hosted-strategies-integration-closure.md`.
+* **Target_weights over HTTP** executes independently of options, and its product
+  is now frozen with the plan (`CNC` default) — without it the paper runtime
+  rejected the order as "missing required field(s): product", which the new HTTP
+  fixture exposed.
+* **Campaign claim:** the earlier "Projects 0-10 complete, all lanes
+  paper-certified, live readiness = deploy + market certification + removing
+  `PAPER_ONLY_EXECUTION`" remains REJECTED. Live readiness additionally requires a
+  hosted live execution mode (`ck_hosted_strategies_execution_mode` allows only
+  paper/dry_run) and a live fill-ingestion binding.
+
+* **Acceptance correction pass (same day):** head moved to
+  **`20260921_000038`** with the durable live-submission table
+  (`live_plan_submissions`: unique plan-step claim, `pending`/`uncertain`/
+  `rejected`/`no_op`, never repeated on an unknown outcome). Also fixed in that
+  pass: the plan->option-run edge is created atomically (one run under
+  concurrency), option steps are sized from the run's OWN fills (never the
+  aggregate strategy book; two structures sharing a contract no longer
+  interfere), live sizing derives side+quantity from target-minus-attributed-
+  current (no default BUY), and a roll is opened by its approved ACQUISITION plan
+  whose quantity is authoritative. Details and evidence classes are in
+  `documents/hosted-strategies-integration-closure.md`.
+* **Live adapter status:** durable and gated, but still PREPARATORY - live routes
+  remain closed, there is no hosted live execution mode, and live fill ingestion
+  is not bound. Do not describe it as production-ready or live-enabled.

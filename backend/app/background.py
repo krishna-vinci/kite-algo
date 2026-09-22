@@ -292,19 +292,30 @@ async def _strategy_schedule_loop(app: FastAPI):
     reports health. One schedule's failure is isolated inside the tick, so a bad
     schedule cannot stall the others, and the loop never raises out of its
     iteration — a scheduler that dies is worse than one that reports degraded.
+
+    The scheduler is constructed with the production job submitter: a due
+    occurrence creates the pinned hosted job that the supervisor's existing
+    lifecycle launches. A construction failure (a missing database, a bad
+    import) is retried on the next interval and reported as ``degraded`` rather
+    than killing the task, so health is truthful about whether scheduling works.
     """
-    from backend.strategies.scheduling import ScheduleScheduler
+    from backend.strategies.scheduling import HostedJobSubmitter, ScheduleScheduler
 
     interval = max(5.0, float(os.getenv("STRATEGY_SCHEDULE_INTERVAL_SECONDS", "60")))
 
-    scheduler = getattr(app.state, "strategy_scheduler", None)
-    if scheduler is None:
-        scheduler = ScheduleScheduler()
-        app.state.strategy_scheduler = scheduler
-
-    set_component_status("strategy_scheduler", "healthy", detail="Strategy scheduler started")
     while True:
         try:
+            scheduler = getattr(app.state, "strategy_scheduler", None)
+            if scheduler is None:
+                session_factory = _strategies_session_factory(app)
+                scheduler = ScheduleScheduler(
+                    session_factory,
+                    job_submitter=HostedJobSubmitter(session_factory),
+                )
+                app.state.strategy_scheduler = scheduler
+                set_component_status(
+                    "strategy_scheduler", "healthy", detail="Strategy scheduler started"
+                )
             result = await asyncio.to_thread(scheduler.tick)
             heartbeat(
                 "strategy_scheduler",
@@ -312,6 +323,7 @@ async def _strategy_schedule_loop(app: FastAPI):
                 meta={
                     "fired": len(result.get("fired") or []),
                     "skipped": len(result.get("skipped") or []),
+                    "expired": len(result.get("expired") or []),
                     "deferred": len(result.get("deferred") or []),
                     "errors": len(result.get("errors") or []),
                     "interval_seconds": interval,
@@ -326,3 +338,13 @@ async def _strategy_schedule_loop(app: FastAPI):
             logging.warning("Strategy scheduler loop failed: %s", exc, exc_info=True)
             set_component_status("strategy_scheduler", "degraded", detail=str(exc))
         await asyncio.sleep(interval)
+
+
+def _strategies_session_factory(app: FastAPI):
+    """The hosted-strategy session factory, exactly as the owner routes resolve it."""
+    factory = getattr(app.state, "strategies_session_factory", None)
+    if factory is not None:
+        return factory
+    from backend.app.database import SessionLocal
+
+    return SessionLocal

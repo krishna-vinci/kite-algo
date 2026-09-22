@@ -2790,7 +2790,8 @@ CREATE TABLE IF NOT EXISTS public.strategy_proposals (
     CONSTRAINT ck_proposals_evaluation_kind
         CHECK (evaluation_kind IN ('scheduled_occurrence', 'run_now')),
     CONSTRAINT ck_proposals_target_kind
-        CHECK (target_kind IN ('single_instrument', 'target_weights', 'intent_bundle')),
+        CHECK (target_kind IN ('single_instrument', 'target_weights', 'intent_bundle',
+                               'target_futures', 'option_structure')),
     CONSTRAINT ck_proposals_status CHECK (status IN ('received', 'validated', 'refused')),
     -- A scheduled occurrence always names the job that produced it.
     CONSTRAINT ck_proposals_scheduled_requires_job
@@ -2818,7 +2819,8 @@ CREATE TABLE IF NOT EXISTS public.strategy_plans (
     -- Exactly one frozen plan per proposal envelope.
     CONSTRAINT uq_plans_proposal UNIQUE (proposal_id),
     CONSTRAINT ck_plans_plan_kind
-        CHECK (plan_kind IN ('single_instrument', 'target_weights', 'intent_bundle')),
+        CHECK (plan_kind IN ('single_instrument', 'target_weights', 'intent_bundle',
+                             'target_futures', 'option_structure')),
     -- A full-snapshot plan cannot honour "omission means target zero" without
     -- both its revision and its member hash.
     CONSTRAINT ck_plans_target_weights_scope
@@ -2835,6 +2837,68 @@ CREATE TABLE IF NOT EXISTS public.strategy_plans (
 );
 CREATE INDEX IF NOT EXISTS idx_plans_strategy
     ON public.strategy_plans (strategy_id, created_at);
+
+-- The durable edge from a frozen option-structure plan to its option run. The
+-- option-run id (``option_run_states.strategy_run_id``) is a DIFFERENT identity
+-- from the hosted worker run; this relation is the only place they meet, so
+-- neither is overloaded. ``plan_id`` is unique (a plan resolves to one binding,
+-- so a retry returns the same run); an entry plan creates at most one run, while
+-- several exit plans may reference one run.
+CREATE TABLE IF NOT EXISTS public.strategy_plan_option_runs (
+    plan_id UUID PRIMARY KEY,
+    option_run_id TEXT NOT NULL,
+    worker_run_id TEXT,
+    strategy_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_plan_option_run_phase CHECK (phase IN ('entry', 'exit')),
+    CONSTRAINT fk_plan_option_run_plan FOREIGN KEY (plan_id)
+        REFERENCES public.strategy_plans (plan_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_plan_option_run_run FOREIGN KEY (option_run_id)
+        REFERENCES public.option_run_states (strategy_run_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_plan_option_run_strategy
+        FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_plan_option_run_run
+    ON public.strategy_plan_option_runs (option_run_id);
+CREATE INDEX IF NOT EXISTS idx_plan_option_run_worker
+    ON public.strategy_plan_option_runs (worker_run_id);
+-- At most one ENTRY plan per run; exit plans are deliberately many.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_option_run_entry
+    ON public.strategy_plan_option_runs (option_run_id)
+    WHERE phase = 'entry';
+
+-- The durable claim/outcome row for one live plan step (internal live adapter,
+-- public live routes remain closed). The UNIQUE (plan_id, step_no) claim is what
+-- stops two adapter instances or a restart from dispatching the same step twice.
+CREATE TABLE IF NOT EXISTS public.live_plan_submissions (
+    submission_id TEXT PRIMARY KEY,
+    plan_id UUID NOT NULL,
+    step_no INTEGER NOT NULL,
+    step_ref TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    state TEXT NOT NULL,
+    broker_order_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    delta_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_live_plan_step UNIQUE (plan_id, step_no),
+    CONSTRAINT ck_live_plan_submission_state
+        CHECK (state IN ('pending', 'uncertain', 'rejected', 'no_op')),
+    CONSTRAINT fk_live_plan_submission_plan FOREIGN KEY (plan_id)
+        REFERENCES public.strategy_plans (plan_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_live_plan_submission_strategy
+        FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_live_plan_submission_state
+    ON public.live_plan_submissions (state);
 
 CREATE TABLE IF NOT EXISTS public.strategy_proposal_journal (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -3369,8 +3433,8 @@ CREATE TABLE IF NOT EXISTS public.strategy_roll_events (
     detail JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT ck_roll_event CHECK (event IN (
-        'created', 'acquired', 'fill_proven', 'close_released', 'old_flat', 'completed',
-        'stalled', 'escalated'
+        'created', 'acquired', 'replacement_filled', 'fill_proven', 'close_released',
+        'old_flat', 'completed', 'stalled', 'escalated'
     )),
     CONSTRAINT fk_roll_events_roll FOREIGN KEY (roll_id)
         REFERENCES public.strategy_rolls (roll_id) ON DELETE RESTRICT

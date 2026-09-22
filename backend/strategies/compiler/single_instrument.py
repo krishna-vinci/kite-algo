@@ -18,6 +18,7 @@ from backend.strategies.compiler.base import (
     ResolvedPlan,
     TargetCompiler,
     ValidationRefusal,
+    pinned_units,
 )
 
 
@@ -102,6 +103,9 @@ class SingleInstrumentCompiler(TargetCompiler):
                     "broker_token": mapping["broker_token"],
                     "product": product,
                     "signed_quantity": target_quantity,
+                    # Executed unit, frozen here so execution never re-reads the
+                    # mutable catalog for it.
+                    **pinned_units(mapping),
                     # Carried so admission's notional arithmetic has a price from
                     # the plan itself, with no new market-data dependency (D-2).
                     "reference_price": reference_price,

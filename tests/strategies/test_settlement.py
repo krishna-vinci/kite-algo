@@ -121,6 +121,26 @@ class SettlementTestCase(unittest.TestCase):
             )
             cursor.execute(
                 """
+                CREATE TABLE public.live_plan_submissions (
+                    submission_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL,
+                    step_no INTEGER NOT NULL,
+                    step_ref TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    execution_environment TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    broker_order_ids TEXT NOT NULL DEFAULT '[]',
+                    delta_snapshot TEXT NOT NULL DEFAULT '{}',
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (plan_id, step_no)
+                )
+                """
+            )
+            cursor.execute(
+                """
                 CREATE TABLE public.strategy_jobs (
                     id TEXT PRIMARY KEY, strategy_id TEXT NOT NULL, owner_id TEXT,
                     account_scope TEXT, execution_mode TEXT, status TEXT NOT NULL DEFAULT 'queued'
@@ -410,6 +430,54 @@ class ProofTests(SettlementTestCase):
         )
         self.assertTrue(state["proof_valid"])
         self.assertEqual(state["barrier_version"], state["quiet_since_version"])
+
+    def test_a_proof_is_scoped_to_one_strategy_and_environment(self):
+        """A proof covers exactly one book: another strategy or mode is unproven."""
+        self._bind("run-1")
+        self.assertTrue(
+            self.barrier.record_proof(
+                account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV
+            ).recorded
+        )
+        own = self.barrier.state(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV
+        )
+        self.assertTrue(own["proof_valid"])
+        # Another strategy on the same account is NOT covered by that proof.
+        other_strategy = self.barrier.state(
+            account_id=ACCOUNT, strategy_id="stg-OTHER", execution_environment=ENV
+        )
+        self.assertFalse(other_strategy["proof_valid"])
+        self.assertFalse(other_strategy["exists"])
+        # Nor is another execution environment for the same strategy (the
+        # fixture proves the ``live`` book, so ``paper`` must stay unproven).
+        other_env = self.barrier.state(
+            account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment="paper"
+        )
+        self.assertFalse(other_env["proof_valid"])
+
+    def test_unreadable_evidence_refuses_the_proof_and_records_nothing(self):
+        """An unreadable work source is NOT an empty one: refuse, record nothing."""
+        from backend.strategies import settlement as settlement_module
+
+        def _unreadable(**_kwargs):
+            raise settlement_module.SettlementEvidenceUnavailable("order_trade_fills")
+
+        original = settlement_module.enumerate_inflight_work
+        settlement_module.enumerate_inflight_work = _unreadable
+        try:
+            result = self.barrier.record_proof(
+                account_id=ACCOUNT, strategy_id=STRATEGY, execution_environment=ENV
+            )
+        finally:
+            settlement_module.enumerate_inflight_work = original
+
+        self.assertFalse(result.recorded)
+        self.assertEqual(result.reason, "evidence_unavailable")
+        self.assertEqual(result.unavailable, ["order_trade_fills"])
+        # No proof row and no quiet stamp: the failure wrote nothing.
+        self.assertIsNone(self._barrier_row())
+        self.assertEqual(self._event_rows(), [])
 
     def test_any_later_work_event_invalidates_every_prior_proof(self):
         """The quiet window proves nothing: one work event kills the proof."""

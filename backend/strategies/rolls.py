@@ -49,6 +49,7 @@ OPEN_ROLL_STATES = ("acquiring", "proving_filled", "releasing_old", "action_requ
 ROLL_EVENTS = (
     "created",
     "acquired",
+    "replacement_filled",
     "fill_proven",
     "close_released",
     "old_flat",
@@ -56,6 +57,10 @@ ROLL_EVENTS = (
     "stalled",
     "escalated",
 )
+
+#: The role a frozen plan plays in a roll. It travels WITH the plan, so the
+#: executor can enforce the contract without being told by its caller.
+ROLL_PLAN_ROLES = ("open_new", "close_old")
 
 
 def _utcnow() -> datetime:
@@ -89,6 +94,24 @@ class ReleaseRefused(RollError):
     reason_code = "ROLL_FILL_NOT_PROVEN"
 
 
+class RollPlanMismatch(RollError):
+    """The plan a roll names is not this strategy's/account's frozen plan."""
+
+    reason_code = "ROLL_PLAN_MISMATCH"
+
+
+class RollCloseNotReleased(RollError):
+    """A close was attempted before the roll released it."""
+
+    reason_code = "ROLL_CLOSE_NOT_RELEASED"
+
+
+class RollUnknown(RollError):
+    """A plan names a roll that does not exist for this strategy."""
+
+    reason_code = "ROLL_UNKNOWN"
+
+
 class RollNotFlat(RollError):
     """The old book is not proven flat, so the roll cannot complete."""
 
@@ -106,7 +129,7 @@ class RollStateMachine:
         positions_reader: Optional[Callable[..., int]] = None,
     ) -> None:
         if session_factory is None:
-            from backend.workflows.repository import SessionLocal
+            from backend.app.database import SessionLocal
 
             session_factory = SessionLocal
         self.session_factory = session_factory
@@ -176,6 +199,116 @@ class RollStateMachine:
             ).scalars().all()
             return [self._view(row) for row in rows]
 
+    def for_plan(self, *, strategy_id: str, plan_id: str) -> Optional[Dict[str, Any]]:
+        """The roll a frozen plan belongs to, if any.
+
+        A plan may name an explicit ``roll_id``; when it does not, the roll that
+        names the plan is the binding. Both are durable lookups, never caller
+        claims, and a roll of another strategy is not a match.
+        """
+        if not plan_id:
+            return None
+        with self.session_factory() as session:
+            row = session.execute(
+                select(StrategyRoll)
+                .where(
+                    StrategyRoll.strategy_id == str(strategy_id),
+                    StrategyRoll.plan_id == str(plan_id),
+                )
+                .order_by(StrategyRoll.created_at.desc())
+            ).scalars().first()
+            return self._view(row) if row is not None else None
+
+    def by_id(self, *, strategy_id: str, roll_id: str) -> Optional[Dict[str, Any]]:
+        """One roll, only when it belongs to this strategy."""
+        roll = self.get(roll_id)
+        if roll is None or str(roll["strategy_id"]) != str(strategy_id):
+            return None
+        return roll
+
+    def _validate_plan_binding(
+        self,
+        *,
+        strategy_id: str,
+        account_id: str,
+        plan_id: str,
+        old_instrument_id: str,
+        new_instrument_id: str,
+    ) -> int:
+        """The named plan is the APPROVED ACQUISITION plan; return its quantity.
+
+        A roll is opened by the plan that acquires the replacement, and that plan
+        carries the replacement contract only - the old-contract close is its own
+        plan (the frozen close plan the executor releases later). Requiring both
+        contracts in one plan contradicted the executor's rule that a plan may
+        only address its own half.
+
+        The quantity is AUTHORITATIVE from the plan, not from the caller: a caller
+        may not lower the required replacement below what the approved plan buys.
+        """
+        from backend.strategies.attribution_models import StrategyPlan
+
+        with self.session_factory() as session:
+            row = session.execute(
+                select(StrategyPlan).where(StrategyPlan.plan_id == str(plan_id))
+            ).scalar_one_or_none()
+        if row is None:
+            raise RollPlanMismatch(
+                {"plan_id": str(plan_id), "message": "no frozen plan with this id"}
+            )
+        if str(row.strategy_id) != str(strategy_id) or str(row.account_id) != str(account_id):
+            raise RollPlanMismatch(
+                {
+                    "plan_id": str(plan_id),
+                    "plan_strategy_id": str(row.strategy_id),
+                    "plan_account_id": str(row.account_id),
+                    "strategy_id": str(strategy_id),
+                    "account_id": str(account_id),
+                    "message": "the plan belongs to another strategy or account",
+                }
+            )
+        legs = list((row.resolved_plan or {}).get("legs") or [])
+        instruments = {str(leg.get("instrument_id") or "") for leg in legs}
+        if str(old_instrument_id) in instruments:
+            # A plan that carries the old contract is not an acquisition plan.
+            raise RollPlanMismatch(
+                {
+                    "plan_id": str(plan_id),
+                    "old_instrument_id": str(old_instrument_id),
+                    "message": (
+                        "this plan carries the old contract: the roll is opened by the "
+                        "approved ACQUISITION plan, and the old-contract close is its own plan"
+                    ),
+                }
+            )
+        acquisition = [
+            leg for leg in legs if str(leg.get("instrument_id") or "") == str(new_instrument_id)
+        ]
+        if not acquisition:
+            raise RollPlanMismatch(
+                {
+                    "plan_id": str(plan_id),
+                    "new_instrument_id": str(new_instrument_id),
+                    "plan_instruments": sorted(instruments),
+                    "message": "the frozen plan does not carry the replacement contract",
+                }
+            )
+        leg = acquisition[0]
+        quantity = leg.get("quantity")
+        if quantity is None:
+            quantity = abs(int(leg.get("signed_quantity") or 0))
+        quantity = int(quantity or 0)
+        if quantity <= 0:
+            raise RollPlanMismatch(
+                {
+                    "plan_id": str(plan_id),
+                    "new_instrument_id": str(new_instrument_id),
+                    "quantity": quantity,
+                    "message": "the approved plan names no replacement quantity",
+                }
+            )
+        return quantity
+
     def events(self, roll_id: str) -> List[Dict[str, Any]]:
         with self.session_factory() as session:
             rows = session.execute(
@@ -221,6 +354,30 @@ class RollStateMachine:
                     ),
                 }
             )
+
+        # The plan (when named) is the authority for the contracts this roll may
+        # move AND for how much must be acquired: it must be THIS strategy's
+        # frozen ACQUISITION plan, and its quantity wins over the caller's.
+        if plan_id:
+            approved = self._validate_plan_binding(
+                strategy_id=str(strategy_id),
+                account_id=str(account_id),
+                plan_id=str(plan_id),
+                old_instrument_id=str(old_instrument_id),
+                new_instrument_id=str(new_instrument_id),
+            )
+            if int(required) != int(approved):
+                raise RollPlanMismatch(
+                    {
+                        "plan_id": str(plan_id),
+                        "required_replacement_quantity": int(required),
+                        "plan_replacement_quantity": int(approved),
+                        "message": (
+                            "the linked plan's quantity is authoritative; a roll may not "
+                            "require less than the approved acquisition"
+                        ),
+                    }
+                )
 
         roll_id = str(uuid.uuid4())
         session = self.session_factory()
@@ -294,6 +451,121 @@ class RollStateMachine:
             row.state = "proving_filled"
         return self.get(roll_id)
 
+    def replacement_fills(self, roll_id: str) -> List[Dict[str, Any]]:
+        """This roll's recorded replacement executions, oldest first."""
+        with self.session_factory() as session:
+            rows = session.execute(
+                select(StrategyRollEvent)
+                .where(
+                    StrategyRollEvent.roll_id == str(roll_id),
+                    StrategyRollEvent.event == "replacement_filled",
+                )
+                .order_by(StrategyRollEvent.created_at)
+            ).scalars().all()
+            return [dict(row.detail or {}) for row in rows]
+
+    def replacement_filled_quantity(self, roll_id: str) -> int:
+        """The proven replacement quantity: the sum of this roll's own fills."""
+        return int(
+            sum(int(entry.get("quantity") or 0) for entry in self.replacement_fills(roll_id))
+        )
+
+    def record_replacement_fill(
+        self,
+        roll_id: str,
+        *,
+        paper_order_id: str,
+        quantity: int,
+        instrument_id: str,
+        plan_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Record ONE confirmed replacement execution against this roll.
+
+        This is the roll's proof, and it is durable: the event names the paper
+        order that filled and the quantity it filled. Because the proof is an
+        event *of this roll*, a pre-existing holding on the new contract and an
+        unrelated new-contract purchase can never be counted as replacement - they
+        have no event here. Idempotent by ``paper_order_id``, so a retried or
+        replayed execution records the same fill exactly once.
+        """
+        order_id = str(paper_order_id or "")
+        amount = int(quantity or 0)
+        if not order_id:
+            raise RollStateError(
+                {"roll_id": str(roll_id), "message": "a replacement fill needs its paper order"}
+            )
+        if amount <= 0:
+            raise RollStateError(
+                {
+                    "roll_id": str(roll_id),
+                    "paper_order_id": order_id,
+                    "quantity": amount,
+                    "message": "a replacement fill must be a positive executed quantity",
+                }
+            )
+        session = self.session_factory()
+        try:
+            row = session.execute(
+                select(StrategyRoll)
+                .where(StrategyRoll.roll_id == str(roll_id))
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                raise RollStateError({"roll_id": str(roll_id), "message": "roll not found"})
+            if str(instrument_id) != str(row.new_instrument_id):
+                raise RollStateError(
+                    {
+                        "roll_id": str(roll_id),
+                        "instrument_id": str(instrument_id),
+                        "new_instrument_id": str(row.new_instrument_id),
+                        "message": "only the replacement contract can be recorded as replacement",
+                    }
+                )
+            if str(row.state) not in ("acquiring", "proving_filled", "action_required"):
+                raise RollStateError(
+                    {
+                        "roll_id": str(roll_id),
+                        "state": str(row.state),
+                        "message": "this roll is no longer acquiring a replacement",
+                    }
+                )
+            recorded = session.execute(
+                select(StrategyRollEvent).where(
+                    StrategyRollEvent.roll_id == str(roll_id),
+                    StrategyRollEvent.event == "replacement_filled",
+                )
+            ).scalars().all()
+            if any(
+                str((entry.detail or {}).get("paper_order_id") or "") == order_id
+                for entry in recorded
+            ):
+                # Idempotent replay: the same paper order is recorded once.
+                session.rollback()
+                return self.get(roll_id)
+            self._record(
+                session,
+                roll_id=str(roll_id),
+                event="replacement_filled",
+                detail={
+                    "paper_order_id": order_id,
+                    "quantity": amount,
+                    "instrument_id": str(instrument_id),
+                    "plan_id": None if plan_id is None else str(plan_id),
+                    "actor_id": None if actor_id is None else str(actor_id),
+                },
+            )
+            row.proven_filled_quantity = int(
+                sum(int((entry.detail or {}).get("quantity") or 0) for entry in recorded)
+            ) + amount
+            session.commit()
+        except SQLAlchemyError:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+        return self.get(roll_id)
+
     def prove_filled(
         self, roll_id: str, *, proven_quantity: Optional[int] = None
     ) -> Dict[str, Any]:
@@ -303,24 +575,46 @@ class RollStateMachine:
         ``action_required`` with the old attribution intact — and never reverses,
         because reversing would close a position the strategy still holds on the
         strength of a fill that did not happen.
+
+        The proof is this roll's own recorded replacement executions
+        (:meth:`record_replacement_fill`), never a caller's number and never the
+        raw attributed book: the book also carries holdings that predate the roll
+        and holdings that belong to other decisions, neither of which proves a
+        replacement. ``proven_quantity`` remains an INTERNAL seam for the state
+        machine's own unit tests and is never reachable from the HTTP surface.
         """
         roll = self.get(roll_id)
         if roll is None:
             raise RollStateError({"roll_id": str(roll_id), "message": "roll not found"})
         if str(roll["state"]) not in ("acquiring", "proving_filled", "action_required"):
+            # Idempotent replay: a proof that already landed (a retried request,
+            # or a restart) reports the standing decision instead of writing a
+            # second one. Any other state is a real refusal.
+            if (
+                str(roll["state"]) in ("releasing_old", "completed")
+                and self.replacement_filled_quantity(roll_id)
+                >= int(roll["required_replacement_quantity"])
+            ):
+                return roll
             raise RollStateError(
                 {"roll_id": str(roll_id), "state": str(roll["state"]),
                  "message": "only an in-flight roll can prove a fill"}
             )
 
-        expected_sign = 1 if str(roll["new_coordinate"].get("side") or "BUY").upper() != "SELL" else -1
         if proven_quantity is None:
-            proven = self.attributed_quantity(
-                strategy_id=str(roll["strategy_id"]),
-                account_id=str(roll["account_id"]),
-                instrument_id=str(roll["new_instrument_id"]),
-                product=str(roll["new_coordinate"].get("product") or "NRML"),
-            )
+            if self._positions_reader is not None:
+                # INTERNAL test seam only: the HTTP surface constructs the machine
+                # without a reader, so production proof is always this roll's own
+                # recorded replacement executions. A synthetic proof reader stands
+                # in for them in the machine's own unit tests.
+                proven = self.attributed_quantity(
+                    strategy_id=str(roll["strategy_id"]),
+                    account_id=str(roll["account_id"]),
+                    instrument_id=str(roll["new_instrument_id"]),
+                    product=str(roll["new_coordinate"].get("product") or "NRML"),
+                )
+            else:
+                proven = self.replacement_filled_quantity(roll_id)
         else:
             proven = int(proven_quantity)
         proven = abs(proven)
@@ -349,7 +643,6 @@ class RollStateMachine:
             row.proven_filled_quantity = proven
             row.state = "action_required"
             row.action_reason = "replacement_incomplete"
-        _ = expected_sign
         return self.get(roll_id)
 
     def release_close(self, roll_id: str) -> Dict[str, Any]:

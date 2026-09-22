@@ -145,3 +145,40 @@ def test_async_proposals_submit_round_trips():
     assert url.endswith("/worker/proposals")
     assert kwargs["json"] == PAYLOAD
     assert result["proposal_id"] == "prop-1"
+
+
+def test_submit_proposal_carries_the_hosted_session_nonce():
+    """A hosted child's proposal must present the session it claimed.
+
+    The route enforces session freshness before persistence, so a client that
+    silently dropped the nonce would make every hosted proposal a 409.
+    """
+    transport = SyncTransport(Response(VALIDATED))
+    client = KiteAlgoWorkerClient(_config())
+    client.session = transport
+
+    client.submit_proposal(PAYLOAD, session_nonce="wsn_hosted_1")
+
+    _method, _url, kwargs = transport.calls[0]
+    assert kwargs["headers"]["X-Worker-Session-Nonce"] == "wsn_hosted_1"
+
+
+def test_managed_run_submits_with_its_own_run_and_nonce():
+    from kite_algo_worker.managed_run import ManagedRun
+    from kite_algo_worker.run_config import RunConfig
+
+    transport = SyncTransport(Response(VALIDATED))
+    client = KiteAlgoWorkerClient(_config())
+    client.session = transport
+    managed = ManagedRun(
+        client=client,
+        config=RunConfig(template_id="hosted:stg-1", account_scope="kite:paper"),
+        run={"strategy_run_id": "run-hosted-1"},
+        session_nonce="wsn_hosted_2",
+    )
+
+    managed.submit_proposal({"evaluation_id": "sched:sch-1:2026-10-10"})
+
+    _method, _url, kwargs = transport.calls[0]
+    assert kwargs["headers"]["X-Worker-Session-Nonce"] == "wsn_hosted_2"
+    assert kwargs["json"]["strategy_run_id"] == "run-hosted-1"

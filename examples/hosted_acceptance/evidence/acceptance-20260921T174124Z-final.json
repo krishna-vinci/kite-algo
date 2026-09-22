@@ -1,0 +1,589 @@
+{
+  "steps": [
+    {
+      "step": "database_created",
+      "at": 1790012430.7763977,
+      "database": "kite_accept_e171d46bf9",
+      "dsn_host": "127.0.0.1:15433/kite_accept_e171d46bf9"
+    },
+    {
+      "step": "migrated_to_head",
+      "at": 1790012434.93268
+    },
+    {
+      "step": "catalog_seeded",
+      "at": 1790012435.0307596,
+      "symbol": "RELIANCE"
+    },
+    {
+      "step": "api_serving",
+      "at": 1790012437.9903853,
+      "base": "http://127.0.0.1:36913"
+    },
+    {
+      "step": "operator_credential_env",
+      "at": 1790012438.027949,
+      "APP_ADMIN_PASSWORD": true,
+      "APP_ADMIN_PASSWORD_HASH": false,
+      "APP_ADMIN_PASSWORD_HASH_B64": false,
+      "APP_ADMIN_PASSWORD_HASH_FILE": false,
+      "APP_JWT_SECRET": true
+    },
+    {
+      "step": "operator_login",
+      "at": 1790012438.0331771,
+      "status": 200
+    },
+    {
+      "step": "version_created",
+      "at": 1790012438.2444189,
+      "version_id": "hsv_ce286c43b417467fbfc3a8b7908bb884",
+      "keys": [
+        "capabilities_snapshot",
+        "created_at",
+        "created_by",
+        "parameters_schema",
+        "source",
+        "source_sha256",
+        "strategy_id",
+        "version",
+        "version_id"
+      ]
+    },
+    {
+      "step": "operator_setup",
+      "at": 1790012438.363056,
+      "strategy_id": "hs_9c85e68922454ed6a93ef2e8882fd0bc",
+      "version_id": "hsv_ce286c43b417467fbfc3a8b7908bb884",
+      "job_id": "hsj_73aff2049f6a43449aeb2e39a98a9af0",
+      "job_keys": [
+        "account_scope",
+        "attempt",
+        "created_at",
+        "desired_state",
+        "execution_mode",
+        "handoff_at",
+        "job_id",
+        "last_progress_at",
+        "logs_discarded",
+        "logs_source",
+        "owner_id",
+        "process_cleanup_actor",
+        "process_cleanup_at",
+        "process_cleanup_state",
+        "reconciled_at",
+        "recovery_required_at",
+        "replacement_blocked",
+        "run_id",
+        "status",
+        "stop",
+        "stop_requested_at",
+        "stop_requested_by",
+        "strategy_id",
+        "token_present",
+        "updated_at",
+        "version_id"
+      ]
+    },
+    {
+      "step": "supervisor_jobs_listed",
+      "at": 1790012438.4260824,
+      "status": 200,
+      "body": "{\"jobs\":[{\"job_id\":\"hsj_73aff2049f6a43449aeb2e39a98a9af0\",\"strategy_id\":\"hs_9c85e68922454ed6a93ef2e8882fd0bc\",\"attempt\":1,\"status\":\"queued\",\"execution_mode\":\"paper\",\"lease_epoch\":0,\"created_at\":\"2026-09-21T17:40:38.322840+00:00\"}]}",
+      "header": "X-Hosted-Supervisor-Credential"
+    },
+    {
+      "step": "entry_plan_frozen",
+      "at": 1790012439.731409,
+      "plan_id": "25898eb9-db13-4ad2-a96f-43577f9ec9e9"
+    },
+    {
+      "step": "operator_execute",
+      "at": 1790012460.9534292,
+      "plan_id": "25898eb9-db13-4ad2-a96f-43577f9ec9e9",
+      "status": "filled",
+      "steps": [
+        {
+          "step_no": 1,
+          "event": "filled",
+          "paper_order_id": "PAPER-4F9E8A1C36B5",
+          "filled_quantity": 10,
+          "refusal_reason": null,
+          "detail": {
+            "fill_price": "1500.000000",
+            "tradingsymbol": "RELIANCE"
+          }
+        }
+      ]
+    },
+    {
+      "step": "attribution_published",
+      "at": 1790012461.0216537,
+      "projection_version": 1,
+      "strategy_id": "hs_9c85e68922454ed6a93ef2e8882fd0bc"
+    },
+    {
+      "step": "entry_position_attributed",
+      "at": 1790012461.0387828,
+      "quantity": 10
+    },
+    {
+      "step": "exit_plan_frozen",
+      "at": 1790012461.059829,
+      "plan_id": "ee79ea64-2e93-4ed2-ae70-78cc74aa6a31"
+    },
+    {
+      "step": "operator_execute",
+      "at": 1790012482.0014381,
+      "plan_id": "ee79ea64-2e93-4ed2-ae70-78cc74aa6a31",
+      "status": "filled",
+      "steps": [
+        {
+          "step_no": 1,
+          "event": "filled",
+          "paper_order_id": "PAPER-9102DA1CFC1E",
+          "filled_quantity": 10,
+          "refusal_reason": null,
+          "detail": {
+            "fill_price": "1500.000000",
+            "tradingsymbol": "RELIANCE"
+          }
+        }
+      ]
+    },
+    {
+      "step": "attribution_published",
+      "at": 1790012482.071147,
+      "projection_version": 2,
+      "strategy_id": "hs_9c85e68922454ed6a93ef2e8882fd0bc"
+    },
+    {
+      "step": "final_position_attributed",
+      "at": 1790012482.0911126,
+      "quantity": 0
+    },
+    {
+      "step": "job_stop",
+      "at": 1790012482.188436,
+      "stop": {
+        "requested": true,
+        "state": "stopping",
+        "requested_at": "2026-09-21T17:41:22.133441+00:00",
+        "requested_by": "app:admin",
+        "replacement_blocked": true,
+        "note": "Stop requested; the supervisor will stop the child and complete the authorized terminal transition. Stop does not cancel orders or flatten."
+      },
+      "idempotent": false
+    },
+    {
+      "step": "supervisor_returned",
+      "at": 1790012483.2522929,
+      "result": {
+        "job_id": "hsj_73aff2049f6a43449aeb2e39a98a9af0",
+        "outcome": "stop_requested",
+        "stop": "exited",
+        "log_overflow": false,
+        "log_ref": "/home/krishna/kite-algo/.acceptance-workspace/logs/hsj_73aff2049f6a43449aeb2e39a98a9af0.log",
+        "process_cleanup_reported": true,
+        "logs_shipped": true,
+        "terminal": "recovery_required",
+        "replacement_blocked": true
+      }
+    },
+    {
+      "step": "attempt_terminal",
+      "at": 1790012483.7663455,
+      "id": "hsj_73aff2049f6a43449aeb2e39a98a9af0",
+      "status": "recovery_required",
+      "process_cleanup_state": "confirmed",
+      "reconciled_at": null
+    },
+    {
+      "step": "supervisor_finished",
+      "at": 1790012483.7664363,
+      "alive": false,
+      "result": {
+        "job_id": "hsj_73aff2049f6a43449aeb2e39a98a9af0",
+        "outcome": "stop_requested",
+        "stop": "exited",
+        "log_overflow": false,
+        "log_ref": "/home/krishna/kite-algo/.acceptance-workspace/logs/hsj_73aff2049f6a43449aeb2e39a98a9af0.log",
+        "process_cleanup_reported": true,
+        "logs_shipped": true,
+        "terminal": "recovery_required",
+        "replacement_blocked": true
+      }
+    },
+    {
+      "step": "job_reconciliation",
+      "at": 1790012484.17753,
+      "status": 200,
+      "settled": true,
+      "body": {
+        "status": "reconciled",
+        "job_id": "hsj_73aff2049f6a43449aeb2e39a98a9af0",
+        "attempt": 1,
+        "case": "trading_settled_flat",
+        "reason_code": "TRADING_SETTLED_FLAT",
+        "replacement_blocked": false,
+        "blocking_reasons": [],
+        "evidence": {
+          "job_id": "hsj_73aff2049f6a43449aeb2e39a98a9af0",
+          "strategy_id": "hs_9c85e68922454ed6a93ef2e8882fd0bc",
+          "attempt": 1,
+          "run_id": "run_f0b6f630c2724d32ba05ac1ac8be6968",
+          "launched": true,
+          "trade_capable": true,
+          "execution_mode": "paper",
+          "job_status": "recovery_required",
+          "desired_state": "stopped",
+          "replacement_blocked": true,
+          "process_cleanup_state": "confirmed",
+          "process_cleanup_at": "2026-09-21T17:41:23.046482+00:00",
+          "process_cleanup_actor": "Debian-home:2539018",
+          "authority_state": "revoked",
+          "run_status": "open",
+          "work_state": "settled",
+          "exposure_state": "flat",
+          "protection_state": "settled",
+          "recovery_action_required": false,
+          "evidence_complete": true,
+          "unavailable": [],
+          "notes": [
+            "execution_settlement_barrier_quiescence_verified"
+          ],
+          "settlement_watermark": "2026-09-21T17:41:06.614902+00:00:2:0",
+          "quiescence_state": "verified"
+        },
+        "audit_id": "hsr_b53ba2e67fea4ef498c5ea97162a3a58"
+      }
+    },
+    {
+      "step": "evidence_collected",
+      "at": 1790012484.225132,
+      "summary": {
+        "plans": 2,
+        "filled_steps": 2,
+        "paper_orders": 2,
+        "final_attributed_quantity": 0,
+        "reservation_statuses": [
+          "consumed",
+          "consumed"
+        ],
+        "job_statuses": [
+          "stopped"
+        ],
+        "process_cleanup": [
+          "confirmed"
+        ],
+        "barrier_events": [
+          "work_created",
+          "work_resolved",
+          "work_created",
+          "work_resolved",
+          "proof_recorded"
+        ]
+      }
+    },
+    {
+      "step": "evidence_written",
+      "at": 1790012484.2273629,
+      "path": "/home/krishna/kite-algo/examples/hosted_acceptance/evidence/acceptance-20260921T174124Z.json"
+    },
+    {
+      "step": "database_dropped",
+      "at": 1790012484.43233,
+      "database": "kite_accept_e171d46bf9"
+    }
+  ],
+  "evidence": {
+    "proposals": [
+      {
+        "proposal_id": "c578bd48-7273-4a48-877e-7b5a11217e8b",
+        "status": "validated",
+        "target_kind": "single_instrument",
+        "evaluation_id": "run_f0b6f630c2724d32ba05ac1ac8be6968:entry:2",
+        "created_at": "2026-09-21 17:40:39.638746+00:00"
+      },
+      {
+        "proposal_id": "bf89df5b-cc29-4349-a091-0f69f9c97737",
+        "status": "validated",
+        "target_kind": "single_instrument",
+        "evaluation_id": "run_f0b6f630c2724d32ba05ac1ac8be6968:exit:5",
+        "created_at": "2026-09-21 17:40:40.435581+00:00"
+      }
+    ],
+    "plans": [
+      {
+        "plan_id": "25898eb9-db13-4ad2-a96f-43577f9ec9e9",
+        "plan_kind": "single_instrument",
+        "legs": [
+          {
+            "product": "CNC",
+            "exchange": "NSE",
+            "lot_size": 1,
+            "lot_source": "catalog",
+            "broker_token": 738561,
+            "broker_symbol": "RELIANCE",
+            "instrument_id": "3163ae00-4eca-4c1a-8319-bbf2d5228e2c",
+            "tradingsymbol": "RELIANCE",
+            "broker_exchange": "NSE",
+            "reference_price": 1500.0,
+            "signed_quantity": 10
+          }
+        ]
+      },
+      {
+        "plan_id": "ee79ea64-2e93-4ed2-ae70-78cc74aa6a31",
+        "plan_kind": "single_instrument",
+        "legs": [
+          {
+            "product": "CNC",
+            "exchange": "NSE",
+            "lot_size": 1,
+            "lot_source": "catalog",
+            "broker_token": 738561,
+            "broker_symbol": "RELIANCE",
+            "instrument_id": "3163ae00-4eca-4c1a-8319-bbf2d5228e2c",
+            "tradingsymbol": "RELIANCE",
+            "broker_exchange": "NSE",
+            "reference_price": 1500.0,
+            "signed_quantity": 0
+          }
+        ]
+      }
+    ],
+    "execution_events": [
+      {
+        "plan_id": "25898eb9-db13-4ad2-a96f-43577f9ec9e9",
+        "step_no": 1,
+        "event": "submitted",
+        "filled_quantity": null,
+        "refusal_reason": null,
+        "paper_order_id": null
+      },
+      {
+        "plan_id": "25898eb9-db13-4ad2-a96f-43577f9ec9e9",
+        "step_no": 1,
+        "event": "filled",
+        "filled_quantity": 10,
+        "refusal_reason": null,
+        "paper_order_id": "PAPER-4F9E8A1C36B5"
+      },
+      {
+        "plan_id": "ee79ea64-2e93-4ed2-ae70-78cc74aa6a31",
+        "step_no": 1,
+        "event": "submitted",
+        "filled_quantity": null,
+        "refusal_reason": null,
+        "paper_order_id": null
+      },
+      {
+        "plan_id": "ee79ea64-2e93-4ed2-ae70-78cc74aa6a31",
+        "step_no": 1,
+        "event": "filled",
+        "filled_quantity": 10,
+        "refusal_reason": null,
+        "paper_order_id": "PAPER-9102DA1CFC1E"
+      }
+    ],
+    "reservations": [
+      {
+        "reservation_id": "a352dfcd-aa5b-4899-865e-5ad7fda696e6",
+        "plan_id": "25898eb9-db13-4ad2-a96f-43577f9ec9e9",
+        "status": "consumed",
+        "execution_environment": "paper"
+      },
+      {
+        "reservation_id": "4ca42168-aa28-431a-bd6c-e4489a96c687",
+        "plan_id": "ee79ea64-2e93-4ed2-ae70-78cc74aa6a31",
+        "status": "consumed",
+        "execution_environment": "paper"
+      }
+    ],
+    "paper_orders": [
+      {
+        "order_id": "PAPER-4F9E8A1C36B5",
+        "tradingsymbol": "RELIANCE",
+        "transaction_type": "buy",
+        "quantity": 10,
+        "filled_quantity": 10,
+        "status": "filled",
+        "strategy_run_id": "run_f0b6f630c2724d32ba05ac1ac8be6968"
+      },
+      {
+        "order_id": "PAPER-9102DA1CFC1E",
+        "tradingsymbol": "RELIANCE",
+        "transaction_type": "sell",
+        "quantity": 10,
+        "filled_quantity": 10,
+        "status": "filled",
+        "strategy_run_id": "run_f0b6f630c2724d32ba05ac1ac8be6968"
+      }
+    ],
+    "attributed_position": [],
+    "jobs": [
+      {
+        "id": "hsj_73aff2049f6a43449aeb2e39a98a9af0",
+        "status": "stopped",
+        "execution_mode": "paper",
+        "lease_owner": "Debian-home:2539018",
+        "lease_epoch": 1,
+        "attempt": 1,
+        "run_id": "run_f0b6f630c2724d32ba05ac1ac8be6968",
+        "process_cleanup_state": "confirmed"
+      }
+    ],
+    "linked_runs": [
+      {
+        "strategy_run_id": "run_f0b6f630c2724d32ba05ac1ac8be6968",
+        "execution_mode": "paper",
+        "status": "closed",
+        "closed_at": "2026-09-21 17:41:24.154247+00:00"
+      }
+    ],
+    "barrier_events": [
+      {
+        "event": "work_created",
+        "ref": "plan:25898eb9-db13-4ad2-a96f-43577f9ec9e9:step:1"
+      },
+      {
+        "event": "work_resolved",
+        "ref": "plan:25898eb9-db13-4ad2-a96f-43577f9ec9e9:step:1"
+      },
+      {
+        "event": "work_created",
+        "ref": "plan:ee79ea64-2e93-4ed2-ae70-78cc74aa6a31:step:1"
+      },
+      {
+        "event": "work_resolved",
+        "ref": "plan:ee79ea64-2e93-4ed2-ae70-78cc74aa6a31:step:1"
+      },
+      {
+        "event": "proof_recorded",
+        "ref": "reconcile:hsj_73aff2049f6a43449aeb2e39a98a9af0:1"
+      }
+    ]
+  },
+  "errors": [],
+  "trails": {
+    "entry": {
+      "plan_id": "25898eb9-db13-4ad2-a96f-43577f9ec9e9",
+      "status": "filled",
+      "steps": [
+        {
+          "step_no": 1,
+          "event": "filled",
+          "paper_order_id": "PAPER-4F9E8A1C36B5",
+          "filled_quantity": 10,
+          "refusal_reason": null,
+          "detail": {
+            "fill_price": "1500.000000",
+            "tradingsymbol": "RELIANCE"
+          }
+        }
+      ],
+      "reservation_id": "a352dfcd-aa5b-4899-865e-5ad7fda696e6",
+      "paper_order_ids": [
+        "PAPER-4F9E8A1C36B5"
+      ]
+    },
+    "exit": {
+      "plan_id": "ee79ea64-2e93-4ed2-ae70-78cc74aa6a31",
+      "status": "filled",
+      "steps": [
+        {
+          "step_no": 1,
+          "event": "filled",
+          "paper_order_id": "PAPER-9102DA1CFC1E",
+          "filled_quantity": 10,
+          "refusal_reason": null,
+          "detail": {
+            "fill_price": "1500.000000",
+            "tradingsymbol": "RELIANCE"
+          }
+        }
+      ],
+      "reservation_id": "4ca42168-aa28-431a-bd6c-e4489a96c687",
+      "paper_order_ids": [
+        "PAPER-9102DA1CFC1E"
+      ]
+    }
+  },
+  "settlement": {
+    "settled": true,
+    "status": 200,
+    "body": {
+      "status": "reconciled",
+      "job_id": "hsj_73aff2049f6a43449aeb2e39a98a9af0",
+      "attempt": 1,
+      "case": "trading_settled_flat",
+      "reason_code": "TRADING_SETTLED_FLAT",
+      "replacement_blocked": false,
+      "blocking_reasons": [],
+      "evidence": {
+        "job_id": "hsj_73aff2049f6a43449aeb2e39a98a9af0",
+        "strategy_id": "hs_9c85e68922454ed6a93ef2e8882fd0bc",
+        "attempt": 1,
+        "run_id": "run_f0b6f630c2724d32ba05ac1ac8be6968",
+        "launched": true,
+        "trade_capable": true,
+        "execution_mode": "paper",
+        "job_status": "recovery_required",
+        "desired_state": "stopped",
+        "replacement_blocked": true,
+        "process_cleanup_state": "confirmed",
+        "process_cleanup_at": "2026-09-21T17:41:23.046482+00:00",
+        "process_cleanup_actor": "Debian-home:2539018",
+        "authority_state": "revoked",
+        "run_status": "open",
+        "work_state": "settled",
+        "exposure_state": "flat",
+        "protection_state": "settled",
+        "recovery_action_required": false,
+        "evidence_complete": true,
+        "unavailable": [],
+        "notes": [
+          "execution_settlement_barrier_quiescence_verified"
+        ],
+        "settlement_watermark": "2026-09-21T17:41:06.614902+00:00:2:0",
+        "quiescence_state": "verified"
+      },
+      "audit_id": "hsr_b53ba2e67fea4ef498c5ea97162a3a58"
+    }
+  },
+  "summary": {
+    "plans": 2,
+    "filled_steps": 2,
+    "paper_orders": 2,
+    "final_attributed_quantity": 0,
+    "reservation_statuses": [
+      "consumed",
+      "consumed"
+    ],
+    "job_statuses": [
+      "stopped"
+    ],
+    "process_cleanup": [
+      "confirmed"
+    ],
+    "barrier_events": [
+      "work_created",
+      "work_resolved",
+      "work_created",
+      "work_resolved",
+      "proof_recorded"
+    ],
+    "_buy_sell_shapes": {
+      "buy": 10,
+      "sell": 10
+    }
+  },
+  "required_assertions": {
+    "final_attributed_quantity_zero": true,
+    "entry_and_exit_paper_orders": true,
+    "settlement_reconciled": true,
+    "linked_worker_run_closed": true
+  },
+  "ok": true
+}

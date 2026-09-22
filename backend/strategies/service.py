@@ -82,14 +82,21 @@ __all__ = [
 ALLOWED_EXECUTION_MODES = ("paper", "dry_run")
 ALLOWED_JOB_KINDS = ("continuous", "finite")
 ALLOWED_STALE_EXIT_POLICIES = ("none", "exit_on_worker_stale")
-#: ``session_close`` was deliberately deferred (ambiguous completion window);
-#: the trigger is an explicit clock time, optionally on a weekday.
-ALLOWED_SCHEDULE_KINDS = ("daily", "weekly")
+#: Every kind the stored schedule vocabulary allows. ``weekly`` needs a weekday,
+#: ``monthly`` a day of month, ``calendar`` explicit ISO dates; ``daily`` is a
+#: plain clock time. ``session_close`` was deliberately deferred (ambiguous
+#: completion window), so it is still absent.
+ALLOWED_SCHEDULE_KINDS = ("daily", "weekly", "monthly", "calendar")
 
 #: Actions a CHILD run token may hold. ``heartbeat`` is absent on purpose.
 #: ``runs:progress`` is the child-authenticated liveness/progress marker.
+#: ``proposals:submit`` is a *trading* right (G5): it rides with
+#: ``order_capable`` so a data-only hosted child can never open proposal
+#: authority, and it never appears in the base or notify sets.
 CHILD_BASE_ACTIONS = frozenset({"runs:read", "runs:log", "runs:progress"})
-CHILD_ORDER_ACTIONS = frozenset({"intents:submit", "runs:exit", "risk:update"})
+CHILD_ORDER_ACTIONS = frozenset(
+    {"intents:submit", "runs:exit", "risk:update", "proposals:submit"}
+)
 CHILD_NOTIFY_ACTIONS = frozenset({"notifications:publish"})
 #: Lifecycle rights reserved to the supervisor (internal lifecycle API).
 CHILD_FORBIDDEN_ACTIONS = frozenset({"heartbeat"})
@@ -393,15 +400,19 @@ def validate_schedule(
     schedule_kind: str,
     at_time: str,
     weekday: Optional[int] = None,
+    day_of_month: Optional[int] = None,
+    calendar_dates: Optional[Iterable[str]] = None,
     timezone: str = "Asia/Kolkata",
     window_end: Optional[str] = None,
     squareoff_at: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Validate the bounded v1 schedule shape.
+    """Validate the bounded schedule shape for every supported kind.
 
-    v1 supports a daily or weekly explicit clock time. ``session_close`` is
-    rejected (its completion window is ambiguous) and a weekly schedule requires
-    an explicit weekday.
+    ``daily`` is a clock time, ``weekly`` adds a weekday, ``monthly`` a day of
+    month (clamped to the month's length at materialisation), and ``calendar``
+    the explicit ISO dates. ``session_close`` remains rejected (ambiguous
+    completion window). A field that belongs to another kind is rejected rather
+    than stored, so a schedule can never carry a silent second meaning.
     """
     if schedule_kind not in ALLOWED_SCHEDULE_KINDS:
         raise StrategyValidationError(
@@ -410,7 +421,14 @@ def validate_schedule(
     at = _validate_clock("at_time", at_time)
     if at is None:
         raise StrategyValidationError("at_time is required")
-    if schedule_kind == "weekly":
+
+    if schedule_kind == "daily":
+        if weekday is not None or day_of_month is not None or calendar_dates is not None:
+            raise StrategyValidationError("a daily schedule takes no weekday/day_of_month/dates")
+        weekday = None
+        day_of_month = None
+        calendar_dates = None
+    elif schedule_kind == "weekly":
         if (
             weekday is None
             or not isinstance(weekday, int)
@@ -418,17 +436,64 @@ def validate_schedule(
             or not (0 <= weekday <= 6)
         ):
             raise StrategyValidationError("a weekly schedule requires weekday 0..6")
-    else:
+        if day_of_month is not None or calendar_dates is not None:
+            raise StrategyValidationError("a weekly schedule takes no day_of_month/calendar dates")
+        day_of_month = None
+        calendar_dates = None
+    elif schedule_kind == "monthly":
+        if (
+            day_of_month is None
+            or not isinstance(day_of_month, int)
+            or isinstance(day_of_month, bool)
+            or not (1 <= day_of_month <= 31)
+        ):
+            raise StrategyValidationError("a monthly schedule requires day_of_month 1..31")
+        if weekday is not None or calendar_dates is not None:
+            raise StrategyValidationError("a monthly schedule takes no weekday/calendar dates")
         weekday = None
+        calendar_dates = None
+    else:  # calendar
+        dates = _validate_calendar_dates(calendar_dates)
+        if not dates:
+            raise StrategyValidationError(
+                "a calendar schedule requires at least one ISO date in calendar_dates"
+            )
+        if weekday is not None or day_of_month is not None:
+            raise StrategyValidationError("a calendar schedule takes no weekday/day_of_month")
+        weekday = None
+        day_of_month = None
+        calendar_dates = dates
+
     tz = str(timezone or "").strip() or "Asia/Kolkata"
     return {
         "schedule_kind": schedule_kind,
         "at_time": at,
         "weekday": weekday,
+        "day_of_month": day_of_month,
+        "calendar_dates": calendar_dates,
         "timezone": tz,
         "window_end": _validate_clock("window_end", window_end),
         "squareoff_at": _validate_clock("squareoff_at", squareoff_at),
     }
+
+
+def _validate_calendar_dates(values: Optional[Iterable[str]]) -> Optional[List[str]]:
+    """Normalize explicit ISO dates: sorted, unique, and actually valid dates."""
+    from datetime import date as _date
+
+    if values is None:
+        return None
+    if isinstance(values, str):
+        candidates = [item.strip() for item in values.split(",") if item.strip()]
+    else:
+        candidates = [str(item).strip() for item in values if str(item).strip()]
+    parsed: List[str] = []
+    for item in candidates:
+        try:
+            parsed.append(_date.fromisoformat(item).isoformat())
+        except ValueError as exc:
+            raise StrategyValidationError(f"calendar_dates entry is not an ISO date: {item!r}") from exc
+    return sorted(dict.fromkeys(parsed))
 
 
 # ---------------------------------------------------------------------------

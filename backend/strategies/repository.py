@@ -32,7 +32,7 @@ import copy
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -92,6 +92,23 @@ class StrategyDisabled(Exception):
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _dialect_name(session: Any) -> str:
+    """The session's dialect name (``postgresql``/``sqlite``), best effort.
+
+    Used for the one thing that genuinely differs between the production database
+    and the SQLite test fixture: ``NOW()`` versus ``CURRENT_TIMESTAMP``. An
+    unknown session shape defaults to PostgreSQL, which is the production path.
+    """
+    bind = None
+    getter = getattr(session, "get_bind", None)
+    if callable(getter):
+        try:
+            bind = getter()
+        except Exception:  # noqa: BLE001 - an unknown session shape is not fatal
+            bind = None
+    return str(getattr(getattr(bind, "dialect", None), "name", None) or "postgresql")
 
 
 class SqlAlchemyStrategyRepository:
@@ -501,14 +518,29 @@ class SqlAlchemyStrategyRepository:
         execution_mode: str,
         params: Optional[Dict[str, Any]] = None,
         occurrence_key: Optional[str] = None,
+        identity: Optional[Dict[str, Any]] = None,
         attempt: int = 1,
         desired_state: str = "started",
+        session: Optional[Session] = None,
     ) -> StrategyJob:
         """Create a queued job, enforcing identity, snapshots and the block.
 
         The whole check + insert runs in one transaction that first locks the
         strategy row, so a concurrent recovery/reconciliation serialises with it
         and a race cannot bypass the block.
+
+        ``identity`` is the launch's *bound evaluation identity* (for a schedule
+        occurrence: the occurrence key, the evaluation id the child must submit
+        under, and the due time). It is stored on the job and is part of what an
+        idempotent replay must match, so a retry under the same key can never
+        silently rebind the launch to a different evaluation.
+
+        ``session`` lets a caller compose the insert into **its own transaction**
+        (the scheduler's atomic job+occurrence decision). With a caller session
+        this method never commits, closes or rolls back: the caller owns the
+        transaction, so it can commit the job row and its occurrence decision
+        together or roll both back. Errors still surface as the typed
+        ``Strategy*`` exceptions.
         """
         if job_kind not in service.ALLOWED_JOB_KINDS:
             raise service.StrategyValidationError("unsupported job_kind")
@@ -517,7 +549,8 @@ class SqlAlchemyStrategyRepository:
         if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
             raise service.StrategyValidationError("attempt must be an integer >= 1")
 
-        session = self._session()
+        caller_session = session is not None
+        session = session if session is not None else self._session()
         try:
             strategy = self._lock_strategy(session, strategy_id, owner_id)
             if strategy is None:
@@ -551,6 +584,7 @@ class SqlAlchemyStrategyRepository:
                         or str(existing.execution_mode) != str(execution_mode)
                         or str(existing.job_kind) != str(job_kind)
                         or dict(existing.params_snapshot or {}) != normalized_params
+                        or dict(existing.identity_json or {}) != dict(identity or {})
                     ):
                         raise StrategyIdempotencyConflict(
                             "the idempotency key was already used for a different launch request"
@@ -613,18 +647,25 @@ class SqlAlchemyStrategyRepository:
                 policy_snapshot=copy.deepcopy(policy_snapshot),
                 max_duration_s=strategy.max_duration_s,
                 progress_deadline_s=strategy.progress_deadline_s,
+                identity_json=copy.deepcopy(dict(identity or {})),
             )
             session.add(row)
-            session.commit()
+            if caller_session:
+                session.flush()
+            else:
+                session.commit()
             return row
         except IntegrityError as exc:
-            session.rollback()
+            if not caller_session:
+                session.rollback()
             raise StrategyConflict("occurrence_key already exists") from exc
         except Exception:
-            session.rollback()
+            if not caller_session:
+                session.rollback()
             raise
         finally:
-            session.close()
+            if not caller_session:
+                session.close()
 
     def get_job(self, owner_id: str, job_id: str) -> Optional[StrategyJob]:
         session = self._session()
@@ -715,6 +756,14 @@ class SqlAlchemyStrategyRepository:
         reason_code: str,
         evidence: Dict[str, Any],
         actor_id: str,
+        settlement_barrier: Any = None,
+        barrier_account_id: Optional[str] = None,
+        barrier_strategy_id: Optional[str] = None,
+        barrier_environment: Optional[str] = None,
+        expected_barrier_version: Optional[int] = None,
+        require_barrier_proof: bool = False,
+        close_worker_run: bool = False,
+        worker_run_id: Optional[str] = None,
     ) -> Optional[StrategyJobReconciliation]:
         """Clear the replacement block **and** append the audit row atomically.
 
@@ -724,6 +773,25 @@ class SqlAlchemyStrategyRepository:
         job to ``stopped`` and inserts the audit row. If the CAS loses, or the
         audit insert fails, the whole transaction rolls back so the block is never
         cleared without a durable record. Returns the audit row or ``None``.
+
+        When ``require_barrier_proof`` is set the SAME transaction also validates
+        the execution-settlement proof for the exact book (``barrier_*``): it takes
+        that book's advisory lock - the lock the work events take, so a concurrent
+        writer serializes rather than racing - and requires a CURRENT proof at
+        ``expected_barrier_version``. A missing, stale or wrong-book proof refuses
+        (returns ``None``) instead of unblocking on evidence that two reads agreed
+        on. Lock order is strategy row -> book (the order every writer uses); no
+        path takes the book lock first and then a strategy row, so it cannot
+        invert.
+
+        When ``close_worker_run`` is set the SAME transaction also closes the
+        linked hosted worker run (``worker_run_id``, the job's ``run_id``) with
+        its existing closed-status semantics - ``status='closed'`` plus a
+        ``closed_at`` stamp - so the unblock and the run's terminal state commit
+        together. If the run cannot be closed the whole transaction rolls back
+        and the attempt stays blocked: replacement is never unblocked while the
+        linked trading run is still open. Data-only/unlaunched attempts leave
+        this off and are unaffected.
         """
         session = self._session()
         try:
@@ -735,6 +803,46 @@ class SqlAlchemyStrategyRepository:
                 return None
             strategy_id = str(row.strategy_id)
             self._lock_strategy(session, strategy_id, owner_id)
+
+            if require_barrier_proof:
+                if settlement_barrier is None or expected_barrier_version is None:
+                    # No barrier, or no exact proof version: nothing can be
+                    # validated, so the invariant refuses (never "any book will do").
+                    session.rollback()
+                    return None
+                # The book is DERIVED from the persisted job inside this
+                # transaction - caller-supplied coordinates are ignored, so a
+                # VALID proof for some other book can never unblock this attempt.
+                job_row = session.execute(
+                    select(StrategyJob.account_scope, StrategyJob.strategy_id, StrategyJob.execution_mode).where(
+                        StrategyJob.id == job_id
+                    )
+                ).first()
+                if job_row is None:
+                    session.rollback()
+                    return None
+                book_account = str(job_row.account_scope or "")
+                book_strategy = str(job_row.strategy_id or "")
+                book_environment = str(job_row.execution_mode or "")
+                settlement_barrier.lock_book(
+                    session,
+                    account_id=book_account,
+                    strategy_id=book_strategy,
+                    execution_environment=book_environment,
+                )
+                book_state = settlement_barrier.state(
+                    account_id=book_account,
+                    strategy_id=book_strategy,
+                    execution_environment=book_environment,
+                    db=session,
+                )
+                current_version = int(book_state.get("barrier_version") or 0)
+                if not bool(book_state.get("proof_valid")) or current_version != int(
+                    expected_barrier_version
+                ):
+                    session.rollback()
+                    return None
+
 
             result = session.execute(
                 update(StrategyJob)
@@ -756,6 +864,36 @@ class SqlAlchemyStrategyRepository:
                 session.rollback()
                 return None
 
+            if close_worker_run:
+                if not worker_run_id:
+                    # A linked close was requested with no run named: refuse
+                    # rather than unblock on an unverified closure.
+                    session.rollback()
+                    return None
+                now_expr = (
+                    "CURRENT_TIMESTAMP"
+                    if _dialect_name(session) == "sqlite"
+                    else "NOW()"
+                )
+                closed = session.execute(
+                    text(
+                        f"""
+                        UPDATE public.algo_worker_runs
+                        SET status = 'closed',
+                            closed_at = COALESCE(closed_at, {now_expr}),
+                            updated_at = {now_expr}
+                        WHERE strategy_run_id = :strategy_run_id
+                        """
+                    ),
+                    {"strategy_run_id": str(worker_run_id)},
+                )
+                if not int(getattr(closed, "rowcount", 0) or 0):
+                    session.rollback()
+                    return None
+
+            audit_evidence = copy.deepcopy(dict(evidence or {}))
+            if close_worker_run:
+                audit_evidence["linked_worker_run_closed"] = str(worker_run_id)
             audit = StrategyJobReconciliation(
                 id=service.new_reconciliation_id(),
                 job_id=job_id,
@@ -765,7 +903,7 @@ class SqlAlchemyStrategyRepository:
                 run_id=expected_run_id,
                 outcome="reconciled",
                 reason_code=reason_code,
-                evidence_json=copy.deepcopy(dict(evidence or {})),
+                evidence_json=audit_evidence,
                 actor_id=actor_id,
             )
             session.add(audit)
@@ -1446,16 +1584,25 @@ class SqlAlchemyStrategyRepository:
         schedule_kind: str = "daily",
         at_time: str,
         weekday: Optional[int] = None,
+        day_of_month: Optional[int] = None,
+        calendar_dates: Optional[List[str]] = None,
         timezone: str = "Asia/Kolkata",
         window_end: Optional[str] = None,
         squareoff_at: Optional[str] = None,
         enabled: bool = True,
     ) -> HostedStrategySchedule:
-        """Store a schedule, validating identity and deriving snapshots."""
+        """Store a schedule, validating identity and deriving snapshots.
+
+        Every supported kind is created here: a monthly schedule keeps its day of
+        month and a calendar schedule its explicit dates, so the scheduler can
+        materialise the same occurrences the operator configured.
+        """
         schedule = service.validate_schedule(
             schedule_kind=schedule_kind,
             at_time=at_time,
             weekday=weekday,
+            day_of_month=day_of_month,
+            calendar_dates=calendar_dates,
             timezone=timezone,
             window_end=window_end,
             squareoff_at=squareoff_at,
@@ -1503,6 +1650,12 @@ class SqlAlchemyStrategyRepository:
                 schedule_kind=schedule["schedule_kind"],
                 at_time=schedule["at_time"],
                 weekday=schedule["weekday"],
+                day_of_month=schedule["day_of_month"],
+                calendar_dates=(
+                    copy.deepcopy(schedule["calendar_dates"])
+                    if schedule["calendar_dates"] is not None
+                    else None
+                ),
                 timezone=schedule["timezone"],
                 window_end=schedule["window_end"],
                 squareoff_at=schedule["squareoff_at"],

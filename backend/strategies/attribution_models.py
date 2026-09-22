@@ -480,7 +480,11 @@ class StrategyProposal(Base):
             name="ck_proposals_evaluation_kind",
         ),
         CheckConstraint(
-            "target_kind IN ('single_instrument', 'target_weights', 'intent_bundle')",
+            # Every kind the compiler registry ships. ``target_futures`` and
+            # ``option_structure`` were missing, so a valid futures or
+            # option-structure submission could not be stored at all.
+            "target_kind IN ('single_instrument', 'target_weights', 'intent_bundle', "
+            "'target_futures', 'option_structure')",
             name="ck_proposals_target_kind",
         ),
         CheckConstraint("status IN ('received', 'validated', 'refused')", name="ck_proposals_status"),
@@ -529,7 +533,8 @@ class StrategyPlan(Base):
     __table_args__ = (
         UniqueConstraint("proposal_id", name="uq_plans_proposal"),
         CheckConstraint(
-            "plan_kind IN ('single_instrument', 'target_weights', 'intent_bundle')",
+            "plan_kind IN ('single_instrument', 'target_weights', 'intent_bundle', "
+            "'target_futures', 'option_structure')",
             name="ck_plans_plan_kind",
         ),
         CheckConstraint(
@@ -556,6 +561,128 @@ class StrategyPlan(Base):
             ondelete="RESTRICT",
         ),
         Index("idx_plans_strategy", "strategy_id", "created_at"),
+    )
+
+
+class StrategyPlanOptionRun(Base):
+    """The durable edge binding a frozen ``option_structure`` plan to its run.
+
+    R3's options lane executes through the existing ``option_run_states`` engine,
+    whose primary key is the option-run id. That id is deliberately **not** the
+    hosted worker-run id: one hosted worker run can carry several option runs,
+    and an option run outlives the plan that created it. This relation is the
+    only place the two identities meet, so neither has to be overloaded.
+
+    ``plan_id`` is unique: a plan resolves to exactly one binding, which is what
+    makes a retry return the same run instead of manufacturing a second one. An
+    entry plan creates at most one run (``uq_plan_option_run_entry``), while
+    several exit plans may reference the same run — closing a structure is not
+    one plan.
+
+    The FK to ``strategy_plans`` IS declared here (that table is in this
+    metadata). The FK to ``strategies`` is composite so owner/account mismatch is
+    impossible. The FKs to ``option_run_states`` and ``algo_worker_runs`` are
+    **not** declared: neither has an ORM model in this codebase, so the database
+    (migration and ``schema.sql``) stays the enforcement point, per the module
+    precedent.
+    """
+
+    __tablename__ = "strategy_plan_option_runs"
+
+    plan_id = Column(Text, primary_key=True)
+    option_run_id = Column(Text, nullable=False)
+    worker_run_id = Column(Text, nullable=True)
+    strategy_id = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    execution_environment = Column(Text, nullable=False)
+    phase = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('entry', 'exit')",
+            name="ck_plan_option_run_phase",
+        ),
+        ForeignKeyConstraint(
+            ["plan_id"],
+            ["strategy_plans.plan_id"],
+            name="fk_plan_option_run_plan",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["strategy_id", "account_id"],
+            ["strategies.id", "strategies.account_scope"],
+            name="fk_plan_option_run_strategy",
+            ondelete="RESTRICT",
+        ),
+        Index("idx_plan_option_run_run", "option_run_id"),
+        Index("idx_plan_option_run_worker", "worker_run_id"),
+        Index(
+            "uq_plan_option_run_entry",
+            "option_run_id",
+            unique=True,
+            postgresql_where=text("phase = 'entry'"),
+            sqlite_where=text("phase = 'entry'"),
+        ),
+    )
+
+
+class LivePlanSubmission(Base):
+    """The DURABLE claim for one live plan step (preparatory live adapter).
+
+    A live submission cannot live in process memory: two adapter instances (or a
+    restart) must not be able to dispatch the same step twice, and an outcome that
+    was never confirmed must survive the process that produced it. This row is the
+    claim and the outcome record:
+
+    * ``UNIQUE (plan_id, step_no)`` makes the claim atomic - the loser of the
+      insert reads the winner's row instead of dispatching;
+    * ``state`` distinguishes ``pending`` (accepted, awaiting fills),
+      ``uncertain`` (transport/response unknown - NEVER auto-repeated, work and
+      reservation retained) and ``rejected`` (an authoritative refusal, which may
+      resolve the known-unfilled residual work);
+    * ``broker_order_ids``/``delta_snapshot``/``detail`` are the evidence: the
+      resolved delta this step was authorised to trade and what the broker said.
+
+    The FKs to ``strategy_plans`` and ``strategies`` are declared here (both are in
+    this metadata); no live ORDER is ever inferred from this table.
+    """
+
+    __tablename__ = "live_plan_submissions"
+
+    submission_id = Column(Text, primary_key=True)
+    plan_id = Column(Text, nullable=False)
+    step_no = Column(Integer, nullable=False)
+    step_ref = Column(Text, nullable=False)
+    strategy_id = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    execution_environment = Column(Text, nullable=False)
+    state = Column(Text, nullable=False)
+    broker_order_ids = Column(JSON, nullable=False, server_default=text("'[]'"))
+    delta_snapshot = Column(JSON, nullable=False, server_default=text("'{}'"))
+    detail = Column(JSON, nullable=False, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("plan_id", "step_no", name="uq_live_plan_step"),
+        CheckConstraint(
+            "state IN ('pending', 'uncertain', 'rejected', 'no_op')",
+            name="ck_live_plan_submission_state",
+        ),
+        ForeignKeyConstraint(
+            ["plan_id"],
+            ["strategy_plans.plan_id"],
+            name="fk_live_plan_submission_plan",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["strategy_id", "account_id"],
+            ["strategies.id", "strategies.account_scope"],
+            name="fk_live_plan_submission_strategy",
+            ondelete="RESTRICT",
+        ),
+        Index("idx_live_plan_submission_state", "state"),
     )
 
 
@@ -923,11 +1050,18 @@ PLAN_EXECUTION_EVENTS = (
     "no_op",
 )
 
-#: Plan kinds that name something the executor can act on. ``target_weights``
-#: stays a valid plan kind (full-snapshot semantics) but the paper executor of
-#: this phase refuses to execute it; ``intent_bundle`` is the Phase 6 addition
-#: (D-6): explicit per-leg single-instrument actions.
-EXECUTABLE_PLAN_KINDS = ("single_instrument", "intent_bundle")
+#: Plan kinds the paper executor can act on: every kind the compiler registry
+#: ships. ``single_instrument``/``intent_bundle`` carry explicit signed
+#: quantities per leg, ``target_futures``/``option_structure`` carry compiled
+#: per-leg quantities from the pinned contracts, and ``target_weights`` is sized
+#: from its pinned weights and the strategy's allocation (see the executor).
+EXECUTABLE_PLAN_KINDS = (
+    "single_instrument",
+    "intent_bundle",
+    "target_weights",
+    "target_futures",
+    "option_structure",
+)
 
 
 class StrategyPlanExecutionEvent(Base):
@@ -1208,8 +1342,8 @@ class StrategyRollEvent(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "event IN ('created', 'acquired', 'fill_proven', 'close_released', 'old_flat', "
-            "'completed', 'stalled', 'escalated')",
+            "event IN ('created', 'acquired', 'replacement_filled', 'fill_proven', "
+            "'close_released', 'old_flat', 'completed', 'stalled', 'escalated')",
             name="ck_roll_event",
         ),
         ForeignKeyConstraint(

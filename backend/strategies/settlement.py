@@ -360,6 +360,51 @@ def _reconciliation_inflight(
         )
 
 
+def _live_submission_inflight(
+    db: Any,
+    *,
+    account_id: str,
+    strategy_id: str,
+    execution_environment: str,
+    items: List[InflightItem],
+) -> None:
+    """(f) a durable live plan step that is pending or UNCERTAIN.
+
+    The internal live adapter writes its per-step claim before the network, so a
+    crash after that commit leaves work the platform can still see. A pending
+    order (an accepted submission awaiting fills) and an UNCERTAIN one (a
+    transport/response that never resolved) are both unresolved truth; only an
+    authoritative rejection or a no-op resolves the step.
+    """
+    with _guarded("live_plan_submissions"):
+        rows = db.execute(
+            text(
+                """
+                SELECT step_ref, state, plan_id, broker_order_ids
+                FROM public.live_plan_submissions
+                WHERE account_id = :account_id
+                  AND strategy_id = :strategy_id
+                  AND execution_environment = :execution_environment
+                  AND state IN ('pending', 'uncertain')
+                ORDER BY step_ref
+                """
+            ),
+            {
+                "account_id": account_id,
+                "strategy_id": strategy_id,
+                "execution_environment": execution_environment,
+            },
+        ).fetchall()
+    for row in rows:
+        items.append(
+            InflightItem(
+                f"live_submission_{str(row[1])}",
+                str(row[0]),
+                {"plan_id": str(row[2]), "state": str(row[1]), "broker_order_ids": row[3]},
+            )
+        )
+
+
 def _ingest_inflight(db: Any, *, account_id: str, items: List[InflightItem]) -> None:
     """(e) an account ingest cycle still refreshing is unresolved truth."""
     with _guarded("account_ingest_state"):
@@ -396,6 +441,13 @@ def enumerate_inflight_work(
         items=items,
     )
     _ingest_inflight(db, account_id=account_id, items=items)
+    _live_submission_inflight(
+        db,
+        account_id=account_id,
+        strategy_id=strategy_id,
+        execution_environment=execution_environment,
+        items=items,
+    )
     items.sort(key=lambda item: (item.kind, item.ref))
     return items
 
@@ -613,6 +665,22 @@ class ExecutionBarrier:
         finally:
             if owns_db:
                 session.close()
+
+    def lock_book(
+        self,
+        db: Any,
+        *,
+        account_id: str,
+        strategy_id: str,
+        execution_environment: str,
+    ) -> None:
+        """Take the book's advisory lock on the CALLER's transaction.
+
+        Used by reconciliation so the proof check and the unblock happen under
+        the same lock the work events (create_job/execution) take - a writer can
+        therefore never slip between the check and the unblock.
+        """
+        self._lock_barrier(db, account_id, strategy_id, execution_environment)
 
     @staticmethod
     def _lock_barrier(session: Any, account_id: str, strategy_id: str, execution_environment: str) -> None:

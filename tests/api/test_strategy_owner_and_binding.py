@@ -340,6 +340,7 @@ from backend.api.routers import strategies as strategies_router  # noqa: E402
 from backend.app.auth import AppUser  # noqa: E402
 from backend.strategies.attribution import SqlAttributionStore  # noqa: E402
 import backend.strategies.attribution_models  # noqa: E402,F401  registers the attribution tables
+import backend.strategies.models  # noqa: E402,F401  registers hosted tables (strategy_jobs)
 from backend.workflows.repository import Base  # noqa: E402
 
 BASE = "/api/strategies"
@@ -444,6 +445,26 @@ class _OwnerApiHarness(unittest.IsolatedAsyncioTestCase):
                 CREATE TABLE public.algo_worker_runs (
                     strategy_run_id TEXT PRIMARY KEY, token_id TEXT, template_id TEXT,
                     account_scope TEXT, execution_mode TEXT, status TEXT NOT NULL DEFAULT 'open'
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.live_plan_submissions (
+                    submission_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL,
+                    step_no INTEGER NOT NULL,
+                    step_ref TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    execution_environment TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    broker_order_ids TEXT NOT NULL DEFAULT '[]',
+                    delta_snapshot TEXT NOT NULL DEFAULT '{}',
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (plan_id, step_no)
                 )
                 """
             )
@@ -565,6 +586,8 @@ class _ProposalApiHarness(_OwnerApiHarness):
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
+        #: run_id -> the hosted template its persisted job authorizes.
+        self._run_templates: dict = {}
         from backend.strategies.attribution_models import (
             Strategy,
             StrategyPlan,
@@ -637,7 +660,7 @@ class _ProposalApiHarness(_OwnerApiHarness):
                 {
                     "strategy_run_id": "run-bound",
                     "token_id": "worker-ok",
-                    "template_id": "hosted:stg-A",
+                    "template_id": self._run_templates.get("run-bound", "hosted:stg-A"),
                     "account_scope": "kite:paper",
                     "execution_mode": "paper",
                     "status": "open",
@@ -645,7 +668,9 @@ class _ProposalApiHarness(_OwnerApiHarness):
                 {
                     "strategy_run_id": "run-other-strategy",
                     "token_id": "worker-ok",
-                    "template_id": "hosted:stg-A",
+                    "template_id": self._run_templates.get(
+                        "run-other-strategy", "hosted:stg-A"
+                    ),
                     "account_scope": "kite:paper",
                     "execution_mode": "paper",
                     "status": "open",
@@ -653,7 +678,7 @@ class _ProposalApiHarness(_OwnerApiHarness):
                 {
                     "strategy_run_id": "run-unbound",
                     "token_id": "worker-ok",
-                    "template_id": "hosted:stg-A",
+                    "template_id": self._run_templates.get("run-unbound", "hosted:stg-A"),
                     "account_scope": "kite:paper",
                     "execution_mode": "paper",
                     "status": "open",
@@ -683,6 +708,10 @@ class _ProposalApiHarness(_OwnerApiHarness):
         app.include_router(strategies_module.router, prefix="/api")
         app.include_router(worker_proposals_module.router, prefix="/api")
         app.dependency_overrides[strategies_module._strategies_db] = lambda: self.factory
+        # The hosted-attempt guard resolves its own repository from app state (as
+        # production does); without this it would fall back to a different
+        # database than the routes use.
+        app.state.strategies_session_factory = self.factory
         app.state.attribution_store = self.store
         app.state.algo_worker_repository = repo
         app.state.proposal_store = _proposal_store(self.factory)
@@ -713,6 +742,76 @@ class _ProposalApiHarness(_OwnerApiHarness):
             bound_by="test",
             binding_source="audited_mapping",
         )
+        self._run_templates[run_id] = f"hosted:{strategy_id}"
+        # A run whose template is namespaced ``hosted:`` is a *hosted child*, and
+        # the proposal route now enforces the persisted attempt authority every
+        # other hosted mutation enforces. The fixture therefore has to model the
+        # real state: a persisted job, claimed and handed off to this run/token.
+        self._running_job(strategy_id, run_id=run_id, account=account)
+
+    def _running_job(self, strategy_id, *, run_id, account, token_id="worker-ok"):
+        from datetime import datetime, timedelta, timezone
+
+        from backend.strategies.repository import SqlAlchemyStrategyRepository
+
+        repo = SqlAlchemyStrategyRepository(self.factory)
+        if repo.get_strategy("app:admin", strategy_id) is None:
+            # A canonical-only (external/adapter) strategy has no hosted job to
+            # model; the run is not a hosted child of this platform.
+            return None
+        versions = repo.list_versions(strategy_id)
+        if versions:
+            version = versions[-1]
+        else:
+            version = repo.create_version(
+                strategy_id=strategy_id,
+                source="inline",
+                source_sha256="a" * 64,
+                parameters_schema={"type": "object"},
+                capabilities_snapshot={
+                    "schema_version": 2,
+                    "capabilities": {"trade": True, "notify": False, "data": True},
+                },
+                created_by="app:admin",
+            )
+        job = repo.create_job(
+            strategy_id=strategy_id,
+            version_id=version.id,
+            owner_id="app:admin",
+            job_kind="finite",
+            execution_mode="paper",
+            params={},
+        )
+        repo.claim_job(
+            job.id,
+            lease_owner="sup-test",
+            expected_lease_epoch=0,
+            expected_attempt=1,
+            lease_until=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        repo.reserve_child_token(
+            job.id,
+            lease_owner="sup-test",
+            expected_lease_epoch=1,
+            expected_attempt=1,
+            token_id=token_id,
+        )
+        repo.record_child_run(
+            job.id,
+            lease_owner="sup-test",
+            expected_lease_epoch=1,
+            expected_attempt=1,
+            token_id=token_id,
+            run_id=run_id,
+        )
+        repo.mark_running_and_handoff(
+            job.id,
+            lease_owner="sup-test",
+            expected_lease_epoch=1,
+            expected_attempt=1,
+            run_id=run_id,
+        )
+        return job
 
     def _payload(self, **overrides):
         body = {
@@ -1371,15 +1470,23 @@ class WorkerProposalSubmissionTests(_ProposalApiHarness):
             self._stop_patches()
         await self._bind_run(sid, run_id="run-bound")
         # A run bound to a DIFFERENT strategy, and a run bound to nothing at all.
-        with self.factory() as session:
-            session.execute(
-                text(
-                    "INSERT INTO strategies (id, owner_id, name, account_scope, status) "
-                    "VALUES ('stg-B', 'app:admin', 'B', 'kite:paper', 'active')"
-                )
-            )
-            session.commit()
-        await self._bind_run("stg-B", run_id="run-other-strategy")
+        # The other strategy is created through the same hosted path as any real
+        # one, so the refusal it produces is the authority mismatch the test is
+        # about rather than an unrelated "unknown attempt".
+        from backend.strategies.repository import SqlAlchemyStrategyRepository
+
+        other = SqlAlchemyStrategyRepository(self.factory).create_strategy(
+            owner_id="app:admin",
+            name="B",
+            description=None,
+            execution_mode="paper",
+            job_kind="finite",
+            account_scope="kite:paper",
+            max_duration_s=3600,
+            progress_deadline_s=600,
+            stale_exit_policy="none",
+        )
+        await self._bind_run(other.id, run_id="run-other-strategy")
 
         repo, raw_token = self._worker_repo()
         client = self._proposal_client(repo=repo)
@@ -1411,7 +1518,12 @@ class WorkerProposalSubmissionTests(_ProposalApiHarness):
                 headers=headers,
             )
             self.assertEqual(unbound.status_code, 403)
-            self.assertEqual(unbound.json()["detail"]["rejection_reason"], "AUTHORITY_MISMATCH")
+            # A run whose template is namespaced ``hosted:`` is a hosted child:
+            # with no persisted job it is an unknown attempt, which the shared
+            # hosted-attempt guard refuses before the envelope authority check.
+            self.assertEqual(
+                unbound.json()["detail"]["rejection_reason"], "HOSTED_ATTEMPT_UNKNOWN"
+            )
 
             # Missing / unknown run is a 404 from the shared run loader.
             missing = await client.post(
@@ -1866,6 +1978,220 @@ class RollReadApiTests(_ProposalApiHarness):
             self._stop_patches()
 
 
+class RollWriteApiTests(_ProposalApiHarness):
+    """Project 9's roll object must be DRIVABLE through the public API.
+
+    The state machine existed (and was tested) with owner *reads* only: nothing in
+    production could open, acquire, prove or release a roll, so the
+    full-required-fill invariant was enforced only inside tests. These are the
+    production entry points, and they place no order.
+    """
+
+    def _seed_projection(self, *, strategy_id, instrument_id, qty, product="NRML"):
+        from backend.strategies.attribution_models import StrategyPositionProjection
+
+        with self.factory() as session:
+            session.add(
+                StrategyPositionProjection(
+                    account_id="kite:paper",
+                    strategy_id=strategy_id,
+                    execution_environment="paper",
+                    identity_kind="canonical",
+                    identity_key=instrument_id,
+                    product=product,
+                    canonical_instrument_id=instrument_id,
+                    instrument_token=1,
+                    exchange="NFO",
+                    tradingsymbol=instrument_id,
+                    net_quantity=int(qty),
+                    projection_version=1,
+                )
+            )
+            session.commit()
+
+    async def _open_roll(self, client, sid, *, required=75):
+        response = await client.post(
+            f"{BASE}/{sid}/rolls",
+            json={
+                "old_instrument_id": "old-contract",
+                "new_instrument_id": "new-contract",
+                "required_replacement_quantity": required,
+                "old_coordinate": {"product": "NRML"},
+                "new_coordinate": {"product": "NRML"},
+            },
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    async def test_owner_drives_a_roll_through_the_public_lifecycle(self):
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+            roll = await self._open_roll(client, sid)
+            roll_id = roll["roll_id"]
+            self.assertEqual(roll["state"], "acquiring")
+            self.assertEqual(roll["required_replacement_quantity"], 75)
+            self.assertFalse(roll["close_release_permitted"])
+
+            # One open roll per (strategy, old contract).
+            duplicate = await client.post(
+                f"{BASE}/{sid}/rolls",
+                json={
+                    "old_instrument_id": "old-contract",
+                    "new_instrument_id": "other-contract",
+                    "required_replacement_quantity": 75,
+                },
+            )
+            self.assertEqual(duplicate.status_code, 409, duplicate.text)
+            self.assertEqual(
+                duplicate.json()["detail"]["rejection_reason"], "ROLL_ALREADY_OPEN"
+            )
+
+            acquired = await client.post(f"{BASE}/{sid}/rolls/{roll_id}/acquire")
+            self.assertEqual(acquired.status_code, 200, acquired.text)
+            self.assertEqual(acquired.json()["state"], "proving_filled")
+
+            # The attributed book on the new contract is EMPTY: full proof is
+            # impossible and the roll stalls instead of releasing the close.
+            # A caller may not inject proof: the body is ignored entirely, and with
+            # nothing recorded the roll is unproven.
+            stalled = await client.post(
+                f"{BASE}/{sid}/rolls/{roll_id}/prove-filled", json={"proven_quantity": 75}
+            )
+            self.assertEqual(stalled.status_code, 200, stalled.text)
+            self.assertEqual(stalled.json()["state"], "action_required")
+            self.assertEqual(stalled.json()["action_reason"], "replacement_incomplete")
+
+            refused = await client.post(f"{BASE}/{sid}/rolls/{roll_id}/release-close")
+            self.assertEqual(refused.status_code, 409, refused.text)
+            self.assertEqual(
+                refused.json()["detail"]["rejection_reason"], "ROLL_FILL_NOT_PROVEN"
+            )
+            self.assertEqual(refused.json()["detail"]["proven_filled_quantity"], 0)
+
+            # A roll that is not this strategy's is non-disclosing, like the reads.
+            missing = await client.post(f"{BASE}/{sid}/rolls/no-such-roll/acquire")
+            self.assertEqual(missing.status_code, 404)
+        finally:
+            self._stop_patches()
+
+    async def test_recorded_replacement_fills_release_the_close_and_flatness_completes_it(self):
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+            roll = await self._open_roll(client, sid)
+        finally:
+            self._stop_patches()
+        roll_id = roll["roll_id"]
+
+        # The replacement is proven from the roll's OWN recorded executions (the
+        # executor records them when a paper fill of the replacement leg is
+        # confirmed), not from a claim and not from a book.
+        from backend.strategies.rolls import RollStateMachine
+
+        machine = RollStateMachine(session_factory=self.factory)
+        machine.record_replacement_fill(
+            roll_id, paper_order_id="PAPER-1", quantity=40, instrument_id="new-contract"
+        )
+        machine.record_replacement_fill(
+            roll_id, paper_order_id="PAPER-2", quantity=35, instrument_id="new-contract"
+        )
+        # The old contract is still held, so the roll cannot complete yet.
+        self._seed_projection(strategy_id=sid, instrument_id="old-contract", qty=75)
+
+        client = self._client()
+        try:
+            await client.post(f"{BASE}/{sid}/rolls/{roll_id}/acquire")
+            proven = await client.post(f"{BASE}/{sid}/rolls/{roll_id}/prove-filled", json={})
+            self.assertEqual(proven.status_code, 200, proven.text)
+            self.assertEqual(proven.json()["state"], "releasing_old")
+            self.assertEqual(proven.json()["proven_filled_quantity"], 75)
+            self.assertTrue(proven.json()["close_release_permitted"])
+            # Replaying the proof is idempotent: the same decision, once.
+            replayed = await client.post(f"{BASE}/{sid}/rolls/{roll_id}/prove-filled")
+            self.assertEqual(replayed.status_code, 200, replayed.text)
+            self.assertEqual(replayed.json()["state"], "releasing_old")
+
+            released = await client.post(f"{BASE}/{sid}/rolls/{roll_id}/release-close")
+            self.assertEqual(released.status_code, 200, released.text)
+
+            not_flat = await client.post(f"{BASE}/{sid}/rolls/{roll_id}/old-flat")
+            self.assertEqual(not_flat.status_code, 409, not_flat.text)
+            self.assertEqual(
+                not_flat.json()["detail"]["rejection_reason"], "ROLL_OLD_NOT_FLAT"
+            )
+            self.assertEqual(not_flat.json()["detail"]["old_attributed_quantity"], 75)
+        finally:
+            self._stop_patches()
+
+        # Flatten the old book; the roll then completes with its whole trail.
+        from backend.strategies.attribution_models import StrategyPositionProjection
+
+        with self.factory() as session:
+            session.query(StrategyPositionProjection).filter(
+                StrategyPositionProjection.canonical_instrument_id == "old-contract"
+            ).delete()
+            session.commit()
+
+        client = self._client()
+        try:
+            completed = await client.post(f"{BASE}/{sid}/rolls/{roll_id}/old-flat")
+            self.assertEqual(completed.status_code, 200, completed.text)
+            self.assertEqual(completed.json()["state"], "completed")
+            self.assertEqual(
+                [row["event"] for row in completed.json()["events"]],
+                [
+                    "created",
+                    "replacement_filled",
+                    "replacement_filled",
+                    "acquired",
+                    "fill_proven",
+                    "close_released",
+                    "old_flat",
+                    "completed",
+                ],
+            )
+        finally:
+            self._stop_patches()
+
+    async def test_only_the_owner_can_open_a_roll(self):
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+        repo, raw_token = self._worker_repo()
+
+        client = self._proposal_client(repo=repo, username=None)
+        try:
+            response = await client.post(
+                f"{BASE}/{sid}/rolls",
+                json={
+                    "old_instrument_id": "old-contract",
+                    "new_instrument_id": "new-contract",
+                    "required_replacement_quantity": 75,
+                },
+                headers={"Authorization": f"Bearer {raw_token}"},
+            )
+            self.assertEqual(response.status_code, 401)
+        finally:
+            self._stop_patches()
+
+        client = self._proposal_client(repo=repo, username="someone-else")
+        try:
+            response = await client.post(
+                f"{BASE}/{sid}/rolls",
+                json={
+                    "old_instrument_id": "old-contract",
+                    "new_instrument_id": "new-contract",
+                    "required_replacement_quantity": 75,
+                },
+            )
+            self.assertEqual(response.status_code, 404)
+        finally:
+            self._stop_patches()
+
+
 class OptionSettlementReadApiTests(_ProposalApiHarness):
     """Task 7: settlement evidence is readable, and `settled` is DERIVED."""
 
@@ -2243,6 +2569,175 @@ class ExecutionOwnerApiTests(_ProposalApiHarness):
             self._stop_patches()
         return repo, sid, plan_id
 
+    async def test_a_target_weights_plan_executes_through_the_public_routes(self):
+        """A pinned-universe weights plan executes over HTTP, independently.
+
+        The weights lane does not depend on the options binding: its own frozen
+        plan (pinned universe + frozen capital basis) is submitted through the
+        proposal route, admitted, reserved, and executed through the same
+        owner-triggered route every other lane uses.
+        """
+        import json as _json
+
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS public.universe_revisions ("
+                    " id TEXT PRIMARY KEY, universe_id TEXT, revision INTEGER,"
+                    " members TEXT, member_count INTEGER, source_generation TEXT)"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.universe_revisions "
+                    "(id, universe_id, revision, members, member_count, source_generation) "
+                    "VALUES ('rev-1', 'univ-1', 1, :members, 1, 'gen-2')"
+                ),
+                {"members": _json.dumps(["RELIANCE"])},
+            )
+            session.commit()
+
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+        await self._bind_run(sid, run_id="run-bound")
+
+        repo, raw_token = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            # The capital basis is resolved from the RECORDED policy, so it must
+            # exist before the proposal (never a caller-supplied number).
+            policy = await client.put(
+                f"{BASE}/{sid}/admission-policy", json={"allocation_inr": 100000.0}
+            )
+            self.assertEqual(policy.status_code, 200, policy.text)
+
+            submitted = await client.post(
+                PROPOSALS_BASE,
+                json=self._payload(
+                    strategy_id=sid,
+                    target_kind="target_weights",
+                    payload={
+                        "universe_revision_id": "rev-1",
+                        "catalog_generation": "gen-2",
+                        "target_weights": {"RELIANCE": 0.5},
+                        # The pinned price the plan freezes AND the price the
+                        # paper runtime fills at (its fake market's last price).
+                        "reference_prices": {"RELIANCE": 1500.0},
+                        "cash_buffer_pct": 0.0,
+                    },
+                ),
+                headers={"Authorization": f"Bearer {raw_token}"},
+            )
+            self.assertEqual(submitted.status_code, 201, submitted.text)
+            plan_id = submitted.json()["plan"]["plan_id"]
+
+            reserved = await client.post(
+                f"{BASE}/{sid}/plans/{plan_id}/reserve?execution_environment=paper"
+            )
+            self.assertEqual(reserved.status_code, 200, reserved.text)
+
+            executed = await client.post(f"{BASE}/{sid}/plans/{plan_id}/execute")
+            self.assertEqual(executed.status_code, 200, executed.text)
+            body = executed.json()
+            self.assertEqual(body["status"], "filled", body)
+            (step,) = body["steps"]
+            # 0.5 x 100000 / 1500 = 33 units, floored to the pinned lot (1).
+            self.assertEqual(step["filled_quantity"], 33)
+
+            plan = await client.get(
+                f"{BASE}/{sid}/plans/{submitted.json()['proposal_id']}"
+            )
+            self.assertEqual(plan.status_code, 200, plan.text)
+            self.assertEqual(plan.json()["plan_kind"], "target_weights")
+        finally:
+            self._stop_patches()
+
+    async def test_a_target_futures_plan_executes_through_the_public_routes(self):
+        """The whole chain through HTTP: proposal route -> compiler -> execute route.
+
+        ``target_futures`` used to be unstorable (the plan CHECK allowed three
+        kinds), so a valid futures submission failed as a raw integrity error.
+        Now the submission compiles, freezes, reserves and executes through the
+        same public entry points the other lanes use.
+        """
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO public.instrument_catalog_records "
+                    "(instrument_id, exchange, tradingsymbol, lifecycle_status, instrument_type, "
+                    " expiry, lot_size, current_generation_id) "
+                    "VALUES ('inst-FUT', 'NFO', 'NIFTY26OCTFUT', 'active', 'FUT', "
+                    " '2026-10-29', 50, 'gen-2')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO public.instrument_broker_mappings "
+                    "(mapping_id, instrument_id, broker, broker_exchange, broker_symbol, "
+                    " broker_token, valid_from_generation, is_current) "
+                    "VALUES ('map-FUT', 'inst-FUT', 'kite', 'NFO', 'NIFTY26OCTFUT', 500, "
+                    " 'gen-2', 1)"
+                )
+            )
+            session.commit()
+
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+        await self._bind_run(sid, run_id="run-bound")
+        repo, raw_token = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            submitted = await client.post(
+                PROPOSALS_BASE,
+                json=self._payload(
+                    strategy_id=sid,
+                    target_kind="target_futures",
+                    payload={
+                        "instrument_token": 500,
+                        "exchange": "NFO",
+                        "tradingsymbol": "NIFTY26OCTFUT",
+                        "product": "NRML",
+                        "lots": 1,
+                        "side": "BUY",
+                        "reference_price": 1000.0,
+                    },
+                ),
+                headers={"Authorization": f"Bearer {raw_token}"},
+            )
+            self.assertEqual(submitted.status_code, 201, submitted.text)
+            plan_id = submitted.json()["plan"]["plan_id"]
+            policy = await client.put(
+                f"{BASE}/{sid}/admission-policy", json={"allocation_inr": 100000.0}
+            )
+            self.assertEqual(policy.status_code, 200, policy.text)
+            reserved = await client.post(
+                f"{BASE}/{sid}/plans/{plan_id}/reserve?execution_environment=paper"
+            )
+            self.assertEqual(reserved.status_code, 200, reserved.text)
+
+            executed = await client.post(f"{BASE}/{sid}/plans/{plan_id}/execute")
+            self.assertEqual(executed.status_code, 200, executed.text)
+            body = executed.json()
+            self.assertEqual(body["status"], "filled", body)
+            (step,) = body["steps"]
+            # 1 lot x the FROZEN lot size (50) - the plan, not the live catalog.
+            self.assertEqual(step["filled_quantity"], 50)
+
+            # The frozen plan is readable and carries the futures kind.
+            plan = await client.get(
+                f"{BASE}/{sid}/plans/{submitted.json()['proposal_id']}"
+            )
+            self.assertEqual(plan.status_code, 200, plan.text)
+            self.assertEqual(plan.json()["plan_kind"], "target_futures")
+        finally:
+            self._stop_patches()
+
     async def test_owner_executes_an_admitted_paper_plan_and_reads_the_trail(self):
         repo, sid, plan_id = await self._admitted_plan(environment="paper")
         client = self._proposal_client(repo=repo)
@@ -2345,6 +2840,112 @@ class ExecutionOwnerApiTests(_ProposalApiHarness):
             self.assertEqual(foreign_execute.status_code, 404)
             foreign_trail = await client.get(f"{BASE}/{sid}/plans/{plan_id}/executions")
             self.assertEqual(foreign_trail.status_code, 404)
+        finally:
+            self._stop_patches()
+
+    async def test_a_roll_is_opened_by_its_approved_acquisition_plan(self):
+        """The roll's quantity and contracts come from the LINKED plan.
+
+        A roll is opened by the approved ACQUISITION plan (which carries the
+        replacement contract); the old-contract close is its own plan, released
+        later by the executor. A caller cannot lower the required quantity, and a
+        plan for the old contract is not an acquisition plan.
+        """
+        with self.factory() as session:
+            for token, symbol in ((500, "NIFTY26OCTFUT"), (501, "NIFTY26SEPFUT")):
+                session.execute(
+                    text(
+                        "INSERT INTO public.instrument_catalog_records "
+                        "(instrument_id, exchange, tradingsymbol, lifecycle_status, "
+                        " instrument_type, expiry, lot_size, current_generation_id) "
+                        "VALUES (:iid, 'NFO', :symbol, 'active', 'FUT', '2026-10-29', 50, 'gen-2')"
+                    ),
+                    {"iid": f"inst-{token}", "symbol": symbol},
+                )
+                session.execute(
+                    text(
+                        "INSERT INTO public.instrument_broker_mappings "
+                        "(mapping_id, instrument_id, broker, broker_exchange, broker_symbol, "
+                        " broker_token, valid_from_generation, is_current) "
+                        "VALUES (:mid, :iid, 'kite', 'NFO', :symbol, :token, 'gen-2', 1)"
+                    ),
+                    {"mid": f"map-{token}", "iid": f"inst-{token}", "symbol": symbol, "token": token},
+                )
+            session.commit()
+
+        client = self._client()
+        try:
+            sid = (await self._create(client))["strategy_id"]
+        finally:
+            self._stop_patches()
+        await self._bind_run(sid, run_id="run-bound")
+        repo, raw_token = self._worker_repo()
+        client = self._proposal_client(repo=repo)
+        try:
+            async def _propose(token, symbol, evaluation_id):
+                response = await client.post(
+                    PROPOSALS_BASE,
+                    json=self._payload(
+                        strategy_id=sid,
+                        evaluation_id=evaluation_id,
+                        target_kind="target_futures",
+                        payload={
+                            "instrument_token": token,
+                            "exchange": "NFO",
+                            "tradingsymbol": symbol,
+                            "product": "NRML",
+                            "lots": 1,
+                            "side": "BUY",
+                            "reference_price": 1000.0,
+                        },
+                    ),
+                    headers={"Authorization": f"Bearer {raw_token}"},
+                )
+                self.assertEqual(response.status_code, 201, response.text)
+                return response.json()["plan"]["plan_id"]
+
+            acquire_plan = await _propose(500, "NIFTY26OCTFUT", "eval-acquire")
+            old_plan = await _propose(501, "NIFTY26SEPFUT", "eval-close")
+
+            # 1 lot x the frozen lot (50) is the plan's quantity; a caller may not
+            # lower the required replacement below it.
+            lower = await client.post(
+                f"{BASE}/{sid}/rolls",
+                json={
+                    "old_instrument_id": "inst-501",
+                    "new_instrument_id": "inst-500",
+                    "required_replacement_quantity": 25,
+                    "plan_id": acquire_plan,
+                },
+            )
+            self.assertEqual(lower.status_code, 409, lower.text)
+            self.assertEqual(lower.json()["detail"]["rejection_reason"], "ROLL_PLAN_MISMATCH")
+
+            opened = await client.post(
+                f"{BASE}/{sid}/rolls",
+                json={
+                    "old_instrument_id": "inst-501",
+                    "new_instrument_id": "inst-500",
+                    "required_replacement_quantity": 50,
+                    "plan_id": acquire_plan,
+                },
+            )
+            self.assertEqual(opened.status_code, 200, opened.text)
+            self.assertEqual(opened.json()["required_replacement_quantity"], 50)
+            self.assertEqual(opened.json()["state"], "acquiring")
+
+            # The plan for the OLD contract is not an acquisition plan.
+            wrong = await client.post(
+                f"{BASE}/{sid}/rolls",
+                json={
+                    "old_instrument_id": "inst-502",
+                    "new_instrument_id": "inst-500",
+                    "required_replacement_quantity": 50,
+                    "plan_id": old_plan,
+                },
+            )
+            self.assertEqual(wrong.status_code, 409, wrong.text)
+            self.assertEqual(wrong.json()["detail"]["rejection_reason"], "ROLL_PLAN_MISMATCH")
         finally:
             self._stop_patches()
 

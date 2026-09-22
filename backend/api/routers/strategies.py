@@ -56,7 +56,9 @@ from backend.api.schemas.strategies import (
     OptionSettlementResponse,
     RollEventRow,
     RollListResponse,
+    RollCreateRequest,
     RollResponse,
+    RollStallRequest,
     SquareoffEvidenceListResponse,
     SquareoffEvidenceRow,
     ExternalAdapterRequest,
@@ -275,11 +277,26 @@ def _owned_strategy(repo: SqlAlchemyStrategyRepository, owner: str, strategy_id:
     return row
 
 
-def _collector(request: Request):
+def _settlement_barrier(request: Request):
+    """The durable execution-settlement barrier over the strategies database.
+
+    Built with the SAME session factory the operator routes use (the canonical
+    binding), so a proof covers the book the attempt actually traded. An injected
+    ``app.state.settlement_barrier`` wins for tests.
+    """
+    injected = getattr(request.app.state, "settlement_barrier", None)
+    if injected is not None:
+        return injected
+    from backend.strategies.settlement import ExecutionBarrier
+
+    return ExecutionBarrier(session_factory=_strategies_db(request))
+
+
+def _collector(request: Request, *, barrier: Any = None):
     """Reconciliation evidence collector (injectable; read-only services)."""
-    collector = getattr(request.app.state, "reconciliation_collector", None)
-    if collector is not None:
-        return collector
+    injected = getattr(request.app.state, "reconciliation_collector", None)
+    if injected is not None:
+        return injected
     from backend.api.repositories.algo_worker_repo import SqlAlchemyAlgoWorkerRepository
     from backend.strategies.reconciliation_service import ReconciliationEvidenceCollector
 
@@ -287,7 +304,10 @@ def _collector(request: Request):
     paper = getattr(request.app.state, "paper_runtime_service", None)
     option_status = getattr(request.app.state, "option_run_status_reader", None)
     return ReconciliationEvidenceCollector(
-        worker_repo=worker, paper_runtime=paper, option_status_reader=option_status
+        worker_repo=worker,
+        paper_runtime=paper,
+        option_status_reader=option_status,
+        settlement_barrier=barrier if barrier is not None else _settlement_barrier(request),
     )
 
 
@@ -943,6 +963,204 @@ async def get_roll(
     # strategy, and the owner asked about this strategy.
     if roll is None or str(roll["strategy_id"]) != str(strategy_id):
         raise HTTPException(status_code=404, detail="Roll not found")
+    return _roll_view(machine, roll, with_events=True)
+
+
+def _roll_machine(session_factory: Any):
+    """The roll state machine over the strategies database (production wiring).
+
+    Constructed with **no notifier**: this path records evidence and decisions,
+    and escalation stays with the platform's own notification path rather than
+    being triggered by an HTTP request.
+    """
+    from backend.strategies.rolls import RollStateMachine
+
+    return RollStateMachine(session_factory=session_factory)
+
+
+def _roll_write_or_409(action: Any) -> Dict[str, Any]:
+    """Run one roll transition, mapping the state machine's refusals to 409."""
+    from backend.strategies.rolls import RollError
+
+    try:
+        return action()
+    except RollError as exc:
+        raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
+
+
+def _owned_roll(machine: Any, roll_id: str, *, strategy_id: str) -> Dict[str, Any]:
+    """A roll of ANOTHER strategy is 404, exactly as the read routes decide."""
+    roll = machine.get(roll_id)
+    if roll is None or str(roll["strategy_id"]) != str(strategy_id):
+        raise HTTPException(status_code=404, detail="Roll not found")
+    return roll
+
+
+@router.post("/{strategy_id}/rolls", response_model=RollResponse)
+async def create_roll(
+    strategy_id: str,
+    body: RollCreateRequest,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Open a roll: acquire the replacement, prove it, then release the close.
+
+    This is the production entry point for the Project 9 roll object. It places
+    no order — the replacement leg is submitted by the child or the operator —
+    and it is where the invariant is enforced: the old-contract close step is
+    unreachable until the FULL required replacement quantity is **proven** filled
+    from the strategy's attributed book (never from an order-status label).
+    """
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    authorize_account_scope(str(canonical.account_scope))
+
+    machine = _roll_machine(session_factory)
+    roll = _roll_write_or_409(
+        lambda: machine.create(
+            strategy_id=strategy_id,
+            account_id=str(canonical.account_scope),
+            old_instrument_id=body.old_instrument_id,
+            new_instrument_id=body.new_instrument_id,
+            required_replacement_quantity=body.required_replacement_quantity,
+            old_coordinate=body.old_coordinate,
+            new_coordinate=body.new_coordinate,
+            plan_id=body.plan_id,
+            peak_margin_evidence=body.peak_margin_evidence,
+        )
+    )
+    return _roll_view(machine, roll, with_events=True)
+
+
+@router.post("/{strategy_id}/rolls/{roll_id}/acquire", response_model=RollResponse)
+async def acquire_roll(
+    strategy_id: str,
+    roll_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Acknowledge that the replacement leg was submitted (it places nothing)."""
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    authorize_account_scope(str(canonical.account_scope))
+
+    machine = _roll_machine(session_factory)
+    _owned_roll(machine, roll_id, strategy_id=strategy_id)
+    roll = _roll_write_or_409(lambda: machine.acquire(roll_id))
+    return _roll_view(machine, roll, with_events=True)
+
+
+@router.post("/{strategy_id}/rolls/{roll_id}/prove-filled", response_model=RollResponse)
+async def prove_roll_filled(
+    strategy_id: str,
+    roll_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Decide proof from THIS roll's own recorded replacement executions.
+
+    No quantity is accepted from the caller: a declared number is not evidence,
+    and neither is the raw attributed book (it also carries holdings that predate
+    the roll or belong to another decision). The replacement fills are recorded
+    by the executor when a paper execution of the roll's replacement leg is
+    CONFIRMED. Full proof releases the close; anything less stalls the roll.
+    """
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    authorize_account_scope(str(canonical.account_scope))
+
+    machine = _roll_machine(session_factory)
+    _owned_roll(machine, roll_id, strategy_id=strategy_id)
+    roll = _roll_write_or_409(lambda: machine.prove_filled(roll_id))
+    return _roll_view(machine, roll, with_events=True)
+
+
+@router.post("/{strategy_id}/rolls/{roll_id}/release-close", response_model=RollResponse)
+async def release_roll_close(
+    strategy_id: str,
+    roll_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Release the old-contract close — refused unless the replacement is proven."""
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    authorize_account_scope(str(canonical.account_scope))
+
+    machine = _roll_machine(session_factory)
+    _owned_roll(machine, roll_id, strategy_id=strategy_id)
+    roll = _roll_write_or_409(lambda: machine.release_close(roll_id))
+    return _roll_view(machine, roll, with_events=True)
+
+
+@router.post("/{strategy_id}/rolls/{roll_id}/old-flat", response_model=RollResponse)
+async def complete_roll(
+    strategy_id: str,
+    roll_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Complete the roll once the OLD book is proven flat (never asserted).
+
+    No quantity is accepted from the caller: flatness is measured from the
+    strategy's attributed book, so a roll cannot be completed by saying so.
+    """
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    authorize_account_scope(str(canonical.account_scope))
+
+    machine = _roll_machine(session_factory)
+    _owned_roll(machine, roll_id, strategy_id=strategy_id)
+    roll = _roll_write_or_409(lambda: machine.mark_old_flat(roll_id))
+    return _roll_view(machine, roll, with_events=True)
+
+
+@router.post("/{strategy_id}/rolls/{roll_id}/stall", response_model=RollResponse)
+async def stall_roll(
+    strategy_id: str,
+    roll_id: str,
+    body: RollStallRequest,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Flag an in-flight roll for the owner: capacity and attribution stay put."""
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    authorize_account_scope(str(canonical.account_scope))
+
+    machine = _roll_machine(session_factory)
+    _owned_roll(machine, roll_id, strategy_id=strategy_id)
+    roll = _roll_write_or_409(lambda: machine.stall(roll_id, reason=body.reason))
     return _roll_view(machine, roll, with_events=True)
 
 
@@ -1608,7 +1826,89 @@ async def reconcile_job(
             detail={"rejection_reason": "STALE_LEASE_EPOCH", "current_lease_epoch": int(job.lease_epoch)},
         )
 
-    collector = _collector(request)
+    # D-4: quiescence is PROVEN, never assumed. The operator reconciliation path
+    # is where the platform records the durable barrier proof: under the book's
+    # advisory lock it enumerates the in-flight sources (run executions, order
+    # intents, reconciliation, ingest) and records a proof ONLY when that
+    # enumeration is empty. Outstanding work is refused with the work named, and
+    # the attempt stays ``recovery_required`` - it is never quietly unblocked.
+    barrier = _settlement_barrier(request)
+    barrier_state = None
+    proof_refusal: Optional[Dict[str, Any]] = None
+    proof_required = False
+    expected_barrier_version: Optional[int] = None
+    try:
+        capabilities = service.parse_capability_snapshot(job.capabilities_snapshot)
+        trade_capable = bool(capabilities.get("trade"))
+    except service.StrategyValidationError:
+        trade_capable = True
+    environment = str(job.execution_mode or "")
+    if trade_capable and job.handoff_at is not None and environment in ("paper", "dry_run"):
+        # A launched, trade-capable attempt must carry a CURRENT durable proof for
+        # this exact book through the unblock transaction.
+        proof_required = True
+        try:
+            barrier_state = barrier.state(
+                account_id=str(job.account_scope or ""),
+                strategy_id=str(job.strategy_id or ""),
+                execution_environment=environment,
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable state is never verified
+            barrier_state = None
+            proof_refusal = {"reason": "evidence_unavailable", "unavailable": [f"settlement_barrier:{exc}"]}
+        if proof_refusal is None and not bool(barrier_state.get("proof_valid")):
+            result = barrier.record_proof(
+                account_id=str(job.account_scope or ""),
+                strategy_id=str(job.strategy_id or ""),
+                execution_environment=environment,
+                ref=f"reconcile:{job.id}:{int(job.attempt)}",
+                detail={"job_id": job.id, "attempt": int(job.attempt), "actor_id": owner},
+            )
+            if not result.recorded:
+                proof_refusal = {
+                    "reason": result.reason,
+                    "barrier_version": result.barrier_version,
+                    "inflight": [item.as_dict() for item in (result.inflight or [])],
+                    "unavailable": list(result.unavailable or []),
+                }
+            else:
+                barrier_state = barrier.state(
+                    account_id=str(job.account_scope or ""),
+                    strategy_id=str(job.strategy_id or ""),
+                    execution_environment=environment,
+                )
+        if barrier_state is not None and bool(barrier_state.get("proof_valid")):
+            expected_barrier_version = int(barrier_state.get("barrier_version") or 0)
+    if proof_refusal is not None and proof_refusal.get("reason") != "evidence_unavailable":
+        # Outstanding work is named here, with its enumeration: the attempt stays
+        # blocked and the operator sees exactly what is still in flight. An
+        # UNREADABLE barrier is different: nothing can be proved, so the normal
+        # assessment runs and fails closed on ``quiescence_state != verified`` -
+        # one authority for the decision, never an invented blocker.
+        reason_code = "EXECUTION_WORK_OUTSTANDING"
+        blocked = repo.record_reconciliation(
+            job_id=job.id,
+            strategy_id=job.strategy_id,
+            owner_id=owner,
+            attempt=int(job.attempt),
+            run_id=job.run_id,
+            outcome="blocked",
+            reason_code=reason_code,
+            evidence={"settlement_barrier": proof_refusal, "barrier_state": barrier_state},
+            actor_id=owner,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": reason_code,
+                "case": "blocked",
+                "blocking_reasons": [reason_code],
+                "settlement_barrier": proof_refusal,
+                "audit_id": blocked.id,
+            },
+        )
+
+    collector = _collector(request, barrier=barrier)
     evidence = await collector.collect(job)
     assessment = assess(evidence)
 
@@ -1676,6 +1976,22 @@ async def reconcile_job(
         reason_code=reassessment.reason_code,
         evidence=recheck.to_dict(),
         actor_id=owner,
+        # Narrow TOCTOU guard: the proof is validated INSIDE the unblock
+        # transaction, under the book's advisory lock, at the exact version the
+        # assessment used. Work committed between the second collect and the CAS
+        # therefore invalidates the proof and refuses the unblock.
+        settlement_barrier=barrier if proof_required else None,
+        barrier_account_id=str(job.account_scope or ""),
+        barrier_strategy_id=str(job.strategy_id or ""),
+        barrier_environment=environment,
+        expected_barrier_version=expected_barrier_version,
+        require_barrier_proof=proof_required,
+        # A launched, trade-capable attempt has a linked worker run; stop it in
+        # the SAME transaction as the unblock (closed-status semantics with
+        # closed_at), so replacement can never be cleared while the trading run
+        # is still open. Data-only/unlaunched attempts pass no run.
+        close_worker_run=bool(proof_required and recheck.run_id),
+        worker_run_id=None if not recheck.run_id else str(recheck.run_id),
     )
     if audit is None:
         blocked = repo.record_reconciliation(

@@ -144,7 +144,7 @@ class ReservationLedger:
 
     def __init__(self, session_factory: Optional[Callable[[], Any]] = None) -> None:
         if session_factory is None:
-            from backend.workflows.repository import SessionLocal
+            from backend.app.database import SessionLocal
 
             session_factory = SessionLocal
         self.session_factory = session_factory

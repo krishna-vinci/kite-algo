@@ -727,6 +727,26 @@ class RollListResponse(BaseModel):
     rolls: List[RollResponse] = Field(default_factory=list)
 
 
+class RollCreateRequest(BaseModel):
+    """Open a roll. The plan id is recorded, never trusted for authority."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    old_instrument_id: str
+    new_instrument_id: str
+    required_replacement_quantity: int
+    old_coordinate: Dict[str, Any] = Field(default_factory=dict)
+    new_coordinate: Dict[str, Any] = Field(default_factory=dict)
+    plan_id: Optional[str] = None
+    peak_margin_evidence: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RollStallRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
+
+
 class OptionSettlementEvidenceRow(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

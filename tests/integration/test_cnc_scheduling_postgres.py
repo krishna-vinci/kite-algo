@@ -37,7 +37,10 @@ from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from backend.strategies.compiler.weights import WeightsPortfolioCompiler  # noqa: E402
 from backend.strategies.corporate_actions import CorporateActionDetector  # noqa: E402
-from backend.strategies.scheduling import ScheduleScheduler  # noqa: E402
+from backend.strategies.scheduling import (  # noqa: E402
+    HostedJobSubmitter as _HostedJobSubmitter,
+    ScheduleScheduler,
+)
 
 PG_URL = os.environ.get("CNC_PG_URL") or os.environ.get("ALERTS_TEST_DATABASE_URL", "")
 
@@ -138,6 +141,26 @@ def _exec(sf, sql, params=None):
 def _scalar(sf, sql, params=None):
     with sf() as session:
         return session.execute(text(sql), params or {}).scalar()
+
+
+class _GatedSubmitter(_HostedJobSubmitter):
+    """The production submitter with a gate inside the job insert.
+
+    It blocks where a real launch is slowest (before the job row is written), so
+    a test can deterministically interleave another tick with the decision -
+    while the claim is held, and after the claim goes stale and is taken over.
+    """
+
+    def __init__(self, session_factory, entered, release):
+        super().__init__(session_factory)
+        self._entered = entered
+        self._release = release
+
+    def _create_pinned_job(self, schedule, occurrence, *, session=None):
+        self._entered.set()
+        if not self._release.wait(timeout=30):
+            raise RuntimeError("the test gate was never released")
+        return super()._create_pinned_job(schedule, occurrence, session=session)
 
 
 def seed_world(sf, *, strategy_id="stg-A"):
@@ -481,7 +504,7 @@ class TestScheduling(_PgTestCase):
         os.environ["SCHEDULE_MISFIRE_GRACE_SECONDS"] = str(30 * 24 * 3600)
 
         def race():
-            scheduler = ScheduleScheduler(session_factory=sf, proposal_submitter=submitter)
+            scheduler = ScheduleScheduler(session_factory=sf, job_submitter=submitter)
             try:
                 barrier.wait(timeout=30)
                 outcomes.append(scheduler.tick(now=NOW))
@@ -502,6 +525,237 @@ class TestScheduling(_PgTestCase):
         ) == 1, outcomes
         # Exactly one fire across both schedulers.
         assert len(fired) == 1, (fired, outcomes)
+
+    # -- production job path ------------------------------------------------
+
+    def _job_path_schedule(self, sf, *, slug="race"):
+        """A hosted strategy/version/schedule on a PAPER account, ready to launch."""
+        strategy_id = f"hs-{slug}"
+        version_id = f"v-{slug}"
+        schedule_id = f"sch-{slug}"
+        _exec(
+            sf,
+            "INSERT INTO public.strategies (id, owner_id, name, account_scope, status) "
+            "VALUES (:sid, 'app:owner', :name, 'kite:paper', 'active')",
+            {"sid": strategy_id, "name": f"{slug} canonical"},
+        )
+        _exec(
+            sf,
+            "INSERT INTO public.hosted_strategies "
+            "(id, owner_id, name, template_id, default_execution_mode, default_account_scope, "
+            " default_job_kind, stale_exit_policy, max_duration_s, progress_deadline_s, status) "
+            "VALUES (:sid, 'app:owner', :name, :template, 'paper', 'kite:paper', "
+            " 'finite', 'exit_on_worker_stale', 3600, 600, 'active')",
+            {"sid": strategy_id, "name": slug, "template": f"hosted:{strategy_id}"},
+        )
+        _exec(
+            sf,
+            "INSERT INTO public.hosted_strategy_versions "
+            "(id, strategy_id, version, source, source_sha256, parameters_schema, "
+            " capabilities_snapshot, created_by) "
+            "VALUES (:vid, :sid, 1, 'inline', 'sha', '{}', '{}', 'app:owner')",
+            {"vid": version_id, "sid": strategy_id},
+        )
+        _exec(
+            sf,
+            "INSERT INTO public.hosted_strategy_schedules "
+            "(id, strategy_id, version_id, owner_id, account_scope, execution_mode, job_kind, "
+            " max_duration_s, progress_deadline_s, schedule_kind, at_time, timezone, "
+            " calendar_dates, enabled, params_snapshot, policy_snapshot, capabilities_snapshot) "
+            "VALUES (:sch, :sid, :vid, 'app:owner', 'kite:paper', 'paper', "
+            " 'finite', 3600, 600, 'calendar', '09:30', 'Asia/Kolkata', "
+            " '[\"2026-10-10\"]'::jsonb, TRUE, '{}', '{}', '{}')",
+            {"sch": schedule_id, "sid": strategy_id, "vid": version_id},
+        )
+        return schedule_id
+
+    def test_the_production_submitter_creates_exactly_one_job_under_a_race(self):
+        """The real submitter, two racing schedulers, one durable job.
+
+        ``uq_strategy_jobs_occurrence`` is what makes this true: ``create_job``
+        returns the original row for an identical replay and refuses a different
+        launch request for the same key, so the loser of the race cannot create a
+        second job for the occurrence.
+        """
+        from backend.strategies.scheduling import HostedJobSubmitter
+
+        sf = self.make_db()
+        self._job_path_schedule(sf, slug="race")
+
+        submitter = HostedJobSubmitter(sf)
+        outcomes: list = []
+        barrier = threading.Barrier(2)
+        os.environ["SCHEDULE_MISFIRE_GRACE_SECONDS"] = str(30 * 24 * 3600)
+
+        def race():
+            scheduler = ScheduleScheduler(session_factory=sf, job_submitter=submitter)
+            try:
+                barrier.wait(timeout=30)
+                outcomes.append(scheduler.tick(now=NOW))
+            except Exception as exc:  # noqa: BLE001
+                outcomes.append({"error": repr(exc)})
+
+        threads = [threading.Thread(target=race) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        os.environ.pop("SCHEDULE_MISFIRE_GRACE_SECONDS", None)
+        errors = [item for item in outcomes if "error" in item]
+        assert not errors, errors
+        assert (
+            _scalar(
+                sf,
+                "SELECT COUNT(*) FROM public.strategy_jobs WHERE occurrence_key = 'sch-race:2026-10-10'",
+            )
+            == 1
+        ), outcomes
+        assert (
+            _scalar(
+                sf,
+                "SELECT COUNT(*) FROM public.strategy_schedule_occurrences WHERE status = 'fired'",
+            )
+            == 1
+        ), outcomes
+        # The job is pinned to the schedule's version and the strategy's paper
+        # account, and carries the bound evaluation identity for the child.
+        row = sf().execute(
+            text(
+                "SELECT strategy_id, version_id, account_scope, execution_mode, status, "
+                " identity_json ->> 'evaluation_id' AS evaluation_id "
+                "FROM public.strategy_jobs WHERE occurrence_key = 'sch-race:2026-10-10'"
+            )
+        ).fetchone()
+        assert row.strategy_id == "hs-race"
+        assert row.version_id == "v-race"
+        assert row.account_scope == "kite:paper"
+        assert row.execution_mode == "paper"
+        assert row.status == "queued"
+        assert row.evaluation_id == "sched:sch-race:2026-10-10"
+
+    def test_a_tick_crossing_grace_cannot_expire_a_launch_in_flight(self):
+        """Deterministic interleaving: the decision holder is mid-insert.
+
+        With the launch blocked *before* the job row is written, another tick
+        whose window has closed must defer rather than expire: the occurrence
+        belongs to the claim holder, and when that holder finishes, the job and
+        the ``fired`` decision are committed together.
+        """
+        from backend.strategies.scheduling import HostedJobSubmitter
+
+        sf = self.make_db()
+        schedule_id = self._job_path_schedule(sf, slug="inflight")
+        entered, release = threading.Event(), threading.Event()
+        outcomes: list = []
+        os.environ["SCHEDULE_MISFIRE_GRACE_SECONDS"] = str(30 * 24 * 3600)
+
+        def run_blocked_tick():
+            scheduler = ScheduleScheduler(
+                session_factory=sf,
+                job_submitter=_GatedSubmitter(sf, entered, release),
+            )
+            try:
+                outcomes.append(scheduler.tick(now=NOW))
+            except Exception as exc:  # noqa: BLE001
+                outcomes.append({"error": repr(exc)})
+
+        worker = threading.Thread(target=run_blocked_tick)
+        worker.start()
+        assert entered.wait(timeout=30), "the launch never reached the insert"
+        try:
+            # The window closes for everyone else while the insert is in flight.
+            os.environ["SCHEDULE_MISFIRE_GRACE_SECONDS"] = "1"
+            other = ScheduleScheduler(session_factory=sf, job_submitter=HostedJobSubmitter(sf))
+            second = other.tick(now=NOW + timedelta(days=2))
+            assert second["expired"] == [], second
+            assert second["deferred"] == [f"{schedule_id}:2026-10-10"], second
+            assert (
+                _scalar(sf, "SELECT status FROM public.strategy_schedule_occurrences")
+                == "pending"
+            )
+        finally:
+            release.set()
+            worker.join(timeout=30)
+
+        assert not worker.is_alive(), "the blocked launch never finished"
+        assert not [item for item in outcomes if "error" in item], outcomes
+        assert outcomes[0]["fired"] == [f"{schedule_id}:2026-10-10"], outcomes
+        assert (
+            _scalar(sf, "SELECT status FROM public.strategy_schedule_occurrences") == "fired"
+        )
+        assert (
+            _scalar(
+                sf,
+                "SELECT COUNT(*) FROM public.strategy_jobs WHERE occurrence_key = :key",
+                {"key": f"{schedule_id}:2026-10-10"},
+            )
+            == 1
+        )
+
+    def test_a_stale_holder_cannot_leave_a_job_after_a_takeover(self):
+        """The job insert and the decision share one transaction.
+
+        The holder is blocked mid-insert; its claim then goes stale and another
+        actor takes it over and expires the occurrence. When the stale holder is
+        released, its compare-and-set must fail and roll its job row back: no
+        launch may exist for an occurrence that was decided as expired.
+        """
+        from backend.strategies.scheduling import HostedJobSubmitter
+
+        sf = self.make_db()
+        schedule_id = self._job_path_schedule(sf, slug="stale")
+        occurrence_key = f"{schedule_id}:2026-10-10"
+        entered, release = threading.Event(), threading.Event()
+        outcomes: list = []
+        os.environ["SCHEDULE_MISFIRE_GRACE_SECONDS"] = str(30 * 24 * 3600)
+
+        def run_stale_holder():
+            scheduler = ScheduleScheduler(
+                session_factory=sf,
+                job_submitter=_GatedSubmitter(sf, entered, release),
+            )
+            try:
+                outcomes.append(scheduler.tick(now=NOW))
+            except Exception as exc:  # noqa: BLE001
+                outcomes.append({"error": repr(exc)})
+
+        worker = threading.Thread(target=run_stale_holder)
+        worker.start()
+        assert entered.wait(timeout=30), "the launch never reached the insert"
+        try:
+            # The claim goes stale, and a second actor takes it over and expires.
+            _exec(
+                sf,
+                "UPDATE public.strategy_schedule_occurrences "
+                "SET fired_at = NOW() - INTERVAL '10 minutes'",
+            )
+            os.environ["SCHEDULE_MISFIRE_GRACE_SECONDS"] = "1"
+            other = ScheduleScheduler(session_factory=sf, job_submitter=HostedJobSubmitter(sf))
+            second = other.tick(now=NOW + timedelta(days=2))
+            assert second["expired"] == [occurrence_key], second
+        finally:
+            release.set()
+            worker.join(timeout=30)
+
+        assert not worker.is_alive(), "the stale holder never finished"
+        assert not [item for item in outcomes if "error" in item], outcomes
+        # The stale holder reports what is actually recorded, and its job row was
+        # rolled back with the failed compare-and-set.
+        assert outcomes[0]["fired"] == [], outcomes
+        assert outcomes[0]["expired"] == [occurrence_key], outcomes
+        assert (
+            _scalar(
+                sf,
+                "SELECT COUNT(*) FROM public.strategy_jobs WHERE occurrence_key = :key",
+                {"key": occurrence_key},
+            )
+            == 0
+        )
+        assert (
+            _scalar(sf, "SELECT status FROM public.strategy_schedule_occurrences")
+            == "expired"
+        )
 
     def test_occurrences_are_unique_per_schedule(self):
         sf = self.make_db()
@@ -525,7 +779,7 @@ class TestScheduling(_PgTestCase):
         self._schedule(sf)
         os.environ["SCHEDULE_MISFIRE_GRACE_SECONDS"] = "60"
         try:
-            scheduler = ScheduleScheduler(session_factory=sf, proposal_submitter=lambda *_: True)
+            scheduler = ScheduleScheduler(session_factory=sf, job_submitter=lambda *_: True)
             result = scheduler.tick(now=NOW)
             assert result["fired"] == []
             row = sf().execute(

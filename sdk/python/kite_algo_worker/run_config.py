@@ -52,6 +52,31 @@ class RunConfig(ModelMixin):
         entry.update({k: v for k, v in extra.items()})
         return self._replace(summary_fields=[*self.summary_fields, entry])
 
+    @property
+    def hosted_occurrence(self) -> dict[str, Any] | None:
+        """The platform-bound occurrence identity for a scheduled hosted run.
+
+        The scheduler records the occurrence on the job it created, and the
+        lifecycle hands it back as ``runtime_state["hosted"]``. A child reads it
+        to learn *which* evaluation it was launched for; it is not authority the
+        child can choose, and the proposal route refuses an evaluation id that
+        does not match the persisted binding.
+        """
+        hosted = self.runtime_state.get("hosted")
+        if not isinstance(hosted, dict):
+            return None
+        occurrence_key = hosted.get("occurrence_key")
+        evaluation_id = hosted.get("evaluation_id")
+        if not occurrence_key and not evaluation_id:
+            return None
+        return {
+            "job_id": hosted.get("job_id"),
+            "occurrence_key": occurrence_key,
+            "evaluation_id": evaluation_id,
+            "evaluation_kind": hosted.get("evaluation_kind"),
+            "due_at": hosted.get("due_at"),
+        }
+
     def with_metadata(self, **kwargs: Any) -> "RunConfig":
         return self._replace(metadata={**self.metadata, **kwargs})
 

@@ -88,7 +88,7 @@ class CorporateActionDetector:
         freeze: Optional[Callable[..., None]] = None,
     ) -> None:
         if session_factory is None:
-            from backend.workflows.repository import SessionLocal
+            from backend.app.database import SessionLocal
 
             session_factory = SessionLocal
         self.session_factory = session_factory

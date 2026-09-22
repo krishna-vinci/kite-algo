@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import unittest
 import uuid
+import json
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import create_engine, event, text
@@ -46,17 +47,22 @@ SINGLE_LEGS = [
         "broker_token": 738561,
         "product": "CNC",
         "signed_quantity": 10,
+        # Pinned with the plan, exactly as a compiler emits it.
+        "lot_size": 1,
+        "lot_source": "default",
         "reference_price": 1500.0,
     }
 ]
 
 
-def _resolved_plan(plan_kind="single_instrument", legs=None):
-    return {
+def _resolved_plan(plan_kind="single_instrument", legs=None, **extra):
+    plan = {
         "target_kind": plan_kind,
         "catalog_generation": G1,
         "legs": list(SINGLE_LEGS if legs is None else legs),
     }
+    plan.update(extra)
+    return plan
 
 
 class ExecutionTestCase(unittest.TestCase):
@@ -106,10 +112,57 @@ class ExecutionTestCase(unittest.TestCase):
                 )
                 """
             )
+            # The option lane executes through the durable option-run engine, so
+            # its canonical table exists here exactly as ``schema.sql`` defines it.
+            cursor.execute(
+                """
+                CREATE TABLE public.option_run_states (
+                    strategy_run_id TEXT PRIMARY KEY,
+                    strategy_name TEXT NOT NULL,
+                    product VARCHAR(8) NOT NULL CHECK (product IN ('MIS', 'NRML')),
+                    status VARCHAR(64) NOT NULL,
+                    legs TEXT NOT NULL DEFAULT '[]',
+                    protection TEXT,
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    orders TEXT NOT NULL DEFAULT '[]',
+                    trades TEXT NOT NULL DEFAULT '[]',
+                    completed_legs TEXT NOT NULL DEFAULT '[]',
+                    failed_legs TEXT NOT NULL DEFAULT '[]',
+                    pending_legs TEXT NOT NULL DEFAULT '[]',
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            # The binding edge lives in the ``public`` schema with the option-run
+            # table it points at (the raw store qualifies both). Constraints are
+            # the production database's job and are proved on PostgreSQL.
+            cursor.execute(
+                """
+                CREATE TABLE public.strategy_plan_option_runs (
+                    plan_id TEXT PRIMARY KEY,
+                    option_run_id TEXT NOT NULL,
+                    worker_run_id TEXT,
+                    strategy_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    execution_environment TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX public.uq_plan_option_run_entry
+                    ON strategy_plan_option_runs (option_run_id)
+                    WHERE phase = 'entry'
+                """
+            )
             dbapi_connection.commit()
 
         from backend.strategies.attribution_models import (
             Strategy,
+            StrategyAdmissionPolicy,
             StrategyExecutionBarrier,
             StrategyExecutionBarrierEvent,
             StrategyPlan,
@@ -118,6 +171,8 @@ class ExecutionTestCase(unittest.TestCase):
             StrategyProposal,
             StrategyReservation,
             StrategyReservationEvent,
+            StrategyRoll,
+            StrategyRollEvent,
             StrategyRunBinding,
         )
         from backend.strategies.attribution_models import PaperOrderFillProgress
@@ -135,9 +190,15 @@ class ExecutionTestCase(unittest.TestCase):
                 StrategyReservationEvent.__table__,
                 StrategyExecutionBarrier.__table__,
                 StrategyExecutionBarrierEvent.__table__,
+                # Weight-sized plans read their sizing basis from the recorded
+                # admission policy, so the table must exist here too.
+                StrategyAdmissionPolicy.__table__,
                 # The executor reads fill progress to decide whether a step is
                 # resolved, so the table must exist even when nothing writes to it.
                 PaperOrderFillProgress.__table__,
+                # The roll seam reads the roll (and records the replacement fill).
+                StrategyRoll.__table__,
+                StrategyRollEvent.__table__,
             ],
         )
         self.factory = sessionmaker(bind=self.engine, expire_on_commit=False)
@@ -168,10 +229,11 @@ class ExecutionTestCase(unittest.TestCase):
         plan_kind="single_instrument",
         legs=None,
         evaluation_id=None,
+        resolved_extra=None,
     ):
         """A validated proposal envelope + its frozen plan (the P3 output)."""
         proposal_id = f"prop-{plan_id}"
-        resolved = _resolved_plan(plan_kind, legs)
+        resolved = _resolved_plan(plan_kind, legs, **(resolved_extra or {}))
         with self.factory() as session:
             session.execute(
                 text(
@@ -267,6 +329,19 @@ class ExecutionTestCase(unittest.TestCase):
                     "VALUES (:iid, 'NSE', 'RELIANCE', 'active', :lot, :gen)"
                 ),
                 {"iid": instrument_id, "lot": lot_size, "gen": G1},
+            )
+            session.commit()
+
+    def seed_allocation(self, *, allocation=100000.0, sid=STRATEGY, account=ACCOUNT):
+        """The strategy's recorded admission policy - the weight-sizing basis."""
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategy_admission_policies "
+                    "(strategy_id, account_id, allocation_inr, updated_by) "
+                    "VALUES (:sid, :account, :allocation, 'test')"
+                ),
+                {"sid": sid, "account": account, "allocation": float(allocation)},
             )
             session.commit()
 
@@ -498,6 +573,38 @@ class ExecutorTestCase(ExecutionTestCase):
             default_starting_balance=Decimal(starting_balance),
         )
 
+    def _option_leg(self, *, side, symbol, lot=75, ratio=1, **overrides):
+        leg = {
+            "instrument_id": INST_B,
+            "exchange": "NFO",
+            "tradingsymbol": symbol,
+            "broker_exchange": "NFO",
+            "broker_symbol": symbol,
+            "broker_token": TOKEN_B,
+            "product": "NRML",
+            "instrument_type": "CE",
+            "option_type": "CE",
+            "strike": 2500.0,
+            "expiry": "2026-10-29",
+            "lot_size": lot,
+            "ratio": ratio,
+            "side": side,
+            "quantity": lot * ratio,
+            "signed_quantity": lot * ratio * (1 if side == "BUY" else -1),
+            "reference_price": 100.0,
+        }
+        leg.update(overrides)
+        return leg
+
+    def _seed_lane(self, plan_id, *, plan_kind, legs, requirement=15000.0):
+        self.seed_strategy()
+        self.seed_validated_plan(
+            plan_id, plan_kind=plan_kind, legs=legs, run_id=f"run-{plan_id}"
+        )
+        self.seed_binding(run_id=f"run-{plan_id}")
+        self.claim_reservation(plan_id=plan_id, requirement=requirement)
+        self.seed_lot_size(7)  # the catalog moved after the plan was frozen
+
     def build_executor(self, *, paper_service=None, now=NOW):
         from backend.strategies.execution import PaperPlanExecutor
 
@@ -598,16 +705,180 @@ class ExecutorPreconditionTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCa
 
         return ProposalStore(session_factory=self.factory).get_plan(plan_id)
 
-    async def test_a_target_weights_plan_is_refused_by_name(self):
-        """No target_weights execution in this phase: the kind itself refuses."""
-        self.seed_validated_plan("plan-tw", plan_kind="target_weights", legs=[])
+    async def test_a_target_weights_plan_executes_sized_from_its_pinned_metadata(self):
+        """``target_weights`` reaches the executor: P3 -> P6 is a real handoff.
+
+        The kind used to refuse ``PLAN_KIND_UNSUPPORTED`` while the campaign
+        reported the portfolio lane certified. It now executes end to end: each
+        leg is sized from the plan's frozen weight, its frozen reference price
+        and its frozen lot, against the strategy's recorded allocation - and the
+        live catalog cannot change the executed quantity.
+        """
+        self.seed_allocation(allocation=100000.0)
+        self.seed_validated_plan(
+            "plan-tw",
+            run_id="run-tw",
+            plan_kind="target_weights",
+            resolved_extra={"capital_basis_inr": 100000.0, "cash_buffer_pct": 0.0},
+            legs=[
+                {
+                    "instrument_id": INST_ID,
+                    "exchange": "NSE",
+                    "tradingsymbol": "RELIANCE",
+                    "broker_exchange": "NSE",
+                    "broker_symbol": "RELIANCE",
+                    "broker_token": 738561,
+                    "product": "CNC",
+                    "target_weight": 0.5,
+                    "reference_price": 1500.0,
+                    "lot_size": 30,
+                    "lot_source": "catalog",
+                }
+            ],
+        )
         self.seed_binding(run_id="run-tw")
+        self.claim_reservation(plan_id="plan-tw", requirement=50000.0)
+        self.seed_lot_size(7)  # the catalog moved after the plan was frozen
+        executor = self.build_executor()
+
+        result = await executor.execute(self._plan_view("plan-tw"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        (step,) = result["steps"]
+        # 0.5 x 100,000 / 1,500 = 33 units, floored to the PINNED lot of 30 -> 30
+        # (the moved catalog would have made it 28).
+        self.assertEqual(step["filled_quantity"], 30)
+        (order,) = executor._paper_service.repository.orders.values()
+        self.assertEqual(order.quantity, 30)
+        self.assertEqual(order.transaction_type, "buy")
+        self.assertEqual(
+            [row["event"] for row in self.events("plan-tw")], ["submitted", "filled"]
+        )
+
+    async def test_a_weight_leg_without_a_frozen_capital_basis_is_refused(self):
+        """No frozen basis means no approved size: refuse, never read the policy."""
+        self.seed_validated_plan(
+            "plan-tw",
+            run_id="run-tw",
+            plan_kind="target_weights",
+            legs=[
+                {
+                    "instrument_id": INST_ID,
+                    "exchange": "NSE",
+                    "tradingsymbol": "RELIANCE",
+                    "broker_exchange": "NSE",
+                    "broker_symbol": "RELIANCE",
+                    "broker_token": 738561,
+                    "product": "CNC",
+                    "target_weight": 0.5,
+                    "reference_price": 100.0,
+                    "lot_size": 30,
+                    "lot_source": "catalog",
+                }
+            ],
+        )
+        self.seed_binding(run_id="run-tw")
+        self.claim_reservation(plan_id="plan-tw", requirement=50000.0)
         exc = await self._refused(plan_id="plan-tw")
-        self.assertEqual(exc.reason_code, "PLAN_KIND_UNSUPPORTED")
+        self.assertEqual(exc.reason_code, "PLAN_CAPITAL_BASIS_UNPINNED")
         self.assertEqual(
             [row["refusal_reason"] for row in self.events("plan-tw")],
-            ["PLAN_KIND_UNSUPPORTED"],
+            ["PLAN_CAPITAL_BASIS_UNPINNED"],
         )
+
+    async def test_a_later_policy_change_cannot_grow_a_frozen_weight_target(self):
+        """The approved size is frozen; the live policy is not a sizing input."""
+        self.seed_allocation(allocation=100000.0)
+        self.seed_validated_plan(
+            "plan-tw",
+            run_id="run-tw",
+            plan_kind="target_weights",
+            resolved_extra={"capital_basis_inr": 100000.0, "cash_buffer_pct": 0.0},
+            legs=[
+                {
+                    "instrument_id": INST_ID,
+                    "exchange": "NSE",
+                    "tradingsymbol": "RELIANCE",
+                    "broker_exchange": "NSE",
+                    "broker_symbol": "RELIANCE",
+                    "broker_token": 738561,
+                    "product": "CNC",
+                    "target_weight": 0.5,
+                    "reference_price": 1500.0,
+                    "lot_size": 30,
+                    "lot_source": "catalog",
+                }
+            ],
+        )
+        self.seed_binding(run_id="run-tw")
+        self.claim_reservation(plan_id="plan-tw", requirement=50000.0)
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE strategy_admission_policies SET allocation_inr = 1000000.0 "
+                    "WHERE strategy_id = :sid"
+                ),
+                {"sid": STRATEGY},
+            )
+            session.commit()
+        executor = self.build_executor()
+
+        result = await executor.execute(self._plan_view("plan-tw"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        (step,) = result["steps"]
+        # A ten-fold allocation increase changes nothing: 0.5 x 100,000 / 1,500 = 33
+        # floored to the pinned lot of 30, exactly as approved.
+        self.assertEqual(step["filled_quantity"], 30)
+
+    async def test_a_policy_drop_below_the_frozen_basis_is_refused(self):
+        """Frozen basis above the current authority is drift: refuse, do not guess."""
+        self.seed_allocation(allocation=100000.0)
+        self.seed_validated_plan(
+            "plan-tw",
+            run_id="run-tw",
+            plan_kind="target_weights",
+            resolved_extra={"capital_basis_inr": 100000.0, "cash_buffer_pct": 0.0},
+            legs=[
+                {
+                    "instrument_id": INST_ID,
+                    "exchange": "NSE",
+                    "tradingsymbol": "RELIANCE",
+                    "broker_exchange": "NSE",
+                    "broker_symbol": "RELIANCE",
+                    "broker_token": 738561,
+                    "product": "CNC",
+                    "target_weight": 0.5,
+                    "reference_price": 1500.0,
+                    "lot_size": 30,
+                    "lot_source": "catalog",
+                }
+            ],
+        )
+        self.seed_binding(run_id="run-tw")
+        self.claim_reservation(plan_id="plan-tw", requirement=50000.0)
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE strategy_admission_policies SET allocation_inr = 10000.0 "
+                    "WHERE strategy_id = :sid"
+                ),
+                {"sid": STRATEGY},
+            )
+            session.commit()
+        exc = await self._refused(plan_id="plan-tw")
+        self.assertEqual(exc.reason_code, "PLAN_CAPITAL_BASIS_DRIFT")
+
+    async def test_an_unknown_plan_kind_is_refused_by_name(self):
+        """A kind outside the executable vocabulary is refused, not attempted."""
+        plan = dict(self._plan_view("plan-1"))
+        plan["plan_kind"] = "not_a_kind"
+        from backend.strategies.execution import ExecutionRefusal
+
+        executor = self.build_executor()
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(plan, actor=OWNER)
+        self.assertEqual(ctx.exception.reason_code, "PLAN_KIND_UNSUPPORTED")
 
     async def test_a_plan_whose_envelope_is_not_validated_is_refused(self):
         with self.factory() as session:
@@ -835,12 +1106,20 @@ class ExecutorSubmissionTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase
             ["work_created", "work_resolved"],
         )
 
-    async def test_lot_size_floors_the_step_to_the_pinned_catalog_lot(self):
+    async def test_the_pinned_lot_decides_and_the_catalog_cannot_change_it(self):
+        """Units are frozen with the plan, never re-read at execution time.
+
+        The plan below pins a lot of 4 (so 10 -> 8). The live catalog is then set
+        to 7 - a change that happens *after* freezing - and the executed quantity
+        must still be the pinned floor, not the catalog's new number.
+        """
         self.seed_strategy()
-        self.seed_validated_plan()  # target +10
+        self.seed_validated_plan(
+            legs=[dict(SINGLE_LEGS[0], lot_size=4, lot_source="catalog")]
+        )
         self.seed_binding()
         self.claim_reservation(requirement=15000.0)
-        self.seed_lot_size(4)  # pinned catalog says lots of 4: 10 -> 8
+        self.seed_lot_size(7)  # the catalog moved after the plan was frozen
         executor = self.build_executor()
         plan = _plan_view_for(self.factory, "plan-1")
 
@@ -851,6 +1130,27 @@ class ExecutorSubmissionTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase
         paper = executor._paper_service
         (order,) = paper.repository.orders.values()
         self.assertEqual(order.quantity, 8)
+
+    async def test_a_plan_without_pinned_units_is_refused_by_name(self):
+        """No pinned lot means unknown units: refuse, never re-read the catalog."""
+        from backend.strategies.execution import ExecutionRefusal
+
+        self.seed_strategy()
+        unpinned = {k: v for k, v in SINGLE_LEGS[0].items() if k not in ("lot_size", "lot_source")}
+        self.seed_validated_plan(legs=[unpinned])
+        self.seed_binding()
+        self.claim_reservation(requirement=15000.0)
+        self.seed_lot_size(4)
+        executor = self.build_executor()
+        plan = _plan_view_for(self.factory, "plan-1")
+
+        with self.assertRaises(ExecutionRefusal) as refusal:
+            await executor.execute(plan, actor=OWNER)
+        self.assertEqual(refusal.exception.reason_code, "PLAN_UNITS_UNPINNED")
+        # The refusal is on the append-only trail and nothing was submitted.
+        trail = self.events("plan-1")
+        self.assertEqual([row["refusal_reason"] for row in trail], ["PLAN_UNITS_UNPINNED"])
+        self.assertEqual(executor._paper_service.repository.orders, {})
 
     async def test_a_broken_runtime_records_failed_and_holds_the_reservation(self):
         """Unknown execution state holds capacity — it never releases on a guess."""
@@ -1000,9 +1300,33 @@ BUNDLE_LEGS = [
         "broker_token": TOKEN_B,
         "product": "CNC",
         "signed_quantity": -10,
+        "lot_size": 1,
+        "lot_source": "default",
         "reference_price": 1000.0,
     },
 ]
+
+
+def _futures_leg(**overrides):
+    """One futures leg, pinned exactly as the compiler emits it."""
+    leg = {
+        "instrument_id": INST_B,
+        "exchange": "NFO",
+        "tradingsymbol": "TCS26OCTFUT",
+        "broker_exchange": "NFO",
+        "broker_symbol": "TCS26OCTFUT",
+        "broker_token": TOKEN_B,
+        "product": "NRML",
+        "instrument_type": "FUT",
+        "lots": 1,
+        "lot_size": 75,
+        "signed_quantity": 100,
+        "expiry": "2026-10-29",
+        "tick_size": 0.05,
+        "reference_price": 1000.0,
+    }
+    leg.update(overrides)
+    return leg
 
 
 def _bundle_payload(legs):
@@ -1151,9 +1475,14 @@ class ExecutorBundleTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(detail.get("paper_order_ids") or []), 1)
 
     async def test_a_risk_reducing_bundle_needs_no_reservation(self):
-        """Capacity is reserved only when exposure increases (D-6); sells are exempt."""
+        """A REDUCTION needs no admission; a new short or a reversal does (D-6)."""
         self.seed_strategy()
-        self.seed_bundle_plan(legs=[dict(BUNDLE_LEGS[1])])  # a single SELL leg
+        # +20 held, target +10: the step is a SELL of 10 that shrinks an existing
+        # long. This is what "risk reducing" actually means - the earlier version
+        # of this test sold from FLAT (a new short) and asserted it needed no
+        # reservation, which is the admission hole this bundle closes.
+        self.seed_book(token=TOKEN_B, product="CNC", qty=20, instrument_id=INST_B, symbol="TCS")
+        self.seed_bundle_plan(legs=[dict(BUNDLE_LEGS[1], signed_quantity=10)])
         self.seed_binding()
         self.seed_lot_size(1)
         from backend.strategies.reservations import ReservationLedger
@@ -1177,6 +1506,36 @@ class ExecutorBundleTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
         )
         paper_order = list(executor._paper_service.repository.orders.values())[0]
         self.assertEqual(paper_order.transaction_type, "sell")
+
+    async def test_a_new_short_requires_a_reservation(self):
+        """Selling from flat opens a short: it is exposure, not an exemption."""
+        self.seed_strategy()
+        self.seed_bundle_plan(legs=[dict(BUNDLE_LEGS[1])])  # target -10 from flat
+        self.seed_binding()
+        self.seed_lot_size(1)
+        from backend.strategies.execution import ExecutionRefusal
+
+        executor = self.build_executor()
+        plan = _plan_view_for(self.factory, "plan-bundle")
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(plan, actor=OWNER)
+        self.assertEqual(ctx.exception.reason_code, "RESERVATION_REQUIRED")
+        self.assertEqual(executor._paper_service.repository.orders, {})
+
+    async def test_a_reversal_across_flat_requires_a_reservation(self):
+        """+10 held, target -5: the trade sells 15 and opens a short."""
+        self.seed_strategy()
+        self.seed_book(token=TOKEN_B, product="CNC", qty=10, instrument_id=INST_B, symbol="TCS")
+        self.seed_bundle_plan(legs=[dict(BUNDLE_LEGS[1], signed_quantity=-5)])
+        self.seed_binding()
+        self.seed_lot_size(1)
+        from backend.strategies.execution import ExecutionRefusal
+
+        executor = self.build_executor()
+        plan = _plan_view_for(self.factory, "plan-bundle")
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(plan, actor=OWNER)
+        self.assertEqual(ctx.exception.reason_code, "RESERVATION_REQUIRED")
 
     async def test_a_bundle_with_an_increasing_leg_still_requires_a_reservation(self):
         self.seed_strategy()
@@ -1233,6 +1592,881 @@ class ExecutorBundleTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.reservation_events(reservation_id), ["created", "consumed"]
         )
+
+
+class ExecutorDerivativeLaneTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
+    """The futures and option-structure lanes reach the PRODUCTION executor.
+
+    ``PaperPlanExecutor.execute`` is what the owner's HTTP route
+    (``POST /strategies/{id}/plans/{plan_id}/execute``) runs, so a walkthrough
+    here is the production dispatch path rather than a helper call: the plan is
+    the frozen artifact P3 persists and the executor is the engine the route
+    builds.
+    """
+
+    async def test_a_target_futures_plan_executes_on_the_pinned_lot(self):
+        """Lot 75 is frozen in the plan; the catalog's 7 cannot resize the order."""
+        self._seed_lane("plan-fut", plan_kind="target_futures", legs=[_futures_leg()])
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-fut"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        (step,) = result["steps"]
+        self.assertEqual(step["filled_quantity"], 75)  # 100 floored to the PINNED 75
+        (order,) = executor._paper_service.repository.orders.values()
+        self.assertEqual(order.quantity, 75)
+        self.assertEqual(order.transaction_type, "buy")
+
+    async def test_an_option_structure_enters_hedge_first_then_releases_the_short(self):
+        """The short leg is released only after the hedge is CONFIRMED filled."""
+        short = self._option_leg(side="SELL", symbol="TCS26OCT2500CE")
+        hedge = self._option_leg(side="BUY", symbol="TCS26OCT3000CE")
+        # The short is leg 1 in the frozen plan; the hedge is leg 2. Entry order
+        # is decided by the gating rule, not by the payload order.
+        self._seed_lane("plan-op", plan_kind="option_structure", legs=[short, hedge])
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-op"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(
+            [(row["step_no"], row["event"]) for row in self.events("plan-op")],
+            [(2, "submitted"), (2, "filled"), (1, "submitted"), (1, "filled")],
+        )
+        sides = sorted(
+            order.transaction_type
+            for order in executor._paper_service.repository.orders.values()
+        )
+        self.assertEqual(sides, ["buy", "sell"])
+
+    async def test_an_unfilled_hedge_never_releases_the_dependent_short(self):
+        """A rejected hedge ⇒ NO short is submitted; the refusal is named."""
+        short = self._option_leg(side="SELL", symbol="TCS26OCT2500CE")
+        broken_hedge = self._option_leg(side="BUY", symbol="MISSING")
+        self._seed_lane("plan-op", plan_kind="option_structure", legs=[short, broken_hedge])
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-op"), actor=OWNER)
+
+        self.assertEqual(result["status"], "rejected")
+        trail = self.events("plan-op")
+        self.assertEqual(
+            [(row["step_no"], row["event"]) for row in trail],
+            [(2, "submitted"), (2, "rejected"), (1, "rejected")],
+        )
+        self.assertEqual(trail[1]["refusal_reason"], "PAPER_ORDER_REJECTED")
+        self.assertEqual(trail[2]["refusal_reason"], "OPTION_HEDGE_NOT_FILLED")
+        # The gate's own evidence: a hedge that did not arrive is an operator's
+        # decision, never a silent reduction in protection.
+        self.assertEqual(trail[2]["detail"]["reason"], "hedge_rejected")
+        self.assertTrue(trail[2]["detail"]["action_required"])
+        self.assertEqual(trail[2]["detail"]["hedge_outcomes"], ["rejected"])
+        # No short order exists anywhere in the paper book.
+        self.assertEqual(
+            [
+                order.transaction_type
+                for order in executor._paper_service.repository.orders.values()
+                if order.transaction_type == "sell"
+            ],
+            [],
+        )
+
+    async def test_an_intentional_naked_structure_is_still_admitted(self):
+        """No hedge legs at all is a naked shape Project 10 admits: no gate applies."""
+        short = self._option_leg(side="SELL", symbol="TCS26OCT2500CE")
+        self._seed_lane("plan-op", plan_kind="option_structure", legs=[short])
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-op"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        (order,) = executor._paper_service.repository.orders.values()
+        self.assertEqual(order.transaction_type, "sell")
+        self.assertEqual(order.quantity, 75)
+
+
+    async def test_a_closing_structure_closes_its_own_short_before_releasing_the_hedge(self):
+        """The exit plan closes the RUN's short first, then releases its hedge."""
+        short = self._option_leg(side="SELL", symbol="TCS26OCT2500CE", instrument_id="opt-short")
+        hedge = self._option_leg(side="BUY", symbol="TCS26OCT3000CE", instrument_id="opt-hedge")
+        self._seed_lane("plan-op", plan_kind="option_structure", legs=[short, hedge])
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+        entry = await executor.execute(_plan_view_for(self.factory, "plan-op"), actor=OWNER)
+        self.assertEqual(entry["status"], "filled")
+        run_id = str(self._run_row_for_plan("plan-op")["option_run_id"])
+
+        # The exit plan names the same two contracts, hedge first. The engine's
+        # exit rule (short liability before hedge release) reorders it.
+        hedge_close = self._option_leg(
+            side="SELL", symbol="TCS26OCT3000CE", instrument_id="opt-hedge", signed_quantity=0
+        )
+        short_close = self._option_leg(
+            side="BUY", symbol="TCS26OCT2500CE", instrument_id="opt-short", signed_quantity=0
+        )
+        self._seed_option_exit_plan("plan-exit", reference=run_id, legs=[hedge_close, short_close])
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(
+            [(row["step_no"], row["event"]) for row in self.events("plan-exit")],
+            [(2, "submitted"), (2, "filled"), (1, "submitted"), (1, "filled")],
+        )
+        self.assertEqual(
+            [
+                row["refusal_reason"]
+                for row in self.events("plan-exit")
+                if row["refusal_reason"] is not None
+            ],
+            [],
+        )
+
+    async def test_a_hedge_is_withheld_when_its_short_is_not_proven_closed(self):
+        """No proven closure ⇒ the hedge is released for nothing (named refusal)."""
+        short = self._option_leg(side="SELL", symbol="TCS26OCT2500CE", instrument_id="opt-short")
+        hedge = self._option_leg(side="BUY", symbol="TCS26OCT3000CE", instrument_id="opt-hedge")
+        self._seed_lane("plan-op", plan_kind="option_structure", legs=[short, hedge])
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+        await executor.execute(_plan_view_for(self.factory, "plan-op"), actor=OWNER)
+        run_id = str(self._run_row_for_plan("plan-op")["option_run_id"])
+        after_entry = dict(executor._paper_service.repository.orders)
+
+        # An exit plan that carries ONLY the hedge close: nothing in it proves the
+        # run's short closed, so the hedge must be withheld.
+        hedge_close = self._option_leg(
+            side="SELL", symbol="TCS26OCT3000CE", instrument_id="opt-hedge", signed_quantity=0
+        )
+        self._seed_option_exit_plan("plan-exit", reference=run_id, legs=[hedge_close])
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(result["status"], "rejected")
+        (step,) = result["steps"]
+        self.assertEqual(step["refusal_reason"], "OPTION_HEDGE_RELEASE_WITHHELD")
+        self.assertEqual(step["detail"]["reason"], "short_not_proven_closed")
+        # No NEW order was submitted by the withheld exit.
+        self.assertEqual(executor._paper_service.repository.orders, after_entry)
+
+    def _run_row_for_plan(self, plan_id):
+        with self.factory() as session:
+            return (
+                session.execute(
+                    text(
+                        "SELECT option_run_id FROM public.strategy_plan_option_runs "
+                        "WHERE plan_id = :p"
+                    ),
+                    {"p": plan_id},
+                )
+                .mappings()
+                .first()
+            )
+
+    def _seed_option_exit_plan(self, plan_id, *, reference, legs):
+        self.seed_validated_plan(
+            plan_id, plan_kind="option_structure", legs=legs, run_id=f"run-{plan_id}"
+        )
+        self.seed_binding(run_id=f"run-{plan_id}")
+        with self.factory() as session:
+            session.execute(
+                text("UPDATE strategy_plans SET resolved_plan = :resolved WHERE plan_id = :p"),
+                {
+                    "p": plan_id,
+                    "resolved": json.dumps(
+                        {
+                            "target_kind": "option_structure",
+                            "product": "NRML",
+                            "legs": legs,
+                            "option_run": {"phase": "exit", "option_run_id": reference},
+                        }
+                    ),
+                },
+            )
+            session.commit()
+
+
+class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
+    """The durable plan -> option-run edge, on the PRODUCTION executor path.
+
+    ``PaperPlanExecutor.execute`` is what the owner's HTTP route runs, so a run
+    created/bound/closed here is the production wiring rather than a helper call.
+    The option-run id is a DIFFERENT identity from the hosted worker-run id; the
+    binding relation is the only place they meet.
+    """
+
+    SHORT_ID = "cccccccc-0000-0000-0000-0000000000a1"
+    HEDGE_ID = "cccccccc-0000-0000-0000-0000000000a2"
+
+    def _entry_legs(self):
+        short = self._option_leg(
+            side="SELL", symbol="TCS26OCT2500CE", instrument_id=self.SHORT_ID
+        )
+        hedge = self._option_leg(
+            side="BUY", symbol="TCS26OCT3000CE", instrument_id=self.HEDGE_ID
+        )
+        return short, hedge
+
+    def _binding_rows(self, plan_id):
+        with self.factory() as session:
+            return (
+                session.execute(
+                    text(
+                        "SELECT plan_id, option_run_id, worker_run_id, strategy_id, "
+                        "account_id, execution_environment, phase "
+                        "FROM public.strategy_plan_option_runs WHERE plan_id = :p"
+                    ),
+                    {"p": plan_id},
+                )
+                .mappings()
+                .all()
+            )
+
+    def _run_row(self, option_run_id):
+        with self.factory() as session:
+            return (
+                session.execute(
+                    text(
+                        "SELECT strategy_run_id, status, legs, orders, trades, metadata "
+                        "FROM public.option_run_states WHERE strategy_run_id = :r"
+                    ),
+                    {"r": option_run_id},
+                )
+                .mappings()
+                .first()
+            )
+
+    def _run_count(self):
+        with self.factory() as session:
+            return int(
+                session.execute(
+                    text("SELECT COUNT(*) FROM public.option_run_states")
+                ).scalar()
+                or 0
+            )
+
+    async def test_an_entry_structure_creates_one_durable_run_and_binds_the_plan(self):
+        short, hedge = self._entry_legs()
+        self._seed_lane("plan-op", plan_kind="option_structure", legs=[short, hedge])
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-op"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        (binding,) = self._binding_rows("plan-op")
+        # The worker-run id is stored as attribution, NOT overloaded as the run id.
+        self.assertEqual(binding["worker_run_id"], "run-plan-op")
+        self.assertNotEqual(binding["option_run_id"], binding["worker_run_id"])
+        self.assertEqual(binding["phase"], "entry")
+        self.assertEqual(binding["execution_environment"], "paper")
+        run = self._run_row(binding["option_run_id"])
+        self.assertEqual(run["status"], "entered")
+        orders = json.loads(run["orders"])
+        self.assertEqual({row["leg_id"] for row in orders}, {"plan-op:1", "plan-op:2"})
+        self.assertEqual({row["status"] for row in orders}, {"filled"})
+        trades = json.loads(run["trades"])
+        self.assertEqual(sum(int(row["quantity"]) for row in trades), 150)
+        self.assertEqual(self._run_count(), 1)
+
+        # A retry (the same frozen plan) resolves to that SAME run; it does not
+        # manufacture a second one, and the executor refuses a second execution.
+        from backend.options.execution.durable_store import DurableOptionRunStore
+        from backend.options.execution.plan_binding import (
+            PlanOptionRunBindingStore,
+            resolve_plan_option_run,
+        )
+
+        target = resolve_plan_option_run(
+            _plan_view_for(self.factory, "plan-op"),
+            strategy_id=STRATEGY,
+            account_id=ACCOUNT,
+            execution_environment="paper",
+            worker_run_id="run-plan-op",
+            binding_store=PlanOptionRunBindingStore(session_factory=self.factory),
+            run_store=DurableOptionRunStore(session_factory=self.factory),
+        )
+        self.assertEqual(target["option_run_id"], binding["option_run_id"])
+        self.assertEqual(self._run_count(), 1)
+
+    async def _enter_a_structure(self):
+        short, hedge = self._entry_legs()
+        self._seed_lane("plan-op", plan_kind="option_structure", legs=[short, hedge])
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+        await executor.execute(_plan_view_for(self.factory, "plan-op"), actor=OWNER)
+        (binding,) = self._binding_rows("plan-op")
+        # The attributed book the entry created (the fake paper runtime does not
+        # update the projection; the real fold does).
+        self.seed_book(
+            instrument_id=self.SHORT_ID,
+            symbol="TCS26OCT2500CE",
+            product="NRML",
+            qty=-75,
+        )
+        self.seed_book(
+            instrument_id=self.HEDGE_ID,
+            symbol="TCS26OCT3000CE",
+            product="NRML",
+            qty=75,
+        )
+        return executor, str(binding["option_run_id"])
+
+    def _exit_legs(self, *, hedge_id=None, short_id=None):
+        # A closing leg targets flat: the delta is the whole open position.
+        short_close = self._option_leg(
+            side="BUY",
+            symbol="TCS26OCT2500CE",
+            instrument_id=short_id or self.SHORT_ID,
+            signed_quantity=0,
+        )
+        hedge_close = self._option_leg(
+            side="SELL",
+            symbol="TCS26OCT3000CE",
+            instrument_id=hedge_id or self.HEDGE_ID,
+            signed_quantity=0,
+        )
+        return [hedge_close, short_close]
+
+    async def test_an_exit_plan_closes_the_bound_run_in_the_existing_engine(self):
+        executor, option_run_id = await self._enter_a_structure()
+        self.seed_validated_plan(
+            "plan-exit",
+            plan_kind="option_structure",
+            legs=self._exit_legs(),
+            run_id="run-plan-op",
+        )
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE strategy_plans SET resolved_plan = :resolved WHERE plan_id = 'plan-exit'"
+                ),
+                {
+                    "resolved": json.dumps(
+                        {
+                            "target_kind": "option_structure",
+                            "legs": self._exit_legs(),
+                            "option_run": {"phase": "exit", "option_run_id": option_run_id},
+                        }
+                    )
+                },
+            )
+            session.commit()
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "exited")
+        # The exit plan is bound to the SAME run: two plans, one run.
+        self.assertEqual(len(self._binding_rows("plan-exit")), 1)
+        exit_binding = self._binding_rows("plan-exit")[0]
+        self.assertEqual(exit_binding["option_run_id"], option_run_id)
+        self.assertEqual(exit_binding["phase"], "exit")
+        # Short-first: leg 2 (the short's close) is the first exit submission.
+        exits = [row for row in self.events("plan-exit") if row["event"] == "submitted"]
+        self.assertEqual([row["step_no"] for row in exits], [2, 1])
+        # The exit's fills are attributed to the RUN's own legs (not the exit
+        # plan's step ids): that is what makes the run's open quantity drop and a
+        # repeated exit a no_op instead of a reversal.
+        trades = json.loads(run["trades"])
+        self.assertEqual({row["leg_id"] for row in trades}, {"plan-op:1", "plan-op:2"})
+        self.assertEqual(sum(int(row["quantity"]) for row in trades), 300)
+
+    async def test_an_entry_targets_its_own_run_not_the_aggregate_book(self):
+        """A pre-existing strategy position in the same contract must not resize it."""
+        short, hedge = self._entry_legs()
+        self._seed_lane("plan-op", plan_kind="option_structure", legs=[short, hedge])
+        # The aggregate strategy book already holds 40 of the SAME contract (say
+        # from another decision). The run is new, so its own open quantity is 0.
+        self.seed_book(
+            instrument_id=self.SHORT_ID, symbol="TCS26OCT2500CE", product="NRML", qty=-40
+        )
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-op"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        sells = [
+            order
+            for order in executor._paper_service.repository.orders.values()
+            if order.tradingsymbol == "TCS26OCT2500CE"
+        ]
+        (sell,) = sells
+        self.assertEqual(sell.transaction_type, "sell")
+        # The run's own target (75), never 75 - 40 or 75 + 40.
+        self.assertEqual(sell.quantity, 75)
+
+    async def test_exiting_one_structure_closes_only_its_own_fill(self):
+        """Two structures share a contract; exiting one must not touch the other."""
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+        a_short, a_hedge = self._entry_legs()
+        self._seed_lane("plan-a", plan_kind="option_structure", legs=[a_short, a_hedge])
+        # Structure B holds the SAME contract, with its own (different) hedge.
+        b_short = self._option_leg(
+            side="SELL", symbol="TCS26OCT2500CE", instrument_id=self.SHORT_ID, lot=25
+        )
+        b_hedge = self._option_leg(
+            side="BUY",
+            symbol="TCS26OCT3500CE",
+            instrument_id="dddddddd-0000-0000-0000-0000000000a3",
+            lot=25,
+        )
+        self.seed_validated_plan(
+            "plan-b", plan_kind="option_structure", legs=[b_short, b_hedge], run_id="run-plan-b"
+        )
+        self.seed_binding(run_id="run-plan-b")
+        self.claim_reservation(plan_id="plan-b", requirement=45000.0)
+
+        await executor.execute(_plan_view_for(self.factory, "plan-a"), actor=OWNER)
+        await executor.execute(_plan_view_for(self.factory, "plan-b"), actor=OWNER)
+        a_run_id = str(self._binding_rows("plan-a")[0]["option_run_id"])
+        b_run_id = str(self._binding_rows("plan-b")[0]["option_run_id"])
+
+        # The aggregate strategy book really does hold BOTH structures (75 + 25).
+        self.seed_book(
+            instrument_id=self.SHORT_ID, symbol="TCS26OCT2500CE", product="NRML", qty=-100
+        )
+        b_trades_before = json.loads(self._run_row(b_run_id)["trades"])
+        orders_before = len(executor._paper_service.repository.orders)
+
+        a_exit_hedge = self._option_leg(
+            side="SELL", symbol="TCS26OCT3000CE", instrument_id=self.HEDGE_ID, signed_quantity=0
+        )
+        a_exit_short = self._option_leg(
+            side="BUY", symbol="TCS26OCT2500CE", instrument_id=self.SHORT_ID, signed_quantity=0
+        )
+        self._seed_exit_plan("plan-a-exit", reference=a_run_id, legs=[a_exit_hedge, a_exit_short])
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-a-exit"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        new_orders = list(executor._paper_service.repository.orders.values())[orders_before:]
+        (x_order,) = [o for o in new_orders if o.tradingsymbol == "TCS26OCT2500CE"]
+        self.assertEqual(x_order.transaction_type, "buy")
+        # A's OWN 75 - never the aggregate 100, and never a reversal.
+        self.assertEqual(x_order.quantity, 75)
+        # Structure B's run is untouched: same trades, still entered, still open.
+        self.assertEqual(json.loads(self._run_row(b_run_id)["trades"]), b_trades_before)
+        self.assertEqual(self._run_row(b_run_id)["status"], "entered")
+        self.assertEqual(self._run_row(a_run_id)["status"], "exited")
+
+    async def test_a_repeated_exit_never_overcloses(self):
+        """A second exit against an already-flat run is a no_op, not a reversal."""
+        executor, run_id = await self._enter_a_structure()
+        self._seed_exit_plan("plan-exit", reference=run_id)
+        first = await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+        self.assertEqual(first["status"], "filled")
+        orders_after_first = len(executor._paper_service.repository.orders)
+
+        self._seed_exit_plan("plan-exit-again", reference=run_id)
+        second = await executor.execute(
+            _plan_view_for(self.factory, "plan-exit-again"), actor=OWNER
+        )
+
+        self.assertEqual(second["status"], "no_op")
+        self.assertEqual(len(executor._paper_service.repository.orders), orders_after_first)
+        self.assertEqual(self._run_row(run_id)["status"], "exited")
+        self.assertEqual(
+            [row["event"] for row in second["steps"]], ["no_op", "no_op"]
+        )
+
+    async def test_an_exit_direction_that_would_open_is_refused(self):
+        """Defence in depth: a run whose open sign contradicts its leg is refused."""
+        from backend.strategies.execution import ExecutionRefusal
+
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+        # The run holds a LONG (+25) and the exit leg declares BUY: closing a
+        # long takes a SELL, so this leg would ADD exposure.
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            executor._validate_option_exit_leg(
+                plan_id="plan-x",
+                leg={"instrument_id": "i-1", "product": "NRML", "side": "BUY"},
+                run_leg={"product": "NRML", "transaction_type": "BUY", "leg_id": "l-1"},
+                current=25,
+            )
+        self.assertEqual(ctx.exception.reason_code, "OPTION_EXIT_WOULD_OPEN")
+
+    async def test_an_exit_that_names_the_worker_run_id_is_refused(self):
+        executor, _option_run_id = await self._enter_a_structure()
+        # The plan's OWN hosted worker-run id is not an option-run id.
+        self._seed_exit_plan("plan-exit", reference="run-plan-exit")
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_EXIT_REFERENCE_IS_WORKER_RUN")
+
+    async def test_an_exit_for_a_run_this_platform_never_launched_is_refused(self):
+        executor, _option_run_id = await self._enter_a_structure()
+        self._seed_exit_plan("plan-exit", reference="opt_run_not_ours")
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_EXIT_RUN_NOT_LAUNCHED")
+
+    async def test_an_exit_leg_that_is_not_in_the_bound_run_is_refused(self):
+        executor, option_run_id = await self._enter_a_structure()
+        self._seed_exit_plan(
+            "plan-exit",
+            reference=option_run_id,
+            legs=self._exit_legs(hedge_id="cccccccc-0000-0000-0000-00000000ffff"),
+        )
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_EXIT_LEG_MISMATCH")
+
+    def _seed_exit_plan(self, plan_id, *, reference, legs=None):
+        exit_legs = legs if legs is not None else self._exit_legs()
+        self.seed_validated_plan(
+            plan_id, plan_kind="option_structure", legs=exit_legs, run_id=f"run-{plan_id}"
+        )
+        self.seed_binding(run_id=f"run-{plan_id}")
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE strategy_plans SET resolved_plan = :resolved WHERE plan_id = :p"
+                ),
+                {
+                    "p": plan_id,
+                    "resolved": json.dumps(
+                        {
+                            "target_kind": "option_structure",
+                            "legs": exit_legs,
+                            "option_run": {"phase": "exit", "option_run_id": reference},
+                        }
+                    ),
+                },
+            )
+            session.commit()
+
+    @property
+    def _refusal(self):
+        from backend.strategies.execution import ExecutionRefusal
+
+        return ExecutionRefusal
+
+
+class ExecutorRollSeamTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
+    """R3 §13: the frozen plan says which half of a roll it is, and the executor
+    enforces the contract on that artifact alone."""
+
+    def _open_roll(self):
+        from backend.strategies.rolls import RollStateMachine
+
+        machine = RollStateMachine(session_factory=self.factory)
+        roll = machine.create(
+            strategy_id=STRATEGY,
+            account_id=ACCOUNT,
+            old_instrument_id="fut-old",
+            new_instrument_id=INST_B,
+            required_replacement_quantity=75,
+            old_coordinate={"product": "NRML"},
+            new_coordinate={"product": "NRML"},
+        )
+        return machine, roll["roll_id"]
+
+    def _futures_plan(self, plan_id, *, roll_id, role, leg, run_id):
+        extra = {"roll": {"roll_id": roll_id, "role": role}} if role else {}
+        self.seed_validated_plan(
+            plan_id,
+            run_id=run_id,
+            plan_kind="target_futures",
+            resolved_extra=extra,
+            legs=[leg],
+        )
+        self.seed_binding(run_id=run_id)
+        self.claim_reservation(plan_id=plan_id, requirement=45000.0)
+
+    async def test_a_close_is_refused_before_the_roll_releases_it(self):
+        from backend.strategies.execution import ExecutionRefusal
+
+        self.seed_strategy()
+        machine, roll_id = self._open_roll()
+        self._futures_plan(
+            "plan-close",
+            roll_id=roll_id,
+            role="close_old",
+            leg=self._futures_leg_name(),
+            run_id="run-close",
+        )
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-close"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "ROLL_CLOSE_NOT_RELEASED")
+        self.assertEqual(ctx.exception.detail["roll_state"], "acquiring")
+        # Nothing was submitted, so nothing filled.
+        self.assertEqual(executor._paper_service.repository.orders, {})
+
+    @staticmethod
+    def _futures_leg_name():
+        return {
+            "instrument_id": "fut-old",
+            "exchange": "NFO",
+            "tradingsymbol": "NIFTY26SEPFUT",
+            "broker_exchange": "NFO",
+            "broker_symbol": "NIFTY26SEPFUT",
+            "broker_token": 601,
+            "product": "NRML",
+            "instrument_type": "FUT",
+            "lots": 1,
+            "lot_size": 75,
+            "signed_quantity": -75,
+            "expiry": "2026-09-24",
+            "tick_size": 0.05,
+            "reference_price": 1000.0,
+        }
+
+    async def test_an_ungated_plan_cannot_close_an_open_roll_leg(self):
+        """No optional role: an open roll's old leg is bound by coordinates."""
+        from backend.strategies.execution import ExecutionRefusal
+
+        self.seed_strategy()
+        machine, roll_id = self._open_roll()
+        # A plain futures plan on the OLD contract, with no roll binding at all.
+        self._futures_plan(
+            "plan-bypass",
+            roll_id=None,
+            role=None,
+            leg=self._futures_leg_name(),
+            run_id="run-bypass",
+        )
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-bypass"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "ROLL_CLOSE_REQUIRES_BINDING")
+        self.assertEqual(ctx.exception.detail["roll_id"], roll_id)
+        self.assertEqual(ctx.exception.detail["instrument_id"], "fut-old")
+        # Nothing was submitted and the roll was not moved.
+        self.assertEqual(executor._paper_service.repository.orders, {})
+        self.assertEqual(machine.get(roll_id)["state"], "acquiring")
+
+    async def test_an_ungated_plan_on_an_unrelated_contract_is_unaffected(self):
+        """Control: the gate is about the roll's OWN coordinates, nothing wider."""
+        self.seed_strategy()
+        machine, roll_id = self._open_roll()
+        self._futures_plan(
+            "plan-free",
+            roll_id=None,
+            role=None,
+            leg=_futures_leg(signed_quantity=75),  # INST_B, not the roll's old leg
+            run_id="run-free",
+        )
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-free"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(machine.get(roll_id)["state"], "acquiring")
+
+    async def test_the_replacement_fill_proves_the_roll_and_then_the_close_goes(self):
+        """Acquire -> recorded proof -> release -> the close is allowed."""
+        from backend.strategies.execution import ExecutionRefusal
+
+        self.seed_strategy()
+        machine, roll_id = self._open_roll()
+        machine.acquire(roll_id)
+
+        self._futures_plan(
+            "plan-open",
+            roll_id=roll_id,
+            role="open_new",
+            leg=_futures_leg(signed_quantity=75),
+            run_id="run-open",
+        )
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-open"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        # The CONFIRMED replacement execution is the roll's durable proof.
+        self.assertEqual(machine.replacement_filled_quantity(roll_id), 75)
+        fills = machine.replacement_fills(roll_id)
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0]["quantity"], 75)
+        self.assertTrue(fills[0]["paper_order_id"])
+
+        # Replaying the plan is idempotent: the fill is recorded once.
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-open"), actor=OWNER)
+        self.assertEqual(ctx.exception.reason_code, "PLAN_ALREADY_EXECUTED")
+        self.assertEqual(machine.replacement_filled_quantity(roll_id), 75)
+
+        self.assertEqual(machine.prove_filled(roll_id)["state"], "releasing_old")
+        machine.release_close(roll_id)
+
+        # A fresh close plan is now permitted (the first one already refused).
+        self._futures_plan(
+            "plan-close",
+            roll_id=roll_id,
+            role="close_old",
+            leg=self._futures_leg_name(),
+            run_id="run-close",
+        )
+        closer = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+        closed = await closer.execute(
+            _plan_view_for(self.factory, "plan-close"), actor=OWNER
+        )
+        self.assertEqual(closed["status"], "filled")
+        (order,) = closer._paper_service.repository.orders.values()
+        self.assertEqual(order.transaction_type, "sell")
+        self.assertEqual(order.quantity, 75)
+
+    def _drive_to_releasing(self, machine, roll_id):
+        """Acquire + prove the replacement so the close is RELEASED."""
+        machine.acquire(roll_id)
+        machine.record_replacement_fill(
+            roll_id,
+            paper_order_id="paper-open-1",
+            quantity=75,
+            instrument_id=INST_B,
+            plan_id="plan-open-seed",
+            actor_id=OWNER,
+        )
+        self.assertEqual(machine.prove_filled(roll_id)["state"], "releasing_old")
+        machine.release_close(roll_id)
+
+    async def test_an_open_new_plan_for_another_contract_is_refused(self):
+        """The acquisition half may only move the roll's own NEW contract."""
+        from backend.strategies.execution import ExecutionRefusal
+
+        self.seed_strategy()
+        _machine, roll_id = self._open_roll()
+        self._futures_plan(
+            "plan-open",
+            roll_id=roll_id,
+            role="open_new",
+            leg=_futures_leg(instrument_id="fut-somewhere-else", signed_quantity=75),
+            run_id="run-open",
+        )
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-open"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "ROLL_PLAN_CONTRACT_MISMATCH")
+        self.assertEqual(ctx.exception.detail["expected_instrument_id"], INST_B)
+        self.assertEqual(executor._paper_service.repository.orders, {})
+
+    async def test_an_open_new_plan_at_the_wrong_quantity_is_refused(self):
+        """The acquisition must be the EXACT required replacement quantity."""
+        from backend.strategies.execution import ExecutionRefusal
+
+        self.seed_strategy()
+        _machine, roll_id = self._open_roll()
+        self._futures_plan(
+            "plan-open",
+            roll_id=roll_id,
+            role="open_new",
+            leg=_futures_leg(signed_quantity=50),
+            run_id="run-open",
+        )
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-open"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "ROLL_PLAN_QUANTITY_MISMATCH")
+        self.assertEqual(ctx.exception.detail["required_replacement_quantity"], 75)
+        self.assertEqual(ctx.exception.detail["plan_quantity"], 50)
+
+    async def test_a_close_that_moves_the_old_contract_the_wrong_way_is_refused(self):
+        """A released close that BUYS the old leg is not a close of a long roll."""
+        from backend.strategies.execution import ExecutionRefusal
+
+        self.seed_strategy()
+        machine, roll_id = self._open_roll()
+        self._drive_to_releasing(machine, roll_id)
+        wrong_way = dict(self._futures_leg_name())
+        wrong_way["signed_quantity"] = 75
+        self._futures_plan(
+            "plan-close", roll_id=roll_id, role="close_old", leg=wrong_way, run_id="run-close"
+        )
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-close"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "ROLL_PLAN_DIRECTION_MISMATCH")
+        self.assertEqual(executor._paper_service.repository.orders, {})
+
+    async def test_a_roll_plan_carrying_both_contracts_is_refused(self):
+        """One plan may not acquire AND close: the ordered roll owns that order."""
+        from backend.strategies.execution import ExecutionRefusal
+
+        self.seed_strategy()
+        machine, roll_id = self._open_roll()
+        self._drive_to_releasing(machine, roll_id)
+        both = self._futures_plan_legs(
+            "plan-close",
+            roll_id=roll_id,
+            role="close_old",
+            legs=[self._futures_leg_name(), _futures_leg(signed_quantity=75)],
+            run_id="run-close",
+        )
+        _ = both
+        executor = self.build_executor(
+            paper_service=self.build_paper_service(starting_balance="1000000")
+        )
+
+        with self.assertRaises(ExecutionRefusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-close"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "ROLL_PLAN_CONTRACT_MISMATCH")
+
+    def _futures_plan_legs(self, plan_id, *, roll_id, role, legs, run_id):
+        self.seed_validated_plan(
+            plan_id,
+            run_id=run_id,
+            plan_kind="target_futures",
+            resolved_extra={"roll": {"roll_id": roll_id, "role": role}},
+            legs=legs,
+        )
+        self.seed_binding(run_id=run_id)
+        self.claim_reservation(plan_id=plan_id, requirement=45000.0)
+        return plan_id
 
 
 def _plan_view_for(factory, plan_id):

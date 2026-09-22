@@ -118,6 +118,7 @@ class ProposalTestCase(unittest.TestCase):
     def _register_orm_tables(self):
         from backend.strategies.attribution_models import (
             Strategy,
+            StrategyAdmissionPolicy,
             StrategyPlan,
             StrategyProposal,
             StrategyProposalJournal,
@@ -131,6 +132,9 @@ class ProposalTestCase(unittest.TestCase):
                 StrategyProposal.__table__,
                 StrategyPlan.__table__,
                 StrategyProposalJournal.__table__,
+                # A weights plan freezes its capital basis from the recorded
+                # admission policy, so the table is part of the fixture.
+                StrategyAdmissionPolicy.__table__,
             ],
         )
 
@@ -448,6 +452,10 @@ class TargetWeightsTests(ProposalTestCase):
     def _compile(self, payload, generation=G2):
         from backend.strategies.compiler import compile_resolved_plan
 
+        # A weights plan must carry the capital basis it was frozen with (the
+        # platform resolves it from the recorded admission policy at submission
+        # time); these tests are about resolution, so they supply it directly.
+        payload = {"capital_basis_inr": 100000.0, **payload}
         return compile_resolved_plan("target_weights", payload, self._pinned(generation))
 
     def test_full_snapshot_omission_means_zero(self):
@@ -817,6 +825,13 @@ class TargetWeightsPlanTests(ProposalTestCase):
                     "VALUES ('stg-W', 'app:o', 'Weights', 'kite:A', 'active')"
                 )
             )
+            session.execute(
+                text(
+                    "INSERT INTO strategy_admission_policies "
+                    "(strategy_id, account_id, allocation_inr, updated_by) "
+                    "VALUES ('stg-W', 'kite:A', 100000.0, 'test')"
+                )
+            )
             session.commit()
 
     def _submit(self, generation=G1):
@@ -834,6 +849,54 @@ class TargetWeightsPlanTests(ProposalTestCase):
                 evaluation_kind="run_now", strategy_run_id="run-1",
                 target_kind="target_weights", payload=payload,
             )
+        )
+
+    def test_the_platform_freezes_the_capital_basis_and_ignores_a_caller_number(self):
+        """Sizing is a platform resolution, not a caller assertion."""
+        from backend.strategies.proposals import ProposalStore, ProposalSubmission
+
+        result = ProposalStore(session_factory=self.factory).submit(
+            ProposalSubmission(
+                strategy_id="stg-W", account_id="kite:A", evaluation_id="eval-basis",
+                evaluation_kind="run_now", strategy_run_id="run-1",
+                target_kind="target_weights",
+                payload={
+                    "universe_revision_id": self.REV,
+                    "target_weights": {"RELIANCE": 0.5},
+                    "catalog_generation": G1,
+                    # A caller-supplied basis is overwritten, never trusted.
+                    "capital_basis_inr": 99999999.0,
+                },
+            )
+        )
+        self.assertEqual(result["status"], "validated", result)
+        self.assertEqual(result["plan"]["resolved_plan"]["capital_basis_inr"], 100000.0)
+        self.assertEqual(result["plan"]["logical_plan"]["capital_basis_inr"], 100000.0)
+
+    def test_a_weights_plan_without_a_recorded_policy_is_refused(self):
+        """No recorded basis means no approved size: refuse, never guess."""
+        from backend.strategies.proposals import ProposalStore, ProposalSubmission
+
+        with self.factory() as session:
+            session.execute(
+                text("DELETE FROM strategy_admission_policies WHERE strategy_id = 'stg-W'")
+            )
+            session.commit()
+        result = ProposalStore(session_factory=self.factory).submit(
+            ProposalSubmission(
+                strategy_id="stg-W", account_id="kite:A", evaluation_id="eval-nobasis",
+                evaluation_kind="run_now", strategy_run_id="run-1",
+                target_kind="target_weights",
+                payload={
+                    "universe_revision_id": self.REV,
+                    "target_weights": {"RELIANCE": 0.5},
+                    "catalog_generation": G1,
+                },
+            )
+        )
+        self.assertEqual(result["status"], "refused", result)
+        self.assertEqual(
+            result["refusal"]["rejection_reason"], "CAPITAL_BASIS_UNAVAILABLE"
         )
 
     def test_weights_plan_persists_its_scope(self):

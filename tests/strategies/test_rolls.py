@@ -109,15 +109,26 @@ class LifecycleTests(RollTestCase):
         rid = roll["roll_id"]
 
         self.assertEqual(self.machine.acquire(rid)["state"], "proving_filled")
-        # The replacement is fully filled on the NEW contract.
-        self.book(NEW, 50)
+        # The replacement is fully filled on the NEW contract: the fill is
+        # RECORDED against the roll (the durable proof), not inferred from a book.
+        self.machine.record_replacement_fill(
+            rid, paper_order_id="PAPER-1", quantity=50, instrument_id=NEW
+        )
         self.assertEqual(self.machine.prove_filled(rid)["state"], "releasing_old")
         self.assertEqual(self.machine.release_close(rid)["state"], "releasing_old")
         # The old book is flat.
         self.assertEqual(self.machine.mark_old_flat(rid)["state"], "completed")
         self.assertEqual(
             [row["event"] for row in self.machine.events(rid)],
-            ["created", "acquired", "fill_proven", "close_released", "old_flat", "completed"],
+            [
+                "created",
+                "acquired",
+                "replacement_filled",
+                "fill_proven",
+                "close_released",
+                "old_flat",
+                "completed",
+            ],
         )
 
     def test_the_state_order_is_the_invariant(self):
@@ -143,7 +154,9 @@ class FullFillGateTests(RollTestCase):
         self.machine.acquire(rid)
 
         # 30 of 50 filled: not enough.
-        self.book(NEW, 30)
+        self.machine.record_replacement_fill(
+            rid, paper_order_id="PAPER-1", quantity=30, instrument_id=NEW
+        )
         stalled = self.machine.prove_filled(rid)
         self.assertEqual(stalled["state"], "action_required")
         self.assertEqual(stalled["action_reason"], "replacement_incomplete")
@@ -194,27 +207,48 @@ class FullFillGateTests(RollTestCase):
         self.machine.prove_filled(rid, proven_quantity=50)
         self.assertEqual(self.machine.get(rid)["state"], "releasing_old")
 
-    def test_proof_comes_from_the_attributed_book_not_an_order_label(self):
-        """The roll reads the strategy's book on the NEW contract at its identity."""
+    def test_proof_is_the_roll_s_own_recorded_replacement_executions(self):
+        """Recorded executions prove the roll; a book or a claim does not.
+
+        The attributed book mixes holdings that predate the roll and holdings that
+        belong to other decisions, so it cannot prove THIS replacement - and the
+        HTTP surface cannot pass a quantity at all. The roll's own durable record
+        of confirmed replacement fills is the proof.
+        """
+        from backend.strategies.rolls import RollStateError
+
         roll = self.roll(required=50)
         rid = roll["roll_id"]
         self.machine.acquire(rid)
-        # No book on the new contract: an order might claim anything, but the
-        # strategy holds nothing.
-        self.assertEqual(
-            self.machine.attributed_quantity(
-                strategy_id="stg-A", account_id="kite:A", instrument_id=NEW, product="NRML"
-            ),
-            0,
-        )
+        # Nothing recorded: the roll is unproven.
         self.assertEqual(self.machine.prove_filled(rid)["state"], "action_required")
 
-        # A book on a DIFFERENT contract does not count either.
+        # A pre-existing holding on the NEW contract does not prove the roll...
+        self.book(NEW, 50)
+        self.assertEqual(self.machine.prove_filled(rid)["state"], "action_required")
+        # ...and neither does a holding on another contract.
         self.book(OLD, 50)
         self.assertEqual(self.machine.prove_filled(rid)["state"], "action_required")
 
-        # Only the right contract's book proves it.
-        self.book(NEW, 50)
+        # An execution on the WRONG contract is refused outright.
+        with self.assertRaises(RollStateError):
+            self.machine.record_replacement_fill(
+                rid, paper_order_id="PAPER-WRONG", quantity=50, instrument_id=OLD
+            )
+
+        # Only recorded executions on the replacement contract prove it, and a
+        # replayed paper order is recorded once (idempotent).
+        self.machine.record_replacement_fill(
+            rid, paper_order_id="PAPER-1", quantity=30, instrument_id=NEW
+        )
+        self.machine.record_replacement_fill(
+            rid, paper_order_id="PAPER-1", quantity=30, instrument_id=NEW
+        )
+        self.assertEqual(self.machine.replacement_filled_quantity(rid), 30)
+        self.assertEqual(self.machine.prove_filled(rid)["state"], "action_required")
+        self.machine.record_replacement_fill(
+            rid, paper_order_id="PAPER-2", quantity=20, instrument_id=NEW
+        )
         self.assertEqual(self.machine.prove_filled(rid)["state"], "releasing_old")
 
 

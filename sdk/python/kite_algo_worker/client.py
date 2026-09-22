@@ -343,9 +343,21 @@ class KiteAlgoWorkerClient:
 
     # -- proposals and frozen plans (G5) -----------------------------------
 
-    def submit_proposal(self, payload: JsonDict) -> JsonDict:
-        """Submit one evaluation's proposal (creates a frozen plan, places nothing)."""
-        return self._request("POST", "/worker/proposals", json=payload)
+    def submit_proposal(
+        self, payload: JsonDict, *, session_nonce: Optional[str] = None
+    ) -> JsonDict:
+        """Submit one evaluation's proposal (creates a frozen plan, places nothing).
+
+        A hosted child must send the session nonce it claimed: the proposal route
+        enforces session freshness and hosted-attempt authority before anything is
+        persisted, exactly like the order-mutation routes.
+        """
+        return self._request(
+            "POST",
+            "/worker/proposals",
+            json=payload,
+            headers=session_headers(session_nonce),
+        )
 
     @property
     def proposals(self) -> "_ProposalNamespace":
@@ -1420,5 +1432,5 @@ class _ProposalNamespace:
     def __init__(self, client: "KiteAlgoWorkerClient") -> None:
         self._client = client
 
-    def submit(self, payload: JsonDict) -> JsonDict:
-        return self._client.submit_proposal(payload)
+    def submit(self, payload: JsonDict, *, session_nonce: Optional[str] = None) -> JsonDict:
+        return self._client.submit_proposal(payload, session_nonce=session_nonce)

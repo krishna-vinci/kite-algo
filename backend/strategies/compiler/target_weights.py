@@ -21,7 +21,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from sqlalchemy import text
 
+from backend.strategies.admission import VALID_PRODUCTS
 from backend.strategies.compiler.base import (
+    pinned_units,
     PinnedCatalogRead,
     ResolvedPlan,
     TargetCompiler,
@@ -40,6 +42,12 @@ def _as_optional_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+#: A full-snapshot portfolio target is cash-equity unless the payload says
+#: otherwise; the frozen product travels with the plan so execution never
+#: re-decides it.
+DEFAULT_PRODUCT = "CNC"
 
 
 class TargetWeightsCompiler(TargetCompiler):
@@ -146,9 +154,49 @@ class TargetWeightsCompiler(TargetCompiler):
                         },
                     )
 
+        # The executed PRODUCT is frozen with the plan, exactly like the unit and
+        # the price: the paper/live order payload needs one, and re-deciding it at
+        # execution would make the same frozen plan orderable under a different
+        # product. A full-snapshot portfolio target is cash-equity (CNC) unless the
+        # payload names another valid product, which admission then re-validates.
+        product = str(payload.get("product") or DEFAULT_PRODUCT).upper()
+        if product not in VALID_PRODUCTS:
+            raise ValidationRefusal(
+                "PAYLOAD_INVALID",
+                {"product": product, "valid_products": sorted(VALID_PRODUCTS)},
+            )
+
         reference_prices = payload.get("reference_prices")
         if reference_prices is not None and not isinstance(reference_prices, Mapping):
             raise ValidationRefusal("PAYLOAD_INVALID", {"missing_fields": ["reference_prices"]})
+
+        # The capital basis is FROZEN with the plan (the platform resolves it at
+        # submission time and the compiler records it). Sizing against the live
+        # admission policy at execution time would let a later policy change
+        # silently re-size an already-approved target, which is exactly what a
+        # frozen plan exists to prevent.
+        try:
+            capital_basis = float(payload.get("capital_basis_inr"))
+        except (TypeError, ValueError) as exc:
+            raise ValidationRefusal(
+                "CAPITAL_BASIS_UNAVAILABLE",
+                {"capital_basis_inr": payload.get("capital_basis_inr")},
+            ) from exc
+        if capital_basis <= 0:
+            raise ValidationRefusal(
+                "CAPITAL_BASIS_UNAVAILABLE", {"capital_basis_inr": capital_basis}
+            )
+        cash_buffer_pct = payload.get("cash_buffer_pct")
+        try:
+            cash_buffer_pct = 0.0 if cash_buffer_pct is None else float(cash_buffer_pct)
+        except (TypeError, ValueError) as exc:
+            raise ValidationRefusal(
+                "PAYLOAD_INVALID", {"cash_buffer_pct": payload.get("cash_buffer_pct")}
+            ) from exc
+        if cash_buffer_pct < 0 or cash_buffer_pct >= 1:
+            raise ValidationRefusal(
+                "PAYLOAD_INVALID", {"cash_buffer_pct": cash_buffer_pct}
+            )
 
         normalized: Dict[str, float] = {}
         for key, value in weights.items():
@@ -192,7 +240,11 @@ class TargetWeightsCompiler(TargetCompiler):
                     "broker_exchange": mapping["broker_exchange"],
                     "broker_symbol": mapping["broker_symbol"],
                     "broker_token": mapping["broker_token"],
+                    "product": product,
                     "target_weight": weight,
+                    # Executed unit frozen with the plan (never re-read at
+                    # execution): weights size to a quantity, which needs a lot.
+                    **pinned_units(mapping),
                     # Per-member price for admission's notional arithmetic.
                     "reference_price": (
                         None
@@ -208,12 +260,20 @@ class TargetWeightsCompiler(TargetCompiler):
             "target_kind": self.target_kind,
             "universe_revision_id": revision["universe_revision_id"],
             "target_weights": {member: float(normalized.get(member, DEFAULT_WEIGHT)) for member in revision["members"]},
+            # Frozen sizing inputs: the executable target is a pure function of
+            # the plan (weight x basis x buffer / pinned price, floored to the
+            # pinned lot), never of a later policy change.
+            "capital_basis_inr": capital_basis,
+            "cash_buffer_pct": cash_buffer_pct,
         }
         resolved: Dict[str, Any] = {
             "target_kind": self.target_kind,
             "catalog_generation": pinned.pin(),
+            "product": product,
             "universe_revision_id": revision["universe_revision_id"],
             "member_hash": resolved_hash,
+            "capital_basis_inr": capital_basis,
+            "cash_buffer_pct": cash_buffer_pct,
             "legs": legs,
         }
         return ResolvedPlan(

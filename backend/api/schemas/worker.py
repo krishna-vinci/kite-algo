@@ -6,6 +6,10 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+# The default action set every new owner-issued token receives. Deliberately
+# excluded (though grantable via ``allowed_actions``): ``proposals:submit``
+# (G5 proposal authority is opt-in) and the F10 producer actions — a default
+# must never hand out authority the caller did not ask for.
 _DEFAULT_WORKER_ACTIONS = [
     "gtt:read",
     "gtt:write",

@@ -508,6 +508,91 @@ def test_create_schedule_derives_and_validates(repo):
     assert schedule.params_snapshot == {"lots": 1}
 
 
+def test_create_schedule_stores_a_monthly_day_of_month(repo):
+    """The real creation path supports monthly, not just daily/weekly."""
+    strategy = _strategy(repo)
+    version = _version(repo, strategy.id)
+    schedule = repo.create_schedule(
+        strategy_id=strategy.id,
+        version_id=version.id,
+        owner_id=OWNER,
+        job_kind="finite",
+        execution_mode="paper",
+        params={"lots": 1},
+        schedule_kind="monthly",
+        at_time="09:15",
+        day_of_month=15,
+    )
+    assert schedule.schedule_kind == "monthly"
+    assert schedule.day_of_month == 15
+    assert schedule.calendar_dates is None
+    # The scheduler reads exactly this row.
+    from backend.strategies.scheduling import ScheduleScheduler
+
+    stored = ScheduleScheduler(session_factory=repo.session_factory).enabled_schedules()
+    assert [row["id"] for row in stored] == [schedule.id]
+    assert stored[0]["day_of_month"] == 15
+    assert stored[0]["version_id"] == version.id
+    assert stored[0]["params_snapshot"] == {"lots": 1}
+
+
+def test_create_schedule_stores_calendar_dates_normalized(repo):
+    strategy = _strategy(repo)
+    version = _version(repo, strategy.id)
+    schedule = repo.create_schedule(
+        strategy_id=strategy.id,
+        version_id=version.id,
+        owner_id=OWNER,
+        job_kind="finite",
+        execution_mode="paper",
+        params={"lots": 1},
+        schedule_kind="calendar",
+        at_time="09:15",
+        calendar_dates=["2026-11-01", "2026-10-10", "2026-10-10"],
+    )
+    assert schedule.schedule_kind == "calendar"
+    # Sorted and de-duplicated, so an occurrence key is never ambiguous.
+    assert list(schedule.calendar_dates) == ["2026-10-10", "2026-11-01"]
+    assert schedule.day_of_month is None
+
+
+def test_create_schedule_rejects_a_kind_without_its_required_field(repo):
+    strategy = _strategy(repo)
+    version = _version(repo, strategy.id)
+    with pytest.raises(service.StrategyValidationError):
+        repo.create_schedule(
+            strategy_id=strategy.id,
+            version_id=version.id,
+            owner_id=OWNER,
+            job_kind="finite",
+            execution_mode="paper",
+            schedule_kind="monthly",
+            at_time="09:15",
+        )
+    with pytest.raises(service.StrategyValidationError):
+        repo.create_schedule(
+            strategy_id=strategy.id,
+            version_id=version.id,
+            owner_id=OWNER,
+            job_kind="finite",
+            execution_mode="paper",
+            schedule_kind="calendar",
+            at_time="09:15",
+            calendar_dates=[],
+        )
+    with pytest.raises(service.StrategyValidationError):
+        repo.create_schedule(
+            strategy_id=strategy.id,
+            version_id=version.id,
+            owner_id=OWNER,
+            job_kind="finite",
+            execution_mode="paper",
+            schedule_kind="calendar",
+            at_time="09:15",
+            calendar_dates=["not-a-date"],
+        )
+
+
 def test_create_schedule_rejects_wrong_owner_and_version(repo):
     strategy_a = _strategy(repo)
     strategy_b = _strategy(repo)

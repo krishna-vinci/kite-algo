@@ -77,7 +77,7 @@ def _headers(cred=CRED):
     return {HEADER_NAME: cred} if cred else {}
 
 
-def _queued_job(repo):
+def _queued_job(repo, *, capabilities=None):
     strategy = repo.create_strategy(
         owner_id=OWNER,
         name=f"s-{uuid.uuid4().hex[:8]}",
@@ -96,7 +96,9 @@ def _queued_job(repo):
         parameters_schema={"type": "object"},
         capabilities_snapshot={
             "schema_version": 2,
-            "capabilities": {"trade": True, "notify": False, "data": True},
+            "capabilities": dict(
+                capabilities or {"trade": True, "notify": False, "data": True}
+            ),
         },
         created_by=OWNER,
     )
@@ -277,6 +279,44 @@ async def test_prepare_returns_one_time_child_config(harness):
         assert config["run_id"] in worker.runs
         # The supervisor credential is never echoed.
         assert CRED not in response.text
+
+
+@pytest.mark.asyncio
+async def test_prepare_mints_a_child_that_can_open_proposal_authority(harness):
+    """The real mint composes the child's actions from its pinned capabilities.
+
+    ``proposals:submit`` is a trading right: it arrives with ``trade``, and the
+    child still never receives the supervisor's lifecycle actions.
+    """
+    repo, worker, app = harness
+    job = _queued_job(repo)
+    async with _client(app) as client:
+        assert (await _claim(client, job)).status_code == 200
+        response = await client.post(
+            f"{BASE}/jobs/{job.id}/prepare", json=_authority(epoch=1), headers=_headers()
+        )
+        assert response.status_code == 200, response.text
+        assert len(worker.tokens) == 1
+        child = next(iter(worker.tokens.values()))
+        assert "proposals:submit" in child["allowed_actions"]
+        assert "intents:submit" in child["allowed_actions"]
+        assert "heartbeat" not in child["allowed_actions"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_does_not_grant_proposal_authority_to_a_data_only_child(harness):
+    repo, worker, app = harness
+    job = _queued_job(repo, capabilities={"trade": False, "notify": False, "data": True})
+    async with _client(app) as client:
+        assert (await _claim(client, job)).status_code == 200
+        response = await client.post(
+            f"{BASE}/jobs/{job.id}/prepare", json=_authority(epoch=1), headers=_headers()
+        )
+        assert response.status_code == 200, response.text
+        child = next(iter(worker.tokens.values()))
+        assert "proposals:submit" not in child["allowed_actions"]
+        assert "intents:submit" not in child["allowed_actions"]
+        assert "runs:read" in child["allowed_actions"]
 
 
 @pytest.mark.asyncio

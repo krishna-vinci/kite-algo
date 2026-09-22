@@ -166,3 +166,14 @@ class ManagedRun:
             dry_run=dry_run,
             session_nonce=self.session_nonce,
         )
+
+    def submit_proposal(self, payload: Mapping[str, Any]) -> JsonDict:
+        """Submit this run's proposal, with the hosted session nonce attached.
+
+        ``strategy_run_id`` defaults to this run: the platform still derives
+        strategy, account and the bound evaluation id from its own records, so
+        the payload cannot rebind the run.
+        """
+        body = dict(payload)
+        body.setdefault("strategy_run_id", self.run_id)
+        return self.client.submit_proposal(body, session_nonce=self.session_nonce)

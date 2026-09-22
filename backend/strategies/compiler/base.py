@@ -85,6 +85,25 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def pinned_units(mapping: Mapping[str, Any]) -> Dict[str, Any]:
+    """The executed unit of a leg, frozen with the plan (R3 §7).
+
+    Resolution reads the catalog once; the executed quantity must come from the
+    same artifact. A catalog that provides no lot for a cash-equity listing means
+    "one unit", and that decision is *recorded* (``lot_source: default``) rather
+    than silently re-derived at execution time from a catalog that may have moved
+    since the plan was frozen.
+    """
+    raw = mapping.get("lot_size")
+    try:
+        lot = int(raw) if raw is not None else 1
+    except (TypeError, ValueError):
+        lot = 1
+    if lot <= 0:
+        lot = 1
+    return {"lot_size": lot, "lot_source": "catalog" if raw is not None else "default"}
+
+
 def member_hash(members: List[str]) -> str:
     """Canonical hash of a resolved member set (sorted, deduplicated)."""
     return sha256_text(canonical_json(sorted({str(item).upper() for item in members})))

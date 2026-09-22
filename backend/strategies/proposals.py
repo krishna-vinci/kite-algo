@@ -105,7 +105,7 @@ class ProposalStore:
         compiler: Any = None,
     ) -> None:
         if session_factory is None:
-            from backend.workflows.repository import SessionLocal
+            from backend.app.database import SessionLocal
 
             session_factory = SessionLocal
         self.session_factory = session_factory
@@ -227,10 +227,13 @@ class ProposalStore:
         compiled = None
         try:
             pinned = self._pinned_read(submission)
+            compile_payload = self._compile_payload(submission)
             if self._compiler is not None:
-                compiled = self._compiler.compile(submission.payload, pinned)
+                compiled = self._compiler.compile(compile_payload, pinned)
             else:
-                compiled = compile_resolved_plan(submission.target_kind, submission.payload, pinned)
+                compiled = compile_resolved_plan(
+                    submission.target_kind, compile_payload, pinned
+                )
         except ValidationRefusal as exc:
             refusal = exc
 
@@ -277,6 +280,51 @@ class ProposalStore:
         return PinnedCatalogRead(
             self.session_factory, generation=str(generation) if generation else None
         )
+
+    def _compile_payload(self, submission: ProposalSubmission) -> Dict[str, Any]:
+        """The payload the compiler sees.
+
+        A weights plan needs a capital basis, and the PLATFORM resolves it here
+        from the strategy's recorded admission policy, then the compiler freezes
+        it with the plan. A caller-supplied basis is overwritten rather than
+        trusted: an approved size must not be narratable into existence. At
+        execution time the frozen basis is what sizes the order, so a later
+        policy change cannot re-size an already-approved target.
+        """
+        payload = dict(submission.payload or {})
+        if str(submission.target_kind or "").strip() == "target_weights":
+            payload["capital_basis_inr"] = self._capital_basis(submission)
+        return payload
+
+    def _capital_basis(self, submission: ProposalSubmission) -> float:
+        from backend.strategies.attribution_models import StrategyAdmissionPolicy
+
+        with self.session_factory() as session:
+            row = session.execute(
+                select(StrategyAdmissionPolicy).where(
+                    StrategyAdmissionPolicy.strategy_id == str(submission.strategy_id)
+                )
+            ).scalar_one_or_none()
+        allocation = None
+        if row is not None and str(row.account_id or "") == str(submission.account_id):
+            allocation = row.allocation_inr
+        try:
+            allocation = None if allocation is None else float(allocation)
+        except (TypeError, ValueError):
+            allocation = None
+        if allocation is None or allocation <= 0:
+            raise ValidationRefusal(
+                "CAPITAL_BASIS_UNAVAILABLE",
+                {
+                    "strategy_id": str(submission.strategy_id),
+                    "account_id": str(submission.account_id),
+                    "message": (
+                        "a weights plan must freeze a capital basis from the strategy's "
+                        "recorded admission policy"
+                    ),
+                },
+            )
+        return float(allocation)
 
     def _resolve_existing(self, existing: Mapping[str, Any], digest: str) -> Dict[str, Any]:
         if str(existing.get("payload_sha256") or "") != digest:

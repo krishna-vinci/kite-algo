@@ -132,6 +132,7 @@ class OptionStructureCompiler(TargetCompiler):
             )
 
         expiry_policy = self._expiry_policy(payload, legs=resolved_legs)
+        phase, option_run_id = self._option_run_binding(payload)
         digest = self._structure_digest(
             underlying=underlying, expiry=structure_expiry, legs=resolved_legs
         )
@@ -143,6 +144,7 @@ class OptionStructureCompiler(TargetCompiler):
             "product": product,
             "structure_id": str(payload.get("structure_id") or ""),
             "expiry_policy": expiry_policy,
+            "option_run": {"phase": phase, "option_run_id": option_run_id},
             "legs": [
                 {
                     "option_type": leg["option_type"],
@@ -161,9 +163,52 @@ class OptionStructureCompiler(TargetCompiler):
             "structure_id": str(payload.get("structure_id") or ""),
             "structure_digest": digest,
             "expiry_policy": expiry_policy,
+            # Frozen here so the EXECUTION-time binding is authoritative: an exit
+            # plan carries the option-run reference it closes; an entry plan
+            # creates the run. Re-deciding this at execution would let a caller
+            # change which structure a plan closes.
+            "option_run": {"phase": phase, "option_run_id": option_run_id},
             "legs": resolved_legs,
         }
         return ResolvedPlan(target_kind=self.target_kind, logical=logical, resolved=resolved)
+
+    # -- run binding --------------------------------------------------------
+
+    @staticmethod
+    def _option_run_binding(payload: Mapping[str, Any]) -> tuple[str, Optional[str]]:
+        """The frozen phase and the option-run reference an EXIT closes.
+
+        The reference is a lookup key, never authority: the executor re-validates
+        ownership, environment and leg identity against the durable run. But it
+        must be frozen, because choosing it later would let a caller point a plan
+        at a structure it never described.
+        """
+        declared_phase = payload.get("phase")
+        reference = payload.get("option_run_id")
+        block = payload.get("option_run")
+        if isinstance(block, Mapping):
+            declared_phase = block.get("phase", declared_phase)
+            reference = block.get("option_run_id", reference)
+        phase = None if declared_phase in (None, "") else str(declared_phase).strip().lower()
+        option_run_id = None if reference in (None, "") else str(reference).strip()
+        if phase is None:
+            phase = "exit" if option_run_id else "entry"
+        if phase not in ("entry", "exit"):
+            raise ValidationRefusal(
+                "PAYLOAD_INVALID",
+                {"phase": phase, "allowed": ["entry", "exit"]},
+            )
+        if phase == "exit" and not option_run_id:
+            raise ValidationRefusal(
+                "OPTION_EXIT_REFERENCE_REQUIRED",
+                {
+                    "message": (
+                        "An exit plan must reference the option run it closes; the "
+                        "reference is validated at execution, never trusted"
+                    )
+                },
+            )
+        return phase, option_run_id
 
     # -- legs ---------------------------------------------------------------
 

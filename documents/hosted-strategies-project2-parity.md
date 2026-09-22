@@ -70,3 +70,16 @@ tests, including real-PostgreSQL proof of triggers, transitions, freeze symmetry
 the §17 walkthrough and append-only adjustment semantics. **Paper/live
 certification:** N/A this phase (no new execution lane; live behaviour NOT PROVEN
 per §4). Phase gate: **PASSED**.
+
+---
+
+## Evidence class note 2026-09-21
+
+The evidence in this report is **component/unit** (and, where stated, route or
+PostgreSQL) evidence. It is NOT a production-route or paper end-to-end result, and
+it does NOT certify live behaviour. See
+`documents/hosted-strategies-integration-closure.md` for the corrected phase and
+migration arithmetic (eleven phases 0..10; original migrations 000025..000034,
+closure migrations 000035..000038, head `20260921_000038`) and for the named
+remaining blockers (no hosted live execution mode, live fill-ingestion not bound,
+no live market certification).

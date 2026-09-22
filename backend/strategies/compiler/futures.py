@@ -78,11 +78,40 @@ def _expiry_iso(value: Any) -> Any:
 class FuturesCompiler(TargetCompiler):
     target_kind = "target_futures"
 
+    @staticmethod
+    def _roll_binding(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """The roll this plan plays a role in, or ``None``.
+
+        A futures plan that is part of a roll says so explicitly:
+        ``{"roll": {"role": "open_new" | "close_old", "roll_id": <optional>}}``.
+        The role is what the executor enforces (a close may not go out before the
+        roll released it; a replacement fill is what proves the roll), so an
+        unknown role is refused rather than ignored.
+        """
+        from backend.strategies.rolls import ROLL_PLAN_ROLES
+
+        raw = payload.get("roll")
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise ValidationRefusal("PAYLOAD_INVALID", {"reason": "roll must be an object"})
+        role = str(raw.get("role") or "").strip().lower()
+        if role not in ROLL_PLAN_ROLES:
+            raise ValidationRefusal(
+                "PAYLOAD_INVALID", {"roll_role": role, "allowed": list(ROLL_PLAN_ROLES)}
+            )
+        roll_id = raw.get("roll_id")
+        if roll_id is not None and not str(roll_id).strip():
+            raise ValidationRefusal("PAYLOAD_INVALID", {"roll_id": str(roll_id)})
+        return {"roll_id": None if roll_id is None else str(roll_id), "role": role}
+
     def compile(self, payload: Mapping[str, Any], pinned: PinnedCatalogRead) -> ResolvedPlan:
         required = ("instrument_token", "exchange", "tradingsymbol", "lots")
         missing = [field for field in required if payload.get(field) is None]
         if missing:
             raise ValidationRefusal("PAYLOAD_INVALID", {"missing_fields": sorted(missing)})
+
+        roll_binding = self._roll_binding(payload)
 
         try:
             broker_token = int(payload["instrument_token"])
@@ -192,10 +221,15 @@ class FuturesCompiler(TargetCompiler):
             "product": product,
             "lots": lots,
             "side": side,
+            "roll": roll_binding,
         }
         resolved: Dict[str, Any] = {
             "target_kind": self.target_kind,
             "catalog_generation": pinned.pin(),
+            # The roll this plan plays a role in, frozen WITH the plan: the
+            # executor enforces the contract from the artifact, never from a
+            # caller's narration (``None`` when the plan is not part of a roll).
+            "roll": roll_binding,
             "legs": [
                 {
                     "instrument_id": mapping["instrument_id"],

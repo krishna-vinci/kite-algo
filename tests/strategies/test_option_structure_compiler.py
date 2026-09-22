@@ -335,5 +335,57 @@ class ExpiryPolicyTests(OptionStructureTestCase):
         self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
 
 
+class OptionRunBindingFreezeTests(OptionStructureTestCase):
+    """The plan freezes WHICH run it opens or closes (the executor re-validates)."""
+
+    def test_an_entry_payload_freezes_phase_entry_with_no_reference(self):
+        self.option(strike=25000, option_type="CE", token=501)
+        plan = self.compile(
+            self.payload([self.leg(strike=25000, option_type="CE", token=501, side="BUY")])
+        )
+        self.assertEqual(plan.resolved["option_run"]["phase"], "entry")
+        self.assertIsNone(plan.resolved["option_run"]["option_run_id"])
+        self.assertEqual(plan.logical["option_run"]["phase"], "entry")
+
+    def test_an_exit_payload_freezes_the_reference_it_closes(self):
+        self.option(strike=25000, option_type="CE", token=501)
+        plan = self.compile(
+            self.payload(
+                [self.leg(strike=25000, option_type="CE", token=501, side="BUY")],
+                option_run_id="opt_run_abc123",
+            )
+        )
+        # A reference implies the exit phase; the id is a LOOKUP KEY, and the
+        # executor validates ownership/environment/leg identity against the run.
+        self.assertEqual(plan.resolved["option_run"]["phase"], "exit")
+        self.assertEqual(plan.resolved["option_run"]["option_run_id"], "opt_run_abc123")
+
+    def test_an_exit_without_a_reference_is_refused_at_plan_time(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.option(strike=25000, option_type="CE", token=501)
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(
+                self.payload(
+                    [self.leg(strike=25000, option_type="CE", token=501, side="BUY")],
+                    phase="exit",
+                )
+            )
+        self.assertEqual(ctx.exception.reason_code, "OPTION_EXIT_REFERENCE_REQUIRED")
+
+    def test_an_invented_phase_is_refused(self):
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.option(strike=25000, option_type="CE", token=501)
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self.compile(
+                self.payload(
+                    [self.leg(strike=25000, option_type="CE", token=501, side="BUY")],
+                    phase="roll",
+                )
+            )
+        self.assertEqual(ctx.exception.reason_code, "PAYLOAD_INVALID")
+
+
 if __name__ == "__main__":
     unittest.main()

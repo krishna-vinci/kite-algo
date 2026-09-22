@@ -99,6 +99,13 @@ DEFAULT_WORKER_ACTIONS = {
     "workflows:write",
     "workflows:activate",
     "notifications:test",
+    # G5 proposal submission. Present in the allow-list so an owner MAY issue an
+    # external token that can submit proposals, but deliberately absent from the
+    # schema's default set (backend/api/schemas/worker.py), so no existing token
+    # silently gains proposal authority. Hosted children receive it only when
+    # their pinned capabilities grant ``trade`` (backend/strategies/service.py
+    # CHILD_ORDER_ACTIONS).
+    "proposals:submit",
     # Phase 4 F10 external producers. Present in the allow-list so a token CAN
     # be granted them, but deliberately absent from the schema's default set
     # (backend/api/schemas/worker.py), so no existing token silently gains

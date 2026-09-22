@@ -173,11 +173,27 @@ class ReconciliationEvidenceCollector:
                 execution_environment=str(job.execution_mode or ""),
                 barrier=self._settlement_barrier,
             )
-            notes.append(
-                "no_execution_settlement_barrier_quiescence_unverified"
-                if quiescence_state != "verified"
-                else "execution_settlement_barrier_quiescence_verified"
-            )
+            if quiescence_state == "verified":
+                notes.append("execution_settlement_barrier_quiescence_verified")
+            else:
+                # Name the barrier's actual state rather than a legacy label: the
+                # blocker is "no valid proof covering this book's current
+                # version", and the operator reconciliation path is what records
+                # one (see the reconcile route).
+                barrier_state = None
+                try:
+                    from backend.strategies.settlement import ExecutionBarrier
+
+                    barrier = self._settlement_barrier or ExecutionBarrier()
+                    barrier_state = barrier.state(
+                        account_id=str(job.account_scope or ""),
+                        strategy_id=str(job.strategy_id or ""),
+                        execution_environment=str(job.execution_mode or ""),
+                    )
+                except Exception:  # noqa: BLE001 - unreadable stays unverified
+                    barrier_state = None
+                notes.append("execution_settlement_barrier_proof_missing_or_invalid")
+                notes.append(f"settlement_barrier_state={barrier_state}")
 
         run: Optional[Dict[str, Any]] = None
         if job.run_id:

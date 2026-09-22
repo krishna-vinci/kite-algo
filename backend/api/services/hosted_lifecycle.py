@@ -367,6 +367,14 @@ async def prepare_launch(
     )
 
     stale_exit_policy = str((job.policy_snapshot or {}).get("stale_exit_policy") or "none")
+    # A job created by a schedule occurrence carries its bound evaluation
+    # identity. It is *config the child reads*, not authority the child invents:
+    # the proposal route still derives run/job/strategy/account from the
+    # persisted records and refuses an evaluation id that does not match this
+    # binding.
+    bound = dict(job.identity_json or {})
+    occurrence_key = job.occurrence_key
+    bound_evaluation_id = str(bound.get("evaluation_id") or "").strip() or None
     runtime_state: Dict[str, Any] = {
         "hosted": {
             "job_id": job_id,
@@ -374,6 +382,10 @@ async def prepare_launch(
             "attempt": int(attempt),
             "version_id": job.version_id,
             "capabilities": dict(capabilities),
+            "occurrence_key": occurrence_key,
+            "evaluation_id": bound_evaluation_id,
+            "evaluation_kind": bound.get("evaluation_kind"),
+            "due_at": bound.get("due_at"),
         }
     }
     protection = _protection_runtime_state(stale_exit_policy, job.progress_deadline_s)
@@ -398,6 +410,8 @@ async def prepare_launch(
             "hosted_params": dict(job.params_snapshot or {}),
             "hosted_capabilities": dict(capabilities),
             "hosted_stale_exit_policy": stale_exit_policy,
+            "hosted_occurrence_key": occurrence_key,
+            "hosted_evaluation_id": bound_evaluation_id,
         },
         runtime_state=runtime_state,
     )

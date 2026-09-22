@@ -21,7 +21,7 @@ install_dependency_stubs()
 
 import httpx  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
-from sqlalchemy import create_engine, text  # noqa: E402
+from sqlalchemy import create_engine, event, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402
 
@@ -87,6 +87,40 @@ def session_factory():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+
+    @event.listens_for(engine, "connect")
+    def _attach_public(dbapi_connection, connection_record):
+        """The raw platform tables the barrier enumeration reads.
+
+        The unblock transaction now validates the durable settlement proof, so
+        this fixture exposes the same evidence sources the real schema has - an
+        unreadable source is NOT an empty one.
+        """
+        _ = connection_record
+        cursor = dbapi_connection.cursor()
+        cursor.execute("ATTACH DATABASE ':memory:' AS public")
+        cursor.execute(
+            """
+            CREATE TABLE public.worker_live_execution_links (
+                link_id INTEGER PRIMARY KEY AUTOINCREMENT, strategy_run_id TEXT NOT NULL,
+                account_id TEXT NOT NULL, broker_order_id TEXT NOT NULL, trade_id TEXT,
+                client_order_ref TEXT, basket_execution_id TEXT, basket_leg_index INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE public.live_order_intents (
+                intent_id TEXT PRIMARY KEY, client_order_ref TEXT NOT NULL,
+                account_id TEXT NOT NULL, strategy_run_id TEXT NOT NULL, broker_order_id TEXT,
+                basket_execution_id TEXT, basket_leg_index INTEGER, bracket_intent_id TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        dbapi_connection.commit()
+
     Base.metadata.create_all(engine)
     yield sessionmaker(bind=engine, expire_on_commit=False)
     engine.dispose()
@@ -164,41 +198,33 @@ BASE = "/api/strategies"
 
 
 @pytest.mark.asyncio
-async def test_allowed_reconciliation_unblocks_replacement(session_factory, monkeypatch):
+async def test_an_injected_quiescence_claim_does_not_unblock_without_a_durable_proof(
+    session_factory, monkeypatch
+):
+    """A collector that CLAIMS quiescence is not a durable proof.
+
+    The unblock transaction validates the execution-settlement barrier itself, so
+    with no current proof for the job's own book the attempt stays blocked even
+    though the injected evidence says "verified". The allowed path is covered by
+    the real-barrier PostgreSQL suite
+    (``tests/integration/test_reconciliation_barrier_toctou_postgres.py``) and by
+    the end-to-end example, not by injecting the callback being certified.
+    """
     repo = _repo(session_factory)
     strategy, job = _make_job(repo)
-    # A real execution-settlement barrier does not exist yet, so exercise the
-    # allowed path with quiescence explicitly verified.
     collector = StubCollector(_evidence(quiescence_state="verified"))
     async with _client(session_factory, monkeypatch, collector) as client:
-        inspection = await client.get(f"{BASE}/{strategy.id}/jobs/{job.id}/reconciliation")
-        assert inspection.status_code == 200
-        body = inspection.json()
-        assert body["assessment"]["allowed"] is True
-        assert body["assessment"]["case"] == "trading_settled_flat"
-
         response = await client.post(
             f"{BASE}/{strategy.id}/jobs/{job.id}/reconciliation",
             json={"attempt": 1, "lease_epoch": 1},
         )
-        assert response.status_code == 200, response.text
-        assert response.json()["status"] == "reconciled"
-        assert response.json()["replacement_blocked"] is False
-
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["rejection_reason"] in {
+        "RECONCILE_RACE_LOST",
+        "EXECUTION_WORK_OUTSTANDING",
+    }
     refreshed = repo.get_job(OWNER, job.id)
-    assert refreshed.status == "stopped" and refreshed.reconciled_at is not None
-    # Replacement is now permitted.
-    version_id = refreshed.version_id
-    new_job = repo.create_job(
-        strategy_id=strategy.id,
-        version_id=version_id,
-        owner_id=OWNER,
-        job_kind="finite",
-        execution_mode="paper",
-        params={},
-        attempt=2,
-    )
-    assert new_job.id != job.id
+    assert refreshed.status == "recovery_required" and refreshed.reconciled_at is None
 
 
 @pytest.mark.asyncio
