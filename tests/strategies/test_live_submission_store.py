@@ -42,6 +42,8 @@ class LiveSubmissionStoreTests(unittest.TestCase):
                     broker_order_ids TEXT NOT NULL DEFAULT '[]',
                     delta_snapshot TEXT NOT NULL DEFAULT '{}',
                     detail TEXT NOT NULL DEFAULT '{}',
+                    consumer_token TEXT,
+                    consumer_until TIMESTAMP,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (plan_id, step_no)

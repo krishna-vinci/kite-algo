@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend.strategies import service as strategy_service
+from backend.strategies.account_truth import INGEST_IDLE
 from backend.strategies.reconciliation import ReconciliationEvidence, barrier_quiescence_state
 
 __all__ = ["ReconciliationEvidenceCollector"]
@@ -38,10 +39,15 @@ class ReconciliationEvidenceCollector:
         paper_runtime: Any = None,
         option_status_reader: Optional[Callable[[str, str], Optional[str]]] = None,
         settlement_barrier: Optional[Any] = None,
+        session_factory: Any = None,
     ) -> None:
         self._worker = worker_repo
         self._paper = paper_runtime
         self._option_status = option_status_reader
+        #: The LIVE settlement sources (the strategy's attributed live book and
+        #: the account's ingest truth) are read from the platform database -- the
+        #: paper runtime is never consulted for a live book.
+        self._session_factory = session_factory
         # The settlement barrier (D-4) backs ``quiescence_state``: ``verified``
         # only on a valid proof for the job's strategy book. ``None`` means the
         # default store is constructed lazily on first use.
@@ -67,6 +73,8 @@ class ReconciliationEvidenceCollector:
         if mode == "dry_run":
             # Preview-only: no execution path exists, so nothing could be accepted.
             return {"work_state": "none", "exposure_state": "flat", "unavailable": [], "watermark": "dry_run"}
+        if mode == "live":
+            return self._live_settlement(job)
         if mode != "paper":
             return {"work_state": "unknown", "exposure_state": "unknown", "unavailable": ["execution_mode"], "watermark": None}
         if self._paper is None or not hasattr(self._paper, "get_strategy_run_settlement_readonly"):
@@ -158,6 +166,188 @@ class ReconciliationEvidenceCollector:
         return {"work_state": work_state, "exposure_state": exposure_state, "unavailable": unavailable, "watermark": watermark}
 
     async def collect(self, job) -> ReconciliationEvidence:
+        return await self._collect(job)
+
+    # ------------------------------------------------------------------ live
+
+    def _live_session(self):
+        if self._session_factory is None:
+            from backend.app.database import SessionLocal
+
+            self._session_factory = SessionLocal
+        return self._session_factory()
+
+    def _live_settlement(self, job) -> Dict[str, Any]:
+        """LIVE settlement evidence: the attributed strategy book + account truth.
+
+        Deliberately NOT the paper collector and NOT an account-net-flat check:
+
+        * the run binding must name this job's strategy/account and the ``live``
+          environment, or the evidence is attributed to something else and stays
+          ``unknown``;
+        * the exposure axis is the strategy's OWN published live attribution
+          projection, so a flat *account* cannot hide an open *strategy* book;
+        * work is ``outstanding`` while any durable live plan step for this book
+          is unresolved (pending/partial/finalizing/rejecting/uncertain/
+          repair_required) -- a staged step whose effects are not yet confirmed
+          is in flight, not settled;
+        * account truth must be COMPLETE (a finished ingest cycle) before the
+          book is treated as read; missing/unrefreshable truth is ``unknown``,
+          never flat.
+        """
+        from sqlalchemy import text
+
+        account_id = str(job.account_scope or "")
+        strategy_id = str(job.strategy_id or "")
+        run_id = str(job.run_id or "")
+        unavailable: List[str] = []
+        session = self._live_session()
+        try:
+            binding = session.execute(
+                text(
+                    """
+                    SELECT strategy_id, owner_id, account_id, execution_environment
+                    FROM public.strategy_run_bindings
+                    WHERE strategy_run_id = :run_id
+                    """
+                ),
+                {"run_id": run_id},
+            ).mappings().first()
+            if binding is None:
+                return {
+                    "work_state": "unknown",
+                    "exposure_state": "unknown",
+                    "unavailable": ["live_run_binding"],
+                    "watermark": None,
+                }
+            if (
+                str(binding["strategy_id"]) != strategy_id
+                or str(binding["account_id"]) != account_id
+                or str(binding["execution_environment"]) != "live"
+            ):
+                return {
+                    "work_state": "unknown",
+                    "exposure_state": "unknown",
+                    "unavailable": ["live_run_binding_attribution"],
+                    "watermark": None,
+                }
+
+            publication = session.execute(
+                text(
+                    """
+                    SELECT projection_version FROM public.strategy_projection_state
+                    WHERE account_id = :account_id AND strategy_id = :strategy_id
+                      AND execution_environment = 'live'
+                    """
+                ),
+                {"account_id": account_id, "strategy_id": strategy_id},
+            ).first()
+            positions = session.execute(
+                text(
+                    """
+                    SELECT net_quantity FROM public.strategy_position_projection
+                    WHERE account_id = :account_id AND strategy_id = :strategy_id
+                      AND execution_environment = 'live'
+                    """
+                ),
+                {"account_id": account_id, "strategy_id": strategy_id},
+            ).fetchall()
+            unresolved_steps = session.execute(
+                text(
+                    """
+                    SELECT COUNT(*) FROM public.live_plan_submissions
+                    WHERE account_id = :account_id AND strategy_id = :strategy_id
+                      AND execution_environment = 'live'
+                      AND state NOT IN ('filled', 'rejected', 'no_op')
+                    """
+                ),
+                {"account_id": account_id, "strategy_id": strategy_id},
+            ).scalar()
+            ingest = session.execute(
+                text(
+                    """
+                    SELECT status, last_complete_ingest_at
+                    FROM public.account_ingest_state
+                    WHERE account_id = :account_id
+                    """
+                ),
+                {"account_id": account_id},
+            ).mappings().first()
+        except Exception:
+            return {
+                "work_state": "unknown",
+                "exposure_state": "unknown",
+                "unavailable": ["live_settlement"],
+                "watermark": None,
+            }
+        finally:
+            session.close()
+
+        # Complete CURRENT account truth is required: a live book cannot be read
+        # as flat (or as settled) unless the account's own ingest cycle finished
+        # cleanly. The policy is the platform's existing one (``account_truth``):
+        # only ``idle`` means a completed cycle, so ``refreshing``, ``stale``,
+        # an unknown/unrecognised status, or a missing completion timestamp are
+        # all named unavailability rather than a flat reading.
+        if ingest is None:
+            unavailable.append("live_account_ingest_state")
+        else:
+            status = str(ingest["status"] or "")
+            if ingest["last_complete_ingest_at"] is None:
+                unavailable.append("live_account_ingest_incomplete")
+            elif status != INGEST_IDLE:
+                unavailable.append(f"live_account_ingest_{status or 'unknown'}")
+
+        if publication is None:
+            # Never published is UNKNOWN, not flat: there is no attributed book
+            # to be flat ON.
+            unavailable.append("live_attribution_unpublished")
+        truth_complete = not any(
+            reason.startswith("live_account_ingest") for reason in unavailable
+        )
+        exposure_state = "unknown"
+        if publication is not None and truth_complete:
+            exposure_state = "flat"
+            for row in positions:
+                quantity = _to_int_checked(row[0])
+                if quantity is None:
+                    exposure_state = "unknown"
+                    unavailable.append("live_attribution_quantities")
+                    break
+                if quantity != 0:
+                    exposure_state = "open"
+                    break
+
+        steps = _to_int_checked(unresolved_steps)
+        if steps is None:
+            work_state = "unknown"
+            unavailable.append("live_plan_submissions")
+        elif steps > 0:
+            work_state = "outstanding"
+        elif publication is None or not truth_complete:
+            # No attributed book and no unresolved step: nothing to settle, but
+            # only claim "settled" when the book itself is readable AND the
+            # account's truth is complete and current.
+            work_state = "unknown"
+        else:
+            work_state = "settled"
+
+        watermark = ":".join(
+            [
+                "live",
+                str(publication[0] if publication is not None else "unpublished"),
+                str(steps if steps is not None else "unknown"),
+                str(len(positions)),
+            ]
+        )
+        return {
+            "work_state": work_state,
+            "exposure_state": exposure_state,
+            "unavailable": sorted(set(unavailable)),
+            "watermark": watermark,
+        }
+
+    async def _collect(self, job) -> ReconciliationEvidence:
         unavailable: List[str] = []
         notes: List[str] = []
         launched = job.handoff_at is not None

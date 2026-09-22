@@ -263,6 +263,22 @@ async def prepare_launch(
         job, lease_owner=lease_owner, lease_epoch=lease_epoch, attempt=attempt
     )
 
+    # LAUNCH gate: ``HOSTED_LIVE_ENABLED`` (default false) gates minting a child
+    # credential for a LIVE attempt, not just the submission that would use it.
+    # Refusing here means a deployment with the setting off can never hand a
+    # child the authority to trade live, even if the job row predates the flip.
+    from backend.strategies.live_settings import (
+        hosted_live_disabled_detail,
+        hosted_live_enabled,
+    )
+
+    if str(job.execution_mode or "").lower() == "live" and not hosted_live_enabled():
+        raise HostedLifecycleError(
+            409,
+            "LIVE_DISABLED",
+            detail=hosted_live_disabled_detail(surface="hosted_prepare"),
+        )
+
     # A completed handoff or an in-flight/reserved preparation is terminal for
     # this attempt: it must never mint a second credential and never replay the
     # launch. We do NOT fence here: a concurrent duplicate (or a supervisor that

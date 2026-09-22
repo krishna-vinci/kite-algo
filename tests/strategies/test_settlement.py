@@ -133,6 +133,8 @@ class SettlementTestCase(unittest.TestCase):
                     broker_order_ids TEXT NOT NULL DEFAULT '[]',
                     delta_snapshot TEXT NOT NULL DEFAULT '{}',
                     detail TEXT NOT NULL DEFAULT '{}',
+                    consumer_token TEXT,
+                    consumer_until TIMESTAMP,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (plan_id, step_no)
@@ -144,6 +146,25 @@ class SettlementTestCase(unittest.TestCase):
                 CREATE TABLE public.strategy_jobs (
                     id TEXT PRIMARY KEY, strategy_id TEXT NOT NULL, owner_id TEXT,
                     account_scope TEXT, execution_mode TEXT, status TEXT NOT NULL DEFAULT 'queued'
+                )
+                """
+            )
+            # The durable multi-step parent (Phase 2A). The in-flight enumeration
+            # reads it, so this fixture carries it like every other live source.
+            cursor.execute(
+                """
+                CREATE TABLE public.live_plan_executions (
+                    execution_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL UNIQUE,
+                    strategy_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    execution_environment TEXT NOT NULL,
+                    lane TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    step_spec TEXT NOT NULL DEFAULT '[]',
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )

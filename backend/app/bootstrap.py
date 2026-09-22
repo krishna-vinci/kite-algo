@@ -5,7 +5,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI
 from sqlalchemy import text
@@ -59,6 +59,83 @@ def run_schema_migrations() -> None:
                 conn.close()
             except Exception:
                 pass
+
+async def start_live_outcome_consumer(app: FastAPI) -> Optional[asyncio.Task]:
+    """Start the hosted LIVE outcome consumer, or record that it is disabled.
+
+    ``HOSTED_LIVE_ENABLED`` defaults to false, and with it off NOTHING starts: a
+    live-disabled deployment performs no live polling and no live writes. When it
+    is on, the loop runs as a supervised background task whose health snapshot is
+    published through the ordinary component-status surface, so a degraded
+    consumer is visible rather than silent.
+    """
+    try:
+        from backend.strategies.live_ingestion import LiveOutcomeConsumer
+        from backend.strategies.live_settings import hosted_live_enabled
+
+        if not hosted_live_enabled():
+            app.state.live_outcome_consumer = None
+            app.state.live_outcome_task = None
+            set_component_status(
+                "live_outcome_consumer",
+                "disabled",
+                detail="HOSTED_LIVE_ENABLED is false (hosted live execution disabled)",
+            )
+            return None
+
+        # The shared sequence release pass is the SAME production executor the
+        # public execute route uses, so a withheld dependent leg is released
+        # through exactly one implementation (authority, approval, admission,
+        # reservation and the lane's own release rule all re-checked there).
+        from backend.strategies.live_service import LivePlanExecutor
+
+        releaser = LivePlanExecutor()
+        consumer = LiveOutcomeConsumer(sequence_releaser=releaser.release_sequence)
+        app.state.live_outcome_consumer = consumer
+        app.state.live_sequence_executor = releaser
+
+        def _live_health(snapshot: dict) -> None:
+            set_component_status(
+                "live_outcome_consumer",
+                str(snapshot.get("state") or "unknown"),
+                detail=str(snapshot.get("last_error") or "") or None,
+                meta={
+                    "resolved_total": snapshot.get("resolved_total"),
+                    "partial_total": snapshot.get("partial_total"),
+                    "repair_required_total": snapshot.get("repair_required_total"),
+                    "pending_observed": snapshot.get("pending_observed"),
+                    "last_poll_at": snapshot.get("last_poll_at"),
+                },
+            )
+
+        task = asyncio.create_task(consumer.run_forever(health_sink=_live_health))
+        app.state.live_outcome_task = task
+        set_component_status(
+            "live_outcome_consumer",
+            "starting",
+            detail="Hosted live outcome consumer started",
+        )
+        return task
+    except Exception as exc:  # noqa: BLE001 - a broken consumer must not break startup
+        logging.error("Failed to start hosted live outcome consumer: %s", exc, exc_info=True)
+        set_component_status("live_outcome_consumer", "degraded", detail=str(exc))
+        return None
+
+
+async def stop_live_outcome_consumer(app: FastAPI) -> None:
+    """Cancel the consumer task and wait for it, so shutdown is deterministic."""
+    task = getattr(app.state, "live_outcome_task", None)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 - shutdown continues regardless
+        pass
+    app.state.live_outcome_task = None
+
 
 async def combined_lifespan(app: FastAPI):
     global market_data_runtime
@@ -475,6 +552,13 @@ async def combined_lifespan(app: FastAPI):
         # front. Publication stays on-demand (no loop is started here).
         ensure_attribution_state(app)
 
+        # Hosted LIVE execution (Phase 1). The deployment setting defaults to
+        # false: with it off the outcome consumer is not started at all, so a
+        # live-disabled deployment performs no live polling or writes. The plan
+        # route constructs the live executor on demand; the setting is enforced
+        # inside it.
+        await start_live_outcome_consumer(app)
+
         if os.getenv("ACCOUNT_INGEST_ENABLED", "true").lower() in {"1", "true", "yes"}:
             account_ingest_task = asyncio.create_task(_account_ingest_loop(app))
         else:
@@ -662,6 +746,8 @@ async def combined_lifespan(app: FastAPI):
                 pass
     except Exception:
         pass
+    # Cancel hosted live outcome consumer
+    await stop_live_outcome_consumer(app)
     # Stop Candle Aggregator
     try:
         aggregator = getattr(app.state, "candle_aggregator", None)

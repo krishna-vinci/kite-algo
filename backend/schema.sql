@@ -2302,7 +2302,7 @@ CREATE TABLE IF NOT EXISTS public.hosted_strategies (
     CONSTRAINT uq_hosted_strategies_template UNIQUE (template_id),
     CONSTRAINT uq_hosted_strategies_id_owner UNIQUE (id, owner_id),
     CONSTRAINT ck_hosted_strategies_template_id CHECK (template_id = 'hosted:' || id),
-    CONSTRAINT ck_hosted_strategies_execution_mode CHECK (default_execution_mode IN ('paper', 'dry_run')),
+    CONSTRAINT ck_hosted_strategies_execution_mode CHECK (default_execution_mode IN ('paper', 'dry_run', 'live')),
     CONSTRAINT ck_hosted_strategies_job_kind CHECK (default_job_kind IN ('continuous', 'finite')),
     CONSTRAINT ck_hosted_strategies_max_duration CHECK (max_duration_s > 0),
     CONSTRAINT ck_hosted_strategies_progress_deadline CHECK (progress_deadline_s > 0),
@@ -2359,7 +2359,7 @@ CREATE TABLE IF NOT EXISTS public.hosted_strategy_schedules (
     CONSTRAINT fk_hosted_strategy_schedules_version_strategy
         FOREIGN KEY (version_id, strategy_id)
         REFERENCES public.hosted_strategy_versions (id, strategy_id) ON DELETE RESTRICT,
-    CONSTRAINT ck_hosted_strategy_schedules_execution_mode CHECK (execution_mode IN ('paper', 'dry_run')),
+    CONSTRAINT ck_hosted_strategy_schedules_execution_mode CHECK (execution_mode IN ('paper', 'dry_run', 'live')),
     CONSTRAINT ck_hosted_strategy_schedules_job_kind CHECK (job_kind IN ('continuous', 'finite')),
     CONSTRAINT ck_hosted_strategy_schedules_kind CHECK (schedule_kind IN ('daily', 'weekly')),
     CONSTRAINT ck_hosted_strategy_schedules_weekday CHECK (weekday IS NULL OR (weekday >= 0 AND weekday <= 6)),
@@ -2415,7 +2415,7 @@ CREATE TABLE IF NOT EXISTS public.strategy_jobs (
         FOREIGN KEY (version_id, strategy_id)
         REFERENCES public.hosted_strategy_versions (id, strategy_id) ON DELETE RESTRICT,
     CONSTRAINT ck_strategy_jobs_job_kind CHECK (job_kind IN ('continuous', 'finite')),
-    CONSTRAINT ck_strategy_jobs_execution_mode CHECK (execution_mode IN ('paper', 'dry_run')),
+    CONSTRAINT ck_strategy_jobs_execution_mode CHECK (execution_mode IN ('paper', 'dry_run', 'live')),
     CONSTRAINT ck_strategy_jobs_desired_state CHECK (desired_state IN ('started', 'paused', 'stopped')),
     CONSTRAINT ck_strategy_jobs_attempt CHECK (attempt > 0),
     CONSTRAINT ck_strategy_jobs_lease_epoch CHECK (lease_epoch >= 0),
@@ -2886,11 +2886,16 @@ CREATE TABLE IF NOT EXISTS public.live_plan_submissions (
     broker_order_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
     delta_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
     detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- Single-writer consumer lease: the outcome consumer takes it with a
+    -- conditional UPDATE so exactly one instance processes a step, and
+    -- ``consumer_until`` is the crash repair (an abandoned lease expires).
+    consumer_token TEXT,
+    consumer_until TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_live_plan_step UNIQUE (plan_id, step_no),
     CONSTRAINT ck_live_plan_submission_state
-        CHECK (state IN ('pending', 'uncertain', 'rejected', 'no_op')),
+        CHECK (state IN ('pending', 'withheld', 'releasing', 'partial', 'finalizing', 'rejecting', 'repair_required', 'residual_abandoned', 'filled', 'uncertain', 'rejected', 'no_op')),
     CONSTRAINT fk_live_plan_submission_plan FOREIGN KEY (plan_id)
         REFERENCES public.strategy_plans (plan_id) ON DELETE RESTRICT,
     CONSTRAINT fk_live_plan_submission_strategy
@@ -2899,6 +2904,47 @@ CREATE TABLE IF NOT EXISTS public.live_plan_submissions (
 );
 CREATE INDEX IF NOT EXISTS idx_live_plan_submission_state
     ON public.live_plan_submissions (state);
+
+-- The durable PARENT of a multi-step live plan. ``live_plan_submissions`` is a
+-- per-step claim; an ordered, dependency-governed step set (a CNC basket, a MIS
+-- square-off, a futures roll) needs its own immutable specification, and that
+-- protocol does not belong in an ad-hoc ``detail`` blob. Exactly one row per
+-- frozen plan; per-leg claims are never duplicated here and this is not a second
+-- execution ledger. Parent + every step claim + barrier work are materialized in
+-- ONE transaction under the canonical book lock.
+CREATE TABLE IF NOT EXISTS public.live_plan_executions (
+    execution_id TEXT PRIMARY KEY,
+    plan_id UUID NOT NULL,
+    strategy_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    lane TEXT NOT NULL,
+    state TEXT NOT NULL,
+    -- The immutable ordered step/dependency specification frozen at first
+    -- admission. A retry reads it; it is never re-derived.
+    step_spec JSONB NOT NULL DEFAULT '[]'::jsonb,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_live_plan_execution_plan UNIQUE (plan_id),
+    CONSTRAINT ck_live_plan_execution_state
+        CHECK (state IN ('planned', 'executing', 'settled', 'blocked')),
+    -- ``futures_roll``/``option_structure`` are RESERVED for the next bundle: the
+    -- extension contract admits them here so wiring those lanes adds no new
+    -- constraint migration.
+    CONSTRAINT ck_live_plan_execution_lane
+        CHECK (lane IN ('single_instrument', 'target_weights', 'mis',
+                        'futures_roll', 'option_structure')),
+    CONSTRAINT fk_live_plan_execution_plan FOREIGN KEY (plan_id)
+        REFERENCES public.strategy_plans (plan_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_live_plan_execution_strategy
+        FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_live_plan_execution_state
+    ON public.live_plan_executions (state);
+CREATE INDEX IF NOT EXISTS idx_live_plan_execution_book
+    ON public.live_plan_executions (account_id, strategy_id, execution_environment, state);
 
 CREATE TABLE IF NOT EXISTS public.strategy_proposal_journal (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -3132,8 +3178,19 @@ CREATE INDEX IF NOT EXISTS idx_barrier_events_key
     ON public.strategy_execution_barrier_events
     (account_id, strategy_id, execution_environment, created_at);
 CREATE INDEX IF NOT EXISTS idx_barrier_events_version
+   ON public.strategy_execution_barrier_events
+   (account_id, strategy_id, execution_environment, version);
+
+-- Database-level backstop for the live outcome consumer's ``work_resolved``
+-- de-duplication: one resolution per live plan step, enforced by the database
+-- and not only by the consumer's in-transaction check. Scoped to ``live`` so
+-- the constraint applies to the new live vocabulary without touching existing
+-- paper/dry-run history.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_barrier_work_resolved_live_step
     ON public.strategy_execution_barrier_events
-    (account_id, strategy_id, execution_environment, version);
+    (account_id, strategy_id, execution_environment, event, ref, (detail ->> 'plan_id'))
+    WHERE event = 'work_resolved' AND ref IS NOT NULL
+      AND execution_environment = 'live';
 
 -- Append-only snapshot of one four-axis settlement assessment (R3 §16, D-5).
 -- An assessment records the ``barrier_version`` it was taken at plus per-axis
@@ -3198,8 +3255,9 @@ CREATE TABLE IF NOT EXISTS public.strategy_plan_execution_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     plan_id UUID NOT NULL REFERENCES public.strategy_plans (plan_id) ON DELETE RESTRICT,
     step_no INTEGER NOT NULL,
-    event TEXT NOT NULL CHECK (event IN ('submitted','filled','rejected','failed','no_op')),
+    event TEXT NOT NULL CHECK (event IN ('submitted','filled','partially_filled','rejected','failed','no_op','residual_abandoned')),
     paper_order_id TEXT,
+    broker_order_id TEXT,
     filled_quantity INTEGER,
     refusal_reason TEXT,
     actor_id TEXT NOT NULL,
@@ -3325,12 +3383,15 @@ CREATE TABLE IF NOT EXISTS public.strategy_corporate_action_event_log (
 CREATE INDEX IF NOT EXISTS idx_corporate_action_log_event
     ON public.strategy_corporate_action_event_log (event_id, created_at);
 
--- A partially filled step is verified progress that is not completion, so the
--- execution trail gains a vocabulary for it.
+-- A partially filled step is verified progress that is not completion, and the
+-- hosted live path adds two dispositions of its own: the operator's bounded
+-- residual abandonment, and the recovery of a broker order the crash left
+-- unbound on a ``releasing`` claim.
 ALTER TABLE public.strategy_plan_execution_events DROP CONSTRAINT IF EXISTS ck_spee_event;
 ALTER TABLE public.strategy_plan_execution_events
     ADD CONSTRAINT ck_spee_event
-    CHECK (event IN ('submitted', 'filled', 'partially_filled', 'rejected', 'failed', 'no_op'));
+    CHECK (event IN ('submitted', 'filled', 'partially_filled', 'rejected', 'failed',
+                     'no_op', 'residual_abandoned', 'release_recovered'));
 
 -- The parent row is mutable (a detection has a lifecycle); the log is not.
 CREATE OR REPLACE FUNCTION forbid_strategy_corporate_action_log_mutation() RETURNS trigger AS $$

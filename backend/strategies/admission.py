@@ -195,34 +195,66 @@ class AdmissionService:
     def plan_notional(self, plan: Mapping[str, Any]) -> Dict[str, Any]:
         """The plan's own notional requirement, from its resolved representation.
 
-        Approximate notional = |quantity| x reference price, with the price coming
-        from the plan itself — no new market-data dependency. When a leg carries no
-        price the requirement is **unknown**, not zero, and the caller refuses
-        rather than under-enforcing a configured limit.
+        A leg that carries a ``signed_quantity`` is |quantity| x reference price.
+
+        A leg that carries a full-snapshot ``target_weight`` is sized against the
+        capital basis FROZEN with the plan - ``|weight| x basis x (1 - buffer)`` -
+        because a weight is a FRACTION, not a share count. Reading the weight as a
+        quantity would under-state the requirement by orders of magnitude and let a
+        portfolio plan claim a reservation far smaller than the legs it will place.
+
+        The price comes from the plan itself - no new market-data dependency. When a
+        priced leg carries no price, or a weighted leg carries no frozen basis, the
+        requirement is **unknown**, not zero, and the caller refuses rather than
+        under-enforcing a configured limit.
         """
         legs = list((plan.get("resolved_plan") or {}).get("legs") or [])
+        logical = dict(plan.get("logical_plan") or {})
+        resolved = dict(plan.get("resolved_plan") or {})
+        basis_raw = resolved.get("capital_basis_inr", logical.get("capital_basis_inr"))
+        try:
+            capital_basis = None if basis_raw is None else float(basis_raw)
+        except (TypeError, ValueError):
+            capital_basis = None
+        buffer_raw = resolved.get("cash_buffer_pct", logical.get("cash_buffer_pct"))
+        try:
+            buffer_pct = 0.0 if buffer_raw is None else float(buffer_raw)
+        except (TypeError, ValueError):
+            buffer_pct = 0.0
         per_leg: List[Dict[str, Any]] = []
         total = 0.0
         missing: List[str] = []
+        missing_basis: List[str] = []
         for leg in legs:
             symbol = str(leg.get("tradingsymbol") or leg.get("broker_symbol") or "")
-            quantity = abs(
-                float(leg.get("signed_quantity", leg.get("target_weight", 0.0)) or 0.0)
-            )
             price = _as_float(leg.get("reference_price"))
-            if price is None:
-                if quantity:
-                    missing.append(symbol)
-                reference = 0.0
+            weight = leg.get("target_weight")
+            if leg.get("signed_quantity") is not None or weight is None:
+                quantity = abs(float(leg.get("signed_quantity") or 0.0))
+                if price is None:
+                    if quantity:
+                        missing.append(symbol)
+                    notional = 0.0
+                else:
+                    notional = quantity * abs(price)
             else:
-                reference = abs(price)
-            notional = quantity * reference
+                weight_value = abs(float(weight or 0.0))
+                if capital_basis is None:
+                    if weight_value:
+                        missing_basis.append(symbol)
+                    notional = 0.0
+                else:
+                    notional = weight_value * capital_basis * max(0.0, 1.0 - buffer_pct)
+                quantity = (
+                    notional / abs(price) if (price is not None and abs(price) > 0) else 0.0
+                )
             total += notional
             per_leg.append({"tradingsymbol": symbol, "quantity": quantity, "notional_inr": notional})
         return {
             "total_notional_inr": total,
             "per_leg": per_leg,
             "reference_price_missing": sorted(set(missing)),
+            "capital_basis_missing": sorted(set(missing_basis)),
             "instrument_count": len({row["tradingsymbol"] for row in per_leg if row["tradingsymbol"]}),
         }
 
@@ -353,16 +385,23 @@ class AdmissionService:
                 or policy.get("per_instrument_notional_inr") is not None
                 or policy.get("gross_notional_inr") is not None
             )
-            if configured_notional_axes and notional["reference_price_missing"]:
-                # A configured notional limit with no price to compute against is
-                # unknown evidence, and unknown evidence never admits.
+            if configured_notional_axes and (
+                notional["reference_price_missing"] or notional["capital_basis_missing"]
+            ):
+                # A configured notional limit with no price - or a weighted leg with
+                # no frozen capital basis - is unknown evidence, and unknown evidence
+                # never admits.
                 return AdmissionVerdict(
                     False,
                     "REFERENCE_PRICE_UNAVAILABLE",
                     {
                         **detail,
                         "missing_for": notional["reference_price_missing"],
-                        "message": "A notional limit is configured but the plan carries no reference price",
+                        "capital_basis_missing_for": notional["capital_basis_missing"],
+                        "message": (
+                            "A notional limit is configured but the plan carries no "
+                            "reference price (or no frozen capital basis for a weighted leg)"
+                        ),
                     },
                 )
 

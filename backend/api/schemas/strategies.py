@@ -509,6 +509,10 @@ class HostedStrategyOptionsResponse(BaseModel):
     The browser must never hardcode or invent account choices: this returns only
     the account scopes the server will actually authorize, plus the supported
     modes, job kinds and policies.
+
+    ``live`` is advertised ONLY when the deployment has hosted live enabled, and
+    ``live_lanes`` names the live lanes that are ACTUALLY wired (empty while live is
+    off), so a client can never advertise a mode or a lane the server would refuse.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -517,6 +521,12 @@ class HostedStrategyOptionsResponse(BaseModel):
     execution_modes: List[str] = Field(default_factory=list)
     job_kinds: List[str] = Field(default_factory=list)
     stale_exit_policies: List[str] = Field(default_factory=list)
+    #: The wired live lanes, e.g. ``["cnc", "mis", "futures", "options"]``. Empty
+    #: whenever hosted live is disabled.
+    live_lanes: List[str] = Field(default_factory=list)
+    #: Live execution always requires the owner's own approval. Stated, not
+    #: inferred by the client.
+    live_requires_owner_approval: bool = True
     hosted_execution_only: bool = True
 
 

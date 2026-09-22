@@ -37,7 +37,7 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -368,14 +368,48 @@ def _live_submission_inflight(
     execution_environment: str,
     items: List[InflightItem],
 ) -> None:
-    """(f) a durable live plan step that is pending or UNCERTAIN.
+    """(f) a durable live plan step that is not yet RESOLVED.
 
-    The internal live adapter writes its per-step claim before the network, so a
-    crash after that commit leaves work the platform can still see. A pending
-    order (an accepted submission awaiting fills) and an UNCERTAIN one (a
-    transport/response that never resolved) are both unresolved truth; only an
-    authoritative rejection or a no-op resolves the step.
+    The live adapter writes its per-step claim before the network, so a crash
+    after that commit leaves work the platform can still see. Everything except
+    the NON-TERMINAL allowlist is in flight: an accepted submission awaiting
+    fills (``pending``), a partial fill retaining residual work (``partial``), a
+    step whose settlement effects are mid-flight (``finalizing``/``rejecting``),
+    an unresolved transport outcome (``uncertain``), and a residual an operator
+    must repair (``repair_required``).
+
+    A DEPENDENT step is work even though nothing was sent: ``withheld`` is a
+    materialized leg whose prerequisites have not filled, and ``releasing`` is a
+    leg the sequence pass committed to but has not yet returned an order id for.
+    Counting them keeps a multi-step plan in flight until EVERY leg is resolved,
+    which is the whole point of the durable parent.
+
+    A staged ``finalizing``/``rejecting`` row is deliberately included: its
+    publish/consume/barrier effects are not confirmed until the terminal claim
+    is written, so treating it as resolved would let the claim disappear from
+    the enumeration before its effects landed. The list is an explicit ALLOWLIST
+    rather than "state NOT IN (terminal)": a future state that nobody classified
+    must block a quiet proof by default instead of silently counting as
+    resolved.
+
+    The item NAMES the bound order ids that are not yet covered by an
+    authoritative terminal ``order_state_projection`` row, so "unresolved" is
+    actionable evidence rather than a bare state name. A ``withheld`` leg has no
+    orders to cover by construction - its unresolved work is the unreleased
+    dependency itself.
     """
+    inflight_states = (
+        "pending",
+        "withheld",
+        "releasing",
+        "partial",
+        "finalizing",
+        "rejecting",
+        "uncertain",
+        "repair_required",
+    )
+    from sqlalchemy import bindparam as _bindparam
+
     with _guarded("live_plan_submissions"):
         rows = db.execute(
             text(
@@ -385,8 +419,123 @@ def _live_submission_inflight(
                 WHERE account_id = :account_id
                   AND strategy_id = :strategy_id
                   AND execution_environment = :execution_environment
-                  AND state IN ('pending', 'uncertain')
+                  AND state IN :states
                 ORDER BY step_ref
+                """
+            ).bindparams(_bindparam("states", expanding=True)),
+            {
+                "account_id": account_id,
+                "strategy_id": strategy_id,
+                "execution_environment": execution_environment,
+                "states": list(inflight_states),
+            },
+        ).fetchall()
+    for row in rows:
+        state = str(row[1])
+        order_ids = _as_order_ids(row[3])
+        uncovered = (
+            _uncovered_live_order_ids(db, account_id=account_id, order_ids=order_ids)
+            if order_ids
+            else []
+        )
+        items.append(
+            InflightItem(
+                f"live_submission_{state}",
+                str(row[0]),
+                {
+                    "plan_id": str(row[2]),
+                    "state": state,
+                    "broker_order_ids": order_ids,
+                    # Named, not inferred: these orders have no authoritative
+                    # terminal status yet, so this step cannot be proven resolved.
+                    "uncovered_order_ids": uncovered,
+                },
+            )
+        )
+    _live_execution_inflight(
+        db,
+        account_id=account_id,
+        strategy_id=strategy_id,
+        execution_environment=execution_environment,
+        items=items,
+    )
+
+
+def _as_order_ids(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        import json as _json
+
+        try:
+            value = _json.loads(value or "[]")
+        except ValueError:
+            return []
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if item not in (None, "")]
+    return []
+
+
+def _uncovered_live_order_ids(
+    db: Any, *, account_id: str, order_ids: Sequence[str]
+) -> List[str]:
+    """Bound live order ids with no authoritative TERMINAL status row yet.
+
+    Fail closed: an unreadable source reports EVERY id as uncovered, because
+    "could not read the evidence" is never "the order is resolved".
+    """
+    if not order_ids:
+        return []
+    try:
+        from sqlalchemy import bindparam as _bindparam
+
+        rows = db.execute(
+            text(
+                """
+                SELECT order_id, latest_status, terminal
+                FROM public.order_state_projection
+                WHERE account_id = :account_id AND order_id IN :order_ids
+                """
+            ).bindparams(_bindparam("order_ids", expanding=True)),
+            {"account_id": account_id, "order_ids": list(order_ids)},
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - unreadable evidence is not "resolved"
+        return sorted({str(value) for value in order_ids})
+    terminal = {
+        str(row[0])
+        for row in rows
+        if bool(row[2]) and str(row[1] or "").upper() in TERMINAL_ORDER_STATUSES
+    }
+    return sorted({str(value) for value in order_ids if str(value) not in terminal})
+
+
+def _live_execution_inflight(
+    db: Any,
+    *,
+    account_id: str,
+    strategy_id: str,
+    execution_environment: str,
+    items: List[InflightItem],
+) -> None:
+    """(g) a durable live plan PARENT with unresolved legs.
+
+    The parent row is the protocol: while it is not ``settled`` the plan still has
+    legs that were materialized and are not resolved, so a quiet proof would be
+    claiming more than the evidence supports. ``blocked`` is included on purpose -
+    a withheld leg whose release is refused (an expired attempt, a stale approval)
+    is unresolved work an operator has to see, not a plan that finished.
+    """
+    with _guarded("live_plan_executions"):
+        rows = db.execute(
+            text(
+                """
+                SELECT execution_id, plan_id, lane, state
+                FROM public.live_plan_executions
+                WHERE account_id = :account_id
+                  AND strategy_id = :strategy_id
+                  AND execution_environment = :execution_environment
+                  AND state IN ('planned', 'executing', 'blocked')
+                ORDER BY plan_id
                 """
             ),
             {
@@ -398,9 +547,13 @@ def _live_submission_inflight(
     for row in rows:
         items.append(
             InflightItem(
-                f"live_submission_{str(row[1])}",
-                str(row[0]),
-                {"plan_id": str(row[2]), "state": str(row[1]), "broker_order_ids": row[3]},
+                f"live_plan_execution_{str(row[3])}",
+                str(row[1]),
+                {
+                    "execution_id": str(row[0]),
+                    "lane": str(row[2]),
+                    "state": str(row[3]),
+                },
             )
         )
 
@@ -521,6 +674,123 @@ class ExecutionBarrier:
         finally:
             if owns_db:
                 session.close()
+
+    def record_work_event_once(
+        self,
+        *,
+        account_id: str,
+        strategy_id: str,
+        execution_environment: str,
+        event: str,
+        ref: str,
+        detail: Optional[Dict[str, Any]] = None,
+        dedupe_key: Optional[str] = None,
+        db: Optional[Any] = None,
+    ) -> tuple[Optional[int], bool]:
+        """Record a work event EXACTLY ONCE per ``(book, event, ref, dedupe_key)``.
+
+        Returns ``(version, created)``. The whole decision is ONE transaction
+        that takes the book's advisory lock BEFORE looking for an existing
+        event, so two concurrent callers serialize: the second observes the
+        first's row and does not bump the version again. A partial unique index
+        on the same columns is the database-level backstop, so even a caller
+        that bypassed this method cannot duplicate the event.
+
+        This replaces an unsafe check-then-insert: a slow owner whose lease
+        expired can no longer append a second ``work_resolved`` for a step that
+        another owner already resolved.
+        """
+        if event not in WORK_EVENTS:
+            raise ValueError(f"event must be one of {', '.join(WORK_EVENTS)}: {event!r}")
+        owns_db = db is None
+        session = db or self.session_factory()
+        try:
+            self._lock_barrier(session, account_id, strategy_id, execution_environment)
+            existing = self._existing_event_version(
+                session,
+                account_id=account_id,
+                strategy_id=strategy_id,
+                execution_environment=execution_environment,
+                event=event,
+                ref=ref,
+                dedupe_key=dedupe_key,
+            )
+            if existing is not None:
+                if owns_db:
+                    session.commit()
+                return int(existing), False
+            version = self._bump_version(
+                session, account_id, strategy_id, execution_environment
+            )
+            session.add(
+                StrategyExecutionBarrierEvent(
+                    id=str(uuid.uuid4()),
+                    account_id=account_id,
+                    strategy_id=strategy_id,
+                    execution_environment=execution_environment,
+                    version=int(version),
+                    event=event,
+                    ref=ref,
+                    detail=dict(detail or {}),
+                )
+            )
+            session.flush()
+            if owns_db:
+                session.commit()
+            return int(version), True
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            if owns_db:
+                session.close()
+
+    @staticmethod
+    def _existing_event_version(
+        session: Any,
+        *,
+        account_id: str,
+        strategy_id: str,
+        execution_environment: str,
+        event: str,
+        ref: str,
+        dedupe_key: Optional[str],
+    ) -> Optional[int]:
+        """The version of an identical work event, or ``None``.
+
+        ``dedupe_key`` is matched against ``detail -> 'plan_id'`` (the live
+        step's identity). Callers MUST already hold the book lock: the read is
+        only meaningful inside the same transaction as the insert.
+        """
+        predicate = (
+            "AND detail ->> 'plan_id' IS NULL"
+            if dedupe_key is None
+            else "AND detail ->> 'plan_id' = :dedupe_key"
+        )
+        params: Dict[str, Any] = {
+            "account_id": account_id,
+            "strategy_id": strategy_id,
+            "environment": execution_environment,
+            "event": event,
+            "ref": ref,
+        }
+        if dedupe_key is not None:
+            params["dedupe_key"] = str(dedupe_key)
+        row = session.execute(
+            text(
+                f"""
+                SELECT version FROM public.strategy_execution_barrier_events
+                WHERE account_id = :account_id AND strategy_id = :strategy_id
+                  AND execution_environment = :environment
+                  AND event = :event AND ref = :ref
+                  {predicate}
+                ORDER BY version
+                LIMIT 1
+                """
+            ),
+            params,
+        ).first()
+        return int(row[0]) if row is not None else None
 
     def _bump_version(self, session: Any, account_id: str, strategy_id: str, execution_environment: str) -> int:
         """Atomically create-or-increment the barrier's version, in-tx."""

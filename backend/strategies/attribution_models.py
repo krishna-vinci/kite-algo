@@ -1082,6 +1082,9 @@ class StrategyPlanExecutionEvent(Base):
     step_no = Column(Integer, nullable=False)
     event = Column(Text, nullable=False)
     paper_order_id = Column(Text, nullable=True)
+    #: The BROKER order id bound to this step by the live submission claim. NULL
+    #: for paper steps, which link through ``paper_order_id``.
+    broker_order_id = Column(Text, nullable=True)
     filled_quantity = Column(Integer, nullable=True)
     refusal_reason = Column(Text, nullable=True)
     actor_id = Column(Text, nullable=False)

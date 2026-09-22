@@ -432,6 +432,7 @@ class ExecutionEventSchemaTests(ExecutionTestCase):
         self.assertEqual(
             columns,
             {
+                "broker_order_id",
                 "id",
                 "plan_id",
                 "step_no",

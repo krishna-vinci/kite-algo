@@ -39,6 +39,9 @@ from backend.api.schemas.proposals import (
     ProposalJournalRow,
     ProposalListResponse,
     ProposalRow,
+    RESIDUAL_ACTIONS,
+    ResidualDispositionRequest,
+    ResidualDispositionResponse,
 )
 from backend.api.schemas.strategies import (
     AdmissionPolicyRequest,
@@ -308,6 +311,9 @@ def _collector(request: Request, *, barrier: Any = None):
         paper_runtime=paper,
         option_status_reader=option_status,
         settlement_barrier=barrier if barrier is not None else _settlement_barrier(request),
+        # The LIVE settlement branch reads the platform's own attributed book and
+        # account-ingest truth; the paper runtime is never consulted for it.
+        session_factory=_strategies_db(request),
     )
 
 
@@ -469,12 +475,27 @@ async def get_hosted_options(owner: str = Depends(require_strategy_owner)):
 
     Account scopes come from the server allowlist (`HOSTED_STRATEGY_ACCOUNT_SCOPES`,
     default-deny) — the browser never invents them.
+
+    ``live`` appears in ``execution_modes`` ONLY when this deployment has hosted
+    live enabled, and ``live_lanes`` names the lanes whose builders are registered
+    and whose plan kinds the executor admits — empty while live is off. A client
+    therefore cannot advertise a mode or a lane the server would refuse.
     """
+    from backend.strategies.live_service import hosted_live_lanes
+    from backend.strategies.live_settings import hosted_live_enabled
+
+    live_enabled = hosted_live_enabled()
     return HostedStrategyOptionsResponse(
         account_scopes=authorized_account_scopes(),
-        execution_modes=list(service.ALLOWED_EXECUTION_MODES),
+        execution_modes=[
+            mode
+            for mode in service.ALLOWED_EXECUTION_MODES
+            if mode != "live" or live_enabled
+        ],
         job_kinds=list(service.ALLOWED_JOB_KINDS),
         stale_exit_policies=list(service.ALLOWED_STALE_EXIT_POLICIES),
+        live_lanes=list(hosted_live_lanes()) if live_enabled else [],
+        live_requires_owner_approval=True,
     )
 
 
@@ -710,16 +731,44 @@ def _live_margin_evidence(account_scope: str, plan: Dict[str, Any]) -> Optional[
         legs = list((plan.get("resolved_plan") or {}).get("legs") or [])
         if not legs:
             return None
+        resolved = dict(plan.get("resolved_plan") or {})
+        logical = dict(plan.get("logical_plan") or {})
+        try:
+            capital_basis = resolved.get("capital_basis_inr", logical.get("capital_basis_inr"))
+            capital_basis = None if capital_basis is None else float(capital_basis)
+        except (TypeError, ValueError):
+            capital_basis = None
+        try:
+            buffer_pct = resolved.get("cash_buffer_pct", logical.get("cash_buffer_pct"))
+            buffer_pct = 0.0 if buffer_pct is None else float(buffer_pct)
+        except (TypeError, ValueError):
+            buffer_pct = 0.0
         items = []
         for leg in legs:
-            quantity = abs(float(leg.get("signed_quantity", leg.get("target_weight", 0.0)) or 0.0))
+            # A weight is a FRACTION of the frozen capital basis, not a share
+            # count: asking the broker for margin on 0.25 "shares" would under-state
+            # the requirement by orders of magnitude.
+            if leg.get("signed_quantity") is None and leg.get("target_weight") is not None:
+                price = float(leg.get("reference_price") or 0)
+                if capital_basis is None or price <= 0:
+                    return None
+                quantity = (
+                    abs(float(leg.get("target_weight") or 0.0))
+                    * capital_basis
+                    * max(0.0, 1.0 - buffer_pct)
+                    / price
+                )
+                side = "BUY"
+            else:
+                quantity = abs(float(leg.get("signed_quantity") or 0.0))
+                side = "BUY" if float(leg.get("signed_quantity") or 0) >= 0 else "SELL"
             if quantity <= 0:
                 continue
             items.append(
                 OrderMarginInput(
                     exchange=str(leg.get("broker_exchange") or leg.get("exchange") or "NSE"),
                     tradingsymbol=str(leg.get("broker_symbol") or leg.get("tradingsymbol") or ""),
-                    transaction_type="BUY" if float(leg.get("signed_quantity") or 0) >= 0 else "SELL",
+                    transaction_type=side,
                     variety="regular",
                     product=str(leg.get("product") or "CNC"),
                     order_type="MARKET",
@@ -805,7 +854,19 @@ async def preview_admission(
     enforce_same_origin(request)
     plan = _plan_or_404(_proposal_store(request, session_factory), owner=owner, repo=repo,
                         strategy_id=strategy_id, plan_id=plan_id)
-    environment = str(execution_environment or "live").lower()
+    # ADMISSION is gated too. The planning environment is still DERIVED from the
+    # persisted binding, so a request parameter can never turn a paper plan into
+    # a live reservation; it may only name the environment an already-paper
+    # plan is admitted in.
+    binding_environment = _plan_environment(session_factory, plan)
+    _refuse_live_when_disabled(
+        binding_environment, surface="plan_reserve", plan_id=plan_id
+    )
+    environment = (
+        "live"
+        if binding_environment == "live"
+        else str(execution_environment or binding_environment or "live").lower()
+    )
     service = _admission_service(session_factory)
     margin = _live_margin_evidence(str(plan["account_id"]), plan) if environment == "live" else None
     verdict = service.evaluate(plan, execution_environment=environment, margin_evidence=margin)
@@ -1384,6 +1445,63 @@ def _paper_plan_executor(request: Request, session_factory: Any):
     return PaperPlanExecutor(session_factory=session_factory, paper_service=paper)
 
 
+def _live_plan_executor(request: Request, session_factory: Any):
+    """The hosted LIVE plan executor (app.state override wins).
+
+    The deployment setting is enforced inside the executor, so this factory never
+    decides whether live is allowed.
+    """
+    from backend.strategies.live_service import LivePlanExecutor
+
+    executor = getattr(request.app.state, "live_plan_executor", None)
+    if executor is not None:
+        return executor
+    return LivePlanExecutor(session_factory=session_factory)
+
+
+def _refuse_live_when_disabled(
+    execution_mode: Any, *, surface: str, plan_id: str = ""
+) -> None:
+    """The deployment setting gates LAUNCH and ADMISSION, not only submission.
+
+    Persisted mode constraints and API/SDK validation admit ``live`` so the mode
+    is representable, but a deployment that has not enabled hosted live must not
+    create live work, reserve live capacity for it, or hand it a child
+    credential. This reuses the SAME ``HOSTED_LIVE_ENABLED`` reader the executor
+    uses, so there is exactly one answer to "is live on in this deployment".
+    """
+    if str(execution_mode or "").lower() != "live":
+        return
+    from backend.strategies.live_settings import (
+        hosted_live_disabled_detail,
+        hosted_live_enabled,
+    )
+
+    if hosted_live_enabled():
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "rejection_reason": "LIVE_DISABLED",
+            **hosted_live_disabled_detail(plan_id=plan_id, surface=surface),
+        },
+    )
+
+
+def _plan_environment(session_factory: Any, plan: Dict[str, Any]) -> str:
+    """The plan's environment, from PERSISTED binding authority.
+
+    A request parameter never selects paper vs live; an unresolvable binding is a
+    refusal, never a silent default.
+    """
+    from backend.strategies.live_authority import LiveAuthorityRefusal, plan_binding
+
+    try:
+        return str(plan_binding(session_factory, plan=plan).get("execution_environment") or "")
+    except LiveAuthorityRefusal as exc:
+        raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
+
+
 @router.post("/{strategy_id}/plans/{plan_id}/execute", response_model=ExecutionResponse)
 async def execute_plan(
     strategy_id: str,
@@ -1406,12 +1524,77 @@ async def execute_plan(
     enforce_same_origin(request)
     plan = _plan_or_404(_proposal_store(request, session_factory), owner=owner, repo=repo,
                         strategy_id=strategy_id, plan_id=plan_id)
-    executor = _paper_plan_executor(request, session_factory)
+    environment = _plan_environment(session_factory, plan)
+    if environment == "live":
+        executor = _live_plan_executor(request, session_factory)
+    else:
+        executor = _paper_plan_executor(request, session_factory)
     try:
         result = await executor.execute(plan, actor=owner)
     except ExecutionRefusal as exc:
         raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
     return ExecutionResponse(**result)
+
+
+@router.post(
+    "/{strategy_id}/plans/{plan_id}/residual",
+    response_model=ResidualDispositionResponse,
+)
+async def dispose_residual(
+    strategy_id: str,
+    plan_id: str,
+    request: Request,
+    payload: ResidualDispositionRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Bounded, owner-only disposition of a live step that needs repair.
+
+    A terminal broker cancel with a residual leaves the step in
+    ``repair_required`` and blocks a quiet proof. This is the ONLY way that step
+    stops blocking, and it never fabricates a fill or a rejection: the residual
+    quantity, the acting operator and the reason are written to the append-only
+    plan trail, the unused capacity is released, and the step's ``work_resolved``
+    barrier event is recorded exactly once. The server still decides: the step
+    must be in ``repair_required`` (or be a ``releasing`` claim whose send is
+    PROVEN never to have reached the broker by the platform's own durable
+    pre-send records), and the disposition is refused while the plan's evaluation
+    authority could still fill the residual. A ``releasing`` claim whose send was
+    attempted and not resolved is never abandoned: when the broker order can be
+    found it is ADOPTED onto the claim instead, and otherwise the step stays in
+    flight.
+    """
+    from backend.strategies.live_repair import LiveRepairRefusal, LiveRepairService
+
+    enforce_same_origin(request)
+    plan = _plan_or_404(
+        _proposal_store(request, session_factory),
+        owner=owner,
+        repo=repo,
+        strategy_id=strategy_id,
+        plan_id=plan_id,
+    )
+    if str(payload.action) != "abandon":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "rejection_reason": "RESIDUAL_ACTION_UNSUPPORTED",
+                "action": str(payload.action),
+                "supported": list(RESIDUAL_ACTIONS),
+            },
+        )
+    service = LiveRepairService(session_factory=session_factory)
+    try:
+        result = service.abandon_residual(
+            plan_id=str(plan["plan_id"]),
+            step_no=None if payload.step_no is None else int(payload.step_no),
+            actor=owner,
+            reason=payload.reason,
+        )
+    except LiveRepairRefusal as exc:
+        raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
+    return ResidualDispositionResponse(**result)
 
 
 @router.get("/{strategy_id}/plans/{plan_id}/executions", response_model=ExecutionTrailResponse)
@@ -1843,7 +2026,10 @@ async def reconcile_job(
     except service.StrategyValidationError:
         trade_capable = True
     environment = str(job.execution_mode or "")
-    if trade_capable and job.handoff_at is not None and environment in ("paper", "dry_run"):
+    # A launched, trade-capable attempt must carry a CURRENT durable proof for
+    # this exact book through the unblock transaction. LIVE is included: a live
+    # attempt is exactly the case where "the two reads matched" proves nothing.
+    if trade_capable and job.handoff_at is not None and environment in ("paper", "dry_run", "live"):
         # A launched, trade-capable attempt must carry a CURRENT durable proof for
         # this exact book through the unblock transaction.
         proof_required = True
@@ -2093,6 +2279,14 @@ async def run_now(
     enforce_same_origin(request)
     strategy = _owned_strategy(repo, owner, strategy_id)
     normalized = _normalized_launch(repo, strategy, payload)
+
+    # LAUNCH is gated by the deployment setting as well as by the mode
+    # vocabulary: with ``HOSTED_LIVE_ENABLED`` off, a live launch is refused
+    # before any job row exists, so a disabled deployment cannot accumulate
+    # queued live work that a later flip would start.
+    _refuse_live_when_disabled(
+        normalized["execution_mode"], surface="job_launch"
+    )
 
     # Server-side authorization: the pinned account scope must be authorized for
     # the operator's environment (independent of the launch request itself).

@@ -79,7 +79,7 @@ __all__ = [
 # closed vocabularies
 # ---------------------------------------------------------------------------
 
-ALLOWED_EXECUTION_MODES = ("paper", "dry_run")
+ALLOWED_EXECUTION_MODES = ("paper", "dry_run", "live")
 ALLOWED_JOB_KINDS = ("continuous", "finite")
 ALLOWED_STALE_EXIT_POLICIES = ("none", "exit_on_worker_stale")
 #: Every kind the stored schedule vocabulary allows. ``weekly`` needs a weekday,
@@ -370,6 +370,10 @@ def validate_account_scope(account_scope: str, execution_mode: str) -> str:
         )
     if execution_mode == "paper" and parsed.mode != "paper":
         raise StrategyValidationError("paper execution requires a paper account_scope")
+    if execution_mode == "live" and parsed.mode != "live":
+        raise StrategyValidationError(
+            "live execution requires a live account_scope (kite:<broker_user_id>)"
+        )
     return candidate
 
 

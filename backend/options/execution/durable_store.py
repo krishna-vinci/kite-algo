@@ -476,3 +476,138 @@ class DurableOptionRunStore:
             raise
         finally:
             session.close()
+
+    def record_trades_once(
+        self, strategy_run_id: str, trades: list[dict], *, dedupe_key: str
+    ) -> tuple[list[dict], list[dict]]:
+        """Append only the trades whose ``dedupe_key`` is not already recorded.
+
+        The read of the existing keys and the append happen inside ONE row-locked
+        transaction on the run, so two consumers that both observed the key as
+        absent cannot both write it: the second one re-reads under the lock and
+        appends nothing. ``extend``-under-lock is not enough on its own, which is
+        exactly the double-booked fill this exists to prevent.
+
+        Returns ``(appended, skipped)``.
+        """
+        self._require_id(strategy_run_id)
+        self._require_id(dedupe_key)
+        session = self._session_factory()
+        try:
+            run = self._get_run_in_session(session, strategy_run_id, for_update=True)
+            seen = {
+                str((row or {}).get(dedupe_key) or "")
+                for row in (run.trades or [])
+                if isinstance(row, dict)
+            }
+            appended: list[dict] = []
+            skipped: list[dict] = []
+            for trade in list(trades or []):
+                key = str((trade or {}).get(dedupe_key) or "")
+                if not key or key in seen:
+                    skipped.append(dict(trade or {}))
+                    continue
+                seen.add(key)
+                appended.append(dict(trade or {}))
+            if appended:
+                run.trades.extend(appended)
+                self._update_run_in_session(session, run)
+            session.commit()
+            return appended, skipped
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def claim_stage(
+        self,
+        strategy_run_id: str,
+        claim: dict,
+        *,
+        now: Any = None,
+    ) -> tuple[bool, Optional[dict]]:
+        """Atomically claim the run's single in-flight exit stage.
+
+        Under the run's row lock, this checks whether a PREVIOUS claim is still
+        unresolved (``state`` is ``sending`` OR ``unknown``) and, if so, refuses:
+        exactly one sender owns the stage. The loser gets the holder's claim back
+        so it can report who is in flight instead of sending a second order.
+
+        The lease is NOT a way out. A sender paused past its lease can still resume
+        and call the broker (there is no fence at the broker write itself), so an
+        expired lease is an OBSERVATION only; the stage is released solely by
+        durable evidence that resolves EVERY leg (the broker's own references, or
+        an acknowledged zero-send/rejection recorded by the sender).
+
+        Returns ``(won, existing_claim)``.
+        """
+        self._require_id(strategy_run_id)
+        session = self._session_factory()
+        try:
+            run = self._get_run_in_session(session, strategy_run_id, for_update=True)
+            holder = self._live_stage_claim(run, now=now)
+            if holder is not None:
+                session.rollback()
+                return False, holder
+            run.orders.extend([dict(claim)])
+            self._update_run_in_session(session, run)
+            session.commit()
+            return True, dict(claim)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    @staticmethod
+    def _live_stage_claim(run: OptionRunState, *, now: Any = None) -> Optional[dict]:
+        """The claim that currently owns the run's stage sending, if any.
+
+        A stage's LATEST record decides its state: a ``sending`` claim followed by
+        its outcome is resolved, and must not keep blocking later stages.
+
+        ``sending`` and ``unknown`` BOTH own the send, and the lease does NOT
+        release that ownership: a sender paused past its lease can still resume and
+        call the broker (there is no fence at the broker write itself), so elapsed
+        time is an observation, never proof that an old process is gone. Only
+        durable evidence that resolves EVERY leg - the broker's own references, or
+        an acknowledged zero-send/rejection recorded by the sender - settles the
+        stage and frees the claim. ``now`` is therefore only reported in the
+        holder's view, not used to release anything.
+        """
+        from datetime import datetime, timezone
+
+        moment = now or datetime.now(timezone.utc)
+        if isinstance(moment, str):
+            moment = datetime.fromisoformat(moment.replace("Z", "+00:00"))
+        if getattr(moment, "tzinfo", None) is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        latest: Dict[tuple, dict] = {}
+        order: list = []
+        for row in list(run.orders or []):
+            if not isinstance(row, dict) or not row.get("stage_digest"):
+                continue
+            key = (str(row.get("stage_digest")), int(row.get("attempt") or 1))
+            if key not in latest:
+                order.append(key)
+            latest[key] = row
+        for key in reversed(order):
+            row = latest[key]
+            if str(row.get("state")) not in ("sending", "unknown"):
+                continue
+            lease_until = row.get("lease_until")
+            view = dict(row)
+            if lease_until:
+                try:
+                    parsed = datetime.fromisoformat(str(lease_until).replace("Z", "+00:00"))
+                except ValueError:
+                    parsed = None
+                if parsed is not None:
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    # Reported for observability ONLY. An expired lease is not a
+                    # reason to hand the stage to anyone else.
+                    view["lease_expired"] = bool(parsed <= moment)
+            return view
+        return None

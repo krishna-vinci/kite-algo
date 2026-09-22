@@ -462,6 +462,8 @@ class _OwnerApiHarness(unittest.IsolatedAsyncioTestCase):
                     broker_order_ids TEXT NOT NULL DEFAULT '[]',
                     delta_snapshot TEXT NOT NULL DEFAULT '{}',
                     detail TEXT NOT NULL DEFAULT '{}',
+                    consumer_token TEXT,
+                    consumer_until TIMESTAMP,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (plan_id, step_no)
@@ -475,6 +477,25 @@ class _OwnerApiHarness(unittest.IsolatedAsyncioTestCase):
                     product TEXT NOT NULL, exchange TEXT, tradingsymbol TEXT,
                     net_quantity INT NOT NULL DEFAULT 0, updated_at TEXT,
                     PRIMARY KEY (account_id, instrument_token, product)
+                )
+                """
+            )
+            # The durable multi-step parent (Phase 2A): the in-flight enumeration
+            # reads it, so a live-source fixture has to carry it.
+            cursor.execute(
+                """
+                CREATE TABLE public.live_plan_executions (
+                    execution_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL UNIQUE,
+                    strategy_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    execution_environment TEXT NOT NULL,
+                    lane TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    step_spec TEXT NOT NULL DEFAULT '[]',
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )

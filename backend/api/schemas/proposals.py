@@ -111,8 +111,18 @@ class ExecutionStepOut(BaseModel):
     step_no: int
     event: str
     paper_order_id: Optional[str] = None
+    #: Broker order ids bound to this step by the live submission claim (empty
+    #: for paper steps, which carry ``paper_order_id``).
+    broker_order_ids: List[str] = Field(default_factory=list)
     filled_quantity: Optional[int] = None
     refusal_reason: Optional[str] = None
+    #: The step's DURABLE state (live only). ``withheld`` means the step was
+    #: materialized as in-flight work and is waiting for its prerequisites to
+    #: fill: nothing has been sent for it, and only the sequence pass may release
+    #: it. ``depends_on`` names those prerequisite step numbers.
+    state: Optional[str] = None
+    withheld: bool = False
+    depends_on: List[int] = Field(default_factory=list)
     detail: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -126,6 +136,7 @@ class ExecutionResponse(BaseModel):
     steps: List[ExecutionStepOut] = Field(default_factory=list)
     reservation_id: Optional[str] = None
     paper_order_ids: List[str] = Field(default_factory=list)
+    broker_order_ids: List[str] = Field(default_factory=list)
 
 
 class ExecutionEventRow(BaseModel):
@@ -143,6 +154,47 @@ class ExecutionEventRow(BaseModel):
     actor_id: str
     detail: Dict[str, Any] = Field(default_factory=dict)
     created_at: Any = None
+
+
+#: The bounded operator dispositions of a live step that needs repair.
+RESIDUAL_ACTIONS = ("abandon",)
+
+
+class ResidualDispositionRequest(BaseModel):
+    """Bounded operator action for a ``repair_required`` live step.
+
+    There is no "flat" or "completed" assertion here: the only action is the
+    explicit disposition of a residual that will not be worked further, and the
+    server still decides whether it is allowed (state, authority, reservation).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Optional: the server resolves the plan's own ``repair_required`` step when
+    #: the operator names the plan only. An explicit value must still match a step
+    #: that is in ``repair_required``.
+    step_no: Optional[int] = Field(default=None, ge=1)
+    action: str = Field(default="abandon", max_length=32)
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class ResidualDispositionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str
+    step_no: int
+    state: str
+    idempotent: bool = False
+    disposition: Dict[str, Any] = Field(default_factory=dict)
+    #: The per-leg capacity outcome the parent's own settlement rule decided.
+    capacity: Dict[str, Any] = Field(default_factory=dict)
+    #: Broker order ids RECOVERED for a ``releasing`` claim whose send reached the
+    #: broker and whose response was lost. A repair, never a retransmit.
+    recovered_order_ids: List[str] = Field(default_factory=list)
+    #: The durable pre-send fence evidence a ``releasing`` recovery decision was
+    #: made from, so the operator can audit what proved (or failed to prove)
+    #: non-submission.
+    dispatch_fence: Optional[Dict[str, Any]] = None
 
 
 class ExecutionTrailResponse(BaseModel):

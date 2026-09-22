@@ -499,7 +499,13 @@ def test_transport_uncertainty_is_recovery_required_and_never_repeated(pg):
 
 
 def test_a_compound_plan_kind_is_a_named_refusal(pg):
-    env = _Env(pg["factory"], run_id=f"run-live-{uuid.uuid4().hex[:8]}", plan_kind="target_futures")
+    """An UNSUPPORTED plan kind is a named refusal, never a guessed dispatch.
+
+    ``target_futures`` and ``option_structure`` left this list in Phase 2B (they
+    have their own lanes and their own route acceptance suites); ``intent_bundle``
+    remains a named refusal, which is what this pins.
+    """
+    env = _Env(pg["factory"], run_id=f"run-live-{uuid.uuid4().hex[:8]}", plan_kind="intent_bundle")
     broker = _FakeBroker()
     adapter = _adapter(pg["factory"], broker, env=env)
 

@@ -31,15 +31,24 @@ class WorkerProtectionRuntime:
         self,
         repo: Any,
         pnl_loader: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]],
-        exit_submitter: Callable[[Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str, Any]]],
+       exit_submitter: Callable[[Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str, Any]]],
         now_fn: Callable[[], datetime] = _utcnow,
         squareoff_schedule: Optional[Dict[str, Any]] = None,
+        structure_exit_submitter: Optional[
+            Callable[[Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         self.repo = repo
         self.pnl_loader = pnl_loader
         self.exit_submitter = exit_submitter
         self.now_fn = now_fn
         self.squareoff_schedule = squareoff_schedule or {}
+        #: The STRUCTURE-aware exit. A hedged structure may not be liquidated as a
+        #: whole book: its short's liability is bounded by its long, so the
+        #: platform derives bounded stages from the run's own evidence instead
+        #: (shorts first, hedges only against PROVEN short closure). ``None`` keeps
+        #: the generic path, which is what every non-structure run uses.
+        self.structure_exit_submitter = structure_exit_submitter
 
     async def evaluate_once(self) -> Dict[str, int]:
         runs = await self.repo.list_protection_enabled_runs()
@@ -96,21 +105,25 @@ class WorkerProtectionRuntime:
 
             structure = self._structure_identity(config)
             if structure is not None:
-                # Structure-aware: the exits are built short-first with their fill
-                # proof and submitted through the claim path, and the outcome is
-                # recorded either way — never a pretend-submitted state.
-                recommended = list(
-                    claimed_state.get("recommended_exit_orders")
-                    or next_state.get("recommended_exit_orders")
-                    or []
-                )
+                # Structure-aware: the exit is derived SERVER-SIDE from the
+                # durable option run's own legs and own confirmed fills, staged
+                # short-first, and submitted through the platform's own
+                # risk-reducing authority. An evaluator's recommended orders are
+                # never trusted, and a whole-book liquidation is never used here.
                 structure_exit = await self._submit_structure_exit(
-                    run, claimed_state, structure, claim_id=claim_id,
-                    recommended_orders=recommended or None,
+                    run, claimed_state, structure, claim_id=claim_id
                 )
                 structure_state = {
                     **claimed_state,
-                    "exit_submitted": bool(structure_exit.get("submitted")),
+                    # "submitted" is not "done": when the staged protocol still
+                    # owes a hedge release (it is waiting for the short's own
+                    # confirmed fill), the run stays unprotected-but-in-sequence
+                    # and the next evaluation continues the SAME staged exit.
+                    "exit_submitted": bool(
+                        structure_exit.get("submitted")
+                        and structure_exit.get("complete", True)
+                    ),
+                    "structure_exit_complete": bool(structure_exit.get("complete", True)),
                     "exit_submission_status": (
                         "submitted" if structure_exit.get("submitted")
                         else str(structure_exit.get("reason") or "not_submitted")
@@ -401,46 +414,44 @@ class WorkerProtectionRuntime:
         structure: Dict[str, Any],
         *,
         claim_id: str,
-        recommended_orders: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Submit a structure's exits through the SAME durable claim path (gap C).
+        """Submit a structure's staged exit, derived server-side.
 
-        The evaluator recommending orders is not a submission, and a protection rule
-        that only recommends is a rule that does not protect. The claim function
-        reuses ``exit_submitter`` — the path the generic exit already uses — so
-        idempotency and the single-claim-per-exit rule are inherited rather than
-        re-implemented.
+        The engine adapter (``StagedStructureExit``) is the ONLY path: it resolves
+        the durable option run bound to this worker run, reads the run's OWN
+        confirmed trades, and asks the existing ``build_structure_exit_orders``
+        rule which bounded actions are permitted now. The short closes first; the
+        hedge is released only in a LATER stage, and only for the quantity its
+        short is proven to have closed.
 
-        Nothing here can decide silently: a missing seam or a failing claim is
-        returned as an outcome, and the caller records it as evidence.
+        An evaluator's ``recommended_exit_orders`` is deliberately NOT part of this
+        call: a caller's order list is not evidence, and a protective rule that
+        submitted one would be trusting the layer it exists to bound.
         """
-        try:
-            from backend.options.protection.expiry_policy import StructureExitSubmission
-        except Exception as exc:  # noqa: BLE001
-            return {"submitted": False, "reason": "seam_unavailable", "error": str(exc)}
-
-        async def claim(**kwargs: Any) -> Dict[str, Any]:
-            orders = list(kwargs.get("orders") or [])
-            result = await self.exit_submitter(run, {**state, "recommended_exit_orders": orders})
-            return {
-                "claim_id": claim_id,
-                "accepted": True,
-                "reason": "submitted",
-                "outcome": result,
-            }
-
-        seam = StructureExitSubmission(claim=claim)
-        try:
-            return await seam.submit(
-                run=run,
-                trigger=state,
-                legs=list(structure.get("legs") or []),
-                closed_short_quantities=dict(structure.get("closed_short_quantities") or {}),
-                structure_digest=str(structure.get("structure_digest") or ""),
-                recommended_orders=recommended_orders,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return {"submitted": False, "reason": "seam_failed", "error": str(exc)}
+        if self.structure_exit_submitter is not None:
+            try:
+                return await self.structure_exit_submitter(run, state)
+            except Exception as exc:  # noqa: BLE001 - a failed stage is evidence
+                return {
+                    "submitted": False,
+                    "complete": False,
+                    "reason": "staged_exit_failed",
+                    "error": str(exc),
+                    "claim_id": claim_id,
+                    "orders": [],
+                }
+        # No staged-exit adapter is wired, so there is NO safe structure exit: the
+        # generic whole-book path would sell the long with the short (the naked
+        # window the structure exists to prevent) and the evaluator's recommended
+        # orders are not evidence. Refuse, and record why.
+        return {
+            "submitted": False,
+            "complete": False,
+            "reason": "staged_exit_not_wired",
+            "claim_id": claim_id,
+            "structure_digest": str((structure or {}).get("structure_digest") or ""),
+            "orders": [],
+        }
 
     def _idempotency_key(self, run: Dict[str, Any], state: Dict[str, Any]) -> str:
         generation = state.get("generation") or 1
@@ -466,3 +477,144 @@ async def submit_worker_protection_exit(request: Any, run: Dict[str, Any], state
         dry_run=False,
         idempotency_key=str(state.get("exit_idempotency_key") or "") or None,
     )
+
+
+async def submit_worker_protection_structure_exit(
+    request: Any, run: Dict[str, Any], state: Dict[str, Any]
+) -> Dict[str, Any]:
+    """The production stage submitter for an option STRUCTURE's protection exit.
+
+    The staged protocol itself lives in the options domain
+    (``backend.options.protection.staged_exit``): it resolves the durable option
+    run bound to this worker run, reads the run's OWN confirmed fills, and lets the
+    existing ``build_structure_exit_orders`` rule decide which bounded actions are
+    permitted now. This function is only the broker boundary it needs, and it
+    builds that boundary the way the control plane does for any platform-initiated
+    exit: the account's own broker session and a SERVER-SIDE attribution, so a
+    risk-REDUCING action stays available after the child's credential is gone.
+
+    Nothing here reads the child's token, and nothing here can INCREASE exposure:
+    every order is a close of a leg the run's own evidence says it holds.
+    """
+    import asyncio
+    from uuid import uuid4
+
+    from fastapi import Response
+
+    from backend.api.routers.worker_shared import _load_live_kite_for_account
+    from backend.app.database import SessionLocal
+    from backend.broker_api.orders import BasketOrderRequest, OrdersService
+    from backend.options.protection.staged_exit import StagedStructureExit
+
+    account_id = str(run.get("account_scope") or "")
+    metadata = dict(run.get("metadata") or {})
+    session_factory = getattr(
+        getattr(request.app.state, "algo_worker_repository", None),
+        "session_factory",
+        None,
+    ) or SessionLocal
+
+    async def place_orders(
+        *,
+        account_id: str,
+        worker_run_id: str,
+        option_run_id: str,
+        structure_digest: str,
+        legs: list,
+        idempotency_key: str,
+    ) -> Dict[str, Any]:
+        from backend.algo_runtime.execution_attribution import build_execution_attribution
+
+        kite = await asyncio.to_thread(_load_live_kite_for_account, account_id)
+        stage = idempotency_key.rsplit(":", 1)[-1][:8].upper()
+        payload_orders = []
+        for index, leg in enumerate(legs):
+            leg = dict(leg or {})
+            # The claim already froze a DETERMINISTIC client order reference per
+            # leg: the same stage computed twice can never become two different
+            # broker orders, and the platform keeps an authoritative correlation
+            # for each one (which is what the pre-send fence reads).
+            client_order_ref = str(leg.get("client_order_ref") or f"KA{stage}{index + 1:02d}")
+            attribution = build_execution_attribution(
+                execution_mode="live",
+                strategy_run_id=worker_run_id,
+                strategy_family=str(metadata.get("strategy_family") or "options_strategy"),
+                strategy_name=str(metadata.get("strategy_name") or "option_structure_protection"),
+                account_ref=account_id,
+                entry_surface="hosted_option_protection",
+                source="backend_protection",
+                idempotency_key=idempotency_key,
+                metadata={
+                    "option_run_id": option_run_id,
+                    "structure_digest": structure_digest,
+                    "stage_digest": idempotency_key.rsplit(":", 1)[-1],
+                    "stage_leg_index": index,
+                },
+            )
+            attribution["client_order_ref"] = client_order_ref
+            payload_orders.append(
+                {
+                    "exchange": str(leg.get("exchange") or "NFO"),
+                    "tradingsymbol": str(leg.get("tradingsymbol") or ""),
+                    "transaction_type": str(leg.get("transaction_type") or ""),
+                    "quantity": int(leg.get("quantity") or 0),
+                    "variety": str(leg.get("variety") or "regular"),
+                    "product": str(leg.get("product") or "NRML"),
+                    "order_type": str(leg.get("order_type") or "MARKET"),
+                    "attribution": attribution,
+                }
+            )
+        basket = BasketOrderRequest.model_validate(
+            {"orders": payload_orders, "all_or_none": False, "dry_run": False}
+        )
+        service = getattr(request.app.state, "algo_worker_orders_service", None) or OrdersService()
+        try:
+            result = await service.place_basket(
+                kite,
+                basket,
+                f"option-protection-{uuid4()}",
+                session_id=f"backend:option-protection:{option_run_id}",
+                idempotency_key=idempotency_key,
+                response=Response(),
+            )
+        except Exception as exc:  # noqa: BLE001 - the stage stays unresolved, never re-sent
+            return {
+                "legs": [
+                    {"index": index, "order_id": None, "error": str(exc)}
+                    for index in range(len(payload_orders))
+                ]
+            }
+        payload = result.model_dump(mode="json")
+        # The orders service answers with a ``BasketOrderResponse``: one entry per
+        # requested leg under ``results``, each carrying its own ``index`` and the
+        # broker's ``order_id`` ONLY when the broker accepted that leg. Matching on
+        # the reported index (not the list position) keeps a partial basket aligned.
+        answers: dict = {}
+        for position, row in enumerate(list(payload.get("results") or [])):
+            if not isinstance(row, dict):
+                continue
+            answers[int(row.get("index", position))] = row
+        return {
+            "legs": [
+                {
+                    "index": index,
+                    "order_id": (
+                        str(answers[index].get("order_id"))
+                        if answers.get(index, {}).get("order_id")
+                        else None
+                    ),
+                    "error": (
+                        None
+                        if answers.get(index, {}).get("order_id")
+                        else "no order reference returned for this leg"
+                    ),
+                }
+                for index in range(len(payload_orders))
+            ]
+        }
+
+    staged = StagedStructureExit(
+        session_factory=session_factory,
+        place_orders=place_orders,
+    )
+    return await staged.submit(worker_run=run, trigger=state)

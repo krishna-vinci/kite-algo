@@ -58,16 +58,35 @@ from .approvals import ApprovalService
 from .reservations import ReservationLedger
 from .settlement import ExecutionBarrier
 
-#: The plan kinds this preparatory adapter supports. Everything else - a
-#: portfolio, a futures roll half, an option structure - is a NAMED refusal
-#: rather than a guess: live support is incomplete on purpose.
-LIVE_SUPPORTED_PLAN_KINDS = ("single_instrument",)
+#: The plan kinds this adapter dispatches. Everything else - an ``intent_bundle``
+#: - is a NAMED refusal rather than a guess: live support is explicit, and each
+#: lane is wired through ``live_sequence.register_live_lane``.
+LIVE_SUPPORTED_PLAN_KINDS = (
+    "single_instrument",
+    "target_weights",
+    "target_futures",
+    "option_structure",
+)
 
 #: How old an executable quote may be before it stops being executable.
 QUOTE_MAX_AGE_SECONDS = 5.0
 
 #: How far ahead the evaluation authority must still be valid.
 AUTHORITY_MIN_REMAINING_SECONDS = 1.0
+
+#: The ONE approval pin a released dependent leg may explain away, and only when
+#: it can PROVE the book moved by nothing but this parent's own confirmed fills.
+#:
+#: The approval pins the exposure snapshot the owner approved against. For a
+#: multi-step parent the book moves by design between legs: the reducing leg
+#: fills, the attribution is republished, and the snapshot version/hash changes.
+#: That is the plan working - but the SAME change is produced by another plan of
+#: the run, a manual trade or a corporate action, and then the frozen delta would
+#: over-target a book it no longer describes. So the pin is tolerated ONLY against
+#: the per-instrument identity proof below; every other pin (plan hash,
+#: reconciliation version, catalog state, session products, reservation activity,
+#: approval window) is always enforced.
+SEQUENCE_TOLERATED_PIN_MISMATCHES = ("EXPOSURE_SNAPSHOT_CHANGED",)
 
 
 def _utcnow() -> datetime:
@@ -108,6 +127,10 @@ class LiveSubmission:
     broker_order_ids: List[str] = field(default_factory=list)
     reason_code: Optional[str] = None
     detail: Dict[str, Any] = field(default_factory=dict)
+    #: Per-step view of a multi-step parent plan. For a one-leg plan this is the
+    #: single step; the top-level fields mirror its first non-withheld step so the
+    #: Phase 1 callers keep the same shape.
+    steps: List[Dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -117,6 +140,7 @@ class LiveSubmission:
             "broker_order_ids": list(self.broker_order_ids),
             "reason_code": self.reason_code,
             "detail": dict(self.detail),
+            "steps": [dict(step) for step in self.steps],
         }
 
 
@@ -157,7 +181,14 @@ class LiveSubmissionStore:
             "broker_order_ids": list(orders or []),
             "delta_snapshot": dict(delta or {}),
             "detail": dict(detail or {}),
+            "consumer_token": row.get("consumer_token"),
+            "consumer_until": row.get("consumer_until"),
         }
+
+    _SELECT_COLUMNS = (
+        "submission_id, plan_id, step_no, step_ref, state, broker_order_ids, "
+        "delta_snapshot, detail, consumer_token, consumer_until"
+    )
 
     def get(self, *, plan_id: str, step_no: int, db: Any = None) -> Optional[Dict[str, Any]]:
         owns = db is None
@@ -166,8 +197,7 @@ class LiveSubmissionStore:
             row = (
                 session.execute(
                     text(
-                        "SELECT submission_id, plan_id, step_no, step_ref, state, "
-                        "broker_order_ids, delta_snapshot, detail FROM public.live_plan_submissions "
+                        f"SELECT {self._SELECT_COLUMNS} FROM public.live_plan_submissions "
                         "WHERE plan_id = :plan_id AND step_no = :step_no"
                     ),
                     {"plan_id": str(plan_id), "step_no": int(step_no)},
@@ -179,6 +209,108 @@ class LiveSubmissionStore:
             if owns:
                 session.close()
         return None if row is None else self._row(dict(row))
+
+    # ------------------------------------------------------- consumer leasing
+
+    def acquire_lease(
+        self,
+        *,
+        plan_id: str,
+        step_no: int,
+        token: str,
+        lease_seconds: float,
+    ) -> Optional[Dict[str, Any]]:
+        """CAS the single-writer lease for one step, or ``None`` when it is held.
+
+        Two consumer instances (or the same one after a restart) can scan the
+        same row at the same moment. The conditional UPDATE is evaluated under
+        the row lock, so exactly ONE caller becomes the writer: the loser updates
+        zero rows and must leave the claim alone. A lease abandoned by a crash
+        expires by plain comparison against ``until``, so work is never
+        stranded.
+
+        The expiry is computed from the DATABASE clock (``NOW()``), not from the
+        caller's: the lease is then comparable to the same clock that later
+        decides whether a write is still authorised, so an app/DB clock skew can
+        neither invalidate a healthy lease nor extend an abandoned one.
+        """
+        owns = True
+        session = self.session_factory()
+        dialect = self._dialect(session)
+        now_expr = "CURRENT_TIMESTAMP" if dialect == "sqlite" else "NOW()"
+        if dialect == "sqlite":
+            until_expr = "datetime('now', '+' || :lease_seconds || ' seconds')"
+        else:
+            until_expr = "NOW() + make_interval(secs => :lease_seconds)"
+        try:
+            row = (
+                session.execute(
+                    text(
+                        """
+                        UPDATE public.live_plan_submissions
+                        SET consumer_token = :token,
+                            consumer_until = {until_expr},
+                            updated_at = {now}
+                        WHERE plan_id = :plan_id
+                          AND step_no = :step_no
+                          AND state NOT IN ('filled', 'rejected', 'no_op')
+                          AND (
+                                consumer_token IS NULL
+                             OR consumer_token = :token
+                             OR consumer_until IS NULL
+                             OR consumer_until <= {now}
+                          )
+                        RETURNING {columns}
+                        """.format(
+                            now=now_expr,
+                            until_expr=until_expr,
+                            columns=self._SELECT_COLUMNS,
+                        )
+                    ),
+                    {
+                        "plan_id": str(plan_id),
+                        "step_no": int(step_no),
+                        "token": str(token),
+                        "lease_seconds": float(lease_seconds),
+                    },
+                )
+                .mappings()
+                .first()
+            )
+            if owns:
+                session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+        return None if row is None else self._row(dict(row))
+
+    def release_lease(self, *, plan_id: str, step_no: int, token: str) -> None:
+        """Give the lease back so a later pass (another instance) can resume."""
+        session = self.session_factory()
+        try:
+            session.execute(
+                text(
+                    """
+                    UPDATE public.live_plan_submissions
+                    SET consumer_token = NULL, consumer_until = NULL
+                    WHERE plan_id = :plan_id AND step_no = :step_no
+                      AND consumer_token = :token
+                    """
+                ),
+                {
+                    "plan_id": str(plan_id),
+                    "step_no": int(step_no),
+                    "token": str(token),
+                },
+            )
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def claim(
         self,
@@ -255,32 +387,65 @@ class LiveSubmissionStore:
         state: str,
         broker_order_ids: Sequence[str] = (),
         detail: Optional[Mapping[str, Any]] = None,
+        merge_detail: bool = True,
+        consumer_token: Optional[str] = None,
         db: Any = None,
     ) -> Dict[str, Any]:
+        """Write an outcome. Never regresses a terminal row.
+
+        ``merge_detail`` keeps the durable cursor/stage keys that a resumable
+        finalize relies on; the lease holder may pass ``consumer_token`` to make
+        the write conditional on still owning the step (so a consumer that lost
+        its lease cannot overwrite the winner's progress).
+        """
         owns = db is None
         session = db or self.session_factory()
-        json_cast = (
-            ":{0}" if self._dialect(session) == "sqlite" else "CAST(:{0} AS jsonb)"
+        dialect = self._dialect(session)
+        json_cast = ":{0}" if dialect == "sqlite" else "CAST(:{0} AS jsonb)"
+        empty_json = "'[]'" if dialect == "sqlite" else "'[]'::jsonb"
+        if merge_detail and dialect != "sqlite":
+            detail_expr = f"COALESCE(detail, '{{}}'::jsonb) || {json_cast.format('detail')}"
+        elif merge_detail:
+            detail_expr = f"json_patch(COALESCE(detail, '{{}}'), {json_cast.format('detail')})"
+        else:
+            detail_expr = json_cast.format("detail")
+        orders_expr = (
+            f"CASE WHEN {json_cast.format('broker_order_ids')} = {empty_json} "
+            f"THEN broker_order_ids ELSE {json_cast.format('broker_order_ids')} END"
         )
+        now_expr = "CURRENT_TIMESTAMP" if dialect == "sqlite" else "NOW()"
+        guard = ""
+        params: Dict[str, Any] = {
+            "plan_id": str(plan_id),
+            "step_no": int(step_no),
+            "state": str(state),
+            "broker_order_ids": json.dumps(list(broker_order_ids)),
+            "detail": json.dumps(dict(detail or {})),
+        }
+        if consumer_token is not None:
+            # The lease must still be VALID, not merely named: a slow owner whose
+            # lease expired (and whose step another consumer has taken over) must
+            # not be able to write an outcome for it.
+            guard = (
+                " AND consumer_token = :consumer_token"
+                f" AND consumer_until IS NOT NULL AND consumer_until > {now_expr}"
+            )
+            params["consumer_token"] = str(consumer_token)
         try:
             session.execute(
                 text(
                     f"""
                     UPDATE public.live_plan_submissions
                     SET state = :state,
-                        broker_order_ids = {json_cast.format('broker_order_ids')},
-                        detail = {json_cast.format('detail')},
-                        updated_at = {"CURRENT_TIMESTAMP" if self._dialect(session) == "sqlite" else "NOW()"}
+                        broker_order_ids = {orders_expr},
+                        detail = {detail_expr},
+                        updated_at = {now_expr}
                     WHERE plan_id = :plan_id AND step_no = :step_no
+                      AND state NOT IN ('filled', 'rejected', 'no_op')
+                      {guard}
                     """
                 ),
-                {
-                    "plan_id": str(plan_id),
-                    "step_no": int(step_no),
-                    "state": str(state),
-                    "broker_order_ids": json.dumps(list(broker_order_ids)),
-                    "detail": json.dumps(dict(detail or {})),
-                },
+                params,
             )
             stored = self.get(plan_id=plan_id, step_no=step_no, db=session)
             if owns:
@@ -335,11 +500,239 @@ class LivePlanAdapter:
         self.quote_max_age_seconds = float(quote_max_age_seconds)
         #: Durable per-step claim/outcome: the ONLY submission state.
         self.submissions = submissions or LiveSubmissionStore(session_factory=session_factory)
+        #: The DOMAIN seams (roll state machine, durable option run binding and
+        #: the option engine's own step derivation) are reused through the paper
+        #: executor's existing methods rather than re-implemented here. Built
+        #: lazily: a single-leg live plan never pays for the option store.
+        self._domain_executor = None
+
+    def _domain(self) -> Any:
+        if self._domain_executor is None:
+            from .execution import PaperPlanExecutor
+
+            self._domain_executor = PaperPlanExecutor(
+                session_factory=self.session_factory, clock=self._clock
+            )
+        return self._domain_executor
+
+    def _attributed_quantity(self, plan: Mapping[str, Any], leg: Mapping[str, Any]) -> int:
+        """One leg's attributed CURRENT quantity, from the platform reader.
+
+        A lane whose step is an ABSOLUTE FLAT (a roll's old-contract close) sizes
+        what it closes from the book, so an unreadable book refuses rather than
+        becoming a zero-quantity no-op.
+        """
+        plan_id = str(plan.get("plan_id") or "")
+        if self.position_reader is None:
+            raise LiveRefusal(
+                "LIVE_POSITION_EVIDENCE_UNAVAILABLE",
+                {"plan_id": plan_id, "message": "no authoritative attributed-current reader"},
+            )
+        try:
+            return int(self.position_reader(plan=dict(plan), leg=dict(leg)) or 0)
+        except LiveRefusal:
+            raise
+        except Exception as exc:  # noqa: BLE001 - unknown evidence is a refusal
+            raise LiveRefusal(
+                "LIVE_POSITION_EVIDENCE_UNAVAILABLE",
+                {"plan_id": plan_id, "error": str(exc)},
+            ) from exc
 
     # -- validation ---------------------------------------------------------
 
     @staticmethod
-    def _single_leg(plan: Mapping[str, Any]) -> Dict[str, Any]:
+    def _legs(plan: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        return [dict(leg) for leg in ((plan.get("resolved_plan") or {}).get("legs") or [])]
+
+    # -- lane gates ---------------------------------------------------------
+
+    def _check_lane_preconditions(
+        self, plan: Mapping[str, Any], lane: str, *, binding: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """The lane's own admission gates, BEFORE anything is materialized.
+
+        The parent protocol is lane-agnostic, but a lane's domain invariants are
+        not: a roll half must belong to a real roll of this strategy and account
+        (and may not quietly close an open roll's old leg), and an option
+        structure must resolve to its durable run inside its frozen expiry policy.
+        These are the SAME rules the paper lane enforces - reused, not restated.
+        """
+        from .live_sequence import LANE_FUTURES_ROLL, LANE_OPTION_STRUCTURE
+
+        if lane == LANE_FUTURES_ROLL:
+            return {"roll": self._check_roll_gates(plan, require_release=False)}
+        if lane == LANE_OPTION_STRUCTURE:
+            return {"option": self._check_option_gates(plan, binding=binding)}
+        return {}
+
+    def _check_roll_gates(
+        self, plan: Mapping[str, Any], *, require_release: bool
+    ) -> Dict[str, Any]:
+        """Reuse the paper executor's roll contract, with the release gate optional.
+
+        ``require_release=False`` is the SUBMIT-time reading: a ``close_old`` plan
+        is materialized ``withheld`` while the roll is still acquiring, so the
+        "close not released yet" refusal is the expected state rather than a
+        reason to refuse the plan. Every identity, account and contract check
+        still runs - and the release pass re-reads them with
+        ``require_release=True`` before it may place anything.
+        """
+        from .execution import ExecutionRefusal, PaperPlanExecutor
+
+        strategy_id = str(plan.get("strategy_id") or "")
+        account_id = str(plan.get("account_id") or "")
+        try:
+            ref = PaperPlanExecutor._roll_binding(plan)
+        except ExecutionRefusal as exc:
+            raise LiveRefusal(exc.reason_code, exc.detail) from exc
+        if not ref:
+            # An unbound plan may still not close a contract an OPEN roll holds:
+            # there is no "optional" roll bypass.
+            try:
+                self._domain()._refuse_ungated_roll_close(
+                    plan, strategy_id=strategy_id, account_id=account_id
+                )
+            except ExecutionRefusal as exc:
+                raise LiveRefusal(exc.reason_code, exc.detail) from exc
+            return {"role": None, "roll_id": None}
+        try:
+            roll = self._domain()._roll_preconditions(plan, ref)
+        except ExecutionRefusal as exc:
+            if not require_release and str(exc.reason_code) == "ROLL_CLOSE_NOT_RELEASED":
+                return {
+                    "role": str(ref.get("role") or ""),
+                    "roll_id": ref.get("roll_id"),
+                    "roll_state": str((exc.detail or {}).get("roll_state") or ""),
+                    "proven_filled_quantity": (exc.detail or {}).get("proven_filled_quantity"),
+                    "required_replacement_quantity": (exc.detail or {}).get(
+                        "required_replacement_quantity"
+                    ),
+                    "release_pending": True,
+                }
+            raise LiveRefusal(exc.reason_code, exc.detail) from exc
+        return {
+            "role": str(ref.get("role") or ""),
+            "roll_id": str(roll.get("roll_id") or ""),
+            "roll_state": str(roll.get("state") or ""),
+            "proven_filled_quantity": int(roll.get("proven_filled_quantity") or 0),
+            "required_replacement_quantity": int(
+                roll.get("required_replacement_quantity") or 0
+            ),
+        }
+
+    def _option_target(
+        self, plan: Mapping[str, Any], binding: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """The durable option run this frozen structure executes against."""
+        from .execution import ExecutionRefusal
+
+        try:
+            return self._domain()._resolve_option_target(dict(plan), dict(binding))
+        except ExecutionRefusal as exc:
+            raise LiveRefusal(exc.reason_code, exc.detail) from exc
+
+    def _option_steps(
+        self, plan: Mapping[str, Any], target: Mapping[str, Any]
+    ) -> List[Any]:
+        """The existing option engine's OWN step derivation for this run."""
+        from .execution import ExecutionRefusal
+
+        try:
+            return list(self._domain()._option_run_steps(dict(plan), dict(target)))
+        except ExecutionRefusal as exc:
+            raise LiveRefusal(exc.reason_code, exc.detail) from exc
+
+    def _begin_option_run(
+        self, plan: Mapping[str, Any], binding: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """Take OWNERSHIP of this option run's next transition, before any submit.
+
+        The transition is the existing engine's own compare-and-set on the run's
+        observed status, so two plans that target the same run can never both move
+        it: exactly one wins and the loser refuses. A run left ``exiting`` by an
+        unknown outcome is refused outright, so a restart never repeats an exit.
+        """
+        from .execution import ExecutionRefusal
+
+        target = self._option_target(plan, binding)
+        try:
+            return self._domain()._begin_option_run(
+                dict(target),
+                plan_id=str(plan.get("plan_id") or ""),
+                actor="live-adapter",
+            )
+        except ExecutionRefusal as exc:
+            raise LiveRefusal(exc.reason_code, exc.detail) from exc
+
+    def _check_option_gates(
+        self, plan: Mapping[str, Any], *, binding: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """Resolve the run and enforce its frozen policy BEFORE any submission.
+
+        Two existing adapters are actually CALLED here rather than cited:
+
+        * the plan/run binding (``resolve_plan_option_run``) - so a structure can
+          only ever execute against the durable run the platform bound it to, and
+          an exit's reference is validated against that run's own leg identities;
+        * the frozen EXPIRY POLICY (``OptionExpiryPolicy.check``) - an entry that
+          would open exposure inside the cutoff window under
+          ``exit_before_cutoff`` is refused by name, because the platform has no
+          mandate to open a structure it would immediately have to escalate.
+        """
+        target = self._option_target(plan, binding)
+        run = target.get("run")
+        phase = str(target.get("phase") or "")
+        resolved = dict(plan.get("resolved_plan") or {})
+        product = str(resolved.get("product") or "NRML").upper()
+        expiry = resolved.get("expiry")
+        detail: Dict[str, Any] = {
+            "phase": phase,
+            "option_run_id": str(getattr(run, "strategy_run_id", "") or ""),
+            "option_run_status": str(getattr(run, "status", "") or ""),
+            "worker_run_id": str(binding.get("strategy_run_id") or ""),
+            "expiry": None if expiry is None else str(expiry),
+            "expiry_policy": str(resolved.get("expiry_policy") or ""),
+        }
+        if phase == "entry" and str(product) != "MIS":
+            from backend.options.protection.expiry_policy import OptionExpiryPolicy
+
+            check = OptionExpiryPolicy().check(
+                account_id=str(plan.get("account_id") or ""),
+                run={
+                    "strategy_run_id": detail["option_run_id"],
+                    "expiry_policy": detail["expiry_policy"],
+                    "status": detail["option_run_status"],
+                },
+                expiry=expiry,
+                product=product,
+                now=self._clock(),
+                notify=False,
+            )
+            detail["expiry_check"] = {
+                "reason": check.reason,
+                "escalated": bool(check.escalated),
+                "action_required": bool(check.action_required),
+                "days_to_expiry": check.days_to_expiry,
+                "policy": str(check.policy or ""),
+            }
+            if check.action_required:
+                raise LiveRefusal(
+                    "OPTION_EXPIRY_CUTOFF_PASSED",
+                    {
+                        "plan_id": str(plan.get("plan_id") or ""),
+                        "instrument_id": "",
+                        **detail,
+                        "message": (
+                            "the frozen structure exits before the expiry cutoff and this "
+                            "entry is already inside the window; the platform does not open "
+                            "what it would immediately have to escalate"
+                        ),
+                    },
+                )
+        return detail
+
+    @classmethod
+    def _single_leg(cls, plan: Mapping[str, Any]) -> Dict[str, Any]:
         plan_id = str(plan.get("plan_id") or "")
         plan_kind = str(plan.get("plan_kind") or "")
         if plan_kind not in LIVE_SUPPORTED_PLAN_KINDS:
@@ -352,13 +745,13 @@ class LivePlanAdapter:
                     "message": "live support remains incomplete: this plan kind is not carried",
                 },
             )
-        legs = list((plan.get("resolved_plan") or {}).get("legs") or [])
+        legs = cls._legs(plan)
         if len(legs) != 1:
             raise LiveRefusal(
                 "LIVE_PLAN_COMPOUND_UNSUPPORTED",
                 {"plan_id": plan_id, "plan_kind": plan_kind, "leg_count": len(legs)},
             )
-        return dict(legs[0])
+        return legs[0]
 
     def _check_binding(self, plan: Mapping[str, Any], binding: Mapping[str, Any]) -> Dict[str, Any]:
         plan_id = str(plan.get("plan_id") or "")
@@ -412,23 +805,101 @@ class LivePlanAdapter:
             )
         return dict(authority)
 
-    def _check_approval(self, plan: Mapping[str, Any]) -> Dict[str, Any]:
+    def _check_approval(
+        self,
+        plan: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """The approval must hold on EVERY pin. Strict by construction."""
+        approval, mismatched, detail = self._approval_pin_state(plan)
+        if mismatched:
+            raise LiveRefusal(
+                "LIVE_APPROVAL_INVALID",
+                {
+                    "plan_id": str(plan.get("plan_id") or ""),
+                    "approval_id": str(approval.get("approval_id") or ""),
+                    "mismatched_pins": mismatched,
+                    "detail": detail,
+                },
+            )
+        return approval
+
+    def _approval_pin_state(
+        self, plan: Mapping[str, Any]
+    ) -> tuple[Dict[str, Any], List[str], Optional[Any]]:
+        """The live approval and EVERY pin it currently fails, unfiltered."""
         plan_id = str(plan.get("plan_id") or "")
         approval = self.approvals.active_for_plan(plan_id)
         if approval is None:
             raise LiveRefusal("LIVE_APPROVAL_REQUIRED", {"plan_id": plan_id})
         validity = self.approvals.structural_validity(plan, approval, now=self._clock())
-        if not bool(validity.get("valid")):
-            raise LiveRefusal(
-                "LIVE_APPROVAL_INVALID",
-                {
-                    "plan_id": plan_id,
-                    "approval_id": str(approval.get("approval_id") or ""),
-                    "mismatched_pins": validity.get("mismatched_pins"),
-                    "detail": validity.get("detail"),
-                },
+        return (
+            dict(approval),
+            [str(pin) for pin in (validity.get("mismatched_pins") or [])],
+            validity.get("detail"),
+        )
+
+    def _exposure_move_is_own_fills(
+        self,
+        plan: Mapping[str, Any],
+        specs: Sequence[Any],
+        parent: Mapping[str, Any],
+    ) -> tuple[bool, Dict[str, Any]]:
+        """Whether the book moved ONLY by this parent's OWN confirmed legs.
+
+        Per instrument the identity is
+
+        ``current_attributed == frozen_current_at_admission + Σ own filled delta``
+
+        where the frozen baseline is the ``current_quantity`` recorded in this
+        parent's immutable step specification and the own filled delta comes from
+        the parent's recorded per-leg outcomes (the VERIFIED fill evidence, not the
+        order acknowledgement). Any other movement on the instrument - another plan
+        of the same run, a manual trade, a corporate action - breaks the identity,
+        and then the frozen delta provably no longer describes the book: the
+        release is refused by name and the operator re-approves.
+        """
+        legs_detail = dict((dict(parent.get("detail") or {})).get("legs") or {})
+        baseline: Dict[tuple, int] = {}
+        own_delta: Dict[tuple, int] = {}
+        legs_by_key: Dict[tuple, Any] = {}
+        for spec in specs:
+            key = (str(spec.instrument_id), str(spec.product))
+            baseline.setdefault(key, int(spec.current_quantity))
+            legs_by_key.setdefault(key, spec)
+            entry = dict(legs_detail.get(str(int(spec.step_no))) or {})
+            sign = 1 if str(spec.side).upper() == "BUY" else -1
+            own_delta[key] = own_delta.get(key, 0) + sign * int(
+                entry.get("filled_quantity") or 0
             )
-        return dict(approval)
+        mismatches: List[Dict[str, Any]] = []
+        for key, base in sorted(baseline.items()):
+            spec = legs_by_key[key]
+            leg_view = self._leg_view(spec)
+            try:
+                actual = int(self.position_reader(plan=dict(plan), leg=dict(leg_view)) or 0)
+            except Exception as exc:  # noqa: BLE001 - unreadable evidence is not proof
+                return False, {
+                    "reason": "POSITION_EVIDENCE_UNAVAILABLE",
+                    "error": str(exc),
+                    "instrument_id": key[0],
+                }
+            expected = base + own_delta.get(key, 0)
+            if actual != expected:
+                mismatches.append(
+                    {
+                        "instrument_id": key[0],
+                        "product": key[1],
+                        "frozen_current_quantity": base,
+                        "own_filled_delta": own_delta.get(key, 0),
+                        "expected_quantity": expected,
+                        "actual_quantity": actual,
+                    }
+                )
+        return (not mismatches), {
+            "identity": "frozen_current + own_filled_delta == current_attributed",
+            "mismatches": mismatches,
+            "legs_considered": len(baseline),
+        }
 
     def _check_reservation(self, plan: Mapping[str, Any]) -> Dict[str, Any]:
         plan_id = str(plan.get("plan_id") or "")
@@ -522,21 +993,113 @@ class LivePlanAdapter:
             )
         return lot
 
+    def _weight_target(
+        self, plan: Mapping[str, Any], leg: Mapping[str, Any], lot: int
+    ) -> int:
+        """A weight leg's executable target, from the basis FROZEN with the plan.
+
+        Re-reading the current admission policy here would silently re-size an
+        already-approved target, so the frozen ``capital_basis_inr`` is the only
+        sizing input. The arithmetic is the compiler's own
+        (``WeightsPortfolioCompiler._target_quantity``), so the live, paper and
+        compile-time answers can never disagree. The current policy allocation is
+        read for DRIFT only: an authority that no longer covers the frozen basis
+        refuses rather than executing against a limit that no longer exists.
+        """
+        from .compiler.weights import WeightsPortfolioCompiler
+
+        plan_id = str(plan.get("plan_id") or "")
+        resolved = dict(plan.get("resolved_plan") or {})
+        logical = dict(plan.get("logical_plan") or {})
+        basis_raw = resolved.get("capital_basis_inr", logical.get("capital_basis_inr"))
+        if basis_raw is None:
+            raise LiveRefusal(
+                "LIVE_TARGET_MISSING",
+                {
+                    "plan_id": plan_id,
+                    "instrument_id": str(leg.get("instrument_id") or ""),
+                    "message": (
+                        "a weight-sized live plan must carry the capital basis it was "
+                        "frozen with"
+                    ),
+                },
+            )
+        try:
+            basis = float(basis_raw)
+        except (TypeError, ValueError) as exc:
+            raise LiveRefusal(
+                "LIVE_TARGET_MISSING",
+                {"plan_id": plan_id, "capital_basis_inr": str(basis_raw)},
+            ) from exc
+        if basis <= 0:
+            raise LiveRefusal(
+                "LIVE_TARGET_MISSING", {"plan_id": plan_id, "capital_basis_inr": basis}
+            )
+        buffer_raw = resolved.get("cash_buffer_pct", logical.get("cash_buffer_pct"))
+        try:
+            buffer_pct = 0.0 if buffer_raw is None else float(buffer_raw)
+        except (TypeError, ValueError) as exc:
+            raise LiveRefusal(
+                "LIVE_TARGET_MISSING", {"plan_id": plan_id, "cash_buffer_pct": str(buffer_raw)}
+            ) from exc
+        price_raw = leg.get("reference_price")
+        try:
+            price = float(price_raw) if price_raw is not None else None
+        except (TypeError, ValueError):
+            price = None
+        if price is None or price <= 0:
+            raise LiveRefusal(
+                "LIVE_REFERENCE_PRICE_UNAVAILABLE",
+                {
+                    "plan_id": plan_id,
+                    "instrument_id": str(leg.get("instrument_id") or ""),
+                    "tradingsymbol": str(leg.get("tradingsymbol") or ""),
+                    "message": "a weight-sized leg needs the reference price frozen with the plan",
+                },
+            )
+        return int(
+            WeightsPortfolioCompiler._target_quantity(
+                weight=float(leg.get("target_weight") or 0.0),
+                capital=basis * max(0.0, 1.0 - buffer_pct),
+                price=price,
+                lot=int(lot or 1),
+            )
+        )
+
     def _resolve_delta(self, plan: Mapping[str, Any], leg: Mapping[str, Any]) -> Dict[str, Any]:
         """The step's direction and quantity, from the ATTRIBUTED current position.
 
-        The frozen leg carries the absolute TARGET (``signed_quantity``); without
-        a current reading the size is unknown, and an unknown size refuses rather
-        than becoming a default BUY of the target's magnitude.
+        The frozen leg carries either an absolute TARGET (``signed_quantity``) or
+        a full-snapshot ``target_weight``. Without a current reading the size is
+        unknown, and an unknown size refuses rather than becoming a default BUY of
+        the target's magnitude.
+
+        ``increases_exposure`` reuses the paper executor's own rule (the book grows
+        OR the trade crosses flat), so the live lane cannot invent a laxer notion
+        of "risk-increasing" than admission and the reservation already enforce.
         """
+        from .execution import PaperPlanExecutor
+
         plan_id = str(plan.get("plan_id") or "")
         target_raw = leg.get("signed_quantity")
-        if target_raw is None:
+        long_only = False
+        lot = self._pinned_units(plan, leg)
+        if target_raw is not None:
+            target = int(target_raw)
+        elif leg.get("target_weight") is not None:
+            target = self._weight_target(plan, leg, lot)
+            # A full-snapshot weight is a long-only fraction: a sell REDUCES to
+            # flat, and can never cross into a short.
+            long_only = True
+        else:
             raise LiveRefusal(
                 "LIVE_TARGET_MISSING",
-                {"plan_id": plan_id, "instrument_id": str(leg.get("instrument_id") or "")},
+                {
+                    "plan_id": plan_id,
+                    "instrument_id": str(leg.get("instrument_id") or ""),
+                    "message": "the leg names neither a signed quantity nor a target weight",
+                },
             )
-        target = int(target_raw)
         if self.position_reader is None:
             raise LiveRefusal(
                 "LIVE_POSITION_EVIDENCE_UNAVAILABLE",
@@ -546,9 +1109,7 @@ class LivePlanAdapter:
                 },
             )
         try:
-            current = int(
-                self.position_reader(plan=dict(plan), leg=dict(leg)) or 0
-            )
+            current = int(self.position_reader(plan=dict(plan), leg=dict(leg)) or 0)
         except LiveRefusal:
             raise
         except Exception as exc:  # noqa: BLE001 - unknown evidence is a refusal
@@ -556,12 +1117,18 @@ class LivePlanAdapter:
                 "LIVE_POSITION_EVIDENCE_UNAVAILABLE",
                 {"plan_id": plan_id, "error": str(exc)},
             ) from exc
-        lot = self._pinned_units(plan, leg)
         delta = target - current
+        if long_only and delta < 0:
+            delta = max(delta, -current)
         quantity = abs(delta)
         if lot > 1:
             quantity = (quantity // lot) * lot
         side = "BUY" if delta > 0 else "SELL"
+        price_raw = leg.get("reference_price")
+        try:
+            price = abs(float(price_raw)) if price_raw is not None else 0.0
+        except (TypeError, ValueError):
+            price = 0.0
         return {
             "target": target,
             "current": current,
@@ -569,6 +1136,11 @@ class LivePlanAdapter:
             "side": side,
             "quantity": int(quantity),
             "lot_size": lot,
+            "notional_inr": float(int(quantity) * price),
+            "increases_exposure": bool(
+                PaperPlanExecutor._opens_or_grows_exposure(target, current)
+            ),
+            "long_only": bool(long_only),
         }
 
     # -- submit -------------------------------------------------------------
@@ -580,31 +1152,114 @@ class LivePlanAdapter:
         actor: str,
         run_binding: Mapping[str, Any],
         evaluation_authority: Mapping[str, Any],
-        quote: Mapping[str, Any],
+        quote: Optional[Mapping[str, Any]] = None,
         margin_evidence: Optional[Mapping[str, Any]] = None,
         catalog_state: Optional[Mapping[str, Any]] = None,
         session_id: Optional[str] = None,
+        lane: Optional[str] = None,
+        step_specs: Optional[Sequence[Any]] = None,
+        sequence: Any = None,
+        quote_reader: Any = None,
     ) -> LiveSubmission:
-        """Validate every control, claim the step durably, then dispatch ONCE."""
-        step_no = 1
+        """Validate every control, materialize the durable parent, dispatch the ready steps.
+
+        ONE frozen plan maps to ONE durable parent (``live_plan_executions``,
+        ``UNIQUE (plan_id)``) whose ordered step/dependency specification is frozen
+        here, at FIRST admission. The parent, every per-leg claim and the per-step
+        barrier work are written in ONE transaction on the canonical book lock, so
+        a crash leaves either the whole protocol or none of it - and a concurrent
+        second executor reads the winner's rows instead of dispatching again.
+
+        A step with prerequisites is materialized as ``withheld`` in-flight work
+        and is NOT dispatched here: only the shared sequence pass may release it,
+        and only while its prerequisites are filled and the persisted authority
+        still holds.
+        """
+        from .live_sequence import (
+            LaneContext,
+            LivePlanSequence,
+            StepSpec,
+            build_steps,
+            capacity_covers,
+            lane_for_plan,
+        )
+
         plan_id = str(plan.get("plan_id") or "")
-        leg = self._single_leg(plan)
+        resolved_lane = str(lane or lane_for_plan(plan))
+        legs = self._legs(plan)
+        if not legs:
+            raise LiveRefusal(
+                "LIVE_PLAN_COMPOSITION_EMPTY",
+                {"plan_id": plan_id, "plan_kind": str(plan.get("plan_kind") or "")},
+            )
         binding = self._check_binding(plan, run_binding)
         self._check_authority(plan, evaluation_authority, binding)
         self._check_approval(plan)
-        self._check_reservation(plan)
-        self._check_quote(plan, leg, quote)
+        reservation = self._check_reservation(plan)
         self._check_admission(plan, margin_evidence=margin_evidence, catalog_state=catalog_state)
-        step_ref = self._step_ref(plan, step_no)
+        # The LANE's own domain invariants (the roll contract, the durable option
+        # run inside its frozen expiry policy) are checked once more here, before
+        # anything is materialized. A lane that cannot name its domain object
+        # refuses instead of freezing a protocol it could never dispatch.
+        lane_gates = self._check_lane_preconditions(plan, resolved_lane, binding=binding)
 
-        # ONE transaction on the CANONICAL book lock (the same lock the barrier
-        # work events take): claim the step, re-check the authority, and record
-        # the barrier work - so a crash after this commit leaves BOTH a durable
-        # claim and the work that blocks a quiet proof. Two instances (or a
-        # restart) serialize here and the loser reads the winner's row.
+        if step_specs is None:
+            specs = build_steps(
+                LaneContext(
+                    plan=plan,
+                    binding=binding,
+                    authority=evaluation_authority,
+                    execution_id="",
+                    size_leg=lambda leg: self._resolve_delta(plan, dict(leg)),
+                    attributed_quantity=lambda leg: self._attributed_quantity(plan, dict(leg)),
+                    option_target=self._option_target,
+                    option_run_steps=self._option_steps,
+                ),
+                resolved_lane,
+            )
+        else:
+            specs = [
+                item if isinstance(item, StepSpec) else StepSpec.from_dict(dict(item))
+                for item in step_specs
+            ]
+        if not specs:
+            raise LiveRefusal("LIVE_PLAN_COMPOSITION_EMPTY", {"plan_id": plan_id})
+        # Per-leg capacity accounting: the reservation must cover EVERY
+        # pending/unsubmitted increasing leg, not merely the one dispatched first.
+        covered, coverage = capacity_covers(reservation, specs)
+        if not covered:
+            raise LiveRefusal(
+                "LIVE_CAPACITY_SHORTFALL",
+                {
+                    "plan_id": plan_id,
+                    "lane": resolved_lane,
+                    **coverage,
+                    "message": (
+                        "the reservation must cover every increasing leg of the parent; "
+                        "the whole reservation is not spent on the first leg"
+                    ),
+                },
+            )
+        if quote is not None and len(specs) == 1:
+            # The single-leg path validates the caller's quote up front (the
+            # multi-leg paths read a fresh quote per leg at dispatch).
+            self._check_quote(plan, legs[0], quote)
+
         account_id = str(plan.get("account_id") or "")
         strategy_id = str(plan.get("strategy_id") or "")
-        delta: Dict[str, Any] = {}
+        from .live_sequence import LANE_OPTION_STRUCTURE, RULE_IMMEDIATE
+
+        if resolved_lane == LANE_OPTION_STRUCTURE and any(int(spec.quantity) for spec in specs):
+            # The durable RUN must never read as "created" while orders are in
+            # flight, so its transition is taken BEFORE the first submission. It is
+            # a compare-and-set on the run's observed status: a second plan for the
+            # same run (a duplicate entry, a second exit) refuses instead of racing.
+            self._begin_option_run(plan, binding)
+        sequence = sequence or LivePlanSequence(
+            session_factory=self.session_factory,
+            submissions=self.submissions,
+            barrier=self.barrier,
+        )
         claim_session = self.session_factory()
         try:
             self.barrier.lock_book(
@@ -613,41 +1268,23 @@ class LivePlanAdapter:
                 strategy_id=strategy_id,
                 execution_environment="live",
             )
-            # The attributed-current read that sizes the step ALSO happens under
-            # the same book lock: a concurrent writer on this book cannot change
-            # the position between the size we compute and the claim we commit.
-            delta = self._resolve_delta(plan, leg)
-            stored, created = self.submissions.claim(
-                plan_id=plan_id,
-                step_no=step_no,
-                step_ref=step_ref,
-                strategy_id=strategy_id,
-                account_id=account_id,
-                execution_environment="live",
-                delta_snapshot=delta,
-                state="pending" if delta["quantity"] else "no_op",
-                detail={"actor": actor},
+            _parent, created = sequence.materialize(
+                plan=plan,
+                lane=resolved_lane,
+                step_specs=specs,
+                detail={"actor": actor, "lane_gates": dict(lane_gates or {})},
                 db=claim_session,
             )
             if not created:
-                # Already claimed (pending/uncertain/rejected/no_op): report the
-                # REAL outcome, never a second dispatch.
+                # Already materialized (pending/withheld/uncertain/rejected/no_op):
+                # report the DURABLE state, never a second dispatch. A withheld
+                # dependent is released only by the sequence pass, on evidence.
                 claim_session.rollback()
-                return self._as_submission(stored)
+                return self._submission_view(plan_id, specs)
             # Re-read the exposure-increasing authority and the evaluation
             # authority INSIDE the claim transaction: a revocation or expiry
-            # between validation and dispatch must be observed here.
+            # between validation and dispatch must roll the whole parent back.
             self._recheck_at_dispatch(plan, evaluation_authority, binding)
-            if delta["quantity"]:
-                self.barrier.record_work_event(
-                    account_id=account_id,
-                    strategy_id=strategy_id,
-                    execution_environment="live",
-                    event="work_created",
-                    ref=step_ref,
-                    detail={"plan_id": plan_id, "delta": delta, "actor": actor},
-                    db=claim_session,
-                )
             claim_session.commit()
         except LiveRefusal:
             claim_session.rollback()
@@ -658,13 +1295,139 @@ class LivePlanAdapter:
         finally:
             claim_session.close()
 
-        if not delta["quantity"]:
-            # Nothing to send: the attributed book is already at the target. The
-            # claim is the record, and no work/reservation is disturbed.
-            return self._as_submission(stored)
+        ready = [
+            spec
+            for spec in specs
+            if not spec.depends_on
+            and spec.quantity
+            and str(spec.release_rule) == RULE_IMMEDIATE
+        ]
+        if ready:
+            # The parent leaves ``planned`` as soon as a leg is actually sent; a
+            # plan whose every leg is withheld stays ``planned`` and in flight.
+            sequence.mark_executing(plan_id=plan_id)
+        for spec in ready:
+            await self.dispatch_step(
+                plan,
+                spec,
+                binding=binding,
+                account_id=account_id,
+                strategy_id=strategy_id,
+                actor=actor,
+                session_id=session_id,
+                quote=quote if len(specs) == 1 else None,
+                quote_reader=quote_reader,
+            )
+        return self._submission_view(plan_id, specs)
+
+    # -- per-step dispatch --------------------------------------------------
+
+    @staticmethod
+    def _leg_view(spec: Any) -> Dict[str, Any]:
+        return {
+            "instrument_id": str(getattr(spec, "instrument_id", "") or ""),
+            "exchange": str(getattr(spec, "exchange", "") or ""),
+            "tradingsymbol": str(getattr(spec, "tradingsymbol", "") or ""),
+            "broker_exchange": str(getattr(spec, "broker_exchange", "") or ""),
+            "broker_symbol": str(getattr(spec, "broker_symbol", "") or ""),
+            "product": str(getattr(spec, "product", "") or ""),
+            "variety": str(getattr(spec, "variety", "") or "regular"),
+        }
+
+    async def dispatch_step(
+        self,
+        plan: Mapping[str, Any],
+        spec: Any,
+        *,
+        binding: Mapping[str, Any],
+        account_id: str,
+        strategy_id: str,
+        actor: str = "",
+        session_id: Optional[str] = None,
+        quote: Optional[Mapping[str, Any]] = None,
+        quote_reader: Any = None,
+        authority: Optional[Mapping[str, Any]] = None,
+        released_by: Optional[str] = None,
+        extra_evidence: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Send ONE already-claimed step through the existing intent handler.
+
+        The claim is durable BEFORE this call: an accepted order is ``pending``, a
+        transport failure or a response naming no order is ``uncertain`` (work and
+        capacity retained, NEVER auto-repeated), and only an explicit authoritative
+        refusal resolves the known-unfilled residual.
+        """
+        from .live_sequence import RULE_MIS_SQUAREOFF
+        from .live_sequence import RULE_ROLL_CLOSE_RELEASED
+
+        plan_id = str(plan.get("plan_id") or "")
+        step_no = int(spec.step_no)
+        step_ref = str(spec.step_ref)
+        leg = self._leg_view(spec)
+        quote = quote if quote is not None else (
+            quote_reader(leg) if callable(quote_reader) else None
+        )
+        if quote is not None:
+            self._check_quote(plan, leg, quote)
+        elif spec.quantity:
+            raise LiveRefusal("LIVE_QUOTE_MISSING", {"plan_id": plan_id, "step": step_no})
+
+        delta = dict(getattr(spec, "detail", {}).get("sizing") or {})
+        delta.setdefault("target", int(spec.target_quantity))
+        delta.setdefault("current", int(spec.current_quantity))
+        delta.setdefault("delta", int(spec.delta))
+        delta.setdefault("side", str(spec.side))
+        delta.setdefault("quantity", int(spec.quantity))
+        delta.setdefault("lot_size", int(spec.lot_size))
+        quantity = abs(int(spec.quantity))
+        side = str(spec.side)
+        release_evidence: Dict[str, Any] = {}
+        if released_by:
+            release_evidence["released_by"] = str(released_by)
+        if extra_evidence:
+            release_evidence["exposure_pin_proof"] = dict(extra_evidence)
+        if str(getattr(spec, "release_rule", "")) == RULE_MIS_SQUAREOFF:
+            quantity, side, release_evidence = self._mis_squareoff_size(
+                plan, spec, authority=authority, binding=binding, evidence=release_evidence
+            )
+            if quantity == 0:
+                stored = self.submissions.record_outcome(
+                    plan_id=plan_id,
+                    step_no=step_no,
+                    state="no_op",
+                    detail={
+                        **release_evidence,
+                        "delta": delta,
+                        "note": "the attributed book is already flat; nothing to square off",
+                    },
+                )
+                return dict(stored or {})
+        elif str(getattr(spec, "release_rule", "")) == RULE_ROLL_CLOSE_RELEASED:
+            # The roll's old-contract close is an ABSOLUTE FLAT for this
+            # strategy's OWN attributed book. Sizing it from the frozen leg's
+            # signed quantity would double it for a long-old roll, and sizing it
+            # from anything but the book would let one strategy's close reach
+            # another's shares.
+            quantity, side, release_evidence = self._roll_close_size(
+                plan, spec, authority=authority, binding=binding, evidence=release_evidence
+            )
+            if quantity == 0:
+                stored = self.submissions.record_outcome(
+                    plan_id=plan_id,
+                    step_no=step_no,
+                    state="no_op",
+                    detail={
+                        **release_evidence,
+                        "delta": delta,
+                        "note": "the attributed old-contract book is already flat",
+                    },
+                )
+                return dict(stored or {})
 
         if self.intent_handler is None:
-            raise LiveRefusal("LIVE_INTENT_HANDLER_MISSING", {"plan_id": plan_id, "step_ref": step_ref})
+            raise LiveRefusal(
+                "LIVE_INTENT_HANDLER_MISSING", {"plan_id": plan_id, "step_ref": step_ref}
+            )
 
         from backend.algo_runtime.models import OrderIntent
 
@@ -673,12 +1436,32 @@ class LivePlanAdapter:
             "correlation_id": step_ref,
             "idempotency_key": step_ref,
             "order": {
-                "exchange": str(leg.get("broker_exchange") or leg.get("exchange") or ""),
-                "tradingsymbol": str(leg.get("broker_symbol") or leg.get("tradingsymbol") or ""),
-                "transaction_type": delta["side"],
-                "product": str(leg.get("product") or ""),
+                "exchange": str(spec.broker_exchange or spec.exchange or ""),
+                "tradingsymbol": str(spec.broker_symbol or spec.tradingsymbol or ""),
+                "transaction_type": side,
+                "variety": str(spec.variety or "regular"),
+                "product": str(spec.product or ""),
                 "order_type": "MARKET",
-                "quantity": abs(int(delta["quantity"])),
+                "quantity": int(quantity),
+                # Attribution binds the broker order id to THIS plan step's run
+                # BEFORE the order exists, so ingestion can attribute the fill
+                # without the child ever asserting ownership.
+                "attribution": {
+                    "strategy_run_id": str(binding.get("strategy_run_id") or ""),
+                    "strategy_family": str(plan.get("plan_kind") or "single_instrument"),
+                    "strategy_name": str(
+                        plan.get("strategy_name") or plan.get("strategy_id") or ""
+                    ),
+                    "execution_mode": "live",
+                    "account_ref": account_id,
+                    "entry_surface": "hosted_plan",
+                    "idempotency_key": step_ref,
+                    "metadata": {
+                        "plan_id": plan_id,
+                        "step_no": step_no,
+                        "strategy_id": strategy_id,
+                    },
+                },
             },
         }
         intent = OrderIntent(intent_type="place_order", payload=payload, dedupe_key=step_ref)
@@ -692,10 +1475,11 @@ class LivePlanAdapter:
                 detail={
                     "error": str(exc),
                     "delta": delta,
+                    **release_evidence,
                     "note": "work and reservation are retained; never auto-repeated",
                 },
             )
-            return self._as_submission(stored)
+            return dict(stored or {})
 
         order_ids = self._accepted_order_ids(result)
         if order_ids:
@@ -704,15 +1488,19 @@ class LivePlanAdapter:
                 step_no=step_no,
                 state="pending",
                 broker_order_ids=order_ids,
-                detail={"delta": delta, "note": "accepted: fills come from ingestion"},
+                detail={
+                    "delta": delta,
+                    **release_evidence,
+                    "note": "accepted: fills come from ingestion",
+                },
             )
-            return self._as_submission(stored)
+            return dict(stored or {})
 
         if self._is_explicit_rejection(result):
             # An AUTHORITATIVE refusal may resolve the known-unfilled residual.
             self.barrier.record_work_event(
-                account_id=str(plan.get("account_id") or ""),
-                strategy_id=str(plan.get("strategy_id") or ""),
+                account_id=account_id,
+                strategy_id=strategy_id,
                 execution_environment="live",
                 event="work_resolved",
                 ref=step_ref,
@@ -722,9 +1510,9 @@ class LivePlanAdapter:
                 plan_id=plan_id,
                 step_no=step_no,
                 state="rejected",
-                detail={"delta": delta, "result": result},
+                detail={"delta": delta, "result": result, **release_evidence},
             )
-            return self._as_submission(stored)
+            return dict(stored or {})
 
         # No order id and no authoritative refusal: the outcome is UNKNOWN. Work
         # and reservation stay held, and the step is never repeated.
@@ -735,10 +1523,365 @@ class LivePlanAdapter:
             detail={
                 "delta": delta,
                 "result": result,
+                **release_evidence,
                 "note": "no authoritative order reference; recovery required",
             },
         )
-        return self._as_submission(stored)
+        return dict(stored or {})
+
+    async def release_step(
+        self,
+        plan: Mapping[str, Any],
+        spec: Any,
+        *,
+        binding: Mapping[str, Any],
+        authority: Mapping[str, Any],
+        actor: str = "live-sequence",
+        margin_evidence: Optional[Mapping[str, Any]] = None,
+        catalog_state: Optional[Mapping[str, Any]] = None,
+        session_id: Optional[str] = None,
+        quote: Optional[Mapping[str, Any]] = None,
+        quote_reader: Any = None,
+        all_specs: Optional[Sequence[Any]] = None,
+        parent: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Release ONE ``withheld`` step, or refuse by name without placing anything.
+
+        The whole release decision is durable and transactional: inside ONE
+        transaction on the canonical book lock this re-reads every prerequisite's
+        durable state, re-validates the exposure-increasing controls against the
+        FRESH persisted authority and approval, re-checks that the reservation still
+        covers every outstanding leg, and only then CASes ``withheld -> releasing``.
+        A second pass (or a concurrent instance) therefore finds no ``withheld`` row
+        and does nothing, and a crash after the CAS leaves an in-flight claim whose
+        work and capacity stay held and which is NEVER re-sent.
+
+        Dispatch happens AFTER the commit, exactly like the first-leg path, so the
+        order can never exist without a durable claim that precedes it.
+        """
+        from .live_sequence import (
+            LiveRefusal as _SequenceRefusal,
+            capacity_covers,
+            prerequisites_met,
+        )
+
+        plan_id = str(plan.get("plan_id") or "")
+        step_no = int(spec.step_no)
+        account_id = str(plan.get("account_id") or "")
+        strategy_id = str(plan.get("strategy_id") or "")
+        specs = list(all_specs or [spec])
+        session = self.session_factory()
+        now_expr = (
+            "CURRENT_TIMESTAMP"
+            if self.submissions._dialect(session) == "sqlite"
+            else "NOW()"
+        )
+        try:
+            self.barrier.lock_book(
+                session,
+                account_id=account_id,
+                strategy_id=strategy_id,
+                execution_environment="live",
+            )
+            stored = self.submissions.get(plan_id=plan_id, step_no=step_no, db=session)
+            if stored is None:
+                raise LiveRefusal(
+                    "LIVE_SUBMISSION_CLAIM_MISSING", {"plan_id": plan_id, "step_no": step_no}
+                )
+            if str(stored.get("state")) != "withheld":
+                session.rollback()
+                return {"state": str(stored.get("state")), "skipped": True, "released": False}
+
+            states = self._step_states(session, plan_id)
+            if not prerequisites_met(spec, states):
+                session.rollback()
+                raise LiveRefusal(
+                    "LIVE_SEQUENCE_PREREQUISITE_UNFILLED",
+                    {
+                        "plan_id": plan_id,
+                        "step_no": step_no,
+                        "depends_on": [int(value) for value in (spec.depends_on or ())],
+                        "states": {str(key): str(value) for key, value in states.items()},
+                    },
+                )
+            # Every exposure-increasing control is re-read HERE, inside the release
+            # transaction, against the FRESH persisted authority - never the
+            # caller's copy from an earlier pass.
+            self._check_authority(plan, authority, binding)
+            # The approval is re-validated pin by pin. The exposure-snapshot pin is
+            # the ONLY one a moving multi-leg book may legitimately change, and only
+            # when this parent's own confirmed fills account for the movement
+            # exactly; every other movement is a NAMED refusal so the operator
+            # re-approves instead of trading an approved delta against a book it no
+            # longer describes.
+            approval, mismatched, pin_detail = self._approval_pin_state(plan)
+            exposure_proof: Dict[str, Any] = {}
+            if mismatched:
+                unexplained = sorted(
+                    set(mismatched) - set(SEQUENCE_TOLERATED_PIN_MISMATCHES)
+                )
+                if unexplained or parent is None:
+                    raise LiveRefusal(
+                        "LIVE_APPROVAL_INVALID",
+                        {
+                            "plan_id": plan_id,
+                            "step_no": step_no,
+                            "approval_id": str(approval.get("approval_id") or ""),
+                            "mismatched_pins": mismatched,
+                            "explained_pins": sorted(
+                                set(mismatched) & set(SEQUENCE_TOLERATED_PIN_MISMATCHES)
+                            ),
+                            "detail": pin_detail,
+                            "message": (
+                                "no durable parent is available to prove an exposure "
+                                "snapshot change against"
+                                if parent is None
+                                else "an approval pin other than the exposure snapshot moved"
+                            ),
+                        },
+                    )
+                proved, exposure_proof = self._exposure_move_is_own_fills(
+                    plan, specs, parent
+                )
+                if not proved:
+                    raise LiveRefusal(
+                        "LIVE_SEQUENCE_BOOK_MOVED_BEYOND_OWN_FILLS",
+                        {
+                            "plan_id": plan_id,
+                            "step_no": step_no,
+                            "approval_id": str(approval.get("approval_id") or ""),
+                            **exposure_proof,
+                            "message": (
+                                "the book moved by something other than this plan's own "
+                                "confirmed fills, so the frozen delta no longer describes "
+                                "it; re-approve the plan"
+                            ),
+                        },
+                    )
+                exposure_proof["pin"] = "EXPOSURE_SNAPSHOT_CHANGED"
+            reservation = self._check_reservation(plan)
+            self._check_admission(
+                plan, margin_evidence=margin_evidence, catalog_state=catalog_state
+            )
+            covered, coverage = capacity_covers(reservation, specs)
+            if not covered:
+                raise LiveRefusal(
+                    "LIVE_CAPACITY_SHORTFALL",
+                    {
+                        "plan_id": plan_id,
+                        "step_no": step_no,
+                        **coverage,
+                        "message": "the reservation no longer covers every outstanding leg",
+                    },
+                )
+            result = session.execute(
+                text(
+                    """
+                    UPDATE public.live_plan_submissions
+                    SET state = 'releasing', updated_at = {now}
+                    WHERE plan_id = :plan_id AND step_no = :step_no
+                      AND state = 'withheld'
+                    """.format(now=now_expr)
+                ),
+                {"plan_id": plan_id, "step_no": step_no},
+            )
+            if int(getattr(result, "rowcount", 0) or 0) == 0:
+                # Another instance released it between the read and the CAS.
+                session.rollback()
+                return {"state": "releasing", "skipped": True, "released": False}
+            session.execute(
+                text(
+                    """
+                    UPDATE public.live_plan_executions
+                    SET state = 'executing', updated_at = {now}
+                    WHERE plan_id = :plan_id AND state = 'planned'
+                    """.format(now=now_expr)
+                ),
+                {"plan_id": plan_id},
+            )
+            session.commit()
+        except LiveRefusal:
+            session.rollback()
+            raise
+        except _SequenceRefusal:
+            session.rollback()
+            raise
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+        try:
+            outcome = await self.dispatch_step(
+                plan,
+                spec,
+                binding=binding,
+                account_id=account_id,
+                strategy_id=strategy_id,
+                actor=actor,
+                session_id=session_id,
+                quote=quote,
+                quote_reader=quote_reader,
+                authority=authority,
+                released_by="live-sequence",
+                extra_evidence=(exposure_proof or None),
+            )
+        except LiveRefusal:
+            # A refusal BEFORE the handler was called means nothing was sent. The
+            # claim is rewound to ``withheld`` so a later pass can retry once the
+            # evidence is available. A step that DID reach the handler cannot take
+            # this path: transport uncertainty is recorded, not raised.
+            self._rewind_release(plan_id=plan_id, step_no=step_no)
+            raise
+        return {"state": str(outcome.get("state") or ""), "skipped": False, "released": True}
+
+    def _rewind_release(self, *, plan_id: str, step_no: int) -> None:
+        session = self.session_factory()
+        now_expr = (
+            "CURRENT_TIMESTAMP"
+            if self.submissions._dialect(session) == "sqlite"
+            else "NOW()"
+        )
+        try:
+            session.execute(
+                text(
+                    """
+                    UPDATE public.live_plan_submissions
+                    SET state = 'withheld', updated_at = {now}
+                    WHERE plan_id = :plan_id AND step_no = :step_no
+                      AND state = 'releasing'
+                      AND (broker_order_ids IS NULL OR broker_order_ids = '[]'::jsonb)
+                    """.format(now=now_expr)
+                ),
+                {"plan_id": str(plan_id), "step_no": int(step_no)},
+            )
+            session.commit()
+        except Exception:  # noqa: BLE001 - the claim stays in flight, never lost
+            session.rollback()
+        finally:
+            session.close()
+
+    @staticmethod
+    def _step_states(session: Any, plan_id: str) -> Dict[int, str]:
+        rows = session.execute(
+            text(
+                "SELECT step_no, state FROM public.live_plan_submissions "
+                "WHERE plan_id = :plan_id"
+            ),
+            {"plan_id": str(plan_id)},
+        ).fetchall()
+        return {int(row[0]): str(row[1] or "") for row in rows}
+
+    def _mis_squareoff_size(
+        self,
+        plan: Mapping[str, Any],
+        spec: Any,
+        *,
+        authority: Optional[Mapping[str, Any]],
+        binding: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+    ) -> tuple[int, str, Dict[str, Any]]:
+        """Size a MIS square-off from the CURRENT attributed book, never beyond it.
+
+        The platform's own ``attributed_exit_size`` is the isolation guarantee: one
+        strategy's square-off can never sell another strategy's shares. The frozen
+        step delta is the REQUEST; the released quantity is the clamped one, and
+        both travel in the trail so a partial exit is visible rather than inferred.
+        """
+        from .mis_squareoff import attributed_exit_size
+
+        plan_id = str(plan.get("plan_id") or "")
+        leg = self._leg_view(spec)
+        try:
+            current = int(self.position_reader(plan=dict(plan), leg=dict(leg)) or 0) if self.position_reader else 0
+        except Exception as exc:  # noqa: BLE001 - unknown evidence is a refusal
+            raise LiveRefusal(
+                "LIVE_POSITION_EVIDENCE_UNAVAILABLE",
+                {"plan_id": plan_id, "error": str(exc)},
+            ) from exc
+        requested = -abs(int(spec.quantity)) if current > 0 else abs(int(spec.quantity))
+        try:
+            signed = int(
+                attributed_exit_size(
+                    attributed_quantity=current, requested_quantity=requested
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - unknown evidence is a refusal
+            raise LiveRefusal(
+                "LIVE_POSITION_EVIDENCE_UNAVAILABLE",
+                {"plan_id": plan_id, "error": str(exc)},
+            ) from exc
+        quantity = abs(signed)
+        side = "BUY" if signed > 0 else "SELL"
+        detail = {
+            **dict(evidence or {}),
+            "mis_squareoff": True,
+            "frozen_quantity": abs(int(spec.quantity)),
+            "attributed_quantity": current,
+            "released_quantity": int(quantity),
+            "release_rule": str(getattr(spec, "release_rule", "")),
+            "scheduled_at": str(
+                (getattr(spec, "detail", {}) or {}).get("mis", {}).get("scheduled_at") or ""
+            ),
+            "authority_attempt": str((authority or {}).get("attempt") or ""),
+            "strategy_run_id": str(binding.get("strategy_run_id") or ""),
+        }
+        return int(quantity), side, detail
+
+    def _roll_close_size(
+        self,
+        plan: Mapping[str, Any],
+        spec: Any,
+        *,
+        authority: Optional[Mapping[str, Any]],
+        binding: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+    ) -> tuple[int, str, Dict[str, Any]]:
+        """Size a roll's old-contract close from the CURRENT attributed book.
+
+        The platform's own ``attributed_exit_size`` is the isolation guarantee: an
+        exit is clamped to what THIS strategy holds, so a roll's close can never
+        reach another strategy's shares, and a request in the same direction as
+        the book (which would GROW it) is zero rather than a trade. The frozen
+        step's quantity is the REQUEST; the released quantity is the clamped one,
+        and both travel in the trail so a partial close is visible rather than
+        inferred.
+        """
+        from .mis_squareoff import attributed_exit_size
+
+        plan_id = str(plan.get("plan_id") or "")
+        leg = self._leg_view(spec)
+        current = self._attributed_quantity(plan, dict(leg))
+        roll_detail = dict((getattr(spec, "detail", {}) or {}).get("roll") or {})
+        try:
+            signed = int(
+                attributed_exit_size(
+                    attributed_quantity=current, requested_quantity=-int(current)
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - unknown evidence is a refusal
+            raise LiveRefusal(
+                "LIVE_POSITION_EVIDENCE_UNAVAILABLE",
+                {"plan_id": plan_id, "error": str(exc)},
+            ) from exc
+        quantity = abs(signed)
+        side = "BUY" if signed > 0 else "SELL"
+        detail = {
+            **dict(evidence or {}),
+            "roll_close": True,
+            "role": str(roll_detail.get("role") or ""),
+            "roll_id": (
+                None if roll_detail.get("roll_id") is None else str(roll_detail.get("roll_id"))
+            ),
+            "frozen_quantity": abs(int(getattr(spec, "quantity", 0) or 0)),
+            "attributed_quantity": int(current),
+            "released_quantity": int(quantity),
+            "release_rule": str(getattr(spec, "release_rule", "")),
+            "authority_attempt": str((authority or {}).get("attempt") or ""),
+            "strategy_run_id": str(binding.get("strategy_run_id") or ""),
+        }
+        return int(quantity), side, detail
 
     def _recheck_at_dispatch(
         self,
@@ -786,22 +1929,110 @@ class LivePlanAdapter:
         self._check_authority(plan, current, binding)
         _ = evaluation_authority
 
-    @staticmethod
-    def _as_submission(stored: Mapping[str, Any]) -> LiveSubmission:
+    #: State -> the trail event the plan's append-only audit records.
+    _STEP_EVENT = {
+        "pending": "submitted",
+        "releasing": "submitted",
+        "partial": "partially_filled",
+        "finalizing": "partially_filled",
+        "rejecting": "partially_filled",
+        "repair_required": "partially_filled",
+        "uncertain": "submitted",
+        "rejected": "rejected",
+        "no_op": "no_op",
+        "filled": "filled",
+        "residual_abandoned": "residual_abandoned",
+        "withheld": "withheld",
+    }
+
+    _STEP_REASON = {
+        "uncertain": "LIVE_TRANSPORT_UNCERTAIN",
+        "rejected": "LIVE_ORDER_REJECTED",
+    }
+
+    def _step_entry(self, spec: Any, stored: Mapping[str, Any]) -> Dict[str, Any]:
+        """One step's durable state as the executor/trail consume it."""
+        state = str(stored.get("state") or "pending")
+        snapshot = dict(stored.get("delta_snapshot") or {})
+        detail = dict(stored.get("detail") or {})
+        merged = {**snapshot, **detail}
+        merged["delta"] = {
+            "target": snapshot.get("target"),
+            "current": snapshot.get("current"),
+            "delta": snapshot.get("delta"),
+            "side": snapshot.get("side"),
+            "quantity": snapshot.get("quantity"),
+            "lot_size": snapshot.get("lot_size"),
+        }
+        return {
+            "step_no": int(getattr(spec, "step_no", 0) or 0),
+            "step_ref": str(getattr(spec, "step_ref", "") or ""),
+            "lane": str(getattr(spec, "lane", "") or ""),
+            "event": self._STEP_EVENT.get(state, "submitted"),
+            "state": state,
+            "refusal_reason": self._STEP_REASON.get(state),
+            "broker_order_ids": [str(value) for value in (stored.get("broker_order_ids") or [])],
+            "depends_on": [int(value) for value in (getattr(spec, "depends_on", ()) or ())],
+            "withheld": state == "withheld",
+            "detail": merged,
+        }
+
+    def _submission_view(self, plan_id: str, specs: Sequence[Any]) -> LiveSubmission:
+        """The plan's durable per-step state, with a primary step for Phase 1 callers.
+
+        The primary step is the first step that is NOT withheld (the one this call
+        could actually send); a plan whose every step is still withheld reports the
+        first withheld step, so "nothing was submitted" is visible rather than
+        looking like a silent success.
+        """
+        steps: List[Dict[str, Any]] = []
+        primary: Optional[Dict[str, Any]] = None
+        for spec in specs:
+            stored = self.submissions.get(plan_id=plan_id, step_no=int(spec.step_no)) or {}
+            entry = self._step_entry(spec, stored)
+            steps.append(entry)
+            if primary is None and entry["state"] != "withheld":
+                primary = entry
+        primary = primary or (steps[0] if steps else None)
+        return LiveSubmission(
+            plan_id=str(plan_id),
+            state=str(primary["state"]) if primary else "",
+            step_ref=str(primary["step_ref"]) if primary else "",
+            broker_order_ids=list(primary["broker_order_ids"]) if primary else [],
+            reason_code=(primary or {}).get("refusal_reason"),
+            detail=dict(primary["detail"]) if primary else {},
+            steps=steps,
+        )
+
+    def _as_submission(self, stored: Mapping[str, Any]) -> LiveSubmission:
+        """One stored claim as a ``LiveSubmission`` (no parent protocol needed)."""
         state = str(stored.get("state") or "")
         return LiveSubmission(
             plan_id=str(stored.get("plan_id") or ""),
             state=state,
             step_ref=str(stored.get("step_ref") or ""),
-            broker_order_ids=list(stored.get("broker_order_ids") or []),
-            reason_code={
-                "uncertain": "LIVE_TRANSPORT_UNCERTAIN",
-                "rejected": "LIVE_ORDER_REJECTED",
-            }.get(state),
+            broker_order_ids=[str(value) for value in (stored.get("broker_order_ids") or [])],
+            reason_code=self._STEP_REASON.get(state),
             detail={
                 **dict(stored.get("delta_snapshot") or {}),
                 **dict(stored.get("detail") or {}),
             },
+            steps=[
+                {
+                    "step_no": int(stored.get("step_no") or 0),
+                    "step_ref": str(stored.get("step_ref") or ""),
+                    "event": self._STEP_EVENT.get(state, "submitted"),
+                    "state": state,
+                    "refusal_reason": self._STEP_REASON.get(state),
+                    "broker_order_ids": [
+                        str(value) for value in (stored.get("broker_order_ids") or [])
+                    ],
+                    "detail": {
+                        **dict(stored.get("delta_snapshot") or {}),
+                        **dict(stored.get("detail") or {}),
+                    },
+                }
+            ],
         )
 
     @staticmethod
