@@ -180,6 +180,7 @@ describe("HostedJobDetailPage", () => {
 
     expect(await screen.findByText(/Cleanup unresolved/)).toBeInTheDocument();
     expect(screen.getByText(/Unknown cleanup is not confirmed stopped/)).toBeInTheDocument();
+    expect(screen.getByText(/mode: Paper/)).toBeInTheDocument();
     expect(await screen.findByText(/Logs not collected/)).toBeInTheDocument();
   });
 

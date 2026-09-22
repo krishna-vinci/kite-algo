@@ -74,3 +74,39 @@ def test_run_child_invokes_strategy_main(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(hosted_bootstrap, "build_context", lambda: ctx)
     assert hosted_bootstrap.run_child(str(source)) == 42
+
+
+def test_build_context_pins_live_mode_from_the_child_environment(tmp_path, monkeypatch):
+    """``KITE_ALGO_MODE=live`` reaches both ``ctx`` and the attach config.
+
+    The SDK has no allowlist that would reject live; the child's attach config
+    must carry the same mode the supervisor launched it with, otherwise the
+    attach consistency check would refuse a live run.
+    """
+    captured: dict[str, object] = {}
+
+    def fake_attach_run(self, run_id, *, session_nonce, config):
+        captured["run_id"] = run_id
+        captured["session_nonce"] = session_nonce
+        captured["config"] = config
+        return object()
+
+    monkeypatch.setattr("kite_algo_worker.client.KiteAlgoWorkerClient.attach_run", fake_attach_run)
+    monkeypatch.setenv("KITE_ALGO_BASE_URL", "http://localhost:8000")
+    monkeypatch.setenv("KITE_ALGO_WORKER_TOKEN", "kwa_test")
+    monkeypatch.setenv("KITE_ALGO_RUN_ID", "run-1")
+    monkeypatch.setenv("KITE_ALGO_SESSION_NONCE", "wsn_1")
+    monkeypatch.setenv("KITE_ALGO_TEMPLATE_ID", "hosted:hs_1")
+    monkeypatch.setenv("KITE_ALGO_ACCOUNT_SCOPE", "kite:live")
+    monkeypatch.setenv("KITE_ALGO_MODE", "live")
+    monkeypatch.setenv("KITE_ALGO_PARAMS", '{"lots": 1}')
+    monkeypatch.setenv("KITE_ALGO_SCRATCH", str(tmp_path))
+
+    ctx = hosted_bootstrap.build_context()
+
+    assert ctx.execution_mode == "live"
+    assert ctx.params == {"lots": 1}
+    assert captured["run_id"] == "run-1"
+    assert captured["session_nonce"] == "wsn_1"
+    assert captured["config"].execution_mode == "live"
+    assert captured["config"].account_scope == "kite:live"

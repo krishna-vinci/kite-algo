@@ -26,6 +26,7 @@ import {
   jobStatusTone,
   stopStateLabel,
 } from "@/features/strategies/lib/format";
+import { executionModeLabel } from "@/features/strategies/lib/modes";
 import type { JobLogEntry } from "@/lib/hosted-strategies/types";
 
 const EXECUTION_QUIESCENCE_UNVERIFIED = "EXECUTION_QUIESCENCE_UNVERIFIED";
@@ -351,7 +352,7 @@ export function HostedJobDetailPage({ strategyId, jobId }: Readonly<{ strategyId
           </CardHeader>
           <CardContent className="space-y-1 text-sm text-muted-foreground">
             <p>desired: {job.desired_state}</p>
-            <p>mode: {job.execution_mode}</p>
+            <p>mode: {executionModeLabel(job.execution_mode)}</p>
             <p>scope: {job.account_scope}</p>
             <p>run: {job.run_id ?? "—"}</p>
           </CardContent>

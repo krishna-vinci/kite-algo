@@ -89,3 +89,20 @@ def test_attach_run_rejects_config_mismatch(monkeypatch):
     with pytest.raises(KiteAlgoWorkerError) as exc:
         client().attach_run("run-1", session_nonce="n", config=config)
     assert exc.value.status_code == 409
+
+
+def test_attach_run_accepts_a_live_run_and_a_live_config(monkeypatch):
+    """Live is an ordinary mode value: the attach consistency check forwards it.
+
+    A hosted child launched in live mode must be able to attach to its own live
+    run; nothing in the SDK narrows the mode vocabulary to paper/dry-run.
+    """
+    calls = []
+    live_run = {**RUN, "execution_mode": "live", "account_scope": "kite:live"}
+    _capture(monkeypatch, calls, payload=live_run)
+
+    config = RunConfig(template_id="hosted:hs_1", account_scope="kite:live", execution_mode="live")
+    managed = client().attach_run("run-1", session_nonce="wsn_sup", config=config)
+
+    assert managed.config.execution_mode == "live"
+    assert managed.run["execution_mode"] == "live"

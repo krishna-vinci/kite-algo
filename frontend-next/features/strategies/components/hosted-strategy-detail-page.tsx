@@ -41,8 +41,17 @@ import {
   useUpdateHostedStrategy,
 } from "@/features/strategies/hooks/use-hosted-strategies-queries";
 import { hostedErrorMessage, jobStatusLabel, jobStatusTone, newIdempotencyKey, runNowMessage } from "@/features/strategies/lib/format";
+import {
+  LIVE_MODE,
+  executionModeLabel,
+  liveLaneSummary,
+  liveRequiresOwnerApproval,
+  modeCapabilityState,
+  runNowGate,
+  supportedExecutionModes,
+} from "@/features/strategies/lib/modes";
 import { parseParamsInput } from "@/features/strategies/lib/params";
-import type { HostedVersion } from "@/lib/hosted-strategies/types";
+import type { HostedJobSummary, HostedVersion } from "@/lib/hosted-strategies/types";
 
 function RegisterVersionForm({ strategyId }: Readonly<{ strategyId: string }>) {
   const mutation = useCreateHostedVersion(strategyId);
@@ -170,16 +179,28 @@ function VersionTable({ versions }: Readonly<{ versions: HostedVersion[] }>) {
 function RunNowForm({
   strategyId,
   versions,
+  jobs,
   defaultAccountScope,
   defaultExecutionMode,
 }: Readonly<{
   strategyId: string;
   versions: HostedVersion[];
+  jobs: HostedJobSummary[];
   defaultAccountScope: string;
   defaultExecutionMode: string;
 }>) {
   const mutation = useRunHostedStrategy(strategyId);
   const optionsQuery = useHostedOptions();
+  const options = optionsQuery.data;
+  // The mode is the strategy's own pinned mode — the server applies the same
+  // value. It is never re-derived from the options query, so a deployment that
+  // stops offering live leaves this strategy in live mode (and blocked).
+  const pinnedMode = defaultExecutionMode;
+  // Until the capability answers, the launch is held: the browser cannot prove
+  // the pinned mode is offered, and the server stays the launch authority.
+  const capability = modeCapabilityState(options, optionsQuery.isError);
+  const gate = runNowGate({ mode: pinnedMode, options, jobs, capability });
+  const lanes = liveLaneSummary(options);
   // Versions arrive oldest-first; default the launch to the newest revision so
   // registering a new version does not silently run the previous one.
   const newestVersion = versions.length > 0 ? versions[versions.length - 1] : undefined;
@@ -219,7 +240,8 @@ function RunNowForm({
         <AlertTitle>Run now queues an attempt — it does not start the process</AlertTitle>
         <AlertDescription>
           The supervisor picks the job up and launches it. Account scope <code>{defaultAccountScope}</code>{" "}
-          (authorized) is pinned by the server.
+          (authorized) and the strategy&apos;s mode (<strong>{executionModeLabel(pinnedMode)}</strong>) are pinned
+          by the server — the launch request cannot switch them.
         </AlertDescription>
       </Alert>
       <div className="grid gap-4 md:grid-cols-2">
@@ -240,12 +262,21 @@ function RunNowForm({
         </div>
         <div className="grid gap-1.5">
           <Label>Execution mode</Label>
-          <div className="flex h-9 items-center gap-2 text-sm text-muted-foreground">
-            <Badge variant="outline">{defaultExecutionMode}</Badge>
+          <div className="flex min-h-9 flex-wrap items-center gap-2 text-sm text-muted-foreground">
+            <Badge
+              variant={pinnedMode === LIVE_MODE ? "destructive" : "outline"}
+              data-testid="run-now-mode"
+            >
+              {executionModeLabel(pinnedMode)}
+            </Badge>
             <span>
-              {optionsQuery.data
-                ? `supported: ${optionsQuery.data.execution_modes.join(", ")}`
-                : "loading modes…"}
+              {options
+                ? `supported here: ${
+                    supportedExecutionModes(options).map(executionModeLabel).join(", ") || "none reported"
+                  }`
+                : optionsQuery.isError
+                  ? "mode capability unavailable"
+                  : "loading modes…"}
             </span>
           </div>
         </div>
@@ -284,8 +315,24 @@ function RunNowForm({
           </p>
         </div>
       </div>
+      {pinnedMode === LIVE_MODE ? (
+        <Alert>
+          <AlertTitle>
+            {lanes
+              ? `Live lanes this deployment supports: ${lanes}`
+              : "Live lanes were not reported by this server"}
+          </AlertTitle>
+          <AlertDescription>
+            A live attempt places real orders. It needs the owner&apos;s explicit approval of the
+            strategy&apos;s plan before anything is sent
+            {liveRequiresOwnerApproval(options)
+              ? " — this deployment never approves a plan automatically."
+              : "."}
+          </AlertDescription>
+        </Alert>
+      ) : null}
       <div className="flex items-center gap-3">
-        <Button onClick={submit} disabled={mutation.isPending || !selected}>
+        <Button onClick={submit} disabled={mutation.isPending || !selected || gate.blocked}>
           <PlayIcon className="size-4" aria-hidden />
           Run now
         </Button>
@@ -295,6 +342,11 @@ function RunNowForm({
           </Link>
         ) : null}
       </div>
+      {gate.blocked ? (
+        <p className="text-xs text-muted-foreground" data-testid="run-now-blocked-reason">
+          {gate.reason}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -360,7 +412,7 @@ export function HostedStrategyDetailPage({ strategyId }: Readonly<{ strategyId: 
             <CardTitle className="text-sm">Default mode / kind</CardTitle>
           </CardHeader>
           <CardContent className="text-sm text-muted-foreground">
-            {strategy.default_execution_mode} · {strategy.default_job_kind}
+            {executionModeLabel(strategy.default_execution_mode)} · {strategy.default_job_kind}
           </CardContent>
         </Card>
         <Card>
@@ -382,6 +434,7 @@ export function HostedStrategyDetailPage({ strategyId }: Readonly<{ strategyId: 
           <RunNowForm
             strategyId={strategyId}
             versions={versions}
+            jobs={jobs}
             defaultAccountScope={strategy.default_account_scope}
             defaultExecutionMode={strategy.default_execution_mode}
           />

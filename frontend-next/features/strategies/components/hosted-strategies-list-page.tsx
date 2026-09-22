@@ -36,6 +36,13 @@ import {
   useUpdateHostedStrategy,
 } from "@/features/strategies/hooks/use-hosted-strategies-queries";
 import { hostedErrorMessage } from "@/features/strategies/lib/format";
+import {
+  LIVE_MODE,
+  executionModeLabel,
+  isModeSupported,
+  liveLaneSummary,
+  preferredCreateMode,
+} from "@/features/strategies/lib/modes";
 import type { HostedStrategy, HostedStrategyOptions } from "@/lib/hosted-strategies/types";
 
 function StatusBadge({ status }: Readonly<{ status: string }>) {
@@ -48,14 +55,19 @@ function StatusBadge({ status }: Readonly<{ status: string }>) {
 
 function CreateStrategyForm({ options }: Readonly<{ options: HostedStrategyOptions }>) {
   const createMutation = useCreateHostedStrategy();
+  const modes = options.execution_modes;
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [accountScope, setAccountScope] = useState(options.account_scopes[0] ?? "");
-  const [mode, setMode] = useState(options.execution_modes[0] ?? "paper");
+  // A first-time default is `paper` whenever the deployment offers it — never
+  // the live mode.
+  const [mode, setMode] = useState(() => preferredCreateMode(modes));
   const [jobKind, setJobKind] = useState(options.job_kinds[0] ?? "finite");
   const [policy, setPolicy] = useState(options.stale_exit_policies[0] ?? "none");
   const [maxDuration, setMaxDuration] = useState("21600");
   const [deadline, setDeadline] = useState("600");
+  const lanes = liveLaneSummary(options);
+  const modeOffered = isModeSupported(options, mode);
 
   async function submit() {
     if (!name.trim()) {
@@ -91,7 +103,8 @@ function CreateStrategyForm({ options }: Readonly<{ options: HostedStrategyOptio
         <CardTitle>New hosted strategy</CardTitle>
         <CardDescription>
           Account scopes come from the server authorization allowlist — only scopes you may use are
-          listed. Paper and dry-run modes only; live trading is not offered here.
+          listed, and the execution modes are the ones this deployment actually offers. Live mode
+          also needs your explicit approval of the plan; nothing is ever approved automatically.
         </CardDescription>
       </CardHeader>
       <CardContent className="grid gap-4 md:grid-cols-2">
@@ -121,13 +134,32 @@ function CreateStrategyForm({ options }: Readonly<{ options: HostedStrategyOptio
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {options.execution_modes.map((value) => (
+              {modes.map((value) => (
                 <SelectItem key={value} value={value}>
-                  {value}
+                  {executionModeLabel(value)}
                 </SelectItem>
               ))}
+              {!modeOffered ? (
+                // The deployment stopped offering this mode after the form was
+                // opened. Keeping the stored value visible is deliberate: the
+                // selection is never silently rewritten to another mode.
+                <SelectItem value={mode}>{executionModeLabel(mode)} (not offered here)</SelectItem>
+              ) : null}
             </SelectContent>
           </Select>
+          {!modeOffered ? (
+            <p className="text-xs text-destructive">
+              This deployment does not currently offer {executionModeLabel(mode)}. The selection is
+              unchanged; a launch in this mode would be refused by the server.
+            </p>
+          ) : null}
+          {mode === LIVE_MODE && modeOffered ? (
+            <p className="text-xs text-muted-foreground">
+              Live runs place real orders and need your explicit approval of the plan before anything
+              is sent.
+              {lanes ? ` Supported lanes: ${lanes}.` : ""}
+            </p>
+          ) : null}
         </div>
         <div className="grid gap-1.5">
           <Label htmlFor="hs-kind">Job kind</Label>
@@ -199,7 +231,10 @@ function CreateStrategyForm({ options }: Readonly<{ options: HostedStrategyOptio
   );
 }
 
-function StrategyRow({ strategy }: Readonly<{ strategy: HostedStrategy }>) {
+function StrategyRow({
+  strategy,
+  options,
+}: Readonly<{ strategy: HostedStrategy; options: HostedStrategyOptions | undefined }>) {
   const updateMutation = useUpdateHostedStrategy(strategy.strategy_id);
   const enabled = strategy.status === "active";
 
@@ -223,7 +258,15 @@ function StrategyRow({ strategy }: Readonly<{ strategy: HostedStrategy }>) {
       <TableCell>
         <StatusBadge status={strategy.status} />
       </TableCell>
-      <TableCell className="text-sm text-muted-foreground">{strategy.default_execution_mode}</TableCell>
+      <TableCell
+        className="text-sm text-muted-foreground"
+        data-testid={`strategy-mode-${strategy.strategy_id}`}
+      >
+        <span>{executionModeLabel(strategy.default_execution_mode)}</span>
+        {options && !isModeSupported(options, strategy.default_execution_mode) ? (
+          <span className="ml-1 text-xs">(not offered here)</span>
+        ) : null}
+      </TableCell>
       <TableCell className="text-sm text-muted-foreground">{strategy.default_account_scope}</TableCell>
       <TableCell className="text-sm text-muted-foreground">{strategy.stale_exit_policy}</TableCell>
       <TableCell className="text-right">
@@ -245,7 +288,7 @@ export function HostedStrategiesListPage() {
       <SectionLabel
         eyebrow="Hosted strategies"
         title="Strategies"
-        description="Register immutable Python versions, configure an authorized account scope, then run supervised paper/dry-run attempts and inspect them."
+        description="Register immutable Python versions, configure an authorized account scope, then run supervised attempts and inspect them."
       />
 
       {optionsQuery.isError ? (
@@ -261,7 +304,9 @@ export function HostedStrategiesListPage() {
         <CardHeader>
           <CardTitle>Registered strategies</CardTitle>
           <CardDescription>
-            Disabling stops new attempts; it does not stop or reconcile a running attempt.
+            Disabling stops new attempts; it does not stop or reconcile a running attempt. A
+            strategy pinned to a mode this deployment does not offer stays listed, and its launches
+            stay refused.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -298,7 +343,11 @@ export function HostedStrategiesListPage() {
               </TableHeader>
               <TableBody>
                 {strategies.map((strategy) => (
-                  <StrategyRow key={strategy.strategy_id} strategy={strategy} />
+                  <StrategyRow
+                    key={strategy.strategy_id}
+                    strategy={strategy}
+                    options={optionsQuery.data}
+                  />
                 ))}
               </TableBody>
             </Table>

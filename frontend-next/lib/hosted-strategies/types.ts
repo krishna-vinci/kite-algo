@@ -12,6 +12,17 @@ export type HostedStrategyOptions = {
   job_kinds: string[];
   stale_exit_policies: string[];
   hosted_execution_only: boolean;
+  /**
+   * Live lanes this deployment supports (`cnc`, `mis`, `futures`, `options`).
+   * Empty when live is not enabled here; absent on servers that predate the
+   * field, which is "unknown", never "none".
+   */
+  live_lanes?: string[];
+  /**
+   * Whether a live run still needs the owner's own plan approval. Servers that
+   * predate the field are approval-gated too, so only `false` relaxes it.
+   */
+  live_requires_owner_approval?: boolean;
 };
 
 export type HostedStrategy = {

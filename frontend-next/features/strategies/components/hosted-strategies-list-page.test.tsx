@@ -51,6 +51,13 @@ const OPTIONS = {
   hosted_execution_only: true,
 };
 
+const LIVE_OPTIONS = {
+  ...OPTIONS,
+  execution_modes: ["paper", "dry_run", "live"],
+  live_lanes: ["cnc", "mis", "futures", "options"],
+  live_requires_owner_approval: true,
+};
+
 describe("HostedStrategiesListPage", () => {
   beforeEach(() => {
     vi.mocked(fetchHostedOptions).mockReset();
@@ -107,5 +114,98 @@ describe("HostedStrategiesListPage", () => {
     await waitFor(() =>
       expect(updateHostedStrategy).toHaveBeenCalledWith("s-1", { status: "disabled" }),
     );
+  });
+
+  it("defaults a new strategy to paper even when the deployment offers live", async () => {
+    vi.mocked(fetchHostedOptions).mockResolvedValue(LIVE_OPTIONS);
+    vi.mocked(fetchHostedStrategies).mockResolvedValue({ strategies: [] });
+    vi.mocked(createHostedStrategy).mockResolvedValue({} as never);
+    renderPage();
+    expect(await screen.findByText("No hosted strategies yet")).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText(/^name$/i), "NIFTY trend");
+    await user.click(screen.getByRole("button", { name: /create strategy/i }));
+    await waitFor(() => expect(createHostedStrategy).toHaveBeenCalled());
+    expect(vi.mocked(createHostedStrategy).mock.calls[0][0].execution_mode).toBe("paper");
+  });
+
+  it("offers live with its lanes and the approval requirement when the deployment enables it", async () => {
+    vi.mocked(fetchHostedOptions).mockResolvedValue(LIVE_OPTIONS);
+    vi.mocked(fetchHostedStrategies).mockResolvedValue({ strategies: [] });
+    renderPage();
+    expect(await screen.findByText("No hosted strategies yet")).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByLabelText(/^execution mode$/i));
+    expect(await screen.findByRole("option", { name: "Live" })).toBeInTheDocument();
+    await user.click(screen.getByRole("option", { name: "Live" }));
+
+    expect(
+      await screen.findByText(/Supported lanes: CNC \/ portfolio · MIS · Futures \/ rolls · Options\./),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Live runs place real orders/)).toBeInTheDocument();
+  });
+
+  it("does not offer live while the deployment disables it", async () => {
+    vi.mocked(fetchHostedOptions).mockResolvedValue(OPTIONS);
+    vi.mocked(fetchHostedStrategies).mockResolvedValue({ strategies: [] });
+    renderPage();
+    expect(await screen.findByText("No hosted strategies yet")).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByLabelText(/^execution mode$/i));
+    expect(screen.queryByRole("option", { name: /live/i })).not.toBeInTheDocument();
+    // The stale "paper and dry-run modes only" claim is gone.
+    expect(screen.queryByText(/live trading is not offered here/i)).not.toBeInTheDocument();
+  });
+
+  it("starts on paper, not live, when live is the only mode the deployment offers", async () => {
+    vi.mocked(fetchHostedOptions).mockResolvedValue({
+      ...OPTIONS,
+      execution_modes: ["live"],
+      live_lanes: ["cnc"],
+    });
+    vi.mocked(fetchHostedStrategies).mockResolvedValue({ strategies: [] });
+    vi.mocked(createHostedStrategy).mockResolvedValue({} as never);
+    renderPage();
+    expect(await screen.findByText("No hosted strategies yet")).toBeInTheDocument();
+
+    const trigger = screen.getByLabelText(/^execution mode$/i);
+    expect(trigger).toHaveTextContent("Paper (not offered here)");
+    expect(trigger).not.toHaveTextContent(/^Live/);
+    expect(
+      screen.getByText(/This deployment does not currently offer Paper/),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps a live strategy listed, in live mode, when the deployment does not offer live", async () => {
+    vi.mocked(fetchHostedOptions).mockResolvedValue(OPTIONS);
+    vi.mocked(fetchHostedStrategies).mockResolvedValue({
+      strategies: [
+        {
+          strategy_id: "s-live",
+          owner_id: "owner",
+          name: "Overnight roll",
+          template_id: "python-strategy",
+          description: null,
+          default_execution_mode: "live",
+          default_job_kind: "finite",
+          default_account_scope: "kite:live",
+          max_duration_s: 21600,
+          progress_deadline_s: 600,
+          stale_exit_policy: "none",
+          status: "active",
+          created_at: null,
+          updated_at: null,
+        },
+      ],
+    });
+    renderPage();
+
+    expect(await screen.findByText("Overnight roll")).toBeInTheDocument();
+    const modeCell = screen.getByTestId("strategy-mode-s-live");
+    expect(modeCell).toHaveTextContent(/^Live/);
+    expect(modeCell).toHaveTextContent(/not offered here/);
   });
 });
