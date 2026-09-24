@@ -1,0 +1,287 @@
+# Hosted-usable release staging manifest
+# Refreshed 2026-09-24 from `git status --porcelain -uall` at `development` 27c58b4.
+# Nothing here is staged, committed, built or deployed.
+#
+# Sections are delimited by explicit markers. Stage ONLY the required section:
+#
+#   awk "/^# >>> SECTION 1 BEGIN/{f=1;next} /^# <<< SECTION 1 END/{f=0} f && /^[^#]/" \
+#       documents/hosted-usable-release-manifest-2026-09-24.txt \
+#     | xargs -d "\n" git add --
+#
+# Then confirm nothing outside the requirement was staged:
+#
+#   git diff --cached --name-only | grep -E "^\.commandcode/|architecture-r1|kite-algo-platform|openalgo|architecture-r3|implementation-roadmap|proposal-draft|architecture-flow" | wc -l   # must be 0
+#   git diff --cached --name-only | wc -l   # must equal the count printed below
+#
+# Do NOT feed the whole file to `git add`: sections 2 and 3 must never be staged.
+#
+# SECTION 1 = required campaign surface (code, migration, SDK, frontend, tests, adapter, reports, guide)
+# SECTION 2 = EVIDENCE_OPTIONAL (reproducible harnesses + recorded run artifacts + browser screenshots).
+#             Cited by the accepted phase-5 record:
+#             examples/hosted_platform/evidence/phase5-20260923T200234Z.json.
+#             Cited by documents/hosted-momentum-closure-2026-09-24.md:
+#             examples/hosted_platform/evidence/phase5-20260924T034828Z.json (the four
+#             momentum scenarios), ...T035017Z.json (the whole harness) and
+#             ...T034044Z.json (the pre-fix trace the closure record root-causes).
+#             ...T040853Z.json is the freshness-guard run that shows the momentum
+#             pre-re-base fixtures refusing INDEX_HISTORY_STALE, ...T041640Z.json is
+#             the CURRENT four-scenario run on the guarded, re-based fixture, and
+#             ...T041715Z.json is the deliberately bounded run that proves ok:false
+#             exits non-zero (closure record sections 6.4-6.5).
+#             The rest are intermediate runs.
+# SECTION 3 = DO NOT STAGE (unrelated pre-existing work and architecture drafts/artifacts).
+
+# >>> SECTION 1 BEGIN (required)
+Dockerfile.supervisor
+README.md
+agent-context/algo-worker-developer/ALGO_WORKER_DEVELOPMENT_GUIDE.md
+agent-context/algo-worker-developer/README.md
+agent-context/algo-worker-developer/examples/sdk-README.md
+backend/alembic/versions/20260923_000042_hosted_execution_authorization.py
+backend/api/routers/__init__.py
+backend/api/routers/fundamentals.py
+backend/api/routers/strategies.py
+backend/api/routers/worker_auth.py
+backend/api/routers/worker_execution.py
+backend/api/routers/worker_executions.py
+backend/api/routers/worker_market.py
+backend/api/routers/worker_proposals.py
+backend/api/routers/worker_protection.py
+backend/api/routers/worker_shared.py
+backend/api/routers/worker_universes.py
+backend/api/schemas/execution_requests.py
+backend/api/schemas/proposals.py
+backend/api/schemas/strategies.py
+backend/api/services/hosted_attempt.py
+backend/api/services/market_data.py
+backend/app/bootstrap.py
+backend/options/api/worker_options_router.py
+backend/schema.sql
+backend/strategies/approvals.py
+backend/strategies/attribution_models.py
+backend/strategies/compiler/target_weights.py
+backend/strategies/execution_authorization.py
+backend/strategies/execution_dispatcher.py
+backend/strategies/execution_requests.py
+backend/strategies/execution_snapshot.py
+backend/strategies/live_adapter.py
+backend/strategies/live_service.py
+backend/strategies/models.py
+backend/strategies/plan_pipeline.py
+backend/strategies/proposals.py
+backend/strategies/readiness.py
+backend/strategies/repository.py
+backend/strategies/scheduling.py
+backend/strategies/service.py
+backend/strategies/supervisor.py
+documents/hosted-momentum-closure-2026-09-24.md
+documents/hosted-strategies-usable-phase1.md
+documents/hosted-strategies-usable-phase2.md
+documents/hosted-strategies-usable-phase3-4.md
+documents/hosted-strategies-usable-phase5.md
+documents/hosted-strategies-usable-platform-plan-2026-09-23.md
+documents/hosted-usable-release-and-momentum-plan-2026-09-24.md
+documents/hosted-usable-release-manifest-2026-09-24.txt
+examples/hosted_platform/USER-GUIDE.md
+examples/hosted_platform/_assertions.py
+examples/hosted_platform/index_indicator.schema.json
+examples/hosted_platform/index_indicator_strategy.py
+examples/hosted_platform/index_universe_equal_weight.py
+examples/hosted_platform/index_universe_equal_weight.schema.json
+examples/hosted_platform/nifty500_momentum.py
+examples/hosted_platform/nifty500_momentum.schema.json
+examples/hosted_platform/options_index_setup.schema.json
+examples/hosted_platform/options_index_setup_adjustment.py
+examples/hosted_platform/run_phase5_acceptance.py
+frontend-next/app/(app)/strategies/new/page.tsx
+frontend-next/features/strategies/components/hosted-authorization-panel.test.tsx
+frontend-next/features/strategies/components/hosted-authorization-panel.tsx
+frontend-next/features/strategies/components/hosted-composer-parts.tsx
+frontend-next/features/strategies/components/hosted-execution-requests-panel.test.tsx
+frontend-next/features/strategies/components/hosted-execution-requests-panel.tsx
+frontend-next/features/strategies/components/hosted-exposure-panel.tsx
+frontend-next/features/strategies/components/hosted-limits-fields.tsx
+frontend-next/features/strategies/components/hosted-params-editor.tsx
+frontend-next/features/strategies/components/hosted-schedule-panel.test.tsx
+frontend-next/features/strategies/components/hosted-schedule-panel.tsx
+frontend-next/features/strategies/components/hosted-strategies-list-page.tsx
+frontend-next/features/strategies/components/hosted-strategy-composer.test.tsx
+frontend-next/features/strategies/components/hosted-strategy-composer.tsx
+frontend-next/features/strategies/components/hosted-strategy-detail-page.test.tsx
+frontend-next/features/strategies/components/hosted-strategy-detail-page.tsx
+frontend-next/features/strategies/hooks/keys.ts
+frontend-next/features/strategies/hooks/use-hosted-strategies-queries.ts
+frontend-next/features/strategies/lib/format.test.ts
+frontend-next/features/strategies/lib/format.ts
+frontend-next/features/strategies/lib/modes.ts
+frontend-next/features/strategies/lib/schema.test.ts
+frontend-next/features/strategies/lib/schema.ts
+frontend-next/features/strategies/lib/starter.ts
+frontend-next/lib/hosted-strategies/api.ts
+frontend-next/lib/hosted-strategies/types.ts
+frontend-next/tests/reference-pages.test.tsx
+frontend-next/tests/secondary-pages.test.tsx
+sdk/python/README.md
+sdk/python/kite_algo_worker/__init__.py
+sdk/python/kite_algo_worker/async_client.py
+sdk/python/kite_algo_worker/client.py
+sdk/python/kite_algo_worker/endpoint_manifest.py
+sdk/python/kite_algo_worker/hosted.py
+sdk/python/kite_algo_worker/managed_run.py
+sdk/python/kite_algo_worker/readiness.py
+sdk/python/pyproject.toml
+tests/api/test_algo_worker_api.py
+tests/api/test_hosted_data_foundation.py
+tests/api/test_hosted_execution_bypasses.py
+tests/api/test_hosted_execution_requests.py
+tests/api/test_hosted_launch_params.py
+tests/api/test_hosted_schedule_api.py
+tests/api/test_hosted_starter_first_read.py
+tests/api/test_strategy_readiness_api.py
+tests/api/test_worker_run_attribution.py
+tests/integration/test_hosted_data_foundation_postgres.py
+tests/integration/test_hosted_execution_authorization_postgres.py
+tests/integration/test_hosted_execution_governed_release_postgres.py
+tests/integration/test_owned_work_option_runs_postgres.py
+tests/options/test_options_auth_boundaries.py
+tests/sdk/test_hosted_bootstrap.py
+tests/strategies/test_execution_authorization.py
+tests/strategies/test_execution_dispatcher.py
+tests/strategies/test_execution_snapshot_option_runs.py
+tests/strategies/test_hosted_harness_assertions.py
+tests/strategies/test_hosted_option_example.py
+tests/strategies/test_hosted_starter_source.py
+tests/strategies/test_lifecycle_prepare.py
+tests/strategies/test_nifty500_momentum_source.py
+tests/strategies/test_proposals.py
+tests/strategies/test_readiness.py
+tests/strategies/test_schedule_next_occurrence.py
+tests/strategies/test_supervisor.py
+tests/support/hosted_fakes.py
+# <<< SECTION 1 END
+
+# >>> SECTION 2 BEGIN (EVIDENCE_OPTIONAL)
+documents/verification/hosted-usable-phases3-4-2026-09-23/01-composer-ready-desktop.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/02-composer-keyboard-focus.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/03-composer-blocked-source.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/04-composer-file-type-error.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/05-composer-schema-parameter.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/06-composer-data-only-permissions.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/07-composer-autonomous-limits.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/08-strategy-detail-created.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/09-run-now-schema-parameters.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/10-authorization-summary.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/11-authorization-granted.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/12-authorization-revoked.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/13-execution-request-waiting.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/14-plan-review.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/15-schedule-form.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/16-schedule-saved.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/17-schedule-disabled.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/18-composer-mobile.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/19-strategy-detail-mobile.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/20-strategy-detail-narrow-tables.png
+documents/verification/hosted-usable-phases3-4-2026-09-23/README.md
+documents/verification/hosted-usable-phases3-4-2026-09-23/harness-result.json
+documents/verification/hosted-usable-phases3-4-2026-09-23/harness.py
+examples/hosted_platform/evidence/phase5-20260923T144640Z.json
+examples/hosted_platform/evidence/phase5-20260923T144703Z.json
+examples/hosted_platform/evidence/phase5-20260923T144738Z.json
+examples/hosted_platform/evidence/phase5-20260923T144820Z.json
+examples/hosted_platform/evidence/phase5-20260923T144850Z.json
+examples/hosted_platform/evidence/phase5-20260923T144927Z.json
+examples/hosted_platform/evidence/phase5-20260923T144949Z.json
+examples/hosted_platform/evidence/phase5-20260923T145015Z.json
+examples/hosted_platform/evidence/phase5-20260923T145421Z.json
+examples/hosted_platform/evidence/phase5-20260923T145728Z.json
+examples/hosted_platform/evidence/phase5-20260923T150130Z.json
+examples/hosted_platform/evidence/phase5-20260923T150328Z.json
+examples/hosted_platform/evidence/phase5-20260923T150552Z.json
+examples/hosted_platform/evidence/phase5-20260923T150859Z.json
+examples/hosted_platform/evidence/phase5-20260923T151118Z.json
+examples/hosted_platform/evidence/phase5-20260923T151554Z.json
+examples/hosted_platform/evidence/phase5-20260923T153236Z.json
+examples/hosted_platform/evidence/phase5-20260923T153318Z.json
+examples/hosted_platform/evidence/phase5-20260923T153405Z.json
+examples/hosted_platform/evidence/phase5-20260923T153538Z.json
+examples/hosted_platform/evidence/phase5-20260923T153638Z.json
+examples/hosted_platform/evidence/phase5-20260923T153732Z.json
+examples/hosted_platform/evidence/phase5-20260923T153855Z.json
+examples/hosted_platform/evidence/phase5-20260923T154150Z.json
+examples/hosted_platform/evidence/phase5-20260923T154313Z.json
+examples/hosted_platform/evidence/phase5-20260923T154825Z.json
+examples/hosted_platform/evidence/phase5-20260923T155112Z.json
+examples/hosted_platform/evidence/phase5-20260923T155351Z.json
+examples/hosted_platform/evidence/phase5-20260923T155541Z.json
+examples/hosted_platform/evidence/phase5-20260923T155731Z.json
+examples/hosted_platform/evidence/phase5-20260923T160102Z.json
+examples/hosted_platform/evidence/phase5-20260923T160432Z.json
+examples/hosted_platform/evidence/phase5-20260923T161013Z.json
+examples/hosted_platform/evidence/phase5-20260923T161206Z.json
+examples/hosted_platform/evidence/phase5-20260923T161301Z.json
+examples/hosted_platform/evidence/phase5-20260923T161459Z.json
+examples/hosted_platform/evidence/phase5-20260923T161717Z.json
+examples/hosted_platform/evidence/phase5-20260923T162637Z.json
+examples/hosted_platform/evidence/phase5-20260923T163136Z.json
+examples/hosted_platform/evidence/phase5-20260923T163607Z.json
+examples/hosted_platform/evidence/phase5-20260923T163925Z.json
+examples/hosted_platform/evidence/phase5-20260923T165647Z.json
+examples/hosted_platform/evidence/phase5-20260923T165951Z.json
+examples/hosted_platform/evidence/phase5-20260923T170228Z.json
+examples/hosted_platform/evidence/phase5-20260923T170430Z.json
+examples/hosted_platform/evidence/phase5-20260923T170828Z.json
+examples/hosted_platform/evidence/phase5-20260923T171145Z.json
+examples/hosted_platform/evidence/phase5-20260923T171339Z.json
+examples/hosted_platform/evidence/phase5-20260923T171758Z.json
+examples/hosted_platform/evidence/phase5-20260923T172006Z.json
+examples/hosted_platform/evidence/phase5-20260923T172336Z.json
+examples/hosted_platform/evidence/phase5-20260923T172725Z.json
+examples/hosted_platform/evidence/phase5-20260923T173209Z.json
+examples/hosted_platform/evidence/phase5-20260923T173515Z.json
+examples/hosted_platform/evidence/phase5-20260923T173849Z.json
+examples/hosted_platform/evidence/phase5-20260923T174100Z.json
+examples/hosted_platform/evidence/phase5-20260923T174335Z.json
+examples/hosted_platform/evidence/phase5-20260923T174653Z.json
+examples/hosted_platform/evidence/phase5-20260923T175202Z.json
+examples/hosted_platform/evidence/phase5-20260923T175653Z.json
+examples/hosted_platform/evidence/phase5-20260923T182126Z.json
+examples/hosted_platform/evidence/phase5-20260923T182244Z.json
+examples/hosted_platform/evidence/phase5-20260923T182826Z.json
+examples/hosted_platform/evidence/phase5-20260923T183119Z.json
+examples/hosted_platform/evidence/phase5-20260923T183911Z.json
+examples/hosted_platform/evidence/phase5-20260923T184142Z.json
+examples/hosted_platform/evidence/phase5-20260923T184555Z.json
+examples/hosted_platform/evidence/phase5-20260923T195614Z.json
+examples/hosted_platform/evidence/phase5-20260923T200234Z.json
+examples/hosted_platform/evidence/phase5-20260924T034044Z.json
+examples/hosted_platform/evidence/phase5-20260924T034828Z.json
+examples/hosted_platform/evidence/phase5-20260924T035017Z.json
+examples/hosted_platform/evidence/phase5-20260924T040853Z.json
+examples/hosted_platform/evidence/phase5-20260924T041640Z.json
+examples/hosted_platform/evidence/phase5-20260924T041715Z.json
+# <<< SECTION 2 END
+
+# >>> SECTION 3 BEGIN (DO NOT STAGE)
+.commandcode/settings.json
+.commandcode/taste/coding-and-implementation-style/taste.md
+.commandcode/taste/communication/taste.md
+.commandcode/taste/taste.md
+.commandcode/taste/workflow/taste.md
+documents/architecture-flow.md
+documents/hosted-strategies-architecture-r1.md
+documents/hosted-strategies-architecture-r3.md
+documents/hosted-strategies-implementation-roadmap.md
+documents/hosted-strategies-proposal-draft.md
+documents/kite-algo-platform-architecture.html
+documents/kite-algo-platform-architecture.visual-check.1440x900.dark.png
+documents/kite-algo-platform-architecture.visual-check.1440x900.light.png
+documents/kite-algo-platform-architecture.visual-check.2048x1320.dark.png
+documents/kite-algo-platform-architecture.visual-check.2048x1320.light.png
+documents/kite-algo-platform-architecture.visual-check.html
+documents/kite-algo-platform-architecture.visual-check.json
+documents/kite-algo-platform.architecture.json
+documents/openalgo-hosted-strategy-usability-review-2026-09-23.md
+documents/openalgo-vs-kite-algo-2026-09-18.md
+# <<< SECTION 3 END
+
+# SECTION 1 count: 126

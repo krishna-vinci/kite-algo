@@ -16,6 +16,12 @@ quotes/candles and one synthetic option chain) and the broker (everything is
 paper). No production configuration is read, no notification is sent, no live
 gate is opened, and no shared schema is reset.
 
+The isolated instance also has no Redis (``REDIS_URL`` points at a closed
+loopback port, so the best-effort event publish fails immediately instead of
+blocking the paper executor on an unresolvable host), and every disposable
+database it creates is dropped on the way out unless ``--keep-database`` is
+given.
+
     timeout 900 .venv/bin/python examples/hosted_platform/run_phase5_acceptance.py
 
 ``--keep-database`` keeps the disposable database for inspection;
@@ -33,8 +39,10 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as time_of_day
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -70,10 +78,19 @@ STORAGE: Dict[str, Any] = {
     "generation": str(uuid.uuid4()),
     "instruments": {
         "NIFTY 50": (256265, "INDEX", 1, "NSE", "NIFTY 50"),
+        "NIFTY 500": (268041, "INDEX", 1, "NSE", "NIFTY 500"),
         "RELIANCE": (738561, "EQ", 1, "NSE", "RELIANCE INDUSTRIES"),
         "INFY": (408065, "EQ", 1, "NSE", "INFOSYSTEMS"),
         "TCS": (2953217, "EQ", 1, "NSE", "TATA CONSULTANCY"),
         "HDFCBANK": (341249, "EQ", 1, "NSE", "HDFC BANK"),
+        # The momentum example's synthetic Nifty-500 constituents, plus one
+        # bystander instrument that belongs to ANOTHER strategy and must never be
+        # touched by this one.
+        "MOMENTUM00": (300001, "EQ", 1, "NSE", "MOMENTUM ZERO"),
+        "MOMENTUM01": (300002, "EQ", 1, "NSE", "MOMENTUM ONE"),
+        "MOMENTUM02": (300003, "EQ", 1, "NSE", "MOMENTUM TWO"),
+        "MOMENTUM03": (300004, "EQ", 1, "NSE", "MOMENTUM THREE"),
+        "BYSTANDER": (310001, "EQ", 1, "NSE", "OTHER STRATEGY HOLDING"),
     },
     "prices": {256265: 22520.0, 738561: 1500.0, 408065: 1450.0, 2953217: 3900.0, 341249: 1650.0},
     #: The last synthetic index print departs sharply ABOVE the trend, so the
@@ -108,6 +125,217 @@ def fail(where: str, exc: BaseException) -> None:
     print(f"[phase5] FAIL {where}: {exc!r}", file=sys.stderr, flush=True)
 
 
+# ------------------------------------------------------- momentum fixtures
+
+#: The NSE daily session close the platform's completeness rule uses, and the
+#: platform's own finality delay after it.
+MOMENTUM_SESSION_CLOSE_IST = time_of_day(15, 30)
+MOMENTUM_FINALITY_DELAY_SECONDS = 900
+MOMENTUM_IST = timezone(timedelta(hours=5, minutes=30))
+
+MOMENTUM_INDEX_TOKEN = 268041
+MOMENTUM_MEMBERS = [
+    (300001, "MOMENTUM00"),
+    (300002, "MOMENTUM01"),
+    (300003, "MOMENTUM02"),
+    (300004, "MOMENTUM03"),
+]
+MOMENTUM_BYSTANDER = (310001, "BYSTANDER")
+MOMENTUM_SOURCE = "nifty500_momentum.py"
+MOMENTUM_SCHEMA = "nifty500_momentum.schema.json"
+MOMENTUM_ACCOUNT = "kite:paper-momentum"
+MOMENTUM_BYSTANDER_ACCOUNT = "kite:paper-bystander"
+
+
+def _momentum_sessions(end: date, count: int) -> List[date]:
+    out: List[date] = []
+    cursor = end
+    while len(out) < count:
+        if cursor.weekday() < 5:
+            out.append(cursor)
+        cursor -= timedelta(days=1)
+    return sorted(out)
+
+
+def momentum_reference_now() -> datetime:
+    """The instant the fixture's calendar is judged against."""
+    return datetime.now(timezone.utc).astimezone(MOMENTUM_IST)
+
+
+def momentum_latest_completed_session(now: datetime) -> date:
+    """The newest session whose close + finality delay has passed.
+
+    Exactly the rule the adapter and the platform's completeness assessment
+    apply: a weekday, closed at 15:30 IST, plus the platform's 900 s delay. This
+    is what makes the fixture's as-of session the one the VERIFIED calendar can
+    prove finished, instead of a fixed past date the calendar would correctly
+    call stale.
+    """
+    cursor = now.date()
+    while True:
+        if cursor.weekday() < 5:
+            close_at = datetime.combine(
+                cursor, MOMENTUM_SESSION_CLOSE_IST, tzinfo=MOMENTUM_IST
+            )
+            if now >= close_at + timedelta(seconds=MOMENTUM_FINALITY_DELAY_SECONDS):
+                return cursor
+        cursor -= timedelta(days=1)
+
+
+def _momentum_series(sessions: List[date], *, above: bool) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for position, session in enumerate(sessions):
+        if above:
+            close = 500.0 + position * 0.5
+        elif position < len(sessions) - 30:
+            close = 500.0 + position * 0.5
+        else:
+            close = (
+                500.0
+                + (len(sessions) - 30) * 0.5
+                - (position - (len(sessions) - 30)) * 8.0
+            )
+        rows.append({"session": session, "close": round(close, 2)})
+    return rows
+
+
+class MomentumFixture:
+    """Synthetic daily history + verified calendar for the momentum example.
+
+    The as-of session is the newest session the platform's own completion rule
+    (close plus the finality delay) allows, computed from the real clock, and the
+    synthetic history is synthesized THROUGH it. A fixed past date cannot be used
+    any more: the seeded calendar carries verified closes through today, so a
+    fixed past tape is a stale feed and the adapter refuses it by name
+    (``INDEX_HISTORY_STALE``).
+
+    While the current session is still open the provider returns that session's
+    UNFINISHED bar explicitly, after the as-of bar. That is the honest shape of a
+    live range - the platform's own finality verdict is ``False`` for it - and it
+    is what keeps the previous completed bar usable.
+    """
+
+    def __init__(self, *, breadth_ok: bool = True, now: Optional[datetime] = None):
+        self.now = now or momentum_reference_now()
+        self.as_of = momentum_latest_completed_session(self.now)
+        # The name the rest of the harness uses for "the newest session this
+        # fixture's tape carries as a completed bar".
+        self.history_end = self.as_of
+        self.anchor = _momentum_sessions(self.as_of, 6)[0]
+        self.history_sessions = _momentum_sessions(self.as_of, 320)
+        self.breadth_ok = breadth_ok
+        self.member_rows = {
+            token: _momentum_series(self.history_sessions, above=breadth_ok)
+            for token, _symbol in MOMENTUM_MEMBERS
+        }
+        self.index_rows = _momentum_series(self.history_sessions, above=True)
+        # The still-open current session, when there is one: a weekday after the
+        # as-of session (so before that session's close + the finality delay).
+        self.open_session: Optional[date] = None
+        today = self.now.date()
+        if today > self.as_of and today.weekday() < 5:
+            self.open_session = today
+            for series in (self.index_rows, *self.member_rows.values()):
+                series.append({"session": today, "close": series[-1]["close"]})
+
+    @property
+    def due_day_of_month(self) -> int:
+        """A calendar day whose resolved session IS the as-of session.
+
+        ``resolve`` returns the first verified session on or after the configured
+        day, and the as-of session is a verified session on its own day, so this
+        always resolves to the as-of session: the run is due.
+        """
+        return self.as_of.day
+
+    @property
+    def deferral_day_of_month(self) -> int:
+        """A calendar day whose resolved session is provably NOT the as-of one.
+
+        Late in the month, day 1 has already resolved to the month's FIRST
+        session. Early in the month, the as-of day plus one resolves to a LATER
+        session (or to the month's final session when that day has none), never to
+        the as-of session itself. Either way the run is not due.
+        """
+        return 1 if self.as_of.day > 15 else self.as_of.day + 1
+
+    def calendar_rows(self):
+        """Every calendar day in the fetched range, weekends included.
+
+        The platform's calendar reader refuses a range that is not covered day by
+        day, so the synthetic document carries HOLIDAY rows for the weekends
+        exactly as an imported official document would.
+
+        Coverage runs to the end of the month containing the LATEST of the
+        fixture's as-of session and the real today, because the adapter asks for
+        the verified calendar through the month end. Every weekday carries the
+        session close (nothing is faked as a holiday and no close is left empty):
+        the sessions after the as-of session are simply not yet finished.
+        """
+        start = self.anchor - timedelta(days=420)
+        latest = max(self.as_of, self.now.date())
+        end = date(latest.year, latest.month, 28)
+        while True:
+            try:
+                end = end.replace(day=end.day + 1)
+            except ValueError:
+                break
+        rows = []
+        cursor = start
+        while cursor <= end:
+            rows.append(
+                {
+                    "session_date": cursor,
+                    "session_type": "REGULAR" if cursor.weekday() < 5 else "HOLIDAY",
+                }
+            )
+            cursor += timedelta(days=1)
+        return rows
+
+    def history_payload(self, token: int, from_date: str, to_date: str) -> Dict[str, Any]:
+        if int(token) == MOMENTUM_INDEX_TOKEN:
+            rows = self.index_rows
+        else:
+            rows = self.member_rows.get(int(token)) or []
+        candles = [
+            {
+                "ts": f"{row['session'].isoformat()}T00:00:00+05:30",
+                "open": row["close"],
+                "high": row["close"],
+                "low": row["close"],
+                "close": row["close"],
+                "volume": 1000,
+                "is_complete": True,
+            }
+            for row in rows
+            if from_date <= row["session"].isoformat() <= to_date
+        ]
+        return {
+            "timeframe": "day",
+            "candles": candles,
+            # Honest before the route's own completeness assessment replaces it:
+            # the newest returned bar is the still-open current session exactly
+            # when this fixture added one.
+            "last_candle_final": self.open_session is None,
+            "complete": True,
+        }
+
+    def members(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "instrument_token": token,
+                "exchange": "NSE",
+                "tradingsymbol": symbol,
+                "series": "EQ",
+                "company_name": symbol,
+                "sector": None,
+                "source_url": None,
+                "last_refreshed_at": None,
+            }
+            for token, symbol in MOMENTUM_MEMBERS
+        ]
+
+
 # ------------------------------------------------------------- boundaries
 
 
@@ -136,8 +364,16 @@ class SyntheticMarket:
 
     def __init__(self) -> None:
         self.candle_rows = _synthetic_candles()
+        # Daily history for the momentum example. The fixture is (re)built per
+        # scenario by ``set_momentum``; the default is a month-end, breadth-passing
+        # book so an unrelated scenario can never be handed a momentum payload by
+        # accident.
+        self.momentum = MomentumFixture()
         for index, strike in enumerate(STORAGE["option_strikes"]):
             STORAGE["option_tokens"][strike] = {"ce": 50000 + index * 2, "pe": 50001 + index * 2}
+
+    def set_momentum(self, fixture: "MomentumFixture") -> None:
+        self.momentum = fixture
 
     def option_price(self, token: int) -> float:
         spot = float(STORAGE["prices"][256265])
@@ -300,6 +536,40 @@ def build_app(session_factory, market: SyntheticMarket):
                 "current": candles[-1] if candles else None,
                 "is_stale": not candles,
             }
+
+        async def get_historical_candles(  # noqa: ANN001
+            self,
+            *,
+            symbol=None,
+            instrument_token=None,
+            timeframe="day",
+            from_date=None,
+            to_date=None,
+            ingest=True,
+            passthrough=False,
+            background_tasks=None,
+        ):
+            """Daily history from the synthetic document, in the real response shape.
+
+            Only the SOURCE is replaced: the route still runs the production
+            completeness assessment against the disposable database's verified
+            calendar, so a session the calendar does not cover stays refused.
+            """
+            instrument = await self._resolve_one(symbol=symbol, instrument_token=instrument_token)
+            token = int(instrument["instrument_token"])
+            payload = market.momentum.history_payload(token, _iso_day(from_date), _iso_day(to_date))
+            payload.update(
+                {
+                    "symbol": instrument["symbol"],
+                    "instrument_token": token,
+                    "interval": "day",
+                    "from": _iso_day(from_date),
+                    "to": _iso_day(to_date),
+                    "count": len(payload["candles"]),
+                    "source": "synthetic_daily_document",
+                }
+            )
+            return payload
 
     app = FastAPI(title="phase5 loopback API")
     for router in (
@@ -648,6 +918,79 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
             "deadline_seconds": 240,
         },
     },
+    # -- Nifty-500 momentum (preview / paper-experimental) -------------------
+    "momentum_manual_entry": {
+        # Review-first monthly rebalance on a session the schedule IS due for:
+        # the request must WAIT for the owner, nothing may be ordered before that
+        # decision, and the delta quantities land only after approval.
+        "source": MOMENTUM_SOURCE,
+        "schema": MOMENTUM_SCHEMA,
+        "momentum": True,
+        "autonomous": False,
+        "expects_manual": True,
+        "schedule": "due",
+        "breadth_ok": True,
+        "expected_requests": 1,
+        "expected_entry_order_count": len(MOMENTUM_MEMBERS),
+    },
+    "momentum_autonomous_entry": {
+        # The same monthly decision, admitted by an owner-issued grant with no
+        # interactive approval, and then the production no-op: a SECOND job on the
+        # same version sees the book the first job produced and submits nothing.
+        "source": MOMENTUM_SOURCE,
+        "schema": MOMENTUM_SCHEMA,
+        "momentum": True,
+        "autonomous": True,
+        "expects_manual": False,
+        "schedule": "due",
+        "breadth_ok": True,
+        "expected_requests": 1,
+        "expected_entry_order_count": len(MOMENTUM_MEMBERS),
+        # A second job on the same version is refused STRATEGY_BLOCKED while the
+        # first attempt holds exposure and has not been reconciled - the
+        # platform's own rule, recorded in the evidence rather than worked
+        # around. The monthly no-op axis ("the book already matches the target")
+        # is covered by the focused unit suite instead.
+    },
+    "momentum_breadth_exit": {
+        # Breadth fails with real holdings: the strategy exits ITS OWN book with
+        # exact quantities and never enters. A second strategy's book in the same
+        # account must be byte-identical afterwards.
+        "source": MOMENTUM_SOURCE,
+        "schema": MOMENTUM_SCHEMA,
+        "momentum": True,
+        "autonomous": False,
+        "expects_manual": True,
+        # The breadth gate is decided before the schedule (a failed gate exits
+        # the strategy's own book on ANY session), so this scenario keeps the
+        # default MONTHLY_LAST_SESSION parameter and does not depend on it.
+        "breadth_ok": False,
+        "seed_positions": [
+            {"tradingsymbol": "MOMENTUM00", "instrument_token": 300001, "net_quantity": 20},
+            {"tradingsymbol": "MOMENTUM01", "instrument_token": 300002, "net_quantity": 10},
+        ],
+        "expected_exit_orders": [
+            {"tradingsymbol": "MOMENTUM00", "transaction_type": "SELL", "quantity": 20},
+            {"tradingsymbol": "MOMENTUM01", "transaction_type": "SELL", "quantity": 10},
+        ],
+        "expected_requests": 1,
+    },
+    "momentum_mid_month_deferral": {
+        # Off-schedule: the configured monthly calendar day resolves to a
+        # DIFFERENT verified session of the month than the as-of session (late in
+        # the month that day has already resolved; early in the month it resolves
+        # later). The schedule is decided against the whole verified month, so the
+        # correct answer is no entry, no request and no order.
+        "source": MOMENTUM_SOURCE,
+        "schema": MOMENTUM_SCHEMA,
+        "momentum": True,
+        "autonomous": False,
+        "expects_manual": False,
+        "schedule": "defer",
+        "breadth_ok": True,
+        "expects_deferral": True,
+        "child_markers": ["off the monthly rebalance session; no entry", "regime RISK_ON"],
+    },
 }
 
 
@@ -870,6 +1213,463 @@ def run_scenario(
     return scenario
 
 
+def _projection_rows(session_factory, strategy_id: str) -> List[Dict[str, Any]]:
+    from sqlalchemy import text
+
+    with session_factory() as session:
+        return [
+            dict(row)
+            for row in session.execute(
+                text(
+                    "SELECT tradingsymbol, net_quantity, product, exchange"
+                    "  FROM public.strategy_position_projection"
+                    " WHERE strategy_id = :sid ORDER BY tradingsymbol"
+                ),
+                {"sid": strategy_id},
+            ).mappings()
+        ]
+
+
+def _paper_orders(session_factory, account_id: str) -> List[Dict[str, Any]]:
+    from sqlalchemy import text
+
+    with session_factory() as session:
+        return [
+            dict(row)
+            for row in session.execute(
+                text(
+                    "SELECT tradingsymbol, transaction_type, quantity, status"
+                    "  FROM public.paper_orders WHERE account_scope = :account"
+                    " ORDER BY placed_at, order_id"
+                ),
+                {"account": account_id},
+            ).mappings()
+        ]
+
+
+def run_momentum_scenario(
+    label: str,
+    spec: Dict[str, Any],
+    *,
+    app: Any,  # noqa: ANN001
+    market: "SyntheticMarket",
+    session_factory,
+    operator,
+    base_url: str,
+    port: int,
+    timeout: float,
+) -> Dict[str, Any]:
+    """The Nifty-500 momentum example through the real child/API/PostgreSQL path.
+
+    Unlike the other examples this one needs three boundaries shaped for it: the
+    synthetic daily history document, the verified calendar rows, and the
+    membership snapshot. Everything else - the router, the authorization, the
+    proposal/execution pipeline, the paper executor, the supervisor child and the
+    reconciliation - is production code.
+    """
+    fixture = MomentumFixture(breadth_ok=bool(spec.get("breadth_ok", True)))
+    market.set_momentum(fixture)
+    seed_momentum_calendar(session_factory, fixture)
+    install_momentum_constituents(fixture)
+
+    source = (EXAMPLES / MOMENTUM_SOURCE).read_text()
+    schema = json.loads((EXAMPLES / MOMENTUM_SCHEMA).read_text())
+    account = account_for(label)
+
+    created = operator.post(
+        "/api/strategies",
+        json={
+            "name": f"momentum {label}",
+            "description": "momentum example scenario",
+            "execution_mode": "paper",
+            "job_kind": "finite",
+            "account_scope": account,
+            "max_duration_s": 1800,
+            "progress_deadline_s": 900,
+            "stale_exit_policy": "none",
+        },
+    )
+    strategy_id = str(created["strategy_id"])
+    version = operator.post(
+        f"/api/strategies/{strategy_id}/versions",
+        json={
+            "source": source,
+            "parameters_schema": schema,
+            "capabilities": {"trade": True, "data": True},
+        },
+    )
+    version_id = str(version["version_id"])
+    operator.put(
+        f"/api/strategies/{strategy_id}/admission-policy",
+        json={"allocation_inr": 500000.0},
+    )
+    if spec["autonomous"]:
+        operator.put(
+            f"/api/strategies/{strategy_id}/authorization",
+            json={"mode": "autonomous", "reason": "phase5 momentum harness"},
+        )
+        operator.post(
+            f"/api/strategies/{strategy_id}/authorization/grants",
+            json={
+                "idempotency_key": f"momentum-grant-{strategy_id}",
+                "version_id": version_id,
+                "execution_environment": "paper",
+            },
+        )
+
+    # A second strategy in the same account, holding its own instrument. Its book
+    # must be byte-identical before and after: an example that "exits" must not
+    # reach into somebody else's positions.
+    bystander = operator.post(
+        "/api/strategies",
+        json={
+            "name": f"momentum bystander {label}",
+            "description": "untouched control book",
+            "execution_mode": "paper",
+            "job_kind": "finite",
+            "account_scope": account,
+            "max_duration_s": 1800,
+            "progress_deadline_s": 900,
+            "stale_exit_policy": "none",
+        },
+    )
+    bystander_id = str(bystander["strategy_id"])
+    seed_projection(
+        session_factory,
+        bystander_id,
+        account,
+        [{"tradingsymbol": "BYSTANDER", "instrument_token": 310001, "net_quantity": 7}],
+    )
+    before = _projection_rows(session_factory, bystander_id)
+
+    if spec.get("seed_positions"):
+        seed_projection(session_factory, strategy_id, account, spec["seed_positions"])
+    else:
+        seed_projection(session_factory, strategy_id, account, [])
+
+    params = {
+        "budget_inr": 500000,
+        "regime_anchor_date": fixture.anchor.isoformat(),
+        "rebalance_kind": "MONTHLY_LAST_SESSION",
+        # This fixture catalog normalizes an index's public key by stripping the
+        # space (``NSE:NIFTY500``); production keeps it (``NSE:NIFTY 500``, token
+        # 268041, verified against the live catalog). The scenario therefore names
+        # the coordinate THIS catalog resolves, which is exactly what the guide
+        # asks a strategy to do.
+        "index_symbol": "NSE:NIFTY500",
+        "deadline_seconds": 60,
+    }
+    # The fixture's as-of session is the newest session the verified calendar can
+    # prove finished, so the monthly decision is scheduled explicitly rather than
+    # left to depend on which day the suite happens to run:
+    #   ``due``   - a calendar day whose resolved session IS the as-of session;
+    #   ``defer`` - a calendar day whose resolved session is provably a different
+    #               verified session of the month (so the run is not due).
+    # A scenario that does not name a schedule keeps MONTHLY_LAST_SESSION (the
+    # breadth exit is decided before the schedule, and the algorithm's
+    # last-session coverage lives in the focused unit suite).
+    if spec.get("schedule") == "due":
+        params["rebalance_kind"] = "MONTHLY_CALENDAR_DAY"
+        params["rebalance_day_of_month"] = fixture.due_day_of_month
+    elif spec.get("schedule") == "defer":
+        params["rebalance_kind"] = "MONTHLY_CALENDAR_DAY"
+        params["rebalance_day_of_month"] = fixture.deferral_day_of_month
+    params.update(spec.get("params") or {})
+
+    jobs_evidence: List[Dict[str, Any]] = []
+    jobs_runtime: List[Dict[str, Any]] = []
+    orders_before_approval: Optional[int] = None
+    job_ids: List[str] = []
+    for job_index in range(int(spec.get("jobs") or 1)):
+        # Publish this strategy's own book before the child reads it. After the
+        # first job the production rebuild reflects the fills it produced, so a
+        # second job on the same version sees a settled book rather than an
+        # unknown one.
+        #
+        # A scenario that SEEDS its book must not rebuild first: the production
+        # rebuild would replace the seeded rows with the real (empty) paper book
+        # and the scenario would silently test the wrong thing.
+        if not (spec.get("seed_positions") and job_index == 0):
+            _publish_positions(operator, strategy_id)
+        job = operator.post(
+            f"/api/strategies/{strategy_id}/jobs",
+            json={
+                "version_id": version_id,
+                "job_kind": "finite",
+                "execution_mode": "paper",
+                "params": dict(params),
+                "idempotency_key": f"momentum-job-{uuid.uuid4().hex[:8]}",
+            },
+        )
+        body = job.get("job") if isinstance(job.get("job"), dict) else job
+        job_id = str(body.get("job_id") or body.get("id") or "")
+        if not job_id:
+            fail(f"{label}_job", AssertionError("the operator API returned no job id"))
+            break
+        job_ids.append(job_id)
+        step(f"{label}_job_created", job_index=job_index, job_id=job_id)
+
+        supervisor_result: Dict[str, Any] = {}
+
+        def _supervise() -> None:
+            try:
+                supervisor_result.update(
+                    acc.run_supervisor(base_url, port, WORKSPACE / f"{label}-{job_index}", job_id)
+                )
+            except BaseException as exc:  # noqa: BLE001 - reported in the evidence
+                fail(f"{label}_supervisor", exc)
+                supervisor_result["error"] = repr(exc)
+
+        thread = threading.Thread(target=_supervise, daemon=True)
+        thread.start()
+
+        deadline = time.monotonic() + timeout
+        child_exited = False
+        approvals_while_child_alive = 0
+        requests_at_child_exit: List[Dict[str, Any]] = []
+        request_timeline: List[Dict[str, Any]] = []
+
+        def _record_timeline(rows: List[Dict[str, Any]]) -> None:
+            observed = {str(row["request_id"]): str(row["status"]) for row in rows}
+            if not request_timeline or request_timeline[-1]["statuses"] != observed:
+                request_timeline.append(
+                    {"at": datetime.now(timezone.utc).isoformat(), "statuses": observed}
+                )
+
+        while time.monotonic() < deadline:
+            rows = _requests_for(session_factory, strategy_id)
+            _record_timeline(rows)
+            for row in rows:
+                request_id = str(row["request_id"])
+                status = str(row["status"])
+                if status == "awaiting_approval":
+                    if orders_before_approval is None:
+                        orders_before_approval = _paper_order_count(session_factory, account)
+                    if not spec["autonomous"]:
+                        # The owner's decision goes through the REAL HTTP route
+                        # WHILE the child is still alive. A hosted child's
+                        # authority is attempt-scoped, so an approval that lands
+                        # after the attempt ended is refused HOSTED_ATTEMPT_FENCED
+                        # by the claim: waiting on the owner only means anything
+                        # while the attempt that waits for it still holds its
+                        # lease. Approving after the child exited would produce a
+                        # green-looking run built on a fenced attempt, so the
+                        # harness approves here and asserts below that the child
+                        # exited ON ITS OWN once every request was terminal.
+                        try:
+                            operator.post(
+                                f"/api/strategies/{strategy_id}/execution-requests/"
+                                f"{request_id}/approve",
+                                json={"reason": "phase5 momentum approval"},
+                            )
+                            approvals_while_child_alive += 1
+                        except Exception as exc:  # noqa: BLE001 - reported, not hidden
+                            fail(f"{label}_approve", exc)
+                elif status == "queued":
+                    # The bounded production dispatcher performs this in-process.
+                    _dispatch_once(app)
+                    _publish_positions(operator, strategy_id)
+            if supervisor_result:
+                child_exited = True
+                # Nothing is approved or dispatched on the child's behalf after it
+                # exits: the child's own exit is the end of child-side work. The
+                # rows read here are what the child left behind, so a request the
+                # child walked away from is evidence, never something to finish
+                # for it.
+                requests_at_child_exit = _requests_for(session_factory, strategy_id)
+                _record_timeline(requests_at_child_exit)
+                break
+            time.sleep(0.5)
+
+        attempt = _job_attempt(session_factory, job_id)
+        if not child_exited:
+            try:
+                operator.post(
+                    f"/api/strategies/{strategy_id}/jobs/{job_id}/stop",
+                    json={"attempt": attempt},
+                )
+            except Exception as exc:  # noqa: BLE001
+                fail(f"{label}_stop", exc)
+            fail(
+                f"{label}_child_timeout",
+                AssertionError(f"the supervised child never exited within {timeout}s"),
+            )
+        thread.join(timeout=30)
+        try:
+            operator.post(
+                f"/api/strategies/{strategy_id}/jobs/{job_id}/reconciliation",
+                json={"attempt": attempt},
+            )
+        except Exception as exc:  # noqa: BLE001 - recorded, and asserted below
+            step(f"{label}_reconcile_refused", job_index=job_index, reason=str(exc)[:200])
+        try:
+            acc.wait_for_terminal_job(session_factory, job_id, deadline_s=60.0)
+        except Exception as exc:  # noqa: BLE001
+            fail(f"{label}_terminal_job", exc)
+        evidence = _collect_scenario_evidence(session_factory, strategy_id, account_id=account)
+        evidence["supervisor"] = dict(supervisor_result)
+        evidence["job_id"] = job_id
+        jobs_runtime.append(
+            {
+                "job_index": job_index,
+                "job_id": job_id,
+                "child_exited": child_exited,
+                "approvals_while_child_alive": approvals_while_child_alive,
+                "requests_at_child_exit": requests_at_child_exit,
+                "request_timeline": request_timeline,
+            }
+        )
+        log_path = WORKSPACE / f"{label}-{job_index}" / "logs" / f"{job_id}.log"
+        evidence["child_log"] = log_path.read_text()[-4000:] if log_path.exists() else ""
+        jobs_evidence.append(evidence)
+
+    after = _projection_rows(session_factory, bystander_id)
+    orders = _paper_orders(session_factory, account)
+    first = jobs_evidence[0] if jobs_evidence else {}
+    aggregate_requests = sum(len(job.get("requests") or []) for job in jobs_evidence)
+
+    failures: List[str] = []
+    if not jobs_evidence:
+        failures.append("no job produced evidence")
+    for index, job in enumerate(jobs_evidence):
+        outcome = str((job.get("supervisor") or {}).get("outcome") or "")
+        exit_code = (job.get("supervisor") or {}).get("exit_code")
+        if outcome != "exited" or int(exit_code if exit_code is not None else -1) != 0:
+            failures.append(
+                f"job {index}: the child did not exit 0 on its own "
+                f"(outcome={outcome!r}, exit={exit_code!r})"
+            )
+    for runtime in jobs_runtime:
+        index = runtime["job_index"]
+        # The child may only walk away from a request the platform already
+        # resolved. A non-terminal request at child exit is exactly the bug this
+        # scenario must expose: the attempt ended, the request stayed parked, and
+        # any later approval acted on a fenced attempt.
+        pending = [
+            {"request_id": str(row["request_id"]), "status": str(row["status"])}
+            for row in runtime["requests_at_child_exit"]
+            if str(row["status"]) not in {"executed", "refused", "rejected"}
+        ]
+        if runtime["child_exited"] and pending:
+            failures.append(
+                f"job {index}: the child exited while its execution request was "
+                f"still non-terminal: {pending!r}"
+            )
+        if spec.get("expects_manual") and not runtime["approvals_while_child_alive"]:
+            failures.append(
+                f"job {index}: no owner approval reached the platform while the "
+                "attempt that waited for it was alive"
+            )
+        if spec["autonomous"] and runtime["approvals_while_child_alive"]:
+            failures.append(
+                f"job {index}: an autonomous run was approved by hand "
+                f"({runtime['approvals_while_child_alive']} approvals)"
+            )
+    if before != after:
+        failures.append(
+            f"the bystander strategy's book changed: before={before!r} after={after!r}"
+        )
+    if spec.get("expects_deferral"):
+        if aggregate_requests:
+            failures.append(f"expected no execution request, saw {aggregate_requests}")
+        if orders:
+            failures.append(f"expected no paper order, saw {len(orders)}")
+    # The child must have reached the decision the scenario is about. Without
+    # this, an adapter that refuses everything for the wrong reason (a wiring
+    # bug, an unavailable provider) would look exactly like a correct deferral.
+    for marker in spec.get("child_markers") or []:
+        if not any(marker in str(job.get("child_log") or "") for job in jobs_evidence):
+            failures.append(f"no child logged {marker!r}")
+    if spec.get("expected_exit_orders"):
+        wanted = sorted(
+            (
+                str(row["tradingsymbol"]),
+                str(row["transaction_type"]).upper(),
+                int(row["quantity"]),
+            )
+            for row in spec["expected_exit_orders"]
+        )
+        actual = sorted(
+            (
+                str(row["tradingsymbol"]),
+                str(row["transaction_type"]).upper(),
+                int(row["quantity"]),
+            )
+            for row in orders
+        )
+        if actual != wanted:
+            failures.append(f"exit orders {actual!r} did not equal the seeded book {wanted!r}")
+    if spec.get("expected_entry_order_count") is not None:
+        if len(orders) != int(spec["expected_entry_order_count"]):
+            failures.append(
+                f"expected {spec['expected_entry_order_count']} entry orders, saw {len(orders)}"
+            )
+        for row in orders:
+            if str(row["transaction_type"]).upper() != "BUY" or int(row["quantity"]) <= 0:
+                failures.append(f"entry order is not a positive BUY: {row!r}")
+    if spec.get("expects_manual") and orders_before_approval not in (0,):
+        failures.append(
+            f"orders existed before the owner's decision (orders_before_approval="
+            f"{orders_before_approval!r})"
+        )
+    if spec.get("expected_requests") is not None and aggregate_requests != int(
+        spec["expected_requests"]
+    ):
+        failures.append(
+            f"expected {spec['expected_requests']} execution requests, saw {aggregate_requests}"
+        )
+    if spec.get("second_job_adds_nothing"):
+        if len(jobs_evidence) < 2:
+            failures.append("the no-op check needs a second job")
+        elif len(jobs_evidence[1].get("requests") or []) != 0:
+            failures.append("the second job submitted a request for an unchanged book")
+    if not spec["autonomous"] and spec.get("expects_manual") and not any(
+        str(row.get("status")) == "executed"
+        for job in jobs_evidence
+        for row in (job.get("requests") or [])
+    ):
+        failures.append("the approved request never reached 'executed'")
+
+    for failure in failures:
+        fail(f"{label}_acceptance", AssertionError(failure))
+
+    scenario = {
+        "strategy_id": strategy_id,
+        "bystander_strategy_id": bystander_id,
+        "job_ids": job_ids,
+        "autonomous": spec["autonomous"],
+        # The fixture is judged against the real clock, so the run records the
+        # sessions it decided on and the schedule it was given: the evidence is
+        # self-describing instead of depending on when it happened to run.
+        "as_of_session": fixture.as_of.isoformat(),
+        "open_session": fixture.open_session.isoformat() if fixture.open_session else None,
+        "regime_anchor_date": params["regime_anchor_date"],
+        "schedule": {
+            "rebalance_kind": params["rebalance_kind"],
+            "rebalance_day_of_month": params.get("rebalance_day_of_month"),
+            "expected_due": spec.get("schedule") == "due",
+        },
+        "orders_before_approval": orders_before_approval,
+        "paper_orders": orders,
+        "bystander_before": before,
+        "bystander_after": after,
+        "jobs": jobs_evidence,
+        "jobs_runtime": jobs_runtime,
+        "acceptance": {"ok": not failures, "failures": failures},
+        "first_evidence": first,
+    }
+    RESULT["scenarios"][label] = scenario
+    step(
+        f"{label}_finished",
+        jobs=len(jobs_evidence),
+        requests=aggregate_requests,
+        orders=len(orders),
+        approvals=sum(item["approvals_while_child_alive"] for item in jobs_runtime),
+        bystander_untouched=before == after,
+    )
+    return scenario
+
+
 def _requests_for(session_factory, strategy_id: str) -> List[Dict[str, Any]]:
     """This run's durable execution requests, newest last."""
     from sqlalchemy import text
@@ -922,6 +1722,172 @@ def _paper_order_count(session_factory, account_id: str) -> int:
             ).scalar()
             or 0
         )
+
+
+def _iso_day(value: Any) -> str:
+    if value is None:
+        return "1970-01-01"
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)[:10]
+
+
+def _sha256(path: Path) -> str:
+    """The digest of a file this run actually used, recorded in the evidence."""
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def seed_momentum_calendar(session_factory, fixture: "MomentumFixture") -> None:
+    """Publish the synthetic document into the REAL calendar tables.
+
+    The worker calendar and daily-completeness readers are production code; they
+    read ``exchange_calendar_*`` from the disposable database. Seeding the rows
+    (weekends included, as an imported official document has them) means the
+    harness exercises that reader instead of replacing it.
+    """
+    from sqlalchemy import text
+
+    document_id = 990001
+    rows = fixture.calendar_rows()
+    with session_factory() as session:
+        session.execute(
+            text(
+                "DELETE FROM public.exchange_calendar_sessions"
+                " WHERE exchange='NSE' AND segment='CM'"
+            )
+        )
+        session.execute(
+            text(
+                "DELETE FROM public.exchange_calendar_source_documents"
+                " WHERE exchange='NSE' AND segment='CM'"
+            )
+        )
+        session.execute(
+            text(
+                "INSERT INTO public.exchange_calendar_source_documents ("
+                " source_document_id, exchange, segment, official_source_reference,"
+                " official_source_document_sha256, canonical_csv_sha256, parser_version,"
+                " calendar_version, actor, reason, imported_at)"
+                " VALUES (:doc, 'NSE', 'CM', 'synthetic://momentum',"
+                "         :sha, :sha, 'phase5-harness', 1, 'phase5-harness',"
+                "         'isolated synthetic calendar', NOW())"
+            ),
+            {"doc": document_id, "sha": "0" * 64},
+        )
+        for row in rows:
+            session.execute(
+                text(
+                    "INSERT INTO public.exchange_calendar_sessions ("
+                    " exchange, segment, session_date, calendar_version, session_type,"
+                    " opens_at, closes_at, verified, source_document_id)"
+                    " VALUES ('NSE', 'CM', :day, 1, :kind, :opens, :closes, true, :doc)"
+                ),
+                {
+                    "day": row["session_date"],
+                    "kind": row["session_type"],
+                    "opens": time_of_day(9, 15),
+                    "closes": time_of_day(15, 30),
+                    "doc": document_id,
+                },
+            )
+        session.commit()
+
+
+def install_momentum_constituents(fixture: "MomentumFixture") -> None:
+    """Serve the synthetic Nifty-500 membership through the production route.
+
+    Only the SOURCE is replaced: the route, its authorization and its response
+    contract are the production ones. Production reads the constituent table;
+    this isolated instance hands the reader the same shape from the fixture.
+    """
+    from backend.broker_api.instruments import index_ingestion
+
+    snapshot = {
+        "schema_version": 1,
+        "source": "synthetic://momentum",
+        "source_as_of": datetime.now(timezone.utc).isoformat(),
+        "effective_date": fixture.history_end.isoformat(),
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "source_list": "Nifty500",
+        "complete": True,
+        "member_count": len(fixture.members()),
+        "checksum": "synthetic",
+        "members": fixture.members(),
+    }
+
+    def _snapshot(source_list: str):
+        normalized = str(source_list).strip()
+        if normalized.lower() != "nifty500":
+            raise ValueError(f"Unsupported index source_list: {source_list}")
+        return dict(snapshot)
+
+    index_ingestion.get_worker_index_snapshot = _snapshot  # type: ignore[assignment]
+
+
+def seed_projection(
+    session_factory,
+    strategy_id: str,
+    account_id: str,
+    positions: List[Dict[str, Any]],
+    *,
+    environment: str = "paper",
+) -> None:
+    """Publish a KNOWN attributed book without manufacturing a strategy action.
+
+    This is fixture setup for the platform's own projection tables, exactly as
+    the operator's rebuild would have written them after earlier fills. The
+    strategy never writes here, and no execution is claimed from it.
+    """
+    from sqlalchemy import text
+
+    with session_factory() as session:
+        session.execute(
+            text(
+                "DELETE FROM public.strategy_position_projection"
+                " WHERE strategy_id = :sid AND account_id = :aid"
+            ),
+            {"sid": strategy_id, "aid": account_id},
+        )
+        session.execute(
+            text(
+                "INSERT INTO public.strategy_projection_state ("
+                " account_id, strategy_id, execution_environment, projection_version,"
+                " content_sha256, last_rebuild_at, updated_at)"
+                " VALUES (:aid, :sid, :env, 1, :sha, NOW(), NOW())"
+                " ON CONFLICT (account_id, strategy_id, execution_environment)"
+                " DO UPDATE SET projection_version = 1, content_sha256 = :sha,"
+                "               last_rebuild_at = NOW(), updated_at = NOW()"
+            ),
+            {"aid": account_id, "sid": strategy_id, "env": environment, "sha": "a" * 64},
+        )
+        for row in positions:
+            symbol = str(row["tradingsymbol"]).upper()
+            session.execute(
+                text(
+                    "INSERT INTO public.strategy_position_projection ("
+                    " account_id, strategy_id, execution_environment, identity_kind,"
+                    " identity_key, product, canonical_instrument_id, instrument_token,"
+                    " exchange, tradingsymbol, net_quantity, unresolved_reason,"
+                    " projection_version)"
+                    " VALUES (:aid, :sid, :env, 'canonical', :key, 'CNC', :iid, :token,"
+                    "         'NSE', :sym, :qty, NULL, 1)"
+                ),
+                {
+                    "aid": account_id,
+                    "sid": strategy_id,
+                    "env": environment,
+                    "key": f"NSE:{symbol}",
+                    "iid": str(uuid.uuid5(uuid.NAMESPACE_URL, f"phase5:{symbol}")),
+                    "token": int(row["instrument_token"]),
+                    "sym": symbol,
+                    "qty": int(row["net_quantity"]),
+                },
+            )
+        session.commit()
 
 
 def _collect_settlement(operator, strategy_id: str, environment: str = "paper") -> Any:
@@ -1296,9 +2262,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--only", default="", help="comma-separated scenario labels")
     args = parser.parse_args(argv)
 
+    # Provenance: the digests of the exact inputs this run drives, so an evidence
+    # file can never be read against a different revision of the example.
+    RESULT["inputs"] = {
+        "nifty500_momentum.py": _sha256(EXAMPLES / MOMENTUM_SOURCE),
+        "nifty500_momentum.schema.json": _sha256(EXAMPLES / MOMENTUM_SCHEMA),
+        "run_phase5_acceptance.py": _sha256(Path(__file__).resolve()),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
     market = SyntheticMarket()
     db_name, dsn = acc.create_database()
     acc._export_isolated_env(dsn)
+    # This instance runs WITHOUT Redis: no notification is sent and no event
+    # fan-out is consumed, so every best-effort publish fails by design. The
+    # inherited/default URL names a host that does not resolve here, which made
+    # each publish block ~5 s on connect; with a multi-leg paper plan that stall
+    # (not the governed work) became the whole dispatch latency and pushed the
+    # governed request past the child's own wait bound. Pointing the side-channel
+    # at a CLOSED loopback port keeps the publish a fast, honest failure so the
+    # harness measures the execution path rather than a DNS timeout.
+    os.environ["REDIS_URL"] = f"redis://127.0.0.1:{acc.free_port()}/0"
+    # Several runtime readers (the exchange-calendar reader above all) open their
+    # own connection from the DB_* variables rather than DATABASE_URL. Point them
+    # at the disposable database: this instance must never read production.
+    parsed = urllib.parse.urlsplit(dsn)
+    os.environ.update(
+        {
+            "DB_HOST": parsed.hostname or "127.0.0.1",
+            "DB_PORT": str(parsed.port or 5432),
+            "DB_NAME": parsed.path.lstrip("/"),
+            "DB_USER": urllib.parse.unquote(parsed.username or "postgres"),
+            "DB_PASSWORD": urllib.parse.unquote(parsed.password or ""),
+        }
+    )
     os.environ["HOSTED_SUPERVISOR_WORKSPACE"] = str(WORKSPACE)
     # This isolated instance's own paper account. The hosted-strategy allowlist
     # is a server setting; nothing outside this process (and no production
@@ -1354,16 +2350,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                 step(f"{label}_not_scored", reason=str(spec["not_scored"]))
                 continue
             try:
-                run_scenario(
-                    label,
-                    spec,
-                    app=app,
-                    session_factory=session_factory,
-                    operator=operator,
-                    base_url=base_url,
-                    port=port,
-                    timeout=args.timeout,
-                )
+                if spec.get("momentum"):
+                    run_momentum_scenario(
+                        label,
+                        spec,
+                        app=app,
+                        market=market,
+                        session_factory=session_factory,
+                        operator=operator,
+                        base_url=base_url,
+                        port=port,
+                        timeout=args.timeout,
+                    )
+                else:
+                    run_scenario(
+                        label,
+                        spec,
+                        app=app,
+                        session_factory=session_factory,
+                        operator=operator,
+                        base_url=base_url,
+                        port=port,
+                        timeout=args.timeout,
+                    )
             except BaseException as exc:  # noqa: BLE001 - one scenario failing is reported
                 fail(f"{label}_scenario", exc)
 

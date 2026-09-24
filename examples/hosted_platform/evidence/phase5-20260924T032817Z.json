@@ -1,0 +1,1503 @@
+{
+  "steps": [
+    {
+      "step": "database_created",
+      "at": 1790220374.5219223,
+      "database": "kite_accept_7bd393f338"
+    },
+    {
+      "step": "fixtures_seeded",
+      "at": 1790220391.6137083
+    },
+    {
+      "step": "api_serving",
+      "at": 1790220394.5258214,
+      "base": "http://127.0.0.1:45783"
+    },
+    {
+      "step": "operator_login",
+      "at": 1790220394.5685043
+    },
+    {
+      "step": "momentum_manual_entry_job_created",
+      "at": 1790220395.54723,
+      "job_index": 0,
+      "job_id": "hsj_a9b7247a847a4825b55b091734521d5e"
+    },
+    {
+      "step": "momentum_manual_entry_finished",
+      "at": 1790220401.0433822,
+      "jobs": 1,
+      "requests": 1,
+      "orders": 0,
+      "bystander_untouched": true
+    },
+    {
+      "step": "momentum_autonomous_entry_job_created",
+      "at": 1790220401.9479597,
+      "job_index": 0,
+      "job_id": "hsj_f1883ac5e7ea4d76a23a33264ceb8ebe"
+    },
+    {
+      "step": "momentum_autonomous_entry_reconcile_refused",
+      "at": 1790220488.3212492,
+      "job_index": 0,
+      "reason": "POST /api/strategies/hs_ce5122497ea84dc8bc4dc6a02a144185/jobs/hsj_f1883ac5e7ea4d76a23a33264ceb8ebe/reconciliation -> 409: {\"detail\":{\"rejection_reason\":\"OPEN_EXPOSURE\",\"case\":\"blocked\",\"blocking_reaso"
+    },
+    {
+      "step": "momentum_autonomous_entry_finished",
+      "at": 1790220488.414124,
+      "jobs": 1,
+      "requests": 1,
+      "orders": 4,
+      "bystander_untouched": true
+    },
+    {
+      "step": "momentum_breadth_exit_job_created",
+      "at": 1790220489.1042469,
+      "job_index": 0,
+      "job_id": "hsj_0e892c17a5794664866016fb1352bcc3"
+    },
+    {
+      "step": "momentum_breadth_exit_finished",
+      "at": 1790220493.4650545,
+      "jobs": 1,
+      "requests": 1,
+      "orders": 0,
+      "bystander_untouched": true
+    },
+    {
+      "step": "momentum_mid_month_deferral_job_created",
+      "at": 1790220494.1118228,
+      "job_index": 0,
+      "job_id": "hsj_6bd5e0ce593549239e8a77303278d02f"
+    },
+    {
+      "step": "momentum_mid_month_deferral_finished",
+      "at": 1790220497.7675478,
+      "jobs": 1,
+      "requests": 0,
+      "orders": 0,
+      "bystander_untouched": true
+    }
+  ],
+  "scenarios": {
+    "momentum_manual_entry": {
+      "strategy_id": "hs_d51ca8e8bbfc4133889e224b76315a5b",
+      "bystander_strategy_id": "hs_9215abc8a86749e6b3732fcd56c2d772",
+      "job_ids": [
+        "hsj_a9b7247a847a4825b55b091734521d5e"
+      ],
+      "autonomous": false,
+      "orders_before_approval": 0,
+      "paper_orders": [],
+      "bystander_before": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "bystander_after": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [
+            {
+              "request_id": "350de631-2918-43c5-8e37-bafbd9ea472a",
+              "plan_id": "0f200cca-31a4-4402-9b60-1d07aa22578f",
+              "status": "refused",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": "HOSTED_ATTEMPT_FENCED",
+              "execution_detail": {
+                "stage": "dispatch_boundary"
+              }
+            }
+          ],
+          "plans": [
+            {
+              "plan_id": "0f200cca-31a4-4402-9b60-1d07aa22578f",
+              "plan_kind": "intent_bundle",
+              "logical_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM00",
+                    "target_quantity": 51,
+                    "instrument_token": 300001
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM01",
+                    "target_quantity": 51,
+                    "instrument_token": 300002
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM02",
+                    "target_quantity": 51,
+                    "instrument_token": 300003
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM03",
+                    "target_quantity": 51,
+                    "instrument_token": 300004
+                  }
+                ],
+                "target_kind": "intent_bundle"
+              },
+              "resolved_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300001,
+                    "broker_symbol": "MOMENTUM00",
+                    "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                    "tradingsymbol": "MOMENTUM00",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300002,
+                    "broker_symbol": "MOMENTUM01",
+                    "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                    "tradingsymbol": "MOMENTUM01",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300003,
+                    "broker_symbol": "MOMENTUM02",
+                    "instrument_id": "e24fd9b8-c5ad-5e40-85f4-e5439af62cd2",
+                    "tradingsymbol": "MOMENTUM02",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300004,
+                    "broker_symbol": "MOMENTUM03",
+                    "instrument_id": "9e279824-c3bd-549d-9106-f4c2cdaf854f",
+                    "tradingsymbol": "MOMENTUM03",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  }
+                ],
+                "target_kind": "intent_bundle",
+                "catalog_generation": "83cc5db8-ecbb-4557-acf6-33dd6e0848ba"
+              }
+            }
+          ],
+          "reservations": [],
+          "execution_events": [],
+          "paper_orders": [],
+          "attributed_positions": [],
+          "jobs": [
+            {
+              "id": "hsj_a9b7247a847a4825b55b091734521d5e",
+              "status": "stopped",
+              "run_id": "run_2a468bc1bd4b4d80bdc9bc0b6fc33dcb",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [],
+          "option_runs": [],
+          "supervisor": {
+            "job_id": "hsj_a9b7247a847a4825b55b091734521d5e",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_manual_entry-0/logs/hsj_a9b7247a847a4825b55b091734521d5e.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": true
+          },
+          "job_id": "hsj_a9b7247a847a4825b55b091734521d5e",
+          "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-24 replay_days=6\n[strategy] monthly rebalance 2026-08-31: targets=4 notional=134538.0 changes=4 excluded=0\n[strategy] monthly_rebalance: submitting 4 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM01', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM02', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM03', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}]\n[strategy] monthly_rebalance requested 350de631-2918-43c5-8e37-bafbd9ea472a status=awaiting_approval\n[strategy] no action: monthly_rebalance is waiting for the owner's decision {\"status\": \"awaiting_approval\"}\n"
+        }
+      ],
+      "acceptance": {
+        "ok": false,
+        "failures": [
+          "expected 4 entry orders, saw 0",
+          "the approved request never reached 'executed'"
+        ]
+      },
+      "first_evidence": {
+        "requests": [
+          {
+            "request_id": "350de631-2918-43c5-8e37-bafbd9ea472a",
+            "plan_id": "0f200cca-31a4-4402-9b60-1d07aa22578f",
+            "status": "refused",
+            "authorization_mode": "approval_based",
+            "decision_kind": "manual",
+            "refusal_code": "HOSTED_ATTEMPT_FENCED",
+            "execution_detail": {
+              "stage": "dispatch_boundary"
+            }
+          }
+        ],
+        "plans": [
+          {
+            "plan_id": "0f200cca-31a4-4402-9b60-1d07aa22578f",
+            "plan_kind": "intent_bundle",
+            "logical_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM00",
+                  "target_quantity": 51,
+                  "instrument_token": 300001
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM01",
+                  "target_quantity": 51,
+                  "instrument_token": 300002
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM02",
+                  "target_quantity": 51,
+                  "instrument_token": 300003
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM03",
+                  "target_quantity": 51,
+                  "instrument_token": 300004
+                }
+              ],
+              "target_kind": "intent_bundle"
+            },
+            "resolved_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300001,
+                  "broker_symbol": "MOMENTUM00",
+                  "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                  "tradingsymbol": "MOMENTUM00",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300002,
+                  "broker_symbol": "MOMENTUM01",
+                  "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                  "tradingsymbol": "MOMENTUM01",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300003,
+                  "broker_symbol": "MOMENTUM02",
+                  "instrument_id": "e24fd9b8-c5ad-5e40-85f4-e5439af62cd2",
+                  "tradingsymbol": "MOMENTUM02",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300004,
+                  "broker_symbol": "MOMENTUM03",
+                  "instrument_id": "9e279824-c3bd-549d-9106-f4c2cdaf854f",
+                  "tradingsymbol": "MOMENTUM03",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                }
+              ],
+              "target_kind": "intent_bundle",
+              "catalog_generation": "83cc5db8-ecbb-4557-acf6-33dd6e0848ba"
+            }
+          }
+        ],
+        "reservations": [],
+        "execution_events": [],
+        "paper_orders": [],
+        "attributed_positions": [],
+        "jobs": [
+          {
+            "id": "hsj_a9b7247a847a4825b55b091734521d5e",
+            "status": "stopped",
+            "run_id": "run_2a468bc1bd4b4d80bdc9bc0b6fc33dcb",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "supervisor": {
+          "job_id": "hsj_a9b7247a847a4825b55b091734521d5e",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": false,
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_manual_entry-0/logs/hsj_a9b7247a847a4825b55b091734521d5e.log",
+          "exit_code": 0,
+          "process_cleanup_reported": true,
+          "logs_shipped": true,
+          "terminal": "recovery_required",
+          "replacement_blocked": true
+        },
+        "job_id": "hsj_a9b7247a847a4825b55b091734521d5e",
+        "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-24 replay_days=6\n[strategy] monthly rebalance 2026-08-31: targets=4 notional=134538.0 changes=4 excluded=0\n[strategy] monthly_rebalance: submitting 4 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM01', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM02', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM03', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}]\n[strategy] monthly_rebalance requested 350de631-2918-43c5-8e37-bafbd9ea472a status=awaiting_approval\n[strategy] no action: monthly_rebalance is waiting for the owner's decision {\"status\": \"awaiting_approval\"}\n"
+      }
+    },
+    "momentum_autonomous_entry": {
+      "strategy_id": "hs_ce5122497ea84dc8bc4dc6a02a144185",
+      "bystander_strategy_id": "hs_745b153365f04f7daa03b87be14dd5a0",
+      "job_ids": [
+        "hsj_f1883ac5e7ea4d76a23a33264ceb8ebe"
+      ],
+      "autonomous": true,
+      "orders_before_approval": null,
+      "paper_orders": [
+        {
+          "tradingsymbol": "MOMENTUM00",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        },
+        {
+          "tradingsymbol": "MOMENTUM01",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        },
+        {
+          "tradingsymbol": "MOMENTUM02",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        },
+        {
+          "tradingsymbol": "MOMENTUM03",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        }
+      ],
+      "bystander_before": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "bystander_after": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [
+            {
+              "request_id": "7b0c1847-f6e1-49e2-a329-1c95f4130390",
+              "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+              "status": "executed",
+              "authorization_mode": "autonomous",
+              "decision_kind": "automatic",
+              "refusal_code": null,
+              "execution_detail": {
+                "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+                "result": {
+                  "steps": [
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM00"
+                      },
+                      "step_no": 1,
+                      "paper_order_id": "PAPER-6702E8F8EBAC",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM01"
+                      },
+                      "step_no": 2,
+                      "paper_order_id": "PAPER-EB6E0E3484A9",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM02"
+                      },
+                      "step_no": 3,
+                      "paper_order_id": "PAPER-8B8CC4CE183C",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM03"
+                      },
+                      "step_no": 4,
+                      "paper_order_id": "PAPER-BAF56342705F",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    }
+                  ],
+                  "status": "filled",
+                  "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+                  "reservation_id": "0c94bb98-b83d-4159-aacf-e9073cf10907",
+                  "paper_order_ids": [
+                    "PAPER-6702E8F8EBAC",
+                    "PAPER-EB6E0E3484A9",
+                    "PAPER-8B8CC4CE183C",
+                    "PAPER-BAF56342705F"
+                  ]
+                },
+                "grant_id": "56d6a2b1-a51b-4325-b1b7-23d884c23b92",
+                "approval_id": null,
+                "environment": "paper",
+                "decision_kind": "automatic",
+                "outcome_state": "filled",
+                "reservation_id": "0c94bb98-b83d-4159-aacf-e9073cf10907",
+                "authorization_mode": "autonomous"
+              }
+            }
+          ],
+          "plans": [
+            {
+              "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+              "plan_kind": "intent_bundle",
+              "logical_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM00",
+                    "target_quantity": 51,
+                    "instrument_token": 300001
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM01",
+                    "target_quantity": 51,
+                    "instrument_token": 300002
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM02",
+                    "target_quantity": 51,
+                    "instrument_token": 300003
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM03",
+                    "target_quantity": 51,
+                    "instrument_token": 300004
+                  }
+                ],
+                "target_kind": "intent_bundle"
+              },
+              "resolved_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300001,
+                    "broker_symbol": "MOMENTUM00",
+                    "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                    "tradingsymbol": "MOMENTUM00",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300002,
+                    "broker_symbol": "MOMENTUM01",
+                    "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                    "tradingsymbol": "MOMENTUM01",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300003,
+                    "broker_symbol": "MOMENTUM02",
+                    "instrument_id": "e24fd9b8-c5ad-5e40-85f4-e5439af62cd2",
+                    "tradingsymbol": "MOMENTUM02",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300004,
+                    "broker_symbol": "MOMENTUM03",
+                    "instrument_id": "9e279824-c3bd-549d-9106-f4c2cdaf854f",
+                    "tradingsymbol": "MOMENTUM03",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  }
+                ],
+                "target_kind": "intent_bundle",
+                "catalog_generation": "83cc5db8-ecbb-4557-acf6-33dd6e0848ba"
+              }
+            }
+          ],
+          "reservations": [
+            {
+              "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+              "status": "consumed",
+              "reserved_notional_inr": 134538.0,
+              "released_at": null,
+              "release_reason": null
+            }
+          ],
+          "execution_events": [
+            {
+              "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+              "step_no": 1,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+              "step_no": 1,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+              "step_no": 2,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+              "step_no": 2,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+              "step_no": 3,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+              "step_no": 3,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+              "step_no": 4,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+              "step_no": 4,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            }
+          ],
+          "paper_orders": [
+            {
+              "order_id": "PAPER-6702E8F8EBAC",
+              "tradingsymbol": "MOMENTUM00",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-EB6E0E3484A9",
+              "tradingsymbol": "MOMENTUM01",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-8B8CC4CE183C",
+              "tradingsymbol": "MOMENTUM02",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-BAF56342705F",
+              "tradingsymbol": "MOMENTUM03",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            }
+          ],
+          "attributed_positions": [
+            {
+              "tradingsymbol": "MOMENTUM01",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            },
+            {
+              "tradingsymbol": "MOMENTUM00",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            },
+            {
+              "tradingsymbol": "MOMENTUM03",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            },
+            {
+              "tradingsymbol": "MOMENTUM02",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            }
+          ],
+          "jobs": [
+            {
+              "id": "hsj_f1883ac5e7ea4d76a23a33264ceb8ebe",
+              "status": "recovery_required",
+              "run_id": "run_c9ca0343427649c98cde1522357573c6",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [
+            {
+              "grant_id": "56d6a2b1-a51b-4325-b1b7-23d884c23b92",
+              "version_id": "hsv_881a6bc98f56499ba4b8ecb9ba22d565",
+              "execution_environment": "paper",
+              "revoked_at": null
+            }
+          ],
+          "option_runs": [],
+          "supervisor": {
+            "job_id": "hsj_f1883ac5e7ea4d76a23a33264ceb8ebe",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_autonomous_entry-0/logs/hsj_f1883ac5e7ea4d76a23a33264ceb8ebe.log",
+            "exit_code": 2,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": true
+          },
+          "job_id": "hsj_f1883ac5e7ea4d76a23a33264ceb8ebe",
+          "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-24 replay_days=6\n[strategy] monthly rebalance 2026-08-31: targets=4 notional=134538.0 changes=4 excluded=0\n[strategy] monthly_rebalance: submitting 4 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM01', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM02', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM03', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}]\n[strategy] monthly_rebalance requested 7b0c1847-f6e1-49e2-a329-1c95f4130390 status=queued\n[strategy] unresolved: monthly_rebalance is not finished and is not an owner wait {\"note\": \"the request stayed non-terminal past this attempt's deadline; the durable row may still be dispatched after the child exits\", \"request_id\": \"7b0c1847-f6e1-49e2-a329-1c95f4130390\", \"status\": \"timeout\"}\n"
+        }
+      ],
+      "acceptance": {
+        "ok": false,
+        "failures": [
+          "job 0: the child did not exit 0 on its own (outcome='exited', exit=2)"
+        ]
+      },
+      "first_evidence": {
+        "requests": [
+          {
+            "request_id": "7b0c1847-f6e1-49e2-a329-1c95f4130390",
+            "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+            "status": "executed",
+            "authorization_mode": "autonomous",
+            "decision_kind": "automatic",
+            "refusal_code": null,
+            "execution_detail": {
+              "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+              "result": {
+                "steps": [
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM00"
+                    },
+                    "step_no": 1,
+                    "paper_order_id": "PAPER-6702E8F8EBAC",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM01"
+                    },
+                    "step_no": 2,
+                    "paper_order_id": "PAPER-EB6E0E3484A9",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM02"
+                    },
+                    "step_no": 3,
+                    "paper_order_id": "PAPER-8B8CC4CE183C",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM03"
+                    },
+                    "step_no": 4,
+                    "paper_order_id": "PAPER-BAF56342705F",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  }
+                ],
+                "status": "filled",
+                "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+                "reservation_id": "0c94bb98-b83d-4159-aacf-e9073cf10907",
+                "paper_order_ids": [
+                  "PAPER-6702E8F8EBAC",
+                  "PAPER-EB6E0E3484A9",
+                  "PAPER-8B8CC4CE183C",
+                  "PAPER-BAF56342705F"
+                ]
+              },
+              "grant_id": "56d6a2b1-a51b-4325-b1b7-23d884c23b92",
+              "approval_id": null,
+              "environment": "paper",
+              "decision_kind": "automatic",
+              "outcome_state": "filled",
+              "reservation_id": "0c94bb98-b83d-4159-aacf-e9073cf10907",
+              "authorization_mode": "autonomous"
+            }
+          }
+        ],
+        "plans": [
+          {
+            "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+            "plan_kind": "intent_bundle",
+            "logical_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM00",
+                  "target_quantity": 51,
+                  "instrument_token": 300001
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM01",
+                  "target_quantity": 51,
+                  "instrument_token": 300002
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM02",
+                  "target_quantity": 51,
+                  "instrument_token": 300003
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM03",
+                  "target_quantity": 51,
+                  "instrument_token": 300004
+                }
+              ],
+              "target_kind": "intent_bundle"
+            },
+            "resolved_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300001,
+                  "broker_symbol": "MOMENTUM00",
+                  "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                  "tradingsymbol": "MOMENTUM00",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300002,
+                  "broker_symbol": "MOMENTUM01",
+                  "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                  "tradingsymbol": "MOMENTUM01",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300003,
+                  "broker_symbol": "MOMENTUM02",
+                  "instrument_id": "e24fd9b8-c5ad-5e40-85f4-e5439af62cd2",
+                  "tradingsymbol": "MOMENTUM02",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300004,
+                  "broker_symbol": "MOMENTUM03",
+                  "instrument_id": "9e279824-c3bd-549d-9106-f4c2cdaf854f",
+                  "tradingsymbol": "MOMENTUM03",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                }
+              ],
+              "target_kind": "intent_bundle",
+              "catalog_generation": "83cc5db8-ecbb-4557-acf6-33dd6e0848ba"
+            }
+          }
+        ],
+        "reservations": [
+          {
+            "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+            "status": "consumed",
+            "reserved_notional_inr": 134538.0,
+            "released_at": null,
+            "release_reason": null
+          }
+        ],
+        "execution_events": [
+          {
+            "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+            "step_no": 1,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+            "step_no": 1,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+            "step_no": 2,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+            "step_no": 2,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+            "step_no": 3,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+            "step_no": 3,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+            "step_no": 4,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "f7ebb970-ae7c-4701-ab90-22fdcd1dd610",
+            "step_no": 4,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          }
+        ],
+        "paper_orders": [
+          {
+            "order_id": "PAPER-6702E8F8EBAC",
+            "tradingsymbol": "MOMENTUM00",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-EB6E0E3484A9",
+            "tradingsymbol": "MOMENTUM01",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-8B8CC4CE183C",
+            "tradingsymbol": "MOMENTUM02",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-BAF56342705F",
+            "tradingsymbol": "MOMENTUM03",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          }
+        ],
+        "attributed_positions": [
+          {
+            "tradingsymbol": "MOMENTUM01",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          },
+          {
+            "tradingsymbol": "MOMENTUM00",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          },
+          {
+            "tradingsymbol": "MOMENTUM03",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          },
+          {
+            "tradingsymbol": "MOMENTUM02",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          }
+        ],
+        "jobs": [
+          {
+            "id": "hsj_f1883ac5e7ea4d76a23a33264ceb8ebe",
+            "status": "recovery_required",
+            "run_id": "run_c9ca0343427649c98cde1522357573c6",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [
+          {
+            "grant_id": "56d6a2b1-a51b-4325-b1b7-23d884c23b92",
+            "version_id": "hsv_881a6bc98f56499ba4b8ecb9ba22d565",
+            "execution_environment": "paper",
+            "revoked_at": null
+          }
+        ],
+        "option_runs": [],
+        "supervisor": {
+          "job_id": "hsj_f1883ac5e7ea4d76a23a33264ceb8ebe",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": false,
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_autonomous_entry-0/logs/hsj_f1883ac5e7ea4d76a23a33264ceb8ebe.log",
+          "exit_code": 2,
+          "process_cleanup_reported": true,
+          "logs_shipped": true,
+          "terminal": "recovery_required",
+          "replacement_blocked": true
+        },
+        "job_id": "hsj_f1883ac5e7ea4d76a23a33264ceb8ebe",
+        "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-24 replay_days=6\n[strategy] monthly rebalance 2026-08-31: targets=4 notional=134538.0 changes=4 excluded=0\n[strategy] monthly_rebalance: submitting 4 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM01', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM02', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM03', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}]\n[strategy] monthly_rebalance requested 7b0c1847-f6e1-49e2-a329-1c95f4130390 status=queued\n[strategy] unresolved: monthly_rebalance is not finished and is not an owner wait {\"note\": \"the request stayed non-terminal past this attempt's deadline; the durable row may still be dispatched after the child exits\", \"request_id\": \"7b0c1847-f6e1-49e2-a329-1c95f4130390\", \"status\": \"timeout\"}\n"
+      }
+    },
+    "momentum_breadth_exit": {
+      "strategy_id": "hs_026ed8557ed74970bb8932f8830b28da",
+      "bystander_strategy_id": "hs_62e749e318c7433b989884274875cd0a",
+      "job_ids": [
+        "hsj_0e892c17a5794664866016fb1352bcc3"
+      ],
+      "autonomous": false,
+      "orders_before_approval": 0,
+      "paper_orders": [],
+      "bystander_before": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "bystander_after": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [
+            {
+              "request_id": "3730aa7d-6a60-4a69-982f-30383770e02e",
+              "plan_id": "53b842a9-ae33-48cd-904e-b2adeb507056",
+              "status": "refused",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": "HOSTED_ATTEMPT_FENCED",
+              "execution_detail": {}
+            }
+          ],
+          "plans": [
+            {
+              "plan_id": "53b842a9-ae33-48cd-904e-b2adeb507056",
+              "plan_kind": "intent_bundle",
+              "logical_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM00",
+                    "target_quantity": 0,
+                    "instrument_token": 300001
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM01",
+                    "target_quantity": 0,
+                    "instrument_token": 300002
+                  }
+                ],
+                "target_kind": "intent_bundle"
+              },
+              "resolved_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300001,
+                    "broker_symbol": "MOMENTUM00",
+                    "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                    "tradingsymbol": "MOMENTUM00",
+                    "broker_exchange": "NSE",
+                    "reference_price": null,
+                    "signed_quantity": 0
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300002,
+                    "broker_symbol": "MOMENTUM01",
+                    "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                    "tradingsymbol": "MOMENTUM01",
+                    "broker_exchange": "NSE",
+                    "reference_price": null,
+                    "signed_quantity": 0
+                  }
+                ],
+                "target_kind": "intent_bundle",
+                "catalog_generation": "83cc5db8-ecbb-4557-acf6-33dd6e0848ba"
+              }
+            }
+          ],
+          "reservations": [],
+          "execution_events": [],
+          "paper_orders": [],
+          "attributed_positions": [],
+          "jobs": [
+            {
+              "id": "hsj_0e892c17a5794664866016fb1352bcc3",
+              "status": "stopped",
+              "run_id": "run_e905a31c42ee4ed887736324fbcafb6d",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [],
+          "option_runs": [],
+          "supervisor": {
+            "job_id": "hsj_0e892c17a5794664866016fb1352bcc3",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_breadth_exit-0/logs/hsj_0e892c17a5794664866016fb1352bcc3.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": true
+          },
+          "job_id": "hsj_0e892c17a5794664866016fb1352bcc3",
+          "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 0/4)\n[strategy] regime DEFENSIVE exposure=0 breadth=0/4 (0.0) index=659.5>622.25 anchor=2026-08-24 replay_days=6\n[strategy] breadth_exit: submitting 2 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 20, 'target_quantity': 0, 'quantity_delta': -20}, {'symbol': 'MOMENTUM01', 'current_quantity': 10, 'target_quantity': 0, 'quantity_delta': -10}]\n[strategy] breadth_exit requested 3730aa7d-6a60-4a69-982f-30383770e02e status=awaiting_approval\n[strategy] no action: breadth_exit is waiting for the owner's decision {\"status\": \"awaiting_approval\"}\n"
+        }
+      ],
+      "acceptance": {
+        "ok": false,
+        "failures": [
+          "exit orders [] did not equal the seeded book [('MOMENTUM00', 'SELL', 20), ('MOMENTUM01', 'SELL', 10)]",
+          "the approved request never reached 'executed'"
+        ]
+      },
+      "first_evidence": {
+        "requests": [
+          {
+            "request_id": "3730aa7d-6a60-4a69-982f-30383770e02e",
+            "plan_id": "53b842a9-ae33-48cd-904e-b2adeb507056",
+            "status": "refused",
+            "authorization_mode": "approval_based",
+            "decision_kind": "manual",
+            "refusal_code": "HOSTED_ATTEMPT_FENCED",
+            "execution_detail": {}
+          }
+        ],
+        "plans": [
+          {
+            "plan_id": "53b842a9-ae33-48cd-904e-b2adeb507056",
+            "plan_kind": "intent_bundle",
+            "logical_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM00",
+                  "target_quantity": 0,
+                  "instrument_token": 300001
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM01",
+                  "target_quantity": 0,
+                  "instrument_token": 300002
+                }
+              ],
+              "target_kind": "intent_bundle"
+            },
+            "resolved_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300001,
+                  "broker_symbol": "MOMENTUM00",
+                  "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                  "tradingsymbol": "MOMENTUM00",
+                  "broker_exchange": "NSE",
+                  "reference_price": null,
+                  "signed_quantity": 0
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300002,
+                  "broker_symbol": "MOMENTUM01",
+                  "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                  "tradingsymbol": "MOMENTUM01",
+                  "broker_exchange": "NSE",
+                  "reference_price": null,
+                  "signed_quantity": 0
+                }
+              ],
+              "target_kind": "intent_bundle",
+              "catalog_generation": "83cc5db8-ecbb-4557-acf6-33dd6e0848ba"
+            }
+          }
+        ],
+        "reservations": [],
+        "execution_events": [],
+        "paper_orders": [],
+        "attributed_positions": [],
+        "jobs": [
+          {
+            "id": "hsj_0e892c17a5794664866016fb1352bcc3",
+            "status": "stopped",
+            "run_id": "run_e905a31c42ee4ed887736324fbcafb6d",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "supervisor": {
+          "job_id": "hsj_0e892c17a5794664866016fb1352bcc3",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": false,
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_breadth_exit-0/logs/hsj_0e892c17a5794664866016fb1352bcc3.log",
+          "exit_code": 0,
+          "process_cleanup_reported": true,
+          "logs_shipped": true,
+          "terminal": "recovery_required",
+          "replacement_blocked": true
+        },
+        "job_id": "hsj_0e892c17a5794664866016fb1352bcc3",
+        "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 0/4)\n[strategy] regime DEFENSIVE exposure=0 breadth=0/4 (0.0) index=659.5>622.25 anchor=2026-08-24 replay_days=6\n[strategy] breadth_exit: submitting 2 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 20, 'target_quantity': 0, 'quantity_delta': -20}, {'symbol': 'MOMENTUM01', 'current_quantity': 10, 'target_quantity': 0, 'quantity_delta': -10}]\n[strategy] breadth_exit requested 3730aa7d-6a60-4a69-982f-30383770e02e status=awaiting_approval\n[strategy] no action: breadth_exit is waiting for the owner's decision {\"status\": \"awaiting_approval\"}\n"
+      }
+    },
+    "momentum_mid_month_deferral": {
+      "strategy_id": "hs_9a13afc31da3417697e9713618c0cf8c",
+      "bystander_strategy_id": "hs_65002e0212d649c8b429d4d59b744b3e",
+      "job_ids": [
+        "hsj_6bd5e0ce593549239e8a77303278d02f"
+      ],
+      "autonomous": false,
+      "orders_before_approval": null,
+      "paper_orders": [],
+      "bystander_before": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "bystander_after": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [],
+          "plans": [],
+          "reservations": [],
+          "execution_events": [],
+          "paper_orders": [],
+          "attributed_positions": [],
+          "jobs": [
+            {
+              "id": "hsj_6bd5e0ce593549239e8a77303278d02f",
+              "status": "stopped",
+              "run_id": "run_178d3806f209417e84250818dceb5e51",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [],
+          "option_runs": [],
+          "supervisor": {
+            "job_id": "hsj_6bd5e0ce593549239e8a77303278d02f",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_mid_month_deferral-0/logs/hsj_6bd5e0ce593549239e8a77303278d02f.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": true
+          },
+          "job_id": "hsj_6bd5e0ce593549239e8a77303278d02f",
+          "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-07 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-11 replay_days=6\n[strategy] no action: off the monthly rebalance session; no entry {\"as_of\": \"2026-08-18\", \"breadth\": \"4/4\", \"regime\": \"RISK_ON\"}\n"
+        }
+      ],
+      "acceptance": {
+        "ok": true,
+        "failures": []
+      },
+      "first_evidence": {
+        "requests": [],
+        "plans": [],
+        "reservations": [],
+        "execution_events": [],
+        "paper_orders": [],
+        "attributed_positions": [],
+        "jobs": [
+          {
+            "id": "hsj_6bd5e0ce593549239e8a77303278d02f",
+            "status": "stopped",
+            "run_id": "run_178d3806f209417e84250818dceb5e51",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "supervisor": {
+          "job_id": "hsj_6bd5e0ce593549239e8a77303278d02f",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": false,
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_mid_month_deferral-0/logs/hsj_6bd5e0ce593549239e8a77303278d02f.log",
+          "exit_code": 0,
+          "process_cleanup_reported": true,
+          "logs_shipped": true,
+          "terminal": "recovery_required",
+          "replacement_blocked": true
+        },
+        "job_id": "hsj_6bd5e0ce593549239e8a77303278d02f",
+        "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-07 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-11 replay_days=6\n[strategy] no action: off the monthly rebalance session; no entry {\"as_of\": \"2026-08-18\", \"breadth\": \"4/4\", \"regime\": \"RISK_ON\"}\n"
+      }
+    }
+  },
+  "errors": [
+    {
+      "where": "momentum_manual_entry_acceptance",
+      "error": "AssertionError('expected 4 entry orders, saw 0')",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_manual_entry_acceptance",
+      "error": "AssertionError(\"the approved request never reached 'executed'\")",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_autonomous_entry_acceptance",
+      "error": "AssertionError(\"job 0: the child did not exit 0 on its own (outcome='exited', exit=2)\")",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_breadth_exit_acceptance",
+      "error": "AssertionError(\"exit orders [] did not equal the seeded book [('MOMENTUM00', 'SELL', 20), ('MOMENTUM01', 'SELL', 10)]\")",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_breadth_exit_acceptance",
+      "error": "AssertionError(\"the approved request never reached 'executed'\")",
+      "trace": "NoneType: None\n"
+    }
+  ],
+  "ok": false
+}

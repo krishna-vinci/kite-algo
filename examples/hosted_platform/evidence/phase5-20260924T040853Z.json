@@ -1,0 +1,327 @@
+{
+  "steps": [
+    {
+      "step": "database_created",
+      "at": 1790222917.78004,
+      "database": "kite_accept_22dbc92920"
+    },
+    {
+      "step": "fixtures_seeded",
+      "at": 1790222922.8409457
+    },
+    {
+      "step": "api_serving",
+      "at": 1790222925.8394723,
+      "base": "http://127.0.0.1:50847"
+    },
+    {
+      "step": "operator_login",
+      "at": 1790222925.8812628
+    },
+    {
+      "step": "momentum_manual_entry_job_created",
+      "at": 1790222926.7680254,
+      "job_index": 0,
+      "job_id": "hsj_c5ae388b1adb4d299cb265183e9c7495"
+    },
+    {
+      "step": "momentum_manual_entry_finished",
+      "at": 1790222929.9563513,
+      "jobs": 1,
+      "requests": 0,
+      "orders": 0,
+      "approvals": 0,
+      "bystander_untouched": true
+    },
+    {
+      "step": "momentum_mid_month_deferral_job_created",
+      "at": 1790222930.60524,
+      "job_index": 0,
+      "job_id": "hsj_b14e61be40b54f37afc3f448fd8fbb0c"
+    },
+    {
+      "step": "momentum_mid_month_deferral_finished",
+      "at": 1790222933.2019498,
+      "jobs": 1,
+      "requests": 0,
+      "orders": 0,
+      "approvals": 0,
+      "bystander_untouched": true
+    }
+  ],
+  "scenarios": {
+    "momentum_manual_entry": {
+      "strategy_id": "hs_9b16f1e2cb7544a691bc690c3efa563c",
+      "bystander_strategy_id": "hs_b01f4e88dc284d0aa3761dfba2554cfa",
+      "job_ids": [
+        "hsj_c5ae388b1adb4d299cb265183e9c7495"
+      ],
+      "autonomous": false,
+      "orders_before_approval": null,
+      "paper_orders": [],
+      "bystander_before": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "bystander_after": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [],
+          "plans": [],
+          "reservations": [],
+          "execution_events": [],
+          "paper_orders": [],
+          "attributed_positions": [],
+          "jobs": [
+            {
+              "id": "hsj_c5ae388b1adb4d299cb265183e9c7495",
+              "status": "stopped",
+              "run_id": "run_af6ed5477cb742c19e6d4a961572492b",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [],
+          "option_runs": [],
+          "supervisor": {
+            "job_id": "hsj_c5ae388b1adb4d299cb265183e9c7495",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_manual_entry-0/logs/hsj_c5ae388b1adb4d299cb265183e9c7495.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": true
+          },
+          "job_id": "hsj_c5ae388b1adb4d299cb265183e9c7495",
+          "child_log": "[strategy] no action: INDEX_HISTORY_STALE {\"as_of\": \"2026-08-31\", \"latest_completed\": \"2026-09-23\", \"message\": \"the newest session the verified calendar reports as finished has no index bar; a stale bar is never re-dated as this session's signal\", \"newest_index_bar\": \"2026-08-31\"}\n"
+        }
+      ],
+      "jobs_runtime": [
+        {
+          "job_index": 0,
+          "job_id": "hsj_c5ae388b1adb4d299cb265183e9c7495",
+          "child_exited": true,
+          "approvals_while_child_alive": 0,
+          "requests_at_child_exit": [],
+          "request_timeline": [
+            {
+              "at": "2026-09-24T04:08:46.786219+00:00",
+              "statuses": {}
+            }
+          ]
+        }
+      ],
+      "acceptance": {
+        "ok": false,
+        "failures": [
+          "job 0: no owner approval reached the platform while the attempt that waited for it was alive",
+          "expected 4 entry orders, saw 0",
+          "orders existed before the owner's decision (orders_before_approval=None)",
+          "expected 1 execution requests, saw 0",
+          "the approved request never reached 'executed'"
+        ]
+      },
+      "first_evidence": {
+        "requests": [],
+        "plans": [],
+        "reservations": [],
+        "execution_events": [],
+        "paper_orders": [],
+        "attributed_positions": [],
+        "jobs": [
+          {
+            "id": "hsj_c5ae388b1adb4d299cb265183e9c7495",
+            "status": "stopped",
+            "run_id": "run_af6ed5477cb742c19e6d4a961572492b",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "supervisor": {
+          "job_id": "hsj_c5ae388b1adb4d299cb265183e9c7495",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": false,
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_manual_entry-0/logs/hsj_c5ae388b1adb4d299cb265183e9c7495.log",
+          "exit_code": 0,
+          "process_cleanup_reported": true,
+          "logs_shipped": true,
+          "terminal": "recovery_required",
+          "replacement_blocked": true
+        },
+        "job_id": "hsj_c5ae388b1adb4d299cb265183e9c7495",
+        "child_log": "[strategy] no action: INDEX_HISTORY_STALE {\"as_of\": \"2026-08-31\", \"latest_completed\": \"2026-09-23\", \"message\": \"the newest session the verified calendar reports as finished has no index bar; a stale bar is never re-dated as this session's signal\", \"newest_index_bar\": \"2026-08-31\"}\n"
+      }
+    },
+    "momentum_mid_month_deferral": {
+      "strategy_id": "hs_50bb17e7734a4626804341d66f6a72c8",
+      "bystander_strategy_id": "hs_a42f21e55c7f407b82fa748deec063e4",
+      "job_ids": [
+        "hsj_b14e61be40b54f37afc3f448fd8fbb0c"
+      ],
+      "autonomous": false,
+      "orders_before_approval": null,
+      "paper_orders": [],
+      "bystander_before": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "bystander_after": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [],
+          "plans": [],
+          "reservations": [],
+          "execution_events": [],
+          "paper_orders": [],
+          "attributed_positions": [],
+          "jobs": [
+            {
+              "id": "hsj_b14e61be40b54f37afc3f448fd8fbb0c",
+              "status": "stopped",
+              "run_id": "run_ca7705cf594b4f8889fea05692393ba9",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [],
+          "option_runs": [],
+          "supervisor": {
+            "job_id": "hsj_b14e61be40b54f37afc3f448fd8fbb0c",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_mid_month_deferral-0/logs/hsj_b14e61be40b54f37afc3f448fd8fbb0c.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": true
+          },
+          "job_id": "hsj_b14e61be40b54f37afc3f448fd8fbb0c",
+          "child_log": "[strategy] no action: INDEX_HISTORY_STALE {\"as_of\": \"2026-08-18\", \"latest_completed\": \"2026-09-23\", \"message\": \"the newest session the verified calendar reports as finished has no index bar; a stale bar is never re-dated as this session's signal\", \"newest_index_bar\": \"2026-08-18\"}\n"
+        }
+      ],
+      "jobs_runtime": [
+        {
+          "job_index": 0,
+          "job_id": "hsj_b14e61be40b54f37afc3f448fd8fbb0c",
+          "child_exited": true,
+          "approvals_while_child_alive": 0,
+          "requests_at_child_exit": [],
+          "request_timeline": [
+            {
+              "at": "2026-09-24T04:08:50.623020+00:00",
+              "statuses": {}
+            }
+          ]
+        }
+      ],
+      "acceptance": {
+        "ok": false,
+        "failures": [
+          "no child logged 'off the monthly rebalance session; no entry'",
+          "no child logged 'regime RISK_ON'"
+        ]
+      },
+      "first_evidence": {
+        "requests": [],
+        "plans": [],
+        "reservations": [],
+        "execution_events": [],
+        "paper_orders": [],
+        "attributed_positions": [],
+        "jobs": [
+          {
+            "id": "hsj_b14e61be40b54f37afc3f448fd8fbb0c",
+            "status": "stopped",
+            "run_id": "run_ca7705cf594b4f8889fea05692393ba9",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "supervisor": {
+          "job_id": "hsj_b14e61be40b54f37afc3f448fd8fbb0c",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": false,
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_mid_month_deferral-0/logs/hsj_b14e61be40b54f37afc3f448fd8fbb0c.log",
+          "exit_code": 0,
+          "process_cleanup_reported": true,
+          "logs_shipped": true,
+          "terminal": "recovery_required",
+          "replacement_blocked": true
+        },
+        "job_id": "hsj_b14e61be40b54f37afc3f448fd8fbb0c",
+        "child_log": "[strategy] no action: INDEX_HISTORY_STALE {\"as_of\": \"2026-08-18\", \"latest_completed\": \"2026-09-23\", \"message\": \"the newest session the verified calendar reports as finished has no index bar; a stale bar is never re-dated as this session's signal\", \"newest_index_bar\": \"2026-08-18\"}\n"
+      }
+    }
+  },
+  "errors": [
+    {
+      "where": "momentum_manual_entry_acceptance",
+      "error": "AssertionError('job 0: no owner approval reached the platform while the attempt that waited for it was alive')",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_manual_entry_acceptance",
+      "error": "AssertionError('expected 4 entry orders, saw 0')",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_manual_entry_acceptance",
+      "error": "AssertionError(\"orders existed before the owner's decision (orders_before_approval=None)\")",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_manual_entry_acceptance",
+      "error": "AssertionError('expected 1 execution requests, saw 0')",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_manual_entry_acceptance",
+      "error": "AssertionError(\"the approved request never reached 'executed'\")",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_mid_month_deferral_acceptance",
+      "error": "AssertionError(\"no child logged 'off the monthly rebalance session; no entry'\")",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_mid_month_deferral_acceptance",
+      "error": "AssertionError(\"no child logged 'regime RISK_ON'\")",
+      "trace": "NoneType: None\n"
+    }
+  ],
+  "ok": false
+}

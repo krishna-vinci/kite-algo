@@ -35,7 +35,11 @@ holds a password hash, not a usable plaintext password. No authentication bypass
 or fabricated operator cookie was used. Earlier isolated UI/paper evidence is
 recorded in the phase reports and is not represented as deployed UI evidence.
 
-The supplied Nifty-500 momentum adapter remains under review and was excluded
-from this release commit. Its corrected breadth rule is daily no-entry/exit when
-breadth fails, with monthly selection/rebalancing. The general SDK dataclass
-loader fix is included in the deployed release.
+The supplied Nifty-500 momentum adapter was excluded from this release commit.
+It subsequently passed four isolated paper integration scenarios and 94 focused
+tests, and is accepted as a paper-experimental example in a separate commit.
+Its corrected breadth rule is daily no-entry/exit when breadth fails, with
+monthly selection/rebalancing. It has not been registered or run in production.
+Recurring operation remains blocked by hosted attempt recovery and invested-book
+admission restrictions; see `documents/hosted-momentum-closure-2026-09-24.md`.
+The general SDK dataclass loader fix is included in the deployed release.

@@ -1,0 +1,193 @@
+{
+  "steps": [
+    {
+      "step": "database_created",
+      "at": 1790223423.3515193,
+      "database": "kite_accept_c0b574b4e2"
+    },
+    {
+      "step": "fixtures_seeded",
+      "at": 1790223428.2988822
+    },
+    {
+      "step": "api_serving",
+      "at": 1790223431.350977,
+      "base": "http://127.0.0.1:33073"
+    },
+    {
+      "step": "operator_login",
+      "at": 1790223431.3941946
+    },
+    {
+      "step": "momentum_mid_month_deferral_job_created",
+      "at": 1790223432.2851276,
+      "job_index": 0,
+      "job_id": "hsj_6bcd2bf174cd4cd999160364ac6b85d1"
+    },
+    {
+      "step": "momentum_mid_month_deferral_finished",
+      "at": 1790223435.6173196,
+      "jobs": 1,
+      "requests": 0,
+      "orders": 0,
+      "approvals": 0,
+      "bystander_untouched": true
+    }
+  ],
+  "scenarios": {
+    "momentum_mid_month_deferral": {
+      "strategy_id": "hs_ea045900cdda4b99a9c2d16f9b310aeb",
+      "bystander_strategy_id": "hs_ea27df4b028f4a18be762f887b70199f",
+      "job_ids": [
+        "hsj_6bcd2bf174cd4cd999160364ac6b85d1"
+      ],
+      "autonomous": false,
+      "as_of_session": "2026-09-23",
+      "open_session": "2026-09-24",
+      "regime_anchor_date": "2026-09-16",
+      "schedule": {
+        "rebalance_kind": "MONTHLY_CALENDAR_DAY",
+        "rebalance_day_of_month": 1,
+        "expected_due": false
+      },
+      "orders_before_approval": null,
+      "paper_orders": [],
+      "bystander_before": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "bystander_after": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [],
+          "plans": [],
+          "reservations": [],
+          "execution_events": [],
+          "paper_orders": [],
+          "attributed_positions": [],
+          "jobs": [
+            {
+              "id": "hsj_6bcd2bf174cd4cd999160364ac6b85d1",
+              "status": "stopped",
+              "run_id": "run_498a90226e344e6b943fa3c7da0e0269",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [],
+          "option_runs": [],
+          "supervisor": {
+            "job_id": "hsj_6bcd2bf174cd4cd999160364ac6b85d1",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_mid_month_deferral-0/logs/hsj_6bcd2bf174cd4cd999160364ac6b85d1.log",
+            "exit_code": 1,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": true
+          },
+          "job_id": "hsj_6bcd2bf174cd4cd999160364ac6b85d1",
+          "child_log": "[strategy] reading daily history for 4 constituents from 2025-08-12 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] progress refused: {'rejection_reason': 'HOSTED_ATTEMPT_STOPPED', 'strategy_run_id': 'run_498a90226e344e6b943fa3c7da0e0269'}\n[strategy] unresolved: momentum evaluation failed {\"error\": \"KiteAlgoWorkerError: {'rejection_reason': 'HOSTED_ATTEMPT_STOPPED', 'strategy_run_id': 'run_498a90226e344e6b943fa3c7da0e0269'}\"}\n[strategy] progress refused: {'rejection_reason': 'HOSTED_ATTEMPT_STOPPED', 'strategy_run_id': 'run_498a90226e344e6b943fa3c7da0e0269'}\nhosted child failed: KiteAlgoWorkerError: {'rejection_reason': 'HOSTED_ATTEMPT_STOPPED', 'strategy_run_id': 'run_498a90226e344e6b943fa3c7da0e0269'}\n"
+        }
+      ],
+      "jobs_runtime": [
+        {
+          "job_index": 0,
+          "job_id": "hsj_6bcd2bf174cd4cd999160364ac6b85d1",
+          "child_exited": false,
+          "approvals_while_child_alive": 0,
+          "requests_at_child_exit": [],
+          "request_timeline": [
+            {
+              "at": "2026-09-24T04:17:12.309814+00:00",
+              "statuses": {}
+            }
+          ]
+        }
+      ],
+      "acceptance": {
+        "ok": false,
+        "failures": [
+          "job 0: the child did not exit 0 on its own (outcome='exited', exit=1)",
+          "no child logged 'off the monthly rebalance session; no entry'",
+          "no child logged 'regime RISK_ON'"
+        ]
+      },
+      "first_evidence": {
+        "requests": [],
+        "plans": [],
+        "reservations": [],
+        "execution_events": [],
+        "paper_orders": [],
+        "attributed_positions": [],
+        "jobs": [
+          {
+            "id": "hsj_6bcd2bf174cd4cd999160364ac6b85d1",
+            "status": "stopped",
+            "run_id": "run_498a90226e344e6b943fa3c7da0e0269",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "supervisor": {
+          "job_id": "hsj_6bcd2bf174cd4cd999160364ac6b85d1",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": false,
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_mid_month_deferral-0/logs/hsj_6bcd2bf174cd4cd999160364ac6b85d1.log",
+          "exit_code": 1,
+          "process_cleanup_reported": true,
+          "logs_shipped": true,
+          "terminal": "recovery_required",
+          "replacement_blocked": true
+        },
+        "job_id": "hsj_6bcd2bf174cd4cd999160364ac6b85d1",
+        "child_log": "[strategy] reading daily history for 4 constituents from 2025-08-12 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] progress refused: {'rejection_reason': 'HOSTED_ATTEMPT_STOPPED', 'strategy_run_id': 'run_498a90226e344e6b943fa3c7da0e0269'}\n[strategy] unresolved: momentum evaluation failed {\"error\": \"KiteAlgoWorkerError: {'rejection_reason': 'HOSTED_ATTEMPT_STOPPED', 'strategy_run_id': 'run_498a90226e344e6b943fa3c7da0e0269'}\"}\n[strategy] progress refused: {'rejection_reason': 'HOSTED_ATTEMPT_STOPPED', 'strategy_run_id': 'run_498a90226e344e6b943fa3c7da0e0269'}\nhosted child failed: KiteAlgoWorkerError: {'rejection_reason': 'HOSTED_ATTEMPT_STOPPED', 'strategy_run_id': 'run_498a90226e344e6b943fa3c7da0e0269'}\n"
+      }
+    }
+  },
+  "errors": [
+    {
+      "where": "momentum_mid_month_deferral_child_timeout",
+      "error": "AssertionError('the supervised child never exited within 2.0s')",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_mid_month_deferral_acceptance",
+      "error": "AssertionError(\"job 0: the child did not exit 0 on its own (outcome='exited', exit=1)\")",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_mid_month_deferral_acceptance",
+      "error": "AssertionError(\"no child logged 'off the monthly rebalance session; no entry'\")",
+      "trace": "NoneType: None\n"
+    },
+    {
+      "where": "momentum_mid_month_deferral_acceptance",
+      "error": "AssertionError(\"no child logged 'regime RISK_ON'\")",
+      "trace": "NoneType: None\n"
+    }
+  ],
+  "inputs": {
+    "nifty500_momentum.py": "60ba7b40f94091b9d8d67556f3ba8aabe7af880d739c71ca98835eda483fd1e4",
+    "nifty500_momentum.schema.json": "f089cc7dda38736653bda8630e0dfe45456b9db5c8ed3d46e81ce2f538a8da18",
+    "run_phase5_acceptance.py": "f6c9515200fec7c573c18fb5d83063e02882f6f1e774a70cb0d5eac2a7a510ee",
+    "started_at": "2026-09-24T04:17:03.247569+00:00"
+  },
+  "ok": false
+}

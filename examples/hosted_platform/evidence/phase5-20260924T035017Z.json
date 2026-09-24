@@ -1,0 +1,4255 @@
+{
+  "steps": [
+    {
+      "step": "database_created",
+      "at": 1790221740.1286469,
+      "database": "kite_accept_07ac0533e5"
+    },
+    {
+      "step": "fixtures_seeded",
+      "at": 1790221746.8304331
+    },
+    {
+      "step": "api_serving",
+      "at": 1790221749.8865423,
+      "base": "http://127.0.0.1:55241"
+    },
+    {
+      "step": "operator_login",
+      "at": 1790221749.930006
+    },
+    {
+      "step": "index_indicator_created",
+      "at": 1790221750.510748,
+      "strategy_id": "hs_4a77fa378dee40e9b658a2b9733c3448",
+      "job_id": "hsj_d9ef3a61c8094db2bfec1bf17220addc",
+      "autonomous": false
+    },
+    {
+      "step": "index_indicator_finished",
+      "at": 1790221756.993105,
+      "requests": 1,
+      "executed": 1,
+      "events": 2,
+      "job_status": "recovery_required"
+    },
+    {
+      "step": "options_adjustment_created",
+      "at": 1790221757.3816197,
+      "strategy_id": "hs_1718ce6bdeef4743bfba066ffc98fe9f",
+      "job_id": "hsj_5e39735d2d6947428691a3389b8ccef2",
+      "autonomous": false
+    },
+    {
+      "step": "options_adjustment_finished",
+      "at": 1790221769.3825426,
+      "requests": 2,
+      "executed": 2,
+      "events": 8,
+      "job_status": "stopped"
+    },
+    {
+      "step": "universe_equal_weight_created",
+      "at": 1790221769.6813104,
+      "strategy_id": "hs_da3d10dcac73420db2f3a1dd422bd31c",
+      "job_id": "hsj_302a78143f2840a5ad9e6270be7ef440",
+      "autonomous": false
+    },
+    {
+      "step": "universe_equal_weight_finished",
+      "at": 1790221778.016983,
+      "requests": 1,
+      "executed": 1,
+      "events": 8,
+      "job_status": "recovery_required"
+    },
+    {
+      "step": "basis_mismatch_created",
+      "at": 1790221778.3474529,
+      "strategy_id": "hs_8059da3db9b94121b638e988618728e5",
+      "job_id": "hsj_d059b7308c5e40ebb9e55d0240c5a743",
+      "autonomous": false
+    },
+    {
+      "step": "basis_mismatch_finished",
+      "at": 1790221781.7085745,
+      "requests": 0,
+      "executed": 0,
+      "events": 0,
+      "job_status": "stopped"
+    },
+    {
+      "step": "autonomous_created",
+      "at": 1790221782.2638645,
+      "strategy_id": "hs_9cf8586cab6b45199b469932e268f28d",
+      "job_id": "hsj_60ad35086b2b4f69a5c31682f990d680",
+      "autonomous": true
+    },
+    {
+      "step": "autonomous_finished",
+      "at": 1790221788.8021564,
+      "requests": 1,
+      "executed": 1,
+      "events": 2,
+      "job_status": "recovery_required"
+    },
+    {
+      "step": "momentum_manual_entry_job_created",
+      "at": 1790221789.4200158,
+      "job_index": 0,
+      "job_id": "hsj_83ec7b8f0d6c480faa0ed12bdb461d4a"
+    },
+    {
+      "step": "momentum_manual_entry_reconcile_refused",
+      "at": 1790221798.4731755,
+      "job_index": 0,
+      "reason": "POST /api/strategies/hs_8219d55337144734a67ac077b6c93cc2/jobs/hsj_83ec7b8f0d6c480faa0ed12bdb461d4a/reconciliation -> 409: {\"detail\":{\"rejection_reason\":\"OPEN_EXPOSURE\",\"case\":\"blocked\",\"blocking_reaso"
+    },
+    {
+      "step": "momentum_manual_entry_finished",
+      "at": 1790221798.559199,
+      "jobs": 1,
+      "requests": 1,
+      "orders": 4,
+      "approvals": 1,
+      "bystander_untouched": true
+    },
+    {
+      "step": "momentum_autonomous_entry_job_created",
+      "at": 1790221799.3148189,
+      "job_index": 0,
+      "job_id": "hsj_a03db674b7984b9083ab6e6689dcaed0"
+    },
+    {
+      "step": "momentum_autonomous_entry_reconcile_refused",
+      "at": 1790221805.6873066,
+      "job_index": 0,
+      "reason": "POST /api/strategies/hs_3c492d4a93304fc5856f297fd6367e48/jobs/hsj_a03db674b7984b9083ab6e6689dcaed0/reconciliation -> 409: {\"detail\":{\"rejection_reason\":\"OPEN_EXPOSURE\",\"case\":\"blocked\",\"blocking_reaso"
+    },
+    {
+      "step": "momentum_autonomous_entry_finished",
+      "at": 1790221805.7706656,
+      "jobs": 1,
+      "requests": 1,
+      "orders": 4,
+      "approvals": 0,
+      "bystander_untouched": true
+    },
+    {
+      "step": "momentum_breadth_exit_job_created",
+      "at": 1790221806.370378,
+      "job_index": 0,
+      "job_id": "hsj_58ff723fba4f4197befa7d11e05eeee7"
+    },
+    {
+      "step": "momentum_breadth_exit_reconcile_refused",
+      "at": 1790221812.6266923,
+      "job_index": 0,
+      "reason": "POST /api/strategies/hs_1fe351ec161541ec8ef912405e58e784/jobs/hsj_58ff723fba4f4197befa7d11e05eeee7/reconciliation -> 409: {\"detail\":{\"rejection_reason\":\"OPEN_EXPOSURE\",\"case\":\"blocked\",\"blocking_reaso"
+    },
+    {
+      "step": "momentum_breadth_exit_finished",
+      "at": 1790221812.723889,
+      "jobs": 1,
+      "requests": 1,
+      "orders": 2,
+      "approvals": 1,
+      "bystander_untouched": true
+    },
+    {
+      "step": "momentum_mid_month_deferral_job_created",
+      "at": 1790221813.4517984,
+      "job_index": 0,
+      "job_id": "hsj_4f45ba9806ee49788df602dd9c4234fd"
+    },
+    {
+      "step": "momentum_mid_month_deferral_finished",
+      "at": 1790221817.1379776,
+      "jobs": 1,
+      "requests": 0,
+      "orders": 0,
+      "approvals": 0,
+      "bystander_untouched": true
+    },
+    {
+      "step": "recovery_finished",
+      "at": 1790221817.5162358,
+      "counts": "{'scanned': 4, 'proved_submitted': 1, 'proved_rejected': 1, 'unresolved': 2, 'stale': 0}",
+      "statuses": "{'withheld': 'dispatch_unresolved', 'accepted': 'executed', 'rejected': 'refused', 'uncertain': 'dispatch_unresolved'}",
+      "outcome_states": "{'withheld': 'not_submitted', 'accepted': 'submitted', 'rejected': 'rejected', 'uncertain': 'unknown'}",
+      "still_dispatching": "0",
+      "acceptance": "{'ok': True, 'failures': []}"
+    }
+  ],
+  "scenarios": {
+    "index_indicator": {
+      "strategy_id": "hs_4a77fa378dee40e9b658a2b9733c3448",
+      "job_id": "hsj_d9ef3a61c8094db2bfec1bf17220addc",
+      "autonomous": false,
+      "terminal_job": {
+        "id": "hsj_d9ef3a61c8094db2bfec1bf17220addc",
+        "status": "recovery_required",
+        "process_cleanup_state": "confirmed",
+        "reconciled_at": "None"
+      },
+      "supervisor": {
+        "job_id": "hsj_d9ef3a61c8094db2bfec1bf17220addc",
+        "outcome": "exited",
+        "stop": "exited",
+        "log_overflow": false,
+        "log_ref": "/home/krishna/kite-algo/.phase5-workspace/index_indicator/logs/hsj_d9ef3a61c8094db2bfec1bf17220addc.log",
+        "exit_code": 0,
+        "process_cleanup_reported": true,
+        "logs_shipped": true,
+        "terminal": "recovery_required",
+        "replacement_blocked": true
+      },
+      "debug": {
+        "attempt": "{\"attempt\": 1, \"error\": null, \"identity\": {\"boot_id\": \"c2070481-1124-4423-b248-15102315e793\", \"container_id\": \"Debian-home\", \"pgid\": 1837307, \"pid\": 1837307, \"session_id\": 1837307, \"start_time\": \"113681738\"}, \"job_id\": \"hsj_d9ef3a61c8094db2bfec1bf17220addc\", \"lease_epoch\": 1, \"lease_owner\": \"Debian-home:1836951\", \"log_ref\": \"/home/krishna/kite-algo/.phase5-workspace/index_indicator/logs/hsj_d9ef3a61c8094db2bfec1bf17220addc.log\", \"phase\": \"recovery_required\", \"run_id\": \"run_59e401e1d3594b03899ec45c4cbb91a0\", \"source_sha256\": \"ac043a4f944f5217d2c876037524098ec0755c89f9f067b9c65b08fa7bca71d4\", \"strategy_id\": \"hs_4a77fa378dee40e9b658a2b9733c3448\", \"updated_at\": \"2026-09-24T03:49:16.289036+00:00\", \"version_id\": \"hsv_1b4414b80b52410f9f15a30ba63ff8c8\"}",
+        "child_log": "[strategy] reading NSE:NIFTY50 candles for the ema(9) signal\n[strategy] NSE:NIFTY50 price=22600.0 ema(9)=22534.0 prior=22527.5 -> rising\n[strategy] signal=NSE:NIFTY50 traded=NSE:RELIANCE reference_price=1500.0\n[strategy] requested execution d7dd0704-57b0-4c15-b1b3-a8b1500661b1 status=awaiting_approval\n[strategy] settled: coverage=known pending=0 positions={'RELIANCE': 5}\n",
+        "supervisor": {
+          "job_id": "hsj_d9ef3a61c8094db2bfec1bf17220addc",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": "False",
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/index_indicator/logs/hsj_d9ef3a61c8094db2bfec1bf17220addc.log",
+          "exit_code": "0",
+          "process_cleanup_reported": "True",
+          "logs_shipped": "True",
+          "terminal": "recovery_required",
+          "replacement_blocked": "True"
+        }
+      },
+      "acceptance": {
+        "label": "index_indicator",
+        "ok": true,
+        "failures": [],
+        "axes": {
+          "requests_created": 1,
+          "requests_executed": 1,
+          "request_statuses": [
+            "executed"
+          ],
+          "execution_events": 2,
+          "submitted_events": 1,
+          "attributed_positions": 1,
+          "paper_orders": 1,
+          "paper_order_quantities": {
+            "RELIANCE": 5
+          },
+          "option_runs": 0,
+          "option_runs_closed": 0,
+          "settlement_overall": "unsettled",
+          "settlement_axes": {
+            "quiescence": "satisfied",
+            "attribution_scoped_flatness": "failed",
+            "terminal_domain_state": "failed",
+            "no_live_evaluation_authority": "failed"
+          },
+          "child_outcome": "exited",
+          "child_exit_code": 0,
+          "orders_before_approval": 0
+        }
+      },
+      "evidence": {
+        "requests": [
+          {
+            "request_id": "d7dd0704-57b0-4c15-b1b3-a8b1500661b1",
+            "plan_id": "2825633b-84fe-4745-b151-fd251ceffe42",
+            "status": "executed",
+            "authorization_mode": "approval_based",
+            "decision_kind": "manual",
+            "refusal_code": null,
+            "execution_detail": {
+              "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+              "result": {
+                "steps": [
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "RELIANCE"
+                    },
+                    "step_no": 1,
+                    "paper_order_id": "PAPER-4E975636F04A",
+                    "refusal_reason": null,
+                    "filled_quantity": 5
+                  }
+                ],
+                "status": "filled",
+                "plan_id": "2825633b-84fe-4745-b151-fd251ceffe42",
+                "reservation_id": "fa8e7db8-d5ce-483c-993c-b65d2f4d2423",
+                "paper_order_ids": [
+                  "PAPER-4E975636F04A"
+                ]
+              },
+              "grant_id": null,
+              "approval_id": null,
+              "environment": "paper",
+              "decision_kind": "manual",
+              "outcome_state": "filled",
+              "reservation_id": "fa8e7db8-d5ce-483c-993c-b65d2f4d2423",
+              "authorization_mode": "approval_based"
+            }
+          }
+        ],
+        "plans": [
+          {
+            "plan_id": "2825633b-84fe-4745-b151-fd251ceffe42",
+            "plan_kind": "single_instrument",
+            "logical_plan": {
+              "product": "CNC",
+              "exchange": "NSE",
+              "target_kind": "single_instrument",
+              "tradingsymbol": "RELIANCE",
+              "target_quantity": 5,
+              "instrument_token": 738561
+            },
+            "resolved_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 738561,
+                  "broker_symbol": "RELIANCE",
+                  "instrument_id": "4d8115cf-83af-586a-b826-ecbfbdad99db",
+                  "tradingsymbol": "RELIANCE",
+                  "broker_exchange": "NSE",
+                  "reference_price": 1500.0,
+                  "signed_quantity": 5
+                }
+              ],
+              "target_kind": "single_instrument",
+              "catalog_generation": "770c9424-d4a3-46cd-b5fb-f715cbfc9fcc"
+            }
+          }
+        ],
+        "reservations": [
+          {
+            "plan_id": "2825633b-84fe-4745-b151-fd251ceffe42",
+            "status": "consumed",
+            "reserved_notional_inr": 7500.0,
+            "released_at": null,
+            "release_reason": null
+          }
+        ],
+        "execution_events": [
+          {
+            "plan_id": "2825633b-84fe-4745-b151-fd251ceffe42",
+            "step_no": 1,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "2825633b-84fe-4745-b151-fd251ceffe42",
+            "step_no": 1,
+            "event": "filled",
+            "filled_quantity": 5,
+            "refusal_reason": null
+          }
+        ],
+        "paper_orders": [
+          {
+            "order_id": "PAPER-4E975636F04A",
+            "tradingsymbol": "RELIANCE",
+            "transaction_type": "buy",
+            "quantity": 5,
+            "status": "filled"
+          }
+        ],
+        "attributed_positions": [
+          {
+            "tradingsymbol": "RELIANCE",
+            "product": "CNC",
+            "net_quantity": 5,
+            "projection_version": 2
+          }
+        ],
+        "jobs": [
+          {
+            "id": "hsj_d9ef3a61c8094db2bfec1bf17220addc",
+            "status": "recovery_required",
+            "run_id": "run_59e401e1d3594b03899ec45c4cbb91a0",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "orders_before_approval": 0,
+        "reconciliation": {
+          "status": "refused",
+          "reason": "OPEN_EXPOSURE"
+        },
+        "settlement": {
+          "assessment_id": "2356e812-57fc-4c0c-83d3-c11604d1605e",
+          "strategy_id": "hs_4a77fa378dee40e9b658a2b9733c3448",
+          "account_id": "kite:paper-index_indicator",
+          "execution_environment": "paper",
+          "overall": "unsettled",
+          "barrier_version": 2,
+          "axes": {
+            "quiescence": {
+              "satisfied": true,
+              "state": "satisfied",
+              "evidence_digest": "6ee3bde56a957160fec7b4dfadd903ddf832c7dbd1c274e55e76497364e5a225",
+              "detail": {
+                "barrier_version": 2,
+                "quiet_since_version": 2,
+                "newest_work_event": {
+                  "event": "work_resolved",
+                  "version": 2
+                },
+                "last_proof_at": "2026-09-24 03:49:16.572382+00:00"
+              }
+            },
+            "attribution_scoped_flatness": {
+              "satisfied": false,
+              "state": "failed",
+              "evidence_digest": "fae2f7ac2901b05b5bdbda7106f3e034137a58876d1f3224eb56c8d54aa879e5",
+              "detail": {
+                "execution_environment": "paper",
+                "open_legs": 1,
+                "open_coordinates": [
+                  "738561:CNC"
+                ],
+                "legs": [
+                  {
+                    "instrument_token": 738561,
+                    "exchange": "NSE",
+                    "tradingsymbol": "RELIANCE",
+                    "product": "CNC",
+                    "net_quantity": 5,
+                    "identity_kind": "canonical"
+                  }
+                ],
+                "broker_nets_at_coordinates": {
+                  "738561:CNC": 5
+                },
+                "reason": "strategy_book_open"
+              }
+            },
+            "terminal_domain_state": {
+              "satisfied": false,
+              "state": "failed",
+              "evidence_digest": "a86a387241530e0f8e6ebba58e8a426bfcfc05fefa8cfb503a43543c34b820e1",
+              "detail": {
+                "non_terminal_runs": [
+                  "run_59e401e1d3594b03899ec45c4cbb91a0"
+                ],
+                "non_terminal_jobs": [
+                  "hsj_d9ef3a61c8094db2bfec1bf17220addc"
+                ],
+                "non_terminal_plans": [],
+                "reason": "non_terminal_domain_state"
+              }
+            },
+            "no_live_evaluation_authority": {
+              "satisfied": false,
+              "state": "failed",
+              "evidence_digest": "d31b2e1b589c224d18820e6f96f117a329fcfa64e7965cd1ab0d8c00f7f62944",
+              "detail": {
+                "active_approvals": [],
+                "authority_jobs": [],
+                "strategy_status": "active",
+                "open_runs": [
+                  "run_59e401e1d3594b03899ec45c4cbb91a0"
+                ],
+                "reason": "evaluation_authority_present"
+              }
+            }
+          },
+          "evidence_digest": "b654d04c381f4719bba888cc5930e4210eccafb01770291b2386cd5479baa0e5",
+          "created_at": "2026-09-24T03:49:16.968020+00:00",
+          "stale": false
+        },
+        "child_log": "[strategy] reading NSE:NIFTY50 candles for the ema(9) signal\n[strategy] NSE:NIFTY50 price=22600.0 ema(9)=22534.0 prior=22527.5 -> rising\n[strategy] signal=NSE:NIFTY50 traded=NSE:RELIANCE reference_price=1500.0\n[strategy] requested execution d7dd0704-57b0-4c15-b1b3-a8b1500661b1 status=awaiting_approval\n[strategy] settled: coverage=known pending=0 positions={'RELIANCE': 5}\n"
+      }
+    },
+    "options_adjustment": {
+      "strategy_id": "hs_1718ce6bdeef4743bfba066ffc98fe9f",
+      "job_id": "hsj_5e39735d2d6947428691a3389b8ccef2",
+      "autonomous": false,
+      "terminal_job": {
+        "id": "hsj_5e39735d2d6947428691a3389b8ccef2",
+        "status": "stopped",
+        "process_cleanup_state": "confirmed",
+        "reconciled_at": "2026-09-24 03:49:29.235629+00:00"
+      },
+      "supervisor": {
+        "job_id": "hsj_5e39735d2d6947428691a3389b8ccef2",
+        "outcome": "exited",
+        "stop": "exited",
+        "log_overflow": false,
+        "log_ref": "/home/krishna/kite-algo/.phase5-workspace/options_adjustment/logs/hsj_5e39735d2d6947428691a3389b8ccef2.log",
+        "exit_code": 0,
+        "process_cleanup_reported": true,
+        "logs_shipped": true,
+        "terminal": "recovery_required",
+        "replacement_blocked": true
+      },
+      "debug": {
+        "attempt": "{\"attempt\": 1, \"error\": null, \"identity\": {\"boot_id\": \"c2070481-1124-4423-b248-15102315e793\", \"container_id\": \"Debian-home\", \"pgid\": 1837983, \"pid\": 1837983, \"session_id\": 1837983, \"start_time\": \"113682425\"}, \"job_id\": \"hsj_5e39735d2d6947428691a3389b8ccef2\", \"lease_epoch\": 1, \"lease_owner\": \"Debian-home:1836951\", \"log_ref\": \"/home/krishna/kite-algo/.phase5-workspace/options_adjustment/logs/hsj_5e39735d2d6947428691a3389b8ccef2.log\", \"phase\": \"recovery_required\", \"run_id\": \"run_3adce03b711444dea4467c93f01e8450\", \"source_sha256\": \"d43b7a35f1a31c82a93ad026f4bd87223527d92a5b1646db745184a54ae3755e\", \"strategy_id\": \"hs_1718ce6bdeef4743bfba066ffc98fe9f\", \"updated_at\": \"2026-09-24T03:49:28.546184+00:00\", \"version_id\": \"hsv_d0823c6e632d4ca6a9c4fca26fa50c06\"}",
+        "child_log": "[strategy] NIFTY rsi=100.0 >= 40.0: bullish setup confirmed\n[strategy] frozen bull call spread NIFTY26OCT22500CE / NIFTY26OCT22600CE expiry=2026-10-29 policy=exit_before_cutoff product=NRML premium=60.0 delta=0.96/0.84 iv=0.14/0.14\n[strategy] entry requested: 1a5cc69b-9d41-445d-bad3-691fece41ced status=awaiting_approval\n[strategy] waiting for request 1a5cc69b-9d41-445d-bad3-691fece41ced: status=awaiting_approval mode=approval_based\n[strategy] waiting for request 1a5cc69b-9d41-445d-bad3-691fece41ced: status=dispatching mode=approval_based\n[strategy] request 1a5cc69b-9d41-445d-bad3-691fece41ced is now executed\n[strategy] structure close requested for run opt_run_454b8c61f63e4fc38c19d1aa93efc2c1: bef6dc32-c657-49e3-8bcb-1f784304bf58 status=awaiting_approval\n[strategy] waiting for request bef6dc32-c657-49e3-8bcb-1f784304bf58: status=awaiting_approval mode=approval_based\n[strategy] request bef6dc32-c657-49e3-8bcb-1f784304bf58 is now executed\n[strategy] structure closed with no outstanding work (runs ['opt_run_454b8c61f63e4fc38c19d1aa93efc2c1'] are closed with no outstanding work)\n",
+        "supervisor": {
+          "job_id": "hsj_5e39735d2d6947428691a3389b8ccef2",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": "False",
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/options_adjustment/logs/hsj_5e39735d2d6947428691a3389b8ccef2.log",
+          "exit_code": "0",
+          "process_cleanup_reported": "True",
+          "logs_shipped": "True",
+          "terminal": "recovery_required",
+          "replacement_blocked": "True"
+        }
+      },
+      "acceptance": {
+        "label": "options_adjustment",
+        "ok": true,
+        "failures": [],
+        "axes": {
+          "requests_created": 2,
+          "requests_executed": 2,
+          "request_statuses": [
+            "executed",
+            "executed"
+          ],
+          "execution_events": 8,
+          "submitted_events": 4,
+          "attributed_positions": 0,
+          "paper_orders": 4,
+          "paper_order_quantities": {
+            "NIFTY26OCT22500CE": 100,
+            "NIFTY26OCT22600CE": 100
+          },
+          "option_runs": 2,
+          "option_runs_closed": 1,
+          "settlement_overall": "settled",
+          "settlement_axes": {
+            "quiescence": "satisfied",
+            "attribution_scoped_flatness": "satisfied",
+            "terminal_domain_state": "satisfied",
+            "no_live_evaluation_authority": "satisfied"
+          },
+          "child_outcome": "exited",
+          "child_exit_code": 0,
+          "orders_before_approval": 0
+        }
+      },
+      "evidence": {
+        "requests": [
+          {
+            "request_id": "1a5cc69b-9d41-445d-bad3-691fece41ced",
+            "plan_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f",
+            "status": "executed",
+            "authorization_mode": "approval_based",
+            "decision_kind": "manual",
+            "refusal_code": null,
+            "execution_detail": {
+              "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+              "result": {
+                "steps": [
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "NIFTY26OCT22500CE"
+                    },
+                    "step_no": 1,
+                    "paper_order_id": "PAPER-2B7B36DD3D67",
+                    "refusal_reason": null,
+                    "filled_quantity": 50
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "NIFTY26OCT22600CE"
+                    },
+                    "step_no": 2,
+                    "paper_order_id": "PAPER-EE01EB423418",
+                    "refusal_reason": null,
+                    "filled_quantity": 50
+                  }
+                ],
+                "status": "filled",
+                "plan_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f",
+                "reservation_id": "42ece80c-1d80-4d3e-aba0-fb9c1be187b8",
+                "paper_order_ids": [
+                  "PAPER-2B7B36DD3D67",
+                  "PAPER-EE01EB423418"
+                ]
+              },
+              "grant_id": null,
+              "approval_id": null,
+              "environment": "paper",
+              "decision_kind": "manual",
+              "outcome_state": "filled",
+              "reservation_id": "42ece80c-1d80-4d3e-aba0-fb9c1be187b8",
+              "authorization_mode": "approval_based"
+            }
+          },
+          {
+            "request_id": "bef6dc32-c657-49e3-8bcb-1f784304bf58",
+            "plan_id": "628a9601-842b-4f4e-95bf-cae9abd02c28",
+            "status": "executed",
+            "authorization_mode": "approval_based",
+            "decision_kind": "manual",
+            "refusal_code": null,
+            "execution_detail": {
+              "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+              "result": {
+                "steps": [
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "NIFTY26OCT22600CE"
+                    },
+                    "step_no": 2,
+                    "paper_order_id": "PAPER-1908A19BAAE6",
+                    "refusal_reason": null,
+                    "filled_quantity": 50
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "NIFTY26OCT22500CE"
+                    },
+                    "step_no": 1,
+                    "paper_order_id": "PAPER-E7D8F4040D49",
+                    "refusal_reason": null,
+                    "filled_quantity": 50
+                  }
+                ],
+                "status": "filled",
+                "plan_id": "628a9601-842b-4f4e-95bf-cae9abd02c28",
+                "reservation_id": "92516e4d-cc49-4bc7-8f0f-ca2869d809c3",
+                "paper_order_ids": [
+                  "PAPER-1908A19BAAE6",
+                  "PAPER-E7D8F4040D49"
+                ]
+              },
+              "grant_id": null,
+              "approval_id": null,
+              "environment": "paper",
+              "decision_kind": "manual",
+              "outcome_state": "filled",
+              "reservation_id": "92516e4d-cc49-4bc7-8f0f-ca2869d809c3",
+              "authorization_mode": "approval_based"
+            }
+          }
+        ],
+        "plans": [
+          {
+            "plan_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f",
+            "plan_kind": "option_structure",
+            "logical_plan": {
+              "legs": [
+                {
+                  "side": "BUY",
+                  "ratio": 1,
+                  "strike": 22500.0,
+                  "option_type": "CE"
+                },
+                {
+                  "side": "SELL",
+                  "ratio": 1,
+                  "strike": 22600.0,
+                  "option_type": "CE"
+                }
+              ],
+              "expiry": "2026-10-29",
+              "product": "NRML",
+              "option_run": {
+                "phase": "entry",
+                "option_run_id": null
+              },
+              "underlying": "NIFTY",
+              "target_kind": "option_structure",
+              "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+              "expiry_policy": "exit_before_cutoff"
+            },
+            "resolved_plan": {
+              "legs": [
+                {
+                  "side": "BUY",
+                  "ratio": 1,
+                  "expiry": "2026-10-29",
+                  "strike": 22500.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "quantity": 50,
+                  "selection": null,
+                  "option_type": "CE",
+                  "broker_token": 50004,
+                  "broker_symbol": "NIFTY26OCT22500CE",
+                  "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587",
+                  "tradingsymbol": "NIFTY26OCT22500CE",
+                  "broker_exchange": "NFO",
+                  "instrument_type": "CE",
+                  "reference_price": 230.0,
+                  "signed_quantity": 50
+                },
+                {
+                  "side": "SELL",
+                  "ratio": 1,
+                  "expiry": "2026-10-29",
+                  "strike": 22600.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "quantity": 50,
+                  "selection": null,
+                  "option_type": "CE",
+                  "broker_token": 50008,
+                  "broker_symbol": "NIFTY26OCT22600CE",
+                  "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8",
+                  "tradingsymbol": "NIFTY26OCT22600CE",
+                  "broker_exchange": "NFO",
+                  "instrument_type": "CE",
+                  "reference_price": 170.0,
+                  "signed_quantity": -50
+                }
+              ],
+              "expiry": "2026-10-29",
+              "option_run": {
+                "phase": "entry",
+                "option_run_id": null
+              },
+              "underlying": "NIFTY",
+              "target_kind": "option_structure",
+              "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+              "expiry_policy": "exit_before_cutoff",
+              "structure_digest": "1becd529d8730ce3ea0af7eddf101aacc561eac72cfae977a071fbbe0d7434a8",
+              "catalog_generation": "770c9424-d4a3-46cd-b5fb-f715cbfc9fcc"
+            }
+          },
+          {
+            "plan_id": "628a9601-842b-4f4e-95bf-cae9abd02c28",
+            "plan_kind": "option_structure",
+            "logical_plan": {
+              "legs": [
+                {
+                  "side": "SELL",
+                  "ratio": 1,
+                  "strike": 22500.0,
+                  "option_type": "CE"
+                },
+                {
+                  "side": "BUY",
+                  "ratio": 1,
+                  "strike": 22600.0,
+                  "option_type": "CE"
+                }
+              ],
+              "expiry": "2026-10-29",
+              "product": "NRML",
+              "option_run": {
+                "phase": "exit",
+                "option_run_id": "opt_run_454b8c61f63e4fc38c19d1aa93efc2c1"
+              },
+              "underlying": "NIFTY",
+              "target_kind": "option_structure",
+              "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+              "expiry_policy": "exit_before_cutoff"
+            },
+            "resolved_plan": {
+              "legs": [
+                {
+                  "side": "SELL",
+                  "ratio": 1,
+                  "expiry": "2026-10-29",
+                  "strike": 22500.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "quantity": 50,
+                  "selection": null,
+                  "option_type": "CE",
+                  "broker_token": 50004,
+                  "broker_symbol": "NIFTY26OCT22500CE",
+                  "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587",
+                  "tradingsymbol": "NIFTY26OCT22500CE",
+                  "broker_exchange": "NFO",
+                  "instrument_type": "CE",
+                  "reference_price": 230.0,
+                  "signed_quantity": -50
+                },
+                {
+                  "side": "BUY",
+                  "ratio": 1,
+                  "expiry": "2026-10-29",
+                  "strike": 22600.0,
+                  "product": "NRML",
+                  "exchange": "NFO",
+                  "lot_size": 50,
+                  "quantity": 50,
+                  "selection": null,
+                  "option_type": "CE",
+                  "broker_token": 50008,
+                  "broker_symbol": "NIFTY26OCT22600CE",
+                  "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8",
+                  "tradingsymbol": "NIFTY26OCT22600CE",
+                  "broker_exchange": "NFO",
+                  "instrument_type": "CE",
+                  "reference_price": 170.0,
+                  "signed_quantity": 50
+                }
+              ],
+              "expiry": "2026-10-29",
+              "option_run": {
+                "phase": "exit",
+                "option_run_id": "opt_run_454b8c61f63e4fc38c19d1aa93efc2c1"
+              },
+              "underlying": "NIFTY",
+              "target_kind": "option_structure",
+              "structure_id": "bull-call-NIFTY26OCT22500CE-NIFTY26OCT22600CE",
+              "expiry_policy": "exit_before_cutoff",
+              "structure_digest": "88365469aa055b11ee6aaf47a8d78e4c7d59df7a37e6766108c5f31c1ef1f17f",
+              "catalog_generation": "770c9424-d4a3-46cd-b5fb-f715cbfc9fcc"
+            }
+          }
+        ],
+        "reservations": [
+          {
+            "plan_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f",
+            "status": "consumed",
+            "reserved_notional_inr": 20000.0,
+            "released_at": null,
+            "release_reason": null
+          },
+          {
+            "plan_id": "628a9601-842b-4f4e-95bf-cae9abd02c28",
+            "status": "consumed",
+            "reserved_notional_inr": 20000.0,
+            "released_at": null,
+            "release_reason": null
+          }
+        ],
+        "execution_events": [
+          {
+            "plan_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f",
+            "step_no": 1,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f",
+            "step_no": 1,
+            "event": "filled",
+            "filled_quantity": 50,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f",
+            "step_no": 2,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f",
+            "step_no": 2,
+            "event": "filled",
+            "filled_quantity": 50,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "628a9601-842b-4f4e-95bf-cae9abd02c28",
+            "step_no": 2,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "628a9601-842b-4f4e-95bf-cae9abd02c28",
+            "step_no": 2,
+            "event": "filled",
+            "filled_quantity": 50,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "628a9601-842b-4f4e-95bf-cae9abd02c28",
+            "step_no": 1,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "628a9601-842b-4f4e-95bf-cae9abd02c28",
+            "step_no": 1,
+            "event": "filled",
+            "filled_quantity": 50,
+            "refusal_reason": null
+          }
+        ],
+        "paper_orders": [
+          {
+            "order_id": "PAPER-2B7B36DD3D67",
+            "tradingsymbol": "NIFTY26OCT22500CE",
+            "transaction_type": "buy",
+            "quantity": 50,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-EE01EB423418",
+            "tradingsymbol": "NIFTY26OCT22600CE",
+            "transaction_type": "sell",
+            "quantity": 50,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-1908A19BAAE6",
+            "tradingsymbol": "NIFTY26OCT22600CE",
+            "transaction_type": "buy",
+            "quantity": 50,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-E7D8F4040D49",
+            "tradingsymbol": "NIFTY26OCT22500CE",
+            "transaction_type": "sell",
+            "quantity": 50,
+            "status": "filled"
+          }
+        ],
+        "attributed_positions": [],
+        "jobs": [
+          {
+            "id": "hsj_5e39735d2d6947428691a3389b8ccef2",
+            "status": "stopped",
+            "run_id": "run_3adce03b711444dea4467c93f01e8450",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [
+          {
+            "option_run_id": "opt_run_454b8c61f63e4fc38c19d1aa93efc2c1",
+            "phase": "entry",
+            "run_status": "exited",
+            "product": "NRML",
+            "legs": [
+              {
+                "lots": 1,
+                "leg_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f:1",
+                "strike": 22500.0,
+                "product": "NRML",
+                "exchange": "NFO",
+                "lot_size": 50,
+                "metadata": {
+                  "role": "entry",
+                  "ratio": 1,
+                  "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587"
+                },
+                "quantity": 50,
+                "expiry_key": "2026-10-29",
+                "order_type": "MARKET",
+                "option_type": "CE",
+                "tradingsymbol": "NIFTY26OCT22500CE",
+                "transaction_type": "BUY"
+              },
+              {
+                "lots": 1,
+                "leg_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f:2",
+                "strike": 22600.0,
+                "product": "NRML",
+                "exchange": "NFO",
+                "lot_size": 50,
+                "metadata": {
+                  "role": "entry",
+                  "ratio": 1,
+                  "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8"
+                },
+                "quantity": 50,
+                "expiry_key": "2026-10-29",
+                "order_type": "MARKET",
+                "option_type": "CE",
+                "tradingsymbol": "NIFTY26OCT22600CE",
+                "transaction_type": "SELL"
+              }
+            ],
+            "completed_legs": [
+              "97f29e59-6daa-40f8-8fa1-ed31d4cab63f:1",
+              "97f29e59-6daa-40f8-8fa1-ed31d4cab63f:2"
+            ]
+          },
+          {
+            "option_run_id": "opt_run_454b8c61f63e4fc38c19d1aa93efc2c1",
+            "phase": "exit",
+            "run_status": "exited",
+            "product": "NRML",
+            "legs": [
+              {
+                "lots": 1,
+                "leg_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f:1",
+                "strike": 22500.0,
+                "product": "NRML",
+                "exchange": "NFO",
+                "lot_size": 50,
+                "metadata": {
+                  "role": "entry",
+                  "ratio": 1,
+                  "instrument_id": "d72a79c7-917d-5103-8ee4-3378da3eb587"
+                },
+                "quantity": 50,
+                "expiry_key": "2026-10-29",
+                "order_type": "MARKET",
+                "option_type": "CE",
+                "tradingsymbol": "NIFTY26OCT22500CE",
+                "transaction_type": "BUY"
+              },
+              {
+                "lots": 1,
+                "leg_id": "97f29e59-6daa-40f8-8fa1-ed31d4cab63f:2",
+                "strike": 22600.0,
+                "product": "NRML",
+                "exchange": "NFO",
+                "lot_size": 50,
+                "metadata": {
+                  "role": "entry",
+                  "ratio": 1,
+                  "instrument_id": "330b82a8-2e57-55d1-91e2-a3a3f592b7f8"
+                },
+                "quantity": 50,
+                "expiry_key": "2026-10-29",
+                "order_type": "MARKET",
+                "option_type": "CE",
+                "tradingsymbol": "NIFTY26OCT22600CE",
+                "transaction_type": "SELL"
+              }
+            ],
+            "completed_legs": [
+              "97f29e59-6daa-40f8-8fa1-ed31d4cab63f:1",
+              "97f29e59-6daa-40f8-8fa1-ed31d4cab63f:2"
+            ]
+          }
+        ],
+        "orders_before_approval": 0,
+        "reconciliation": {
+          "status": "reconciled",
+          "response": {
+            "status": "reconciled",
+            "job_id": "hsj_5e39735d2d6947428691a3389b8ccef2",
+            "attempt": 1,
+            "case": "trading_settled_flat",
+            "reason_code": "TRADING_SETTLED_FLAT",
+            "replacement_blocked": false,
+            "blocking_reasons": [],
+            "evidence": {
+              "job_id": "hsj_5e39735d2d6947428691a3389b8ccef2",
+              "strategy_id": "hs_1718ce6bdeef4743bfba066ffc98fe9f",
+              "attempt": 1,
+              "run_id": "run_3adce03b711444dea4467c93f01e8450",
+              "launched": true,
+              "trade_capable": true,
+              "execution_mode": "paper",
+              "job_status": "recovery_required",
+              "desired_state": "started",
+              "replacement_blocked": true,
+              "process_cleanup_state": "confirmed",
+              "process_cleanup_at": "2026-09-24T03:49:28.392578+00:00",
+              "process_cleanup_actor": "Debian-home:1836951",
+              "authority_state": "revoked",
+              "run_status": "open",
+              "work_state": "settled",
+              "exposure_state": "flat",
+              "protection_state": "settled",
+              "recovery_action_required": false,
+              "evidence_complete": true,
+              "unavailable": [],
+              "notes": [
+                "execution_settlement_barrier_quiescence_verified"
+              ],
+              "settlement_watermark": "2026-09-24T03:49:26.955733+00:00:4:0",
+              "quiescence_state": "verified"
+            },
+            "audit_id": "hsr_f018a94ef4054049876b7900dc4f57e4"
+          }
+        },
+        "settlement": {
+          "assessment_id": "931bbb97-e45c-459d-bad7-fe0ee1f4b1f2",
+          "strategy_id": "hs_1718ce6bdeef4743bfba066ffc98fe9f",
+          "account_id": "kite:paper-options_adjustment",
+          "execution_environment": "paper",
+          "overall": "settled",
+          "barrier_version": 8,
+          "axes": {
+            "quiescence": {
+              "satisfied": true,
+              "state": "satisfied",
+              "evidence_digest": "a71bc0363fb8611c518dcb57b82efc8ff8de1a07bf2f4bb66a4edf04f188036f",
+              "detail": {
+                "barrier_version": 8,
+                "quiet_since_version": 8,
+                "newest_work_event": {
+                  "event": "work_resolved",
+                  "version": 8
+                },
+                "last_proof_at": "2026-09-24 03:49:28.946723+00:00"
+              }
+            },
+            "attribution_scoped_flatness": {
+              "satisfied": true,
+              "state": "satisfied",
+              "evidence_digest": "ba6df0435f62861335261dd5f490e5cea555b7f09b820c7c2d03f4f72f20698a",
+              "detail": {
+                "execution_environment": "paper",
+                "open_legs": 0,
+                "open_coordinates": [],
+                "reason": "strategy_book_flat"
+              }
+            },
+            "terminal_domain_state": {
+              "satisfied": true,
+              "state": "satisfied",
+              "evidence_digest": "79f3eb67c7a40aaf5aa63f8e27ca75129e451e4994838c3096fb0a55335a2b89",
+              "detail": {
+                "non_terminal_runs": [],
+                "non_terminal_jobs": [],
+                "non_terminal_plans": [],
+                "reason": "all_terminal"
+              }
+            },
+            "no_live_evaluation_authority": {
+              "satisfied": true,
+              "state": "satisfied",
+              "evidence_digest": "ac038d0978ccc10ae2be66cd005c4dae98c0c3183b22c366243adad3942e421c",
+              "detail": {
+                "active_approvals": [],
+                "authority_jobs": [],
+                "strategy_status": "active",
+                "open_runs": [],
+                "reason": "no_evaluation_authority"
+              }
+            }
+          },
+          "evidence_digest": "6b72ebba0591d1de63f31119cfc671e30a579a806553c93cd4939f23a8bf58c1",
+          "created_at": "2026-09-24T03:49:29.375490+00:00",
+          "stale": false
+        },
+        "child_log": "[strategy] NIFTY rsi=100.0 >= 40.0: bullish setup confirmed\n[strategy] frozen bull call spread NIFTY26OCT22500CE / NIFTY26OCT22600CE expiry=2026-10-29 policy=exit_before_cutoff product=NRML premium=60.0 delta=0.96/0.84 iv=0.14/0.14\n[strategy] entry requested: 1a5cc69b-9d41-445d-bad3-691fece41ced status=awaiting_approval\n[strategy] waiting for request 1a5cc69b-9d41-445d-bad3-691fece41ced: status=awaiting_approval mode=approval_based\n[strategy] waiting for request 1a5cc69b-9d41-445d-bad3-691fece41ced: status=dispatching mode=approval_based\n[strategy] request 1a5cc69b-9d41-445d-bad3-691fece41ced is now executed\n[strategy] structure close requested for run opt_run_454b8c61f63e4fc38c19d1aa93efc2c1: bef6dc32-c657-49e3-8bcb-1f784304bf58 status=awaiting_approval\n[strategy] waiting for request bef6dc32-c657-49e3-8bcb-1f784304bf58: status=awaiting_approval mode=approval_based\n[strategy] request bef6dc32-c657-49e3-8bcb-1f784304bf58 is now executed\n[strategy] structure closed with no outstanding work (runs ['opt_run_454b8c61f63e4fc38c19d1aa93efc2c1'] are closed with no outstanding work)\n"
+      }
+    },
+    "universe_equal_weight": {
+      "strategy_id": "hs_da3d10dcac73420db2f3a1dd422bd31c",
+      "job_id": "hsj_302a78143f2840a5ad9e6270be7ef440",
+      "autonomous": false,
+      "terminal_job": {
+        "id": "hsj_302a78143f2840a5ad9e6270be7ef440",
+        "status": "recovery_required",
+        "process_cleanup_state": "confirmed",
+        "reconciled_at": "None"
+      },
+      "supervisor": {
+        "job_id": "hsj_302a78143f2840a5ad9e6270be7ef440",
+        "outcome": "exited",
+        "stop": "exited",
+        "log_overflow": false,
+        "log_ref": "/home/krishna/kite-algo/.phase5-workspace/universe_equal_weight/logs/hsj_302a78143f2840a5ad9e6270be7ef440.log",
+        "exit_code": 0,
+        "process_cleanup_reported": true,
+        "logs_shipped": true,
+        "terminal": "recovery_required",
+        "replacement_blocked": true
+      },
+      "debug": {
+        "attempt": "{\"attempt\": 1, \"error\": null, \"identity\": {\"boot_id\": \"c2070481-1124-4423-b248-15102315e793\", \"container_id\": \"Debian-home\", \"pgid\": 1838732, \"pid\": 1838732, \"session_id\": 1838732, \"start_time\": \"113683649\"}, \"job_id\": \"hsj_302a78143f2840a5ad9e6270be7ef440\", \"lease_epoch\": 1, \"lease_owner\": \"Debian-home:1836951\", \"log_ref\": \"/home/krishna/kite-algo/.phase5-workspace/universe_equal_weight/logs/hsj_302a78143f2840a5ad9e6270be7ef440.log\", \"phase\": \"recovery_required\", \"run_id\": \"run_4df855e979a5482a947df4dccab43e91\", \"source_sha256\": \"f2e2f6e396eec779314644098514bf5934c09063e4d8265c3eda1b8b2903f592\", \"strategy_id\": \"hs_da3d10dcac73420db2f3a1dd422bd31c\", \"updated_at\": \"2026-09-24T03:49:37.054838+00:00\", \"version_id\": \"hsv_3f75f041f2b74843993644be83cd45e9\"}",
+        "child_log": "[strategy] pinned revision f58dde33-a5d3-488d-9f36-7a23a87c348b: 4 members, target notional 389500.0, residual 10500.0, deltas {'NSE:HDFCBANK': 59, 'NSE:INFY': 67, 'NSE:RELIANCE': 65, 'NSE:TCS': 25}\n[strategy] rebalance requested ea974c1b-e2f7-4ac8-9133-321476765cca status=awaiting_approval\n[strategy] settled notional 388050.0 within budget 400000.0\n[strategy] rebalance dispatched and settled with no outstanding work\n",
+        "supervisor": {
+          "job_id": "hsj_302a78143f2840a5ad9e6270be7ef440",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": "False",
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/universe_equal_weight/logs/hsj_302a78143f2840a5ad9e6270be7ef440.log",
+          "exit_code": "0",
+          "process_cleanup_reported": "True",
+          "logs_shipped": "True",
+          "terminal": "recovery_required",
+          "replacement_blocked": "True"
+        }
+      },
+      "acceptance": {
+        "label": "universe_equal_weight",
+        "ok": true,
+        "failures": [],
+        "axes": {
+          "requests_created": 1,
+          "requests_executed": 1,
+          "request_statuses": [
+            "executed"
+          ],
+          "execution_events": 8,
+          "submitted_events": 4,
+          "attributed_positions": 4,
+          "paper_orders": 4,
+          "paper_order_quantities": {
+            "HDFCBANK": 59,
+            "INFY": 66,
+            "RELIANCE": 65,
+            "TCS": 25
+          },
+          "option_runs": 0,
+          "option_runs_closed": 0,
+          "settlement_overall": "unsettled",
+          "settlement_axes": {
+            "quiescence": "satisfied",
+            "attribution_scoped_flatness": "failed",
+            "terminal_domain_state": "failed",
+            "no_live_evaluation_authority": "failed"
+          },
+          "child_outcome": "exited",
+          "child_exit_code": 0,
+          "orders_before_approval": 0
+        }
+      },
+      "evidence": {
+        "requests": [
+          {
+            "request_id": "ea974c1b-e2f7-4ac8-9133-321476765cca",
+            "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+            "status": "executed",
+            "authorization_mode": "approval_based",
+            "decision_kind": "manual",
+            "refusal_code": null,
+            "execution_detail": {
+              "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+              "result": {
+                "steps": [
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "HDFCBANK"
+                    },
+                    "step_no": 1,
+                    "paper_order_id": "PAPER-288137069436",
+                    "refusal_reason": null,
+                    "filled_quantity": 59
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "INFY"
+                    },
+                    "step_no": 2,
+                    "paper_order_id": "PAPER-9A9A73D8E6A1",
+                    "refusal_reason": null,
+                    "filled_quantity": 66
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "RELIANCE"
+                    },
+                    "step_no": 3,
+                    "paper_order_id": "PAPER-317889AAC4CA",
+                    "refusal_reason": null,
+                    "filled_quantity": 65
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "TCS"
+                    },
+                    "step_no": 4,
+                    "paper_order_id": "PAPER-993EEA5B0203",
+                    "refusal_reason": null,
+                    "filled_quantity": 25
+                  }
+                ],
+                "status": "filled",
+                "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+                "reservation_id": "c8fd0a89-e593-4784-820d-a2cbc8cef167",
+                "paper_order_ids": [
+                  "PAPER-288137069436",
+                  "PAPER-9A9A73D8E6A1",
+                  "PAPER-317889AAC4CA",
+                  "PAPER-993EEA5B0203"
+                ]
+              },
+              "grant_id": null,
+              "approval_id": null,
+              "environment": "paper",
+              "decision_kind": "manual",
+              "outcome_state": "filled",
+              "reservation_id": "c8fd0a89-e593-4784-820d-a2cbc8cef167",
+              "authorization_mode": "approval_based"
+            }
+          }
+        ],
+        "plans": [
+          {
+            "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+            "plan_kind": "target_weights",
+            "logical_plan": {
+              "target_kind": "target_weights",
+              "target_weights": {
+                "NSE:TCS": 0.24872449,
+                "NSE:INFY": 0.24783163,
+                "NSE:HDFCBANK": 0.24834184,
+                "NSE:RELIANCE": 0.24872449
+              },
+              "cash_buffer_pct": 0.02,
+              "capital_basis_inr": 400000.0,
+              "universe_revision_id": "f58dde33-a5d3-488d-9f36-7a23a87c348b"
+            },
+            "resolved_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 341249,
+                  "broker_symbol": "HDFCBANK",
+                  "explicit_zero": false,
+                  "instrument_id": "df4aec9d-396a-548e-9211-d0aa62fd01bd",
+                  "target_weight": 0.24834184,
+                  "tradingsymbol": "HDFCBANK",
+                  "broker_exchange": "NSE",
+                  "reference_price": 1650.0
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 408065,
+                  "broker_symbol": "INFY",
+                  "explicit_zero": false,
+                  "instrument_id": "42c12044-7b4c-53ff-b02f-12cdd4943519",
+                  "target_weight": 0.24783163,
+                  "tradingsymbol": "INFY",
+                  "broker_exchange": "NSE",
+                  "reference_price": 1450.0
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 738561,
+                  "broker_symbol": "RELIANCE",
+                  "explicit_zero": false,
+                  "instrument_id": "4d8115cf-83af-586a-b826-ecbfbdad99db",
+                  "target_weight": 0.24872449,
+                  "tradingsymbol": "RELIANCE",
+                  "broker_exchange": "NSE",
+                  "reference_price": 1500.0
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 2953217,
+                  "broker_symbol": "TCS",
+                  "explicit_zero": false,
+                  "instrument_id": "d39db2bc-5d4f-5bb3-b512-7e240efcd88b",
+                  "target_weight": 0.24872449,
+                  "tradingsymbol": "TCS",
+                  "broker_exchange": "NSE",
+                  "reference_price": 3900.0
+                }
+              ],
+              "product": "CNC",
+              "member_hash": "de2afb2ada904d708c314a2ee5c65c9e87c1bb2530afe1000994ff21e5e6c950",
+              "target_kind": "target_weights",
+              "cash_buffer_pct": 0.02,
+              "capital_basis_inr": 400000.0,
+              "catalog_generation": "770c9424-d4a3-46cd-b5fb-f715cbfc9fcc",
+              "universe_revision_id": "f58dde33-a5d3-488d-9f36-7a23a87c348b"
+            }
+          }
+        ],
+        "reservations": [
+          {
+            "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+            "status": "consumed",
+            "reserved_notional_inr": 389500.0004,
+            "released_at": null,
+            "release_reason": null
+          }
+        ],
+        "execution_events": [
+          {
+            "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+            "step_no": 1,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+            "step_no": 1,
+            "event": "filled",
+            "filled_quantity": 59,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+            "step_no": 2,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+            "step_no": 2,
+            "event": "filled",
+            "filled_quantity": 66,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+            "step_no": 3,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+            "step_no": 3,
+            "event": "filled",
+            "filled_quantity": 65,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+            "step_no": 4,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "8f3edb94-fd41-4ce3-ad28-a0bdfeacab79",
+            "step_no": 4,
+            "event": "filled",
+            "filled_quantity": 25,
+            "refusal_reason": null
+          }
+        ],
+        "paper_orders": [
+          {
+            "order_id": "PAPER-288137069436",
+            "tradingsymbol": "HDFCBANK",
+            "transaction_type": "buy",
+            "quantity": 59,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-9A9A73D8E6A1",
+            "tradingsymbol": "INFY",
+            "transaction_type": "buy",
+            "quantity": 66,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-317889AAC4CA",
+            "tradingsymbol": "RELIANCE",
+            "transaction_type": "buy",
+            "quantity": 65,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-993EEA5B0203",
+            "tradingsymbol": "TCS",
+            "transaction_type": "buy",
+            "quantity": 25,
+            "status": "filled"
+          }
+        ],
+        "attributed_positions": [
+          {
+            "tradingsymbol": "INFY",
+            "product": "CNC",
+            "net_quantity": 66,
+            "projection_version": 2
+          },
+          {
+            "tradingsymbol": "RELIANCE",
+            "product": "CNC",
+            "net_quantity": 65,
+            "projection_version": 2
+          },
+          {
+            "tradingsymbol": "TCS",
+            "product": "CNC",
+            "net_quantity": 25,
+            "projection_version": 2
+          },
+          {
+            "tradingsymbol": "HDFCBANK",
+            "product": "CNC",
+            "net_quantity": 59,
+            "projection_version": 2
+          }
+        ],
+        "jobs": [
+          {
+            "id": "hsj_302a78143f2840a5ad9e6270be7ef440",
+            "status": "recovery_required",
+            "run_id": "run_4df855e979a5482a947df4dccab43e91",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "orders_before_approval": 0,
+        "reconciliation": {
+          "status": "refused",
+          "reason": "OPEN_EXPOSURE"
+        },
+        "settlement": {
+          "assessment_id": "d269f3e6-b268-4513-a2fa-dfa7ed28ba95",
+          "strategy_id": "hs_da3d10dcac73420db2f3a1dd422bd31c",
+          "account_id": "kite:paper-universe_equal_weight",
+          "execution_environment": "paper",
+          "overall": "unsettled",
+          "barrier_version": 8,
+          "axes": {
+            "quiescence": {
+              "satisfied": true,
+              "state": "satisfied",
+              "evidence_digest": "0da01b24935182cc7fb8c7621867acdb34861932c4ad126cfc7089f84e47837d",
+              "detail": {
+                "barrier_version": 8,
+                "quiet_since_version": 8,
+                "newest_work_event": {
+                  "event": "work_resolved",
+                  "version": 8
+                },
+                "last_proof_at": "2026-09-24 03:49:37.658255+00:00"
+              }
+            },
+            "attribution_scoped_flatness": {
+              "satisfied": false,
+              "state": "failed",
+              "evidence_digest": "beee4693f4130d46a7010b0512ca745d3bed527f555869d17a907a5f976110f6",
+              "detail": {
+                "execution_environment": "paper",
+                "open_legs": 4,
+                "open_coordinates": [
+                  "2953217:CNC",
+                  "341249:CNC",
+                  "408065:CNC",
+                  "738561:CNC"
+                ],
+                "legs": [
+                  {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "product": "CNC",
+                    "net_quantity": 66,
+                    "identity_kind": "canonical"
+                  },
+                  {
+                    "instrument_token": 738561,
+                    "exchange": "NSE",
+                    "tradingsymbol": "RELIANCE",
+                    "product": "CNC",
+                    "net_quantity": 65,
+                    "identity_kind": "canonical"
+                  },
+                  {
+                    "instrument_token": 2953217,
+                    "exchange": "NSE",
+                    "tradingsymbol": "TCS",
+                    "product": "CNC",
+                    "net_quantity": 25,
+                    "identity_kind": "canonical"
+                  },
+                  {
+                    "instrument_token": 341249,
+                    "exchange": "NSE",
+                    "tradingsymbol": "HDFCBANK",
+                    "product": "CNC",
+                    "net_quantity": 59,
+                    "identity_kind": "canonical"
+                  }
+                ],
+                "broker_nets_at_coordinates": {
+                  "341249:CNC": 59,
+                  "408065:CNC": 66,
+                  "738561:CNC": 65,
+                  "2953217:CNC": 25
+                },
+                "reason": "strategy_book_open"
+              }
+            },
+            "terminal_domain_state": {
+              "satisfied": false,
+              "state": "failed",
+              "evidence_digest": "249f5ebe3fe842db28d81dc6d20c1d070703f23e7fb06e3c59282cbfab41ec83",
+              "detail": {
+                "non_terminal_runs": [
+                  "run_4df855e979a5482a947df4dccab43e91"
+                ],
+                "non_terminal_jobs": [
+                  "hsj_302a78143f2840a5ad9e6270be7ef440"
+                ],
+                "non_terminal_plans": [],
+                "reason": "non_terminal_domain_state"
+              }
+            },
+            "no_live_evaluation_authority": {
+              "satisfied": false,
+              "state": "failed",
+              "evidence_digest": "cb48ff1becb0e662520ac0ace5c577a7908c390aef60efab158d97eb0868db80",
+              "detail": {
+                "active_approvals": [],
+                "authority_jobs": [],
+                "strategy_status": "active",
+                "open_runs": [
+                  "run_4df855e979a5482a947df4dccab43e91"
+                ],
+                "reason": "evaluation_authority_present"
+              }
+            }
+          },
+          "evidence_digest": "5e67e75f7d7e3a9594a93e5b4ad42410daa9b06017a8bf8b111078101d3b97c9",
+          "created_at": "2026-09-24T03:49:38.007341+00:00",
+          "stale": false
+        },
+        "child_log": "[strategy] pinned revision f58dde33-a5d3-488d-9f36-7a23a87c348b: 4 members, target notional 389500.0, residual 10500.0, deltas {'NSE:HDFCBANK': 59, 'NSE:INFY': 67, 'NSE:RELIANCE': 65, 'NSE:TCS': 25}\n[strategy] rebalance requested ea974c1b-e2f7-4ac8-9133-321476765cca status=awaiting_approval\n[strategy] settled notional 388050.0 within budget 400000.0\n[strategy] rebalance dispatched and settled with no outstanding work\n"
+      }
+    },
+    "basis_mismatch": {
+      "strategy_id": "hs_8059da3db9b94121b638e988618728e5",
+      "job_id": "hsj_d059b7308c5e40ebb9e55d0240c5a743",
+      "autonomous": false,
+      "terminal_job": {
+        "id": "hsj_d059b7308c5e40ebb9e55d0240c5a743",
+        "status": "stopped",
+        "process_cleanup_state": "confirmed",
+        "reconciled_at": "2026-09-24 03:49:41.500073+00:00"
+      },
+      "supervisor": {
+        "job_id": "hsj_d059b7308c5e40ebb9e55d0240c5a743",
+        "outcome": "exited",
+        "stop": "exited",
+        "log_overflow": false,
+        "log_ref": "/home/krishna/kite-algo/.phase5-workspace/basis_mismatch/logs/hsj_d059b7308c5e40ebb9e55d0240c5a743.log",
+        "exit_code": 0,
+        "process_cleanup_reported": true,
+        "logs_shipped": true,
+        "terminal": "recovery_required",
+        "replacement_blocked": true
+      },
+      "debug": {
+        "attempt": "{\"attempt\": 1, \"error\": null, \"identity\": {\"boot_id\": \"c2070481-1124-4423-b248-15102315e793\", \"container_id\": \"Debian-home\", \"pgid\": 1839369, \"pid\": 1839369, \"session_id\": 1839369, \"start_time\": \"113684520\"}, \"job_id\": \"hsj_d059b7308c5e40ebb9e55d0240c5a743\", \"lease_epoch\": 1, \"lease_owner\": \"Debian-home:1836951\", \"log_ref\": \"/home/krishna/kite-algo/.phase5-workspace/basis_mismatch/logs/hsj_d059b7308c5e40ebb9e55d0240c5a743.log\", \"phase\": \"recovery_required\", \"run_id\": \"run_132c3226102444f3b310dd842ecf0414\", \"source_sha256\": \"f2e2f6e396eec779314644098514bf5934c09063e4d8265c3eda1b8b2903f592\", \"strategy_id\": \"hs_8059da3db9b94121b638e988618728e5\", \"updated_at\": \"2026-09-24T03:49:40.714033+00:00\", \"version_id\": \"hsv_7fe29b5d9f994934a014ee68862f30f8\"}",
+        "child_log": "[strategy] pinned revision b71e897b-4e82-4ff9-a2c5-42fadd7e83f7: 4 members, target notional 389500.0, residual 10500.0, deltas {'NSE:HDFCBANK': 59, 'NSE:INFY': 67, 'NSE:RELIANCE': 65, 'NSE:TCS': 25}\n[strategy] no action: the platform refused the weights plan; no order was sent {\"allocation\": 500000.0, \"code\": \"CAPITAL_BASIS_MISMATCH\", \"stated\": 400000.0, \"status\": \"refused\"}\n",
+        "supervisor": {
+          "job_id": "hsj_d059b7308c5e40ebb9e55d0240c5a743",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": "False",
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/basis_mismatch/logs/hsj_d059b7308c5e40ebb9e55d0240c5a743.log",
+          "exit_code": "0",
+          "process_cleanup_reported": "True",
+          "logs_shipped": "True",
+          "terminal": "recovery_required",
+          "replacement_blocked": "True"
+        }
+      },
+      "acceptance": {
+        "label": "basis_mismatch",
+        "ok": true,
+        "failures": [],
+        "axes": {
+          "deferred": true,
+          "requests_created": 0,
+          "paper_orders": 0,
+          "child_named_reason": true,
+          "child_exit_code": 0
+        }
+      },
+      "evidence": {
+        "requests": [],
+        "plans": [],
+        "reservations": [],
+        "execution_events": [],
+        "paper_orders": [],
+        "attributed_positions": [],
+        "jobs": [
+          {
+            "id": "hsj_d059b7308c5e40ebb9e55d0240c5a743",
+            "status": "stopped",
+            "run_id": "run_132c3226102444f3b310dd842ecf0414",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "reconciliation": {
+          "status": "reconciled",
+          "response": {
+            "status": "reconciled",
+            "job_id": "hsj_d059b7308c5e40ebb9e55d0240c5a743",
+            "attempt": 1,
+            "case": "trading_settled_flat",
+            "reason_code": "TRADING_SETTLED_FLAT",
+            "replacement_blocked": false,
+            "blocking_reasons": [],
+            "evidence": {
+              "job_id": "hsj_d059b7308c5e40ebb9e55d0240c5a743",
+              "strategy_id": "hs_8059da3db9b94121b638e988618728e5",
+              "attempt": 1,
+              "run_id": "run_132c3226102444f3b310dd842ecf0414",
+              "launched": true,
+              "trade_capable": true,
+              "execution_mode": "paper",
+              "job_status": "recovery_required",
+              "desired_state": "started",
+              "replacement_blocked": true,
+              "process_cleanup_state": "confirmed",
+              "process_cleanup_at": "2026-09-24T03:49:40.530577+00:00",
+              "process_cleanup_actor": "Debian-home:1836951",
+              "authority_state": "revoked",
+              "run_status": "open",
+              "work_state": "none",
+              "exposure_state": "flat",
+              "protection_state": "settled",
+              "recovery_action_required": false,
+              "evidence_complete": true,
+              "unavailable": [],
+              "notes": [
+                "execution_settlement_barrier_quiescence_verified"
+              ],
+              "settlement_watermark": "empty",
+              "quiescence_state": "verified"
+            },
+            "audit_id": "hsr_a64422a2ae014697bf4216bdd57d13f7"
+          }
+        },
+        "settlement": {
+          "assessment_id": "f2e9a2ed-8f52-4195-a32e-d6a377508b60",
+          "strategy_id": "hs_8059da3db9b94121b638e988618728e5",
+          "account_id": "kite:paper-basis_mismatch",
+          "execution_environment": "paper",
+          "overall": "settled",
+          "barrier_version": 0,
+          "axes": {
+            "quiescence": {
+              "satisfied": true,
+              "state": "satisfied",
+              "evidence_digest": "3fdf44316c444e54805bb3d77a0590fab65462a158ab36629f5b92a165d026ab",
+              "detail": {
+                "barrier_version": 0,
+                "quiet_since_version": 0,
+                "last_proof_at": "2026-09-24 03:49:41.127839+00:00"
+              }
+            },
+            "attribution_scoped_flatness": {
+              "satisfied": true,
+              "state": "satisfied",
+              "evidence_digest": "ba6df0435f62861335261dd5f490e5cea555b7f09b820c7c2d03f4f72f20698a",
+              "detail": {
+                "execution_environment": "paper",
+                "open_legs": 0,
+                "open_coordinates": [],
+                "reason": "strategy_book_flat"
+              }
+            },
+            "terminal_domain_state": {
+              "satisfied": true,
+              "state": "satisfied",
+              "evidence_digest": "79f3eb67c7a40aaf5aa63f8e27ca75129e451e4994838c3096fb0a55335a2b89",
+              "detail": {
+                "non_terminal_runs": [],
+                "non_terminal_jobs": [],
+                "non_terminal_plans": [],
+                "reason": "all_terminal"
+              }
+            },
+            "no_live_evaluation_authority": {
+              "satisfied": true,
+              "state": "satisfied",
+              "evidence_digest": "ac038d0978ccc10ae2be66cd005c4dae98c0c3183b22c366243adad3942e421c",
+              "detail": {
+                "active_approvals": [],
+                "authority_jobs": [],
+                "strategy_status": "active",
+                "open_runs": [],
+                "reason": "no_evaluation_authority"
+              }
+            }
+          },
+          "evidence_digest": "750507ffa1450ed3267501564ffefe3600a293e80e82cb2086d52a7abe65a4ae",
+          "created_at": "2026-09-24T03:49:41.696153+00:00",
+          "stale": false
+        },
+        "child_log": "[strategy] pinned revision b71e897b-4e82-4ff9-a2c5-42fadd7e83f7: 4 members, target notional 389500.0, residual 10500.0, deltas {'NSE:HDFCBANK': 59, 'NSE:INFY': 67, 'NSE:RELIANCE': 65, 'NSE:TCS': 25}\n[strategy] no action: the platform refused the weights plan; no order was sent {\"allocation\": 500000.0, \"code\": \"CAPITAL_BASIS_MISMATCH\", \"stated\": 400000.0, \"status\": \"refused\"}\n"
+      }
+    },
+    "autonomous": {
+      "strategy_id": "hs_9cf8586cab6b45199b469932e268f28d",
+      "job_id": "hsj_60ad35086b2b4f69a5c31682f990d680",
+      "autonomous": true,
+      "terminal_job": {
+        "id": "hsj_60ad35086b2b4f69a5c31682f990d680",
+        "status": "recovery_required",
+        "process_cleanup_state": "confirmed",
+        "reconciled_at": "None"
+      },
+      "supervisor": {
+        "job_id": "hsj_60ad35086b2b4f69a5c31682f990d680",
+        "outcome": "exited",
+        "stop": "exited",
+        "log_overflow": false,
+        "log_ref": "/home/krishna/kite-algo/.phase5-workspace/autonomous/logs/hsj_60ad35086b2b4f69a5c31682f990d680.log",
+        "exit_code": 0,
+        "process_cleanup_reported": true,
+        "logs_shipped": true,
+        "terminal": "recovery_required",
+        "replacement_blocked": true
+      },
+      "debug": {
+        "attempt": "{\"attempt\": 1, \"error\": null, \"identity\": {\"boot_id\": \"c2070481-1124-4423-b248-15102315e793\", \"container_id\": \"Debian-home\", \"pgid\": 1839780, \"pid\": 1839780, \"session_id\": 1839780, \"start_time\": \"113684915\"}, \"job_id\": \"hsj_60ad35086b2b4f69a5c31682f990d680\", \"lease_epoch\": 1, \"lease_owner\": \"Debian-home:1836951\", \"log_ref\": \"/home/krishna/kite-algo/.phase5-workspace/autonomous/logs/hsj_60ad35086b2b4f69a5c31682f990d680.log\", \"phase\": \"recovery_required\", \"run_id\": \"run_3280381bb272418da45ded731ae69f06\", \"source_sha256\": \"ac043a4f944f5217d2c876037524098ec0755c89f9f067b9c65b08fa7bca71d4\", \"strategy_id\": \"hs_9cf8586cab6b45199b469932e268f28d\", \"updated_at\": \"2026-09-24T03:49:47.967597+00:00\", \"version_id\": \"hsv_a517de023f2d44b591625bb49e8b8078\"}",
+        "child_log": "[strategy] reading NSE:NIFTY50 candles for the ema(9) signal\n[strategy] NSE:NIFTY50 price=22600.0 ema(9)=22534.0 prior=22527.5 -> rising\n[strategy] signal=NSE:NIFTY50 traded=NSE:INFY reference_price=1450.0\n[strategy] requested execution c980440b-703d-4754-84d1-4d34b2ef2e0a status=queued\n[strategy] settled: coverage=known pending=0 positions={'INFY': 3}\n",
+        "supervisor": {
+          "job_id": "hsj_60ad35086b2b4f69a5c31682f990d680",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": "False",
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/autonomous/logs/hsj_60ad35086b2b4f69a5c31682f990d680.log",
+          "exit_code": "0",
+          "process_cleanup_reported": "True",
+          "logs_shipped": "True",
+          "terminal": "recovery_required",
+          "replacement_blocked": "True"
+        }
+      },
+      "acceptance": {
+        "label": "autonomous",
+        "ok": true,
+        "failures": [],
+        "axes": {
+          "requests_created": 1,
+          "requests_executed": 1,
+          "request_statuses": [
+            "executed"
+          ],
+          "execution_events": 2,
+          "submitted_events": 1,
+          "attributed_positions": 1,
+          "paper_orders": 1,
+          "paper_order_quantities": {
+            "INFY": 3
+          },
+          "option_runs": 0,
+          "option_runs_closed": 0,
+          "settlement_overall": "unsettled",
+          "settlement_axes": {
+            "quiescence": "satisfied",
+            "attribution_scoped_flatness": "failed",
+            "terminal_domain_state": "failed",
+            "no_live_evaluation_authority": "failed"
+          },
+          "child_outcome": "exited",
+          "child_exit_code": 0,
+          "orders_before_approval": null
+        }
+      },
+      "evidence": {
+        "requests": [
+          {
+            "request_id": "c980440b-703d-4754-84d1-4d34b2ef2e0a",
+            "plan_id": "07851bab-a92c-4224-bf52-e47c5e7b85f8",
+            "status": "executed",
+            "authorization_mode": "autonomous",
+            "decision_kind": "automatic",
+            "refusal_code": null,
+            "execution_detail": {
+              "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+              "result": {
+                "steps": [
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "INFY"
+                    },
+                    "step_no": 1,
+                    "paper_order_id": "PAPER-0DC72774BA67",
+                    "refusal_reason": null,
+                    "filled_quantity": 3
+                  }
+                ],
+                "status": "filled",
+                "plan_id": "07851bab-a92c-4224-bf52-e47c5e7b85f8",
+                "reservation_id": "3cf50199-0f2b-47bf-9c75-bde11ff48957",
+                "paper_order_ids": [
+                  "PAPER-0DC72774BA67"
+                ]
+              },
+              "grant_id": "312b884c-b904-4e43-8405-6ca8c1e2b1c5",
+              "approval_id": null,
+              "environment": "paper",
+              "decision_kind": "automatic",
+              "outcome_state": "filled",
+              "reservation_id": "3cf50199-0f2b-47bf-9c75-bde11ff48957",
+              "authorization_mode": "autonomous"
+            }
+          }
+        ],
+        "plans": [
+          {
+            "plan_id": "07851bab-a92c-4224-bf52-e47c5e7b85f8",
+            "plan_kind": "single_instrument",
+            "logical_plan": {
+              "product": "CNC",
+              "exchange": "NSE",
+              "target_kind": "single_instrument",
+              "tradingsymbol": "INFY",
+              "target_quantity": 3,
+              "instrument_token": 408065
+            },
+            "resolved_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 408065,
+                  "broker_symbol": "INFY",
+                  "instrument_id": "42c12044-7b4c-53ff-b02f-12cdd4943519",
+                  "tradingsymbol": "INFY",
+                  "broker_exchange": "NSE",
+                  "reference_price": 1450.0,
+                  "signed_quantity": 3
+                }
+              ],
+              "target_kind": "single_instrument",
+              "catalog_generation": "770c9424-d4a3-46cd-b5fb-f715cbfc9fcc"
+            }
+          }
+        ],
+        "reservations": [
+          {
+            "plan_id": "07851bab-a92c-4224-bf52-e47c5e7b85f8",
+            "status": "consumed",
+            "reserved_notional_inr": 4350.0,
+            "released_at": null,
+            "release_reason": null
+          }
+        ],
+        "execution_events": [
+          {
+            "plan_id": "07851bab-a92c-4224-bf52-e47c5e7b85f8",
+            "step_no": 1,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "07851bab-a92c-4224-bf52-e47c5e7b85f8",
+            "step_no": 1,
+            "event": "filled",
+            "filled_quantity": 3,
+            "refusal_reason": null
+          }
+        ],
+        "paper_orders": [
+          {
+            "order_id": "PAPER-0DC72774BA67",
+            "tradingsymbol": "INFY",
+            "transaction_type": "buy",
+            "quantity": 3,
+            "status": "filled"
+          }
+        ],
+        "attributed_positions": [
+          {
+            "tradingsymbol": "INFY",
+            "product": "CNC",
+            "net_quantity": 3,
+            "projection_version": 2
+          }
+        ],
+        "jobs": [
+          {
+            "id": "hsj_60ad35086b2b4f69a5c31682f990d680",
+            "status": "recovery_required",
+            "run_id": "run_3280381bb272418da45ded731ae69f06",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [
+          {
+            "grant_id": "312b884c-b904-4e43-8405-6ca8c1e2b1c5",
+            "version_id": "hsv_a517de023f2d44b591625bb49e8b8078",
+            "execution_environment": "paper",
+            "revoked_at": null
+          }
+        ],
+        "option_runs": [],
+        "reconciliation": {
+          "status": "refused",
+          "reason": "OPEN_EXPOSURE"
+        },
+        "settlement": {
+          "assessment_id": "9c401623-3059-4fcf-8f9b-b6cb455e70b5",
+          "strategy_id": "hs_9cf8586cab6b45199b469932e268f28d",
+          "account_id": "kite:paper-autonomous",
+          "execution_environment": "paper",
+          "overall": "unsettled",
+          "barrier_version": 2,
+          "axes": {
+            "quiescence": {
+              "satisfied": true,
+              "state": "satisfied",
+              "evidence_digest": "0d3d5cc3dee1e4a42f765475cd3b3604c861f87038bc9bdd2169cbb105578d48",
+              "detail": {
+                "barrier_version": 2,
+                "quiet_since_version": 2,
+                "newest_work_event": {
+                  "event": "work_resolved",
+                  "version": 2
+                },
+                "last_proof_at": "2026-09-24 03:49:48.486292+00:00"
+              }
+            },
+            "attribution_scoped_flatness": {
+              "satisfied": false,
+              "state": "failed",
+              "evidence_digest": "006b13f946ae6b2249dd81bcd59e817a3d426c044523c247336e7a60bd71ee04",
+              "detail": {
+                "execution_environment": "paper",
+                "open_legs": 1,
+                "open_coordinates": [
+                  "408065:CNC"
+                ],
+                "legs": [
+                  {
+                    "instrument_token": 408065,
+                    "exchange": "NSE",
+                    "tradingsymbol": "INFY",
+                    "product": "CNC",
+                    "net_quantity": 3,
+                    "identity_kind": "canonical"
+                  }
+                ],
+                "broker_nets_at_coordinates": {
+                  "408065:CNC": 3
+                },
+                "reason": "strategy_book_open"
+              }
+            },
+            "terminal_domain_state": {
+              "satisfied": false,
+              "state": "failed",
+              "evidence_digest": "cecdaf7179b76a7c1038c24d8657adcd431c9b2937d800e449f392c7dc351efc",
+              "detail": {
+                "non_terminal_runs": [
+                  "run_3280381bb272418da45ded731ae69f06"
+                ],
+                "non_terminal_jobs": [
+                  "hsj_60ad35086b2b4f69a5c31682f990d680"
+                ],
+                "non_terminal_plans": [],
+                "reason": "non_terminal_domain_state"
+              }
+            },
+            "no_live_evaluation_authority": {
+              "satisfied": false,
+              "state": "failed",
+              "evidence_digest": "721e0e7f0e31b1479a990dc50de1872692236251846ea724c5a026cde354b99d",
+              "detail": {
+                "active_approvals": [],
+                "authority_jobs": [],
+                "strategy_status": "active",
+                "open_runs": [
+                  "run_3280381bb272418da45ded731ae69f06"
+                ],
+                "reason": "evaluation_authority_present"
+              }
+            }
+          },
+          "evidence_digest": "4b9adef5e433045c04da271c54400e0d9e775fd9d3e624fb3059af8790ad1d89",
+          "created_at": "2026-09-24T03:49:48.795680+00:00",
+          "stale": false
+        },
+        "child_log": "[strategy] reading NSE:NIFTY50 candles for the ema(9) signal\n[strategy] NSE:NIFTY50 price=22600.0 ema(9)=22534.0 prior=22527.5 -> rising\n[strategy] signal=NSE:NIFTY50 traded=NSE:INFY reference_price=1450.0\n[strategy] requested execution c980440b-703d-4754-84d1-4d34b2ef2e0a status=queued\n[strategy] settled: coverage=known pending=0 positions={'INFY': 3}\n"
+      }
+    },
+    "momentum_manual_entry": {
+      "strategy_id": "hs_8219d55337144734a67ac077b6c93cc2",
+      "bystander_strategy_id": "hs_d542a813e17a45d680ac05b9dac04b42",
+      "job_ids": [
+        "hsj_83ec7b8f0d6c480faa0ed12bdb461d4a"
+      ],
+      "autonomous": false,
+      "orders_before_approval": 0,
+      "paper_orders": [
+        {
+          "tradingsymbol": "MOMENTUM00",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        },
+        {
+          "tradingsymbol": "MOMENTUM01",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        },
+        {
+          "tradingsymbol": "MOMENTUM02",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        },
+        {
+          "tradingsymbol": "MOMENTUM03",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        }
+      ],
+      "bystander_before": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "bystander_after": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [
+            {
+              "request_id": "b109a140-83f7-4ecb-8dca-151f3e020d42",
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": null,
+              "execution_detail": {
+                "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+                "result": {
+                  "steps": [
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM00"
+                      },
+                      "step_no": 1,
+                      "paper_order_id": "PAPER-11D53050D9A4",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM01"
+                      },
+                      "step_no": 2,
+                      "paper_order_id": "PAPER-0792A101F145",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM02"
+                      },
+                      "step_no": 3,
+                      "paper_order_id": "PAPER-87ACD3774F87",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM03"
+                      },
+                      "step_no": 4,
+                      "paper_order_id": "PAPER-03B4EF0417C5",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    }
+                  ],
+                  "status": "filled",
+                  "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+                  "reservation_id": "ab19d643-5b98-4559-8539-2ca674016943",
+                  "paper_order_ids": [
+                    "PAPER-11D53050D9A4",
+                    "PAPER-0792A101F145",
+                    "PAPER-87ACD3774F87",
+                    "PAPER-03B4EF0417C5"
+                  ]
+                },
+                "grant_id": null,
+                "approval_id": null,
+                "environment": "paper",
+                "decision_kind": "manual",
+                "outcome_state": "filled",
+                "reservation_id": "ab19d643-5b98-4559-8539-2ca674016943",
+                "authorization_mode": "approval_based"
+              }
+            }
+          ],
+          "plans": [
+            {
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "plan_kind": "intent_bundle",
+              "logical_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM00",
+                    "target_quantity": 51,
+                    "instrument_token": 300001
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM01",
+                    "target_quantity": 51,
+                    "instrument_token": 300002
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM02",
+                    "target_quantity": 51,
+                    "instrument_token": 300003
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM03",
+                    "target_quantity": 51,
+                    "instrument_token": 300004
+                  }
+                ],
+                "target_kind": "intent_bundle"
+              },
+              "resolved_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300001,
+                    "broker_symbol": "MOMENTUM00",
+                    "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                    "tradingsymbol": "MOMENTUM00",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300002,
+                    "broker_symbol": "MOMENTUM01",
+                    "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                    "tradingsymbol": "MOMENTUM01",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300003,
+                    "broker_symbol": "MOMENTUM02",
+                    "instrument_id": "e24fd9b8-c5ad-5e40-85f4-e5439af62cd2",
+                    "tradingsymbol": "MOMENTUM02",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300004,
+                    "broker_symbol": "MOMENTUM03",
+                    "instrument_id": "9e279824-c3bd-549d-9106-f4c2cdaf854f",
+                    "tradingsymbol": "MOMENTUM03",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  }
+                ],
+                "target_kind": "intent_bundle",
+                "catalog_generation": "770c9424-d4a3-46cd-b5fb-f715cbfc9fcc"
+              }
+            }
+          ],
+          "reservations": [
+            {
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "status": "consumed",
+              "reserved_notional_inr": 134538.0,
+              "released_at": null,
+              "release_reason": null
+            }
+          ],
+          "execution_events": [
+            {
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "step_no": 1,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "step_no": 1,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "step_no": 2,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "step_no": 2,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "step_no": 3,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "step_no": 3,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "step_no": 4,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "step_no": 4,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            }
+          ],
+          "paper_orders": [
+            {
+              "order_id": "PAPER-11D53050D9A4",
+              "tradingsymbol": "MOMENTUM00",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-0792A101F145",
+              "tradingsymbol": "MOMENTUM01",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-87ACD3774F87",
+              "tradingsymbol": "MOMENTUM02",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-03B4EF0417C5",
+              "tradingsymbol": "MOMENTUM03",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            }
+          ],
+          "attributed_positions": [
+            {
+              "tradingsymbol": "MOMENTUM01",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            },
+            {
+              "tradingsymbol": "MOMENTUM00",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            },
+            {
+              "tradingsymbol": "MOMENTUM03",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            },
+            {
+              "tradingsymbol": "MOMENTUM02",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            }
+          ],
+          "jobs": [
+            {
+              "id": "hsj_83ec7b8f0d6c480faa0ed12bdb461d4a",
+              "status": "recovery_required",
+              "run_id": "run_4417733d119744019d4e643f0a92ef2b",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [],
+          "option_runs": [],
+          "supervisor": {
+            "job_id": "hsj_83ec7b8f0d6c480faa0ed12bdb461d4a",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_manual_entry-0/logs/hsj_83ec7b8f0d6c480faa0ed12bdb461d4a.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": true
+          },
+          "job_id": "hsj_83ec7b8f0d6c480faa0ed12bdb461d4a",
+          "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-24 replay_days=6\n[strategy] monthly rebalance 2026-08-31: targets=4 notional=134538.0 changes=4 excluded=0\n[strategy] monthly_rebalance: submitting 4 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM01', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM02', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM03', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}]\n[strategy] monthly_rebalance requested b109a140-83f7-4ecb-8dca-151f3e020d42 status=awaiting_approval\n[strategy] monthly_rebalance dispatch status=executed\n"
+        }
+      ],
+      "jobs_runtime": [
+        {
+          "job_index": 0,
+          "job_id": "hsj_83ec7b8f0d6c480faa0ed12bdb461d4a",
+          "child_exited": true,
+          "approvals_while_child_alive": 1,
+          "requests_at_child_exit": [
+            {
+              "request_id": "b109a140-83f7-4ecb-8dca-151f3e020d42",
+              "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual"
+            }
+          ],
+          "request_timeline": [
+            {
+              "at": "2026-09-24T03:49:49.441076+00:00",
+              "statuses": {}
+            },
+            {
+              "at": "2026-09-24T03:49:53.079188+00:00",
+              "statuses": {
+                "b109a140-83f7-4ecb-8dca-151f3e020d42": "awaiting_approval"
+              }
+            },
+            {
+              "at": "2026-09-24T03:49:53.690808+00:00",
+              "statuses": {
+                "b109a140-83f7-4ecb-8dca-151f3e020d42": "queued"
+              }
+            },
+            {
+              "at": "2026-09-24T03:49:56.107127+00:00",
+              "statuses": {
+                "b109a140-83f7-4ecb-8dca-151f3e020d42": "executed"
+              }
+            }
+          ]
+        }
+      ],
+      "acceptance": {
+        "ok": true,
+        "failures": []
+      },
+      "first_evidence": {
+        "requests": [
+          {
+            "request_id": "b109a140-83f7-4ecb-8dca-151f3e020d42",
+            "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+            "status": "executed",
+            "authorization_mode": "approval_based",
+            "decision_kind": "manual",
+            "refusal_code": null,
+            "execution_detail": {
+              "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+              "result": {
+                "steps": [
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM00"
+                    },
+                    "step_no": 1,
+                    "paper_order_id": "PAPER-11D53050D9A4",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM01"
+                    },
+                    "step_no": 2,
+                    "paper_order_id": "PAPER-0792A101F145",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM02"
+                    },
+                    "step_no": 3,
+                    "paper_order_id": "PAPER-87ACD3774F87",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM03"
+                    },
+                    "step_no": 4,
+                    "paper_order_id": "PAPER-03B4EF0417C5",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  }
+                ],
+                "status": "filled",
+                "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+                "reservation_id": "ab19d643-5b98-4559-8539-2ca674016943",
+                "paper_order_ids": [
+                  "PAPER-11D53050D9A4",
+                  "PAPER-0792A101F145",
+                  "PAPER-87ACD3774F87",
+                  "PAPER-03B4EF0417C5"
+                ]
+              },
+              "grant_id": null,
+              "approval_id": null,
+              "environment": "paper",
+              "decision_kind": "manual",
+              "outcome_state": "filled",
+              "reservation_id": "ab19d643-5b98-4559-8539-2ca674016943",
+              "authorization_mode": "approval_based"
+            }
+          }
+        ],
+        "plans": [
+          {
+            "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+            "plan_kind": "intent_bundle",
+            "logical_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM00",
+                  "target_quantity": 51,
+                  "instrument_token": 300001
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM01",
+                  "target_quantity": 51,
+                  "instrument_token": 300002
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM02",
+                  "target_quantity": 51,
+                  "instrument_token": 300003
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM03",
+                  "target_quantity": 51,
+                  "instrument_token": 300004
+                }
+              ],
+              "target_kind": "intent_bundle"
+            },
+            "resolved_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300001,
+                  "broker_symbol": "MOMENTUM00",
+                  "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                  "tradingsymbol": "MOMENTUM00",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300002,
+                  "broker_symbol": "MOMENTUM01",
+                  "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                  "tradingsymbol": "MOMENTUM01",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300003,
+                  "broker_symbol": "MOMENTUM02",
+                  "instrument_id": "e24fd9b8-c5ad-5e40-85f4-e5439af62cd2",
+                  "tradingsymbol": "MOMENTUM02",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300004,
+                  "broker_symbol": "MOMENTUM03",
+                  "instrument_id": "9e279824-c3bd-549d-9106-f4c2cdaf854f",
+                  "tradingsymbol": "MOMENTUM03",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                }
+              ],
+              "target_kind": "intent_bundle",
+              "catalog_generation": "770c9424-d4a3-46cd-b5fb-f715cbfc9fcc"
+            }
+          }
+        ],
+        "reservations": [
+          {
+            "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+            "status": "consumed",
+            "reserved_notional_inr": 134538.0,
+            "released_at": null,
+            "release_reason": null
+          }
+        ],
+        "execution_events": [
+          {
+            "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+            "step_no": 1,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+            "step_no": 1,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+            "step_no": 2,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+            "step_no": 2,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+            "step_no": 3,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+            "step_no": 3,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+            "step_no": 4,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "85a0372e-4c8e-4cfa-ae2e-62df3a2f0627",
+            "step_no": 4,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          }
+        ],
+        "paper_orders": [
+          {
+            "order_id": "PAPER-11D53050D9A4",
+            "tradingsymbol": "MOMENTUM00",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-0792A101F145",
+            "tradingsymbol": "MOMENTUM01",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-87ACD3774F87",
+            "tradingsymbol": "MOMENTUM02",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-03B4EF0417C5",
+            "tradingsymbol": "MOMENTUM03",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          }
+        ],
+        "attributed_positions": [
+          {
+            "tradingsymbol": "MOMENTUM01",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          },
+          {
+            "tradingsymbol": "MOMENTUM00",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          },
+          {
+            "tradingsymbol": "MOMENTUM03",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          },
+          {
+            "tradingsymbol": "MOMENTUM02",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          }
+        ],
+        "jobs": [
+          {
+            "id": "hsj_83ec7b8f0d6c480faa0ed12bdb461d4a",
+            "status": "recovery_required",
+            "run_id": "run_4417733d119744019d4e643f0a92ef2b",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "supervisor": {
+          "job_id": "hsj_83ec7b8f0d6c480faa0ed12bdb461d4a",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": false,
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_manual_entry-0/logs/hsj_83ec7b8f0d6c480faa0ed12bdb461d4a.log",
+          "exit_code": 0,
+          "process_cleanup_reported": true,
+          "logs_shipped": true,
+          "terminal": "recovery_required",
+          "replacement_blocked": true
+        },
+        "job_id": "hsj_83ec7b8f0d6c480faa0ed12bdb461d4a",
+        "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-24 replay_days=6\n[strategy] monthly rebalance 2026-08-31: targets=4 notional=134538.0 changes=4 excluded=0\n[strategy] monthly_rebalance: submitting 4 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM01', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM02', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM03', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}]\n[strategy] monthly_rebalance requested b109a140-83f7-4ecb-8dca-151f3e020d42 status=awaiting_approval\n[strategy] monthly_rebalance dispatch status=executed\n"
+      }
+    },
+    "momentum_autonomous_entry": {
+      "strategy_id": "hs_3c492d4a93304fc5856f297fd6367e48",
+      "bystander_strategy_id": "hs_c0250c4b86664481b921cae9cc784e01",
+      "job_ids": [
+        "hsj_a03db674b7984b9083ab6e6689dcaed0"
+      ],
+      "autonomous": true,
+      "orders_before_approval": null,
+      "paper_orders": [
+        {
+          "tradingsymbol": "MOMENTUM00",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        },
+        {
+          "tradingsymbol": "MOMENTUM01",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        },
+        {
+          "tradingsymbol": "MOMENTUM02",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        },
+        {
+          "tradingsymbol": "MOMENTUM03",
+          "transaction_type": "buy",
+          "quantity": 51,
+          "status": "filled"
+        }
+      ],
+      "bystander_before": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "bystander_after": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [
+            {
+              "request_id": "93fee7d1-6fbe-4dcc-b03b-06806f93e636",
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "status": "executed",
+              "authorization_mode": "autonomous",
+              "decision_kind": "automatic",
+              "refusal_code": null,
+              "execution_detail": {
+                "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+                "result": {
+                  "steps": [
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM00"
+                      },
+                      "step_no": 1,
+                      "paper_order_id": "PAPER-F0C9ED5DAEF5",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM01"
+                      },
+                      "step_no": 2,
+                      "paper_order_id": "PAPER-6E227C52CFD0",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM02"
+                      },
+                      "step_no": 3,
+                      "paper_order_id": "PAPER-E7125F15EEAA",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM03"
+                      },
+                      "step_no": 4,
+                      "paper_order_id": "PAPER-25E37124ACA4",
+                      "refusal_reason": null,
+                      "filled_quantity": 51
+                    }
+                  ],
+                  "status": "filled",
+                  "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+                  "reservation_id": "868d0f84-fe84-4e2f-8ec3-7e93b3359bd9",
+                  "paper_order_ids": [
+                    "PAPER-F0C9ED5DAEF5",
+                    "PAPER-6E227C52CFD0",
+                    "PAPER-E7125F15EEAA",
+                    "PAPER-25E37124ACA4"
+                  ]
+                },
+                "grant_id": "114f6939-eee5-475b-b6fe-a4741bffd2ba",
+                "approval_id": null,
+                "environment": "paper",
+                "decision_kind": "automatic",
+                "outcome_state": "filled",
+                "reservation_id": "868d0f84-fe84-4e2f-8ec3-7e93b3359bd9",
+                "authorization_mode": "autonomous"
+              }
+            }
+          ],
+          "plans": [
+            {
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "plan_kind": "intent_bundle",
+              "logical_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM00",
+                    "target_quantity": 51,
+                    "instrument_token": 300001
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM01",
+                    "target_quantity": 51,
+                    "instrument_token": 300002
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM02",
+                    "target_quantity": 51,
+                    "instrument_token": 300003
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM03",
+                    "target_quantity": 51,
+                    "instrument_token": 300004
+                  }
+                ],
+                "target_kind": "intent_bundle"
+              },
+              "resolved_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300001,
+                    "broker_symbol": "MOMENTUM00",
+                    "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                    "tradingsymbol": "MOMENTUM00",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300002,
+                    "broker_symbol": "MOMENTUM01",
+                    "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                    "tradingsymbol": "MOMENTUM01",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300003,
+                    "broker_symbol": "MOMENTUM02",
+                    "instrument_id": "e24fd9b8-c5ad-5e40-85f4-e5439af62cd2",
+                    "tradingsymbol": "MOMENTUM02",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300004,
+                    "broker_symbol": "MOMENTUM03",
+                    "instrument_id": "9e279824-c3bd-549d-9106-f4c2cdaf854f",
+                    "tradingsymbol": "MOMENTUM03",
+                    "broker_exchange": "NSE",
+                    "reference_price": 659.5,
+                    "signed_quantity": 51
+                  }
+                ],
+                "target_kind": "intent_bundle",
+                "catalog_generation": "770c9424-d4a3-46cd-b5fb-f715cbfc9fcc"
+              }
+            }
+          ],
+          "reservations": [
+            {
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "status": "consumed",
+              "reserved_notional_inr": 134538.0,
+              "released_at": null,
+              "release_reason": null
+            }
+          ],
+          "execution_events": [
+            {
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "step_no": 1,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "step_no": 1,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "step_no": 2,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "step_no": 2,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "step_no": 3,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "step_no": 3,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "step_no": 4,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "step_no": 4,
+              "event": "filled",
+              "filled_quantity": 51,
+              "refusal_reason": null
+            }
+          ],
+          "paper_orders": [
+            {
+              "order_id": "PAPER-F0C9ED5DAEF5",
+              "tradingsymbol": "MOMENTUM00",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-6E227C52CFD0",
+              "tradingsymbol": "MOMENTUM01",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-E7125F15EEAA",
+              "tradingsymbol": "MOMENTUM02",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-25E37124ACA4",
+              "tradingsymbol": "MOMENTUM03",
+              "transaction_type": "buy",
+              "quantity": 51,
+              "status": "filled"
+            }
+          ],
+          "attributed_positions": [
+            {
+              "tradingsymbol": "MOMENTUM01",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            },
+            {
+              "tradingsymbol": "MOMENTUM00",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            },
+            {
+              "tradingsymbol": "MOMENTUM03",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            },
+            {
+              "tradingsymbol": "MOMENTUM02",
+              "product": "CNC",
+              "net_quantity": 51,
+              "projection_version": 3
+            }
+          ],
+          "jobs": [
+            {
+              "id": "hsj_a03db674b7984b9083ab6e6689dcaed0",
+              "status": "recovery_required",
+              "run_id": "run_9bf95a1009a246c6a79cb3e5f6e3922c",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [
+            {
+              "grant_id": "114f6939-eee5-475b-b6fe-a4741bffd2ba",
+              "version_id": "hsv_b29a17b3f3a94d2eab42535c18e065f9",
+              "execution_environment": "paper",
+              "revoked_at": null
+            }
+          ],
+          "option_runs": [],
+          "supervisor": {
+            "job_id": "hsj_a03db674b7984b9083ab6e6689dcaed0",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_autonomous_entry-0/logs/hsj_a03db674b7984b9083ab6e6689dcaed0.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": true
+          },
+          "job_id": "hsj_a03db674b7984b9083ab6e6689dcaed0",
+          "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-24 replay_days=6\n[strategy] monthly rebalance 2026-08-31: targets=4 notional=134538.0 changes=4 excluded=0\n[strategy] monthly_rebalance: submitting 4 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM01', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM02', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM03', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}]\n[strategy] monthly_rebalance requested 93fee7d1-6fbe-4dcc-b03b-06806f93e636 status=queued\n[strategy] monthly_rebalance dispatch status=executed\n"
+        }
+      ],
+      "jobs_runtime": [
+        {
+          "job_index": 0,
+          "job_id": "hsj_a03db674b7984b9083ab6e6689dcaed0",
+          "child_exited": true,
+          "approvals_while_child_alive": 0,
+          "requests_at_child_exit": [
+            {
+              "request_id": "93fee7d1-6fbe-4dcc-b03b-06806f93e636",
+              "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+              "status": "executed",
+              "authorization_mode": "autonomous",
+              "decision_kind": "automatic"
+            }
+          ],
+          "request_timeline": [
+            {
+              "at": "2026-09-24T03:49:59.333386+00:00",
+              "statuses": {}
+            },
+            {
+              "at": "2026-09-24T03:50:02.459984+00:00",
+              "statuses": {
+                "93fee7d1-6fbe-4dcc-b03b-06806f93e636": "queued"
+              }
+            },
+            {
+              "at": "2026-09-24T03:50:04.882825+00:00",
+              "statuses": {
+                "93fee7d1-6fbe-4dcc-b03b-06806f93e636": "executed"
+              }
+            }
+          ]
+        }
+      ],
+      "acceptance": {
+        "ok": true,
+        "failures": []
+      },
+      "first_evidence": {
+        "requests": [
+          {
+            "request_id": "93fee7d1-6fbe-4dcc-b03b-06806f93e636",
+            "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+            "status": "executed",
+            "authorization_mode": "autonomous",
+            "decision_kind": "automatic",
+            "refusal_code": null,
+            "execution_detail": {
+              "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+              "result": {
+                "steps": [
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM00"
+                    },
+                    "step_no": 1,
+                    "paper_order_id": "PAPER-F0C9ED5DAEF5",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM01"
+                    },
+                    "step_no": 2,
+                    "paper_order_id": "PAPER-6E227C52CFD0",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM02"
+                    },
+                    "step_no": 3,
+                    "paper_order_id": "PAPER-E7125F15EEAA",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM03"
+                    },
+                    "step_no": 4,
+                    "paper_order_id": "PAPER-25E37124ACA4",
+                    "refusal_reason": null,
+                    "filled_quantity": 51
+                  }
+                ],
+                "status": "filled",
+                "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+                "reservation_id": "868d0f84-fe84-4e2f-8ec3-7e93b3359bd9",
+                "paper_order_ids": [
+                  "PAPER-F0C9ED5DAEF5",
+                  "PAPER-6E227C52CFD0",
+                  "PAPER-E7125F15EEAA",
+                  "PAPER-25E37124ACA4"
+                ]
+              },
+              "grant_id": "114f6939-eee5-475b-b6fe-a4741bffd2ba",
+              "approval_id": null,
+              "environment": "paper",
+              "decision_kind": "automatic",
+              "outcome_state": "filled",
+              "reservation_id": "868d0f84-fe84-4e2f-8ec3-7e93b3359bd9",
+              "authorization_mode": "autonomous"
+            }
+          }
+        ],
+        "plans": [
+          {
+            "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+            "plan_kind": "intent_bundle",
+            "logical_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM00",
+                  "target_quantity": 51,
+                  "instrument_token": 300001
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM01",
+                  "target_quantity": 51,
+                  "instrument_token": 300002
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM02",
+                  "target_quantity": 51,
+                  "instrument_token": 300003
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM03",
+                  "target_quantity": 51,
+                  "instrument_token": 300004
+                }
+              ],
+              "target_kind": "intent_bundle"
+            },
+            "resolved_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300001,
+                  "broker_symbol": "MOMENTUM00",
+                  "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                  "tradingsymbol": "MOMENTUM00",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300002,
+                  "broker_symbol": "MOMENTUM01",
+                  "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                  "tradingsymbol": "MOMENTUM01",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300003,
+                  "broker_symbol": "MOMENTUM02",
+                  "instrument_id": "e24fd9b8-c5ad-5e40-85f4-e5439af62cd2",
+                  "tradingsymbol": "MOMENTUM02",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300004,
+                  "broker_symbol": "MOMENTUM03",
+                  "instrument_id": "9e279824-c3bd-549d-9106-f4c2cdaf854f",
+                  "tradingsymbol": "MOMENTUM03",
+                  "broker_exchange": "NSE",
+                  "reference_price": 659.5,
+                  "signed_quantity": 51
+                }
+              ],
+              "target_kind": "intent_bundle",
+              "catalog_generation": "770c9424-d4a3-46cd-b5fb-f715cbfc9fcc"
+            }
+          }
+        ],
+        "reservations": [
+          {
+            "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+            "status": "consumed",
+            "reserved_notional_inr": 134538.0,
+            "released_at": null,
+            "release_reason": null
+          }
+        ],
+        "execution_events": [
+          {
+            "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+            "step_no": 1,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+            "step_no": 1,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+            "step_no": 2,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+            "step_no": 2,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+            "step_no": 3,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+            "step_no": 3,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+            "step_no": 4,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "437b8988-448a-4c3c-b507-8c56546579db",
+            "step_no": 4,
+            "event": "filled",
+            "filled_quantity": 51,
+            "refusal_reason": null
+          }
+        ],
+        "paper_orders": [
+          {
+            "order_id": "PAPER-F0C9ED5DAEF5",
+            "tradingsymbol": "MOMENTUM00",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-6E227C52CFD0",
+            "tradingsymbol": "MOMENTUM01",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-E7125F15EEAA",
+            "tradingsymbol": "MOMENTUM02",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-25E37124ACA4",
+            "tradingsymbol": "MOMENTUM03",
+            "transaction_type": "buy",
+            "quantity": 51,
+            "status": "filled"
+          }
+        ],
+        "attributed_positions": [
+          {
+            "tradingsymbol": "MOMENTUM01",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          },
+          {
+            "tradingsymbol": "MOMENTUM00",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          },
+          {
+            "tradingsymbol": "MOMENTUM03",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          },
+          {
+            "tradingsymbol": "MOMENTUM02",
+            "product": "CNC",
+            "net_quantity": 51,
+            "projection_version": 3
+          }
+        ],
+        "jobs": [
+          {
+            "id": "hsj_a03db674b7984b9083ab6e6689dcaed0",
+            "status": "recovery_required",
+            "run_id": "run_9bf95a1009a246c6a79cb3e5f6e3922c",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [
+          {
+            "grant_id": "114f6939-eee5-475b-b6fe-a4741bffd2ba",
+            "version_id": "hsv_b29a17b3f3a94d2eab42535c18e065f9",
+            "execution_environment": "paper",
+            "revoked_at": null
+          }
+        ],
+        "option_runs": [],
+        "supervisor": {
+          "job_id": "hsj_a03db674b7984b9083ab6e6689dcaed0",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": false,
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_autonomous_entry-0/logs/hsj_a03db674b7984b9083ab6e6689dcaed0.log",
+          "exit_code": 0,
+          "process_cleanup_reported": true,
+          "logs_shipped": true,
+          "terminal": "recovery_required",
+          "replacement_blocked": true
+        },
+        "job_id": "hsj_a03db674b7984b9083ab6e6689dcaed0",
+        "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-24 replay_days=6\n[strategy] monthly rebalance 2026-08-31: targets=4 notional=134538.0 changes=4 excluded=0\n[strategy] monthly_rebalance: submitting 4 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM01', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM02', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}, {'symbol': 'MOMENTUM03', 'current_quantity': 0, 'target_quantity': 51, 'quantity_delta': 51}]\n[strategy] monthly_rebalance requested 93fee7d1-6fbe-4dcc-b03b-06806f93e636 status=queued\n[strategy] monthly_rebalance dispatch status=executed\n"
+      }
+    },
+    "momentum_breadth_exit": {
+      "strategy_id": "hs_1fe351ec161541ec8ef912405e58e784",
+      "bystander_strategy_id": "hs_d246c791a61e441296a9bfacf11622d4",
+      "job_ids": [
+        "hsj_58ff723fba4f4197befa7d11e05eeee7"
+      ],
+      "autonomous": false,
+      "orders_before_approval": 0,
+      "paper_orders": [
+        {
+          "tradingsymbol": "MOMENTUM00",
+          "transaction_type": "sell",
+          "quantity": 20,
+          "status": "filled"
+        },
+        {
+          "tradingsymbol": "MOMENTUM01",
+          "transaction_type": "sell",
+          "quantity": 10,
+          "status": "filled"
+        }
+      ],
+      "bystander_before": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "bystander_after": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [
+            {
+              "request_id": "1385e6e5-18d4-4225-b3a7-67d821a8e6be",
+              "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual",
+              "refusal_code": null,
+              "execution_detail": {
+                "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+                "result": {
+                  "steps": [
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM00"
+                      },
+                      "step_no": 1,
+                      "paper_order_id": "PAPER-9463ED60FC59",
+                      "refusal_reason": null,
+                      "filled_quantity": 20
+                    },
+                    {
+                      "event": "filled",
+                      "detail": {
+                        "fill_price": "1500.000000",
+                        "tradingsymbol": "MOMENTUM01"
+                      },
+                      "step_no": 2,
+                      "paper_order_id": "PAPER-B8CCEAAE7451",
+                      "refusal_reason": null,
+                      "filled_quantity": 10
+                    }
+                  ],
+                  "status": "filled",
+                  "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+                  "reservation_id": "1ad25121-e246-4636-b6a2-738fb4c49724",
+                  "paper_order_ids": [
+                    "PAPER-9463ED60FC59",
+                    "PAPER-B8CCEAAE7451"
+                  ]
+                },
+                "grant_id": null,
+                "approval_id": null,
+                "environment": "paper",
+                "decision_kind": "manual",
+                "outcome_state": "filled",
+                "reservation_id": "1ad25121-e246-4636-b6a2-738fb4c49724",
+                "authorization_mode": "approval_based"
+              }
+            }
+          ],
+          "plans": [
+            {
+              "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+              "plan_kind": "intent_bundle",
+              "logical_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM00",
+                    "target_quantity": 0,
+                    "instrument_token": 300001
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "target_kind": "single_instrument",
+                    "tradingsymbol": "MOMENTUM01",
+                    "target_quantity": 0,
+                    "instrument_token": 300002
+                  }
+                ],
+                "target_kind": "intent_bundle"
+              },
+              "resolved_plan": {
+                "legs": [
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300001,
+                    "broker_symbol": "MOMENTUM00",
+                    "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                    "tradingsymbol": "MOMENTUM00",
+                    "broker_exchange": "NSE",
+                    "reference_price": null,
+                    "signed_quantity": 0
+                  },
+                  {
+                    "product": "CNC",
+                    "exchange": "NSE",
+                    "lot_size": 1,
+                    "lot_source": "catalog",
+                    "broker_token": 300002,
+                    "broker_symbol": "MOMENTUM01",
+                    "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                    "tradingsymbol": "MOMENTUM01",
+                    "broker_exchange": "NSE",
+                    "reference_price": null,
+                    "signed_quantity": 0
+                  }
+                ],
+                "target_kind": "intent_bundle",
+                "catalog_generation": "770c9424-d4a3-46cd-b5fb-f715cbfc9fcc"
+              }
+            }
+          ],
+          "reservations": [
+            {
+              "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+              "status": "consumed",
+              "reserved_notional_inr": 0.0,
+              "released_at": null,
+              "release_reason": null
+            }
+          ],
+          "execution_events": [
+            {
+              "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+              "step_no": 1,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+              "step_no": 1,
+              "event": "filled",
+              "filled_quantity": 20,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+              "step_no": 2,
+              "event": "submitted",
+              "filled_quantity": null,
+              "refusal_reason": null
+            },
+            {
+              "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+              "step_no": 2,
+              "event": "filled",
+              "filled_quantity": 10,
+              "refusal_reason": null
+            }
+          ],
+          "paper_orders": [
+            {
+              "order_id": "PAPER-9463ED60FC59",
+              "tradingsymbol": "MOMENTUM00",
+              "transaction_type": "sell",
+              "quantity": 20,
+              "status": "filled"
+            },
+            {
+              "order_id": "PAPER-B8CCEAAE7451",
+              "tradingsymbol": "MOMENTUM01",
+              "transaction_type": "sell",
+              "quantity": 10,
+              "status": "filled"
+            }
+          ],
+          "attributed_positions": [
+            {
+              "tradingsymbol": "MOMENTUM01",
+              "product": "CNC",
+              "net_quantity": -10,
+              "projection_version": 2
+            },
+            {
+              "tradingsymbol": "MOMENTUM00",
+              "product": "CNC",
+              "net_quantity": -20,
+              "projection_version": 2
+            }
+          ],
+          "jobs": [
+            {
+              "id": "hsj_58ff723fba4f4197befa7d11e05eeee7",
+              "status": "recovery_required",
+              "run_id": "run_968164ed138a477b9cd0b09a958ef664",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [],
+          "option_runs": [],
+          "supervisor": {
+            "job_id": "hsj_58ff723fba4f4197befa7d11e05eeee7",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_breadth_exit-0/logs/hsj_58ff723fba4f4197befa7d11e05eeee7.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": true
+          },
+          "job_id": "hsj_58ff723fba4f4197befa7d11e05eeee7",
+          "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 0/4)\n[strategy] regime DEFENSIVE exposure=0 breadth=0/4 (0.0) index=659.5>622.25 anchor=2026-08-24 replay_days=6\n[strategy] breadth_exit: submitting 2 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 20, 'target_quantity': 0, 'quantity_delta': -20}, {'symbol': 'MOMENTUM01', 'current_quantity': 10, 'target_quantity': 0, 'quantity_delta': -10}]\n[strategy] breadth_exit requested 1385e6e5-18d4-4225-b3a7-67d821a8e6be status=awaiting_approval\n[strategy] breadth_exit dispatch status=executed\n"
+        }
+      ],
+      "jobs_runtime": [
+        {
+          "job_index": 0,
+          "job_id": "hsj_58ff723fba4f4197befa7d11e05eeee7",
+          "child_exited": true,
+          "approvals_while_child_alive": 1,
+          "requests_at_child_exit": [
+            {
+              "request_id": "1385e6e5-18d4-4225-b3a7-67d821a8e6be",
+              "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+              "status": "executed",
+              "authorization_mode": "approval_based",
+              "decision_kind": "manual"
+            }
+          ],
+          "request_timeline": [
+            {
+              "at": "2026-09-24T03:50:06.391034+00:00",
+              "statuses": {}
+            },
+            {
+              "at": "2026-09-24T03:50:09.503538+00:00",
+              "statuses": {
+                "1385e6e5-18d4-4225-b3a7-67d821a8e6be": "awaiting_approval"
+              }
+            },
+            {
+              "at": "2026-09-24T03:50:10.100526+00:00",
+              "statuses": {
+                "1385e6e5-18d4-4225-b3a7-67d821a8e6be": "queued"
+              }
+            },
+            {
+              "at": "2026-09-24T03:50:11.808757+00:00",
+              "statuses": {
+                "1385e6e5-18d4-4225-b3a7-67d821a8e6be": "executed"
+              }
+            }
+          ]
+        }
+      ],
+      "acceptance": {
+        "ok": true,
+        "failures": []
+      },
+      "first_evidence": {
+        "requests": [
+          {
+            "request_id": "1385e6e5-18d4-4225-b3a7-67d821a8e6be",
+            "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+            "status": "executed",
+            "authorization_mode": "approval_based",
+            "decision_kind": "manual",
+            "refusal_code": null,
+            "execution_detail": {
+              "note": "the request was dispatched; fills, settlement and protection are tracked by the execution trail",
+              "result": {
+                "steps": [
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM00"
+                    },
+                    "step_no": 1,
+                    "paper_order_id": "PAPER-9463ED60FC59",
+                    "refusal_reason": null,
+                    "filled_quantity": 20
+                  },
+                  {
+                    "event": "filled",
+                    "detail": {
+                      "fill_price": "1500.000000",
+                      "tradingsymbol": "MOMENTUM01"
+                    },
+                    "step_no": 2,
+                    "paper_order_id": "PAPER-B8CCEAAE7451",
+                    "refusal_reason": null,
+                    "filled_quantity": 10
+                  }
+                ],
+                "status": "filled",
+                "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+                "reservation_id": "1ad25121-e246-4636-b6a2-738fb4c49724",
+                "paper_order_ids": [
+                  "PAPER-9463ED60FC59",
+                  "PAPER-B8CCEAAE7451"
+                ]
+              },
+              "grant_id": null,
+              "approval_id": null,
+              "environment": "paper",
+              "decision_kind": "manual",
+              "outcome_state": "filled",
+              "reservation_id": "1ad25121-e246-4636-b6a2-738fb4c49724",
+              "authorization_mode": "approval_based"
+            }
+          }
+        ],
+        "plans": [
+          {
+            "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+            "plan_kind": "intent_bundle",
+            "logical_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM00",
+                  "target_quantity": 0,
+                  "instrument_token": 300001
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "target_kind": "single_instrument",
+                  "tradingsymbol": "MOMENTUM01",
+                  "target_quantity": 0,
+                  "instrument_token": 300002
+                }
+              ],
+              "target_kind": "intent_bundle"
+            },
+            "resolved_plan": {
+              "legs": [
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300001,
+                  "broker_symbol": "MOMENTUM00",
+                  "instrument_id": "966e9c80-ce85-5ff2-8d05-00834ae52909",
+                  "tradingsymbol": "MOMENTUM00",
+                  "broker_exchange": "NSE",
+                  "reference_price": null,
+                  "signed_quantity": 0
+                },
+                {
+                  "product": "CNC",
+                  "exchange": "NSE",
+                  "lot_size": 1,
+                  "lot_source": "catalog",
+                  "broker_token": 300002,
+                  "broker_symbol": "MOMENTUM01",
+                  "instrument_id": "40094428-925f-58d9-97eb-5f700b7f1829",
+                  "tradingsymbol": "MOMENTUM01",
+                  "broker_exchange": "NSE",
+                  "reference_price": null,
+                  "signed_quantity": 0
+                }
+              ],
+              "target_kind": "intent_bundle",
+              "catalog_generation": "770c9424-d4a3-46cd-b5fb-f715cbfc9fcc"
+            }
+          }
+        ],
+        "reservations": [
+          {
+            "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+            "status": "consumed",
+            "reserved_notional_inr": 0.0,
+            "released_at": null,
+            "release_reason": null
+          }
+        ],
+        "execution_events": [
+          {
+            "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+            "step_no": 1,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+            "step_no": 1,
+            "event": "filled",
+            "filled_quantity": 20,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+            "step_no": 2,
+            "event": "submitted",
+            "filled_quantity": null,
+            "refusal_reason": null
+          },
+          {
+            "plan_id": "85e68475-59d5-484c-bade-06a7336246be",
+            "step_no": 2,
+            "event": "filled",
+            "filled_quantity": 10,
+            "refusal_reason": null
+          }
+        ],
+        "paper_orders": [
+          {
+            "order_id": "PAPER-9463ED60FC59",
+            "tradingsymbol": "MOMENTUM00",
+            "transaction_type": "sell",
+            "quantity": 20,
+            "status": "filled"
+          },
+          {
+            "order_id": "PAPER-B8CCEAAE7451",
+            "tradingsymbol": "MOMENTUM01",
+            "transaction_type": "sell",
+            "quantity": 10,
+            "status": "filled"
+          }
+        ],
+        "attributed_positions": [
+          {
+            "tradingsymbol": "MOMENTUM01",
+            "product": "CNC",
+            "net_quantity": -10,
+            "projection_version": 2
+          },
+          {
+            "tradingsymbol": "MOMENTUM00",
+            "product": "CNC",
+            "net_quantity": -20,
+            "projection_version": 2
+          }
+        ],
+        "jobs": [
+          {
+            "id": "hsj_58ff723fba4f4197befa7d11e05eeee7",
+            "status": "recovery_required",
+            "run_id": "run_968164ed138a477b9cd0b09a958ef664",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "supervisor": {
+          "job_id": "hsj_58ff723fba4f4197befa7d11e05eeee7",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": false,
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_breadth_exit-0/logs/hsj_58ff723fba4f4197befa7d11e05eeee7.log",
+          "exit_code": 0,
+          "process_cleanup_reported": true,
+          "logs_shipped": true,
+          "terminal": "recovery_required",
+          "replacement_blocked": true
+        },
+        "job_id": "hsj_58ff723fba4f4197befa7d11e05eeee7",
+        "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-20 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 0/4)\n[strategy] regime DEFENSIVE exposure=0 breadth=0/4 (0.0) index=659.5>622.25 anchor=2026-08-24 replay_days=6\n[strategy] breadth_exit: submitting 2 exact-quantity legs [{'symbol': 'MOMENTUM00', 'current_quantity': 20, 'target_quantity': 0, 'quantity_delta': -20}, {'symbol': 'MOMENTUM01', 'current_quantity': 10, 'target_quantity': 0, 'quantity_delta': -10}]\n[strategy] breadth_exit requested 1385e6e5-18d4-4225-b3a7-67d821a8e6be status=awaiting_approval\n[strategy] breadth_exit dispatch status=executed\n"
+      }
+    },
+    "momentum_mid_month_deferral": {
+      "strategy_id": "hs_3bc241efdda244f0bafe930c171c38be",
+      "bystander_strategy_id": "hs_a6bc3e581ce24f99aac67e9772f751da",
+      "job_ids": [
+        "hsj_4f45ba9806ee49788df602dd9c4234fd"
+      ],
+      "autonomous": false,
+      "orders_before_approval": null,
+      "paper_orders": [],
+      "bystander_before": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "bystander_after": [
+        {
+          "tradingsymbol": "BYSTANDER",
+          "net_quantity": 7,
+          "product": "CNC",
+          "exchange": "NSE"
+        }
+      ],
+      "jobs": [
+        {
+          "requests": [],
+          "plans": [],
+          "reservations": [],
+          "execution_events": [],
+          "paper_orders": [],
+          "attributed_positions": [],
+          "jobs": [
+            {
+              "id": "hsj_4f45ba9806ee49788df602dd9c4234fd",
+              "status": "stopped",
+              "run_id": "run_9f93570e8b0344af9792d80238c45ca3",
+              "attempt": 1,
+              "process_cleanup_state": "confirmed"
+            }
+          ],
+          "grants": [],
+          "option_runs": [],
+          "supervisor": {
+            "job_id": "hsj_4f45ba9806ee49788df602dd9c4234fd",
+            "outcome": "exited",
+            "stop": "exited",
+            "log_overflow": false,
+            "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_mid_month_deferral-0/logs/hsj_4f45ba9806ee49788df602dd9c4234fd.log",
+            "exit_code": 0,
+            "process_cleanup_reported": true,
+            "logs_shipped": true,
+            "terminal": "recovery_required",
+            "replacement_blocked": true
+          },
+          "job_id": "hsj_4f45ba9806ee49788df602dd9c4234fd",
+          "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-07 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-11 replay_days=6\n[strategy] no action: off the monthly rebalance session; no entry {\"as_of\": \"2026-08-18\", \"breadth\": \"4/4\", \"regime\": \"RISK_ON\"}\n"
+        }
+      ],
+      "jobs_runtime": [
+        {
+          "job_index": 0,
+          "job_id": "hsj_4f45ba9806ee49788df602dd9c4234fd",
+          "child_exited": true,
+          "approvals_while_child_alive": 0,
+          "requests_at_child_exit": [],
+          "request_timeline": [
+            {
+              "at": "2026-09-24T03:50:13.471467+00:00",
+              "statuses": {}
+            }
+          ]
+        }
+      ],
+      "acceptance": {
+        "ok": true,
+        "failures": []
+      },
+      "first_evidence": {
+        "requests": [],
+        "plans": [],
+        "reservations": [],
+        "execution_events": [],
+        "paper_orders": [],
+        "attributed_positions": [],
+        "jobs": [
+          {
+            "id": "hsj_4f45ba9806ee49788df602dd9c4234fd",
+            "status": "stopped",
+            "run_id": "run_9f93570e8b0344af9792d80238c45ca3",
+            "attempt": 1,
+            "process_cleanup_state": "confirmed"
+          }
+        ],
+        "grants": [],
+        "option_runs": [],
+        "supervisor": {
+          "job_id": "hsj_4f45ba9806ee49788df602dd9c4234fd",
+          "outcome": "exited",
+          "stop": "exited",
+          "log_overflow": false,
+          "log_ref": "/home/krishna/kite-algo/.phase5-workspace/momentum_mid_month_deferral-0/logs/hsj_4f45ba9806ee49788df602dd9c4234fd.log",
+          "exit_code": 0,
+          "process_cleanup_reported": true,
+          "logs_shipped": true,
+          "terminal": "recovery_required",
+          "replacement_blocked": true
+        },
+        "job_id": "hsj_4f45ba9806ee49788df602dd9c4234fd",
+        "child_log": "[strategy] reading daily history for 4 constituents from 2025-07-07 to 2026-09-24\n[strategy] thread pool unavailable (RuntimeError); reading sequentially\n[strategy] constituent history 4/4 read\n[strategy] regime replay 6/6 sessions (breadth 4/4)\n[strategy] regime RISK_ON exposure=1 breadth=4/4 (1.0) index=659.5>609.75 anchor=2026-08-11 replay_days=6\n[strategy] no action: off the monthly rebalance session; no entry {\"as_of\": \"2026-08-18\", \"breadth\": \"4/4\", \"regime\": \"RISK_ON\"}\n"
+      }
+    },
+    "recovery": {
+      "strategy_id": "hs_8d114ee208cb4c10824eb44aa2d92407",
+      "counts": {
+        "scanned": 4,
+        "proved_submitted": 1,
+        "proved_rejected": 1,
+        "unresolved": 2,
+        "stale": 0
+      },
+      "statuses": {
+        "withheld": "dispatch_unresolved",
+        "accepted": "executed",
+        "rejected": "refused",
+        "uncertain": "dispatch_unresolved"
+      },
+      "outcome_states": {
+        "withheld": "not_submitted",
+        "accepted": "submitted",
+        "rejected": "rejected",
+        "uncertain": "unknown"
+      },
+      "still_dispatching": 0,
+      "acceptance": {
+        "ok": true,
+        "failures": []
+      }
+    }
+  },
+  "errors": [],
+  "ok": true
+}
