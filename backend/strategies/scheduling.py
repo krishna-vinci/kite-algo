@@ -37,6 +37,7 @@ recoverable without ever firing twice.
 from __future__ import annotations
 
 import calendar as _calendar
+import logging
 import os
 import uuid
 from dataclasses import dataclass
@@ -47,6 +48,8 @@ from sqlalchemy import and_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from backend.strategies.attribution_models import StrategyScheduleOccurrence
+
+logger = logging.getLogger(__name__)
 
 #: Kinds this runtime drives: every kind the stored schedule vocabulary allows
 #: (``ck_hosted_strategy_schedules_kind`` in ``backend/strategies/models.py``).
@@ -1279,6 +1282,33 @@ class HostedJobSubmitter:
             return None
         return matches_pinned_launch(existing, schedule, occurrence)
 
+    def finish_predecessor_continuation(self, *, owner_id: str, strategy_id: str) -> Optional[Dict[str, Any]]:
+        """Best-effort automatic continuation for a blocked predecessor.
+
+        The scheduled-job path shares the Run now path's rule: an eligible
+        finished finite evaluation clears its own block so the next scheduled
+        evaluation reads the same durable book. An ineligible predecessor is
+        untouched and the occurrence still defers.
+        """
+        try:
+            from backend.strategies.continuation import COMPLETION_UNKNOWN, ContinuationService
+
+            service = ContinuationService(
+                session_factory=self.session_factory, repository=self.repository
+            )
+            return service.attempt(
+                owner_id=str(owner_id),
+                strategy_id=str(strategy_id),
+                completion_state=COMPLETION_UNKNOWN,
+                actor_id="host:scheduler",
+            )
+        except Exception:  # noqa: BLE001 - never break the tick on a continuation attempt
+            logger.exception(
+                "scheduler_continuation_attempt_failed",
+                extra={"strategy_id": str(strategy_id), "owner_id": str(owner_id)},
+            )
+            return None
+
     def __call__(
         self,
         schedule: Mapping[str, Any],
@@ -1331,6 +1361,11 @@ class HostedJobSubmitter:
 
         strategy_id = str(schedule.get("strategy_id") or "")
         owner_id = str(schedule.get("owner_id") or "")
+        # Shared scheduled-job path: finish an eligible predecessor's continuation
+        # proof first, so a healthy finite evaluation hands its held book to the
+        # next scheduled evaluation (including after a host restart) instead of
+        # deferring forever behind an unreconciled block.
+        self.finish_predecessor_continuation(owner_id=owner_id, strategy_id=strategy_id)
         try:
             return self.repository.create_job(
                 strategy_id=strategy_id,

@@ -912,13 +912,26 @@ class HostedSupervisor:
         process_unresolved = stop_result in {"group_unresolved", "stop_failed"}
         if outcome in {"exited", "stop_requested"} and not process_unresolved:
             # Normal completion is NOT proof of flatness: a launched attempt is
-            # released into recovery_required by the server.
+            # released into recovery_required by the server. The reported
+            # ``completion`` plus the TRUSTED ``exit_code`` are what the server
+            # uses: only ``exited`` with code 0 is a clean finite exit it may
+            # continue automatically. A non-zero or signalled exit keeps the
+            # block, exactly like an operator-requested stop.
+            exit_code = detail.get("exit_code") if outcome == "exited" else None
             try:
                 released = self.api.release(
-                    job_id, lease_owner=self.config.lease_owner, lease_epoch=epoch, attempt=attempt
+                    job_id,
+                    lease_owner=self.config.lease_owner,
+                    lease_epoch=epoch,
+                    attempt=attempt,
+                    completion="exited" if outcome == "exited" else "stop_requested",
+                    exit_code=exit_code,
                 )
                 result["terminal"] = released.get("status")
                 result["replacement_blocked"] = released.get("replacement_blocked")
+                result["clean_exit"] = bool(outcome == "exited" and exit_code == 0)
+                if released.get("continuation") is not None:
+                    result["continuation"] = released["continuation"]
                 record.phase = str(released.get("status") or "terminal")
             except SupervisorApiError as exc:
                 cleanup = self._fail_closed(job_id, epoch, attempt, reason=f"release_refused:{exc.reason}")
@@ -930,10 +943,17 @@ class HostedSupervisor:
         elif outcome == "observe_timeout" and not process_unresolved:
             try:
                 released = self.api.release(
-                    job_id, lease_owner=self.config.lease_owner, lease_epoch=epoch, attempt=attempt
+                    job_id,
+                    lease_owner=self.config.lease_owner,
+                    lease_epoch=epoch,
+                    attempt=attempt,
+                    completion="timeout",
                 )
                 result["terminal"] = released.get("status")
                 result["replacement_blocked"] = released.get("replacement_blocked")
+                result["clean_exit"] = False
+                if released.get("continuation") is not None:
+                    result["continuation"] = released["continuation"]
                 record.phase = str(released.get("status") or "terminal")
             except (SupervisorApiError, SupervisorTransportError):
                 result["cleanup_required"] = True

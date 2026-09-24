@@ -26,6 +26,22 @@ export function jobStatusLabel(status: string | null | undefined): string {
   return JOB_STATUS_LABELS[key] ?? (key ? key : "Unknown");
 }
 
+/**
+ * Audit outcomes for an attempt's block. ``continuation`` is the server-side
+ * automatic handover of a finished FINITE evaluation that deliberately left a
+ * held book: it is NOT a manual reconciliation and it is NOT a flatness claim.
+ */
+export const BLOCK_OUTCOME_LABELS: Record<string, string> = {
+  reconciled: "Reconciled by an operator",
+  blocked: "Blocked",
+  continuation: "Continued automatically (book held, not flat)",
+};
+
+export function blockOutcomeLabel(outcome: string | null | undefined): string {
+  const key = String(outcome ?? "").trim();
+  return BLOCK_OUTCOME_LABELS[key] ?? (key ? key : "Unknown");
+}
+
 export const STOP_STATE_LABELS: Record<string, string> = {
   none: "No stop requested",
   requested: "Stop requested (queued — not yet launched)",
@@ -57,7 +73,7 @@ export type ErrorLike = { detail?: unknown; body?: unknown; message?: string };
  */
 const ERROR_COPY: Record<string, string> = {
   STRATEGY_BLOCKED:
-    "This strategy already has an active or unreconciled attempt. Stop it and reconcile before starting another.",
+    "This strategy already has an active or unreconciled attempt. A healthy finite run clears itself automatically; anything else must be stopped and reconciled before another attempt.",
   STRATEGY_DISABLED: "This strategy is disabled. Enable it before running an attempt.",
   REPLACEMENT_CONFLICT: "This launch request conflicts with an existing job for this strategy.",
   IDEMPOTENCY_CONFLICT:

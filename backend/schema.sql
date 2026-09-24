@@ -2402,6 +2402,8 @@ CREATE TABLE IF NOT EXISTS public.strategy_jobs (
     process_cleanup_state TEXT,
     process_cleanup_at TIMESTAMPTZ,
     process_cleanup_actor TEXT,
+    completion_state TEXT,
+    completion_at TIMESTAMPTZ,
     stop_requested_at TIMESTAMPTZ,
     stop_requested_by TEXT,
     logs_discarded BOOLEAN NOT NULL DEFAULT false,
@@ -2429,6 +2431,9 @@ CREATE TABLE IF NOT EXISTS public.strategy_jobs (
     ),
     CONSTRAINT ck_strategy_jobs_process_cleanup_state CHECK (
         process_cleanup_state IS NULL OR process_cleanup_state IN ('confirmed', 'unresolved')
+    ),
+    CONSTRAINT ck_strategy_jobs_completion_state CHECK (
+        completion_state IS NULL OR completion_state IN ('exited', 'stop_requested', 'timeout')
     )
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_jobs_lease
@@ -2448,7 +2453,7 @@ CREATE TABLE IF NOT EXISTS public.strategy_job_reconciliations (
     evidence_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     actor_id TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT ck_strategy_job_reconciliations_outcome CHECK (outcome IN ('reconciled', 'blocked')),
+    CONSTRAINT ck_strategy_job_reconciliations_outcome CHECK (outcome IN ('reconciled', 'blocked', 'continuation')),
     CONSTRAINT ck_strategy_job_reconciliations_attempt CHECK (attempt > 0)
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_job_reconciliations_job

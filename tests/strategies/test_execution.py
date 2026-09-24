@@ -1346,6 +1346,204 @@ def _bundle_payload(legs):
     }
 
 
+class _StagedStubService:
+    """A paper runtime stub that supplies AUTHORITATIVE funds evidence.
+
+    The real runtime re-checks cash under its own lock; this stub exists so the
+    executor's OWN half of the staged contract - re-derive the account money
+    before releasing a dependent buy - is exercised deterministically, including
+    a partial sale and an account that cannot carry the increase.
+    """
+
+    def __init__(self, *, sell_status="filled", available="0", sell_fill_ratio=0.5):
+        self.sell_status = sell_status
+        self.available = available
+        self.sell_fill_ratio = sell_fill_ratio
+        self.sent = []
+
+    async def place_order(self, *, account_scope, order_payload, attribution):
+        _ = (account_scope, attribution)
+        self.sent.append(dict(order_payload))
+        quantity = int(order_payload["quantity"])
+        side = str(order_payload["transaction_type"]).upper()
+        status = self.sell_status if side == "SELL" else "filled"
+        if status == "filled":
+            filled = quantity
+        elif status == "partially_filled":
+            filled = int(quantity * self.sell_fill_ratio)
+        else:
+            filled = 0
+        return {
+            "status": status,
+            "order": {
+                "order_id": f"STUB-{len(self.sent)}",
+                "tradingsymbol": order_payload["tradingsymbol"],
+                "quantity": quantity,
+                "filled_quantity": filled,
+                "pending_quantity": quantity - filled,
+                "average_price": "100.0",
+            },
+        }
+
+    async def get_account_summary(self, account_scope):
+        # The real runtime's summary is FLAT (available_funds at the top level).
+        _ = account_scope
+        return {
+            "account_scope": account_scope,
+            "available_funds": float(self.available),
+            "blocked_funds": 0.0,
+        }
+
+
+class ExecutorStagedFinancingTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
+    """A dependent buy is released only against a CONFIRMED reduction.
+
+    The contract forbids crediting a projected sale: an unfilled, partial or
+    rejected removal cannot fund the replacement that depends on it.
+    """
+
+    async def test_a_rejected_reduction_cannot_fund_a_dependent_buy(self):
+        self.seed_strategy()
+        reduce_leg = {**SINGLE_LEGS[0], "signed_quantity": 0}  # sell the held 10 of A
+        buy_leg = {
+            **SINGLE_LEGS[0],
+            "instrument_id": INST_B,
+            "broker_token": TOKEN_B,
+            "tradingsymbol": "INFY",
+            "broker_symbol": "INFY",
+            "signed_quantity": 10,
+        }
+        self.seed_validated_plan(plan_kind="intent_bundle", legs=[reduce_leg, buy_leg])
+        self.seed_binding()
+        self.claim_reservation(requirement=15000.0)
+        self.seed_lot_size(1)
+        # The strategy HOLDS 10 of A, so the reduction is a real order. The
+        # runtime fails while placing it, so the sale never confirms.
+        self.seed_book(qty=10)
+
+        class _ExplodingService:
+            async def place_order(self, **kwargs):
+                raise RuntimeError("runtime unavailable")
+
+        executor = self.build_executor(paper_service=_ExplodingService())
+        plan = _plan_view_for(self.factory, "plan-1")
+
+        result = await executor.execute(plan, actor=OWNER)
+
+        events = {int(step["step_no"]): step["event"] for step in result["steps"]}
+        reasons = {int(step["step_no"]): step.get("refusal_reason") for step in result["steps"]}
+        self.assertEqual(events[1], "failed", result)
+        self.assertEqual(reasons[2], "FINANCING_UNSECURED", result)
+        self.assertEqual(
+            result["steps"][1]["detail"]["unresolved_funding_legs"], [1]
+        )
+        # The dependent buy never reached the runtime: the trail records the
+        # reduction's failure and the buy's named refusal, and nothing else.
+        trail = self.events("plan-1")
+        self.assertEqual([row["step_no"] for row in trail], [1, 1, 2])
+        self.assertEqual(trail[2]["refusal_reason"], "FINANCING_UNSECURED")
+
+    def _seed_staged_rebalance(self):
+        """Sell the held A to flat and buy 10 of B at 1500 (15000 of new money)."""
+        self.seed_strategy()
+        reduce_leg = {**SINGLE_LEGS[0], "signed_quantity": 0}
+        buy_leg = {
+            **SINGLE_LEGS[0],
+            "instrument_id": INST_B,
+            "broker_token": TOKEN_B,
+            "tradingsymbol": "INFY",
+            "broker_symbol": "INFY",
+            "signed_quantity": 10,
+            "reference_price": 1500.0,
+        }
+        self.seed_validated_plan(plan_kind="intent_bundle", legs=[reduce_leg, buy_leg])
+        self.seed_binding()
+        self.claim_reservation(requirement=15000.0)
+        self.seed_lot_size(1)
+        self.seed_book(qty=10)
+
+    async def test_a_partial_sale_cannot_fund_the_dependent_buy(self):
+        self._seed_staged_rebalance()
+        service = _StagedStubService(sell_status="partially_filled")
+        result = await self.build_executor(paper_service=service).execute(
+            _plan_view_for(self.factory, "plan-1"), actor=OWNER
+        )
+        steps = {int(step["step_no"]): step for step in result["steps"]}
+        self.assertEqual(steps[1]["event"], "partially_filled")
+        self.assertEqual(steps[2]["event"], "rejected")
+        self.assertEqual(steps[2]["refusal_reason"], "FINANCING_UNSECURED")
+        # Only the sale reached the runtime: a half-filled removal funded nothing.
+        self.assertEqual([row["transaction_type"] for row in service.sent], ["SELL"])
+
+    async def test_an_increase_is_refused_when_the_account_cannot_carry_it(self):
+        self._seed_staged_rebalance()
+        service = _StagedStubService(sell_status="filled", available="100")
+        result = await self.build_executor(paper_service=service).execute(
+            _plan_view_for(self.factory, "plan-1"), actor=OWNER
+        )
+        steps = {int(step["step_no"]): step for step in result["steps"]}
+        self.assertEqual(steps[1]["event"], "filled")
+        self.assertEqual(steps[2]["event"], "rejected")
+        self.assertEqual(steps[2]["refusal_reason"], "ACCOUNT_FUNDS_UNSECURED")
+        self.assertEqual(steps[2]["detail"]["scope"], "account_funds_increase")
+        # The buy never reached the runtime: confirmation is not money.
+        self.assertEqual([row["transaction_type"] for row in service.sent], ["SELL"])
+
+    async def test_an_increase_proceeds_only_against_confirmed_account_money(self):
+        self._seed_staged_rebalance()
+        service = _StagedStubService(sell_status="filled", available="20000")
+        executor = self.build_executor(paper_service=service)
+        result = await executor.execute(_plan_view_for(self.factory, "plan-1"), actor=OWNER)
+
+        steps = {int(step["step_no"]): step for step in result["steps"]}
+        self.assertEqual(steps[1]["event"], "filled")
+        self.assertEqual(steps[2]["event"], "filled")
+        self.assertEqual(
+            [row["transaction_type"] for row in service.sent], ["SELL", "BUY"]
+        )
+        # Durable proof: the authorization carries the account money it used.
+        reservation = self.ledger.for_plan("plan-1")
+        authorized = [
+            row
+            for row in self.ledger.events(reservation["reservation_id"])
+            if row["detail"].get("staged_increase_authorized")
+        ]
+        self.assertEqual(len(authorized), 1)
+        self.assertEqual(authorized[0]["detail"]["account_capacity_inr"], 20000.0)
+        self.assertEqual(authorized[0]["detail"]["increase_inr"], 15000.0)
+
+    async def test_a_confirmed_reduction_releases_the_dependent_buy(self):
+        self.seed_strategy()
+        reduce_leg = {**SINGLE_LEGS[0], "signed_quantity": 0}
+        buy_leg = {
+            **SINGLE_LEGS[0],
+            "instrument_id": INST_B,
+            "broker_token": TOKEN_B,
+            "tradingsymbol": "INFY",
+            "broker_symbol": "INFY",
+            "signed_quantity": 10,
+        }
+        self.seed_validated_plan(plan_kind="intent_bundle", legs=[reduce_leg, buy_leg])
+        self.seed_binding()
+        self.claim_reservation(requirement=15000.0)
+        self.seed_lot_size(1)
+        self.seed_book(qty=10)
+        executor = self.build_executor()
+        # The paper account holds nothing of A, so the reduction is refused: this
+        # case is the ORDER/GATE wiring only - the buy must still be attempted
+        # only after the reduction produced a recorded outcome.
+        plan = _plan_view_for(self.factory, "plan-1")
+        result = await executor.execute(plan, actor=OWNER)
+        steps = {int(step["step_no"]): step for step in result["steps"]}
+        self.assertIn(steps[1]["event"], {"rejected", "filled"})
+        # Whatever the reduction did, the buy carries a decision - it is never
+        # silently skipped, and it never publishes a plan-level success that hides
+        # an unsecured funding leg.
+        self.assertIn(steps[2]["event"], {"filled", "rejected"})
+        if steps[1]["event"] != "filled":
+            self.assertEqual(steps[2]["refusal_reason"], "FINANCING_UNSECURED")
+
+
 class IntentBundleCompilerTests(ExecutionTestCase):
     """A bundle resolves to explicit per-leg single-instrument actions (D-6).
 

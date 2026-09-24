@@ -39,7 +39,16 @@ class HeartbeatRequest(_Authority):
 
 
 class ReleaseRequest(_Authority):
-    pass
+    #: How the supervised child ended, as observed by the runner. This is a
+    #: *report*, not an assertion of safety: the server still derives every
+    #: terminal decision from persisted evidence. It exists because the release
+    #: path is shared by a clean exit, an operator stop and an observation
+    #: timeout, and only a clean exit may be continued automatically.
+    completion: Optional[str] = Field(default=None, max_length=32)
+    #: The trusted, runner-observed process exit code when the child ended.
+    #: ``None`` means the runner did not observe a normal exit (or could not read
+    #: one). Automatic evaluation continuation requires ``0``.
+    exit_code: Optional[int] = None
 
 
 class FenceRequest(_Authority):
@@ -148,6 +157,9 @@ class ActionResponse(BaseModel):
     #: True when the terminal transition leaves the replacement block in place
     #: (open exposure may remain); False when replacement is safe.
     replacement_blocked: Optional[bool] = None
+    #: Present on a release that ran the automatic evaluation-continuation: the
+    #: named verdict (``continued`` false with a reason code when it refused).
+    continuation: Optional[Dict[str, Any]] = None
 
 
 class JobSummaryResponse(BaseModel):

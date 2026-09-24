@@ -26,6 +26,7 @@ this slice, and this docstring does not claim otherwise.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -150,6 +151,8 @@ from backend.strategies.repository import (
 )
 
 router = APIRouter(prefix="/strategies", tags=["Hosted strategies (operator)"])
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["router"]
 
@@ -345,6 +348,41 @@ def _job_replacement_blocked(job: Any) -> bool:
     if status in {"queued", "starting", "running"}:
         return True
     return status == "recovery_required" and job.reconciled_at is None
+
+
+async def _finish_predecessor_continuation(
+    request: Request,
+    repo: SqlAlchemyStrategyRepository,
+    owner: str,
+    strategy_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Attempt the automatic evaluation continuation for a blocked predecessor.
+
+    Best-effort by design: the shared Run now path must not fail because the
+    continuation service could not run. When the predecessor is eligible its
+    block is cleared (with a distinct continuation audit); otherwise nothing
+    changes and the caller's own ``STRATEGY_BLOCKED`` refusal stands.
+    """
+    try:
+        from backend.strategies.continuation import COMPLETION_UNKNOWN, ContinuationService
+
+        service = ContinuationService(
+            session_factory=_strategies_db(request),
+            repository=repo,
+        )
+        return await asyncio.to_thread(
+            service.attempt,
+            owner_id=owner,
+            strategy_id=strategy_id,
+            completion_state=COMPLETION_UNKNOWN,
+            actor_id=f"host:run_now:{owner}",
+        )
+    except Exception:  # noqa: BLE001 - continuation is best-effort on this path
+        logger.exception(
+            "run_now_continuation_attempt_failed",
+            extra={"strategy_id": strategy_id, "owner_id": owner},
+        )
+        return None
 
 
 def _job_summary(job: Any) -> JobSummaryResponse:
@@ -2967,6 +3005,14 @@ async def run_now(
     existing = repo.get_job_by_occurrence_key(occurrence_key)
     if existing is not None:
         return RunNowResponse(idempotent=True, job=_job_detail(_replay_or_conflict(existing, normalized, owner, strategy_id)))
+
+    # Shared Run now path: finish an eligible predecessor's continuation proof
+    # BEFORE the new attempt is refused. This is what lets a healthy finite
+    # evaluation hand its held book to the next evaluation even when the host
+    # restarted between the supervised release and the proof. An ineligible
+    # predecessor is left exactly as it was, and create_job below still refuses
+    # with STRATEGY_BLOCKED - the manual reconciliation path is unchanged.
+    await _finish_predecessor_continuation(request, repo, owner, strategy_id)
 
     idempotent = False
     try:

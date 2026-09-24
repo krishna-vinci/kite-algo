@@ -31,10 +31,16 @@ from sqlalchemy.exc import SQLAlchemyError
 from backend.strategies.attribution_models import (
     StrategyReservation,
     StrategyReservationEvent,
+    StrategyPlan,
 )
 
 #: Statuses that still hold capacity against the allocation.
 HOLDING_STATUSES = ("active", "renewed", "action_required")
+
+#: Statuses from which a reservation may still authorize work (a staged increase,
+#: an execution preconditions check). ``action_required`` is deliberately NOT
+#: here: an unproven disposition must not release money.
+EXECUTABLE_STATUSES = ("active", "renewed")
 
 #: Terminal states. ``consumed`` is terminal in the strongest sense: it represents
 #: real exposure, so nothing may release it.
@@ -134,6 +140,19 @@ class ClaimRequest:
     requirement_inr: float
     valid_until: datetime
     allocation_inr: Optional[float] = None
+    #: The ACCOUNT's actual available funds/margin, when the caller has
+    #: authoritative evidence. It is a separate constraint from the strategy's
+    #: own ``allocation_inr``: two strategies must not reserve the same account
+    #: funds, and one strategy's budget must never be measured against another's
+    #: reservations. ``None`` means "no account-funds evidence", never zero.
+    account_capacity_inr: Optional[float] = None
+    #: Set for a STAGED CNC claim: this part of ``requirement_inr`` is funded by
+    #: the plan's OWN reductions, so no account cash is needed at claim time.
+    #: The increases may only spend afterwards, and each one must be authorized
+    #: against CONFIRMED account money by :meth:`ReservationLedger.authorize_staged_increase`
+    #: before it is submitted. ``None`` means "not staged": the whole
+    #: requirement must be fundable from the account's free cash right now.
+    staged_increase_inr: Optional[float] = None
     margin_evidence: Optional[Dict[str, Any]] = None
     margin_as_of: Optional[datetime] = None
     actor_id: Optional[str] = None
@@ -210,19 +229,194 @@ class ReservationLedger:
                 # claim rather than extending or duplicating it.
                 return self._view(existing)
 
-            if request.allocation_inr is not None:
-                held = self.held_notional(account_id=request.account_id, db=session)
-                if held + float(request.requirement_inr) > float(request.allocation_inr):
+            # TWO separate constraints, measured the same way admission measures
+            # them (one shared rule in ``backend.strategies.financing``):
+            #   1. this STRATEGY's own budget, in THIS environment;
+            #   2. the ACCOUNT's actual funds, across strategies, when the caller
+            #      has authoritative evidence for them.
+            # The old check summed account-wide consumed+held (no environment) and
+            # compared it to a single strategy's allocation, so strategy B spent
+            # strategy A's budget.
+            from backend.strategies.financing import (
+                account_capacity_held_inr,
+                capacity_held,
+                plan_exposure,
+            )
+
+            capacity = capacity_held(
+                session,
+                account_id=request.account_id,
+                strategy_id=request.strategy_id,
+                execution_environment=request.execution_environment,
+            )
+            held = float(capacity["held_inr"])
+
+            # CONSTRAINT 1 (necessary, always): the strategy's OTHER unfilled
+            # commitments plus THIS plan's own incremental funding must fit the
+            # allocation. Two concurrent plans each admitted at 95 against a 100
+            # budget (current 80 + 15) both pass a per-plan check, so the ledger
+            # must sum the outstanding cash demands under the lock. The gate is
+            # on ``held`` (unfilled + consumed-not-yet-published), never on
+            # account-wide rows and never on another environment's book.
+            if (
+                request.allocation_inr is not None
+                and held + float(request.requirement_inr) > float(request.allocation_inr)
+            ):
+                raise CapacityExceeded(
+                    {
+                        "account_id": request.account_id,
+                        "strategy_id": request.strategy_id,
+                        "execution_environment": request.execution_environment,
+                        "scope": "strategy_budget_held",
+                        "allocation_inr": float(request.allocation_inr),
+                        "held_inr": held,
+                        "requested_inr": float(request.requirement_inr),
+                        "capacity_evidence": {
+                            key: str(value) for key, value in capacity.items()
+                        },
+                        "message": (
+                            "Capacity is already committed; the first durable reservation wins "
+                            "and this plan is refused rather than queued or resized."
+                        ),
+                    }
+                )
+
+            # DURABLE BUDGET REVALIDATION, under the account lock and against the
+            # PERSISTED plan + the CURRENT book - never the detached admission
+            # verdict. Testing only "held commitments + this requirement" let two
+            # individually-admitted plans both pass (current 80, budget 100, two
+            # buys of 15: 0+15 and 15+15 both fit) and overspend the budget by 10.
+            # The gate is the DESIRED POST-PLAN book plus the OTHER unfilled
+            # commitments, which is the same arithmetic admission showed and the
+            # same arithmetic this transaction can re-derive from fresh rows.
+            post_plan_inr: Optional[float] = None
+            plan_row = session.execute(
+                select(StrategyPlan).where(StrategyPlan.plan_id == str(request.plan_id))
+            ).scalar_one_or_none()
+            # A plan row with NO resolved legs carries no portfolio to value (a
+            # focused ledger fixture, or a structurally empty plan); the
+            # post-plan revalidation below is meaningful only for a plan that
+            # actually declares coordinates.
+            #
+            # SCOPE matches the executor's own staged-financing lane
+            # (``execution.CNC_REBALANCE_PLAN_KINDS``): the post-plan book is a
+            # NOTIONAL CNC portfolio. A futures roll deliberately carries both
+            # contracts at claim time (peak-margin semantics) and an option
+            # structure is measured by its own run, so neither may be charged the
+            # generic portfolio arithmetic. Those lanes keep the necessary
+            # ``held + requirement <= allocation`` gate below.
+            from backend.strategies.execution import CNC_REBALANCE_PLAN_KINDS
+
+            declared_legs = (
+                list((plan_row.resolved_plan or {}).get("legs") or [])
+                if plan_row is not None
+                else []
+            )
+            cnc_lane = (
+                plan_row is not None
+                and str(plan_row.plan_kind) in CNC_REBALANCE_PLAN_KINDS
+            )
+            if plan_row is not None and declared_legs and cnc_lane:
+                exposure = plan_exposure(
+                    session,
+                    {
+                        "plan_id": str(plan_row.plan_id),
+                        "strategy_id": str(plan_row.strategy_id),
+                        "account_id": str(plan_row.account_id),
+                        "plan_kind": str(plan_row.plan_kind),
+                        "logical_plan": dict(plan_row.logical_plan or {}),
+                        "resolved_plan": dict(plan_row.resolved_plan or {}),
+                    },
+                    execution_environment=request.execution_environment,
+                )
+                # A coordinate the strategy HOLDS but cannot price, or a raw
+                # (unattributed) projection fact, is unknown evidence about the
+                # strategy's own book; refusing is the only honest answer. A plan
+                # leg that carries no sizeable target is NOT this ledger's
+                # business: sizing is the executor's contract (it owns
+                # PLAN_CAPITAL_BASIS_UNPINNED / PLAN_UNITS_UNPINNED), and refusing
+                # here would mask that named refusal.
+                blocking_unvalued = [
+                    entry
+                    for entry in exposure["unvalued"]
+                    if str(entry.get("reason"))
+                    in ("no_valid_price", "unresolved_projection_fact")
+                ]
+                if blocking_unvalued:
                     raise CapacityExceeded(
                         {
                             "account_id": request.account_id,
                             "strategy_id": request.strategy_id,
-                            "allocation_inr": float(request.allocation_inr),
-                            "held_inr": held,
-                            "requested_inr": float(request.requirement_inr),
+                            "execution_environment": request.execution_environment,
+                            "scope": "strategy_post_plan",
+                            "unvalued": blocking_unvalued,
                             "message": (
-                                "Capacity is already committed; the first durable reservation wins "
-                                "and this plan is refused rather than queued or resized."
+                                "The strategy's post-plan book cannot be valued, so the "
+                                "budget cannot be revalidated under the lock."
+                            ),
+                        }
+                    )
+                post_plan_inr = (
+                    None
+                    if exposure["desired_exposure_inr"] is None
+                    else float(exposure["desired_exposure_inr"])
+                )
+
+            # Unfilled commitments OTHER than this plan (this plan has no
+            # reservation yet, so every unfilled row is another plan's work).
+            other_unfilled = float(capacity["unfilled_commitments_inr"])
+            if request.allocation_inr is not None and post_plan_inr is not None and (
+                post_plan_inr + other_unfilled > float(request.allocation_inr)
+            ):
+                raise CapacityExceeded(
+                    {
+                        "account_id": request.account_id,
+                        "strategy_id": request.strategy_id,
+                        "execution_environment": request.execution_environment,
+                        "scope": "strategy_post_plan",
+                        "allocation_inr": float(request.allocation_inr),
+                        "post_plan_inr": post_plan_inr,
+                        "other_unfilled_inr": other_unfilled,
+                        "held_inr": held,
+                        "capacity_evidence": {
+                            key: str(value) for key, value in capacity.items()
+                        },
+                        "requested_inr": float(request.requirement_inr),
+                        "message": (
+                            "This strategy's post-plan book, together with the commitments "
+                            "other plans already hold, exceeds its allocation."
+                        ),
+                    }
+                )
+            if request.account_capacity_inr is not None:
+                account_held = account_capacity_held_inr(
+                    session,
+                    account_id=request.account_id,
+                    execution_environment=request.execution_environment,
+                )
+                # PHASE-SCOPED cash. A staged CNC rebalance funds part of its
+                # requirement from its OWN reductions, so the cash it must be
+                # able to spend BEFORE anything happens is only the part the
+                # account's free funds already cover. The sale-funded part is
+                # NOT credited here as a projection: it is deferred, and each
+                # dependent increase must be authorized later against CONFIRMED
+                # money (``authorize_staged_increase``) under the same lock.
+                deferred = float(request.staged_increase_inr or 0.0)
+                immediate_cash = max(0.0, float(request.requirement_inr) - deferred)
+                if account_held + immediate_cash > float(request.account_capacity_inr):
+                    raise CapacityExceeded(
+                        {
+                            "account_id": request.account_id,
+                            "strategy_id": request.strategy_id,
+                            "execution_environment": request.execution_environment,
+                            "scope": "account_funds",
+                            "account_capacity_inr": float(request.account_capacity_inr),
+                            "account_held_inr": account_held,
+                            "requested_inr": immediate_cash,
+                            "deferred_increase_inr": deferred,
+                            "message": (
+                                "The account's own available funds are already committed by "
+                                "another strategy's unfilled reservations."
                             ),
                         }
                     )
@@ -251,6 +445,14 @@ class ReservationLedger:
                 detail={
                     "reserved_notional_inr": float(request.requirement_inr),
                     "valid_until": request.valid_until.isoformat(),
+                    # Durable proof of the DEFERRED phase: this reservation does
+                    # not authorize its own increases to spend. Each one is
+                    # authorized separately, later, against confirmed money.
+                    "staged_increase_inr": (
+                        float(request.staged_increase_inr)
+                        if request.staged_increase_inr is not None
+                        else None
+                    ),
                 },
                 at=moment,
             )
@@ -263,6 +465,146 @@ class ReservationLedger:
             session.close()
 
     # -- lifecycle ----------------------------------------------------------
+
+    def authorize_staged_increase(
+        self,
+        *,
+        plan_id: str,
+        requirement_inr: float,
+        account_capacity_inr: float,
+        evidence: Optional[Mapping[str, Any]] = None,
+        actor_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Authorize the INCREASE phase of a staged CNC claim to spend real money.
+
+        A staged reservation deliberately does NOT authorize its own increases at
+        claim time (there is no cash yet). This is the second half of the
+        contract: immediately before an increase is submitted, the executor
+        supplies the account's CURRENT authoritative available funds and this
+        method re-derives, under the same account lock the claim used, whether
+        the money is really there.
+
+        Nothing projected is credited. ``account_capacity_inr`` is the broker /
+        paper runtime's own figure, which already reflects the plan's confirmed
+        sales and is reduced by every order that has already consumed cash.
+
+        Idempotent by amount: an already-authorized increase is not charged
+        twice, so a retried step cannot inflate the account's commitments.
+        """
+        moment = now or _utcnow()
+        session = self.session_factory()
+        try:
+            self._lock_account(session, str(self._account_for(session, plan_id)))
+            from backend.strategies.financing import account_capacity_held_inr
+
+            row = session.execute(
+                select(StrategyReservation).where(
+                    StrategyReservation.plan_id == str(plan_id)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                raise ReservationNotFound({"plan_id": str(plan_id)})
+            if str(row.status) not in EXECUTABLE_STATUSES:
+                raise ReservationStateError(
+                    {
+                        "plan_id": str(plan_id),
+                        "reservation_id": str(row.reservation_id),
+                        "status": str(row.status),
+                        "message": "only an executable reservation may authorize an increase",
+                    }
+                )
+            already = self._authorized_increase_inr(session, str(row.reservation_id))
+            needed = max(0.0, float(requirement_inr) - already)
+            if needed <= 0.0:
+                return {
+                    "authorized": True,
+                    "already_authorized": True,
+                    "authorized_increase_inr": already,
+                    "reservation_id": str(row.reservation_id),
+                }
+            # Competing commitments are every OTHER unfilled reservation on this
+            # account in this environment. This plan's OWN reservation is not a
+            # competitor for the money it is about to spend.
+            competing = account_capacity_held_inr(
+                session,
+                account_id=str(row.account_id),
+                execution_environment=str(row.execution_environment),
+            ) - float(row.reserved_notional_inr or 0.0)
+            competing = max(0.0, competing)
+            if competing + needed > float(account_capacity_inr):
+                raise CapacityExceeded(
+                    {
+                        "account_id": str(row.account_id),
+                        "strategy_id": str(row.strategy_id),
+                        "execution_environment": str(row.execution_environment),
+                        "scope": "account_funds_increase",
+                        "reservation_id": str(row.reservation_id),
+                        "account_capacity_inr": float(account_capacity_inr),
+                        "competing_commitments_inr": competing,
+                        "already_authorized_inr": already,
+                        "requested_increase_inr": float(requirement_inr),
+                        "message": (
+                            "This staged increase would spend account money that is not "
+                            "available once every other unfilled commitment is counted."
+                        ),
+                    }
+                )
+            self._record(
+                session,
+                reservation_id=str(row.reservation_id),
+                # ``advanced`` is the existing progress event; the AUTHORIZATION
+                # travels explicitly in the detail instead of widening the
+                # reservation event vocabulary (which would need a migration).
+                event="advanced",
+                actor_id=actor_id,
+                detail={
+                    "staged_increase_authorized": True,
+                    "increase_inr": needed,
+                    "cumulative_authorized_inr": already + needed,
+                    "account_capacity_inr": float(account_capacity_inr),
+                    "competing_commitments_inr": competing,
+                    **dict(evidence or {}),
+                },
+                at=moment,
+            )
+            session.commit()
+            return {
+                "authorized": True,
+                "already_authorized": False,
+                "authorized_increase_inr": already + needed,
+                "reservation_id": str(row.reservation_id),
+            }
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _account_for(self, session: Any, plan_id: str) -> str:
+        row = session.execute(
+            select(StrategyReservation.account_id).where(
+                StrategyReservation.plan_id == str(plan_id)
+            )
+        ).first()
+        return str(row[0]) if row is not None else ""
+
+    @staticmethod
+    def _authorized_increase_inr(session: Any, reservation_id: str) -> float:
+        """Cumulative increase already authorized on this reservation."""
+        rows = session.execute(
+            select(StrategyReservationEvent.detail).where(
+                StrategyReservationEvent.reservation_id == str(reservation_id),
+                StrategyReservationEvent.event == "advanced",
+            )
+        ).scalars().all()
+        total = 0.0
+        for detail in rows:
+            payload = dict(detail or {})
+            if not payload.get("staged_increase_authorized"):
+                continue
+            total += float(payload.get("increase_inr") or 0.0)
+        return total
 
     def renew(
         self,

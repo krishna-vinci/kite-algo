@@ -595,6 +595,39 @@ async def heartbeat(
     }
 
 
+def _attempt_continuation(
+    *,
+    strategy_repo: SqlAlchemyStrategyRepository,
+    session_factory: Any,
+    job: Any,
+    completion: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Try the automatic evaluation-continuation for a freshly fenced attempt.
+
+    Returns ``None`` when the continuation could not even be attempted (no
+    session factory, an unexpected failure) so the caller falls back to the
+    manual reconciliation block. A returned dict always carries ``continued``.
+    """
+    factory = session_factory or getattr(strategy_repo, "session_factory", None)
+    if factory is None:
+        return None
+    try:
+        from backend.strategies.continuation import COMPLETION_UNKNOWN, ContinuationService
+
+        service = ContinuationService(session_factory=factory, repository=strategy_repo)
+        return service.attempt(
+            owner_id=str(job.owner_id),
+            strategy_id=str(job.strategy_id),
+            completion_state=str(completion or COMPLETION_UNKNOWN),
+            actor_id="host:supervisor_release",
+        )
+    except Exception:  # noqa: BLE001 - never let continuation break the release path
+        logger.exception(
+            "hosted_release_continuation_attempt_failed", extra={"job_id": str(getattr(job, "id", ""))}
+        )
+        return None
+
+
 async def release(
     *,
     strategy_repo: SqlAlchemyStrategyRepository,
@@ -603,6 +636,9 @@ async def release(
     lease_owner: str,
     lease_epoch: int,
     attempt: int,
+    completion: Optional[str] = None,
+    exit_code: Optional[int] = None,
+    session_factory: Any = None,
 ) -> Dict[str, Any]:
     """Runner-owned stop: withdraw authority, then decide replacement safety.
 
@@ -614,7 +650,12 @@ async def release(
       have accepted work, so it is safely marked ``stopped`` and replacement is
       allowed;
     - a **launched** attempt may have accepted work, so it is fenced to
-      ``recovery_required`` and its replacement stays blocked until explicit
+      ``recovery_required``. When the runner reports a **clean exit** of a finite
+      evaluation, the host then attempts the automatic evaluation-continuation
+      proof: an eligible attempt clears its own block (recording a distinct
+      continuation audit) so the next evaluation reads the same durable book
+      without an operator clicking "reconcile". A crash, operator stop, timeout
+      or any missing evidence leaves the block in place for explicit
       reconciliation.
 
     Either way the session is released and the child token revoked. Open exposure
@@ -638,6 +679,25 @@ async def release(
 
     launched = job.handoff_at is not None
     if launched:
+        # Persist the runner's end-of-child report BEFORE the fence, so the
+        # durable marker survives a host crash between the fence and the
+        # continuation attempt. It is a report, never a safety assertion: the
+        # continuation decision still derives from persisted evidence.
+        if completion in ("exited", "stop_requested", "timeout"):
+            try:
+                await asyncio.to_thread(
+                    strategy_repo.report_completion,
+                    job_id,
+                    completion_state=str(completion),
+                    exit_code=exit_code,
+                    lease_owner=lease_owner,
+                    expected_lease_epoch=lease_epoch,
+                    expected_attempt=attempt,
+                )
+            except Exception:  # noqa: BLE001 - a report failure must not break release
+                logger.exception(
+                    "hosted_release_completion_report_failed", extra={"job_id": job_id}
+                )
         fenced = await asyncio.to_thread(
             strategy_repo.mark_recovery_required,
             job_id,
@@ -647,12 +707,33 @@ async def release(
         )
         if not fenced:
             raise HostedLifecycleError(409, "HOSTED_RELEASE_REFUSED")
-        return {
+        # The automatic continuation runs AFTER the fence: the child's authority
+        # is already revoked above, and the fence is what makes the job's status
+        # (``recovery_required``) match the CAS the unblock requires.
+        continuation = await asyncio.to_thread(
+            _attempt_continuation,
+            strategy_repo=strategy_repo,
+            session_factory=session_factory,
+            job=job,
+            completion=completion,
+        )
+        if continuation is not None and continuation.get("continued"):
+            return {
+                "status": "recovery_required",
+                "job_id": job_id,
+                "replacement_blocked": False,
+                "reason": "evaluation_continuation_cleared",
+                "continuation": continuation,
+            }
+        response = {
             "status": "recovery_required",
             "job_id": job_id,
             "replacement_blocked": True,
             "reason": "launched_attempt_requires_reconciliation",
         }
+        if continuation is not None:
+            response["continuation"] = continuation
+        return response
 
     stopped = await asyncio.to_thread(
         strategy_repo.mark_stopped,

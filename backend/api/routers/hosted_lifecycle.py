@@ -291,6 +291,9 @@ async def release(
             lease_owner=payload.lease_owner,
             lease_epoch=payload.lease_epoch,
             attempt=payload.attempt,
+            completion=payload.completion,
+            exit_code=payload.exit_code,
+            session_factory=_strategies_db(request),
         )
     except hosted_lifecycle.HostedLifecycleError as exc:
         raise _raise(exc) from exc

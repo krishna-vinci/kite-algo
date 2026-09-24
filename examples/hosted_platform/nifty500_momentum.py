@@ -1483,15 +1483,27 @@ def _legs_for_targets(
     identities: Mapping[str, Mapping[str, Any]],
     prices: Mapping[str, Decimal],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Exact-quantity legs for every symbol whose target differs from the book."""
+    """A FULL-SNAPSHOT bundle of exact-quantity legs, plus the coordinates that change.
+
+    The bundle is the strategy's whole post-plan book, not just its deltas: a name
+    the durable book already holds at its new target is emitted as an UNCHANGED
+    leg (a no-op the executor records without ordering), and a name the plan no
+    longer wants is emitted as a ZERO target. That is what makes the platform's
+    post-plan exposure accounting possible at all - neither admission nor the
+    reservation ledger can value a book it was never told about - and it is why a
+    recurring evaluation carries every held coordinate rather than only the ones
+    the membership moved.
+
+    ``changes`` stays the smaller truth: only the coordinates whose target
+    actually differs from the durable book. Callers decide whether there is work
+    to do from ``changes``; the executor decides what to send from ``legs``.
+    """
     legs: List[Dict[str, Any]] = []
     changes: List[Dict[str, Any]] = []
 
     for symbol in sorted(set(target_quantities) | set(book)):
         target = int(target_quantities.get(symbol, 0))
         current = int(book.get(symbol, 0))
-        if target == current:
-            continue
         identity = identities.get(symbol)
         _require(
             identity is not None,
@@ -1506,6 +1518,8 @@ def _legs_for_targets(
                 reference_price=prices.get(symbol),
             )
         )
+        if target == current:
+            continue
         changes.append(
             {
                 "symbol": symbol,
@@ -2038,7 +2052,7 @@ def _run(ctx) -> int:  # noqa: ANN001
             identities=known_identities,
             prices=prices,
         )
-        if not legs:
+        if not changes:
             return _stop(ctx, "no exit legs to place", as_of=as_of.isoformat())
         return _dispatch(
             ctx,
@@ -2110,7 +2124,7 @@ def _run(ctx) -> int:  # noqa: ANN001
         f"excluded={len(plan.excluded)}",
     )
 
-    if not legs:
+    if not changes:
         return _stop(
             ctx,
             "the book already matches the momentum target; no proposal",

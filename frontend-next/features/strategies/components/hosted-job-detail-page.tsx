@@ -21,6 +21,7 @@ import {
   useStopHostedJob,
 } from "@/features/strategies/hooks/use-hosted-strategies-queries";
 import {
+  blockOutcomeLabel,
   hostedErrorMessage,
   jobStatusLabel,
   jobStatusTone,
@@ -294,10 +295,18 @@ function ReconciliationCard({ strategyId, jobId, attempt }: Readonly<{
                 <ul className="flex flex-col gap-1 text-xs text-muted-foreground">
                   {inspection.history.map((entry) => (
                     <li key={entry.id}>
-                      {entry.created_at ?? ""} — {entry.outcome} ({entry.reason_code}) by {entry.actor_id}
+                      {entry.created_at ?? ""} — {blockOutcomeLabel(entry.outcome)} ({entry.reason_code}) by{" "}
+                      {entry.actor_id}
                     </li>
                   ))}
                 </ul>
+                {inspection.history.some((entry) => entry.outcome === "continuation") ? (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    This attempt was continued automatically because it finished cleanly. Any book it left
+                    is <span className="font-medium">held</span>, not flat — the next evaluation reads the
+                    same positions.
+                  </p>
+                ) : null}
               </div>
             ) : null}
           </>

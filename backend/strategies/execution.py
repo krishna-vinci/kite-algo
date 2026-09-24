@@ -37,6 +37,7 @@ trail. In-process threads are additionally serialized on a per-plan lock.
 
 from __future__ import annotations
 
+import math
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -52,6 +53,7 @@ from backend.strategies.attribution_models import (
     StrategyRunBinding,
 )
 from backend.strategies.reservations import (
+    CapacityExceeded,
     HOLDING_STATUSES,
     ReservationLedger,
     _as_datetime,
@@ -94,9 +96,26 @@ REFUSAL_REASONS = (
 #: Reservation statuses from which this plan may still begin executing.
 EXECUTABLE_RESERVATION_STATUSES = ("active", "renewed")
 
+#: Plan kinds whose steps are a CNC portfolio rebalance, and are therefore
+#: eligible for the generic staged sell-before-buy financing rule. Futures rolls
+#: (acquire-first) and option structures (hedge-first) own their own ordering and
+#: are deliberately excluded.
+CNC_REBALANCE_PLAN_KINDS = ("intent_bundle", "target_weights")
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _as_float(value: Any) -> Optional[float]:
+    """A finite float, or ``None`` when the caller's evidence is not a number."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _hedge_outcome(events: Sequence[str]) -> str:
@@ -114,6 +133,19 @@ def _hedge_outcome(events: Sequence[str]) -> str:
     if events and all(event == "filled" for event in events):
         return "filled"
     return "pending"
+
+
+def _event_for_step(outcomes: Sequence[Mapping[str, Any]], step_no: int) -> str:
+    """The recorded event for one step, or ``""`` when it never produced one.
+
+    An unrecorded (or unrecognised) event is deliberately NOT treated as a
+    confirmation: staged financing releases a dependent buy only against
+    ``filled``/``no_op``.
+    """
+    for outcome in outcomes:
+        if int(outcome.get("step_no") or 0) == int(step_no):
+            return str(outcome.get("event") or "")
+    return ""
 
 
 class ExecutionRefusal(Exception):
@@ -305,6 +337,54 @@ class PaperPlanExecutor:
         # run must never read as "created" while orders are already in flight. A
         # plan with NOTHING to do (every step is a zero delta - a repeated exit
         # against an already-flat run) changes no run state, so it must not try.
+        #
+        # STAGED FINANCING (non-option lane): a plan that both reduces and
+        # increases exposure places its reductions FIRST and releases its
+        # dependent increases ONLY against those reductions' CONFIRMED outcomes.
+        # A partial, rejected, failed or unobserved sale cannot fund a
+        # replacement, so the dependent buy refuses by name instead of trading on
+        # money the platform has not seen.
+        # SCOPE: only the CNC portfolio-rebalance shapes, and only when the plan
+        # is not already governed by a domain ordering that owns its sequence. A
+        # futures ROLL deliberately acquires the replacement BEFORE releasing the
+        # old contract (peak-margin semantics), and the options lane has its own
+        # hedge/exit ordering; neither may be reordered by this generic rule.
+        staged_by_release: Dict[int, List[int]] = {}
+        # The product must be the CNC cash segment on EVERY leg: an
+        # ``intent_bundle`` also carries NRML/MIS shapes whose sequencing and
+        # margining are the domain's own, so the generic portfolio rule must not
+        # silently adopt them.
+        plan_products = {
+            str(leg.get("product") or "").upper()
+            for _index, leg, _quantity, _side in step_order
+        }
+        staging_applies = (
+            not gating
+            and roll_ref is None
+            and str(plan.get("plan_kind") or "") in CNC_REBALANCE_PLAN_KINDS
+            and bool(plan_products)
+            and plan_products == {"CNC"}
+        )
+        if staging_applies:
+            reducing_steps = [
+                step
+                for step in step_order
+                if int(step[2] or 0) != 0 and not step[1].get("_increases_exposure")
+            ]
+            increasing_steps = [
+                step
+                for step in step_order
+                if int(step[2] or 0) != 0 and step[1].get("_increases_exposure")
+            ]
+            if reducing_steps and increasing_steps:
+                untouched = [
+                    step for step in step_order if step not in reducing_steps and step not in increasing_steps
+                ]
+                step_order = untouched + reducing_steps + increasing_steps
+                reducing_numbers = [int(step[0]) for step in reducing_steps]
+                for step in increasing_steps:
+                    staged_by_release[int(step[0])] = list(reducing_numbers)
+
         option_touches_run = bool(option_target) and any(
             int(step[2] or 0) != 0 for step in step_order
         )
@@ -331,6 +411,84 @@ class PaperPlanExecutor:
             return base + timedelta(microseconds=counter)
 
         for step_no, leg, quantity, side in step_order:
+            dependent_on = staged_by_release.get(int(step_no))
+            if dependent_on:
+                unresolved_sales = [
+                    number
+                    for number in dependent_on
+                    if _event_for_step(outcomes, number) not in ("filled", "no_op")
+                ]
+                if unresolved_sales:
+                    outcomes.append(
+                        self._record_event(
+                            plan_id,
+                            step_no=step_no,
+                            event="rejected",
+                            refusal_reason="FINANCING_UNSECURED",
+                            actor_id=actor,
+                            detail={
+                                "instrument_id": leg.get("instrument_id"),
+                                "tradingsymbol": leg.get("tradingsymbol"),
+                                "side": side,
+                                "quantity": int(quantity),
+                                "funding_legs": list(dependent_on),
+                                "unresolved_funding_legs": unresolved_sales,
+                                "confirmed_funding": {
+                                    str(number): _event_for_step(outcomes, number)
+                                    for number in dependent_on
+                                },
+                                "message": (
+                                    "This leg increases exposure and depends on this plan's own "
+                                    "reductions. Only CONFIRMED sale outcomes may fund it; a "
+                                    "partial, rejected, failed or unobserved reduction leaves the "
+                                    "financing unsecured."
+                                ),
+                            },
+                            at=_stamp(),
+                        )
+                    )
+                    rejected = True
+                    continue
+                # The reductions are CONFIRMED, but confirmation is not money.
+                # Re-derive, under the reservation's own account lock, whether
+                # the account's CURRENT authoritative funds can carry this
+                # increase. Nothing projected is credited: the figure comes from
+                # the paper runtime, which has already applied every fill.
+                authorization = await self._authorize_staged_increase(
+                    plan,
+                    reservation,
+                    leg=leg,
+                    quantity=int(quantity),
+                    actor=actor,
+                )
+                if not authorization.get("authorized"):
+                    outcomes.append(
+                        self._record_event(
+                            plan_id,
+                            step_no=step_no,
+                            event="rejected",
+                            refusal_reason=str(
+                                authorization.get("reason_code") or "ACCOUNT_FUNDS_UNSECURED"
+                            ),
+                            actor_id=actor,
+                            detail={
+                                "instrument_id": leg.get("instrument_id"),
+                                "tradingsymbol": leg.get("tradingsymbol"),
+                                "side": side,
+                                "quantity": int(quantity),
+                                "funding_legs": list(dependent_on),
+                                **dict(authorization.get("detail") or {}),
+                                "message": (
+                                    "This increase is released only against CONFIRMED funding, "
+                                    "and the account's authoritative funds at submission time "
+                                    "cannot carry it alongside its other commitments."
+                                ),
+                            },
+                            at=_stamp(),
+                        )
+                    )
+                    rejected = True
+                    continue
             if quantity == 0:
                 outcomes.append(
                     self._record_event(
@@ -561,6 +719,104 @@ class PaperPlanExecutor:
         }
 
     # ---------------------------------------------------------- preconditions
+
+    async def _authorize_staged_increase(
+        self,
+        plan: Mapping[str, Any],
+        reservation: Optional[Dict[str, Any]],
+        *,
+        leg: Mapping[str, Any],
+        quantity: int,
+        actor: str,
+    ) -> Dict[str, Any]:
+        """Prove the account's money is really there before a staged increase.
+
+        The reservation deliberately deferred this increase; the executor is the
+        only place that knows the reduction has actually confirmed, so this is
+        where the second half of the contract is enforced. A missing price is
+        unknown evidence and refuses: a buy whose notional cannot be computed
+        cannot be shown to be affordable.
+        """
+        reservation_id = str((reservation or {}).get("reservation_id") or "")
+        if not reservation_id:
+            # A reduction-only plan needs no reservation, and a plan with no
+            # reservation has no deferred increase to authorize.
+            return {"authorized": True}
+        price = _as_float(leg.get("reference_price"))
+        if price is None or abs(price) <= 0:
+            return {
+                "authorized": False,
+                "reason_code": "ACCOUNT_FUNDS_UNSECURED",
+                "detail": {
+                    "reason": "no_reference_price",
+                    "reservation_id": reservation_id,
+                },
+            }
+        service = self._paper_service
+        if service is None:
+            return {
+                "authorized": False,
+                "reason_code": "ACCOUNT_FUNDS_UNSECURED",
+                "detail": {
+                    "reason": "no_paper_runtime",
+                    "reservation_id": reservation_id,
+                },
+            }
+        try:
+            summary = await service.get_account_summary(
+                account_scope=str(plan.get("account_id") or "")
+            )
+            # The runtime's summary is FLAT; tolerate a nested envelope too, but
+            # never invent a number: an unreadable figure refuses below.
+            available = _as_float(
+                summary.get("available_funds")
+                if "available_funds" in summary
+                else (summary.get("account") or {}).get("available_funds")
+            )
+        except Exception as exc:  # noqa: BLE001 - unknown money never buys
+            return {
+                "authorized": False,
+                "reason_code": "ACCOUNT_FUNDS_UNSECURED",
+                "detail": {
+                    "reason": "account_funds_unreadable",
+                    "error": str(exc),
+                    "reservation_id": reservation_id,
+                },
+            }
+        if available is None:
+            return {
+                "authorized": False,
+                "reason_code": "ACCOUNT_FUNDS_UNSECURED",
+                "detail": {
+                    "reason": "account_funds_unknown",
+                    "reservation_id": reservation_id,
+                },
+            }
+        notional = abs(float(int(quantity))) * float(price)
+        try:
+            return self.ledger.authorize_staged_increase(
+                plan_id=str(plan.get("plan_id") or ""),
+                requirement_inr=notional,
+                account_capacity_inr=float(available),
+                actor_id=actor,
+                evidence={
+                    "tradingsymbol": str(leg.get("tradingsymbol") or ""),
+                    "notional_inr": notional,
+                    "available_funds_inr": float(available),
+                },
+            )
+        except CapacityExceeded as exc:
+            return {
+                "authorized": False,
+                "reason_code": "ACCOUNT_FUNDS_UNSECURED",
+                "detail": dict(exc.detail),
+            }
+        except Exception as exc:  # noqa: BLE001 - never spend on an unproved claim
+            return {
+                "authorized": False,
+                "reason_code": "ACCOUNT_FUNDS_UNSECURED",
+                "detail": {"reason": "authorization_failed", "error": str(exc)},
+            }
 
     def _envelope(self, plan: Mapping[str, Any]) -> Dict[str, Any]:
         from backend.strategies.proposals import ProposalStore

@@ -748,6 +748,69 @@ class SqlAlchemyStrategyRepository:
         finally:
             session.close()
 
+    def report_completion(
+        self,
+        job_id: str,
+        *,
+        completion_state: str,
+        exit_code: Optional[int],
+        lease_owner: str,
+        expected_lease_epoch: int,
+        expected_attempt: int,
+    ) -> bool:
+        """Record the runner-reported end-of-child report, bound to the attempt.
+
+        Only the supervisor lifecycle API calls this, and only with
+        ``exited``/``stop_requested``/``timeout``. It is the DURABLE marker that
+        distinguishes a clean finite exit (which the automatic evaluation
+        continuation may clear) from a stop, a timeout, a fence or a crash
+        recovery (which it never clears), including across a host restart.
+
+        The write is fenced by the FULL attempt authority (id + ``lease_owner`` +
+        ``lease_epoch`` + ``attempt``), not merely the attempt number, so a stale
+        runner cannot report on an attempt it no longer owns. It is also
+        write-once per attempt: a later report may only fill in a MISSING exit
+        code for the SAME completion value. An unsafe outcome (a stop, a timeout,
+        a non-zero exit) can therefore never be laundered into ``exited``/``0``
+        by a subsequent or delayed report.
+        """
+        if completion_state not in ("exited", "stop_requested", "timeout"):
+            raise service.StrategyValidationError(
+                "completion state must be exited/stop_requested/timeout"
+            )
+        if exit_code is not None and not isinstance(exit_code, int):
+            raise service.StrategyValidationError("exit_code must be an integer or None")
+        session = self._session()
+        try:
+            result = session.execute(
+                update(StrategyJob)
+                .where(
+                    self._authority_clause(
+                        job_id, lease_owner, expected_lease_epoch, expected_attempt
+                    ),
+                    or_(
+                        StrategyJob.completion_state.is_(None),
+                        and_(
+                            StrategyJob.completion_state == str(completion_state),
+                            StrategyJob.exit_code.is_(None),
+                        ),
+                    ),
+                )
+                .values(
+                    completion_state=str(completion_state),
+                    completion_at=_utcnow(),
+                    exit_code=exit_code,
+                    updated_at=_utcnow(),
+                )
+            )
+            session.commit()
+            return bool(result.rowcount)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def reconcile_with_audit(
         self,
         job_id: str,
@@ -766,6 +829,9 @@ class SqlAlchemyStrategyRepository:
         barrier_environment: Optional[str] = None,
         expected_barrier_version: Optional[int] = None,
         require_barrier_proof: bool = False,
+        expected_projection_version: Optional[int] = None,
+        require_clean_completion: bool = False,
+        outcome: str = "reconciled",
         close_worker_run: bool = False,
         worker_run_id: Optional[str] = None,
     ) -> Optional[StrategyJobReconciliation]:
@@ -796,6 +862,13 @@ class SqlAlchemyStrategyRepository:
         and the attempt stays blocked: replacement is never unblocked while the
         linked trading run is still open. Data-only/unlaunched attempts leave
         this off and are unaffected.
+
+        ``expected_projection_version`` (used by the evaluation-continuation
+        path) pins the attributed book the proof vouched for: if the book was
+        republished between the assessment and this commit the unblock refuses,
+        so the successor never adopts a book nobody proved. ``outcome`` labels
+        the audit row and defaults to the operator reconciliation vocabulary, so
+        existing callers are unchanged.
         """
         session = self._session()
         try:
@@ -847,6 +920,34 @@ class SqlAlchemyStrategyRepository:
                     session.rollback()
                     return None
 
+            if expected_projection_version is not None:
+                # Same derivation as the barrier block above: the book comes
+                # from the persisted job, never from caller-supplied coordinates.
+                proj_row = session.execute(
+                    select(
+                        StrategyJob.account_scope,
+                        StrategyJob.strategy_id,
+                        StrategyJob.execution_mode,
+                    ).where(StrategyJob.id == job_id)
+                ).first()
+                if proj_row is None:
+                    session.rollback()
+                    return None
+                from backend.strategies.attribution_models import StrategyProjectionState
+
+                proj_state = session.execute(
+                    select(StrategyProjectionState.projection_version).where(
+                        StrategyProjectionState.account_id == str(proj_row.account_scope or ""),
+                        StrategyProjectionState.strategy_id == str(proj_row.strategy_id or ""),
+                        StrategyProjectionState.execution_environment
+                        == str(proj_row.execution_mode or ""),
+                    )
+                ).scalar_one_or_none()
+                if proj_state is None or int(proj_state or 0) != int(expected_projection_version):
+                    # The book moved under the proof; the operator re-inspects.
+                    session.rollback()
+                    return None
+
 
             result = session.execute(
                 update(StrategyJob)
@@ -861,6 +962,20 @@ class SqlAlchemyStrategyRepository:
                         expected_process_cleanup_state
                     ),
                     StrategyJob.run_id.is_not_distinct_from(expected_run_id),
+                    # Evaluation continuation revalidates the WHOLE clean-exit
+                    # identity here, in the unblock transaction: an operator stop
+                    # that landed after the runner's report, a non-zero exit, or a
+                    # completion row that moved under the assessment all fail the
+                    # CAS rather than clearing the block.
+                    *(
+                        [
+                            StrategyJob.completion_state == "exited",
+                            StrategyJob.exit_code == 0,
+                            StrategyJob.desired_state == "started",
+                        ]
+                        if require_clean_completion
+                        else []
+                    ),
                 )
                 .values(status="stopped", reconciled_at=_utcnow(), updated_at=_utcnow())
             )
@@ -905,7 +1020,7 @@ class SqlAlchemyStrategyRepository:
                 owner_id=owner_id,
                 attempt=int(expected_attempt),
                 run_id=expected_run_id,
-                outcome="reconciled",
+                outcome=str(outcome),
                 reason_code=reason_code,
                 evidence_json=audit_evidence,
                 actor_id=actor_id,
@@ -1559,6 +1674,36 @@ class SqlAlchemyStrategyRepository:
                 )
             ).first()
             return row is not None
+        finally:
+            session.close()
+
+    def get_blocking_job(self, owner_id: str, strategy_id: str) -> Optional[StrategyJob]:
+        """The one job that currently blocks a new attempt, or ``None``.
+
+        Mirrors the predicate ``create_job`` enforces (an active job, or a
+        ``recovery_required`` attempt whose block has not been cleared). Used by
+        the automatic-continuation path so it reasons about exactly the row
+        ``create_job`` would refuse on, rather than a separate notion of
+        "blocked".
+        """
+        session = self._session()
+        try:
+            return session.execute(
+                select(StrategyJob)
+                .where(
+                    StrategyJob.owner_id == owner_id,
+                    StrategyJob.strategy_id == strategy_id,
+                    or_(
+                        StrategyJob.status.in_(_ACTIVE_JOB_STATUSES),
+                        and_(
+                            StrategyJob.status == _UNRECONCILED,
+                            StrategyJob.reconciled_at.is_(None),
+                        ),
+                    ),
+                )
+                .order_by(StrategyJob.created_at.desc(), StrategyJob.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
         finally:
             session.close()
 

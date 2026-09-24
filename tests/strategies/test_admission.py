@@ -145,17 +145,7 @@ class AdmissionTestCase(unittest.TestCase):
     # -- fixtures -----------------------------------------------------------
 
     def plan(self, **overrides):
-        leg = {
-            "instrument_id": "inst-REL",
-            "exchange": "NSE",
-            "tradingsymbol": "RELIANCE",
-            "broker_exchange": "NSE",
-            "broker_symbol": "RELIANCE",
-            "broker_token": 100,
-            "product": "CNC",
-            "signed_quantity": 10,
-            "reference_price": 100.0,
-        }
+        leg = self._leg()
         values = {
             "plan_id": "plan-1",
             "proposal_id": "prop-1",
@@ -171,6 +161,19 @@ class AdmissionTestCase(unittest.TestCase):
         values.update(overrides)
         return values
 
+    def _leg(self):
+        return {
+            "instrument_id": "inst-REL",
+            "exchange": "NSE",
+            "tradingsymbol": "RELIANCE",
+            "broker_exchange": "NSE",
+            "broker_symbol": "RELIANCE",
+            "broker_token": 100,
+            "product": "CNC",
+            "signed_quantity": 10,
+            "reference_price": 100.0,
+        }
+
     def margin(self, *, usable=10000.0, age_seconds=0.0):
         return {"usable": usable, "as_of": NOW - timedelta(seconds=age_seconds)}
 
@@ -181,7 +184,12 @@ class AdmissionTestCase(unittest.TestCase):
             strategy_id="stg-A", account_id="kite:A", updated_by="app:o", **values
         )
 
-    def book(self, quantity, *, price=None, token=738561):
+    def book(self, quantity, *, canonical_id="inst-REL", token=100, environment="live"):
+        """Seed this strategy's attributed book for ONE canonical coordinate.
+
+        Defaults to the plan's own coordinate (``inst-REL``); pass another
+        ``canonical_id`` to seed an unrelated held name.
+        """
         with self.factory() as session:
             session.execute(
                 text(
@@ -189,10 +197,33 @@ class AdmissionTestCase(unittest.TestCase):
                     "(account_id, strategy_id, execution_environment, identity_kind, identity_key, "
                     " canonical_instrument_id, product, instrument_token, exchange, tradingsymbol, "
                     " net_quantity, projection_version) "
-                    "VALUES ('kite:A', 'stg-A', 'live', 'canonical', :key, :key, 'CNC', :token, "
+                    "VALUES ('kite:A', 'stg-A', :env, 'canonical', :key, :key, 'CNC', :token, "
                     " 'NSE', 'RELIANCE', :qty, 1)"
                 ),
-                {"key": f"inst-{token}", "token": token, "qty": int(quantity)},
+                {
+                    "key": canonical_id,
+                    "token": int(token),
+                    "qty": int(quantity),
+                    "env": str(environment),
+                },
+            )
+            session.commit()
+
+    def publish_state(self, *, at=None, environment="live"):
+        """Publish this book (the normal publication marker) at a given instant."""
+        moment = at or NOW
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategy_projection_state "
+                    "(account_id, strategy_id, execution_environment, projection_version, "
+                    " content_sha256, last_rebuild_at, updated_at) "
+                    "VALUES ('kite:A', 'stg-A', :env, 1, 'content-hash', :at, :at) "
+                    "ON CONFLICT (account_id, strategy_id, execution_environment) DO UPDATE "
+                    "SET last_rebuild_at = EXCLUDED.last_rebuild_at, "
+                    "    content_sha256 = EXCLUDED.content_sha256"
+                ),
+                {"at": moment, "env": str(environment)},
             )
             session.commit()
 
@@ -222,6 +253,10 @@ class AdmissionTestCase(unittest.TestCase):
 
     def reserve(self, notional, *, status="active", strategy_id="stg-A", plan_id="plan-old"):
         self.seed_plan_row(plan_id, strategy_id=strategy_id)
+        return self._reserve(notional, status=status, strategy_id=strategy_id, plan_id=plan_id)
+
+    def _reserve(self, notional, *, status, strategy_id, plan_id, consumed_at=None):
+        self.seed_plan_row(plan_id, strategy_id=strategy_id)
         with self.factory() as session:
             session.execute(
                 text(
@@ -241,6 +276,18 @@ class AdmissionTestCase(unittest.TestCase):
                     "created": NOW - timedelta(seconds=30),
                 },
             )
+            if consumed_at is not None:
+                # The IMMUTABLE consumption timestamp: the server-written
+                # ``consumed`` event. A reservation row alone carries no proof of
+                # when (or whether) its fill landed.
+                session.execute(
+                    text(
+                        "INSERT INTO strategy_reservation_events "
+                        "(id, reservation_id, event, actor_id, detail, created_at) "
+                        "VALUES (:eid, :rid, 'consumed', 'test', '{}', :at)"
+                    ),
+                    {"eid": f"evt-{plan_id}", "rid": f"res-{plan_id}", "at": consumed_at},
+                )
             session.commit()
 
 
@@ -271,12 +318,53 @@ class AllocationTests(AdmissionTestCase):
         self.assertEqual(verdict.detail["plan_requirement_inr"], 1000.0)
 
     def test_allocation_counts_the_attributed_book(self):
-        # 10 units at 100 = 1000 already attributed; a new 1000 cannot fit in 1500.
+        # The enforced requirement is the INCREMENTAL funding. Growing a held 10
+        # to 15 needs only 500 more (not the whole 1500 target), so 1500 admits;
+        # growing it to 20 needs 1000 more than the 500 already attributed, so
+        # 1000 attributed + 500 pending headroom refuses.
         self.policy(allocation_inr=1500.0)
         self.book(10)
+        grow = self.plan(leg={**self._leg(), "signed_quantity": 15})
+        verdict = self.service.evaluate(grow, now=NOW, margin_evidence=self.margin())
+        self.assertTrue(verdict.admitted, verdict.detail)
+        self.assertEqual(verdict.detail["current_exposure_inr"], 1000.0)
+        self.assertEqual(verdict.detail["plan_requirement_inr"], 500.0)
+
+        tighter = self.plan(leg={**self._leg(), "signed_quantity": 20})
+        refused = self.service.evaluate(tighter, now=NOW, margin_evidence=self.margin())
+        self.assertEqual(refused.refusal_reason, "ALLOCATION_EXCEEDED")
+        self.assertEqual(refused.detail["attributed_consumption_inr"], 1000.0)
+
+    def test_reapplying_an_unchanged_target_costs_nothing(self):
+        # The deployed doubling: a full-target plan re-applying the book it is
+        # already holding was charged the whole book again and refused
+        # ALLOCATION_EXCEEDED. Re-applying the unchanged target is now a
+        # zero-order, zero-additional-capital operation.
+        self.policy(allocation_inr=1000.0)
+        self.book(10)
         verdict = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
-        self.assertEqual(verdict.refusal_reason, "ALLOCATION_EXCEEDED")
-        self.assertEqual(verdict.detail["attributed_consumption_inr"], 1000.0)
+        self.assertTrue(verdict.admitted, verdict.detail)
+        self.assertEqual(verdict.detail["plan_requirement_inr"], 0.0)
+        self.assertEqual(verdict.detail["incremental_funding_inr"], 0.0)
+
+    def test_a_sell_only_rebalance_funds_nothing_until_it_fills(self):
+        # A removal (held 10 -> target 0) releases no cash in admission: the sell
+        # contributes zero incremental funding, and the buys that depend on it
+        # must fund themselves.
+        self.policy(allocation_inr=1000.0)
+        self.book(10)
+        removal = self.plan(leg={**self._leg(), "signed_quantity": 0})
+        verdict = self.service.evaluate(removal, now=NOW, margin_evidence=self.margin())
+        self.assertTrue(verdict.admitted, verdict.detail)
+        self.assertEqual(verdict.detail["incremental_funding_inr"], 0.0)
+        # And an unfilled sale never becomes headroom for a replacement buy.
+        self.reserve(1000.0, status="active", plan_id="plan-a")
+        replacement = self.service.evaluate(
+            self.plan(leg={**self._leg(), "instrument_id": "inst-REL", "signed_quantity": 10}),
+            now=NOW,
+            margin_evidence=self.margin(),
+        )
+        self.assertEqual(replacement.refusal_reason, "ALLOCATION_EXCEEDED")
 
     def test_allocation_counts_active_reservations_but_not_released_ones(self):
         self.policy(allocation_inr=1500.0)
@@ -295,18 +383,77 @@ class AllocationTests(AdmissionTestCase):
             self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin()).admitted
         )
 
-    def test_consumed_capacity_is_never_released(self):
-        # Capital backing an open position counts against allocation forever.
+    def test_consumed_capacity_is_history_not_a_second_charge(self):
+        # A consumed reservation holds capacity until the exposure it backed is
+        # actually VISIBLE in the published attributed book. Only then does the
+        # position carry the exposure and stop the reservation being charged a
+        # second time.
         self.policy(allocation_inr=1500.0)
-        self.reserve(600.0, status="consumed", plan_id="plan-c")
-        verdict = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
-        self.assertEqual(verdict.refusal_reason, "ALLOCATION_EXCEEDED")
-        self.assertEqual(verdict.detail["active_reserved_inr"], 600.0)
+        consumed_at = NOW - timedelta(seconds=10)
+        self._reserve(600.0, status="consumed", strategy_id="stg-A", plan_id="plan-c", consumed_at=consumed_at)
+        # A publication that predates the CONSUMPTION event proves nothing about
+        # the fill, so the reservation still holds.
+        self.publish_state(at=NOW - timedelta(seconds=20))
+        refused = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
+        self.assertEqual(refused.refusal_reason, "ALLOCATION_EXCEEDED")
+        self.assertEqual(refused.detail["consumed_unpublished_inr"], 600.0)
+        self.assertEqual(refused.detail["consumed_published_inr"], 0.0)
+
+        # Published AFTER consumption: the position now carries it.
+        self.publish_state(at=NOW)
+        allowed = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
+        self.assertTrue(allowed.admitted, allowed.detail)
+        self.assertEqual(allowed.detail["consumed_published_inr"], 600.0)
+        self.assertEqual(allowed.detail["consumed_unpublished_inr"], 0.0)
+        self.assertEqual(allowed.detail["consumed_history_inr"], 600.0)
+
+    def test_a_consumed_reservation_without_a_consumption_event_still_holds(self):
+        """The reservation row's ``created_at`` is not consumption evidence."""
+        self.policy(allocation_inr=1500.0)
+        self.reserve(600.0, status="consumed", plan_id="plan-d")
+        self.publish_state(at=NOW)
+        refused = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
+        self.assertEqual(refused.refusal_reason, "ALLOCATION_EXCEEDED")
+        self.assertEqual(refused.detail["consumed_unpublished_inr"], 600.0)
 
     def test_zero_allocation_is_a_real_limit_not_null(self):
         self.policy(allocation_inr=0.0)
         verdict = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
         self.assertEqual(verdict.refusal_reason, "ALLOCATION_EXCEEDED")
+
+    def test_a_fully_allocated_sell_and_buy_rebalance_is_admitted_but_staged(self):
+        """A sell-A / buy-B rebalance on a fully allocated book.
+
+        The budget test is on the POST-PLAN book, so this fits. The funding that
+        is not covered by free headroom must come from A's own confirmed release,
+        which is reported as a shortfall for the executor to enforce staged -
+        never credited as if the projected sale had already paid.
+        """
+        self.policy(allocation_inr=1000.0)
+        self.book(10)  # A: 10 @ 100 = the whole 1000 allocation
+        rebalance = self.plan(
+            **{
+                "resolved_plan": {
+                    "legs": [
+                        {**self._leg(), "signed_quantity": 0},  # remove A
+                        {
+                            **self._leg(),
+                            "instrument_id": "inst-REL2",
+                            "broker_token": 101,
+                            "signed_quantity": 10,  # add B for the same notional
+                        },
+                    ]
+                }
+            }
+        )
+        verdict = self.service.evaluate(rebalance, now=NOW, margin_evidence=self.margin())
+        self.assertTrue(verdict.admitted, verdict.detail)
+        self.assertEqual(verdict.detail["desired_exposure_inr"], 1000.0)
+        self.assertEqual(verdict.detail["free_headroom_inr"], 0.0)
+        self.assertEqual(verdict.detail["funding_shortfall_inr"], 1000.0)
+        self.assertIs(verdict.detail["requires_staged_financing"], True)
+        # The pre-plan shape would have refused the same plan (the old doubling).
+        self.assertGreater(verdict.detail["pre_plan_projected_inr"], 1000.0)
 
 
 class OptionalAxisTests(AdmissionTestCase):
@@ -329,7 +476,7 @@ class OptionalAxisTests(AdmissionTestCase):
         # ...then the same plan with every optional axis NULL is admitted, with no
         # evidence gathered for them at all.
         self.policy(allocation_inr=100000.0)
-        self.book(10, token=999)
+        self.book(10)
         verdict = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
         self.assertTrue(verdict.admitted, verdict.detail)
 
@@ -346,16 +493,219 @@ class OptionalAxisTests(AdmissionTestCase):
 
     def test_gross_notional_axis(self):
         self.policy(allocation_inr=100000.0, gross_notional_inr=1500.0)
-        self.book(10)  # 1000 already gross
-        verdict = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
+        # The post-plan gross includes the unchanged held coordinate AND the leg
+        # this plan grows, valued per instrument.
+        self.book(15)  # 1500 already held at this coordinate
+        grow = self.plan(leg={**self._leg(), "signed_quantity": 20})
+        verdict = self.service.evaluate(grow, now=NOW, margin_evidence=self.margin())
         self.assertEqual(verdict.refusal_reason, "GROSS_NOTIONAL_EXCEEDED")
         self.assertEqual(verdict.detail["projected_gross_inr"], 2000.0)
 
     def test_max_open_instruments_axis(self):
         self.policy(allocation_inr=100000.0, max_open_instruments=1)
-        self.book(10, token=999)
-        verdict = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
+        # Both post-plan coordinates are priced by the plan, so the refusal is the
+        # instrument COUNT and not a valuation gap.
+        second = {**self._leg(), "instrument_id": "inst-REL2", "broker_token": 101}
+        two_legs = self.plan(**{"resolved_plan": {"legs": [self._leg(), second]}})
+        verdict = self.service.evaluate(two_legs, now=NOW, margin_evidence=self.margin())
         self.assertEqual(verdict.refusal_reason, "MAX_OPEN_INSTRUMENTS_EXCEEDED")
+
+    def test_an_unpriced_held_coordinate_refuses_instead_of_reading_as_zero(self):
+        # A configured notional limit with a held coordinate the plan does not
+        # price is unknown evidence: refusing by name is honest, and valuing it as
+        # zero would under-state this strategy's own projection.
+        self.policy(allocation_inr=100000.0)
+        self.book(5, canonical_id="inst-OTHER", token=999)
+        verdict = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
+        self.assertEqual(verdict.refusal_reason, "POSITION_VALUATION_UNAVAILABLE")
+        self.assertEqual(verdict.detail["unvalued"][0]["coordinate"], ["inst-OTHER", "CNC"])
+
+    def test_an_unattributed_raw_fact_refuses_instead_of_being_ignored(self):
+        # A raw (unattributed) projection fact is real exposure the platform
+        # cannot reconcile to a canonical instrument. It must refuse, not be
+        # counted and dropped.
+        self.policy(allocation_inr=100000.0)
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategy_position_projection "
+                    "(account_id, strategy_id, execution_environment, identity_kind, identity_key, "
+                    " canonical_instrument_id, product, instrument_token, exchange, tradingsymbol, "
+                    " net_quantity, projection_version) "
+                    "VALUES ('kite:A', 'stg-A', 'live', 'raw', 'era-1:unknown', NULL, 'CNC', 999, "
+                    " 'NSE', 'UNKNOWN', 7, 1)"
+                )
+            )
+            session.commit()
+        verdict = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
+        self.assertEqual(verdict.refusal_reason, "POSITION_VALUATION_UNAVAILABLE")
+        reasons = {entry["reason"] for entry in verdict.detail["unvalued"]}
+        self.assertIn("unresolved_projection_fact", reasons)
+        self.assertEqual(verdict.detail["unresolved_projection_facts"], 1)
+
+    def test_a_fully_allocated_rebalance_with_no_free_cash_is_staged_not_refused(self):
+        """The zero-free-cash sell-A/buy-B rebalance is ADMITTED, staged.
+
+        The account has no spare cash, so the whole incremental requirement must
+        come from this plan's own reduction. Admission records the shortfall and
+        admits; it never credits a projected sale, and the executor refuses each
+        dependent buy unless the reduction actually confirms.
+        """
+        self.policy(allocation_inr=20000.0)
+        self.book(100, environment="paper")  # 100 x 100 = 10000 of RELIANCE held
+        self.publish_state(at=NOW, environment="paper")
+        buy_leg = {
+            "instrument_id": "inst-INFY",
+            "exchange": "NSE",
+            "tradingsymbol": "INFY",
+            "broker_exchange": "NSE",
+            "broker_symbol": "INFY",
+            "broker_token": 200,
+            "product": "CNC",
+            "signed_quantity": 100,
+            "reference_price": 100.0,
+        }
+        sell_leg = {**self._leg(), "signed_quantity": 0}
+
+        verdict = self.service.evaluate(
+            self.plan(
+                plan_kind="intent_bundle",
+                resolved_plan={"legs": [sell_leg, buy_leg]},
+            ),
+            execution_environment="paper",
+            now=NOW,
+            paper_funds={"available_funds": 0.0},
+        )
+
+        self.assertTrue(verdict.admitted, verdict.detail)
+        self.assertTrue(verdict.detail["staged_financing_lane"])
+        self.assertEqual(verdict.detail["staged_financing_shortfall_inr"], 10000.0)
+        self.assertEqual(verdict.detail["account_available_inr"], 0.0)
+
+    def test_a_buy_only_plan_with_no_free_cash_is_still_refused(self):
+        """Staging needs a reduction to fund: a naked buy keeps the refusal."""
+        self.policy(allocation_inr=20000.0)
+        # A genuine INCREASE (flat book, buy 10) with no free cash: there is no
+        # reduction to stage it against, so the refusal stands.
+        verdict = self.service.evaluate(
+            self.plan(plan_kind="intent_bundle"),
+            execution_environment="paper",
+            now=NOW,
+            paper_funds={"available_funds": 0.0},
+        )
+
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.refusal_reason, "MARGIN_UNAVAILABLE")
+        self.assertFalse(verdict.detail["staged_financing_lane"])
+
+    def test_live_staged_rebalance_refuses_by_name(self):
+        """Staged sell-before-buy financing is PAPER-only today.
+
+        The live adapter has no confirmed-release authorization path, so a live
+        rebalance whose increases are not covered by available margin refuses by
+        NAME instead of trading on money the platform has not proved. This is the
+        explicit live boundary root accepted, not a silent fallback.
+        """
+        self.policy(allocation_inr=20000.0)
+        self.book(100)
+        self.publish_state(at=NOW)
+        buy_leg = {
+            "instrument_id": "inst-INFY",
+            "exchange": "NSE",
+            "tradingsymbol": "INFY",
+            "broker_exchange": "NSE",
+            "broker_symbol": "INFY",
+            "broker_token": 200,
+            "product": "CNC",
+            "signed_quantity": 100,
+            "reference_price": 100.0,
+        }
+        sell_leg = {**self._leg(), "signed_quantity": 0}
+
+        verdict = self.service.evaluate(
+            self.plan(
+                plan_kind="intent_bundle",
+                resolved_plan={"legs": [sell_leg, buy_leg]},
+            ),
+            execution_environment="live",
+            now=NOW,
+            margin_evidence=self.margin(usable=0.0),
+        )
+
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.refusal_reason, "STAGED_LIVE_FINANCING_UNSUPPORTED")
+        self.assertTrue(verdict.detail["staged_financing_lane"])
+
+    def test_a_non_cnc_intent_bundle_is_not_staged(self):
+        """MIS/NRML bundles must not adopt the CNC portfolio sequencing.
+
+        The same sell-A/buy-B shape in MIS is margined and sequenced by its own
+        domain rules, so the generic rule must not classify it as a staged CNC
+        rebalance (which would also reorder it).
+        """
+        self.policy(allocation_inr=20000.0)
+        self.book(100, environment="paper")
+        self.publish_state(at=NOW, environment="paper")
+        mis_buy = {
+            "instrument_id": "inst-INFY",
+            "exchange": "NSE",
+            "tradingsymbol": "INFY",
+            "broker_exchange": "NSE",
+            "broker_symbol": "INFY",
+            "broker_token": 200,
+            "product": "MIS",
+            "signed_quantity": 100,
+            "reference_price": 100.0,
+        }
+        mis_sell = {**self._leg(), "product": "MIS", "signed_quantity": 0}
+
+        verdict = self.service.evaluate(
+            self.plan(
+                plan_kind="intent_bundle",
+                resolved_plan={"legs": [mis_sell, mis_buy]},
+            ),
+            execution_environment="paper",
+            now=NOW,
+            paper_funds={"available_funds": 0.0},
+        )
+
+        # The classification is the contract under test: a MIS bundle must never
+        # be treated as a staged CNC portfolio (which would also reorder it).
+        self.assertFalse(verdict.detail["staged_financing_lane"])
+        self.assertIsNone(verdict.detail["staged_increase_inr"])
+        self.assertFalse(verdict.admitted)
+
+    def test_admission_sizing_matches_the_executor_for_a_lot_floored_weight_leg(self):
+        """Admission and the executor must derive the SAME order quantity.
+
+        The financing contract is only coherent if the number admission funds is
+        the number the executor will actually send, so this is a deliberate
+        cross-check against ``PaperPlanExecutor._plan_steps`` rather than a
+        re-assertion of admission's own arithmetic.
+        """
+        from backend.strategies.execution import PaperPlanExecutor
+
+        self.policy(allocation_inr=100000.0)
+        leg = {
+            **self._leg(),
+            "signed_quantity": None,
+            "target_weight": 0.9,
+            "reference_price": 100.0,
+            "lot_size": 6,
+        }
+        plan = self.plan(**{"resolved_plan": {"legs": [leg], "capital_basis_inr": 1000.0}})
+
+        exposure = self.service.plan_exposure(plan, execution_environment="live")
+        admitted = exposure["per_instrument"][0]
+
+        executor = PaperPlanExecutor(session_factory=self.factory)
+        steps = executor._plan_steps(plan, {})
+        _index, _step_leg, quantity, _side = steps[0]
+
+        self.assertEqual(quantity, 6, "0.9 x 1000 / 100 = 9 units, floored to a lot of 6")
+        self.assertEqual(admitted["order_quantity"], quantity)
+        self.assertEqual(admitted["target_quantity"], 6)
+        self.assertEqual(exposure["plan_requirement_inr"], 600.0)
 
     def test_order_rate_axis_counts_prior_admissions_in_window(self):
         self.policy(

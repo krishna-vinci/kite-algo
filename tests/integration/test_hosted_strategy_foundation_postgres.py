@@ -204,7 +204,13 @@ def test_migration_constraints_reject_invalid_rows(factory):
     strategy = _strategy(repo)
     version = _version(repo, strategy.id)
 
-    # execution_mode CHECK rejects 'live'.
+    # execution_mode CHECK rejects an unsupported mode. NOTE: this assertion used
+    # to name 'live', which stopped being invalid when the COMMITTED migration
+    # ``20260922_000039_hosted_live_mode`` widened the constraint to
+    # ('paper', 'dry_run', 'live'). Corrected to the current committed contract
+    # rather than changing that migration's semantics. (The stray 'live' row this
+    # test used to insert also broke the module-scoped downgrade case, which
+    # narrows the constraint back.)
     with pytest.raises(Exception):
         with factory() as session:
             session.execute(
@@ -212,7 +218,7 @@ def test_migration_constraints_reject_invalid_rows(factory):
                     "INSERT INTO strategy_jobs (id, strategy_id, version_id, owner_id, "
                     "account_scope, job_kind, execution_mode, params_snapshot, "
                     "capabilities_snapshot, policy_snapshot, max_duration_s, progress_deadline_s) "
-                    "VALUES ('bad', :sid, :vid, 'app:admin', 'kite:paper', 'finite', 'live', "
+                    "VALUES ('bad', :sid, :vid, 'app:admin', 'kite:paper', 'finite', 'continuous', "
                     "'{}', '{}', '{}', 600, 60)"
                 ),
                 {"sid": strategy.id, "vid": version.id},

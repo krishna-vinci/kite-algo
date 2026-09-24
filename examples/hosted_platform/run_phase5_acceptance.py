@@ -90,6 +90,9 @@ STORAGE: Dict[str, Any] = {
         "MOMENTUM01": (300002, "EQ", 1, "NSE", "MOMENTUM ONE"),
         "MOMENTUM02": (300003, "EQ", 1, "NSE", "MOMENTUM TWO"),
         "MOMENTUM03": (300004, "EQ", 1, "NSE", "MOMENTUM THREE"),
+        # A name that is NOT an index member at entry and becomes one later, so a
+        # recurring evaluation has a genuine ADD to make beside its REMOVAL.
+        "MOMENTUM04": (300005, "EQ", 1, "NSE", "MOMENTUM FOUR"),
         "BYSTANDER": (310001, "EQ", 1, "NSE", "OTHER STRATEGY HOLDING"),
     },
     "prices": {256265: 22520.0, 738561: 1500.0, 408065: 1450.0, 2953217: 3900.0, 341249: 1650.0},
@@ -215,7 +218,13 @@ class MomentumFixture:
     is what keeps the previous completed bar usable.
     """
 
-    def __init__(self, *, breadth_ok: bool = True, now: Optional[datetime] = None):
+    def __init__(
+        self,
+        *,
+        breadth_ok: bool = True,
+        now: Optional[datetime] = None,
+        members: Optional[List[Any]] = None,
+    ):
         self.now = now or momentum_reference_now()
         self.as_of = momentum_latest_completed_session(self.now)
         # The name the rest of the harness uses for "the newest session this
@@ -224,9 +233,14 @@ class MomentumFixture:
         self.anchor = _momentum_sessions(self.as_of, 6)[0]
         self.history_sessions = _momentum_sessions(self.as_of, 320)
         self.breadth_ok = breadth_ok
+        # The membership snapshot this evaluation is asked to rebalance against.
+        # A RECURRING sequence changes it between jobs: a dropped name is a real
+        # SELL and an added one is a real BUY, so a rebalance arises from the
+        # strategy's own index input rather than from a seeded book.
+        self.member_rows_source = list(members or MOMENTUM_MEMBERS)
         self.member_rows = {
             token: _momentum_series(self.history_sessions, above=breadth_ok)
-            for token, _symbol in MOMENTUM_MEMBERS
+            for token, _symbol in self.member_rows_source
         }
         self.index_rows = _momentum_series(self.history_sessions, above=True)
         # The still-open current session, when there is one: a weekday after the
@@ -332,7 +346,7 @@ class MomentumFixture:
                 "source_url": None,
                 "last_refreshed_at": None,
             }
-            for token, symbol in MOMENTUM_MEMBERS
+            for token, symbol in self.member_rows_source
         ]
 
 
@@ -975,6 +989,92 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         ],
         "expected_requests": 1,
     },
+    "momentum_recurring_sequence": {
+        # ONE persistent strategy across evaluations: entry into an index
+        # membership, a healthy held completion, the next evaluation (a genuine
+        # NO-OP on an unchanged book), a membership-driven sell/add REBALANCE,
+        # and finally a breadth EXIT of the strategy's own book. Every job is a
+        # fresh supervised child process against the same durable strategy, so a
+        # "restart between evaluations" is the normal path rather than a special
+        # one. The book is never seeded: each evaluation reads what the previous
+        # one actually filled.
+        "source": MOMENTUM_SOURCE,
+        "schema": MOMENTUM_SCHEMA,
+        "momentum": True,
+        "recurring": True,
+        "autonomous": True,
+        "expects_manual": False,
+        "recurring_jobs": [
+            {"phase": "entry", "breadth_ok": True, "membership": "base", "schedule": "due"},
+            {"phase": "noop", "breadth_ok": True, "membership": "base", "schedule": "due"},
+            {
+                "phase": "rebalance",
+                "breadth_ok": True,
+                "membership": "rebased",
+                "schedule": "due",
+            },
+            {"phase": "exit", "breadth_ok": False, "membership": "rebased", "schedule": "due"},
+        ],
+    },
+    "momentum_recurring_sequence_manual": {
+        # The SAME persistent sequence admitted by explicit owner approval: same
+        # one strategy, same durable book, same four evaluations, each approval
+        # landing while the attempt that waits for it is still alive.
+        "source": MOMENTUM_SOURCE,
+        "schema": MOMENTUM_SCHEMA,
+        "momentum": True,
+        "recurring": True,
+        "autonomous": False,
+        "expects_manual": True,
+        "recurring_jobs": [
+            {"phase": "entry", "breadth_ok": True, "membership": "base", "schedule": "due"},
+            {"phase": "noop", "breadth_ok": True, "membership": "base", "schedule": "due"},
+            {
+                "phase": "rebalance",
+                "breadth_ok": True,
+                "membership": "rebased",
+                "schedule": "due",
+            },
+            {"phase": "exit", "breadth_ok": False, "membership": "rebased", "schedule": "due"},
+        ],
+    },
+    "momentum_recurring_zero_cash_rebalance": {
+        # The financial-correctness case: the account is left with GENUINELY
+        # insufficient free cash. The example sizes each name from
+        # ``budget_inr / TOP_N``, so a budget of 1,485,000 buys 150 shares of each
+        # of the four members - roughly 900,000 of the account's 1,000,000 - and
+        # leaves ~100,000 free: far less than the ~225,000 the next evaluation's
+        # increase actually costs. The
+        # rebalance therefore has to SELL the dropped name and BUY the added one,
+        # funded by that sale. The runner reads the paper account's OWN
+        # available_funds before the rebalance and FAILS unless it is strictly
+        # below the increase, so "insufficient free cash" is asserted, not
+        # assumed.
+        "source": MOMENTUM_SOURCE,
+        "schema": MOMENTUM_SCHEMA,
+        "momentum": True,
+        "recurring": True,
+        "autonomous": True,
+        "expects_manual": False,
+        "allocation_inr": 1485000.0,
+        "recurring_jobs": [
+            {
+                "phase": "entry",
+                "breadth_ok": True,
+                "membership": "base",
+                "schedule": "due",
+                "budget_inr": 1485000.0,
+            },
+            {
+                "phase": "rebalance",
+                "breadth_ok": True,
+                "membership": "rebased",
+                "schedule": "due",
+                "budget_inr": 1485000.0,
+                "insufficient_free_cash": True,
+            },
+        ],
+    },
     "momentum_mid_month_deferral": {
         # Off-schedule: the configured monthly calendar day resolves to a
         # DIFFERENT verified session of the month than the as-of session (late in
@@ -1238,7 +1338,7 @@ def _paper_orders(session_factory, account_id: str) -> List[Dict[str, Any]]:
             dict(row)
             for row in session.execute(
                 text(
-                    "SELECT tradingsymbol, transaction_type, quantity, status"
+                    "SELECT tradingsymbol, transaction_type, quantity, status, average_price"
                     "  FROM public.paper_orders WHERE account_scope = :account"
                     " ORDER BY placed_at, order_id"
                 ),
@@ -1670,6 +1770,511 @@ def run_momentum_scenario(
     return scenario
 
 
+MOMENTUM_REBASED_MEMBERS = [
+    (300002, "MOMENTUM01"),
+    (300003, "MOMENTUM02"),
+    (300004, "MOMENTUM03"),
+    (300005, "MOMENTUM04"),
+]
+
+
+def run_momentum_recurring_scenario(
+    label: str,
+    spec: Dict[str, Any],
+    *,
+    app: Any,  # noqa: ANN001
+    market: "SyntheticMarket",
+    session_factory,
+    operator,
+    base_url: str,
+    port: int,
+    timeout: float,
+) -> Dict[str, Any]:
+    """One persistent momentum strategy across evaluations (the Phase A core).
+
+    Every job is a fresh supervised child on the SAME durable strategy and the
+    same frozen version. The book each evaluation reads is the one the previous
+    evaluation actually filled (published through the production rebuild), never
+    a seeded row: entry, a no-op, a membership-driven sell/add rebalance, and a
+    breadth exit.
+    """
+    source = (EXAMPLES / MOMENTUM_SOURCE).read_text()
+    schema = json.loads((EXAMPLES / MOMENTUM_SCHEMA).read_text())
+    account = account_for(label)
+
+    created = operator.post(
+        "/api/strategies",
+        json={
+            "name": f"momentum recurring {label}",
+            "description": "recurring momentum sequence",
+            "execution_mode": "paper",
+            "job_kind": "finite",
+            "account_scope": account,
+            "max_duration_s": 1800,
+            "progress_deadline_s": 900,
+            # No standing protection policy: the supported recurring shape. A
+            # protected strategy refuses the handover by name rather than leaving
+            # two protection owners (root-accepted bounded limit).
+            "stale_exit_policy": "none",
+        },
+    )
+    strategy_id = str(created["strategy_id"])
+    version = operator.post(
+        f"/api/strategies/{strategy_id}/versions",
+        json={
+            "source": source,
+            "parameters_schema": schema,
+            "capabilities": {"trade": True, "data": True},
+        },
+    )
+    version_id = str(version["version_id"])
+    operator.put(
+        f"/api/strategies/{strategy_id}/admission-policy",
+        json={"allocation_inr": float(spec.get("allocation_inr") or 500000.0)},
+    )
+    # The authorization setup is BRANCHED on the spec. A "manual" scenario that
+    # silently installed an autonomous grant would produce requests with
+    # authorization_mode=autonomous / decision_kind=automatic, and every
+    # "owner approval" it recorded would be a no-op against an already-authorized
+    # request: a green-looking manual run that never exercised the owner's
+    # decision at all.
+    if spec["autonomous"]:
+        operator.put(
+            f"/api/strategies/{strategy_id}/authorization",
+            json={"mode": "autonomous", "reason": "phase5 recurring harness"},
+        )
+        operator.post(
+            f"/api/strategies/{strategy_id}/authorization/grants",
+            json={
+                "idempotency_key": f"recurring-grant-{strategy_id}",
+                "version_id": version_id,
+                "execution_environment": "paper",
+            },
+        )
+
+    bystander = operator.post(
+        "/api/strategies",
+        json={
+            "name": f"momentum recurring bystander {label}",
+            "description": "untouched control book",
+            "execution_mode": "paper",
+            "job_kind": "finite",
+            "account_scope": account,
+            "max_duration_s": 1800,
+            "progress_deadline_s": 900,
+            "stale_exit_policy": "none",
+        },
+    )
+    bystander_id = str(bystander["strategy_id"])
+    seed_projection(
+        session_factory,
+        bystander_id,
+        account,
+        [{"tradingsymbol": "BYSTANDER", "instrument_token": 310001, "net_quantity": 7}],
+    )
+    bystander_before = _projection_rows(session_factory, bystander_id)
+
+    failures: List[str] = []
+    jobs_evidence: List[Dict[str, Any]] = []
+    jobs_runtime: List[Dict[str, Any]] = []
+    phases: List[Dict[str, Any]] = []
+    job_specs = list(spec.get("recurring_jobs") or [])
+    orders_so_far = 0
+    requests_so_far = 0
+
+    for job_index, job_spec in enumerate(job_specs):
+        phase = str(job_spec.get("phase") or f"job{job_index}")
+        members = (
+            MOMENTUM_REBASED_MEMBERS
+            if str(job_spec.get("membership")) == "rebased"
+            else MOMENTUM_MEMBERS
+        )
+        fixture = MomentumFixture(
+            breadth_ok=bool(job_spec.get("breadth_ok", True)), members=members
+        )
+        market.set_momentum(fixture)
+        seed_momentum_calendar(session_factory, fixture)
+        install_momentum_constituents(fixture)
+
+        params = {
+            # The strategy's OWN affordability bound for this evaluation. A
+            # scenario may change it between jobs (a resize), which is how the
+            # zero-free-cash case is produced WITHOUT inflating the account.
+            "budget_inr": float(
+                job_spec.get("budget_inr") or spec.get("budget_inr") or 500000
+            ),
+            "regime_anchor_date": fixture.anchor.isoformat(),
+            "rebalance_kind": "MONTHLY_LAST_SESSION",
+            "index_symbol": "NSE:NIFTY500",
+            "deadline_seconds": 60,
+        }
+        if job_spec.get("schedule") == "due":
+            params["rebalance_kind"] = "MONTHLY_CALENDAR_DAY"
+            params["rebalance_day_of_month"] = fixture.due_day_of_month
+
+        # The production rebuild is what makes the previous evaluation's fills
+        # visible to this one: the durable book is read from the platform, never
+        # handed to the child.
+        _publish_positions(operator, strategy_id)
+        before_book = _projection_rows(session_factory, strategy_id)
+        paper_available_before = _paper_available_funds(session_factory, account)
+        orders_before = len(_paper_orders(session_factory, account))
+        requests_before = len(_requests_for(session_factory, strategy_id))
+
+        job = operator.post(
+            f"/api/strategies/{strategy_id}/jobs",
+            json={
+                "version_id": version_id,
+                "job_kind": "finite",
+                "execution_mode": "paper",
+                "params": dict(params),
+                "idempotency_key": f"recurring-job-{uuid.uuid4().hex[:8]}",
+            },
+        )
+        body = job.get("job") if isinstance(job.get("job"), dict) else job
+        job_id = str(body.get("job_id") or body.get("id") or "")
+        if not job_id:
+            fail(f"{label}_{phase}_job", AssertionError("the operator API returned no job id"))
+            break
+        step(f"{label}_{phase}_job_created", job_index=job_index, job_id=job_id)
+
+        supervisor_result: Dict[str, Any] = {}
+
+        def _supervise() -> None:
+            try:
+                supervisor_result.update(
+                    acc.run_supervisor(
+                        base_url, port, WORKSPACE / f"{label}-{phase}", job_id
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - reported in the evidence
+                fail(f"{label}_{phase}_supervisor", exc)
+                supervisor_result["error"] = repr(exc)
+
+        thread = threading.Thread(target=_supervise, daemon=True)
+        thread.start()
+
+        deadline = time.monotonic() + timeout
+        child_exited = False
+        requests_at_child_exit: List[Dict[str, Any]] = []
+        approvals_while_child_alive = 0
+        orders_before_approval: Optional[int] = None
+        while time.monotonic() < deadline:
+            rows = _requests_for(session_factory, strategy_id)
+            for row in rows:
+                status = str(row["status"])
+                if status == "awaiting_approval" and not spec["autonomous"]:
+                    if orders_before_approval is None:
+                        orders_before_approval = len(_paper_orders(session_factory, account))
+                    # The owner's decision goes through the REAL HTTP route while
+                    # the attempt that waits for it is still alive: a hosted
+                    # child's authority is attempt-scoped, so an approval that
+                    # lands after the child exited would be refused
+                    # HOSTED_ATTEMPT_FENCED by the claim.
+                    try:
+                        operator.post(
+                            f"/api/strategies/{strategy_id}/execution-requests/"
+                            f"{row['request_id']}/approve",
+                            json={"reason": "phase5 recurring approval"},
+                        )
+                        approvals_while_child_alive += 1
+                    except Exception as exc:  # noqa: BLE001 - reported, not hidden
+                        fail(f"{label}_{phase}_approve", exc)
+                elif status == "queued":
+                    _dispatch_once(app)
+                    _publish_positions(operator, strategy_id)
+            if supervisor_result:
+                child_exited = True
+                requests_at_child_exit = _requests_for(session_factory, strategy_id)
+                break
+            time.sleep(0.5)
+
+        attempt = _job_attempt(session_factory, job_id)
+        if not child_exited:
+            try:
+                operator.post(
+                    f"/api/strategies/{strategy_id}/jobs/{job_id}/stop",
+                    json={"attempt": attempt},
+                )
+            except Exception as exc:  # noqa: BLE001
+                fail(f"{label}_{phase}_stop", exc)
+            failures.append(f"{phase}: the supervised child never exited within {timeout}s")
+        thread.join(timeout=30)
+        # No operator reconciliation: the eligible completion clears its own
+        # block. A refusal to reconcile (the job is not blocked) is the expected,
+        # recorded outcome here.
+        try:
+            operator.post(
+                f"/api/strategies/{strategy_id}/jobs/{job_id}/reconciliation",
+                json={"attempt": attempt},
+            )
+            failures.append(
+                f"{phase}: an operator reconciliation was required, so the healthy "
+                "completion did not clear its own block"
+            )
+        except Exception as exc:  # noqa: BLE001 - expected: HOSTED_JOB_NOT_BLOCKED
+            if "HOSTED_JOB_NOT_BLOCKED" not in str(exc):
+                failures.append(f"{phase}: unexpected reconciliation answer {str(exc)[:200]}")
+        try:
+            acc.wait_for_terminal_job(session_factory, job_id, deadline_s=60.0)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{phase}: the job never reached a terminal state ({exc})")
+
+        after_book = _projection_rows(session_factory, strategy_id)
+        all_orders = _paper_orders(session_factory, account)
+        job_orders = all_orders[orders_before:]
+        job_requests = _requests_for(session_factory, strategy_id)[requests_before:]
+        job_requests_at_exit = requests_at_child_exit[requests_before:]
+        orders_so_far = len(all_orders)
+        requests_so_far = len(_requests_for(session_factory, strategy_id))
+
+        outcome = str(supervisor_result.get("outcome") or "")
+        exit_code = supervisor_result.get("exit_code")
+        if outcome != "exited" or int(exit_code if exit_code is not None else -1) != 0:
+            failures.append(
+                f"{phase}: the child did not exit 0 on its own "
+                f"(outcome={outcome!r}, exit={exit_code!r})"
+            )
+        pending = [
+            str(row["status"])
+            for row in job_requests_at_exit
+            if str(row["status"]) not in {"executed", "refused", "rejected"}
+        ]
+        if child_exited and pending:
+            failures.append(f"{phase}: the child exited with non-terminal requests {pending!r}")
+
+        if spec.get("expects_manual") and phase != "noop":
+            if not approvals_while_child_alive:
+                failures.append(
+                    f"{phase}: no owner approval reached the platform while the "
+                    "attempt that waited for it was alive"
+                )
+            # The baseline is THIS evaluation's own starting count: earlier
+            # evaluations in the same persistent strategy have their own fills,
+            # and comparing against zero would measure the whole history.
+            if orders_before_approval != orders_before:
+                failures.append(
+                    f"{phase}: orders existed before the owner's decision "
+                    f"({(orders_before_approval or 0) - orders_before} new since "
+                    f"this evaluation started)"
+                )
+            non_manual = [
+                (str(row["request_id"]), str(row.get("authorization_mode")),
+                 str(row.get("decision_kind")))
+                for row in job_requests
+                if str(row.get("decision_kind")) != "manual"
+                or str(row.get("authorization_mode")) != "approval_based"
+            ]
+            if non_manual:
+                failures.append(
+                    f"{phase}: a trading request was not owner-decided "
+                    f"(authorization_mode, decision_kind): {non_manual!r}"
+                )
+        if spec["autonomous"] and approvals_while_child_alive:
+            failures.append(
+                f"{phase}: an autonomous run was approved by hand "
+                f"({approvals_while_child_alive} approvals)"
+            )
+
+        buys = [row for row in job_orders if str(row["transaction_type"]).upper() == "BUY"]
+        sells = [row for row in job_orders if str(row["transaction_type"]).upper() == "SELL"]
+        held_names = {str(row["tradingsymbol"]) for row in after_book if int(row["net_quantity"] or 0)}
+        members_now = {symbol for _token, symbol in members}
+
+        if phase == "entry":
+            if len(buys) != len(members):
+                failures.append(
+                    f"entry: expected {len(members)} buys, saw {len(buys)} ({job_orders!r})"
+                )
+            if sells:
+                failures.append(f"entry: an opening evaluation sold {sells!r}")
+            if not held_names or not held_names <= members_now:
+                failures.append(f"entry: the book {sorted(held_names)} is not the membership")
+        elif phase == "noop":
+            if job_orders:
+                failures.append(f"noop: an unchanged book produced orders {job_orders!r}")
+            if job_requests:
+                failures.append(f"noop: an unchanged book produced a request {job_requests!r}")
+            if before_book != after_book:
+                failures.append(
+                    f"noop: the book moved without a fill: {before_book!r} -> {after_book!r}"
+                )
+        elif phase == "rebalance":
+            dropped = {str(row["tradingsymbol"]) for row in before_book} - members_now
+            added = members_now - {str(row["tradingsymbol"]) for row in before_book}
+            if not sells:
+                failures.append(f"rebalance: the dropped member(s) {sorted(dropped)} were not sold")
+            if not buys:
+                failures.append(f"rebalance: the added member(s) {sorted(added)} were not bought")
+            sold_names = {str(row["tradingsymbol"]) for row in sells}
+            bought_names = {str(row["tradingsymbol"]) for row in buys}
+            if sold_names != dropped:
+                failures.append(f"rebalance: sold {sorted(sold_names)} but dropped {sorted(dropped)}")
+            if bought_names != added:
+                failures.append(f"rebalance: bought {sorted(bought_names)} but added {sorted(added)}")
+        if job_spec.get("insufficient_free_cash"):
+            # The account's OWN funds are the evidence, read from the paper
+            # runtime's durable account row - never an inflated harness balance.
+            increase_notional = _increase_notional_inr(
+                session_factory, strategy_id, job_orders
+            )
+            if paper_available_before is None:
+                failures.append(f"{phase}: the paper account's funds could not be read")
+            elif increase_notional is None or increase_notional <= 0:
+                failures.append(
+                    f"{phase}: the evaluation was expected to INCREASE exposure "
+                    f"(orders={job_orders!r})"
+                )
+            elif float(paper_available_before) >= float(increase_notional):
+                failures.append(
+                    f"{phase}: free cash {paper_available_before!r} was not actually "
+                    f"short of the increase {increase_notional!r}"
+                )
+            else:
+                step(
+                    f"{label}_{phase}_insufficient_free_cash",
+                    paper_available_before_inr=paper_available_before,
+                    increase_notional_inr=increase_notional,
+                )
+
+        if phase == "exit":
+            if not sells:
+                failures.append("exit: a failed breadth gate produced no sell")
+            if buys:
+                failures.append(f"exit: a defensive evaluation bought {buys!r}")
+            if after_book:
+                failures.append(f"exit: the strategy's own book was not emptied: {after_book!r}")
+            sold_quantities = {
+                str(row["tradingsymbol"]): int(row["quantity"]) for row in sells
+            }
+            for row in before_book:
+                symbol = str(row["tradingsymbol"])
+                if int(sold_quantities.get(symbol, 0)) != int(row["net_quantity"]):
+                    failures.append(
+                        f"exit: {symbol} held {row['net_quantity']} but sold "
+                        f"{sold_quantities.get(symbol)}"
+                    )
+
+        evidence = _collect_scenario_evidence(session_factory, strategy_id, account_id=account)
+        log_path = WORKSPACE / f"{label}-{phase}" / "logs" / f"{job_id}.log"
+        evidence["child_log"] = log_path.read_text()[-4000:] if log_path.exists() else ""
+        jobs_evidence.append(evidence)
+        jobs_runtime.append(
+            {
+                "phase": phase,
+                "job_index": job_index,
+                "job_id": job_id,
+                "child_exited": child_exited,
+                "requests_at_child_exit": len(requests_at_child_exit),
+            }
+        )
+        phases.append(
+            {
+                "phase": phase,
+                "job_id": job_id,
+                "membership": "rebased" if members is MOMENTUM_REBASED_MEMBERS else "base",
+                "book_before": before_book,
+                "book_after": after_book,
+                "paper_available_before_inr": paper_available_before,
+                "orders": job_orders,
+                "requests": job_requests,
+                "approvals_while_child_alive": approvals_while_child_alive,
+                "orders_before_approval": orders_before_approval,
+                "supervisor": dict(supervisor_result),
+            }
+        )
+
+    bystander_after = _projection_rows(session_factory, bystander_id)
+    if bystander_before != bystander_after:
+        failures.append(
+            f"the bystander strategy's book changed: "
+            f"{bystander_before!r} -> {bystander_after!r}"
+        )
+    if len(phases) != len(job_specs):
+        failures.append(f"only {len(phases)} of {len(job_specs)} evaluations ran")
+
+    for failure in failures:
+        fail(f"{label}_acceptance", AssertionError(failure))
+
+    scenario = {
+        "strategy_id": strategy_id,
+        "bystander_strategy_id": bystander_id,
+        "job_ids": [row["job_id"] for row in phases],
+        "autonomous": spec["autonomous"],
+        "phases": phases,
+        "bystander_before": bystander_before,
+        "bystander_after": bystander_after,
+        "jobs": jobs_evidence,
+        "jobs_runtime": jobs_runtime,
+        "acceptance": {"ok": not failures, "failures": failures},
+    }
+    RESULT["scenarios"][label] = scenario
+    step(
+        f"{label}_finished",
+        evaluations=len(phases),
+        orders=sum(len(row["orders"]) for row in phases),
+        bystander_untouched=bystander_before == bystander_after,
+    )
+    return scenario
+
+
+def _paper_available_funds(session_factory, account_id: str) -> Optional[float]:
+    """The paper account's OWN free cash, straight from its durable row.
+
+    This is the real account-funds evidence: nothing here inflates a balance to
+    make a scenario pass.
+    """
+    from sqlalchemy import text
+
+    with session_factory() as session:
+        row = session.execute(
+            text(
+                "SELECT available_funds FROM public.paper_accounts"
+                " WHERE account_scope = :account"
+            ),
+            {"account": account_id},
+        ).first()
+    return None if row is None else float(row[0])
+
+
+def _increase_notional_inr(
+    session_factory, strategy_id: str, orders: List[Dict[str, Any]]
+) -> Optional[float]:
+    """What the executed BUYs cost, priced from the frozen plan's own legs."""
+    from sqlalchemy import text
+
+    buys = [row for row in orders if str(row["transaction_type"]).upper() == "BUY"]
+    if not buys:
+        return None
+    with session_factory() as session:
+        rows = session.execute(
+            text(
+                "SELECT resolved_plan FROM public.strategy_plans"
+                " WHERE strategy_id = :sid ORDER BY created_at DESC LIMIT 5"
+            ),
+            {"sid": strategy_id},
+        ).scalars().all()
+    prices: Dict[str, float] = {}
+    for resolved in rows:
+        for leg in dict(resolved or {}).get("legs") or []:
+            symbol = str(leg.get("tradingsymbol") or "").upper()
+            price = leg.get("reference_price")
+            if symbol and price is not None:
+                prices.setdefault(symbol, float(price))
+    total = 0.0
+    for row in buys:
+        # The REAL money the fill cost, taken from the paper order itself. The
+        # plan's frozen reference price is only a fallback: in this harness the
+        # paper runtime quotes a different synthetic price than the momentum
+        # fixture's history, and the assertion must use what was actually paid.
+        paid = row.get("average_price")
+        price = float(paid) if paid is not None else prices.get(str(row["tradingsymbol"]).upper())
+        if price is None:
+            return None
+        total += abs(int(row["quantity"])) * price
+    return total
+
+
 def _requests_for(session_factory, strategy_id: str) -> List[Dict[str, Any]]:
     """This run's durable execution requests, newest last."""
     from sqlalchemy import text
@@ -1965,7 +2570,8 @@ def _collect_scenario_evidence(
                 dict(row)
                 for row in session.execute(
                     text(
-                        "SELECT e.plan_id, e.step_no, e.event, e.filled_quantity, e.refusal_reason"
+                        "SELECT e.plan_id, e.step_no, e.event, e.filled_quantity,"
+                        "       e.refusal_reason, e.detail"
                         "  FROM strategy_plan_execution_events e JOIN strategy_plans l"
                         "    ON l.plan_id = e.plan_id WHERE l.strategy_id = :sid"
                         " ORDER BY e.created_at"
@@ -2350,7 +2956,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 step(f"{label}_not_scored", reason=str(spec["not_scored"]))
                 continue
             try:
-                if spec.get("momentum"):
+                if spec.get("recurring"):
+                    run_momentum_recurring_scenario(
+                        label,
+                        spec,
+                        app=app,
+                        market=market,
+                        session_factory=session_factory,
+                        operator=operator,
+                        base_url=base_url,
+                        port=port,
+                        timeout=args.timeout,
+                    )
+                elif spec.get("momentum"):
                     run_momentum_scenario(
                         label,
                         spec,

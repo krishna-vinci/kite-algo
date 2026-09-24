@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -32,6 +32,7 @@ from backend.strategies.attribution_models import (
     AccountReconciliationVersion,
     StrategyAdmissionPolicy,
     StrategyPositionProjection,
+    StrategyProjectionState,
     StrategyReservation,
 )
 
@@ -43,6 +44,8 @@ ADMISSION_REFUSALS = (
     "ADMISSION_POLICY_MISSING",
     "ALLOCATION_EXCEEDED",
     "REFERENCE_PRICE_UNAVAILABLE",
+    "POSITION_VALUATION_UNAVAILABLE",
+    "STAGED_LIVE_FINANCING_UNSUPPORTED",
     "INSTRUMENT_NOTIONAL_EXCEEDED",
     "GROSS_NOTIONAL_EXCEEDED",
     "MAX_OPEN_INSTRUMENTS_EXCEEDED",
@@ -58,6 +61,12 @@ ADMISSION_REFUSALS = (
 #: Statuses that hold capacity. ``consumed`` is included deliberately: capital
 #: backing an open position is never released because its evaluation expired.
 CAPACITY_HOLDING_STATUSES = ("active", "renewed", "consumed", "action_required")
+
+#: Statuses that hold capacity as an UNFILLED commitment. ``consumed`` is NOT
+#: here: a consumed reservation became a published position, and counting both
+#: would double-charge the same exposure. Consumed history stays auditable in the
+#: ledger (``consumed_history_inr``), it is just no longer capacity.
+PENDING_COMMITMENT_STATUSES = ("active", "renewed", "action_required")
 
 DEFAULT_MARGIN_MAX_AGE_SECONDS = 60
 
@@ -258,6 +267,48 @@ class AdmissionService:
             "instrument_count": len({row["tradingsymbol"] for row in per_leg if row["tradingsymbol"]}),
         }
 
+    # -- post-plan exposure (per instrument, canonical coordinates) ---------
+
+    def capacity_held_inr(
+        self,
+        *,
+        account_id: str,
+        strategy_id: str,
+        execution_environment: str,
+    ) -> Dict[str, float]:
+        """Capacity held for ONE strategy in ONE environment (shared rule).
+
+        Delegates to :mod:`backend.strategies.financing` so admission and the
+        reservation ledger can never drift: the rule is defined once.
+        """
+        from backend.strategies.financing import capacity_held
+
+        with self.session_factory() as session:
+            return capacity_held(
+                session,
+                account_id=account_id,
+                strategy_id=strategy_id,
+                execution_environment=execution_environment,
+            )
+
+    def plan_exposure(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        execution_environment: str,
+    ) -> Dict[str, Any]:
+        """Post-plan exposure, from the ONE shared rule in ``financing``.
+
+        The ledger revalidates with exactly this function under its own lock, so
+        admission cannot drift from the gate that actually claims capacity.
+        """
+        from backend.strategies.financing import plan_exposure
+
+        with self.session_factory() as session:
+            return plan_exposure(
+                session, plan, execution_environment=execution_environment
+            )
+
     def attributed_consumption(
         self, *, strategy_id: str, account_id: str, reference_price: Optional[float]
     ) -> float:
@@ -370,12 +421,89 @@ class AdmissionService:
             )
 
         notional = self.plan_notional(plan)
-        requirement = float(notional["total_notional_inr"])
-        reference_prices = [leg.get("reference_price") for leg in (plan.get("resolved_plan") or {}).get("legs") or []]
-        reference_price = next((_as_float(price) for price in reference_prices if _as_float(price)), None)
+        exposure = self.plan_exposure(plan, execution_environment=environment)
+        # The enforced requirement is the INCREMENTAL funding the plan needs, not
+        # the whole target book: re-applying an unchanged target costs nothing,
+        # and a sell leg funds nothing until it actually fills.
+        requirement = float(exposure["incremental_funding_inr"])
+        capacity = self.capacity_held_inr(
+            account_id=account_id,
+            strategy_id=strategy_id,
+            execution_environment=environment,
+        )
+        # Capacity held is the strategy's OWN unfilled commitments plus any
+        # consumed reservation whose exposure is not yet visible in the published
+        # book. A consumed reservation whose fill IS published is carried by the
+        # attributed position instead, never charged twice.
+        pending = float(capacity["held_inr"])
+        # STAGED FINANCING (CNC portfolio lane only): a rebalance that both
+        # REDUCES and INCREASES exposure places its reductions first and releases
+        # each dependent increase only against a CONFIRMED reduction
+        # (``execution.PaperPlanExecutor``), with the paper runtime's own
+        # per-order cash check enforcing the actual money. Such a plan must
+        # therefore not be refused merely because the account's cash is short of
+        # the whole incremental requirement BEFORE the reductions execute - the
+        # shortfall is funded by the plan's own confirmed releases, never by a
+        # projected sale. Futures rolls (acquire-first) and option structures own
+        # their own sequencing and are deliberately excluded, exactly as in the
+        # executor.
+        from backend.strategies.execution import CNC_REBALANCE_PLAN_KINDS
+
+        resolved_plan = dict(plan.get("resolved_plan") or {})
+        # The product must be the CNC cash segment on EVERY leg. An
+        # ``intent_bundle`` also carries futures (NRML) and MIS shapes, and those
+        # are margined differently and sequenced by their own domain rules; the
+        # generic portfolio sell-before-buy staging must never adopt them.
+        leg_products = {
+            str(leg.get("product") or "").upper()
+            for leg in (resolved_plan.get("legs") or [])
+        }
+        cnc_lane = (
+            str(plan.get("plan_kind") or "") in CNC_REBALANCE_PLAN_KINDS
+            and not resolved_plan.get("roll")
+            and bool(leg_products)
+            and leg_products == {"CNC"}
+        )
+        order_quantities = [
+            int(row.get("order_quantity") or 0)
+            for row in exposure["per_instrument"]
+            if int(row.get("order_quantity") or 0) != 0
+        ]
+        staged_plan = bool(
+            cnc_lane
+            and any(quantity < 0 for quantity in order_quantities)
+            and any(quantity > 0 for quantity in order_quantities)
+        )
         detail: Dict[str, Any] = {
             "execution_environment": environment,
             "plan_requirement_inr": requirement,
+            "incremental_funding_inr": requirement,
+            "staged_financing_lane": staged_plan,
+            # The part of the requirement a staged plan funds from its OWN
+            # reductions, and therefore must NOT be reserved against free cash at
+            # claim time. It is authorized later, per increase, against confirmed
+            # account money.
+            "staged_increase_inr": (float(requirement) if staged_plan else None),
+            "current_exposure_inr": exposure["current_exposure_inr"],
+            "desired_exposure_inr": exposure["desired_exposure_inr"],
+            "pending_commitments_inr": pending,
+            "unfilled_commitments_inr": capacity["unfilled_commitments_inr"],
+            "consumed_unpublished_inr": capacity["consumed_unpublished_inr"],
+            "consumed_published_inr": capacity["consumed_published_inr"],
+            # ISO string, not a ``datetime``: this detail is persisted verbatim
+            # into the execution request's JSON columns, and a raw datetime
+            # cannot be serialized by the durable write.
+            "projection_published_at": (
+                None
+                if capacity["projection_published_at"] is None
+                else capacity["projection_published_at"].isoformat()
+            ),
+            "consumed_history_inr": (
+                capacity["consumed_published_inr"] + capacity["consumed_unpublished_inr"]
+            ),
+            "post_instruments": exposure["post_instruments"],
+            "per_instrument": exposure["per_instrument"],
+            "unresolved_projection_facts": exposure["unresolved_projection_facts"],
             "per_leg": notional["per_leg"],
         }
 
@@ -404,19 +532,50 @@ class AdmissionService:
                         ),
                     },
                 )
+            if configured_notional_axes and exposure["unvalued"]:
+                # An unchanged HELD coordinate the plan does not price is unknown
+                # evidence about this strategy's own book: refusing by name is the
+                # honest behaviour, and valuing it as zero would under-state the
+                # projection.
+                return AdmissionVerdict(
+                    False,
+                    "POSITION_VALUATION_UNAVAILABLE",
+                    {
+                        **detail,
+                        "unvalued": exposure["unvalued"],
+                        "message": (
+                            "A notional limit is configured but a coordinate in this "
+                            "strategy's post-plan book carries no valid price or size"
+                        ),
+                    },
+                )
 
         if policy is not None and policy.get("allocation_inr") is not None:
-            consumed = self.attributed_consumption(
-                strategy_id=strategy_id, account_id=account_id, reference_price=reference_price
+            current = float(exposure["current_exposure_inr"] or 0.0)
+            desired = float(exposure["desired_exposure_inr"] or 0.0)
+            # The budget test is on the DESIRED POST-PLAN book: what the strategy
+            # will hold once the plan is done. Testing the pre-plan book plus the
+            # whole plan (the old shape) charged a full-target rebalance twice and
+            # refused a fully-allocated sell-A/buy-B even when the post-plan book
+            # fits the budget.
+            projected = desired + pending
+            from backend.strategies.financing import staged_funding
+
+            staging = staged_funding(
+                allocation_inr=policy["allocation_inr"],
+                current_exposure_inr=current,
+                pending_commitments_inr=pending,
+                incremental_funding_inr=requirement,
             )
-            reserved = self.reserved_notional(account_id=account_id, strategy_id=strategy_id)
-            projected = consumed + reserved + requirement
             detail.update(
                 {
                     "allocation_inr": policy["allocation_inr"],
-                    "attributed_consumption_inr": consumed,
-                    "active_reserved_inr": reserved,
+                    "attributed_consumption_inr": current,
+                    "active_reserved_inr": pending,
                     "projected_inr": projected,
+                    "post_plan_projected_inr": projected,
+                    "pre_plan_projected_inr": current + pending + requirement,
+                    **staging,
                 }
             )
             if projected > float(policy["allocation_inr"]):
@@ -424,27 +583,29 @@ class AdmissionService:
 
         if policy is not None and policy.get("per_instrument_notional_inr") is not None:
             limit = float(policy["per_instrument_notional_inr"])
-            worst = max((row["notional_inr"] for row in notional["per_leg"]), default=0.0)
+            # Includes unchanged held coordinates: the limit is on the strategy's
+            # own post-plan book, not merely on the legs this plan touches.
+            worst = max(
+                (float(row["notional_inr"]) for row in exposure["per_instrument"] if row["notional_inr"] is not None),
+                default=0.0,
+            )
             detail.update({"per_instrument_limit_inr": limit, "worst_leg_notional_inr": worst})
             if worst > limit:
                 return AdmissionVerdict(False, "INSTRUMENT_NOTIONAL_EXCEEDED", detail)
 
         if policy is not None and policy.get("gross_notional_inr") is not None:
             limit = float(policy["gross_notional_inr"])
-            consumed = self.attributed_consumption(
-                strategy_id=strategy_id, account_id=account_id, reference_price=reference_price
-            )
-            gross = consumed + requirement
+            gross = float(exposure["desired_exposure_inr"] or 0.0) + pending
             detail.update({"gross_limit_inr": limit, "projected_gross_inr": gross})
             if gross > limit:
                 return AdmissionVerdict(False, "GROSS_NOTIONAL_EXCEEDED", detail)
 
         if policy is not None and policy.get("max_open_instruments") is not None:
             limit = int(policy["max_open_instruments"])
-            open_instruments = self._open_instrument_count(
-                strategy_id=strategy_id, account_id=account_id
-            )
-            projected_open = open_instruments + int(notional["instrument_count"])
+            # The post-plan instrument set already contains the unchanged held
+            # coordinates, so this is not "existing + new" (which double-counts a
+            # name the plan keeps).
+            projected_open = int(exposure["post_instruments"])
             detail.update(
                 {"max_open_instruments": limit, "projected_open_instruments": projected_open}
             )
@@ -558,7 +719,29 @@ class AdmissionService:
                 )
             available = _as_float(margin.get("usable"))
             detail["margin_available_inr"] = available
+            # The ACCOUNT's own constraint, distinct from the strategy budget: the
+            # pipeline hands this to the reservation ledger so two strategies can
+            # never reserve the same actual account funds.
+            detail["account_available_inr"] = available
             if available is not None and available < requirement:
+                if staged_plan:
+                    # LIVE staged financing is NOT implemented: the live adapter
+                    # has no confirmed-release authorization path, so a live
+                    # rebalance whose cash is short refuses by name rather than
+                    # trading on money the platform has not proved.
+                    return AdmissionVerdict(
+                        False,
+                        "STAGED_LIVE_FINANCING_UNSUPPORTED",
+                        {
+                            **detail,
+                            "required_inr": requirement,
+                            "message": (
+                                "A live rebalance whose increases are not covered by "
+                                "available margin is refused: staged sell-before-buy "
+                                "financing is only implemented for paper"
+                            ),
+                        },
+                    )
                 # Authoritative insufficiency is a refusal; the named reason is the
                 # margin axis, since the broker said the money is not there.
                 return AdmissionVerdict(
@@ -571,7 +754,18 @@ class AdmissionService:
             if funds:
                 available = _as_float(funds.get("available_funds"))
                 detail["paper_available_funds"] = available
+                detail["account_available_inr"] = available
                 if available is not None and available < requirement:
+                    if staged_plan:
+                        detail["staged_financing_shortfall_inr"] = float(
+                            requirement - available
+                        )
+                        detail["staged_financing_message"] = (
+                            "Paper cash is short of the whole incremental requirement; "
+                            "this plan's own confirmed reductions must fund the rest and "
+                            "each dependent buy is refused unless they do."
+                        )
+                        return AdmissionVerdict(True, None, detail)
                     return AdmissionVerdict(
                         False, "MARGIN_UNAVAILABLE", {**detail, "required_inr": requirement}
                     )

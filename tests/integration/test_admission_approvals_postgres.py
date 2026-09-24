@@ -361,9 +361,25 @@ class TestCapacityRace(_PgTestCase):
         # must go through the descriptor or it silently becomes an instance method.
         original = ReservationLedger.__dict__["_lock_account"]
         ReservationLedger._lock_account = staticmethod(lambda session, account_id: None)
+        # Make the interleaving DETERMINISTIC rather than timing-dependent: both
+        # workers must finish reading capacity before either inserts. Without the
+        # lock that is the shape the race actually has; with the lock this barrier
+        # would deadlock, which is why it is only installed in this variant.
+        from backend.strategies import financing as financing_module
+
+        real_capacity_held = financing_module.capacity_held
+        both_read = threading.Barrier(2)
+
+        def _synchronized_capacity_held(db, **kwargs):
+            snapshot = real_capacity_held(db, **kwargs)
+            both_read.wait(timeout=30)
+            return snapshot
+
+        financing_module.capacity_held = _synchronized_capacity_held
         try:
             outcomes = self._race(ledger, [PLAN_A, PLAN_B])
         finally:
+            financing_module.capacity_held = real_capacity_held
             ReservationLedger._lock_account = original
 
         assert not [item for item in outcomes if item[0] == "error"], outcomes

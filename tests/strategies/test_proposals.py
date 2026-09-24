@@ -1101,6 +1101,97 @@ class TargetWeightsPlanTests(ProposalTestCase):
         self.assertEqual(state["reason"], "CATALOG_GENERATION_UNRELATED")
 
 
+class ExactQuantityBasisTests(TargetWeightsPlanTests):
+    """An exact-quantity plan may STATE its basis; it must match the owner's.
+
+    The weights lane has always been guarded this way. An ``intent_bundle`` of
+    whole shares carries no weight to size from, but a child can still *state* a
+    budget it was sized against — and that statement is not allowed to exceed the
+    owner's recorded allocation. Omitting the field keeps the existing governed
+    behaviour.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from sqlalchemy import text
+
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.instrument_catalog_records "
+                    "SET instrument_type = 'EQ' WHERE instrument_id LIKE 'inst-%'"
+                )
+            )
+            session.commit()
+
+    def _submit_bundle(self, *, basis="__omitted__", evaluation_id="eval-bundle"):
+        from backend.strategies.proposals import ProposalStore, ProposalSubmission
+
+        payload = {
+            "catalog_generation": G1,
+            "legs": [
+                {
+                    "instrument_token": 100,
+                    "exchange": "NSE",
+                    "tradingsymbol": "RELIANCE",
+                    "product": "CNC",
+                    "target_quantity": 10,
+                }
+            ],
+        }
+        if basis != "__omitted__":
+            payload["capital_basis_inr"] = basis
+        return ProposalStore(session_factory=self.factory).submit(
+            ProposalSubmission(
+                strategy_id="stg-W",
+                account_id="kite:A",
+                evaluation_id=evaluation_id,
+                evaluation_kind="run_now",
+                strategy_run_id="run-1",
+                target_kind="intent_bundle",
+                payload=payload,
+            )
+        )
+
+    def test_an_omitted_basis_keeps_the_existing_behaviour(self):
+        result = self._submit_bundle(evaluation_id="bundle-omitted")
+        self.assertEqual(result["status"], "validated", result)
+        # Nothing is frozen: the exact quantities are the instruction.
+        self.assertNotIn("capital_basis_inr", result["plan"]["resolved_plan"])
+
+    def test_a_matching_stated_basis_is_accepted(self):
+        # A bundle of exact quantities is sized by its legs, so there is nothing
+        # to freeze: the stated basis must simply agree with the owner's
+        # allocation. (The weights lane DOES freeze it, because a weight is a
+        # fraction that must be sized against the platform's number.)
+        result = self._submit_bundle(basis=100000.0, evaluation_id="bundle-match")
+        self.assertEqual(result["status"], "validated", result)
+        self.assertNotIn("capital_basis_inr", result["plan"]["resolved_plan"])
+
+    def test_a_conflicting_stated_basis_is_refused_and_writes_no_plan(self):
+        before = self._plan_ids()
+        result = self._submit_bundle(basis=40000.0, evaluation_id="bundle-small")
+        self.assertEqual(result["status"], "refused", result)
+        self.assertEqual(result["refusal"]["rejection_reason"], "CAPITAL_BASIS_MISMATCH")
+        self.assertEqual(result["refusal"]["stated_capital_basis_inr"], 40000.0)
+        self.assertEqual(result["refusal"]["authoritative_allocation_inr"], 100000.0)
+        self.assertEqual(self._plan_ids(), before)
+
+        larger = self._submit_bundle(basis=500000.0, evaluation_id="bundle-large")
+        self.assertEqual(larger["status"], "refused", larger)
+        self.assertEqual(larger["refusal"]["rejection_reason"], "CAPITAL_BASIS_MISMATCH")
+        self.assertEqual(self._plan_ids(), before)
+
+    def test_a_non_positive_stated_basis_is_still_invalid(self):
+        for index, basis in enumerate((0.0, -100.0, float("nan"), "not-a-number")):
+            with self.subTest(basis=basis):
+                result = self._submit_bundle(basis=basis, evaluation_id=f"bundle-invalid-{index}")
+                self.assertEqual(result["status"], "refused", result)
+                self.assertEqual(
+                    result["refusal"]["rejection_reason"], "CAPITAL_BASIS_INVALID"
+                )
+
+
 class MisOvernightProposalTests(ProposalStoreTests):
     """A MIS overnight refusal is a validation refusal, so it ends the evaluation."""
 

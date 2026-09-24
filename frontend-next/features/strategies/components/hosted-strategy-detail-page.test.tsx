@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -61,8 +61,11 @@ import {
 } from "@/lib/hosted-strategies/api";
 import { toast } from "sonner";
 
-function renderPage(ui: ReactElement = <HostedStrategyDetailPage strategyId="s-1" />) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderPage(
+  ui: ReactElement = <HostedStrategyDetailPage strategyId="s-1" />,
+  existingClient?: QueryClient,
+) {
+  const client = existingClient ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
 }
 
@@ -288,5 +291,43 @@ describe("HostedStrategyDetailPage run-now gating", () => {
       ),
     );
     expect(screen.getByRole("button", { name: /run now/i })).toBeDisabled();
+  });
+});
+
+describe("HostedStrategyDetailPage job list freshness", () => {
+  beforeEach(() => {
+    vi.mocked(fetchHostedStrategy).mockReset();
+    vi.mocked(fetchHostedOptions).mockReset();
+    vi.mocked(fetchHostedVersions).mockReset();
+    vi.mocked(fetchHostedJobs).mockReset();
+  });
+
+  it("keeps refreshing the job list until a queued attempt reports its real terminal state", async () => {
+    // The deployed symptom this pins: after "Create and run" the operator lands
+    // on the strategy page, and the list kept showing "Queued" more than 40s
+    // later even though GET /jobs already returned recovery_required. The
+    // polling decision itself is pinned by `anyJobStillMoving`; this pins the
+    // visible behaviour: when the list is refetched, it shows the server's real
+    // terminal state instead of a stale "Queued".
+    vi.mocked(fetchHostedStrategy).mockResolvedValue(strategy());
+    vi.mocked(fetchHostedOptions).mockResolvedValue(options());
+    vi.mocked(fetchHostedVersions).mockResolvedValue({ versions: [VERSION] });
+    vi.mocked(fetchHostedJobs).mockResolvedValueOnce({
+      jobs: [job({ status: "queued", replacement_blocked: true })],
+    });
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderPage(<HostedStrategyDetailPage strategyId="s-1" />, client);
+    await waitFor(() => expect(screen.getByText("Queued")).toBeInTheDocument());
+
+    vi.mocked(fetchHostedJobs).mockResolvedValue({
+      jobs: [job({ status: "recovery_required", replacement_blocked: true })],
+    });
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["hosted", "jobs", "s-1"] });
+    });
+
+    await waitFor(() => expect(screen.getByText("Recovery required")).toBeInTheDocument());
+    expect(screen.queryByText("Queued")).not.toBeInTheDocument();
   });
 });

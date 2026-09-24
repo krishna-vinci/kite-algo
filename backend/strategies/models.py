@@ -265,6 +265,14 @@ class StrategyJob(Base):
     process_cleanup_state = Column(Text, nullable=True)
     process_cleanup_at = Column(DateTime(timezone=True), nullable=True)
     process_cleanup_actor = Column(Text, nullable=True)
+    #: Supervisor-reported end-of-child report, bound to this attempt and written
+    #: only by the supervisor lifecycle API: ``exited`` (clean script exit),
+    #: ``stop_requested`` (operator asked the attempt to stop) or ``timeout``
+    #: (observation bound reached). ``NULL`` means the attempt did not report a
+    #: normal end (a fence, a lease expiry, a crash recovery) and is therefore
+    #: never eligible for automatic evaluation continuation.
+    completion_state = Column(Text, nullable=True)
+    completion_at = Column(DateTime(timezone=True), nullable=True)
     #: Operator stop request, bound to the immutable attempt. ``desired_state``
     #: becomes ``stopped`` while the supervisor keeps its authority to perform a
     #: bounded local cleanup and the authorized terminal transition.
@@ -315,6 +323,10 @@ class StrategyJob(Base):
             "process_cleanup_state IS NULL OR process_cleanup_state IN ('confirmed', 'unresolved')",
             name="ck_strategy_jobs_process_cleanup_state",
         ),
+        CheckConstraint(
+            "completion_state IS NULL OR completion_state IN ('exited', 'stop_requested', 'timeout')",
+            name="ck_strategy_jobs_completion_state",
+        ),
         Index("idx_strategy_jobs_lease", "status", "lease_until"),
         Index("idx_strategy_jobs_owner_strategy", "owner_id", "strategy_id"),
     )
@@ -346,7 +358,7 @@ class StrategyJobReconciliation(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "outcome IN ('reconciled', 'blocked')",
+            "outcome IN ('reconciled', 'blocked', 'continuation')",
             name="ck_strategy_job_reconciliations_outcome",
         ),
         CheckConstraint("attempt > 0", name="ck_strategy_job_reconciliations_attempt"),

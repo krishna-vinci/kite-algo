@@ -27,7 +27,8 @@ The rules that make it safe, stated once:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from sqlalchemy import select, update
@@ -104,6 +105,26 @@ def _as_utc(value: Any) -> Optional[datetime]:
             return None
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     return None
+
+
+def _json_safe(value: Any) -> Any:
+    """Coerce a detail payload into something a JSON column can store.
+
+    Datetimes/dates become ISO strings, ``Decimal`` becomes ``float``, and
+    mapping/list shapes are rebuilt recursively. Anything else is passed
+    through untouched so a genuine mistake still surfaces.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 class ExecutionRequestError(Exception):
@@ -1105,8 +1126,15 @@ class ExecutionRequestService:
             values: Dict[str, Any] = {
                 "status": str(status),
                 "refusal_code": refusal_code,
-                "refusal_detail": {} if status == "executed" else dict(detail),
-                "execution_detail": dict(detail),
+                # A durable JSON column must carry JSON. Evidence assembled from
+                # live objects can hold a ``datetime`` (a margin ``as_of``, a
+                # publication stamp, an executor report); failing the write would
+                # leave an UNKNOWN broker outcome unrecorded, which is the one
+                # state this table exists to make unambiguous.
+                "refusal_detail": (
+                    {} if status == "executed" else _json_safe(dict(detail))
+                ),
+                "execution_detail": _json_safe(dict(detail)),
                 "dispatch_finished_at": moment,
                 "updated_at": moment,
             }

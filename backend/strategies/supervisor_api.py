@@ -173,11 +173,28 @@ class LifecycleApiClient:
             },
         )
 
-    def release(self, job_id: str, *, lease_owner: str, lease_epoch: int, attempt: int) -> Dict[str, Any]:
+    def release(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str,
+        lease_epoch: int,
+        attempt: int,
+        completion: Optional[str] = None,
+        exit_code: Optional[int] = None,
+    ) -> Dict[str, Any]:
         return self._request(
             "POST",
             f"/hosted-supervisor/jobs/{job_id}/release",
-            body={"lease_owner": lease_owner, "lease_epoch": lease_epoch, "attempt": attempt},
+            body={
+                "lease_owner": lease_owner,
+                "lease_epoch": lease_epoch,
+                "attempt": attempt,
+                # A REPORT of how the child ended, not a safety assertion: the
+                # server derives the terminal decision from persisted evidence.
+                "completion": completion,
+                "exit_code": exit_code,
+            },
         )
 
     def fence(

@@ -181,6 +181,20 @@ export function preferredCreateMode(modes: readonly string[]): string {
  */
 const BLOCKING_JOB_STATUSES = new Set(["queued", "starting", "running"]);
 
+/**
+ * Statuses that mean the attempt is still moving. The strategy job list polls
+ * while any visible job is in one of these, so a job that was ``queued`` when
+ * the page loaded keeps refreshing until it reports its real terminal state
+ * (queued -> starting -> running -> stopped/failed/recovery_required) instead of
+ * showing a stale "Queued" long after the run finished.
+ */
+export const MOVING_JOB_STATUSES = new Set(["queued", "starting", "running", "fencing"]);
+
+export function anyJobStillMoving(jobs: readonly HostedJobSummary[] | undefined): boolean {
+  if (!jobs || jobs.length === 0) return false;
+  return jobs.some((job) => MOVING_JOB_STATUSES.has(String(job?.status ?? "").trim()));
+}
+
 export function blockingJob(jobs: readonly HostedJobSummary[]): HostedJobSummary | undefined {
   return jobs.find(
     (job) =>

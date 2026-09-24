@@ -50,6 +50,8 @@ class ReservationTestCase(unittest.TestCase):
             StrategyAdmissionPolicy,
             StrategyApproval,
             StrategyPlan,
+            StrategyPositionProjection,
+            StrategyProjectionState,
             StrategyProposal,
             StrategyReservation,
             StrategyReservationEvent,
@@ -66,6 +68,11 @@ class ReservationTestCase(unittest.TestCase):
                 StrategyReservationEvent.__table__,
                 StrategyApproval.__table__,
                 AccountReconciliationVersion.__table__,
+                # The ledger revalidates the strategy's POST-PLAN book under its
+                # lock, so the projection tables are part of its real dependency
+                # set.
+                StrategyPositionProjection.__table__,
+                StrategyProjectionState.__table__,
             ],
         )
         self.factory = sessionmaker(bind=self.engine)
@@ -135,6 +142,179 @@ class ReservationTestCase(unittest.TestCase):
 
 
 class CapacityClaimTests(ReservationTestCase):
+    def seed_cnc_plan(self, plan_id, *, target_quantity):
+        """A CNC portfolio plan with a priced, explicitly sized coordinate.
+
+        The ledger revalidates the POST-PLAN book for this lane, so the fixture
+        must be a real portfolio plan (not the empty structural stub the other
+        cases use).
+        """
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT OR IGNORE INTO strategy_proposals "
+                    "(proposal_id, strategy_id, account_id, evaluation_id, evaluation_kind, "
+                    " strategy_run_id, target_kind, payload, payload_sha256, status) "
+                    "VALUES (:prop, 'stg-A', 'kite:A', :prop, 'run_now', 'run-1', "
+                    " 'intent_bundle', '{}', 'sha', 'validated')"
+                ),
+                {"prop": f"prop-{plan_id}"},
+            )
+            session.execute(
+                text(
+                    "INSERT OR IGNORE INTO strategy_plans "
+                    "(plan_id, proposal_id, strategy_id, account_id, plan_kind, plan_hash, "
+                    " logical_plan, resolved_plan, pinned_catalog_generation) "
+                    "VALUES (:pid, :prop, 'stg-A', 'kite:A', 'intent_bundle', 'h', '{}', "
+                    " :resolved, :gen)"
+                ),
+                {
+                    "pid": plan_id,
+                    "prop": f"prop-{plan_id}",
+                    "gen": G1,
+                    "resolved": __import__("json").dumps(
+                        {
+                            "legs": [
+                                {
+                                    "instrument_id": "inst-REL",
+                                    "product": "CNC",
+                                    "tradingsymbol": "RELIANCE",
+                                    "signed_quantity": int(target_quantity),
+                                    "reference_price": 100.0,
+                                    "lot_size": 1,
+                                }
+                            ]
+                        }
+                    ),
+                },
+            )
+            session.commit()
+
+    def publish_book(self, quantity):
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategy_position_projection "
+                    "(account_id, strategy_id, execution_environment, identity_kind, identity_key, "
+                    " canonical_instrument_id, product, instrument_token, exchange, tradingsymbol, "
+                    " net_quantity, projection_version) "
+                    "VALUES ('kite:A', 'stg-A', 'live', 'canonical', 'inst-REL', 'inst-REL', 'CNC', "
+                    " 738561, 'NSE', 'RELIANCE', :qty, 2)"
+                ),
+                {"qty": int(quantity)},
+            )
+            session.commit()
+
+    def _cnc_request(self, plan_id):
+        from backend.strategies.reservations import ClaimRequest
+
+        return ClaimRequest(
+            plan_id=plan_id,
+            strategy_id="stg-A",
+            account_id="kite:A",
+            evaluation_id=f"eval-{plan_id}",
+            execution_environment="live",
+            requirement_inr=1500.0,
+            valid_until=NOW + timedelta(hours=1),
+            allocation_inr=10000.0,
+            actor_id="app:o",
+        )
+
+    def test_two_individually_admitted_cnc_plans_cannot_exceed_the_budget(self):
+        """Concurrent claims are revalidated against the POST-PLAN book.
+
+        Current book 8000 against a 10000 budget: two plans that each buy 1500
+        are INDIVIDUALLY admissible (post-plan 9500 <= 10000), so the ledger is
+        the only place the second one can be stopped - and it must be, under the
+        account lock, from fresh rows rather than the detached admission verdict.
+        """
+        from backend.strategies.reservations import CapacityExceeded
+
+        self.publish_book(80)  # 80 x 100 = 8000 of RELIANCE held
+        self.seed_cnc_plan("plan-1", target_quantity=95)
+        self.seed_cnc_plan("plan-2", target_quantity=95)
+
+        first = self.ledger.claim(self._cnc_request("plan-1"), now=NOW)
+        self.assertEqual(first["status"], "active")
+
+        with self.assertRaises(CapacityExceeded) as ctx:
+            self.ledger.claim(self._cnc_request("plan-2"), now=NOW)
+        detail = ctx.exception.detail
+        self.assertEqual(detail["scope"], "strategy_post_plan")
+        self.assertEqual(detail["post_plan_inr"], 9500.0)
+        self.assertEqual(detail["other_unfilled_inr"], 1500.0)
+        self.assertIsNone(self.ledger.for_plan("plan-2"))
+
+    def test_a_staged_claim_defers_its_increase_and_authorizes_it_later(self):
+        """The account cap is PHASE-scoped, not omitted.
+
+        A staged CNC rebalance funds its increases from its own reductions, so no
+        cash is needed when the claim is made. The increase is authorized later
+        against the account's real money - and it is genuinely refused when that
+        money is not there, which is what proves the cap was moved rather than
+        dropped.
+        """
+        from dataclasses import replace
+
+        from backend.strategies.reservations import CapacityExceeded
+
+        self.publish_book(80)  # 8000 held against a 10000 allocation
+        self.seed_cnc_plan("plan-1", target_quantity=95)
+        request = replace(
+            self._cnc_request("plan-1"),
+            account_capacity_inr=0.0,
+            staged_increase_inr=1500.0,
+        )
+
+        claimed = self.ledger.claim(request, now=NOW)
+        self.assertEqual(claimed["status"], "active")
+        created = [row for row in self.ledger.events(claimed["reservation_id"]) if row["event"] == "created"]
+        self.assertEqual(created[0]["detail"]["staged_increase_inr"], 1500.0)
+        self.assertFalse(
+            [
+                row
+                for row in self.ledger.events(claimed["reservation_id"])
+                if row["detail"].get("staged_increase_authorized")
+            ]
+        )
+
+        # The sale has NOT produced money yet: the increase cannot spend.
+        with self.assertRaises(CapacityExceeded) as ctx:
+            self.ledger.authorize_staged_increase(
+                plan_id="plan-1", requirement_inr=1500.0, account_capacity_inr=0.0, now=NOW
+            )
+        self.assertEqual(ctx.exception.detail["scope"], "account_funds_increase")
+
+        # The proceeds are now in the account: authorized, exactly once.
+        first = self.ledger.authorize_staged_increase(
+            plan_id="plan-1", requirement_inr=1500.0, account_capacity_inr=2000.0, now=NOW
+        )
+        self.assertTrue(first["authorized"])
+        self.assertFalse(first["already_authorized"])
+        again = self.ledger.authorize_staged_increase(
+            plan_id="plan-1", requirement_inr=1500.0, account_capacity_inr=2000.0, now=NOW
+        )
+        self.assertTrue(again["already_authorized"])
+        authorized = [
+            row for row in self.ledger.events(claimed["reservation_id"])
+            if row["detail"].get("staged_increase_authorized")
+        ]
+        self.assertEqual(len(authorized), 1)
+        self.assertEqual(authorized[0]["detail"]["account_capacity_inr"], 2000.0)
+
+    def test_an_unstaged_claim_still_enforces_the_account_cap(self):
+        """The control: without staging the same zero-cash claim is refused."""
+        from dataclasses import replace
+
+        from backend.strategies.reservations import CapacityExceeded
+
+        self.publish_book(80)
+        self.seed_cnc_plan("plan-1", target_quantity=95)
+        request = replace(self._cnc_request("plan-1"), account_capacity_inr=0.0)
+        with self.assertRaises(CapacityExceeded) as ctx:
+            self.ledger.claim(request, now=NOW)
+        self.assertEqual(ctx.exception.detail["scope"], "account_funds")
+
     def test_claim_records_capacity_and_an_event(self):
         reservation = self.claim(requirement=2500.0)
         self.assertEqual(reservation["status"], "active")

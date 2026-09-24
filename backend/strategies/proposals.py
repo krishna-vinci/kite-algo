@@ -302,7 +302,40 @@ class ProposalStore:
         value, not the caller's number.
         """
         payload = dict(submission.payload or {})
-        if str(submission.target_kind or "").strip() != "target_weights":
+        target_kind = str(submission.target_kind or "").strip()
+        if target_kind != "target_weights":
+            # An exact-quantity proposal may STATE the allocation basis it was
+            # sized against (an ``intent_bundle`` carrying whole shares is the
+            # real case). Stating one does not create it: a stated basis that is
+            # not a finite positive number is ``CAPITAL_BASIS_INVALID``, and one
+            # that differs from the owner's recorded allocation is
+            # ``CAPITAL_BASIS_MISMATCH`` — refused by name, so a child cannot
+            # silently size from a budget the owner never granted. Omitting the
+            # field leaves the existing governed behaviour completely unchanged.
+            stated = payload.get("capital_basis_inr")
+            if stated is None:
+                return payload
+            stated_value = self._stated_capital_basis(stated, submission)
+            authoritative = self._capital_basis(submission)
+            if not math.isclose(
+                stated_value, authoritative, rel_tol=1e-9, abs_tol=1e-6
+            ):
+                raise ValidationRefusal(
+                    "CAPITAL_BASIS_MISMATCH",
+                    {
+                        "strategy_id": str(submission.strategy_id),
+                        "account_id": str(submission.account_id),
+                        "target_kind": target_kind,
+                        "stated_capital_basis_inr": stated_value,
+                        "authoritative_allocation_inr": authoritative,
+                        "message": (
+                            "an exact-quantity plan cannot be sized past the budget it "
+                            "states: the stated capital basis must equal the owner's "
+                            "recorded admission allocation"
+                        ),
+                    },
+                )
+            payload["capital_basis_inr"] = authoritative
             return payload
         authoritative = self._capital_basis(submission)
         stated = payload.get("capital_basis_inr")

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { HostedJobSummary, HostedStrategyOptions } from "@/lib/hosted-strategies/types";
 
 import {
+  anyJobStillMoving,
   blockingJob,
   executionModeLabel,
   isModeSupported,
@@ -175,5 +176,20 @@ describe("hosted execution-mode helpers", () => {
     expect(modeCapabilityState(undefined, false)).toBe("loading");
     expect(modeCapabilityState(undefined, true)).toBe("unavailable");
     expect(modeCapabilityState(options(), false)).toBe("ready");
+  });
+
+  it("polls the job list only while an attempt is still moving", () => {
+    // The deployed symptom: a job shown as "Queued" stayed queued on the page
+    // long after the server reported recovery_required. The list must keep
+    // refreshing while any visible attempt is in a moving state.
+    expect(anyJobStillMoving(undefined)).toBe(false);
+    expect(anyJobStillMoving([])).toBe(false);
+    for (const status of ["queued", "starting", "running", "fencing"]) {
+      expect(anyJobStillMoving([job({ status })])).toBe(true);
+    }
+    for (const status of ["stopped", "failed", "recovery_required", "hung"]) {
+      expect(anyJobStillMoving([job({ status })])).toBe(false);
+    }
+    expect(anyJobStillMoving([job({ status: "stopped" }), job({ status: "running" })])).toBe(true);
   });
 });

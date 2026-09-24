@@ -249,7 +249,12 @@ class PlanExecutionPipeline:
                 {"plan_id": plan_id, "admission": verdict},
             )
         policy = self.admission.policy_for(str(plan.get("strategy_id") or "")) or {}
-        requirement = float(dict(verdict.get("detail") or {}).get("plan_requirement_inr") or 0.0)
+        admission_detail = dict(verdict.get("detail") or {})
+        requirement = float(admission_detail.get("plan_requirement_inr") or 0.0)
+        # The account's OWN funds constraint travels with the plan, separately
+        # from the strategy's allocation: the ledger enforces both, so two
+        # strategies cannot reserve the same actual account funds.
+        account_capacity = admission_detail.get("account_available_inr")
         margin = self.margin(plan, environment)
         return self.ledger.claim(
             ClaimRequest(
@@ -261,6 +266,17 @@ class PlanExecutionPipeline:
                 requirement_inr=requirement,
                 valid_until=self._clock() + timedelta(seconds=int(validity_seconds)),
                 allocation_inr=policy.get("allocation_inr"),
+                account_capacity_inr=(
+                    None if account_capacity is None else float(account_capacity)
+                ),
+                # A staged CNC rebalance funds its increases from its own
+                # confirmed reductions, so the ledger defers that part of the
+                # account-funds claim instead of refusing it up front.
+                staged_increase_inr=(
+                    None
+                    if admission_detail.get("staged_increase_inr") is None
+                    else float(admission_detail["staged_increase_inr"])
+                ),
                 margin_evidence=margin,
                 margin_as_of=(margin or {}).get("as_of"),
                 actor_id=str(actor),

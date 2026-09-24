@@ -3,6 +3,7 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { hostedKeys } from "@/features/strategies/hooks/keys";
+import { anyJobStillMoving } from "@/features/strategies/lib/modes";
 import {
   approveExecutionRequest,
   checkSourceReadiness,
@@ -76,6 +77,11 @@ export function useHostedJobs(strategyId: string | null) {
     queryKey: hostedKeys.jobs(strategyId ?? ""),
     queryFn: () => fetchHostedJobs(strategyId as string),
     enabled: Boolean(strategyId),
+    // The list is what the operator lands on straight after "Create and run".
+    // A job that was queued at first paint must keep refreshing until the server
+    // reports its real terminal state, or the page keeps claiming "Queued" long
+    // after the attempt finished. Poll only while something is actually moving.
+    refetchInterval: (query) => (anyJobStillMoving(query.state.data?.jobs) ? 5_000 : false),
   });
 }
 
