@@ -2,6 +2,7 @@ import { ApiClientError } from "@/lib/api/client";
 import { describe, expect, it } from "vitest";
 
 import {
+  formatTimestamp,
   hostedErrorMessage,
   jobStatusLabel,
   jobStatusTone,
@@ -11,6 +12,14 @@ import {
 } from "./format";
 
 describe("hosted strategy format helpers", () => {
+  it("renders a stored time as a short local value, never a raw ISO token", () => {
+    const rendered = formatTimestamp("2026-09-23T13:05:00+00:00");
+    expect(rendered).toMatch(/23 Sep/);
+    expect(rendered).not.toContain("T");
+    expect(formatTimestamp(null)).toBe("—");
+    expect(formatTimestamp("not a time")).toBe("—");
+  });
+
   it("labels unknown statuses without inventing a state", () => {
     expect(jobStatusLabel("running")).toBe("Running");
     expect(jobStatusLabel("recovery_required")).toBe("Recovery required");

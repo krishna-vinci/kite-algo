@@ -23,27 +23,27 @@ def _require_schema_version(value: int) -> None:
 
 async def resolve_worker_market_ticker(request: Request, symbol: str):
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     return await _market_data_service(request).resolve_ticker(symbol)
 
 async def search_worker_market_tickers(request: Request, query: str, exchange: Optional[str] = None, limit: int = Query(20, ge=1, le=50)):
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     return await _market_data_service(request).search_tickers(query, exchange=exchange, limit=limit)
 
 async def resolve_worker_market_tickers(request: Request, payload: WorkerInstrumentResolveRequest):
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     return await _market_data_service(request).resolve_many(symbols=payload.symbols, instrument_tokens=payload.instrument_tokens)
 
 async def get_worker_market_quotes(request: Request, payload: WorkerQuoteRequest):
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     return await _market_data_service(request).get_quotes(payload)
 
 async def stream_worker_market_ticks(request: Request, symbols: Optional[str] = None, tokens: Optional[str] = None, mode: str = "quote"):
     token = await require_worker_token(request)
-    _require_action(token, "market:stream")
+    await require_worker_read_action(request, token, "market:stream")
     parsed_symbols = _parse_csv_values(symbols)
     parsed_tokens = _parse_csv_int_values(tokens, field_name="tokens")
     return StreamingResponse(
@@ -70,7 +70,7 @@ async def get_worker_market_candles(
     lookback: int = Query(50, ge=1, le=500),
 ):
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     return await _market_data_service(request).get_candles(
         symbol=symbol,
         instrument_token=instrument_token,
@@ -92,7 +92,7 @@ async def get_worker_market_history(
     passthrough: bool = False,
 ):
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     from_ts_value = _optional_query_datetime(from_ts)
     to_ts_value = _optional_query_datetime(to_ts)
     from_date_value = _optional_query_datetime(from_date)
@@ -137,10 +137,11 @@ async def stream_worker_market_candles(
     interval: str = "5minute",
 ):
     token = await require_worker_token(request)
-    _require_action(token, "market:stream")
+    await require_worker_read_action(request, token, "market:stream")
     return StreamingResponse(
         _market_data_service(request).stream_candles(
             request,
+            token=token,
             symbol=symbol,
             instrument_token=instrument_token,
             interval=interval,
@@ -155,12 +156,12 @@ async def stream_worker_market_candles(
 
 async def get_worker_market_snapshot(request: Request, payload: WorkerMarketSnapshotRequest):
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     return await _market_data_service(request).get_market_snapshot(payload)
 
 async def get_worker_funds(request: Request, mode: str = Query("paper"), account_scope: Optional[str] = None):
     token = await require_worker_token(request)
-    _require_action(token, "funds:read")
+    await require_worker_read_action(request, token, "funds:read")
     normalized_mode = str(mode or "paper").strip().lower()
     _require_v1_mode(normalized_mode)
     if normalized_mode not in token.allowed_modes:
@@ -177,7 +178,7 @@ async def get_worker_funds(request: Request, mode: str = Query("paper"), account
 async def get_worker_account_portfolio(request: Request, account_scope: Optional[str] = None, schema_version: int = Query(1, ge=1)):
     _require_schema_version(schema_version)
     token = await require_worker_token(request)
-    _require_action(token, "funds:read")
+    await require_worker_read_action(request, token, "funds:read")
     scope = str(account_scope or token.account_scope or "").strip()
     if not scope or not _token_allows_account_scope(token, scope):
         raise HTTPException(status_code=403, detail={"rejection_reason": "WORKER_ACCOUNT_SCOPE_NOT_ALLOWED"})
@@ -191,7 +192,7 @@ async def get_worker_account_portfolio(request: Request, account_scope: Optional
 async def get_worker_index_constituents(request: Request, source_list: str, schema_version: int = Query(1, ge=1)):
     _require_schema_version(schema_version)
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     from backend.broker_api.instruments.index_ingestion import get_worker_index_snapshot
     try:
         return await asyncio.to_thread(get_worker_index_snapshot, source_list)
@@ -203,7 +204,7 @@ async def get_worker_index_constituents(request: Request, source_list: str, sche
 async def get_worker_index_status(request: Request, source_list: str, schema_version: int = Query(1, ge=1)):
     _require_schema_version(schema_version)
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     from backend.broker_api.instruments.index_ingestion import get_worker_index_status
     try:
         return await asyncio.to_thread(get_worker_index_status, source_list)
@@ -213,7 +214,7 @@ async def get_worker_index_status(request: Request, source_list: str, schema_ver
 async def get_worker_market_calendar_status(request: Request, exchange: str = "NSE", segment: str = "CM", schema_version: int = Query(1, ge=1)):
     _require_schema_version(schema_version)
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     from backend.app.database import get_db_connection
     from backend.broker_api.market.exchange_calendar import CalendarSchemaMigrationRequired, get_calendar_status
     conn = get_db_connection()
@@ -228,7 +229,7 @@ async def get_worker_market_calendar_status(request: Request, exchange: str = "N
 async def get_worker_market_calendar(request: Request, exchange: str = "NSE", segment: str = "CM", from_date: date = Query(..., alias="from"), to_date: date = Query(..., alias="to"), schema_version: int = Query(1, ge=1)):
     _require_schema_version(schema_version)
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     if from_date > to_date:
         raise HTTPException(status_code=422, detail="from must not be after to")
     from backend.app.database import get_db_connection
@@ -243,7 +244,7 @@ async def get_worker_market_calendar(request: Request, exchange: str = "NSE", se
 
 async def get_worker_run_funds(request: Request, strategy_run_id: str):
     token = await require_worker_token(request)
-    _require_action(token, "funds:read")
+    await require_worker_read_action(request, token, "funds:read")
     run = await _repo(request).get_run(strategy_run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Strategy run not found")
@@ -327,7 +328,7 @@ async def delete_worker_gtt_trigger(request: Request, trigger_id: int):
 
 async def compute_worker_market_indicator(request: Request, payload: WorkerIndicatorRequest):
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
     # Imported lazily so environments without the optional numerical stack can
     # still import this router (tests, tooling); the backend runtime always
     # has pandas/numpy.

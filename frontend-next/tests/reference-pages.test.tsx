@@ -91,13 +91,16 @@ describe("reference pages", () => {
     expect(screen.getByText(/watch and handoff/i)).toBeInTheDocument();
   });
 
-  it("renders the primary strategies operator workspace", () => {
+  it("renders the hosted strategies workspace with its creation entry point", () => {
     renderWithQueryClient(<StrategiesPage />);
 
     expect(screen.getByRole("heading", { name: /^strategies$/i })).toBeInTheDocument();
-    expect(screen.getByText(/strategies workspace/i)).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /live/i })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /paper/i })).toBeInTheDocument();
+    // The paste-or-drop composer is the one creation path; the page links to it.
+    expect(screen.getByRole("link", { name: /new strategy/i })).toHaveAttribute(
+      "href",
+      "/strategies/new",
+    );
+    expect(screen.getByText(/registered strategies/i)).toBeInTheDocument();
   });
 
 });

@@ -30,6 +30,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 
 from backend.workflows.repository import Base
@@ -48,6 +49,13 @@ class HostedStrategy(Base):
     default_execution_mode = Column(Text, nullable=False, default="paper")
     default_job_kind = Column(Text, nullable=False, default="finite")
     default_account_scope = Column(Text, nullable=False)
+    #: How this strategy's execution requests are authorised. ``approval_based``
+    #: is the default, and it is the only value a pre-existing strategy can be
+    #: read as: an ``autonomous`` *selection* authorises nothing on its own, it
+    #: only makes an owner-issued grant usable.
+    authorization_mode = Column(
+        Text, nullable=False, default="approval_based", server_default="approval_based"
+    )
     #: Required explicitly until defaults are agreed (coordinator constraint):
     #: no DB default, so a strategy cannot be created without them.
     max_duration_s = Column(Integer, nullable=False)
@@ -63,9 +71,16 @@ class HostedStrategy(Base):
         # Composite target for child FKs: (id, owner_id).
         UniqueConstraint("id", "owner_id", name="uq_hosted_strategies_id_owner"),
         CheckConstraint("template_id = 'hosted:' || id", name="ck_hosted_strategies_template_id"),
+        # ``live`` is representable because migration 20260922_000039 widened the
+        # database constraint; this ORM mirror is kept in step so a
+        # ``create_all`` test database accepts the same vocabulary.
         CheckConstraint(
-            "default_execution_mode IN ('paper', 'dry_run')",
+            "default_execution_mode IN ('paper', 'dry_run', 'live')",
             name="ck_hosted_strategies_execution_mode",
+        ),
+        CheckConstraint(
+            "authorization_mode IN ('approval_based', 'autonomous')",
+            name="ck_hosted_strategies_authorization_mode",
         ),
         CheckConstraint(
             "default_job_kind IN ('continuous', 'finite')",
@@ -159,7 +174,7 @@ class HostedStrategySchedule(Base):
             name="fk_hosted_strategy_schedules_version_strategy",
         ),
         CheckConstraint(
-            "execution_mode IN ('paper', 'dry_run')",
+            "execution_mode IN ('paper', 'dry_run', 'live')",
             name="ck_hosted_strategy_schedules_execution_mode",
         ),
         CheckConstraint(
@@ -280,7 +295,8 @@ class StrategyJob(Base):
         ),
         CheckConstraint("job_kind IN ('continuous', 'finite')", name="ck_strategy_jobs_job_kind"),
         CheckConstraint(
-            "execution_mode IN ('paper', 'dry_run')", name="ck_strategy_jobs_execution_mode"
+            "execution_mode IN ('paper', 'dry_run', 'live')",
+            name="ck_strategy_jobs_execution_mode",
         ),
         CheckConstraint(
             "desired_state IN ('started', 'paused', 'stopped')",
@@ -363,10 +379,278 @@ class StrategyJobLog(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# Governed execution authorization (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class HostedExecutionGrant(Base):
+    """An owner-issued, version-bound standing authorisation (Phase 2).
+
+    A grant is *identity*, not a policy store: it binds the hosted strategy, the
+    immutable version and its source hash, the canonical account, the execution
+    environment, and a canonical hash of the validated admission policy plus the
+    strategy's mandatory run-protection policy. It never carries a user's
+    capital or loss tolerance of its own — those are read from the recorded
+    policy and hashed, so a policy change invalidates the grant instead of
+    silently widening it.
+
+    The row is **immutable in its identity**: the database trigger added by the
+    migration refuses an ``UPDATE`` that changes any identity column, refuses a
+    DELETE, and refuses a row that stopped being ``active`` from becoming
+    ``active`` again (a revoked or superseded grant can never be resurrected).
+    Only the revocation/supersession columns and ``status`` may move.
+
+    ``uq_hosted_execution_grant_active`` is the partial unique index that makes
+    "one active grant per (strategy, account, environment)" a database fact
+    rather than a read-then-write race; ``uq_hosted_execution_grant_request``
+    makes an identical owner request idempotent instead of a second grant.
+    """
+
+    __tablename__ = "hosted_execution_grants"
+
+    grant_id = Column(Text, primary_key=True)
+    #: The app owner (``app:<username>``). Server-derived; never actor-supplied.
+    owner_id = Column(Text, nullable=False)
+    #: The hosted strategy this grant authorises.
+    strategy_id = Column(Text, nullable=False)
+    #: The canonical product identity the hosted strategy is an adapter over.
+    #: Recorded explicitly so the binding is legible without a join.
+    canonical_strategy_id = Column(Text, nullable=False)
+    version_id = Column(Text, nullable=False)
+    version_number = Column(Integer, nullable=False)
+    source_sha256 = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    execution_environment = Column(Text, nullable=False)
+    policy_hash = Column(Text, nullable=False)
+    policy_snapshot = Column(JSON, nullable=False, default=dict)
+    issued_by = Column(Text, nullable=False)
+    issued_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    status = Column(Text, nullable=False, default="active")
+    revoked_by = Column(Text, nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    revocation_reason = Column(Text, nullable=True)
+    superseded_by = Column(Text, nullable=True)
+    superseded_at = Column(DateTime(timezone=True), nullable=True)
+    supersession_reason = Column(Text, nullable=True)
+    #: The caller's idempotency key, plus the canonical hash of what the request
+    #: actually asked for. A repeat with the same key AND the same content is
+    #: idempotent; the same key with different content is a conflict.
+    request_key = Column(Text, nullable=False)
+    content_sha256 = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "strategy_id", "request_key",
+            name="uq_hosted_execution_grant_request",
+        ),
+        Index(
+            "uq_hosted_execution_grant_active",
+            "strategy_id",
+            "account_id",
+            "execution_environment",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status = 'active'"),
+        ),
+        ForeignKeyConstraint(
+            ["strategy_id", "owner_id"],
+            ["hosted_strategies.id", "hosted_strategies.owner_id"],
+            ondelete="CASCADE",
+            name="fk_hosted_execution_grant_strategy_owner",
+        ),
+        ForeignKeyConstraint(
+            ["version_id", "strategy_id"],
+            ["hosted_strategy_versions.id", "hosted_strategy_versions.strategy_id"],
+            ondelete="RESTRICT",
+            name="fk_hosted_execution_grant_version_strategy",
+        ),
+        # Account agreement is database-enforced against the CANONICAL strategy,
+        # so a grant can never name an account the strategy is not pinned to.
+        ForeignKeyConstraint(
+            ["canonical_strategy_id", "account_id"],
+            ["strategies.id", "strategies.account_scope"],
+            ondelete="RESTRICT",
+            name="fk_hosted_execution_grant_canonical",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'revoked', 'superseded')",
+            name="ck_hosted_execution_grant_status",
+        ),
+        CheckConstraint(
+            "execution_environment IN ('paper', 'dry_run', 'live')",
+            name="ck_hosted_execution_grant_environment",
+        ),
+        CheckConstraint("version_number > 0", name="ck_hosted_execution_grant_version"),
+        CheckConstraint(
+            "(status = 'revoked' AND revoked_at IS NOT NULL AND revoked_by IS NOT NULL) "
+            "OR (status <> 'revoked' AND revoked_at IS NULL AND revoked_by IS NULL)",
+            name="ck_hosted_execution_grant_revocation",
+        ),
+        CheckConstraint(
+            "(status = 'superseded' AND superseded_by IS NOT NULL "
+            "AND superseded_at IS NOT NULL) "
+            "OR (status <> 'superseded' AND superseded_by IS NULL "
+            "AND superseded_at IS NULL)",
+            name="ck_hosted_execution_grant_supersession",
+        ),
+        Index("idx_hosted_execution_grant_strategy", "strategy_id", "created_at"),
+    )
+
+
+class HostedExecutionRequest(Base):
+    """One durable, idempotent request to execute one frozen plan (Phase 2).
+
+    A proposal stays a proposal until execution is *requested*. This row is that
+    request: it records the originating run/job/version, the authorization mode
+    and (for autonomous mode) the grant, the decision evidence, the linked
+    reservation/approval/execution trail, and the durable dispatch claim.
+
+    ``uq_hosted_execution_requests_key`` makes a repeated call with the same
+    idempotency key return the same request; a repeated key with different
+    content is a conflict. The dispatcher's claim is an ``UPDATE`` guarded by the
+    hosted-strategy row lock, so revocation and claim acquisition linearise on
+    one row.
+    """
+
+    __tablename__ = "hosted_execution_requests"
+
+    request_id = Column(Text, primary_key=True)
+    owner_id = Column(Text, nullable=False)
+    strategy_id = Column(Text, nullable=False)
+    canonical_strategy_id = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    execution_environment = Column(Text, nullable=False)
+    strategy_run_id = Column(Text, nullable=False)
+    job_id = Column(Text, nullable=True)
+    #: The child credential the request was created under. A rotated token is a
+    #: different attempt, so the dispatch fence compares it.
+    token_id = Column(Text, nullable=True)
+    attempt = Column(Integer, nullable=True)
+    lease_epoch = Column(BigInteger, nullable=True)
+    version_id = Column(Text, nullable=False)
+    version_number = Column(Integer, nullable=True)
+    source_sha256 = Column(Text, nullable=False)
+    policy_hash = Column(Text, nullable=False)
+    evaluation_id = Column(Text, nullable=True)
+    plan_id = Column(Text, nullable=False)
+    plan_hash = Column(Text, nullable=False)
+    authorization_mode = Column(Text, nullable=False)
+    grant_id = Column(Text, nullable=True)
+    status = Column(Text, nullable=False, default="requested")
+    refusal_code = Column(Text, nullable=True)
+    refusal_detail = Column(JSON, nullable=False, default=dict)
+    decision_kind = Column(Text, nullable=True)
+    decision_actor = Column(Text, nullable=True)
+    decision_at = Column(DateTime(timezone=True), nullable=True)
+    decision_evidence = Column(JSON, nullable=False, default=dict)
+    approval_id = Column(Text, nullable=True)
+    reservation_id = Column(Text, nullable=True)
+    execution_detail = Column(JSON, nullable=False, default=dict)
+    dispatch_claim_id = Column(Text, nullable=True)
+    dispatch_claimed_at = Column(DateTime(timezone=True), nullable=True)
+    dispatch_started_at = Column(DateTime(timezone=True), nullable=True)
+    dispatch_finished_at = Column(DateTime(timezone=True), nullable=True)
+    idempotency_key = Column(Text, nullable=False)
+    request_hash = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "plan_id", "idempotency_key",
+            name="uq_hosted_execution_requests_key",
+        ),
+        ForeignKeyConstraint(
+            ["strategy_id", "owner_id"],
+            ["hosted_strategies.id", "hosted_strategies.owner_id"],
+            ondelete="CASCADE",
+            name="fk_hosted_execution_request_strategy_owner",
+        ),
+        ForeignKeyConstraint(
+            ["canonical_strategy_id", "account_id"],
+            ["strategies.id", "strategies.account_scope"],
+            ondelete="RESTRICT",
+            name="fk_hosted_execution_request_canonical",
+        ),
+        ForeignKeyConstraint(
+            ["plan_id"],
+            ["strategy_plans.plan_id"],
+            ondelete="RESTRICT",
+            name="fk_hosted_execution_request_plan",
+        ),
+        ForeignKeyConstraint(
+            ["grant_id"],
+            ["hosted_execution_grants.grant_id"],
+            ondelete="RESTRICT",
+            name="fk_hosted_execution_request_grant",
+        ),
+        CheckConstraint(
+            "status IN ('requested', 'awaiting_approval', 'queued', 'dispatching', "
+            "'executed', 'refused', 'rejected', 'dispatch_unresolved')",
+            name="ck_hosted_execution_request_status",
+        ),
+        CheckConstraint(
+            "authorization_mode IN ('approval_based', 'autonomous')",
+            name="ck_hosted_execution_request_mode",
+        ),
+        CheckConstraint(
+            "execution_environment IN ('paper', 'dry_run', 'live')",
+            name="ck_hosted_execution_request_environment",
+        ),
+        Index("idx_hosted_execution_request_strategy", "strategy_id", "created_at"),
+        Index("idx_hosted_execution_request_state", "status", "created_at"),
+        Index("idx_hosted_execution_request_run", "strategy_run_id", "created_at"),
+    )
+
+
+class HostedExecutionAudit(Base):
+    """Append-only audit of authorization and dispatch decisions (Phase 2).
+
+    Every mode change, grant issue/revoke/supersede, request decision, dispatch
+    claim and terminal outcome lands here with a server-derived actor. The
+    migration installs an insert-only trigger, so an audit row can never be
+    rewritten or deleted — it is the durable "who decided what, against which
+    evidence" record for the governed execution path.
+    """
+
+    __tablename__ = "hosted_execution_audit"
+
+    audit_id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_id = Column(Text, nullable=False)
+    strategy_id = Column(Text, nullable=False)
+    subject_kind = Column(Text, nullable=False)
+    subject_id = Column(Text, nullable=False)
+    event = Column(Text, nullable=False)
+    actor_id = Column(Text, nullable=False)
+    #: ``owner`` | ``system`` | ``automatic_grant`` — never a caller claim.
+    actor_kind = Column(Text, nullable=False)
+    detail = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "subject_kind IN ('grant', 'mode', 'request', 'dispatch')",
+            name="ck_hosted_execution_audit_subject",
+        ),
+        CheckConstraint(
+            "actor_kind IN ('owner', 'system', 'automatic_grant')",
+            name="ck_hosted_execution_audit_actor_kind",
+        ),
+        Index("idx_hosted_execution_audit_strategy", "strategy_id", "created_at"),
+        Index("idx_hosted_execution_audit_subject", "subject_kind", "subject_id"),
+    )
+
+
 __all__ = [
     "HostedStrategy",
     "HostedStrategySchedule",
     "HostedStrategyVersion",
+    "HostedExecutionAudit",
+    "HostedExecutionGrant",
+    "HostedExecutionRequest",
     "StrategyJob",
     "StrategyJobLog",
     "StrategyJobReconciliation",

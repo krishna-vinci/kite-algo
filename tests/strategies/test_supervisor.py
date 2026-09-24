@@ -326,6 +326,12 @@ def test_child_environment_allowlist(tmp_path):
         "KITE_ALGO_BASE_URL", "KITE_ALGO_WORKER_TOKEN", "KITE_ALGO_RUN_ID",
         "KITE_ALGO_SESSION_NONCE", "KITE_ALGO_TEMPLATE_ID", "KITE_ALGO_ACCOUNT_SCOPE",
         "KITE_ALGO_MODE", "KITE_ALGO_PARAMS", "KITE_ALGO_SCRATCH",
+        # Bounded numerical runtime (see the rlimit rationale in _child_env):
+        # an unbounded thread pool under RLIMIT_AS=2 GiB can exhaust the
+        # address space while importing numpy/numba.
+        "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMBA_NUM_THREADS",
+        "NUMBA_CACHE_DIR",
     }
     assert set(env) == expected_keys
     # No supervisor credential, no DB/broker secrets.
@@ -333,6 +339,26 @@ def test_child_environment_allowlist(tmp_path):
         assert forbidden not in env
         assert forbidden not in env.values()
     assert env["KITE_ALGO_WORKER_TOKEN"] == "kwa_secret"
+    for key in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMBA_NUM_THREADS",
+    ):
+        assert env[key] == "1"
+    assert env["NUMBA_CACHE_DIR"] == str(tmp_path / ".numba-cache")
+
+
+def test_child_scratch_prepares_the_numeric_cache_dir(tmp_path):
+    """The Numba cache directory named in the child env exists before spawn."""
+    api = FakeApi()
+    sup = _supervisor(tmp_path, api)
+    scratch = tmp_path / "child-scratch"
+    sup._prepare_scratch(scratch)
+    assert scratch.is_dir()
+    assert (scratch / ".numba-cache").is_dir()
 
 
 # ---------------------------------------------------------------------------

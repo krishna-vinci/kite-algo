@@ -288,8 +288,17 @@ export function HostedStrategiesListPage() {
       <SectionLabel
         eyebrow="Hosted strategies"
         title="Strategies"
-        description="Register immutable Python versions, configure an authorized account scope, then run supervised attempts and inspect them."
+        description="Paste or drop a Python file on one page, choose what it may do and where it runs, then supervise the attempts."
       />
+
+      <div>
+        <Button asChild>
+          <Link href="/strategies/new">
+            <PlusIcon className="size-4" aria-hidden />
+            New strategy
+          </Link>
+        </Button>
+      </div>
 
       {optionsQuery.isError ? (
         <Alert variant="destructive">

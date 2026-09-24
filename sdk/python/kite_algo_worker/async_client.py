@@ -15,6 +15,7 @@ from ._shared import (
     fundamentals_scope_params,
     normalize_calendar_date_params,
     omit_none_params,
+    require_idempotency_key,
     run_list_params,
     session_headers,
     split_instruments,
@@ -567,6 +568,54 @@ class AsyncKiteAlgoWorkerClient:
     def proposals(self) -> "_AsyncProposalNamespace":
         """Namespaced access: ``await client.proposals.submit(payload)``."""
         return _AsyncProposalNamespace(self)
+
+    # -- governed execution (Phase 2) --------------------------------------
+
+    async def request_execution(
+        self,
+        strategy_run_id: str,
+        plan_id: str,
+        *,
+        idempotency_key: str,
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
+        """Ask the platform to execute one frozen plan of THIS run.
+
+        A proposal stays inert until execution is requested. The request is
+        recorded durably under ``idempotency_key`` and then follows the
+        strategy's authorization mode: ``approval_based`` waits for the owner's
+        decision, ``autonomous`` queues only under a matching current grant.
+        """
+        return await self._request(
+            "POST",
+            "/worker/executions",
+            json={
+                "strategy_run_id": str(strategy_run_id),
+                "plan_id": str(plan_id),
+                "idempotency_key": require_idempotency_key(idempotency_key),
+            },
+            headers=session_headers(session_nonce),
+        )
+
+    async def list_execution_requests(self, strategy_run_id: str, *, limit: int = 50) -> JsonDict:
+        """This run's execution requests, newest first."""
+        return await self._request(
+            "GET",
+            "/worker/executions",
+            params={"strategy_run_id": str(strategy_run_id), "limit": int(limit)},
+        )
+
+    async def get_execution_request(self, request_id: str, *, strategy_run_id: str) -> JsonDict:
+        """One execution request, scoped to this run."""
+        return await self._request(
+            "GET",
+            f"/worker/executions/{request_id}",
+            params={"strategy_run_id": str(strategy_run_id)},
+        )
+
+    async def get_owned_work(self, strategy_run_id: str) -> JsonDict:
+        """The run's canonical-strategy book plus its pending execution work."""
+        return await self._request("GET", f"/worker/runs/{strategy_run_id}/positions")
 
     async def list_orders(self, strategy_run_id: str) -> JsonDict:
         return await self._request("GET", "/worker/orders", params={"strategy_run_id": strategy_run_id})

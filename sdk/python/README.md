@@ -7,14 +7,14 @@ Kite Algo is a self-hosted algorithmic trading platform for Zerodha/Kite workflo
 ## Package status and install
 
 ```bash
-python3 -m pip install kite-algo-worker==0.13.0
+python3 -m pip install kite-algo-worker==0.14.0
 ```
 
 Extras:
 
 ```bash
-python3 -m pip install "kite-algo-worker[dataframe]==0.13.0"
-python3 -m pip install "kite-algo-worker[indicators]==0.13.0"
+python3 -m pip install "kite-algo-worker[dataframe]==0.14.0"
+python3 -m pip install "kite-algo-worker[indicators]==0.14.0"
 ```
 
 - base SDK: HTTP/WebSocket clients, typed models, order helpers
@@ -22,6 +22,52 @@ python3 -m pip install "kite-algo-worker[indicators]==0.13.0"
 - `indicators` extra: adds dataframe dependencies plus the indicator stack and optional `numba`
 
 Pin to an immutable version in production.
+
+### Hosted runner profile
+
+Code pasted into the hosted strategy runner does not pick its own dependencies. It
+runs under exactly one documented profile, `hosted-python-dataframe-indicators`
+(Python 3.14, `python:3.14-slim`), which has the base SDK plus the `dataframe` and
+`indicators` extras installed at image build time — that is, `pandas`, `numpy` and
+`numba` are importable, and `kite_algo_worker.indicators` works. There is no
+runtime `pip install`.
+
+The same profile is what `POST /api/strategies/readiness` reports: a `main(ctx)`
+compatibility check plus a static import check against that package list, with
+guarded optional imports and dynamic imports reported as `unknown` rather than as
+a pass. Server-side indicators (`POST /worker/indicators`) need no local
+numerical stack at all.
+
+### Governed execution (hosted strategies)
+
+A hosted strategy's proposal is inert until execution is requested, and the
+strategy's **authorization mode** decides what happens next:
+
+```python
+plan = ctx.client.submit_proposal(payload)["plan"]         # frozen, places nothing
+request = ctx.request_execution(plan["plan_id"],           # durable + idempotent
+                                idempotency_key="eval-42-attempt-1")
+if request["status"] == "awaiting_approval":
+    ...  # the account owner reviews it in the app; nothing executes meanwhile
+```
+
+- `request_execution(plan_id, idempotency_key=...)` records one durable request
+  per `(plan, key)`. Repeating the same call returns the same request; reusing
+  the key for different content is refused.
+- `approval_based` (the default) waits for the owner's decision.
+  `autonomous` queues immediately **only** under a current owner-issued grant
+  bound to this strategy's version, source, account, environment and recorded
+  policy. The child cannot create or widen that grant.
+- `list_execution_requests(...)` / `get_execution_request(...)` report the
+  durable state (`awaiting_approval`, `queued`, `dispatching`, `executed`,
+  `refused`, `rejected`, `dispatch_unresolved`) with a named refusal reason.
+- `get_owned_work(...)` returns the strategy's own filled book plus its pending
+  execution work with coverage/freshness; use it before sending an adjustment
+  again. An unpublished book is reported as unknown, never as flat.
+- On the hosted raw surface (`place_order`, `place_basket`, brackets, order
+  cancel/modify, `exit_run`) a hosted child is refused with
+  `HOSTED_RAW_MUTATION_FORBIDDEN`: those are governed actions now. External
+  worker runs keep the existing contract unchanged.
 
 ## Quick reference
 
@@ -44,6 +90,7 @@ Pin to an immutable version in production.
 | Options namespace | `client.options.*`, resolver helpers, options run lifecycle |
 | GTT helpers | `place_gtt(...)`, `list_gtts()`, `get_gtt(...)`, `modify_gtt(...)`, `delete_gtt(...)` |
 | Exits + recovery | `exit_run(...)`, `wait_for_history(...)`, `warmup_history(...)`, polling helpers |
+| Governed execution | `submit_proposal(...)`, `request_execution(...)`, `list_execution_requests(...)`, `get_execution_request(...)`, `get_owned_work(...)` |
 
 ## Connection and authentication
 

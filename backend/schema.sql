@@ -2295,6 +2295,7 @@ CREATE TABLE IF NOT EXISTS public.hosted_strategies (
     max_duration_s INTEGER NOT NULL,
     progress_deadline_s INTEGER NOT NULL,
     stale_exit_policy TEXT NOT NULL,
+    authorization_mode TEXT NOT NULL DEFAULT 'approval_based',
     status TEXT NOT NULL DEFAULT 'active',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -2307,6 +2308,8 @@ CREATE TABLE IF NOT EXISTS public.hosted_strategies (
     CONSTRAINT ck_hosted_strategies_max_duration CHECK (max_duration_s > 0),
     CONSTRAINT ck_hosted_strategies_progress_deadline CHECK (progress_deadline_s > 0),
     CONSTRAINT ck_hosted_strategies_stale_policy CHECK (stale_exit_policy IN ('none', 'exit_on_worker_stale')),
+    CONSTRAINT ck_hosted_strategies_authorization_mode
+        CHECK (authorization_mode IN ('approval_based', 'autonomous')),
     CONSTRAINT ck_hosted_strategies_status CHECK (status IN ('active', 'disabled'))
 );
 CREATE INDEX IF NOT EXISTS idx_hosted_strategies_owner
@@ -3091,11 +3094,14 @@ CREATE TABLE IF NOT EXISTS public.strategy_approvals (
     catalog_generation UUID NOT NULL,
     session_product_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
     actor_id TEXT NOT NULL,
+    actor_kind TEXT NOT NULL DEFAULT 'manual',
+    authorization_evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
     status TEXT NOT NULL DEFAULT 'active',
     valid_from TIMESTAMPTZ NOT NULL,
     valid_until TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT ck_appr_status CHECK (status IN ('active', 'expired', 'superseded', 'revoked')),
+    CONSTRAINT ck_appr_actor_kind CHECK (actor_kind IN ('manual', 'automatic')),
     CONSTRAINT fk_appr_plan FOREIGN KEY (plan_id)
         REFERENCES public.strategy_plans (plan_id) ON DELETE RESTRICT,
     CONSTRAINT fk_appr_reservation FOREIGN KEY (reservation_id)
@@ -3564,3 +3570,223 @@ DROP TRIGGER IF EXISTS trg_option_settlement_evidence_immutable
 CREATE TRIGGER trg_option_settlement_evidence_immutable
     BEFORE UPDATE OR DELETE ON public.option_settlement_evidence
     FOR EACH ROW EXECUTE FUNCTION forbid_option_settlement_evidence_mutation();
+
+-- ---------------------------------------------------------------------------
+-- Governed hosted execution (migration 20260923_000042)
+--
+-- An owner-issued, version/account/environment/policy-bound standing
+-- authorisation; the durable idempotent execution request with its dispatch
+-- claim; and the append-only audit of both. Additive: nothing above changes.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.hosted_execution_grants (
+    grant_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    canonical_strategy_id TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    version_number INTEGER NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    policy_hash TEXT NOT NULL,
+    policy_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    issued_by TEXT NOT NULL,
+    issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
+    status TEXT NOT NULL DEFAULT 'active',
+    revoked_by TEXT,
+    revoked_at TIMESTAMPTZ,
+    revocation_reason TEXT,
+    superseded_by TEXT,
+    superseded_at TIMESTAMPTZ,
+    supersession_reason TEXT,
+    request_key TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_hosted_execution_grant_request
+        UNIQUE (owner_id, strategy_id, request_key),
+    CONSTRAINT ck_hosted_execution_grant_status
+        CHECK (status IN ('active', 'revoked', 'superseded')),
+    CONSTRAINT ck_hosted_execution_grant_environment
+        CHECK (execution_environment IN ('paper', 'dry_run', 'live')),
+    CONSTRAINT ck_hosted_execution_grant_version CHECK (version_number > 0),
+    CONSTRAINT ck_hosted_execution_grant_revocation CHECK (
+        (status = 'revoked' AND revoked_at IS NOT NULL AND revoked_by IS NOT NULL)
+        OR (status <> 'revoked' AND revoked_at IS NULL AND revoked_by IS NULL)),
+    CONSTRAINT ck_hosted_execution_grant_supersession CHECK (
+        (status = 'superseded' AND superseded_by IS NOT NULL
+            AND superseded_at IS NOT NULL)
+        OR (status <> 'superseded' AND superseded_by IS NULL
+            AND superseded_at IS NULL)),
+    CONSTRAINT fk_hosted_execution_grant_strategy_owner
+        FOREIGN KEY (strategy_id, owner_id)
+        REFERENCES public.hosted_strategies (id, owner_id) ON DELETE CASCADE,
+    CONSTRAINT fk_hosted_execution_grant_version_strategy
+        FOREIGN KEY (version_id, strategy_id)
+        REFERENCES public.hosted_strategy_versions (id, strategy_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_hosted_execution_grant_canonical
+        FOREIGN KEY (canonical_strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT
+);
+-- At most ONE active grant per (strategy, account, environment): the second
+-- guard behind the hosted-strategy row lock.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_hosted_execution_grant_active
+    ON public.hosted_execution_grants (strategy_id, account_id, execution_environment)
+    WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_hosted_execution_grant_strategy
+    ON public.hosted_execution_grants (strategy_id, created_at DESC);
+
+CREATE OR REPLACE FUNCTION forbid_hosted_execution_grant_identity_mutation()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.grant_id <> OLD.grant_id
+       OR NEW.owner_id <> OLD.owner_id
+       OR NEW.strategy_id <> OLD.strategy_id
+       OR NEW.canonical_strategy_id <> OLD.canonical_strategy_id
+       OR NEW.version_id <> OLD.version_id
+       OR NEW.version_number <> OLD.version_number
+       OR NEW.source_sha256 <> OLD.source_sha256
+       OR NEW.account_id <> OLD.account_id
+       OR NEW.execution_environment <> OLD.execution_environment
+       OR NEW.policy_hash <> OLD.policy_hash
+       OR NEW.issued_by <> OLD.issued_by
+       OR NEW.request_key <> OLD.request_key
+       OR NEW.content_sha256 <> OLD.content_sha256 THEN
+        RAISE EXCEPTION
+            'hosted_execution_grants identity is immutable (issue a new grant)';
+    END IF;
+    IF OLD.status <> 'active' AND NEW.status = 'active' THEN
+        RAISE EXCEPTION
+            'a revoked or superseded hosted execution grant cannot be reactivated';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_hosted_execution_grant_identity
+    ON public.hosted_execution_grants;
+CREATE TRIGGER trg_hosted_execution_grant_identity
+    BEFORE UPDATE ON public.hosted_execution_grants
+    FOR EACH ROW EXECUTE FUNCTION forbid_hosted_execution_grant_identity_mutation();
+
+CREATE OR REPLACE FUNCTION forbid_hosted_execution_grant_delete()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION
+        'hosted_execution_grants are never deleted (revoke or supersede instead)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_hosted_execution_grant_no_delete
+    ON public.hosted_execution_grants;
+CREATE TRIGGER trg_hosted_execution_grant_no_delete
+    BEFORE DELETE ON public.hosted_execution_grants
+    FOR EACH ROW EXECUTE FUNCTION forbid_hosted_execution_grant_delete();
+
+CREATE TABLE IF NOT EXISTS public.hosted_execution_requests (
+    request_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    canonical_strategy_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    strategy_run_id TEXT NOT NULL,
+    job_id TEXT,
+    token_id TEXT,
+    attempt INTEGER,
+    lease_epoch BIGINT,
+    version_id TEXT NOT NULL,
+    version_number INTEGER,
+    source_sha256 TEXT NOT NULL,
+    policy_hash TEXT NOT NULL,
+    evaluation_id TEXT,
+    plan_id UUID NOT NULL,
+    plan_hash TEXT NOT NULL,
+    authorization_mode TEXT NOT NULL,
+    grant_id TEXT,
+    status TEXT NOT NULL DEFAULT 'requested',
+    refusal_code TEXT,
+    refusal_detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    decision_kind TEXT,
+    decision_actor TEXT,
+    decision_at TIMESTAMPTZ,
+    decision_evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    approval_id UUID,
+    reservation_id UUID,
+    execution_detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    dispatch_claim_id TEXT,
+    dispatch_claimed_at TIMESTAMPTZ,
+    dispatch_started_at TIMESTAMPTZ,
+    dispatch_finished_at TIMESTAMPTZ,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_hosted_execution_requests_key
+        UNIQUE (owner_id, plan_id, idempotency_key),
+    CONSTRAINT ck_hosted_execution_request_status CHECK (status IN (
+        'requested', 'awaiting_approval', 'queued', 'dispatching',
+        'executed', 'refused', 'rejected', 'dispatch_unresolved')),
+    CONSTRAINT ck_hosted_execution_request_mode
+        CHECK (authorization_mode IN ('approval_based', 'autonomous')),
+    CONSTRAINT ck_hosted_execution_request_environment
+        CHECK (execution_environment IN ('paper', 'dry_run', 'live')),
+    CONSTRAINT fk_hosted_execution_request_strategy_owner
+        FOREIGN KEY (strategy_id, owner_id)
+        REFERENCES public.hosted_strategies (id, owner_id) ON DELETE CASCADE,
+    CONSTRAINT fk_hosted_execution_request_canonical
+        FOREIGN KEY (canonical_strategy_id, account_id)
+        REFERENCES public.strategies (id, account_scope) ON DELETE RESTRICT,
+    CONSTRAINT fk_hosted_execution_request_plan
+        FOREIGN KEY (plan_id) REFERENCES public.strategy_plans (plan_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_hosted_execution_request_grant
+        FOREIGN KEY (grant_id) REFERENCES public.hosted_execution_grants (grant_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_hosted_execution_request_approval
+        FOREIGN KEY (approval_id) REFERENCES public.strategy_approvals (approval_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_hosted_execution_request_reservation
+        FOREIGN KEY (reservation_id)
+        REFERENCES public.strategy_reservations (reservation_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_hosted_execution_request_strategy
+    ON public.hosted_execution_requests (strategy_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_hosted_execution_request_state
+    ON public.hosted_execution_requests (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_hosted_execution_request_run
+    ON public.hosted_execution_requests (strategy_run_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS public.hosted_execution_audit (
+    audit_id BIGSERIAL PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    event TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    actor_kind TEXT NOT NULL,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_hosted_execution_audit_subject
+        CHECK (subject_kind IN ('grant', 'mode', 'request', 'dispatch')),
+    CONSTRAINT ck_hosted_execution_audit_actor_kind
+        CHECK (actor_kind IN ('owner', 'system', 'automatic_grant'))
+);
+CREATE INDEX IF NOT EXISTS idx_hosted_execution_audit_strategy
+    ON public.hosted_execution_audit (strategy_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_hosted_execution_audit_subject
+    ON public.hosted_execution_audit (subject_kind, subject_id);
+
+CREATE OR REPLACE FUNCTION forbid_hosted_execution_audit_mutation()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'hosted_execution_audit is append-only (insert-only)';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_hosted_execution_audit_immutable
+    ON public.hosted_execution_audit;
+CREATE TRIGGER trg_hosted_execution_audit_immutable
+    BEFORE UPDATE OR DELETE ON public.hosted_execution_audit
+    FOR EACH ROW EXECUTE FUNCTION forbid_hosted_execution_audit_mutation();

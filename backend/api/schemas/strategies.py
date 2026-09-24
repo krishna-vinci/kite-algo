@@ -241,6 +241,9 @@ class StrategyResponse(BaseModel):
     max_duration_s: int
     progress_deadline_s: int
     stale_exit_policy: str
+    #: ``approval_based`` (default) or ``autonomous``. Selecting autonomous
+    #: authorises nothing by itself; a grant is a separate owner act.
+    authorization_mode: str = "approval_based"
     #: Hosted SCHEDULING enablement (the existing field, unchanged meaning).
     status: str
     #: Canonical PRODUCT status — additive; never written by PATCH /{id}.
@@ -503,6 +506,94 @@ class JobLogsResponse(BaseModel):
     notice: str = ""
 
 
+class ScheduleEnabledRequest(BaseModel):
+    """Explicit enable/disable of the stored schedule."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
+class HostedScheduleRequest(BaseModel):
+    """One operator schedule configuration (create or edit).
+
+    The schedule stores *what* to run (`version_id`, `params`, mode, kind) and
+    *when* (`schedule_kind` + its kind-specific field). Account, policy and
+    capability snapshots are derived server-side from the strategy and the
+    pinned version, exactly like a launch, so an edit is a re-pin rather than a
+    caller-asserted identity.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version_id: str = Field(min_length=1, max_length=128)
+    execution_mode: Literal["paper", "dry_run", "live"]
+    job_kind: str = Field(default="finite", max_length=32)
+    params: Dict[str, Any] = Field(default_factory=dict)
+    schedule_kind: Literal["daily", "weekly", "monthly", "calendar"]
+    at_time: str = Field(max_length=5)
+    weekday: Optional[int] = Field(default=None, ge=0, le=6)
+    day_of_month: Optional[int] = Field(default=None, ge=1, le=31)
+    calendar_dates: Optional[List[str]] = None
+    timezone: str = Field(default="Asia/Kolkata", max_length=64)
+    window_end: Optional[str] = Field(default=None, max_length=5)
+    squareoff_at: Optional[str] = Field(default=None, max_length=5)
+    enabled: bool = True
+
+
+class HostedScheduleOccurrenceResponse(BaseModel):
+    """One materialised occurrence (the scheduler's own durable row)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    occurrence_key: str
+    due_at: Optional[str] = None
+    #: ``pending`` / ``fired`` / ``skipped`` / ``expired``.
+    status: str
+    fired_at: Optional[str] = None
+    evaluation_id: Optional[str] = None
+    skip_reason: Optional[str] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class HostedScheduleResponse(BaseModel):
+    """The stored schedule plus what the runtime will actually do with it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schedule_id: str
+    strategy_id: str
+    version_id: str
+    version_number: Optional[int] = None
+    account_scope: str
+    execution_mode: str
+    job_kind: str
+    params_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    schedule_kind: str
+    at_time: str
+    weekday: Optional[int] = None
+    day_of_month: Optional[int] = None
+    calendar_dates: List[str] = Field(default_factory=list)
+    timezone: str
+    window_end: Optional[str] = None
+    squareoff_at: Optional[str] = None
+    enabled: bool
+    #: The stored manual pause, if one was set outside this surface.
+    manually_paused: bool = False
+    max_duration_s: int
+    progress_deadline_s: int
+    #: How late a missed occurrence may still fire, and what happens when the
+    #: previous occurrence is unresolved. Reported from the live runtime rather
+    #: than described in prose.
+    misfire_grace_seconds: int
+    overlap_policy: str
+    next_occurrence_at: Optional[str] = None
+    next_occurrence_key: Optional[str] = None
+    last_occurrence: Optional["HostedScheduleOccurrenceResponse"] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
 class HostedStrategyOptionsResponse(BaseModel):
     """Server-authorized choices for configuring a hosted strategy.
 
@@ -528,6 +619,10 @@ class HostedStrategyOptionsResponse(BaseModel):
     #: inferred by the client.
     live_requires_owner_approval: bool = True
     hosted_execution_only: bool = True
+    #: The documented runner profile (dependencies, Python version, whether
+    #: arbitrary runtime installs are supported). Best-effort additive field:
+    #: existing UI fields above are unchanged.
+    runner_profile: Optional["RunnerProfileResponse"] = None
 
 
 class AdmissionPolicyRequest(BaseModel):
@@ -609,6 +704,11 @@ class ApprovalResponse(BaseModel):
     catalog_generation: str
     session_product_snapshot: Dict[str, Any] = Field(default_factory=dict)
     actor_id: str
+    #: ``manual`` for the owner's own click, ``automatic`` for the server
+    #: recording a standing grant's authorisation. The decision is auditable and
+    #: the automatic evidence travels with it, so it is never read as a click.
+    actor_kind: str = "manual"
+    authorization_evidence: Dict[str, Any] = Field(default_factory=dict)
     status: str
     valid_from: Optional[str] = None
     valid_until: Optional[str] = None
@@ -632,6 +732,178 @@ class ApprovalRequestModel(BaseModel):
 # ---------------------------------------------------------------------------
 # Settlement evidence surfaces (G7): owner read + assess trigger
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Governed execution authorization (Phase 2): mode, grants, requests
+# ---------------------------------------------------------------------------
+
+
+class AuthorizationModeRequest(BaseModel):
+    """Explicit owner mode change. ``reason`` is recorded, never required."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["approval_based", "autonomous"]
+    reason: Optional[str] = Field(default=None, max_length=1000)
+
+
+class AuthorizationModeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str
+    authorization_mode: str
+    previous_mode: str
+    changed: bool
+
+
+class ExecutionGrantRequest(BaseModel):
+    """An owner's standing authorisation request.
+
+    The version, its source hash, the account and the policy hash are DERIVED by
+    the server; only the environment is chosen (and validated). ``idempotency_key``
+    is owner-provided and hidden from the UI.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = Field(min_length=8, max_length=160)
+    version_id: str = Field(min_length=1, max_length=128)
+    execution_environment: Literal["paper", "dry_run", "live"]
+    expires_at: Optional[datetime] = None
+
+
+class ExecutionGrantResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    grant_id: str
+    owner_id: str
+    strategy_id: str
+    canonical_strategy_id: str
+    version_id: str
+    version_number: int
+    source_sha256: str
+    account_id: str
+    execution_environment: str
+    policy_hash: str
+    policy_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    issued_by: str
+    issued_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    status: str
+    revoked_by: Optional[str] = None
+    revoked_at: Optional[datetime] = None
+    revocation_reason: Optional[str] = None
+    superseded_by: Optional[str] = None
+    superseded_at: Optional[datetime] = None
+    supersession_reason: Optional[str] = None
+    #: The owner's idempotency key (hidden from the UI) and the canonical hash
+    #: of the request content that key is bound to.
+    request_key: str
+    content_sha256: str
+    created_at: Optional[datetime] = None
+    idempotent: bool = False
+
+
+class ExecutionGrantRevokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    grant_id: Optional[str] = Field(default=None, max_length=128)
+    reason: Optional[str] = Field(default=None, max_length=1000)
+
+
+class ExecutionGrantRevokeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    grant: ExecutionGrantResponse
+    revoked_at: Optional[datetime] = None
+
+
+class AuthorizationStatusResponse(BaseModel):
+    """The operator's authorization view. ``grant_usable`` is a statement about
+    the current record; execution re-derives it under the strategy lock."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str
+    authorization_mode: str
+    active_grant: Optional[ExecutionGrantResponse] = None
+    policy_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    policy_hash: str
+    policy_concrete: bool
+    grant_usable: bool
+    blocking_reasons: List[str] = Field(default_factory=list)
+    evaluated_at: Optional[datetime] = None
+
+
+class ExecutionRequestRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    owner_id: str
+    strategy_id: str
+    canonical_strategy_id: str
+    account_id: str
+    execution_environment: str
+    strategy_run_id: str
+    job_id: Optional[str] = None
+    #: The child credential the request was created under (an identifier, never a
+    #: secret). A rotated token is a different attempt and refuses the dispatch.
+    token_id: Optional[str] = None
+    attempt: Optional[int] = None
+    lease_epoch: Optional[int] = None
+    version_id: str
+    version_number: Optional[int] = None
+    source_sha256: str
+    policy_hash: str
+    evaluation_id: Optional[str] = None
+    plan_id: str
+    plan_hash: str
+    authorization_mode: str
+    grant_id: Optional[str] = None
+    status: str
+    refusal_code: Optional[str] = None
+    refusal_detail: Dict[str, Any] = Field(default_factory=dict)
+    decision_kind: Optional[str] = None
+    decision_actor: Optional[str] = None
+    decision_at: Optional[datetime] = None
+    decision_evidence: Dict[str, Any] = Field(default_factory=dict)
+    approval_id: Optional[str] = None
+    reservation_id: Optional[str] = None
+    execution_detail: Dict[str, Any] = Field(default_factory=dict)
+    #: The executor's own outcome word (submitted / filled / rejected / failed /
+    #: uncertain / no_op). ``terminal`` means "not dispatched again", not "done".
+    outcome_state: Optional[str] = None
+    dispatch_claim_id: Optional[str] = None
+    dispatch_claimed_at: Optional[datetime] = None
+    dispatch_started_at: Optional[datetime] = None
+    dispatch_finished_at: Optional[datetime] = None
+    idempotency_key: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    terminal: bool = False
+    executable: bool = False
+
+
+class ExecutionRequestListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str
+    requests: List[ExecutionRequestRow] = Field(default_factory=list)
+
+
+class ExecutionRequestDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Optional[str] = Field(default=None, max_length=1000)
+
+
+class ExecutionRequestDecisionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request: ExecutionRequestRow
+    approved: bool = False
+    rejected: bool = False
 
 
 class SettlementAxisResponse(BaseModel):
@@ -780,3 +1052,101 @@ class OptionSettlementResponse(BaseModel):
     #: Derived, never stored: settled exactly when authoritative evidence exists.
     settled: bool = False
     evidence: List[OptionSettlementEvidenceRow] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# first-run source readiness (Slice: hosted data foundation)
+# ---------------------------------------------------------------------------
+
+
+class SourceReadinessRequest(BaseModel):
+    """A source file the user is about to run, checked BEFORE anything is stored.
+
+    ``extra="forbid"`` at the boundary, and the source is bounded exactly like a
+    stored version. The source is parsed (``ast``) and never imported, compiled
+    into a module or executed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(min_length=1, max_length=256 * 1024)
+
+
+class RunnerPackageResponse(BaseModel):
+    """One package the documented runner profile provides."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    import_name: str
+    distribution: str
+    extra: Optional[str] = None
+
+
+class RunnerProfileResponse(BaseModel):
+    """The single documented runner profile a hosted strategy runs under."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    python: str
+    base_image: str
+    packages: List[RunnerPackageResponse] = Field(default_factory=list)
+    #: Server-side indicators need no local numerical stack.
+    server_side_indicators: bool = True
+    #: Arbitrary runtime ``pip install`` is not supported; stated, not implied.
+    runtime_pip_install: bool = False
+    notes: Optional[str] = None
+
+
+class ReadinessCheckResponse(BaseModel):
+    """One named check: ``ok``, ``blocked`` or ``unknown`` (never a false pass)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    status: Literal["ok", "blocked", "unknown"]
+    detail: str
+    remediation: Optional[str] = None
+
+
+class SourceEntrypointResponse(BaseModel):
+    """The ``main(ctx)`` entrypoint as far as static parsing can tell."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    found: bool
+    compatible: bool
+    name: Optional[str] = None
+    is_async: Optional[bool] = None
+    detail: str
+    remediation: Optional[str] = None
+
+
+class SourceImportResponse(BaseModel):
+    """Statically visible imports, resolved against the runner profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    available: List[str] = Field(default_factory=list)
+    missing: List[str] = Field(default_factory=list)
+    #: Imports guarded by ``except ImportError`` that the profile does provide.
+    optional_available: List[str] = Field(default_factory=list)
+    #: Imports guarded by ``except ImportError``: reported, not treated as fatal.
+    optional_missing: List[str] = Field(default_factory=list)
+    providers: Dict[str, str] = Field(default_factory=dict)
+    #: ``importlib``/``__import__``/``exec``/``eval`` seen: cannot be certified.
+    dynamic: bool = False
+
+
+class SourceReadinessResponse(BaseModel):
+    """Reusable first-run readiness result consumed by the operator UI."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = 1
+    status: Literal["ready", "blocked"]
+    profile: RunnerProfileResponse
+    checks: List[ReadinessCheckResponse] = Field(default_factory=list)
+    entrypoint: SourceEntrypointResponse
+    imports: SourceImportResponse
+    messages: List[str] = Field(default_factory=list)

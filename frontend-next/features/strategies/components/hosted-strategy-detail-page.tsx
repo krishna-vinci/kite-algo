@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
-import { PlayIcon, RefreshCcwIcon, ShieldPlusIcon } from "lucide-react";
+import { useRef, useState } from "react";
+import { PlayIcon, ShieldPlusIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -10,7 +10,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -40,17 +39,32 @@ import {
   useRunHostedStrategy,
   useUpdateHostedStrategy,
 } from "@/features/strategies/hooks/use-hosted-strategies-queries";
-import { hostedErrorMessage, jobStatusLabel, jobStatusTone, newIdempotencyKey, runNowMessage } from "@/features/strategies/lib/format";
+import { HostedAuthorizationPanel } from "@/features/strategies/components/hosted-authorization-panel";
+import { HostedExposurePanel } from "@/features/strategies/components/hosted-exposure-panel";
+import { HostedExecutionRequestsPanel } from "@/features/strategies/components/hosted-execution-requests-panel";
 import {
+  HostedParamInputs,
+  useHostedParamValues,
+} from "@/features/strategies/components/hosted-params-editor";
+import { HostedSchedulePanel } from "@/features/strategies/components/hosted-schedule-panel";
+import {
+  formatTimestamp,
+  hostedErrorMessage,
+  jobStatusLabel,
+  jobStatusTone,
+  newIdempotencyKey,
+  runNowMessage,
+} from "@/features/strategies/lib/format";
+import {
+  APPROVAL_BASED,
+  authorizationModeLabel,
   LIVE_MODE,
   executionModeLabel,
   liveLaneSummary,
-  liveRequiresOwnerApproval,
   modeCapabilityState,
   runNowGate,
   supportedExecutionModes,
 } from "@/features/strategies/lib/modes";
-import { parseParamsInput } from "@/features/strategies/lib/params";
 import type { HostedJobSummary, HostedVersion } from "@/lib/hosted-strategies/types";
 
 function RegisterVersionForm({ strategyId }: Readonly<{ strategyId: string }>) {
@@ -167,7 +181,9 @@ function VersionTable({ versions }: Readonly<{ versions: HostedVersion[] }>) {
               <TableCell className="text-sm text-muted-foreground">
                 {capabilities.length > 0 ? capabilities.join(", ") : "—"}
               </TableCell>
-              <TableCell className="text-sm text-muted-foreground">{version.created_at ?? "—"}</TableCell>
+              <TableCell className="text-sm text-muted-foreground">
+                {formatTimestamp(version.created_at)}
+              </TableCell>
             </TableRow>
           );
         })}
@@ -205,27 +221,42 @@ function RunNowForm({
   // registering a new version does not silently run the previous one.
   const newestVersion = versions.length > 0 ? versions[versions.length - 1] : undefined;
   const [versionId, setVersionId] = useState(newestVersion?.version_id ?? "");
-  const [params, setParams] = useState("{}");
-  const [idempotencyKey, setIdempotencyKey] = useState(() => newIdempotencyKey());
   const [acknowledgedJob, setAcknowledgedJob] = useState<string | null>(null);
+  // The retry identity stays INTERNAL: the operator never sees or types it. It
+  // is regenerated only when the launch inputs actually change, so a retry of
+  // the same request replays the original job and a changed request cannot
+  // silently reuse the old key.
+  const launchIdentity = useRef<{ fingerprint: string; key: string }>({
+    fingerprint: "",
+    key: newIdempotencyKey(),
+  });
 
   const selected = versions.find((version) => version.version_id === versionId) ?? newestVersion;
+  // The pinned version's own schema drives the inputs; a schema this app cannot
+  // show field by field falls back to JSON. Either way the operator's values are
+  // what is sent - the platform adds nothing to them.
+  const paramValues = useHostedParamValues(selected?.parameters_schema);
 
   async function submit() {
     if (!selected) {
       toast.error("Register a version before running.");
       return;
     }
-    const parsed = parseParamsInput(params);
-    if (!parsed.ok) {
-      toast.error(parsed.error);
+    if (!paramValues.valid) {
+      toast.error(
+        Object.values(paramValues.errors)[0] ?? "Check the parameters before running.",
+      );
       return;
+    }
+    const fingerprint = `${selected.version_id}:${JSON.stringify(paramValues.value)}`;
+    if (launchIdentity.current.fingerprint !== fingerprint) {
+      launchIdentity.current = { fingerprint, key: newIdempotencyKey() };
     }
     try {
       const response = await mutation.mutateAsync({
         version_id: selected.version_id,
-        params: parsed.value,
-        idempotency_key: idempotencyKey,
+        params: paramValues.value,
+        idempotency_key: launchIdentity.current.key,
       });
       setAcknowledgedJob(response.job.job_id);
       toast.success(runNowMessage(response.idempotent));
@@ -239,9 +270,14 @@ function RunNowForm({
       <Alert>
         <AlertTitle>Run now queues an attempt — it does not start the process</AlertTitle>
         <AlertDescription>
-          The supervisor picks the job up and launches it. Account scope <code>{defaultAccountScope}</code>{" "}
-          (authorized) and the strategy&apos;s mode (<strong>{executionModeLabel(pinnedMode)}</strong>) are pinned
-          by the server — the launch request cannot switch them.
+          {/* One child: the description is a grid, so inline elements would
+              otherwise each be laid out as their own row. */}
+          <span>
+            The supervisor picks the job up and launches it. Account scope{" "}
+            <code>{defaultAccountScope}</code> (authorized) and the strategy&apos;s mode (
+            <strong>{executionModeLabel(pinnedMode)}</strong>) are pinned by the server — the launch
+            request cannot switch them.
+          </span>
         </AlertDescription>
       </Alert>
       <div className="grid gap-4 md:grid-cols-2">
@@ -280,40 +316,13 @@ function RunNowForm({
             </span>
           </div>
         </div>
-        <div className="grid gap-1.5 md:col-span-2">
-          <Label htmlFor="run-params">Parameters (JSON)</Label>
-          <Textarea
-            id="run-params"
-            rows={3}
-            className="font-mono text-xs"
-            value={params}
-            onChange={(event) => setParams(event.target.value)}
-          />
+        <div className="md:col-span-2">
+          <HostedParamInputs params={paramValues} idPrefix="run" />
         </div>
-        <div className="grid gap-1.5 md:col-span-2">
-          <Label htmlFor="run-key">Idempotency key</Label>
-          <div className="flex items-center gap-2">
-            <Input
-              id="run-key"
-              readOnly
-              value={idempotencyKey}
-              className="font-mono text-xs"
-            />
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => setIdempotencyKey(newIdempotencyKey())}
-            >
-              <RefreshCcwIcon className="size-4" aria-hidden />
-              New key
-            </Button>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            Retries of this same launch reuse the key and replay the original job. Use “New key” only
-            for a genuinely new launch.
-          </p>
-        </div>
+        <p className="text-xs text-muted-foreground md:col-span-2">
+          Retrying an unchanged launch replays the original attempt instead of creating a second one.
+          Changing the version or the parameters starts a new launch.
+        </p>
       </div>
       {pinnedMode === LIVE_MODE ? (
         <Alert>
@@ -324,10 +333,9 @@ function RunNowForm({
           </AlertTitle>
           <AlertDescription>
             A live attempt places real orders. It needs the owner&apos;s explicit approval of the
-            strategy&apos;s plan before anything is sent
-            {liveRequiresOwnerApproval(options)
-              ? " — this deployment never approves a plan automatically."
-              : "."}
+            strategy&apos;s plan before anything is sent — either your approval of that plan here, or the
+            standing authorization you issue for this version, account, environment and limits. The
+            platform never approves a plan by itself.
           </AlertDescription>
         </Alert>
       ) : null}
@@ -355,6 +363,7 @@ export function HostedStrategyDetailPage({ strategyId }: Readonly<{ strategyId: 
   const strategyQuery = useHostedStrategy(strategyId);
   const versionsQuery = useHostedVersions(strategyId);
   const jobsQuery = useHostedJobs(strategyId);
+  const optionsQuery = useHostedOptions();
   const updateMutation = useUpdateHostedStrategy(strategyId);
 
   const strategy = strategyQuery.data;
@@ -384,16 +393,22 @@ export function HostedStrategyDetailPage({ strategyId }: Readonly<{ strategyId: 
     }
   }
 
+  // `[&>*]:min-w-0` lets each card shrink to the column and scroll its own
+  // table, instead of a wide table setting the width of the whole page.
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex flex-col gap-6 [&>*]:min-w-0">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <SectionLabel
+          className="min-w-0 [&>p]:break-all"
           eyebrow={`Hosted strategy · ${strategy.strategy_id}`}
           title={strategy.name}
           description={strategy.description ?? undefined}
         />
         <div className="flex items-center gap-3">
           <Badge variant={enabled ? "default" : "secondary"}>{enabled ? "Enabled" : "Disabled"}</Badge>
+          <Badge variant="outline">
+            {authorizationModeLabel(strategy.authorization_mode ?? APPROVAL_BASED)}
+          </Badge>
           <Button variant="outline" size="sm" onClick={toggle} disabled={updateMutation.isPending}>
             {enabled ? "Disable" : "Enable"}
           </Button>
@@ -437,6 +452,64 @@ export function HostedStrategyDetailPage({ strategyId }: Readonly<{ strategyId: 
             jobs={jobs}
             defaultAccountScope={strategy.default_account_scope}
             defaultExecutionMode={strategy.default_execution_mode}
+          />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Review or automate</CardTitle>
+          <CardDescription>
+            Who approves trades: your decision on every plan, or your standing authorization for this
+            exact version, account, environment and limits.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <HostedAuthorizationPanel
+            strategy={strategy}
+            versions={versions}
+            options={optionsQuery.data}
+          />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Execution requests</CardTitle>
+          <CardDescription>
+            What the strategy asked the platform to do, and what actually happened.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <HostedExecutionRequestsPanel strategyId={strategyId} />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Schedule</CardTitle>
+          <CardDescription>
+            Start a new attempt of a pinned version at a fixed local time, with the platform&apos;s own
+            missed-run and overlap rules.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <HostedSchedulePanel strategy={strategy} versions={versions} options={optionsQuery.data} />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Strategy book</CardTitle>
+          <CardDescription>
+            Positions attributed to this strategy, not the account&apos;s net position.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <HostedExposurePanel
+            strategyId={strategyId}
+            options={optionsQuery.data}
+            defaultEnvironment={strategy.default_execution_mode}
           />
         </CardContent>
       </Card>
@@ -497,7 +570,9 @@ export function HostedStrategyDetailPage({ strategyId }: Readonly<{ strategyId: 
                     <TableCell className="text-sm text-muted-foreground">
                       {job.replacement_blocked ? "Blocked" : "Clear"}
                     </TableCell>
-                    <TableCell className="text-sm text-muted-foreground">{job.created_at ?? "—"}</TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {formatTimestamp(job.created_at)}
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>

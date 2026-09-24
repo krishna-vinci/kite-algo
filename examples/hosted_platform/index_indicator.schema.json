@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Index ticker + indicator",
+  "description": "The index ticker is the signal; the traded instrument is configured separately and resolved before anything is proposed.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "index_symbol": {
+      "type": "string",
+      "default": "NIFTY 50",
+      "description": "Index ticker whose candles drive the signal (for example 'NIFTY 50'). This is never traded."
+    },
+    "interval": {
+      "type": "string",
+      "enum": ["1minute", "3minute", "5minute", "15minute", "30minute", "60minute", "day"],
+      "default": "5minute",
+      "description": "Candle interval for the index series."
+    },
+    "lookback": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 400,
+      "default": 60,
+      "description": "How many recent index candles to read."
+    },
+    "indicator": {
+      "type": "string",
+      "enum": ["ema", "sma", "wma", "rsi", "supertrend", "macd", "bbands", "atr"],
+      "default": "ema",
+      "description": "One of the platform's allowlisted indicators, computed server-side."
+    },
+    "period": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 500,
+      "default": 20,
+      "description": "Indicator period."
+    },
+    "traded_symbol": {
+      "type": "string",
+      "description": "The instrument actually traded (for example 'RELIANCE'). Required before any proposal is built."
+    },
+    "traded_exchange": {
+      "type": "string",
+      "default": "NSE",
+      "description": "Exchange for the traded instrument."
+    },
+    "product": {
+      "type": "string",
+      "enum": ["CNC", "MIS", "NRML"],
+      "default": "CNC",
+      "description": "Frozen product for the traded instrument."
+    },
+    "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1,
+      "description": "Signed target quantity to hold when the signal is bullish."
+    },
+    "deadline_seconds": {
+      "type": "number",
+      "minimum": 0,
+      "default": 120,
+      "description": "How long the child waits for an owner decision on an approval-based request."
+    }
+  },
+  "required": ["traded_symbol"]
+}

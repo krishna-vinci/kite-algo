@@ -548,6 +548,105 @@ class TargetWeightsTests(ProposalTestCase):
             )
         self.assertEqual(ctx.exception.reason_code, "UNIVERSE_REVISION_UNKNOWN")
 
+    def test_qualified_weight_alias_sizes_the_bare_member(self):
+        """A weight written with the exchange-qualified public key must size the
+        bare persisted member instead of resolving to a zero target."""
+        self.seed_generation(G2, "published", T2)
+        self._seed_members()
+        self.seed_universe_revision(self.REV, ["RELIANCE", "INFY", "TCS"])
+
+        plan = self._compile(
+            {
+                "universe_revision_id": self.REV,
+                "target_weights": {"NSE:RELIANCE": 0.5},
+                "reference_prices": {"NSE:RELIANCE": 1500.0},
+            }
+        )
+        by_symbol = {leg["tradingsymbol"]: leg for leg in plan.resolved["legs"]}
+        self.assertEqual(by_symbol["RELIANCE"]["target_weight"], 0.5)
+        self.assertFalse(by_symbol["RELIANCE"]["explicit_zero"])
+        self.assertEqual(by_symbol["RELIANCE"]["reference_price"], 1500.0)
+        # The omitted members are still explicit zeros, not absences.
+        self.assertEqual(by_symbol["INFY"]["target_weight"], 0.0)
+        self.assertTrue(by_symbol["INFY"]["explicit_zero"])
+        self.assertEqual(
+            plan.resolved["member_hash"], member_hash(["RELIANCE", "INFY", "TCS"])
+        )
+
+    def test_bare_weight_alias_sizes_the_qualified_member(self):
+        """The reverse spelling (bare key, qualified revision member) resolves to
+        the same member and keeps the member's own exchange."""
+        from backend.strategies.compiler import compile_resolved_plan
+
+        self.seed_generation(G2, "published", T2)
+        self._seed_members()
+        self.seed_universe_revision(self.REV, ["NSE:RELIANCE", "NSE:INFY"])
+
+        plan = compile_resolved_plan(
+            "target_weights",
+            {
+                "capital_basis_inr": 100000.0,
+                "universe_revision_id": self.REV,
+                "target_weights": {"RELIANCE": 1.0},
+                "reference_prices": {"RELIANCE": 1450.0},
+            },
+            self._pinned(G2),
+        )
+        by_symbol = {leg["tradingsymbol"]: leg for leg in plan.resolved["legs"]}
+        self.assertEqual(by_symbol["RELIANCE"]["target_weight"], 1.0)
+        self.assertEqual(by_symbol["RELIANCE"]["exchange"], "NSE")
+        self.assertEqual(by_symbol["RELIANCE"]["reference_price"], 1450.0)
+        self.assertEqual(by_symbol["INFY"]["target_weight"], 0.0)
+
+    def test_conflicting_weight_aliases_are_refused(self):
+        """Two spellings of one member describing different targets is an
+        ambiguous payload: refuse by name rather than pick one."""
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.seed_generation(G2, "published", T2)
+        self._seed_members()
+        self.seed_universe_revision(self.REV, ["RELIANCE", "INFY", "TCS"])
+
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self._compile(
+                {
+                    "universe_revision_id": self.REV,
+                    "target_weights": {"RELIANCE": 1.0, "NSE:RELIANCE": 0.25},
+                }
+            )
+        self.assertEqual(ctx.exception.reason_code, "TARGET_WEIGHTS_ALIAS_CONFLICT")
+        self.assertEqual(ctx.exception.detail["member"], "RELIANCE")
+
+        # The same instruction spelled twice is not a conflict.
+        plan = self._compile(
+            {
+                "universe_revision_id": self.REV,
+                "target_weights": {"RELIANCE": 0.5, "NSE:RELIANCE": 0.5},
+            }
+        )
+        by_symbol = {leg["tradingsymbol"]: leg for leg in plan.resolved["legs"]}
+        self.assertEqual(by_symbol["RELIANCE"]["target_weight"], 0.5)
+
+    def test_out_of_scope_reference_price_is_refused(self):
+        """An unknown reference price cannot be silently dropped: admission would
+        size the leg against no price at all."""
+        from backend.strategies.compiler.base import ValidationRefusal
+
+        self.seed_generation(G2, "published", T2)
+        self._seed_members()
+        self.seed_universe_revision(self.REV, ["RELIANCE", "INFY", "TCS"])
+
+        with self.assertRaises(ValidationRefusal) as ctx:
+            self._compile(
+                {
+                    "universe_revision_id": self.REV,
+                    "target_weights": {"RELIANCE": 1.0},
+                    "reference_prices": {"WIPRO": 400.0},
+                }
+            )
+        self.assertEqual(ctx.exception.reason_code, "UNIVERSE_MEMBER_UNRESOLVED")
+        self.assertEqual(ctx.exception.detail["outside_scope"], ["WIPRO"])
+
     def test_weights_resolution_uses_pinned_generation(self):
         self.seed_remapped_catalog()
         self.seed_universe_revision(self.REV, ["RELIANCE"], source_generation=G1)
@@ -851,27 +950,98 @@ class TargetWeightsPlanTests(ProposalTestCase):
             )
         )
 
-    def test_the_platform_freezes_the_capital_basis_and_ignores_a_caller_number(self):
-        """Sizing is a platform resolution, not a caller assertion."""
+    def _submit_with_basis(self, basis, *, evaluation_id="eval-basis"):
+        """Submit the same weights proposal with an explicitly stated basis."""
         from backend.strategies.proposals import ProposalStore, ProposalSubmission
 
-        result = ProposalStore(session_factory=self.factory).submit(
+        return ProposalStore(session_factory=self.factory).submit(
             ProposalSubmission(
-                strategy_id="stg-W", account_id="kite:A", evaluation_id="eval-basis",
+                strategy_id="stg-W", account_id="kite:A", evaluation_id=evaluation_id,
                 evaluation_kind="run_now", strategy_run_id="run-1",
                 target_kind="target_weights",
                 payload={
                     "universe_revision_id": self.REV,
                     "target_weights": {"RELIANCE": 0.5},
                     "catalog_generation": G1,
-                    # A caller-supplied basis is overwritten, never trusted.
-                    "capital_basis_inr": 99999999.0,
+                    "capital_basis_inr": basis,
+                },
+            )
+        )
+
+    def _plan_ids(self):
+        from sqlalchemy import text
+
+        with self.factory() as session:
+            return list(
+                session.execute(text("SELECT plan_id FROM strategy_plans")).scalars().all()
+            )
+
+    def test_the_platform_freezes_the_capital_basis_when_it_matches(self):
+        """A stated basis is accepted only when it IS the platform's basis, and
+        the FROZEN value is the platform's, not the caller's number."""
+        result = self._submit_with_basis(100000.0, evaluation_id="eval-match")
+        self.assertEqual(result["status"], "validated", result)
+        self.assertEqual(result["plan"]["resolved_plan"]["capital_basis_inr"], 100000.0)
+        self.assertEqual(result["plan"]["logical_plan"]["capital_basis_inr"], 100000.0)
+
+    def test_an_omitted_capital_basis_uses_the_recorded_policy(self):
+        from backend.strategies.proposals import ProposalStore, ProposalSubmission
+
+        result = ProposalStore(session_factory=self.factory).submit(
+            ProposalSubmission(
+                strategy_id="stg-W", account_id="kite:A", evaluation_id="eval-omitted",
+                evaluation_kind="run_now", strategy_run_id="run-1",
+                target_kind="target_weights",
+                payload={
+                    "universe_revision_id": self.REV,
+                    "target_weights": {"RELIANCE": 0.5},
+                    "catalog_generation": G1,
                 },
             )
         )
         self.assertEqual(result["status"], "validated", result)
         self.assertEqual(result["plan"]["resolved_plan"]["capital_basis_inr"], 100000.0)
-        self.assertEqual(result["plan"]["logical_plan"]["capital_basis_inr"], 100000.0)
+
+    def test_a_smaller_stated_budget_is_refused_not_overwritten(self):
+        """The financial blocker: a stated 40000 budget against a 100000
+        allocation must REFUSE. Silently sizing to the allocation would spend
+        2.5x the budget the caller declared."""
+        from sqlalchemy import text
+
+        before = self._plan_ids()
+        result = self._submit_with_basis(40000.0, evaluation_id="eval-small")
+
+        self.assertEqual(result["status"], "refused", result)
+        self.assertEqual(result["refusal"]["rejection_reason"], "CAPITAL_BASIS_MISMATCH")
+        self.assertEqual(
+            result["refusal"]["stated_capital_basis_inr"], 40000.0
+        )
+        self.assertEqual(
+            result["refusal"]["authoritative_allocation_inr"], 100000.0
+        )
+        # No plan is written, so nothing can be reserved, approved or ordered.
+        self.assertEqual(self._plan_ids(), before)
+
+    def test_a_larger_stated_budget_is_refused_too(self):
+        """The opposite direction: a caller cannot narrate a LARGER size into
+        existence either."""
+        from sqlalchemy import text
+
+        before = self._plan_ids()
+        result = self._submit_with_basis(500000.0, evaluation_id="eval-large")
+
+        self.assertEqual(result["status"], "refused", result)
+        self.assertEqual(result["refusal"]["rejection_reason"], "CAPITAL_BASIS_MISMATCH")
+        self.assertEqual(self._plan_ids(), before)
+
+    def test_a_non_positive_or_non_finite_stated_basis_is_invalid(self):
+        for index, basis in enumerate((0.0, -100.0, float("nan"), float("inf"), "not-a-number")):
+            with self.subTest(basis=basis):
+                result = self._submit_with_basis(basis, evaluation_id=f"eval-invalid-{index}")
+                self.assertEqual(result["status"], "refused", result)
+                self.assertEqual(
+                    result["refusal"]["rejection_reason"], "CAPITAL_BASIS_INVALID"
+                )
 
     def test_a_weights_plan_without_a_recorded_policy_is_refused(self):
         """No recorded basis means no approved size: refuse, never guess."""

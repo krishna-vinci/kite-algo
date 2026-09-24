@@ -4,19 +4,37 @@ import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/rea
 
 import { hostedKeys } from "@/features/strategies/hooks/keys";
 import {
+  approveExecutionRequest,
+  checkSourceReadiness,
   createHostedStrategy,
   createHostedVersion,
+  fetchAdmissionPolicy,
+  fetchAuthorization,
+  fetchExecutionGrants,
+  fetchExecutionRequests,
   fetchHostedJob,
   fetchHostedJobLogs,
   fetchHostedJobNotifications,
   fetchHostedJobs,
   fetchHostedOptions,
+  fetchHostedPositions,
+  fetchHostedSchedule,
+  fetchHostedScheduleOccurrences,
   fetchHostedStrategies,
   fetchHostedStrategy,
   fetchHostedVersions,
+  fetchOperatorCalendar,
+  fetchPlan,
   inspectHostedReconciliation,
+  issueExecutionGrant,
   reconcileHostedJob,
+  rejectExecutionRequest,
+  revokeExecutionGrant,
   runHostedStrategy,
+  saveAdmissionPolicy,
+  saveHostedSchedule,
+  setAuthorizationMode,
+  setHostedScheduleEnabled,
   stopHostedJob,
   updateHostedStrategy,
 } from "@/lib/hosted-strategies/api";
@@ -174,6 +192,185 @@ export function useReconcileHostedJob(strategyId: string, jobId: string) {
       void client.invalidateQueries({ queryKey: hostedKeys.job(strategyId, jobId) });
       void client.invalidateQueries({ queryKey: hostedKeys.jobs(strategyId) });
       void client.invalidateQueries({ queryKey: hostedKeys.reconciliation(strategyId, jobId) });
+    },
+  });
+}
+
+/**
+ * Readiness is a request, not a query: the source is a form value, and the
+ * composer decides when it is worth asking (debounced) and which answer is the
+ * newest.
+ */
+export function useSourceReadiness() {
+  return useMutation({ mutationFn: (source: string) => checkSourceReadiness(source) });
+}
+
+export function useAuthorization(strategyId: string | null) {
+  return useQuery({
+    queryKey: hostedKeys.authorization(strategyId ?? ""),
+    queryFn: () => fetchAuthorization(strategyId as string),
+    enabled: Boolean(strategyId),
+  });
+}
+
+export function useExecutionGrants(strategyId: string | null) {
+  return useQuery({
+    queryKey: hostedKeys.grants(strategyId ?? ""),
+    queryFn: () => fetchExecutionGrants(strategyId as string),
+    enabled: Boolean(strategyId),
+  });
+}
+
+export function useExecutionRequests(strategyId: string | null) {
+  return useQuery({
+    queryKey: hostedKeys.executionRequests(strategyId ?? ""),
+    queryFn: () => fetchExecutionRequests(strategyId as string),
+    enabled: Boolean(strategyId),
+    // A request that is still moving (waiting, queued, dispatching) is worth
+    // re-reading; anything terminal is not polled.
+    refetchInterval: (query) => {
+      const rows = query.state.data?.requests ?? [];
+      const moving = rows.some((row) =>
+        ["requested", "awaiting_approval", "queued", "dispatching"].includes(row.status),
+      );
+      return moving ? 5_000 : false;
+    },
+  });
+}
+
+export function useAdmissionPolicy(strategyId: string | null) {
+  return useQuery({
+    queryKey: hostedKeys.admissionPolicy(strategyId ?? ""),
+    queryFn: () => fetchAdmissionPolicy(strategyId as string),
+    enabled: Boolean(strategyId),
+  });
+}
+
+export function useHostedSchedule(strategyId: string | null) {
+  return useQuery({
+    queryKey: hostedKeys.schedule(strategyId ?? ""),
+    queryFn: () => fetchHostedSchedule(strategyId as string),
+    enabled: Boolean(strategyId),
+  });
+}
+
+export function useHostedScheduleOccurrences(strategyId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: hostedKeys.scheduleOccurrences(strategyId ?? ""),
+    queryFn: () => fetchHostedScheduleOccurrences(strategyId as string),
+    enabled: Boolean(strategyId) && enabled,
+  });
+}
+
+export function useOperatorCalendar(
+  params: { exchange: string; segment: string; from: string; to: string } | null,
+) {
+  return useQuery({
+    queryKey: hostedKeys.calendar(params?.exchange ?? "", params?.segment ?? ""),
+    queryFn: () => fetchOperatorCalendar(params as NonNullable<typeof params>),
+    enabled: Boolean(params),
+  });
+}
+
+export function useHostedPlan(strategyId: string | null, proposalId: string | null) {
+  return useQuery({
+    queryKey: hostedKeys.plan(strategyId ?? "", proposalId ?? ""),
+    queryFn: () => fetchPlan(strategyId as string, proposalId as string),
+    enabled: Boolean(strategyId && proposalId),
+  });
+}
+
+export function useHostedPositions(strategyId: string | null, environment: string) {
+  return useQuery({
+    queryKey: hostedKeys.positions(strategyId ?? "", environment),
+    queryFn: () => fetchHostedPositions(strategyId as string, environment),
+    enabled: Boolean(strategyId && environment),
+  });
+}
+
+export function useSetAuthorizationMode(strategyId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: Parameters<typeof setAuthorizationMode>[1]) =>
+      setAuthorizationMode(strategyId, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.authorization(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.grants(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.strategy(strategyId) });
+    },
+  });
+}
+
+export function useIssueExecutionGrant(strategyId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: Parameters<typeof issueExecutionGrant>[1]) =>
+      issueExecutionGrant(strategyId, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.authorization(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.grants(strategyId) });
+    },
+  });
+}
+
+export function useRevokeExecutionGrant(strategyId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: Parameters<typeof revokeExecutionGrant>[1]) =>
+      revokeExecutionGrant(strategyId, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.authorization(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.grants(strategyId) });
+    },
+  });
+}
+
+export function useExecutionRequestDecision(strategyId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { requestId: string; decision: "approve" | "reject"; reason?: string }) =>
+      input.decision === "approve"
+        ? approveExecutionRequest(strategyId, input.requestId, { reason: input.reason ?? null })
+        : rejectExecutionRequest(strategyId, input.requestId, { reason: input.reason ?? null }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.executionRequests(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.jobs(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.authorization(strategyId) });
+    },
+  });
+}
+
+export function useSaveAdmissionPolicy(strategyId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: Parameters<typeof saveAdmissionPolicy>[1]) =>
+      saveAdmissionPolicy(strategyId, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.admissionPolicy(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.authorization(strategyId) });
+    },
+  });
+}
+
+export function useSaveHostedSchedule(strategyId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: Parameters<typeof saveHostedSchedule>[1]) =>
+      saveHostedSchedule(strategyId, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.schedule(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.scheduleOccurrences(strategyId) });
+    },
+  });
+}
+
+export function useSetHostedScheduleEnabled(strategyId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (enabled: boolean) => setHostedScheduleEnabled(strategyId, enabled),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: hostedKeys.schedule(strategyId) });
+      void client.invalidateQueries({ queryKey: hostedKeys.scheduleOccurrences(strategyId) });
     },
   });
 }

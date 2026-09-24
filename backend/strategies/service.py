@@ -47,8 +47,11 @@ __all__ = [
     "ALLOWED_SCHEDULE_KINDS",
     "ALLOWED_STALE_EXIT_POLICIES",
     "CHILD_FORBIDDEN_ACTIONS",
+    "CHILD_FUNDS_ACTIONS",
+    "CHILD_MARKET_ACTIONS",
     "CHILD_ORDER_ACTIONS",
     "CHILD_NOTIFY_ACTIONS",
+    "CHILD_UNIVERSE_ACTIONS",
     "MAX_NAME_LENGTH",
     "MAX_PARAMS_BYTES",
     "MAX_SCHEMA_BYTES",
@@ -98,10 +101,23 @@ CHILD_ORDER_ACTIONS = frozenset(
     {"intents:submit", "runs:exit", "risk:update", "proposals:submit"}
 )
 CHILD_NOTIFY_ACTIONS = frozenset({"notifications:publish"})
+#: ``data`` read lens: the standard market read/stream actions a strategy uses
+#: for quotes, candles, history, indicator reads and index ticker reads.
+CHILD_MARKET_ACTIONS = frozenset({"market:read", "market:stream"})
+#: ``data`` universe lens: dedicated actions for listing, reading, previewing
+#: and resolving membership of an *existing* owner-owned universe. They
+#: deliberately do NOT include ``workflows:read``/``workflows:write``: a hosted
+#: child may consume a universe but never author a workflow or universe
+#: definition.
+CHILD_UNIVERSE_ACTIONS = frozenset({"universes:read", "universes:resolve"})
+#: ``trade`` account-scoped read lens: the funds/portfolio reads a trade-authoring
+#: strategy needs. The backend still owns authoritative margin/admission.
+CHILD_FUNDS_ACTIONS = frozenset({"funds:read"})
 #: Lifecycle rights reserved to the supervisor (internal lifecycle API).
 CHILD_FORBIDDEN_ACTIONS = frozenset({"heartbeat"})
 _ALLOWED_CHILD_ACTIONS = (
     CHILD_BASE_ACTIONS | CHILD_ORDER_ACTIONS | CHILD_NOTIFY_ACTIONS
+    | CHILD_MARKET_ACTIONS | CHILD_UNIVERSE_ACTIONS | CHILD_FUNDS_ACTIONS
 )
 
 # ---------------------------------------------------------------------------
@@ -310,18 +326,29 @@ def child_run_token_actions(
     *,
     order_capable: bool = False,
     notify: bool = False,
+    data: bool = False,
+    funds: bool = False,
     extra: Iterable[str] = (),
 ) -> List[str]:
     """Compose the action set a child run token may hold.
 
     The child never receives ``heartbeat``: lifecycle rights belong to the
     supervisor. Composition is validated before it could ever be minted.
+
+    ``data`` adds the market read/stream and universe read/resolve lenses;
+    ``funds`` adds the account-scoped funds read (trade-authoring only). Both
+    default to ``False`` so an external or ad-hoc composition is unchanged.
     """
     actions = set(CHILD_BASE_ACTIONS)
     if order_capable:
         actions |= CHILD_ORDER_ACTIONS
     if notify:
         actions |= CHILD_NOTIFY_ACTIONS
+    if data:
+        actions |= CHILD_MARKET_ACTIONS
+        actions |= CHILD_UNIVERSE_ACTIONS
+    if funds:
+        actions |= CHILD_FUNDS_ACTIONS
     actions |= {str(action) for action in extra}
     return validate_child_token_actions(actions)
 
@@ -506,9 +533,10 @@ def _validate_calendar_dates(values: Optional[Iterable[str]]) -> Optional[List[s
 
 
 #: Capabilities a hosted version may declare. ``trade`` grants the paper order
-#: actions, ``notify`` grants run-scoped notification publish, ``data`` is the
-#: baseline read/log capability. A snapshot that does not clearly declare these
-#: is *ambiguous* and confers NO trading rights.
+#: actions plus the account-scoped funds read, ``notify`` grants run-scoped
+#: notification publish, and ``data`` grants the market read/stream and
+#: dedicated universe read/resolve lenses. A snapshot that does not clearly
+#: declare these is *ambiguous* and confers NO trading rights.
 CAPABILITY_KEYS = ("data", "trade", "notify")
 #: Current capability snapshot schema. Earlier marker-only snapshots (schema 1,
 #: which recorded no capability entries) are treated as ambiguous and fail closed.
@@ -603,13 +631,18 @@ def parse_capability_snapshot(snapshot: Optional[Mapping[str, Any]]) -> Dict[str
 def capability_actions(capabilities: Mapping[str, bool]) -> List[str]:
     """Compose the child token actions for a capability set.
 
-    ``trade`` → paper order actions; ``notify`` → ``notifications:publish``;
-    ``data`` → the baseline read/log actions (always present). ``heartbeat`` is
-    never included.
+    ``data`` → the market read/stream lens plus the dedicated universe
+    read/resolve lens. ``trade`` → paper order actions **and** the
+    account-scoped ``funds:read`` needed to author a trade. ``notify`` →
+    ``notifications:publish``. The baseline run read/log actions are always
+    present and ``heartbeat`` is never included. A ``data=false`` capability set
+    gains none of the read lenses; only its baseline run actions remain.
     """
     return child_run_token_actions(
         order_capable=bool(capabilities.get("trade")),
         notify=bool(capabilities.get("notify")),
+        data=bool(capabilities.get("data")),
+        funds=bool(capabilities.get("trade")),
     )
 
 

@@ -37,6 +37,15 @@ export type HostedStrategy = {
   max_duration_s: number;
   progress_deadline_s: number;
   stale_exit_policy: string;
+  /**
+   * `approval_based` (default) or `autonomous`. A server that predates the
+   * field means approval-based, so only an explicit value is read.
+   */
+  authorization_mode?: string;
+  /** Canonical product status; the hosted scheduling status is `status`. */
+  product_status?: string;
+  /** Which compute adapters this product has ("hosted" / "external"). */
+  adapter_kinds?: string[];
   status: string;
   created_at: string | null;
   updated_at: string | null;
@@ -227,4 +236,400 @@ export type StopJobResponse = {
   attempt: number;
   idempotent: boolean;
   stop: StopView;
+};
+
+// ---------------------------------------------------------------------------
+// Phase 1: first-run source readiness (`POST /api/strategies/readiness`)
+// ---------------------------------------------------------------------------
+
+export type RunnerPackage = {
+  import_name: string;
+  distribution: string;
+  extra?: string | null;
+};
+
+export type RunnerProfile = {
+  id: string;
+  python: string;
+  base_image: string;
+  packages: RunnerPackage[];
+  server_side_indicators: boolean;
+  runtime_pip_install: boolean;
+  notes?: string | null;
+};
+
+/** `unknown` is a real answer: a check that cannot be proven is not a pass. */
+export type ReadinessStatus = "ok" | "blocked" | "unknown";
+
+export type ReadinessCheck = {
+  id: string;
+  status: ReadinessStatus;
+  detail: string;
+  remediation?: string | null;
+};
+
+export type SourceEntrypoint = {
+  found: boolean;
+  compatible: boolean;
+  name?: string | null;
+  is_async?: boolean | null;
+  detail: string;
+  remediation?: string | null;
+};
+
+export type SourceImports = {
+  available: string[];
+  missing: string[];
+  optional_available: string[];
+  optional_missing: string[];
+  providers: Record<string, string>;
+  /** `importlib`/`__import__`/`exec`/`eval` seen: cannot be certified ready. */
+  dynamic: boolean;
+};
+
+export type SourceReadiness = {
+  schema_version: number;
+  status: "ready" | "blocked";
+  profile: RunnerProfile;
+  checks: ReadinessCheck[];
+  entrypoint: SourceEntrypoint;
+  imports: SourceImports;
+  messages: string[];
+};
+
+// ---------------------------------------------------------------------------
+// Phase 2: authorization mode, grants and durable execution requests
+// ---------------------------------------------------------------------------
+
+export type AdmissionPolicy = {
+  strategy_id: string;
+  account_id: string;
+  allocation_inr: number | null;
+  per_instrument_notional_inr: number | null;
+  gross_notional_inr: number | null;
+  max_open_instruments: number | null;
+  admissions_per_window: number | null;
+  admission_window_seconds: number | null;
+  daily_loss_budget_inr: number | null;
+  updated_by: string;
+};
+
+export type AdmissionPolicyPayload = {
+  allocation_inr?: number | null;
+  per_instrument_notional_inr?: number | null;
+  gross_notional_inr?: number | null;
+  max_open_instruments?: number | null;
+  admissions_per_window?: number | null;
+  admission_window_seconds?: number | null;
+  daily_loss_budget_inr?: number | null;
+};
+
+/** Half the grant's policy basis: the owner's recorded admission policy. */
+export type AdmissionEvidence = {
+  account_id: string;
+  allocation_inr: number | null;
+  per_instrument_notional_inr: number | null;
+  gross_notional_inr: number | null;
+  max_open_instruments: number | null;
+  admissions_per_window: number | null;
+  admission_window_seconds: number | null;
+  daily_loss_budget_inr: number | null;
+};
+
+export type ProtectionPolicy = {
+  stale_exit_policy: string;
+  max_duration_s: number;
+  progress_deadline_s: number;
+};
+
+/** The exact policy basis a grant binds: admission + mandatory protection. */
+export type PolicySnapshot = {
+  admission: AdmissionEvidence | null;
+  protection: ProtectionPolicy;
+};
+
+export type ExecutionGrant = {
+  grant_id: string;
+  owner_id: string;
+  strategy_id: string;
+  canonical_strategy_id: string;
+  version_id: string;
+  version_number: number;
+  source_sha256: string;
+  account_id: string;
+  execution_environment: string;
+  policy_hash: string;
+  policy_snapshot: PolicySnapshot;
+  issued_by: string;
+  issued_at: string | null;
+  expires_at: string | null;
+  status: string;
+  revoked_by: string | null;
+  revoked_at: string | null;
+  revocation_reason: string | null;
+  superseded_by: string | null;
+  superseded_at: string | null;
+  supersession_reason: string | null;
+  /** Technical. Hidden in the UI and never reused for a changed request. */
+  request_key: string;
+  content_sha256: string;
+  created_at: string | null;
+  idempotent: boolean;
+};
+
+export type AuthorizationStatus = {
+  strategy_id: string;
+  authorization_mode: string;
+  active_grant: ExecutionGrant | null;
+  policy_snapshot: PolicySnapshot;
+  policy_hash: string;
+  /** `false` means no capital basis is recorded: ask for the missing limits. */
+  policy_concrete: boolean;
+  grant_usable: boolean;
+  blocking_reasons: string[];
+  evaluated_at: string | null;
+};
+
+export type AuthorizationModeResponse = {
+  strategy_id: string;
+  authorization_mode: string;
+  previous_mode: string;
+  changed: boolean;
+};
+
+export type ExecutionGrantRevokeResponse = {
+  grant: ExecutionGrant;
+  revoked_at: string | null;
+};
+
+/** The executor's own word. `terminal` means "not dispatched again". */
+export type ExecutionOutcomeState =
+  | "submitted"
+  | "accepted"
+  | "filled"
+  | "partial"
+  | "rejected"
+  | "no_op"
+  | "uncertain"
+  | "failed"
+  | string;
+
+export type ExecutionRequestRow = {
+  request_id: string;
+  owner_id: string;
+  strategy_id: string;
+  canonical_strategy_id: string;
+  account_id: string;
+  execution_environment: string;
+  strategy_run_id: string;
+  job_id: string | null;
+  token_id: string | null;
+  attempt: number | null;
+  lease_epoch: number | null;
+  version_id: string;
+  version_number: number | null;
+  source_sha256: string;
+  policy_hash: string;
+  evaluation_id: string | null;
+  plan_id: string;
+  plan_hash: string;
+  authorization_mode: string;
+  grant_id: string | null;
+  status: string;
+  refusal_code: string | null;
+  refusal_detail: Record<string, unknown>;
+  decision_kind: string | null;
+  decision_actor: string | null;
+  decision_at: string | null;
+  decision_evidence: Record<string, unknown>;
+  approval_id: string | null;
+  reservation_id: string | null;
+  execution_detail: Record<string, unknown>;
+  outcome_state: ExecutionOutcomeState | null;
+  dispatch_claim_id: string | null;
+  dispatch_claimed_at: string | null;
+  dispatch_started_at: string | null;
+  dispatch_finished_at: string | null;
+  /** Technical. Hidden in the UI. */
+  idempotency_key: string;
+  created_at: string | null;
+  updated_at: string | null;
+  terminal: boolean;
+  executable: boolean;
+};
+
+export type ExecutionRequestList = {
+  strategy_id: string;
+  requests: ExecutionRequestRow[];
+};
+
+export type ExecutionRequestDecisionResponse = {
+  request: ExecutionRequestRow;
+  approved: boolean;
+  rejected: boolean;
+};
+
+// ---------------------------------------------------------------------------
+// Phase 4: schedules (operator create/edit/disable)
+// ---------------------------------------------------------------------------
+
+export type ScheduleKind = "daily" | "weekly" | "monthly" | "calendar";
+
+export type HostedScheduleOccurrence = {
+  occurrence_key: string;
+  due_at: string | null;
+  status: "pending" | "fired" | "skipped" | "expired" | string;
+  fired_at: string | null;
+  evaluation_id: string | null;
+  skip_reason: string | null;
+  detail: Record<string, unknown>;
+};
+
+export type HostedSchedule = {
+  schedule_id: string;
+  strategy_id: string;
+  version_id: string;
+  version_number: number | null;
+  account_scope: string;
+  execution_mode: string;
+  job_kind: string;
+  params_snapshot: Record<string, unknown>;
+  schedule_kind: ScheduleKind | string;
+  at_time: string;
+  weekday: number | null;
+  day_of_month: number | null;
+  calendar_dates: string[];
+  timezone: string;
+  window_end: string | null;
+  squareoff_at: string | null;
+  enabled: boolean;
+  manually_paused: boolean;
+  max_duration_s: number;
+  progress_deadline_s: number;
+  misfire_grace_seconds: number;
+  /** The runtime's own policy (`defer_until_resolved`), reported verbatim. */
+  overlap_policy: string;
+  next_occurrence_at: string | null;
+  next_occurrence_key: string | null;
+  last_occurrence: HostedScheduleOccurrence | null;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type HostedSchedulePayload = {
+  version_id: string;
+  execution_mode: string;
+  job_kind: string;
+  params: Record<string, unknown>;
+  schedule_kind: ScheduleKind;
+  at_time: string;
+  weekday?: number | null;
+  day_of_month?: number | null;
+  calendar_dates?: string[] | null;
+  timezone: string;
+  window_end?: string | null;
+  squareoff_at?: string | null;
+  enabled: boolean;
+};
+
+export type CalendarSession = {
+  session_date: string;
+  session_type: string;
+  opens_at: string | null;
+  closes_at: string | null;
+  verified: boolean;
+  source_reference: string | null;
+};
+
+export type CalendarSessions = {
+  schema_version: number;
+  source: string;
+  source_as_of: string;
+  retrieved_at: string;
+  exchange: string;
+  segment: string;
+  calendar_version: number;
+  official_source_document_sha256: string;
+  canonical_csv_sha256: string;
+  sessions: CalendarSession[];
+};
+
+// ---------------------------------------------------------------------------
+// Plan review, reservations, approvals and the projected book
+// ---------------------------------------------------------------------------
+
+export type PlanDetail = {
+  plan_id: string;
+  proposal_id: string;
+  strategy_id: string;
+  account_id: string;
+  plan_kind: string;
+  plan_hash: string;
+  logical_plan: Record<string, unknown>;
+  resolved_plan: Record<string, unknown>;
+  pinned_universe_revision_id: string | null;
+  pinned_member_hash: string | null;
+  pinned_catalog_generation: string;
+  invalidation_state: Record<string, unknown>;
+};
+
+export type AdmissionVerdict = {
+  admitted: boolean;
+  rejection_reason: string | null;
+  detail: Record<string, unknown>;
+};
+
+export type ReservationRow = {
+  reservation_id: string;
+  plan_id: string;
+  strategy_id: string;
+  account_id: string;
+  evaluation_id: string;
+  execution_environment: string;
+  status: string;
+  reserved_notional_inr: number;
+  margin_evidence: Record<string, unknown>;
+  margin_as_of: string | null;
+  valid_until: string | null;
+  renewed_at: string | null;
+  released_at: string | null;
+  release_reason: string | null;
+};
+
+export type ApprovalRow = {
+  approval_id: string;
+  plan_id: string;
+  strategy_id: string;
+  account_id: string;
+  reservation_id: string;
+  plan_hash: string;
+  exposure_snapshot_version: number;
+  exposure_snapshot_hash: string | null;
+  reconciliation_version: number;
+  catalog_generation: string;
+  session_product_snapshot: Record<string, unknown>;
+  actor_id: string;
+  actor_kind: string;
+  authorization_evidence: Record<string, unknown>;
+  status: string;
+  valid_from: string | null;
+  valid_until: string | null;
+  structural_validity: Record<string, unknown>;
+};
+
+export type HostedPositionRow = {
+  identity_kind: string;
+  identity_key: string;
+  product: string;
+  instrument_token: number;
+  exchange: string;
+  tradingsymbol: string;
+  net_quantity: number;
+  unresolved_reason: string | null;
+};
+
+export type HostedPositionList = {
+  strategy_id: string;
+  environment: string;
+  positions: HostedPositionRow[];
 };

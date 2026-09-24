@@ -62,6 +62,9 @@ class ProposalSubmitResponse(BaseModel):
     status: str
     plan: Optional[PlanResponse] = None
     idempotent: bool = False
+    #: Why the proposal produced no plan, when it did not: a named reason code
+    #: plus its detail, so a strategy can act on the refusal instead of guessing.
+    refusal: Optional[Dict[str, Any]] = None
 
 
 class ProposalRow(BaseModel):

@@ -364,6 +364,60 @@ class KiteAlgoWorkerClient:
         """Namespaced access: ``client.proposals.submit(payload)``."""
         return _ProposalNamespace(self)
 
+    # -- governed execution (Phase 2) --------------------------------------
+
+    def request_execution(
+        self,
+        strategy_run_id: str,
+        plan_id: str,
+        *,
+        idempotency_key: str,
+        session_nonce: Optional[str] = None,
+    ) -> JsonDict:
+        """Ask the platform to execute one frozen plan of THIS run.
+
+        A proposal stays inert until execution is requested. The request is
+        recorded durably under ``idempotency_key`` and then follows the
+        strategy's authorization mode: ``approval_based`` waits for the owner's
+        decision, ``autonomous`` queues only under a matching current grant.
+        """
+        return self._request(
+            "POST",
+            "/worker/executions",
+            json={
+                "strategy_run_id": str(strategy_run_id),
+                "plan_id": str(plan_id),
+                "idempotency_key": require_idempotency_key(idempotency_key),
+            },
+            headers=session_headers(session_nonce),
+        )
+
+    def list_execution_requests(self, strategy_run_id: str, *, limit: int = 50) -> JsonDict:
+        """This run's execution requests, newest first."""
+        return self._request(
+            "GET",
+            "/worker/executions",
+            params={"strategy_run_id": str(strategy_run_id), "limit": int(limit)},
+        )
+
+    def get_execution_request(self, request_id: str, *, strategy_run_id: str) -> JsonDict:
+        """One execution request, scoped to this run."""
+        return self._request(
+            "GET",
+            f"/worker/executions/{request_id}",
+            params={"strategy_run_id": str(strategy_run_id)},
+        )
+
+    def get_owned_work(self, strategy_run_id: str) -> JsonDict:
+        """The run's canonical-strategy book plus its pending execution work.
+
+        This is the strategy's OWN attributed book (not the account net) with
+        coverage/freshness metadata, submitted and withheld steps, fills and
+        remaining quantities. An unpublished projection is reported as unknown
+        rather than as a flat book.
+        """
+        return self._request("GET", f"/worker/runs/{strategy_run_id}/positions")
+
     def list_orders(self, strategy_run_id: str) -> JsonDict:
         return self._request("GET", "/worker/orders", params={"strategy_run_id": strategy_run_id})
 

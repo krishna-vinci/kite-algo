@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Index universe equal-weight full snapshot",
+  "description": "Resolve an owner-owned universe, validate complete membership and pricing, and target an equal weight against a concrete budget.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "universe": {
+      "type": "string",
+      "description": "Name of the owner-owned universe to rebalance (resolved to an immutable membership revision)."
+    },
+    "budget_inr": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Total capital the equal-weight target is built against, in INR."
+    },
+    "cash_buffer_pct": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 0.99,
+      "default": 0,
+      "description": "Fraction of the budget deliberately left uninvested."
+    },
+    "product": {
+      "type": "string",
+      "enum": ["CNC", "MIS", "NRML"],
+      "default": "CNC",
+      "description": "Frozen product for every member leg."
+    },
+    "exchange": {
+      "type": "string",
+      "default": "NSE",
+      "description": "Exchange every member is quoted on."
+    },
+    "no_change_tolerance": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Per-member quantity difference below which the book is considered unchanged."
+    },
+    "deadline_seconds": {
+      "type": "number",
+      "minimum": 0,
+      "default": 120,
+      "description": "How long the child waits for an owner decision on an approval-based request."
+    }
+  },
+  "required": ["universe", "budget_inr"]
+}

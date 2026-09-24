@@ -53,6 +53,15 @@ class _FakeWorkerRepo:
     async def get_token_by_hash(self, token_hash: str):
         return self._tokens.get(token_hash)
 
+    async def get_run(self, _strategy_run_id: str):
+        """The options mutation guard resolves the bound worker run.
+
+        This fake models an EXTERNAL token, which is not bound to any worker run,
+        so the run is absent - exactly the answer the production repository gives
+        for an options id that has no worker-run row.
+        """
+        return None
+
     async def touch_token(self, _token_id: str):
         return datetime.now(timezone.utc)
 

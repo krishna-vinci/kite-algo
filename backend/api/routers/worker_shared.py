@@ -39,6 +39,7 @@ __all__ = [
     "WORKER_SESSION_FRESHNESS_SECONDS",
     "create_worker_run_for_token",
     "require_active_worker_run_session",
+    "require_worker_read_action",
     "require_worker_token",
     "require_worker_ws_token",
     # Underscored symbols re-used by other worker routers
@@ -95,6 +96,12 @@ DEFAULT_WORKER_ACTIONS = {
     "market:read",
     "market:stream",
     "funds:read",
+    # NOTE: ``universes:read`` / ``universes:resolve`` are deliberately absent
+    # from this owner-issued allow-list. They are the **hosted child** universe
+    # lens (backend/strategies/service.py CHILD_UNIVERSE_ACTIONS, granted by the
+    # ``data`` capability). External tokens keep their established
+    # ``workflows:read``/``workflows:write`` universe contract unchanged, so no
+    # new authority appears on the external surface.
     "workflows:read",
     "workflows:write",
     "workflows:activate",
@@ -322,6 +329,25 @@ def _payload_matches_worker_run(payload: Dict[str, Any], strategy_run_id: str, r
 def _require_action(token: WorkerToken, action: str) -> None:
     if action not in set(token.allowed_actions):
         raise HTTPException(status_code=403, detail=f"Worker token is not allowed to perform '{action}'")
+
+
+async def require_worker_read_action(request: Request, token: WorkerToken, action: str) -> Optional[Any]:
+    """Guard a **read** route: action membership plus hosted attempt authority.
+
+    External worker tokens keep their established behaviour: the action is
+    checked and nothing else. A hosted child token (a token bound to a
+    ``strategy_jobs`` row) must additionally still be a *live* attempt — not
+    stopped, fenced, expired or revoked at the persisted ledger — which is
+    enforced in ``backend.api.services.hosted_attempt`` from persisted records,
+    never from a caller-supplied owner or run id.
+
+    Returns the persisted hosted job for a hosted child, ``None`` otherwise.
+    """
+    from backend.api.services.hosted_attempt import enforce_hosted_read_authority
+
+    _require_action(token, action)
+    return await enforce_hosted_read_authority(request, token)
+
 
 def _require_worker_gtt_action(token: WorkerToken, action: str) -> None:
     allowed = set(token.allowed_actions)

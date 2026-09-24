@@ -251,6 +251,7 @@ async def submit_proposal(request: Request, payload: ProposalSubmitRequest) -> P
         status=result["status"],
         plan=PlanResponse(**result["plan"]) if result.get("plan") else None,
         idempotent=bool(result.get("idempotent")),
+        refusal=result.get("refusal"),
     )
 
 

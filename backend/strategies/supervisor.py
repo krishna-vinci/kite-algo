@@ -65,6 +65,9 @@ ENV_SCRATCH = "KITE_ALGO_SCRATCH"
 
 _DEFAULT_SDK_PATH = str(Path(__file__).resolve().parents[2] / "sdk" / "python")
 
+#: Child-scratch subdirectory holding Numba's on-disk JIT cache.
+_NUMBA_CACHE_DIRNAME = ".numba-cache"
+
 
 def derive_child_base_url(lifecycle_base_url: str) -> str:
     """Host-root base URL for the hosted child's SDK.
@@ -597,6 +600,22 @@ class HostedSupervisor:
             "HOME": str(scratch),
             "PYTHONUNBUFFERED": "1",
             "PYTHONPATH": self.config.child_pythonpath,
+            # Numerical runtime bounds. The child runs under RLIMIT_AS (2 GiB);
+            # an unbounded BLAS/OpenMP/Numba thread pool allocates one large
+            # stack per thread and can exhaust that address space while merely
+            # importing numpy/numba. Bounding the pools here keeps containment
+            # intact (the limits above are NOT relaxed) and keeps the documented
+            # runner profile — pandas/numpy/numba — inside its own budget.
+            # These names are an explicit allowlist, not a shell passthrough.
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "VECLIB_MAXIMUM_THREADS": "1",
+            "NUMBA_NUM_THREADS": "1",
+            # Numba's on-disk JIT cache goes to the child's own writable scratch
+            # (HOME already points there; this makes it explicit and stable).
+            "NUMBA_CACHE_DIR": str(scratch / ".numba-cache"),
             ENV_BASE_URL: self.config.child_base_url or derive_child_base_url(self.config.base_url),
             ENV_WORKER_TOKEN: config["worker_token"],
             ENV_RUN_ID: config["run_id"],
@@ -640,6 +659,20 @@ class HostedSupervisor:
                     ) from exc
                 logger.warning("supervisor_scratch_chown_failed", extra={"path": str(scratch)})
         os.chmod(scratch, 0o700)
+        # Numba's JIT cache lives inside the child's scratch (NUMBA_CACHE_DIR in
+        # ``_child_env``); create it here so a JIT-compiling strategy never has
+        # to fail on a missing cache directory.
+        cache_dir = scratch / _NUMBA_CACHE_DIRNAME
+        cache_dir.mkdir(exist_ok=True)
+        if self.config.child_uid is not None:
+            try:
+                os.chown(cache_dir, self.config.child_uid, self.config.child_gid)
+            except OSError as exc:
+                if self.config.require_identity_separation:
+                    raise RuntimeError(
+                        f"cannot set child ownership on numeric cache {cache_dir}: {exc}"
+                    ) from exc
+                logger.warning("supervisor_cache_chown_failed", extra={"path": str(cache_dir)})
 
     # -- supervision --------------------------------------------------------
 

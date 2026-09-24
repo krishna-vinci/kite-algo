@@ -12,8 +12,10 @@ from backend.api.routers.worker_shared import (
     require_worker_token,
 )
 from backend.api.services.hosted_attempt import (
+    assert_hosted_discretionary_mutation_allowed,
     assert_hosted_run_binding,
     enforce_hosted_attempt_authority,
+    enforce_hosted_read_authority,
     hosted_job_for_token,
 )
 from backend.options.api.execution_router import (
@@ -45,7 +47,13 @@ router = APIRouter(prefix="/api/algo-workers/worker/options", tags=["Algo Worker
 
 
 async def _guard_options_mutation(
-    request, token, strategy_run_id: str, *, required_action: str, operation: str
+    request,
+    token,
+    strategy_run_id: str,
+    *,
+    required_action: str,
+    operation: str,
+    action_payload: object = None,
 ):
     """Authorize an options mutation: operation permission + run binding + mode.
 
@@ -87,6 +95,18 @@ async def _guard_options_mutation(
             )
     if run is not None:
         await require_active_worker_run_session(request, run)
+    if hosted_job is not None:
+        # Phase 2: a hosted options CREATE/ENTER/EXIT/PROTECTION mutation is
+        # discretionary exposure, so it goes through the governed execution
+        # request contract or is refused by name. This sits AFTER the operation,
+        # binding and mode gates so those refusals keep their existing codes and
+        # meanings; external tokens never reach this branch.
+        #
+        # Caller-injected execution results are refused first, because that is a
+        # MORE specific diagnosis of the same refusal and its named code is part
+        # of the established contract.
+        _reject_hosted_execution_injection(hosted_job, action_payload)
+        assert_hosted_discretionary_mutation_allowed(run, operation=operation)
     return run, hosted_job
 
 
@@ -106,90 +126,138 @@ def _reject_hosted_execution_injection(hosted_job, action_payload) -> None:
         )
 
 
+async def _hosted_read_guard(request: Request, token) -> None:
+    """Bind the market/options **read** routes to a live hosted attempt.
+
+    The option chain, Greek, expiry, selection, PCR and max-pain reads are
+    token-only by external contract, so they do not otherwise carry a worker
+    action. A hosted child reaches them only when **both** hold, and only while
+    its persisted attempt is live:
+
+    - the ``data`` capability lens the market reads use (``market:read``), and
+    - a live persisted attempt (not stopped, fenced, expired or revoked).
+
+    An external token is unaffected: no action is required of it and no attempt
+    is looked up. This is a read check only - entering, exiting and protection
+    mutations keep their existing ``intents:submit``/``risk:update`` gates, so
+    this never unlocks direct options mutation.
+    """
+    hosted_job = await enforce_hosted_read_authority(request, token)
+    if hosted_job is None:
+        return
+    if "market:read" not in set(getattr(token, "allowed_actions", None) or []):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "rejection_reason": "HOSTED_OPERATION_NOT_PERMITTED",
+                "operation": "options.read",
+                "required_action": "market:read",
+            },
+        )
+
+
 @router.get("/underlyings/{underlying}/session")
 async def get_worker_option_session(
+    request: Request,
     underlying: str,
     _token=Depends(require_worker_token),
     manager=Depends(get_options_session_manager),
 ):
+    await _hosted_read_guard(request, _token)
     return OptionsMarketService(manager).get_session(underlying)
 
 
 @router.get("/underlyings/{underlying}/expiries")
 async def list_worker_option_expiries(
+    request: Request,
     underlying: str,
     _token=Depends(require_worker_token),
     manager=Depends(get_options_session_manager),
 ):
+    await _hosted_read_guard(request, _token)
     return OptionsMarketService(manager).list_expiries(underlying)
 
 
 @router.get("/underlyings/{underlying}/chain")
 async def get_worker_option_chain(
+    request: Request,
     underlying: str,
     expiry: str | None = None,
     _token=Depends(require_worker_token),
     manager=Depends(get_options_session_manager),
 ):
+    await _hosted_read_guard(request, _token)
     return OptionsMarketService(manager).get_chain(underlying, expiry)
 
 
 @router.get("/underlyings/{underlying}/mini-chain")
 async def get_worker_option_mini_chain(
+    request: Request,
     underlying: str,
     expiry: str | None = None,
     window: int = Query(default=5, ge=1, le=20),
     _token=Depends(require_worker_token),
     manager=Depends(get_options_session_manager),
 ):
+    await _hosted_read_guard(request, _token)
     return OptionsMarketService(manager).get_mini_chain(underlying, expiry, window)
 
 
 @router.get("/underlyings/{underlying}/greeks")
 async def get_worker_option_greeks(
+    request: Request,
     underlying: str,
     expiry: str | None = None,
     _token=Depends(require_worker_token),
     manager=Depends(get_options_session_manager),
 ):
+    await _hosted_read_guard(request, _token)
     return OptionsMarketService(manager).get_greeks(underlying, expiry)
 
 
 @router.post("/underlyings/{underlying}/selection/resolve")
 async def resolve_worker_option_selection(
+    request: Request,
     underlying: str,
     payload: dict,
     _token=Depends(require_worker_token),
     manager=Depends(get_options_session_manager),
 ):
+    await _hosted_read_guard(request, _token)
     return OptionsMarketService(manager).resolve_selection(underlying, payload)
 
 
 @router.get("/underlyings/{underlying}/analytics/pcr")
 async def get_worker_option_pcr(
+    request: Request,
     underlying: str,
     expiry: str | None = None,
     _token=Depends(require_worker_token),
     manager=Depends(get_options_session_manager),
 ):
+    await _hosted_read_guard(request, _token)
     return OptionsMarketService(manager).get_pcr(underlying, expiry)
 
 
 @router.get("/underlyings/{underlying}/analytics/max-pain")
 async def get_worker_option_max_pain(
+    request: Request,
     underlying: str,
     expiry: str | None = None,
     _token=Depends(require_worker_token),
     manager=Depends(get_options_session_manager),
 ):
+    await _hosted_read_guard(request, _token)
     return OptionsMarketService(manager).get_max_pain(underlying, expiry)
 
 
 @router.post("/strategies/preview")
 async def preview_worker_option_strategy(
+    request: Request,
     payload: dict,
     _token=Depends(require_worker_token),
 ):
+    await _hosted_read_guard(request, _token)
     return await preview_option_strategy(payload)
 
 
@@ -225,6 +293,7 @@ async def create_worker_option_run(
                     "execution_mode": str(run.get("execution_mode") or ""),
                 },
             )
+        assert_hosted_discretionary_mutation_allowed(run, operation="options.create_run")
     return await create_option_run(payload, store)
 
 
@@ -248,10 +317,15 @@ async def enter_worker_option_run(
     store: OptionRunStore = Depends(get_option_run_store),
     runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
 ):
-    _, hosted_job = await _guard_options_mutation(
-        request, _token, strategy_run_id, required_action="intents:submit", operation="options.enter"
-    )
     action_payload = payload or OptionRunActionRequest()
+    _, hosted_job = await _guard_options_mutation(
+        request,
+        _token,
+        strategy_run_id,
+        required_action="intents:submit",
+        operation="options.enter",
+        action_payload=action_payload,
+    )
     _reject_hosted_execution_injection(hosted_job, action_payload)
     if action_payload.safety_token:
         await validate_worker_run_safety_token(request, strategy_run_id, action_payload.safety_token)
@@ -284,10 +358,15 @@ async def exit_worker_option_run(
     store: OptionRunStore = Depends(get_option_run_store),
     runtime: OptionExecutionRuntimeInstance = Depends(get_option_execution_runtime_instance),
 ):
-    _, hosted_job = await _guard_options_mutation(
-        request, _token, strategy_run_id, required_action="intents:submit", operation="options.exit"
-    )
     action_payload = payload or OptionRunActionRequest()
+    _, hosted_job = await _guard_options_mutation(
+        request,
+        _token,
+        strategy_run_id,
+        required_action="intents:submit",
+        operation="options.exit",
+        action_payload=action_payload,
+    )
     _reject_hosted_execution_injection(hosted_job, action_payload)
     if action_payload.safety_token:
         await validate_worker_run_safety_token(request, strategy_run_id, action_payload.safety_token)
@@ -301,10 +380,12 @@ async def exit_worker_option_run(
 
 @router.get("/runs/{strategy_run_id}/state")
 async def get_worker_option_run_state(
+    request: Request,
     strategy_run_id: str,
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
 ):
+    await _hosted_read_guard(request, _token)
     return await get_option_run_state(strategy_run_id, store)
 
 
@@ -329,6 +410,7 @@ async def get_worker_option_run_protection_state(
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
 ):
+    await _hosted_read_guard(request, _token)
     state = await get_option_run_protection_state(strategy_run_id, store)
     worker_run = await _repo(request).get_run(strategy_run_id)
     if worker_run is not None:
@@ -343,8 +425,19 @@ async def get_worker_option_run_protection_state(
 @router.post("/runs/{strategy_run_id}/protection/replay")
 async def replay_worker_option_run_protection(
     strategy_run_id: str,
+    request: Request,
     payload: OptionProtectionReplayRequest,
     _token=Depends(require_worker_token),
     store: OptionRunStore = Depends(get_option_run_store),
 ):
+    hosted_job = await hosted_job_for_token(request, _token)
+    if hosted_job is not None:
+        # Replaying protection re-evaluates the rules and can submit an exit, so
+        # for a hosted child it is a governed mutation like enter/exit/protection.
+        run = await _repo(request).get_run(str(strategy_run_id))
+        assert_hosted_run_binding(run, _token)
+        await enforce_hosted_attempt_authority(request, _token, run)
+        assert_hosted_discretionary_mutation_allowed(
+            run, operation="options.protection_replay"
+        )
     return await replay_option_run_protection(strategy_run_id, payload, store)

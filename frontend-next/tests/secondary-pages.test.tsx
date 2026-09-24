@@ -112,14 +112,17 @@ vi.mock("@/components/workspace/workspace-provider", () => ({
 }));
 
 describe("secondary reference pages", () => {
-  it("renders the paper tab inside the shared strategies workspace", () => {
-    window.history.replaceState({}, "", "/strategies?mode=paper");
+  it("renders the hosted strategies workspace", () => {
+    window.history.replaceState({}, "", "/strategies");
     renderWithQueryClient(<StrategiesPage />);
 
     expect(screen.getByRole("heading", { name: /^strategies$/i })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /paper/i })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByText(/paper iron condor/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /exit/i })).toBeInTheDocument();
+    // The composer is a separate route: this page lists and explains strategies.
+    expect(screen.getByRole("link", { name: /new strategy/i })).toHaveAttribute(
+      "href",
+      "/strategies/new",
+    );
+    expect(screen.getByText(/registered strategies/i)).toBeInTheDocument();
   });
 
   it("renders the settings page with a tab bar navigation", () => {

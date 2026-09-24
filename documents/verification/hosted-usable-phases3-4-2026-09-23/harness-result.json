@@ -1,0 +1,274 @@
+{
+  "database": "kite_ui_qa_00fb505d2b",
+  "shots": [
+    {
+      "file": "01-composer-ready-desktop.png",
+      "captured_at": 1790170322.9956686
+    },
+    {
+      "file": "02-composer-keyboard-focus.png",
+      "captured_at": 1790170323.301372
+    },
+    {
+      "file": "03-composer-blocked-source.png",
+      "captured_at": 1790170324.32755
+    },
+    {
+      "file": "04-composer-file-type-error.png",
+      "captured_at": 1790170324.7044346
+    },
+    {
+      "file": "05-composer-schema-parameter.png",
+      "captured_at": 1790170325.3735228
+    },
+    {
+      "file": "06-composer-data-only-permissions.png",
+      "captured_at": 1790170325.5755816
+    },
+    {
+      "file": "07-composer-autonomous-limits.png",
+      "captured_at": 1790170326.0075464
+    },
+    {
+      "file": "08-strategy-detail-created.png",
+      "captured_at": 1790170327.7772439
+    },
+    {
+      "file": "09-run-now-schema-parameters.png",
+      "captured_at": 1790170327.9851096
+    },
+    {
+      "file": "10-authorization-summary.png",
+      "captured_at": 1790170328.139761
+    },
+    {
+      "file": "11-authorization-granted.png",
+      "captured_at": 1790170328.8728492
+    },
+    {
+      "file": "12-authorization-revoked.png",
+      "captured_at": 1790170329.3070486
+    },
+    {
+      "file": "13-execution-request-waiting.png",
+      "captured_at": 1790170330.4298983
+    },
+    {
+      "file": "14-plan-review.png",
+      "captured_at": 1790170330.578221
+    },
+    {
+      "file": "15-schedule-form.png",
+      "captured_at": 1790170330.8403566
+    },
+    {
+      "file": "16-schedule-saved.png",
+      "captured_at": 1790170331.320375
+    },
+    {
+      "file": "17-schedule-disabled.png",
+      "captured_at": 1790170331.7324727
+    },
+    {
+      "file": "18-composer-mobile.png",
+      "captured_at": 1790170332.3902693
+    },
+    {
+      "file": "19-strategy-detail-mobile.png",
+      "captured_at": 1790170333.3348978
+    },
+    {
+      "file": "20-strategy-detail-narrow-tables.png",
+      "captured_at": 1790170333.4171734
+    }
+  ],
+  "readiness_ready": true,
+  "keyboard_source_focus": true,
+  "blocked_disables_action": true,
+  "drop_error_preserves_source": true,
+  "refused_drop_notice_shown": true,
+  "schema_parameter_added": true,
+  "data_only_has_no_decision": true,
+  "limits_start_empty": true,
+  "review_first_limits_visible": true,
+  "refused_drop_does_not_block_launch": true,
+  "created_strategy_id": "hs_a14ac960437048cabf393d3b6a4c6928",
+  "run_now_params_are_fields": true,
+  "authorization_notes_no_trade_capability": true,
+  "grant_issued": true,
+  "grant_revoked": true,
+  "waiting_request_visible": true,
+  "plan_review_visible": true,
+  "schedule_next": "2026-09-24T10:15:00+00:00",
+  "schedule_disabled": true,
+  "composer_mobile_overflow": {
+    "viewport": 390,
+    "scroll_width": 511,
+    "content_min_width": 285,
+    "cards": [
+      {
+        "title": "Paste your Python, choose what it may do",
+        "min_width": 81
+      },
+      {
+        "title": "Python source",
+        "min_width": 237
+      },
+      {
+        "title": "Permissions",
+        "min_width": 153
+      },
+      {
+        "title": "Strategy and account",
+        "min_width": 285
+      },
+      {
+        "title": "Who approves trades",
+        "min_width": 120
+      },
+      {
+        "title": "Inputs",
+        "min_width": 181
+      },
+      {
+        "title": "Timing and run protection",
+        "min_width": 132
+      },
+      {
+        "title": "What this will do",
+        "min_width": 190
+      }
+    ],
+    "shell_min_width": {
+      "header": 443,
+      "dock": 437
+    },
+    "widest": [
+      {
+        "tag": "header",
+        "cls": "flex h-[52px] items-center gap-3 border-b border-[var(--border)] bg-[v",
+        "width": 443,
+        "inside_main": false
+      },
+      {
+        "tag": "main",
+        "cls": "min-w-0 overflow-auto p-4 lg:p-5",
+        "width": 443,
+        "inside_main": true
+      },
+      {
+        "tag": "footer",
+        "cls": "border-t border-[var(--border)] bg-[var(--panel)]",
+        "width": 443,
+        "inside_main": false
+      },
+      {
+        "tag": "div",
+        "cls": "flex items-center gap-2 border-b border-[var(--border-soft)] px-4 py-2",
+        "width": 443,
+        "inside_main": false
+      }
+    ]
+  },
+  "detail_mobile_overflow": {
+    "viewport": 390,
+    "scroll_width": 684,
+    "content_min_width": 469,
+    "cards": [
+      {
+        "title": "QA RELIANCE starter",
+        "min_width": 389
+      },
+      {
+        "title": "Account scope",
+        "min_width": 125
+      },
+      {
+        "title": "Run now",
+        "min_width": 250
+      },
+      {
+        "title": "Review or automate",
+        "min_width": 50
+      },
+      {
+        "title": "Execution requests",
+        "min_width": 160
+      },
+      {
+        "title": "Schedule",
+        "min_width": 50
+      },
+      {
+        "title": "Strategy book",
+        "min_width": 338
+      },
+      {
+        "title": "Versions",
+        "min_width": 431
+      },
+      {
+        "title": "Jobs",
+        "min_width": 469
+      }
+    ],
+    "shell_min_width": {
+      "header": 443,
+      "dock": 616
+    },
+    "widest": [
+      {
+        "tag": "header",
+        "cls": "flex h-[52px] items-center gap-3 border-b border-[var(--border)] bg-[v",
+        "width": 616,
+        "inside_main": false
+      },
+      {
+        "tag": "main",
+        "cls": "min-w-0 overflow-auto p-4 lg:p-5",
+        "width": 616,
+        "inside_main": true
+      },
+      {
+        "tag": "footer",
+        "cls": "border-t border-[var(--border)] bg-[var(--panel)]",
+        "width": 616,
+        "inside_main": false
+      },
+      {
+        "tag": "div",
+        "cls": "flex items-center gap-2 border-b border-[var(--border-soft)] px-4 py-2",
+        "width": 616,
+        "inside_main": false
+      }
+    ]
+  },
+  "versions_table_inside_card": {
+    "table_scrollable": true,
+    "container_width": 534,
+    "card_width": 584,
+    "viewport": 390
+  },
+  "screenshots": [
+    "01-composer-ready-desktop.png",
+    "02-composer-keyboard-focus.png",
+    "03-composer-blocked-source.png",
+    "04-composer-file-type-error.png",
+    "05-composer-schema-parameter.png",
+    "06-composer-data-only-permissions.png",
+    "07-composer-autonomous-limits.png",
+    "08-strategy-detail-created.png",
+    "09-run-now-schema-parameters.png",
+    "10-authorization-summary.png",
+    "11-authorization-granted.png",
+    "12-authorization-revoked.png",
+    "13-execution-request-waiting.png",
+    "14-plan-review.png",
+    "15-schedule-form.png",
+    "16-schedule-saved.png",
+    "17-schedule-disabled.png",
+    "18-composer-mobile.png",
+    "19-strategy-detail-mobile.png",
+    "20-strategy-detail-narrow-tables.png"
+  ]
+}

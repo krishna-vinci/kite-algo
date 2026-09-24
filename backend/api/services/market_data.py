@@ -4,6 +4,8 @@ import asyncio
 import inspect
 import json
 import math
+import os
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Mapping, Optional
@@ -16,6 +18,123 @@ from backend.broker_api.instruments.catalog import AmbiguousInstrumentError
 from backend.broker_api.instruments.instruments_repository import InstrumentsRepository
 from backend.broker_api.orders.market_runtime_client import RUNTIME_TICKS_CHANNEL
 
+
+#: How often a long-lived hosted stream re-checks its persisted attempt
+#: authority. A streaming connection can outlive a stop, a fence, a lease expiry
+#: or a token revocation, so connection-time authorization is re-validated on a
+#: bounded interval. External tokens are never checked.
+HOSTED_STREAM_AUTHORITY_RECHECK_SECONDS = float(
+    os.getenv("HOSTED_STREAM_AUTHORITY_RECHECK_SECONDS", "15")
+)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Timezone-aware comparison for a persisted timestamp."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+class _HostedStreamAuthority:
+    """Bounded periodic revalidation of a hosted child while it streams.
+
+    Uses the **same** persisted-attempt check as every other hosted read
+    (:func:`backend.api.services.hosted_attempt.enforce_hosted_read_authority`),
+    so a stopped/fenced/expired attempt or a revoked token ends the stream
+    instead of continuing to deliver data.
+
+    Two independent things are re-checked, because they can change
+    independently:
+
+    - the **credential**: the persisted token row (``get_token_status``, the
+      existing reconciliation ledger, looked up by ``token_id`` so the raw
+      bearer secret is never retained or logged) must still say ``active``, and
+      the token's own expiry (captured at connect, so no secret is needed) must
+      not have passed. A ``revoke_token`` that never touches the job row
+      therefore ends the stream.
+    - the **attempt**: the job must still be started, live and unexpired.
+
+    A non-hosted (external) token disables the check entirely, preserving its
+    established behaviour.
+    """
+
+    def __init__(self, request: Any, token: Any, *, interval: Optional[float] = None) -> None:
+        self._request = request
+        self._token = token
+        # Floored so a misconfigured interval cannot busy-loop the ledger; the
+        # floor is small enough to keep a focused test fast.
+        self._interval = max(
+            0.25,
+            float(
+                HOSTED_STREAM_AUTHORITY_RECHECK_SECONDS
+                if interval is None
+                else interval
+            ),
+        )
+        self._enabled: Optional[bool] = None
+        self._next_check = 0.0
+
+    def applies(self) -> bool:
+        """Cheap, no-I/O: is this a hosted (non-external) credential?"""
+        from backend.api.services.hosted_attempt import token_is_hosted_candidate
+
+        if self._enabled is None:
+            self._enabled = token_is_hosted_candidate(self._token)
+        return bool(self._enabled)
+
+    def poll_timeout(self) -> float:
+        """Seconds a caller may wait before the next authority check is due."""
+        if not self.applies():
+            return 1.0
+        remaining = self._next_check - time.monotonic()
+        return max(0.05, min(1.0, remaining if remaining > 0 else 0.05))
+
+    async def _credential_stop_reason(self) -> Optional[str]:
+        """Revalidate the persisted credential; ``None`` while it is usable."""
+        from backend.api.routers.worker_shared import _repo
+
+        expires_at = getattr(self._token, "expires_at", None)
+        if expires_at is not None and _as_utc(expires_at) <= datetime.now(timezone.utc):
+            return "WORKER_TOKEN_EXPIRED"
+        token_id = str(getattr(self._token, "token_id", "") or "")
+        if not token_id:
+            return "WORKER_TOKEN_UNKNOWN"
+        try:
+            status = await _repo(self._request).get_token_status(token_id)
+        except Exception:
+            # Cannot prove the credential is still good: end the stream rather
+            # than keep delivering data on unverified authority.
+            return "WORKER_TOKEN_STATE_UNAVAILABLE"
+        if status is None:
+            return "WORKER_TOKEN_UNKNOWN"
+        if status != "active":
+            return "WORKER_TOKEN_REVOKED" if status == "revoked" else "WORKER_TOKEN_NOT_ACTIVE"
+        return None
+
+    async def stop_reason(self) -> Optional[str]:
+        """``None`` while the stream may continue, else the refusal reason."""
+        from backend.api.services.hosted_attempt import (
+            enforce_hosted_read_authority,
+        )
+
+        if not self.applies():
+            return None
+
+        now = time.monotonic()
+        if now < self._next_check:
+            return None
+        self._next_check = now + self._interval
+        credential_reason = await self._credential_stop_reason()
+        if credential_reason is not None:
+            return credential_reason
+        try:
+            await enforce_hosted_read_authority(self._request, self._token)
+        except HTTPException as exc:
+            detail = exc.detail
+            if isinstance(detail, dict):
+                return str(detail.get("rejection_reason") or "HOSTED_ATTEMPT_UNAUTHORIZED")
+            return str(detail or "HOSTED_ATTEMPT_UNAUTHORIZED")
+        return None
 
 VALID_MARKET_MODES = {"ltp", "quote", "full"}
 DEFAULT_TICK_STALE_MS = 15_000
@@ -499,6 +618,7 @@ class WorkerMarketDataService:
         symbol: Optional[str] = None,
         instrument_token: Optional[int] = None,
         interval: str = "5minute",
+        token: Any = None,
     ) -> AsyncGenerator[str, None]:
         instrument = await self._resolve_one(symbol=symbol, instrument_token=instrument_token)
         snapshot = await self.get_candles(
@@ -510,24 +630,97 @@ class WorkerMarketDataService:
         yield self._sse_event("snapshot", snapshot)
 
         reader = self.candle_reader
+        authority = _HostedStreamAuthority(request, token) if token is not None else None
         if reader is None or not hasattr(reader, "stream_candles"):
-            async for event in self._stream_candles_from_redis(request, instrument=instrument, interval=interval):
+            async for event in self._stream_candles_from_redis(
+                request,
+                instrument=instrument,
+                interval=interval,
+                authority=authority,
+            ):
                 yield event
             return
 
-        async for payload in reader.stream_candles(int(instrument["instrument_token"]), interval):
-            if await request.is_disconnected():
-                break
-            yield self._sse_event(
-                "candle",
-                self._normalize_stream_candle_payload(
-                    payload,
-                    instrument=instrument,
-                    interval=interval,
-                ),
-            )
+        stream = reader.stream_candles(int(instrument["instrument_token"]), interval)
+        if authority is None or not authority.applies():
+            # External workers keep the original straight pass-through.
+            async for payload in stream:
+                if await request.is_disconnected():
+                    break
+                yield self._sse_event(
+                    "candle",
+                    self._normalize_stream_candle_payload(
+                        payload,
+                        instrument=instrument,
+                        interval=interval,
+                    ),
+                )
+            return
 
-    async def _stream_candles_from_redis(self, request: Any, *, instrument: Dict[str, Any], interval: str) -> AsyncGenerator[str, None]:
+        # Hosted child: race each read against the authority check so an **idle**
+        # reader cannot hold the stream open past the bound (a plain ``async for``
+        # only revalidates after the next payload). The in-flight read is
+        # cancelled and the reader closed on every exit path, so no task or
+        # generator is left behind.
+        iterator = stream.__aiter__()
+        pending: Optional[asyncio.Task] = None
+        try:
+            while True:
+                if pending is None:
+                    pending = asyncio.ensure_future(iterator.__anext__())
+                done, _waiting = await asyncio.wait(
+                    {pending}, timeout=authority.poll_timeout()
+                )
+                if not done:
+                    if await request.is_disconnected():
+                        break
+                    reason = await authority.stop_reason()
+                    if reason is not None:
+                        yield self._sse_event("stream_closed", {"reason": reason})
+                        break
+                    continue
+                try:
+                    payload = pending.result()
+                except StopAsyncIteration:
+                    pending = None
+                    break
+                pending = None
+                if await request.is_disconnected():
+                    break
+                reason = await authority.stop_reason()
+                if reason is not None:
+                    yield self._sse_event("stream_closed", {"reason": reason})
+                    break
+                yield self._sse_event(
+                    "candle",
+                    self._normalize_stream_candle_payload(
+                        payload,
+                        instrument=instrument,
+                        interval=interval,
+                    ),
+                )
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+                try:
+                    await pending
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # pragma: no cover - defensive cleanup only
+                    pass
+
+    async def _stream_candles_from_redis(
+        self,
+        request: Any,
+        *,
+        instrument: Dict[str, Any],
+        interval: str,
+        authority: Optional[_HostedStreamAuthority] = None,
+    ) -> AsyncGenerator[str, None]:
         redis = self.redis or getattr(self.market_data_runtime, "redis", None)
         if redis is None:
             yield self._sse_event("error", {"detail": "Candle stream is not available after snapshot"})
@@ -542,6 +735,11 @@ class WorkerMarketDataService:
             while True:
                 if await request.is_disconnected():
                     break
+                if authority is not None:
+                    reason = await authority.stop_reason()
+                    if reason is not None:
+                        yield self._sse_event("stream_closed", {"reason": reason})
+                        break
                 try:
                     message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
                 except Exception as exc:
@@ -864,6 +1062,7 @@ class WorkerMarketDataService:
         runtime = self.market_data_runtime
         pubsub = None
         owner_registered = False
+        authority = _HostedStreamAuthority(request, token)
 
         if runtime is None:
             yield self._sse_event("error", {"detail": "Market runtime is not available"})
@@ -901,6 +1100,13 @@ class WorkerMarketDataService:
             idle_cycles = 0
             while True:
                 if await request.is_disconnected():
+                    break
+                reason = await authority.stop_reason()
+                if reason is not None:
+                    # The persisted attempt stopped being live (fenced, stopped,
+                    # expired lease or revoked token): end the stream instead of
+                    # continuing to deliver market data.
+                    yield self._sse_event("stream_closed", {"reason": reason})
                     break
                 try:
                     message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
@@ -979,6 +1185,7 @@ class WorkerMarketDataService:
         self,
         websocket: WebSocket,
         *,
+        token: Any = None,
         symbol: Optional[str] = None,
         instrument_token: Optional[int] = None,
         interval: str = "5minute",
@@ -986,6 +1193,7 @@ class WorkerMarketDataService:
         normalized_token = normalize_instrument_token(instrument_token) if instrument_token is not None else None
         async for payload in self.stream_candles(
             _WebSocketRequestAdapter(websocket),
+            token=token,
             symbol=symbol,
             instrument_token=normalized_token,
             interval=interval,

@@ -1,0 +1,65 @@
+# Hosted Python strategy usability and integration plan
+
+Date: 2026-09-23. Baseline development `27c58b4`; deployed code `f0c747c`.
+
+## Accepted objective and boundaries
+
+The user approved implementing the OpenAlgo comparison's recommendations in dependency order. Bring Python code, paste or drop a file, understand its inputs and permissions, then run it. Strategies may use stock/option indicators, index ticker prices, premiums/IV/Greeks, ongoing position adjustments and index-universe equal-weight rebalancing. The user's latest clarification is **index ticker**, not an alert breadth aggregate or a required constituent-breadth engine. Both approval-based and autonomous operation are required.
+
+Reuse the existing hosted supervisor, SDK, catalog, market runtime, indicators, universes, options engine, proposal/admission/reservation/approval pipeline, attribution and settlement. No second execution or Greeks engine. External workers remain compatible. Paper-fidelity comparison, multi-broker expansion, MCP, unrelated analytics dashboards and real-money certification are excluded. No test broker orders, notifications, production migrations or deployment are part of this implementation pass. The live-account allowlist change rejected during the prior release remains unapplied pending its separate explicit approval.
+
+Native Flash implements; Astra owns architecture, acceptance and integration. One worker at a time. Preserve pre-existing modified R1 and untracked documents/reference checkouts. Do not stage, commit or push automatically. Real test data uses isolated disposable PostgreSQL on 15433, never production15432. Source code is never imported or executed in the API for validation.
+
+## Design decisions
+
+### Hosted read access
+
+`data=true` grants the existing market read/stream actions and narrowly scoped universe membership access. `data=false` must not gain these through incidental token validity. For hosted tokens, guarded reads verify the persisted attempt/run and derive the owner from the hosted strategy, never from a caller-provided owner or by confusing broker account scope with application owner. Keep external-worker authorization semantics intact.
+
+Universe access may list/read/preview and resolve a revision for an existing owner-owned universe. Resolution may persist the existing service's immutable membership revision, but must not grant workflow/universe definition mutation. Use dedicated `universes:read` and `universes:resolve` actions, rather than granting `workflows:write`. Existing external workflow-token actions continue to work under their existing owner contract. `trade=true` grants account-scoped funds reads needed by trade authoring; the backend still owns authoritative margin/admission. Existing option read routes need consistent hosted `data` enforcement without expanding the external contract.
+
+Index ticker prices/candles use normal catalog/market endpoints and SDK contracts. Preserve the separate index-constituent interface for investing strategies. Validate at least one index ticker path; do not substitute constituents or alert aggregation.
+
+### Dependencies and first-run readiness
+
+Offer one documented runner profile with the SDK's dataframe/indicator dependencies installed at build time on a compatible Python runtime. Verify the image with imports and a representative indicator calculation under the child identity. Do not install arbitrary source-requested packages at runtime. A reusable readiness result names supported dependencies, entrypoint issues and known missing imports; AST inspection cannot certify dynamic imports or the strategy's correctness. Missing packages produce an actionable message before launch where determinable. No broker/supervisor secrets inside user code.
+
+### Approval-based and autonomous execution
+
+Existing strategies default to approval-based; no migration or UI default silently enables autonomy. Autonomous authorization is an explicit owner action bound to immutable version/source, canonical strategy, account/environment and a revision of validated admission/risk policy. Record actor, issue/revocation times, scope and limits durably. Authorization is revocable and does not let the child approve itself. Editing code, changing account/mode, or widening policy invalidates the old grant. Disabled/stopped/expired/fenced attempts cannot spend through it.
+
+Approval-based plans retain existing per-plan approval. Autonomous plans use server-derived authorization evidence to pass the same admission/reservation/execution path; never disable gates or treat `Run now` alone as standing approval. Revalidate grant and current attempt at execution and dependent-step release. Audit each automatic decision and bound concurrent use to existing reservations/attribution. Revocation denies new discretionary actions; handling existing pending orders and platform risk-reduction follows the established explicit stop/protection policy. A continuous adjustment must include pending work as well as filled positions; repeated observations cannot duplicate adjustment orders.
+
+Authorization linearizes with a durable dispatch claim under the same grant/version fence used by revocation. Revocation prevents later dispatch claims; it cannot undo an already-authorized broker request or claim to cancel pending orders. Do not hold an unbounded database transaction over broker I/O. Unknown submissions retain their claim and are not retried based on elapsed time.
+
+Expose an explicit SDK execution-request/status flow after proposal submission. Approval-based requests wait for the operator; autonomous requests may enter the shared admission/reservation/approval/execution orchestration only under the persisted grant. Proposal persistence alone remains backward-compatible and does not silently start trading. The shared orchestration derives environment from persisted run/plan binding, not request query parameters. Paper approval exemptions in the old low-level service must not be misrepresented as an approval-based request already approved: track the user-request authorization separately where needed.
+
+Hosted direct mutation surfaces must not bypass the new mode. Discretionary exposure-increasing raw orders/intents/options mutations must use the governed plan path or be refused by name; external workers retain their existing contract. Existing platform-authorized risk reduction remains separately allowed, with attribution and non-reversal checks. User-code risk updates cannot relax owner-authorized mandatory limits. Provide a run-bound SDK snapshot of strategy-owned filled positions and pending plan/order work with freshness/version metadata; account-net positions are not that snapshot.
+
+### One-screen hosting
+
+Paste or drop `.py` source at the start, with a readable name, paper/live mode, authorized account, meaningful parameters and run timing. Create the strategy/version records beneath the flow, retaining immutable history. Explain the `main(ctx)` contract and provide a working starter rather than pretending arbitrary scripts are compatible. Render the supported JSON Schema as fields; retain an explicit JSON option for unsupported structures. No exposed idempotency keys or mandatory hand-authored schema for a parameterless program. Do not infer trade permission by importing source or scanning for a magic word.
+
+Review a compact summary of source/version, account/mode, permissions, approval mode, timing and limits. Technical settings should be grouped by purpose with clear defaults and explanations, not scattered across a wizard. Index ticker selection is ordinary instrument selection. Keep paper/live and stop/flatten meanings explicit. File errors, missing capabilities and account readiness must name a corrective action.
+
+### Operations
+
+Expose schedule create/edit/disable and next/last occurrence with the existing missed-run/overlap semantics. Use validated calendar/session data; do not apply NSE hours globally. Show proposal/plan details, reservations, approve/revoke and execution results through operator-authenticated endpoints. Provide strategy/run logs, readable progress and blocked-state reasons; do not call post-termination logs live streaming. Dynamic options selection helpers may resolve first client-side, then submit frozen explicit legs; connect the server resolver only if needed by the accepted authoring contract. Protection configuration must match enforceable generic and options-specific paths; do not advertise unsupported Greek-trigger protection.
+
+## Dependency-ordered implementation and acceptance
+
+- [x] **1. Hosted data and dependency foundation.** Modify token capability composition, narrowly scoped route authorization, SDK integration, runner image and readiness contracts. Real lifecycle-issued child credential tests must reach quote/candle/index/indicator/option-chain/universe read handlers through HTTP with simulated provider boundaries. Test data=false, stale/revoked attempt, cross-owner universe, forbidden mutation, preserved external contract. Build an isolated runner image and prove numerical dependencies plus a representative indicator under its child identity. No production containers.
+- [x] **2. Explicit execution authorization.** Add additive schema/repository/service/API/SDK contracts for approval-based and version-bound autonomous mode. Reuse admission/reservation/approval execution services. Test grants, edits, revocation, expired attempt, concurrent submissions, dependent-step release and duplicate observations against disposable PostgreSQL. Record migration proofs. Final implementation brief must name the persisted grant schema and transaction boundaries after inspecting phase1's actual result.
+- [x] **3. Unified first-run UI.** Paste/drop source, render parameters, display dependencies/readiness, derive understandable run configuration and permission summary. Integrate account/mode availability and both approval modes. Verify browser workflows on an isolated API; include loading, invalid file, invalid source, missing package, unavailable account and first successful data read. Do not require the user to understand internal version/token/lease fields.
+- [x] **4. Scheduling, approvals and recovery UI.** Connect existing schedules, plan admission/reservation/approval/execution and run history. Add only missing operator contracts with consistent cookie auth/origin checks/owner scoping. Verify pending approval versus running process, revoked autonomy, missed occurrence, partial order, unresolved submission and stop-versus-flatten explanations.
+- [x] **5. Representative end-to-end examples and guide.** Run three strategies through the same hosted contracts: index-ticker/indicator directional logic; options premiums/Greeks plus index-ticker setup with a bounded adjustment; index-universe equal-weight rebalance. Use real processes/API/database and simulated market/broker boundaries. Evidence must cover actual child data access, pending-work-aware adjustment, both authorization modes, ownership and settlement. Write copyable user guidance and explicitly distinguish simulated execution from live certification.
+
+Each phase ends with a focused acceptance review of actual code and evidence. Do not repeat broad suites without a changed surface or concrete concern. The research report is a source-based gap inventory, not an implementation proof. Complete the approved phases in sequence; refine later briefs as earlier contracts land.
+
+## Acceptance record — 2026-09-24
+
+All five implementation phases are accepted for the scoped local implementation. Final evidence: `examples/hosted_platform/evidence/phase5-20260923T200234Z.json`. Actual supervised children, API, disposable PostgreSQL and simulated providers exercised index/indicator trading, options entry and governed complete-structure close, equal-weight investing, autonomous execution, budget-mismatch refusal and restart recovery. Open investment holdings correctly remain unsettled; the paper options close passed the four core settlement axes. This is not live certification or cash/physical expiry settlement evidence.
+
+Final review corrections include production database fallback for run attribution, canonical symbol alias sizing, unknown coverage for truncated option-run reads, honest request/fill/settlement distinctions, and server-side refusal when an explicitly stated portfolio capital basis differs from the owner's sizing allocation. The source/UI retry fixes are accepted.
+
+Evidence limits: the mobile app shell still overflows on narrow viewports; some pre-existing broad API suites hang and are not counted as passing; arbitrary option-leg replacement, live market behavior and live expiry receipt remain unproven. Three representative examples do not certify every strategy. Existing open-exposure reconciliation restrictions still apply. Nothing staged, committed, pushed, deployed or migrated in production. See `examples/hosted_platform/USER-GUIDE.md` and per-phase reports.

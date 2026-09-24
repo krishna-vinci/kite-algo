@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -286,15 +287,86 @@ class ProposalStore:
 
         A weights plan needs a capital basis, and the PLATFORM resolves it here
         from the strategy's recorded admission policy, then the compiler freezes
-        it with the plan. A caller-supplied basis is overwritten rather than
-        trusted: an approved size must not be narratable into existence. At
-        execution time the frozen basis is what sizes the order, so a later
+        it with the plan: an approved size must not be narratable into existence.
+        At execution time the frozen basis is what sizes the order, so a later
         policy change cannot re-size an already-approved target.
+
+        A caller may STATE the basis (it is part of a readable plan), but stating
+        one does not create it. A stated basis that is not a finite positive
+        number is ``CAPITAL_BASIS_INVALID``, and one that differs from the owner's
+        recorded allocation is ``CAPITAL_BASIS_MISMATCH`` - refused by name here,
+        before an envelope, plan, reservation or order exists. Silently replacing
+        a stated smaller budget with the owner's allocation is exactly the
+        overspend this refusal exists to prevent. Omitting the field keeps the
+        existing policy basis; stating the matching value freezes the policy
+        value, not the caller's number.
         """
         payload = dict(submission.payload or {})
-        if str(submission.target_kind or "").strip() == "target_weights":
-            payload["capital_basis_inr"] = self._capital_basis(submission)
+        if str(submission.target_kind or "").strip() != "target_weights":
+            return payload
+        authoritative = self._capital_basis(submission)
+        stated = payload.get("capital_basis_inr")
+        if stated is None:
+            payload["capital_basis_inr"] = authoritative
+            return payload
+        stated_value = self._stated_capital_basis(stated, submission)
+        if not math.isclose(
+            stated_value, authoritative, rel_tol=1e-9, abs_tol=1e-6
+        ):
+            raise ValidationRefusal(
+                "CAPITAL_BASIS_MISMATCH",
+                {
+                    "strategy_id": str(submission.strategy_id),
+                    "account_id": str(submission.account_id),
+                    "stated_capital_basis_inr": stated_value,
+                    "authoritative_allocation_inr": authoritative,
+                    "message": (
+                        "a weights plan cannot be sized past the budget it states: "
+                        "the stated capital basis must equal the owner's recorded "
+                        "admission allocation, and the platform sizes from that "
+                        "allocation, never from the caller's number"
+                    ),
+                },
+            )
+        payload["capital_basis_inr"] = authoritative
         return payload
+
+    @staticmethod
+    def _stated_capital_basis(value: Any, submission: ProposalSubmission) -> float:
+        """A caller-stated basis as a finite positive number, or a named refusal."""
+        if isinstance(value, bool):
+            raise ValidationRefusal(
+                "CAPITAL_BASIS_INVALID",
+                {
+                    "strategy_id": str(submission.strategy_id),
+                    "account_id": str(submission.account_id),
+                    "capital_basis_inr": value,
+                    "reason": "a boolean is not a capital amount",
+                },
+            )
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationRefusal(
+                "CAPITAL_BASIS_INVALID",
+                {
+                    "strategy_id": str(submission.strategy_id),
+                    "account_id": str(submission.account_id),
+                    "capital_basis_inr": str(value),
+                    "reason": "the stated capital basis is not a number",
+                },
+            ) from exc
+        if not math.isfinite(numeric) or numeric <= 0:
+            raise ValidationRefusal(
+                "CAPITAL_BASIS_INVALID",
+                {
+                    "strategy_id": str(submission.strategy_id),
+                    "account_id": str(submission.account_id),
+                    "capital_basis_inr": numeric,
+                    "reason": "the stated capital basis must be finite and positive",
+                },
+            )
+        return numeric
 
     def _capital_basis(self, submission: ProposalSubmission) -> float:
         from backend.strategies.attribution_models import StrategyAdmissionPolicy

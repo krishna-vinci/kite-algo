@@ -41,6 +41,7 @@ _lazy("models", "CostContract", "ItemizedCharges", "WorkerBasketExecution", "Wor
 _lazy("orders", "OrderBuilder", "equity_market_order", "limit_order", "market_order", "option_market_order", "sl_m_order", "sl_order")
 _lazy("options", "AsyncOptionWorkerClient", "OptionEntryPreviewRequest", "OptionExpirySnapshot", "OptionWorkerClient", "SpreadLegSelection", "SpreadSpec", "option_leg", "resolve_delta_leg", "resolve_offset_leg", "resolve_option_contracts", "resolve_option_leg", "resolve_spread")
 _lazy("protection", "BackendProtection", "BasketProtection", "OperationalProtection", "ProtectedPosition")
+_lazy("readiness", "ReadinessCheck", "RunnerPackage", "RunnerProfile", "SourceEntrypoint", "SourceImports", "SourceReadiness")
 _lazy("run_config", "RunConfig")
 _lazy("ws", "StreamHealth", "WorkerCandleWebSocketClient", "WorkerRunPnlWebSocketClient", "WorkerTickWebSocketClient", "WorkerWebSocketClient")
 

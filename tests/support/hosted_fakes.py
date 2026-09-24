@@ -76,6 +76,11 @@ class FakeWorkerRepository:
     async def touch_token(self, token_id: str) -> None:
         return None
 
+    async def get_token_status(self, token_id: str) -> Optional[str]:
+        """Persisted token status by id (mirrors the real repository method)."""
+        record = self.tokens.get(token_id)
+        return str(record["status"]) if record else None
+
     async def revoke_token(self, token_id: str) -> Optional[Dict[str, Any]]:
         record = self.tokens.get(token_id)
         if record is None:

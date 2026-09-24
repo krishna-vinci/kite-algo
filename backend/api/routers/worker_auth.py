@@ -181,6 +181,19 @@ async def _attach_worker_run_positions(request: Request, run: dict) -> dict:
     strategy_run_id = str(enriched.get("strategy_run_id") or "")
     execution_mode = str(enriched.get("execution_mode") or "").strip().lower()
     account_scope = str(enriched.get("account_scope") or "")
+
+    # The run's canonical strategy identity comes from the PERSISTED binding, so
+    # a strategy never has to guess its id or be handed one as a parameter. An
+    # unbound (legacy/external) run reports ``unattributed`` rather than a guess,
+    # and a binding that disagrees with this run's own account/environment is a
+    # mismatch rather than an attribution.
+    enriched["strategy_attribution"] = _run_strategy_attribution(
+        request,
+        strategy_run_id,
+        account_scope=account_scope,
+        execution_environment=execution_mode,
+    )
+
     positions = []
     source = "none"
     status = "available"
@@ -217,6 +230,92 @@ async def _attach_worker_run_positions(request: Request, run: dict) -> dict:
     enriched["backend_positions_status"] = status
     enriched["backend_positions_source"] = source
     return enriched
+
+
+def _strategies_session_factory(request: Request):
+    """The hosted-strategy session factory, resolved as the other worker routes do.
+
+    Production never sets ``app.state.strategies_session_factory``; only tests
+    and the isolated acceptance apps do. Falling back to the ordinary
+    ``SessionLocal`` (exactly like ``worker_proposals``/``worker_executions``)
+    keeps the normal production path working instead of reporting every run as
+    unattributed.
+    """
+    factory = getattr(request.app.state, "strategies_session_factory", None)
+    if factory is not None:
+        return factory
+    from backend.app.database import SessionLocal
+
+    return SessionLocal
+
+
+def _run_strategy_attribution(
+    request: Request,
+    strategy_run_id: str,
+    *,
+    account_scope: str = "",
+    execution_environment: str = "",
+) -> Any:
+    """``{strategy_id, owner_id, account_id, execution_environment}`` or a reason.
+
+    The persisted binding is authoritative only where it AGREES with the run the
+    caller already authenticated against: a binding whose account or environment
+    belongs to something else is a data mismatch, not a licence to attribute this
+    run to another strategy.
+    """
+    if not strategy_run_id:
+        return "unattributed"
+    session_factory = _strategies_session_factory(request)
+    from sqlalchemy import select
+
+    from backend.strategies.attribution_models import StrategyRunBinding
+
+    try:
+        with session_factory() as session:
+            row = session.execute(
+                select(
+                    StrategyRunBinding.strategy_id,
+                    StrategyRunBinding.owner_id,
+                    StrategyRunBinding.account_id,
+                    StrategyRunBinding.execution_environment,
+                    StrategyRunBinding.binding_source,
+                ).where(StrategyRunBinding.strategy_run_id == str(strategy_run_id))
+            ).first()
+    except Exception:  # noqa: BLE001 - an unreadable binding is "unknown", not a guess
+        logger.warning(
+            "algo_worker_run_attribution_unavailable",
+            extra={"strategy_run_id": strategy_run_id},
+        )
+        return "unattributed"
+    if row is None:
+        return "unattributed"
+    if account_scope and str(row[2]) != str(account_scope):
+        logger.warning(
+            "algo_worker_run_attribution_account_mismatch",
+            extra={
+                "strategy_run_id": strategy_run_id,
+                "run_account_scope": str(account_scope),
+                "binding_account_id": str(row[2]),
+            },
+        )
+        return "unattributed"
+    if execution_environment and str(row[3]) != str(execution_environment):
+        logger.warning(
+            "algo_worker_run_attribution_environment_mismatch",
+            extra={
+                "strategy_run_id": strategy_run_id,
+                "run_execution_mode": str(execution_environment),
+                "binding_execution_environment": str(row[3]),
+            },
+        )
+        return "unattributed"
+    return {
+        "strategy_id": str(row[0]),
+        "owner_id": str(row[1]),
+        "account_id": str(row[2]),
+        "execution_environment": str(row[3]),
+        "binding_source": str(row[4]),
+    }
 
 
 async def get_worker_run(request: Request, strategy_run_id: str):

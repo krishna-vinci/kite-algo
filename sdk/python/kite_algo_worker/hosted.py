@@ -49,6 +49,14 @@ class ChildContext:
         """Report progress to the hosted attempt (the child's own liveness)."""
         return self.run.progress(note)
 
+    def request_execution(self, plan_id: str, *, idempotency_key: str) -> Dict[str, Any]:
+        """Ask the platform to execute a frozen plan of this run (governed)."""
+        return self.run.request_execution(plan_id, idempotency_key=idempotency_key)
+
+    def owned_work(self) -> Dict[str, Any]:
+        """The strategy's own positions plus its pending execution work."""
+        return self.run.owned_work()
+
 
 def _require(name: str) -> str:
     value = os.environ.get(name)
@@ -86,7 +94,19 @@ def build_context() -> ChildContext:
 
 
 def load_strategy_main(source_path: str):
-    """Import the uploaded file in this (child) process and return its ``main``."""
+    """Import the uploaded file in this (child) process and return its ``main``.
+
+    The module is registered in ``sys.modules`` for the duration of the import,
+    under the name the loader gives it. That registration is a correctness
+    requirement, not bookkeeping: a source that uses
+    ``from __future__ import annotations`` (or any quoted annotation) makes
+    ``@dataclass`` resolve its string annotations through
+    ``sys.modules[cls.__module__]``, and an unregistered module makes that lookup
+    return ``None`` -- the import then dies with ``AttributeError: 'NoneType'
+    object has no attribute '__dict__'`` before a single line of strategy code
+    runs. On the failure path the previous entry is restored (or the name removed
+    if there was none), so a half-built module is never left behind.
+    """
     path = Path(source_path)
     if not path.is_file():
         raise RuntimeError(f"hosted strategy source not found: {source_path}")
@@ -94,7 +114,17 @@ def load_strategy_main(source_path: str):
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load hosted strategy source: {source_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module_name = spec.name or "hosted_strategy"
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+        raise
     main = getattr(module, "main", None)
     if not callable(main):
         raise RuntimeError("hosted strategy must define a callable main(ctx)")

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Options: index setup + one bounded adjustment",
+  "description": "An index-ticker technical setup selects a defined option structure from live premiums/Greeks. Both legs are frozen explicitly before submission.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "underlying": {
+      "type": "string",
+      "default": "NIFTY",
+      "description": "Index ticker the option chain belongs to (for example NIFTY or BANKNIFTY)."
+    },
+    "index_ticker": {
+      "type": "string",
+      "description": "Catalog coordinate of the index whose candles drive the setup (for example NSE:NIFTY50). Defaults to the underlying plus its exchange."
+    },
+    "interval": {
+      "type": "string",
+      "enum": ["1minute", "3minute", "5minute", "15minute", "30minute", "60minute", "day"],
+      "default": "5minute",
+      "description": "Candle interval for the index-ticker setup."
+    },
+    "lookback": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 400,
+      "default": 60,
+      "description": "Recent index candles to read."
+    },
+    "rsi_period": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 200,
+      "default": 14,
+      "description": "RSI period over the index candles."
+    },
+    "bullish_rsi_level": {
+      "type": "number",
+      "default": 55,
+      "description": "RSI at or above which the bullish call-spread setup is considered confirmed."
+    },
+    "long_offset_points": {
+      "type": "number",
+      "default": 0,
+      "description": "Points from spot for the LONG call leg (0 = at the money)."
+    },
+    "short_offset_points": {
+      "type": "number",
+      "default": 100,
+      "description": "Points from spot for the SHORT call leg of the entry spread."
+    },
+    "product": {
+      "type": "string",
+      "enum": ["NRML", "MIS"],
+      "default": "NRML",
+      "description": "Frozen product for the option legs."
+    },
+    "expiry_policy": {
+      "type": "string",
+      "enum": ["exit_before_cutoff", "allow_cash_settlement"],
+      "default": "exit_before_cutoff",
+      "description": "Frozen expiry policy. Physical settlement needs separate capability evidence and is not offered here."
+    },
+    "deadline_seconds": {
+      "type": "number",
+      "minimum": 0,
+      "default": 120,
+      "description": "How long the child waits for an owner decision on an approval-based request."
+    }
+  },
+  "required": ["underlying"]
+}

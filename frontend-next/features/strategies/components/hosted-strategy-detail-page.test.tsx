@@ -30,6 +30,24 @@ vi.mock("@/lib/hosted-strategies/api", () => ({
   fetchHostedJobNotifications: vi.fn(),
   inspectHostedReconciliation: vi.fn(),
   reconcileHostedJob: vi.fn(),
+  fetchAuthorization: vi.fn(),
+  fetchExecutionGrants: vi.fn(),
+  fetchExecutionRequests: vi.fn(),
+  fetchAdmissionPolicy: vi.fn(),
+  fetchHostedSchedule: vi.fn(),
+  fetchHostedScheduleOccurrences: vi.fn(),
+  fetchOperatorCalendar: vi.fn(),
+  fetchPlan: vi.fn(),
+  fetchHostedPositions: vi.fn(),
+  approveExecutionRequest: vi.fn(),
+  rejectExecutionRequest: vi.fn(),
+  setAuthorizationMode: vi.fn(),
+  issueExecutionGrant: vi.fn(),
+  revokeExecutionGrant: vi.fn(),
+  saveAdmissionPolicy: vi.fn(),
+  saveHostedSchedule: vi.fn(),
+  setHostedScheduleEnabled: vi.fn(),
+  checkSourceReadiness: vi.fn(),
 }));
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -142,6 +160,8 @@ describe("HostedStrategyDetailPage run-now gating", () => {
     expect(screen.getByRole("button", { name: /run now/i })).toBeDisabled();
     // The stored live strategy stays visible; it was not rewritten to paper.
     expect(screen.getByText(/Live · finite/)).toBeInTheDocument();
+    // The retry identity is internal: the operator never sees or types a key.
+    expect(screen.queryByLabelText(/idempotency/i)).toBeNull();
   });
 
   it("enables Run now for a live strategy and labels the lanes the server supports", async () => {
@@ -160,7 +180,10 @@ describe("HostedStrategyDetailPage run-now gating", () => {
       await screen.findByText(/CNC \/ portfolio · MIS · Futures \/ rolls · Options/),
     ).toBeInTheDocument();
     expect(screen.getByText(/explicit approval of the strategy's plan/)).toBeInTheDocument();
-    expect(screen.getByText(/never approves a plan automatically/)).toBeInTheDocument();
+    // The owner decision can be a per-plan approval OR a standing authorization;
+    // the platform itself never approves (live + autonomous still needs a grant).
+    expect(screen.getByText(/standing authorization you issue/)).toBeInTheDocument();
+    expect(screen.getByText(/platform never approves a plan by itself/)).toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: /run now/i })).toBeEnabled());
   });
 

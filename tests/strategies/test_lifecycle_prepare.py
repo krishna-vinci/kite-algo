@@ -540,7 +540,25 @@ def test_data_only_capability_grants_no_trading_rights(harness):
     )
     harness.prepare(job.id, epoch=epoch, attempt=attempt)
     token = next(iter(harness.worker.tokens.values()))
-    assert set(token["allowed_actions"]) == {"runs:read", "runs:log", "runs:progress"}
+    # The accepted Phase-1 data lens: the child's *runtime* actions plus the
+    # narrowly scoped market/universe READS (``universes:resolve`` persists an
+    # existing immutable revision and grants no definition mutation).
+    assert set(token["allowed_actions"]) == {
+        "runs:read",
+        "runs:log",
+        "runs:progress",
+        "market:read",
+        "market:stream",
+        "universes:read",
+        "universes:resolve",
+    }
+    assert not set(token["allowed_actions"]) & {
+        "intents:submit",
+        "runs:exit",
+        "risk:update",
+        "funds:read",
+        "workflows:write",
+    }
 
 
 def test_notify_only_capability_grants_publish_but_not_trading(harness):

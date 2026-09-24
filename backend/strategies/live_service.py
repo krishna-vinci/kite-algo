@@ -133,6 +133,7 @@ class LivePlanExecutor:
         margin_reader: Any = None,
         session_id_reader: Any = None,
         mis_clock: Optional[Callable[[], datetime]] = None,
+        authorization: Any = None,
     ) -> None:
         self.session_factory = session_factory or SessionLocal
         self.adapter = adapter
@@ -151,6 +152,17 @@ class LivePlanExecutor:
         #: deployment (or a test) can pin the session instant while authority,
         #: quote freshness and reservation windows keep using the request clock.
         self._session_clock = mis_clock or self._clock
+        #: Phase 2: the governed-execution authorization reader. It re-derives the
+        #: authority of the GOVERNING request - mode, grant, version, source,
+        #: policy and attempt - on every dependent release, so the initial request
+        #: cannot hand unbounded approval to a step that is released later. When a
+        #: caller injects nothing, the authoritative reader is constructed here:
+        #: the production release pass must never run un-governed by omission.
+        if authorization is None:
+            from backend.strategies.execution_requests import ExecutionRequestService
+
+            authorization = ExecutionRequestService(session_factory=self.session_factory)
+        self._authorization = authorization
         self._trail = PaperPlanExecutor(session_factory=self.session_factory, clock=self._clock)
         #: The durable multi-step parent store, shared by first-leg dispatch and
         #: the sequence release pass so both read the SAME frozen protocol.
@@ -512,6 +524,39 @@ class LivePlanExecutor:
                 counts["errors"] += 1
         return counts
 
+    def _release_authority_check(self, plan: Mapping[str, Any]):
+        """The governed authority check for one plan's dependent release, or None.
+
+        Returned as a callable so the live adapter runs it INSIDE the release
+        claim transaction (holding the canonical book lock AND the hosted-strategy
+        row lock), which is what linearises it against a grant revocation.
+        """
+        authorization = self._authorization
+        if authorization is None:
+            # No explicit collaborator was injected. Rather than release WITHOUT
+            # a governed check, use the PRODUCTION one built from this executor's
+            # own session factory: a plan that a governed execution request
+            # created is re-derived against that request, and a plan with no
+            # governing request (the operator path, a pre-Phase-2 row) is
+            # unaffected. A default factory therefore fails closed instead of
+            # skipping the authority check.
+            from backend.strategies.execution_requests import ExecutionRequestService
+
+            authorization = ExecutionRequestService(self.session_factory)
+            self._authorization = authorization
+        if hasattr(authorization, "release_authority_check"):
+            return authorization.release_authority_check(plan)
+        if hasattr(authorization, "authorize_dependent_release"):
+            # Compatibility seam: a collaborator that only implements the
+            # standalone query is still authoritative, just not session-bound.
+            capture = dict(plan)
+
+            def _check(_session: Any) -> Any:
+                return authorization.authorize_dependent_release(capture)
+
+            return _check
+        return None
+
     async def _release_parent(
         self,
         parent: Mapping[str, Any],
@@ -551,6 +596,26 @@ class LivePlanExecutor:
                 continue
             binding = derived["binding"]
             authority = derived["authority"]
+
+            # Phase 2: a GOVERNED plan's dependent step re-derives the authority of
+            # the request that started it - its mode, grant, version, source,
+            # policy and attempt - against the CURRENT persisted records. The
+            # authoritative check also runs INSIDE the release claim transaction
+            # (below), so this pass is a fast, named blocker rather than the only
+            # gate. Approval-based plans keep their existing pin-by-pin approval
+            # check inside the adapter.
+            release_check = self._release_authority_check(plan)
+            if release_check is not None:
+                release_refusal = release_check(None)
+                if release_refusal is not None:
+                    self.sequence.record_release_blocker(
+                        plan_id=plan_id,
+                        step_no=step_no,
+                        reason_code=str(release_refusal.get("reason_code") or "GRANT_REQUIRED"),
+                        detail=dict(release_refusal) | {"stage": "dependent_release"},
+                    )
+                    counts["blocked"] += 1
+                    continue
 
             allowed, rule_reason, rule_detail = self._lane_release_rule(
                 plan=plan,
@@ -597,6 +662,7 @@ class LivePlanExecutor:
                     quote_reader=self._quote_reader or live_quote_for_leg,
                     all_specs=list(parent["step_spec"]),
                     parent=parent,
+                    governed_authority_check=release_check,
                 )
             except (
                 LiveRefusal,

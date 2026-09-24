@@ -11,6 +11,21 @@ not include it). The owner is derived from the token's account scope exactly
 the same way, so one worker token can never read or resolve another owner's
 universes (portfolio membership especially).
 
+Hosted children (Slice: hosted data foundation) are a second, narrower path:
+
+- Reads accept the dedicated ``universes:read`` action; resolution accepts the
+  dedicated ``universes:resolve`` action. A hosted child never holds the legacy
+  ``workflows:read``/``workflows:write`` actions.
+- The owner is derived from the **persisted hosted strategy**
+  (``strategy_jobs.owner_id`` — an ``app:<username>`` identity) and never from
+  the token's ``account_scope``, because a broker account scope names a trading
+  account, not application ownership. Negative cases stay owner-scoped even
+  when a hosted strategy trades an explicitly selected account.
+- Every hosted request is re-validated against the persisted attempt, so a
+  stopped, fenced or expired attempt is refused even with a valid-looking token.
+- Defining a universe (create) is refused outright for a hosted child: the new
+  actions grant membership *consumption* only.
+
 The sessionmaker is injected: ``app.state.alerts_session_factory`` wins, else
 the global ``SessionLocal`` (same mechanism as ``worker_workflows``). Tests
 swap it via ``app.dependency_overrides``. A fully wired
@@ -27,6 +42,10 @@ from typing import Any, Callable, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from backend.api.routers.worker_shared import _require_action, require_worker_token
+from backend.api.services.hosted_attempt import (
+    enforce_hosted_read_authority,
+    hosted_job_for_token,
+)
 from backend.api.schemas.universes import (
     PreviewResponse,
     ResolveResponse,
@@ -92,9 +111,77 @@ def _owner_id_for_token(token: Any) -> str:
     return scope or f"worker:{getattr(token, 'token_id', '')}"
 
 
-async def _authorize(request: Request, action: str) -> Tuple[Any, str]:
+def _owner_from_hosted_job(job: Any) -> str:
+    """The application owner persisted on a hosted strategy job (``app:<user>``)."""
+    owner = str(getattr(job, "owner_id", "") or "").strip()
+    if not owner:
+        raise HTTPException(
+            status_code=403,
+            detail={"rejection_reason": "HOSTED_OWNER_UNRESOLVED"},
+        )
+    return owner
+
+
+def _require_any_action(token: Any, actions: Tuple[str, ...]) -> None:
+    allowed = set(getattr(token, "allowed_actions", None) or [])
+    if allowed.intersection(actions):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "rejection_reason": "WORKER_ACTION_NOT_ALLOWED",
+            "required_actions": list(actions),
+        },
+    )
+
+
+async def _authorize_read(request: Request) -> Tuple[Any, str]:
+    """Owner-scoped universe read: hosted ``universes:read`` or legacy external.
+
+    A hosted child is validated against its persisted attempt first (a stopped
+    or expired attempt is refused), must hold ``universes:read``, and is scoped
+    to the **strategy's** application owner. An external token keeps its
+    established ``workflows:read`` contract **unchanged** — the dedicated
+    hosted action is not part of the owner-issued token allow-list.
+    """
     token = await require_worker_token(request)
-    _require_action(token, action)
+    job = await enforce_hosted_read_authority(request, token)
+    if job is not None:
+        _require_any_action(token, ("universes:read",))
+        return token, _owner_from_hosted_job(job)
+    _require_action(token, "workflows:read")
+    return token, _owner_id_for_token(token)
+
+
+async def _authorize_resolve(request: Request) -> Tuple[Any, str]:
+    """Owner-scoped universe resolution: hosted ``universes:resolve`` or legacy.
+
+    Resolution may persist the service's immutable membership revision for an
+    existing owner-owned universe. It grants no definition mutation, and the
+    external path keeps its established ``workflows:write`` contract.
+    """
+    token = await require_worker_token(request)
+    job = await enforce_hosted_read_authority(request, token)
+    if job is not None:
+        _require_any_action(token, ("universes:resolve",))
+        return token, _owner_from_hosted_job(job)
+    _require_action(token, "workflows:write")
+    return token, _owner_id_for_token(token)
+
+
+async def _authorize_definition(request: Request) -> Tuple[Any, str]:
+    """Workflow-definition authority. A hosted child never has it."""
+    token = await require_worker_token(request)
+    job = await hosted_job_for_token(request, token)
+    if job is not None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "rejection_reason": "HOSTED_UNIVERSE_DEFINITION_FORBIDDEN",
+                "operation": "universes.create",
+            },
+        )
+    _require_action(token, "workflows:write")
     return token, _owner_id_for_token(token)
 
 
@@ -145,7 +232,7 @@ async def create_universe(
     payload: UniverseCreateRequest,
     service: UniverseService = Depends(_universe_service),
 ):
-    _, owner_id = await _authorize(request, "workflows:write")
+    _, owner_id = await _authorize_definition(request)
     created = _call(
         service.create_universe,
         owner_id,
@@ -168,7 +255,7 @@ async def list_universes(
     request: Request,
     service: UniverseService = Depends(_universe_service),
 ):
-    _, owner_id = await _authorize(request, "workflows:read")
+    _, owner_id = await _authorize_read(request)
     universes = _call(service.list_universes, owner_id)
     items = []
     for universe in universes:
@@ -193,7 +280,7 @@ async def get_universe(
     name: str,
     service: UniverseService = Depends(_universe_service),
 ):
-    _, owner_id = await _authorize(request, "workflows:read")
+    _, owner_id = await _authorize_read(request)
     universe = _call(service.get_universe, owner_id, name)
     latest = _call(service.latest_revision, owner_id, name)
     return UniverseDetailResponse(
@@ -215,7 +302,7 @@ async def resolve_universe(
     name: str,
     service: UniverseService = Depends(_universe_service),
 ):
-    _, owner_id = await _authorize(request, "workflows:write")
+    _, owner_id = await _authorize_resolve(request)
     resolved = _call(service.resolve_membership, owner_id, name)
     return ResolveResponse(
         universe_id=str(resolved["universe_id"]),
@@ -235,7 +322,7 @@ async def preview_universe(
     service: UniverseService = Depends(_universe_service),
 ):
     """Resolve would-be membership WITHOUT persisting anything."""
-    _, owner_id = await _authorize(request, "workflows:read")
+    _, owner_id = await _authorize_read(request)
     preview = _call(
         service.preview_membership,
         owner_id,
@@ -257,7 +344,7 @@ async def list_universe_revisions(
     limit: int = Query(50, ge=1, le=500),
     service: UniverseService = Depends(_universe_service),
 ):
-    _, owner_id = await _authorize(request, "workflows:read")
+    _, owner_id = await _authorize_read(request)
     universe = _call(service.get_universe, owner_id, name)
     revisions = _call(service.list_revisions, owner_id, name, limit=limit)
     return UniverseRevisionsResponse(

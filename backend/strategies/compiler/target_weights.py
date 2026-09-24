@@ -50,6 +50,127 @@ def _as_optional_float(value: Any) -> Optional[float]:
 DEFAULT_PRODUCT = "CNC"
 
 
+def _member_spellings(member: str) -> List[str]:
+    """Every accepted spelling of one persisted member.
+
+    The persisted member is the coordinate and keeps its own exchange. A
+    qualified member also answers to its bare symbol and (for NSE) to the
+    ``NSE:SYMBOL`` public key; a bare member also answers to its ``NSE:`` form,
+    because a bare symbol in this catalog is an NSE symbol.
+    """
+    key = str(member).strip().upper()
+    spellings = [key]
+    if ":" in key:
+        exchange, _, symbol = key.partition(":")
+        if symbol and symbol not in spellings:
+            spellings.append(symbol)
+        if exchange == "NSE" and f"NSE:{symbol}" not in spellings:
+            spellings.append(f"NSE:{symbol}")
+    else:
+        spellings.append(f"NSE:{key}")
+    return spellings
+
+
+def _alias_to_member(members: Sequence[str]) -> Dict[str, str]:
+    """Accepted spelling -> persisted member, with ambiguous spellings removed.
+
+    A bare symbol that two exchanges of the same revision both claim cannot be
+    resolved to one instrument, so it is dropped from the map and a payload that
+    uses it is refused as out of scope rather than silently bound to whichever
+    member happened to be read first.
+    """
+    mapping: Dict[str, str] = {}
+    ambiguous = set()
+    for member in members:
+        canonical = str(member).upper()
+        for spelling in _member_spellings(canonical):
+            existing = mapping.get(spelling)
+            if existing is not None and existing != canonical:
+                ambiguous.add(spelling)
+            else:
+                mapping[spelling] = canonical
+    for spelling in ambiguous:
+        mapping.pop(spelling, None)
+    return mapping
+
+
+def _normalize_member_list(
+    declared: Any, alias_to_member: Mapping[str, str]
+) -> tuple[List[str], List[str]]:
+    """Declared membership in canonical spelling, plus anything unresolvable."""
+    resolved: List[str] = []
+    unresolved: List[str] = []
+    for item in declared or []:
+        canonical = alias_to_member.get(str(item).strip().upper())
+        if canonical is None:
+            unresolved.append(str(item))
+        else:
+            resolved.append(canonical)
+    return resolved, unresolved
+
+
+def _normalize_weights(
+    weights: Mapping[Any, Any], alias_to_member: Mapping[str, str]
+) -> Dict[str, float]:
+    """Weights keyed by the persisted member, with aliases folded together.
+
+    Two spellings of the same member carrying *different* weights are an
+    ambiguous payload, not a last-one-wins: the caller has described two
+    different targets for one instrument, so the plan is refused. Identical
+    values are the same instruction.
+    """
+    normalized: Dict[str, float] = {}
+    seen_keys: Dict[str, str] = {}
+    unresolved: List[str] = []
+    for key, value in weights.items():
+        text_key = str(key).strip().upper()
+        canonical = alias_to_member.get(text_key)
+        if canonical is None:
+            unresolved.append(str(key))
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationRefusal(
+                "PAYLOAD_INVALID", {"key": str(key), "reason": str(exc)}
+            ) from exc
+        if canonical in normalized and normalized[canonical] != numeric:
+            raise ValidationRefusal(
+                "TARGET_WEIGHTS_ALIAS_CONFLICT",
+                {
+                    "member": canonical,
+                    "keys": sorted({seen_keys[canonical], str(key)}),
+                    "weights": [normalized[canonical], numeric],
+                },
+            )
+        normalized[canonical] = numeric
+        seen_keys[canonical] = str(key)
+    if unresolved:
+        # A weight for an instrument outside the scope has no defined meaning:
+        # the scope is the snapshot, so this is a malformed payload.
+        raise ValidationRefusal("UNIVERSE_MEMBER_UNRESOLVED", {"outside_scope": unresolved})
+    return normalized
+
+
+def _normalize_reference_prices(
+    reference_prices: Optional[Mapping[Any, Any]], alias_to_member: Mapping[str, str]
+) -> Dict[str, Optional[float]]:
+    """Reference prices keyed by the persisted member, aliases folded together."""
+    if not reference_prices:
+        return {}
+    normalized: Dict[str, Optional[float]] = {}
+    unresolved: List[str] = []
+    for key, value in reference_prices.items():
+        canonical = alias_to_member.get(str(key).strip().upper())
+        if canonical is None:
+            unresolved.append(str(key))
+            continue
+        normalized[canonical] = _as_optional_float(value)
+    if unresolved:
+        raise ValidationRefusal("UNIVERSE_MEMBER_UNRESOLVED", {"outside_scope": unresolved})
+    return normalized
+
+
 class TargetWeightsCompiler(TargetCompiler):
     target_kind = "target_weights"
 
@@ -127,6 +248,12 @@ class TargetWeightsCompiler(TargetCompiler):
         revision = self._load_revision(
             str(revision_id), session_factory, pinned.session_factory
         )
+        # Every accepted spelling of a persisted member resolves to the member
+        # itself. The persisted revision is the scope and the coordinate: a weight
+        # written as ``NSE:RELIANCE`` while the revision holds ``RELIANCE`` (or the
+        # reverse) names the same instrument, and an ambiguous bare symbol shared
+        # by two exchanges is refused rather than silently bound to one of them.
+        alias_to_member = _alias_to_member(revision["members"])
         resolved_hash = member_hash(revision["members"])
         claimed = payload.get("member_hash")
         if claimed is not None and str(claimed) != resolved_hash:
@@ -145,12 +272,16 @@ class TargetWeightsCompiler(TargetCompiler):
             # The payload may name members directly instead of hashing them.
             declared = payload.get("members")
             if declared is not None:
-                if sorted({str(item).upper() for item in declared}) != sorted(revision["members"]):
+                declared_members, undeclared = _normalize_member_list(
+                    declared, alias_to_member
+                )
+                if undeclared or sorted(declared_members) != sorted(revision["members"]):
                     raise ValidationRefusal(
                         "UNIVERSE_MEMBER_UNRESOLVED",
                         {
                             "universe_revision_id": revision["universe_revision_id"],
                             "resolved_member_hash": resolved_hash,
+                            "outside_scope": sorted(undeclared),
                         },
                     )
 
@@ -198,25 +329,22 @@ class TargetWeightsCompiler(TargetCompiler):
                 "PAYLOAD_INVALID", {"cash_buffer_pct": cash_buffer_pct}
             )
 
-        normalized: Dict[str, float] = {}
-        for key, value in weights.items():
-            try:
-                normalized[str(key).upper()] = float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValidationRefusal(
-                    "PAYLOAD_INVALID", {"key": str(key), "reason": str(exc)}
-                ) from exc
-
-        outside = sorted(set(normalized) - set(revision["members"]))
-        if outside:
-            # A weight for an instrument outside the scope has no defined meaning:
-            # the scope is the snapshot, so this is a malformed payload.
-            raise ValidationRefusal("UNIVERSE_MEMBER_UNRESOLVED", {"outside_scope": outside})
+        normalized = _normalize_weights(weights, alias_to_member)
+        normalized_prices = _normalize_reference_prices(reference_prices, alias_to_member)
 
         legs: List[Dict[str, Any]] = []
         for member in revision["members"]:
             weight = float(normalized.get(member, DEFAULT_WEIGHT))
-            mapping = pinned.resolve_symbol("NSE", member)
+            # A persisted membership may be the bare NSE symbol set or the
+            # exchange-qualified public keys the universe service validates. Both
+            # are resolved here, and a qualified member keeps its own exchange
+            # instead of being re-prefixed into ``NSE:NSE:SYMBOL``.
+            member_key = str(member)
+            if ":" in member_key:
+                member_exchange, _, member_symbol = member_key.partition(":")
+                mapping = pinned.resolve_symbol(member_exchange.upper(), member_symbol.upper())
+            else:
+                mapping = pinned.resolve_symbol("NSE", member_key.upper())
             if mapping is None:
                 raise ValidationRefusal(
                     "UNIVERSE_MEMBER_UNRESOLVED",
@@ -247,9 +375,7 @@ class TargetWeightsCompiler(TargetCompiler):
                     **pinned_units(mapping),
                     # Per-member price for admission's notional arithmetic.
                     "reference_price": (
-                        None
-                        if not reference_prices
-                        else _as_optional_float(reference_prices.get(member))
+                        None if not reference_prices else normalized_prices.get(member)
                     ),
                     # Omission inside the scope is an explicit zero, not an absence.
                     "explicit_zero": weight == 0.0,

@@ -98,6 +98,10 @@ WORKER_HTTP_ENDPOINTS = (
     _e("POST", "/worker/orders/{order_id}/modify", "modify_order", mutates=True),
     # proposals and frozen plans (G5)
     _e("POST", "/worker/proposals", "submit_proposal", mutates=True),
+    _e("POST", "/worker/executions", "request_execution", mutates=True),
+    _e("GET", "/worker/executions", "list_execution_requests"),
+    _e("GET", "/worker/executions/{request_id}", "get_execution_request"),
+    _e("GET", "/worker/runs/{strategy_run_id}/positions", "get_owned_work"),
     _e("POST", "/worker/runs", "create_run", mutates=True),
     _e("GET", "/worker/runs", "list_runs"),
     _e("GET", "/worker/runs/{strategy_run_id}", "get_run"),

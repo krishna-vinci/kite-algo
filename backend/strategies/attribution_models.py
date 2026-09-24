@@ -667,7 +667,12 @@ class LivePlanSubmission(Base):
     __table_args__ = (
         UniqueConstraint("plan_id", "step_no", name="uq_live_plan_step"),
         CheckConstraint(
-            "state IN ('pending', 'uncertain', 'rejected', 'no_op')",
+            # The vocabulary SHIPPED by migrations 20260922_000039 / 000040. Kept
+            # in step with ``backend/schema.sql`` so a metadata-created database
+            # (and the test harness) can hold the same states PostgreSQL does.
+            "state IN ('pending', 'withheld', 'releasing', 'partial', 'finalizing', "
+            "'rejecting', 'repair_required', 'residual_abandoned', 'filled', "
+            "'uncertain', 'rejected', 'no_op')",
             name="ck_live_plan_submission_state",
         ),
         ForeignKeyConstraint(
@@ -865,6 +870,12 @@ class StrategyApproval(Base):
     catalog_generation = Column(Text, nullable=False)
     session_product_snapshot = Column(JSON, nullable=False, server_default=text("'{}'"))
     actor_id = Column(Text, nullable=False)
+    #: ``manual`` when the owner acted on one plan; ``automatic`` when the
+    #: server recorded a standing grant's authorization. The distinction is
+    #: explicit so an autonomous decision is never readable as a forged manual
+    #: click, and the evidence travels with it.
+    actor_kind = Column(Text, nullable=False, server_default="manual")
+    authorization_evidence = Column(JSON, nullable=False, server_default=text("'{}'"))
     status = Column(Text, nullable=False, server_default="active")
     valid_from = Column(DateTime(timezone=True), nullable=False)
     valid_until = Column(DateTime(timezone=True), nullable=False)
@@ -873,6 +884,9 @@ class StrategyApproval(Base):
     __table_args__ = (
         CheckConstraint(
             "status IN ('active', 'expired', 'superseded', 'revoked')", name="ck_appr_status"
+        ),
+        CheckConstraint(
+            "actor_kind IN ('manual', 'automatic')", name="ck_appr_actor_kind"
         ),
         ForeignKeyConstraint(
             ["plan_id"], ["strategy_plans.plan_id"], name="fk_appr_plan", ondelete="RESTRICT"

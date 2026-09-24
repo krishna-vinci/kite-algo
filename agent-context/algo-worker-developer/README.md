@@ -13,18 +13,18 @@ Give this pack to an external coding agent when you want worker code written in 
 ## Current package status
 
 - Package name: `kite-algo-worker`
-- SDK version described by this pack: `0.13.0`
-- Current public PyPI release: `0.13.0`
-- Release tag: `kite-algo-worker-v0.13.0`
+- SDK version described by this pack: `0.14.0`
+- Current public PyPI release: `0.14.0`
+- Release tag: `kite-algo-worker-v0.14.0`
 - SDK tag convention: `kite-algo-worker-vX.Y.Z`
 
 Canonical public install:
 
 ```bash
-python3 -m pip install kite-algo-worker==0.13.0
+python3 -m pip install kite-algo-worker==0.14.0
 ```
 
-This pack documents the 0.13.0 release candidate. Keep the exact pin when the
+This pack documents the 0.14.0 release candidate. Keep the exact pin when the
 release is published; do not silently fall back to an unpinned package. If
 this pack and the repo disagree, trust the repo files.
 

@@ -212,8 +212,24 @@ class ApprovalService:
 
     # -- approve / revoke ---------------------------------------------------
 
-    def approve(self, request: ApprovalRequest, *, now: Optional[datetime] = None) -> Dict[str, Any]:
-        """Bind an immutable plan and all its pins to one owner authorisation."""
+    def approve(
+        self,
+        request: ApprovalRequest,
+        *,
+        now: Optional[datetime] = None,
+        actor_kind: str = "manual",
+        evidence: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Bind an immutable plan and all its pins to one owner authorisation.
+
+        ``actor_kind`` distinguishes the owner acting on one plan from the server
+        recording a standing grant's authorisation. The authority check is the
+        same either way - the owner issued the grant - but an automatic decision
+        is never *readable* as a manual click, and its evidence travels with it.
+        """
+        kind = str(actor_kind or "manual")
+        if kind not in ("manual", "automatic"):
+            raise ApprovalInputError({"actor_kind": kind})
         moment = now or _utcnow()
         plan = dict(request.plan)
         strategy_id = str(plan.get("strategy_id") or "")
@@ -317,6 +333,8 @@ class ApprovalService:
                 catalog_generation=catalogue_generation,
                 session_product_snapshot=session_product,
                 actor_id=str(request.actor_id),
+                actor_kind=kind,
+                authorization_evidence=dict(evidence or {}),
                 status="active",
                 valid_from=moment,
                 valid_until=moment + timedelta(seconds=int(request.validity_seconds)),
@@ -523,6 +541,10 @@ class ApprovalService:
             "catalog_generation": str(row.catalog_generation),
             "session_product_snapshot": dict(row.session_product_snapshot or {}),
             "actor_id": str(row.actor_id),
+            "actor_kind": str(getattr(row, "actor_kind", None) or "manual"),
+            "authorization_evidence": dict(
+                getattr(row, "authorization_evidence", None) or {}
+            ),
             "status": str(row.status),
             "valid_from": _as_datetime(row.valid_from).isoformat() if row.valid_from else None,
             "valid_until": _as_datetime(row.valid_until).isoformat() if row.valid_until else None,

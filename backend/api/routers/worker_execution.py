@@ -13,6 +13,7 @@ from backend.broker_api.orders.bracket_runtime import bracket_runtime_store
 from backend.api.schemas.worker import WorkerBasketPreviewRequest, WorkerBracketCreateRequest, WorkerExitRequest, WorkerIntentRequest, WorkerOrderActionRequest, WorkerOrderModifyRequest, WorkerOrderPreviewRequest, WorkerProgressRequest, WorkerRunNotifyRequest
 from backend.api.routers.worker_shared import *
 from backend.api.services.hosted_attempt import (
+    assert_hosted_discretionary_mutation_allowed,
     enforce_hosted_attempt_authority,
     hosted_job_for_run,
     record_hosted_progress,
@@ -661,6 +662,7 @@ async def cancel_worker_order(request: Request, order_id: str, payload: WorkerOr
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     await enforce_hosted_attempt_authority(request, token, run)
+    assert_hosted_discretionary_mutation_allowed(run, operation="order:cancel")
     _require_live_run(run, feature="Order cancellation")
     await _require_worker_order_ownership(request, run, order_id, payload.parent_order_id)
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
@@ -685,6 +687,7 @@ async def modify_worker_order(request: Request, order_id: str, payload: WorkerOr
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     await enforce_hosted_attempt_authority(request, token, run)
+    assert_hosted_discretionary_mutation_allowed(run, operation="order:modify")
     _require_live_run(run, feature="Order modification")
     await _require_worker_order_ownership(request, run, order_id, payload.parent_order_id)
     kite = await asyncio.to_thread(_load_live_kite_for_account, str(run["account_scope"]))
@@ -773,6 +776,7 @@ async def create_worker_bracket(request: Request, strategy_run_id: str, payload:
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     await enforce_hosted_attempt_authority(request, token, run)
+    assert_hosted_discretionary_mutation_allowed(run, operation="brackets:create")
     _require_live_run(run, feature="Bracket intents")
     await require_active_worker_run_session(request, run)
 
@@ -910,6 +914,7 @@ async def cancel_worker_bracket(request: Request, strategy_run_id: str, bracket_
         raise HTTPException(status_code=404, detail="Strategy run not found")
     _assert_run_access(token, run)
     await enforce_hosted_attempt_authority(request, token, run)
+    assert_hosted_discretionary_mutation_allowed(run, operation="brackets:cancel")
     _require_live_run(run, feature="Bracket intents")
     await require_active_worker_run_session(request, run)
 
@@ -947,6 +952,12 @@ async def submit_worker_intent(request: Request, strategy_run_id: str, payload: 
         raise HTTPException(status_code=409, detail="Worker intents can only be submitted for open strategy runs")
     mode = str(run.get("execution_mode") or "").lower()
     _require_v1_mode(mode)
+    # Discretionary exposure changes on a HOSTED run belong to the governed
+    # execution-request contract, never to the raw order surface. A dry-run
+    # intent mutates nothing, so it stays permitted; external runs return from
+    # this guard unchanged.
+    if mode != "dry_run":
+        assert_hosted_discretionary_mutation_allowed(run, operation=f"intent:{payload.intent_type}")
     if mode not in token.allowed_modes:
         raise HTTPException(status_code=403, detail="Worker token cannot submit intents for this execution mode")
 
@@ -1083,6 +1094,11 @@ async def exit_worker_run(request: Request, strategy_run_id: str, payload: Worke
     if mode == "dry_run":
         updated = await _repo(request).update_run_status(strategy_run_id, "closed", state_patch={"exit_reason": payload.reason or "dry_run_exit"})
         return {"mode": "dry_run", "status": "closed", "run": updated}
+    # A hosted flatten places real closing orders, so it is a governed action:
+    # the child asks for it through the execution-request contract (the plan
+    # lanes already express square-off/exit plans), and the platform's own
+    # stale-exit policy keeps running outside the child token.
+    assert_hosted_discretionary_mutation_allowed(run, operation="runs:exit")
     if mode == "live":
         return await _exit_live_worker_run(request=request, token=token, run=run, payload=payload)
 

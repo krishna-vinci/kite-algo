@@ -1330,7 +1330,7 @@ class AlgoWorkerApiTests(unittest.IsolatedAsyncioTestCase):
         repo = _FakeWorkerRepository()
         request = self._request(repo)
         request.app.state.worker_market_data_service = SimpleNamespace(
-            stream_candles=lambda request, symbol, instrument_token, interval: _single_sse(
+            stream_candles=lambda request, symbol, instrument_token, interval, token=None: _single_sse(
                 '{"symbol": "NSE:INFY", "candles": [], "current": null}'
             )
         )

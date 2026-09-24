@@ -10,7 +10,7 @@ FROM python:3.14-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Dependencies are deliberately limited to the hosted child's SDK runtime.
+# Dependencies are the hosted child's SDK runtime, installed at BUILD time.
 # The supervisor itself is standard-library only (urllib/subprocess), and it
 # holds NO database or broker credentials, so the platform's backend
 # requirements (psycopg2, SQLAlchemy, FastAPI, uvicorn, kiteconnect, ...) are
@@ -18,8 +18,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # (psycopg2 has no binary wheel on slim images), and a DB driver inside the
 # runner image would work against the credential-free design.
 #
-# Limitation: strategies that need the SDK's optional extras (pandas/numpy/numba
-# indicators) are not supported by this image as configured.
+# The single documented runner profile is "hosted-python-dataframe-indicators"
+# (backend/strategies/readiness.py): the SDK's `dataframe` and `indicators`
+# extras (pandas, numpy, numba) are installed from wheels here, so a strategy
+# can `import pandas`/`numpy`/`numba` and use the client-side indicator library.
+# There is deliberately NO runtime pip installation path: a strategy cannot ask
+# for a package at launch, and this image is the whole answer to "what can my
+# strategy import?". Server-side indicators (`POST /worker/indicators`) run in
+# the backend image, so a strategy that needs no local numerical stack does not
+# need these packages at all.
 RUN pip install --no-cache-dir "requests>=2" "httpx>=0.27" "websockets>=12"
 
 # Dedicated unprivileged identity for hosted children.
@@ -34,7 +41,9 @@ WORKDIR /app
 # part of this image (the SDK ships its own module).
 COPY sdk/python/pyproject.toml sdk/python/README.md /tmp/sdk/
 COPY sdk/python/kite_algo_worker/ /tmp/sdk/kite_algo_worker/
-RUN pip install --no-cache-dir /tmp/sdk && rm -rf /tmp/sdk
+# `[indicators]` pulls the `dataframe` + `indicators` extras the profile
+# documents (pandas, numpy, numba).
+RUN pip install --no-cache-dir "/tmp/sdk[indicators]" && rm -rf /tmp/sdk
 
 COPY backend/ /app/backend/
 

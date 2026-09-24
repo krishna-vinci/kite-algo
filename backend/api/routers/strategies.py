@@ -25,6 +25,8 @@ this slice, and this docstring does not claim otherwise.
 
 from __future__ import annotations
 
+import asyncio
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -53,6 +55,17 @@ from backend.api.schemas.strategies import (
     ApprovalListResponse,
     ApprovalRequestModel,
     ApprovalResponse,
+    AuthorizationModeRequest,
+    AuthorizationModeResponse,
+    AuthorizationStatusResponse,
+    ExecutionGrantRequest,
+    ExecutionGrantResponse,
+    ExecutionGrantRevokeRequest,
+    ExecutionGrantRevokeResponse,
+    ExecutionRequestDecisionRequest,
+    ExecutionRequestDecisionResponse,
+    ExecutionRequestListResponse,
+    ExecutionRequestRow,
     ReservationListResponse,
     ReservationResponse,
     OptionSettlementEvidenceRow,
@@ -64,11 +77,16 @@ from backend.api.schemas.strategies import (
     RollStallRequest,
     SquareoffEvidenceListResponse,
     SquareoffEvidenceRow,
+    SourceReadinessRequest,
+    SourceReadinessResponse,
     ExternalAdapterRequest,
     ExternalAdapterResponse,
     ExternalStrategyCreateRequest,
     GrantRequest,
     GrantResponse,
+    HostedScheduleOccurrenceResponse,
+    HostedScheduleRequest,
+    HostedScheduleResponse,
     HostedStrategyOptionsResponse,
     JobDetailResponse,
     JobListResponse,
@@ -77,6 +95,7 @@ from backend.api.schemas.strategies import (
     PositionRow,
     ProductStatusUpdateRequest,
     RebuildResponse,
+    RunnerProfileResponse,
     ReconciliationActionRequest,
     ReconciliationActionResponse,
     ReconciliationAuditResponse,
@@ -85,6 +104,7 @@ from backend.api.schemas.strategies import (
     SettlementAssessRequest,
     SettlementAssessmentResponse,
     SettlementAxisResponse,
+    ScheduleEnabledRequest,
     JobLogEntryResponse,
     JobLogsResponse,
     RunNotificationEventResponse,
@@ -95,7 +115,6 @@ from backend.api.schemas.strategies import (
     DeliveryResponse,
     StopJobRequest,
     StopJobResponse,
-    StrategyCreateRequest,
     StrategyListResponse,
     StrategyResponse,
     StrategyUpdateRequest,
@@ -112,12 +131,14 @@ from backend.api.services.hosted_strategy_authz import (
 )
 from backend.app.auth import AppUser, require_app_user
 from backend.strategies import service
+from backend.strategies import readiness
 from backend.strategies.attribution import (
     EXECUTION_ENVIRONMENTS,
     SqlAttributionStore,
     StrategyAttributionService,
 )
 from backend.strategies.reconciliation import assess, evidence_digest
+from backend.strategies.plan_pipeline import PipelineRefusal, PlanExecutionPipeline
 from backend.strategies.repository import (
     SqlAlchemyStrategyRepository,
     StrategyConflict,
@@ -125,6 +146,7 @@ from backend.strategies.repository import (
     StrategyFenceError,
     StrategyIdempotencyConflict,
     StrategyIdentityError,
+    StrategyNotFound,
 )
 
 router = APIRouter(prefix="/strategies", tags=["Hosted strategies (operator)"])
@@ -184,6 +206,7 @@ def _strategy_out(
         max_duration_s=row.max_duration_s,
         progress_deadline_s=row.progress_deadline_s,
         stale_exit_policy=row.stale_exit_policy,
+        authorization_mode=str(getattr(row, "authorization_mode", None) or "approval_based"),
         status=row.status,
         product_status=product_status or "active",
         adapter_kinds=list(adapter_kinds or ["hosted"]),
@@ -496,7 +519,277 @@ async def get_hosted_options(owner: str = Depends(require_strategy_owner)):
         stale_exit_policies=list(service.ALLOWED_STALE_EXIT_POLICIES),
         live_lanes=list(hosted_live_lanes()) if live_enabled else [],
         live_requires_owner_approval=True,
+        runner_profile=RunnerProfileResponse(**readiness.profile_payload()),
     )
+
+
+@router.post("/readiness", response_model=SourceReadinessResponse)
+async def check_source_readiness(
+    request: Request,
+    payload: SourceReadinessRequest,
+    owner: str = Depends(require_strategy_owner),
+):
+    """First-run readiness for a source file, before it is stored or launched.
+
+    Parses the source with ``ast`` and reports the documented runner profile, a
+    compatible ``main(ctx)`` entrypoint and any statically visible import the
+    profile does not provide. The source is never imported or executed and no
+    strategy/version row is written. The same contract is what any UI renders,
+    so a "ready" answer means the same thing in every caller — and a check that
+    cannot be proven (dynamic imports, guarded optional imports) reports
+    ``unknown`` instead of a pass.
+    """
+    enforce_same_origin(request)
+    try:
+        result = readiness.assess_source_readiness(payload.source)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return SourceReadinessResponse(**result)
+
+
+def _schedule_mapping(row: Any) -> Dict[str, Any]:
+    """The occurrence-relevant fields of a stored schedule, for the runtime."""
+    return {
+        "id": str(row.id),
+        "strategy_id": str(row.strategy_id),
+        "schedule_kind": str(row.schedule_kind),
+        "at_time": str(row.at_time),
+        "timezone": str(row.timezone),
+        "day_of_month": row.day_of_month,
+        "weekday": row.weekday,
+        "calendar_dates": list(row.calendar_dates or []),
+    }
+
+
+def _schedule_out(row: Any, *, repo: SqlAlchemyStrategyRepository) -> HostedScheduleResponse:
+    """The stored schedule plus the runtime's own next/last/missed answer.
+
+    ``next_occurrence`` is the forward mirror of the scheduler's due-time rules,
+    and the last/missed row comes from the scheduler's durable occurrence table,
+    so nothing here re-implements scheduling policy.
+    """
+    from backend.strategies.scheduling import (
+        OVERLAP_POLICY,
+        misfire_grace_seconds,
+        next_occurrence,
+    )
+
+    version = repo.get_version_by_id(str(row.strategy_id), str(row.version_id))
+    occurrences = repo.list_schedule_occurrences(str(row.id), limit=1)
+    following = next_occurrence(
+        _schedule_mapping(row), now=datetime.now(timezone.utc)
+    )
+    return HostedScheduleResponse(
+        schedule_id=str(row.id),
+        strategy_id=str(row.strategy_id),
+        version_id=str(row.version_id),
+        version_number=int(version.version) if version is not None else None,
+        account_scope=str(row.account_scope),
+        execution_mode=str(row.execution_mode),
+        job_kind=str(row.job_kind),
+        params_snapshot=dict(row.params_snapshot or {}),
+        schedule_kind=str(row.schedule_kind),
+        at_time=str(row.at_time),
+        weekday=row.weekday,
+        day_of_month=row.day_of_month,
+        calendar_dates=list(row.calendar_dates or []),
+        timezone=str(row.timezone),
+        window_end=row.window_end,
+        squareoff_at=row.squareoff_at,
+        enabled=bool(row.enabled),
+        manually_paused=row.manual_paused_at is not None,
+        max_duration_s=int(row.max_duration_s),
+        progress_deadline_s=int(row.progress_deadline_s),
+        misfire_grace_seconds=int(misfire_grace_seconds()),
+        overlap_policy=OVERLAP_POLICY,
+        next_occurrence_at=following.due_at.isoformat() if following is not None else None,
+        next_occurrence_key=following.occurrence_key if following is not None else None,
+        last_occurrence=(
+            HostedScheduleOccurrenceResponse(**occurrences[0]) if occurrences else None
+        ),
+        created_at=_iso(row.created_at),
+        updated_at=_iso(row.updated_at),
+    )
+
+
+@router.get("/calendar", response_model=Dict[str, Any])
+async def get_operator_market_calendar(
+    exchange: str = Query(default="NSE", min_length=2, max_length=16),
+    segment: str = Query(default="CM", min_length=1, max_length=16),
+    from_date: date = Query(..., alias="from"),
+    to_date: date = Query(..., alias="to"),
+    owner: str = Depends(require_strategy_owner),
+):
+    """Exchange sessions for the operator's own schedule screen.
+
+    The same authoritative calendar service the worker surface reads. Exchange
+    and segment are explicit parameters, so nothing here assumes NSE/CM timing
+    for an MCX or currency schedule, and missing/uncovered calendar data fails
+    closed with a named reason instead of inventing session times.
+    """
+    if from_date > to_date:
+        raise HTTPException(status_code=422, detail="from must not be after to")
+    if (to_date - from_date).days > 370:
+        raise HTTPException(status_code=422, detail="calendar range is bounded to 370 days")
+    from backend.app.database import get_db_connection
+    from backend.broker_api.market.exchange_calendar import (
+        CalendarSchemaMigrationRequired,
+        CalendarUnavailable,
+        get_calendar_sessions,
+    )
+
+    conn = get_db_connection()
+    try:
+        return await asyncio.to_thread(
+            get_calendar_sessions,
+            conn,
+            exchange=exchange.upper(),
+            segment=segment.upper(),
+            from_date=from_date,
+            to_date=to_date,
+        )
+    except (CalendarUnavailable, CalendarSchemaMigrationRequired) as exc:
+        raise HTTPException(status_code=503, detail={"rejection_reason": str(exc)}) from exc
+    finally:
+        conn.close()
+
+
+@router.get("/{strategy_id}/schedule", response_model=Optional[HostedScheduleResponse])
+async def get_hosted_schedule(
+    strategy_id: str,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """The strategy's stored schedule, or ``null`` when it has none."""
+    _owned_strategy(repo, owner, strategy_id)
+    row = repo.get_schedule(strategy_id)
+    if row is None:
+        return None
+    return _schedule_out(row, repo=repo)
+
+
+@router.put("/{strategy_id}/schedule", response_model=HostedScheduleResponse)
+async def put_hosted_schedule(
+    strategy_id: str,
+    request: Request,
+    payload: HostedScheduleRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Create or edit the strategy's single schedule (owner + origin guarded).
+
+    Account, policy and capability snapshots are derived from the strategy and
+    the pinned version exactly like a manual launch, so an edited schedule can
+    never carry a caller-chosen account or a stale policy.
+    """
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    _refuse_live_when_disabled(payload.execution_mode, surface="schedule")
+    try:
+        row = repo.save_schedule(
+            strategy_id=strategy_id,
+            version_id=payload.version_id,
+            owner_id=owner,
+            job_kind=payload.job_kind,
+            execution_mode=payload.execution_mode,
+            params=payload.params,
+            schedule_kind=payload.schedule_kind,
+            at_time=payload.at_time,
+            weekday=payload.weekday,
+            day_of_month=payload.day_of_month,
+            calendar_dates=payload.calendar_dates,
+            timezone=payload.timezone,
+            window_end=payload.window_end,
+            squareoff_at=payload.squareoff_at,
+            enabled=payload.enabled,
+        )
+    except service.StrategyValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StrategyIdentityError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StrategyDisabled as exc:
+        raise HTTPException(status_code=409, detail="STRATEGY_DISABLED") from exc
+    except StrategyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _schedule_out(row, repo=repo)
+
+
+@router.post("/{strategy_id}/schedule/enabled", response_model=HostedScheduleResponse)
+async def set_hosted_schedule_enabled(
+    strategy_id: str,
+    request: Request,
+    payload: ScheduleEnabledRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Disable or re-enable the schedule. Never silently resumes work.
+
+    Re-enabling applies the SAME persisted readiness checks as creating or
+    editing the schedule: the pinned mode must still be offered by this
+    deployment (a live schedule cannot be enabled while hosted live is off), the
+    pinned account must still be authorized for that mode, and the pinned version
+    must still belong to the strategy. A disabled strategy stays refused, and the
+    scheduler's launch path applies the same fence a manual launch does, so a
+    disabled or stopped strategy cannot be started by a schedule.
+    """
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    existing = repo.get_schedule(strategy_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    if payload.enabled:
+        # Enabling is a launch-capability decision, so it re-checks exactly what
+        # a launch would: deployment mode availability, then account/mode
+        # authorization (never only at create/edit time).
+        _refuse_live_when_disabled(existing.execution_mode, surface="schedule_enable")
+        try:
+            service.validate_account_scope(
+                str(existing.account_scope or ""), str(existing.execution_mode or "")
+            )
+        except service.StrategyValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        authorize_account_scope(str(existing.account_scope or ""))
+        if repo.get_version_by_id(strategy_id, str(existing.version_id)) is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "rejection_reason": "SCHEDULE_VERSION_MISSING",
+                    "message": (
+                        "The version this schedule pins is no longer part of this strategy. "
+                        "Save the schedule against a current version before enabling it."
+                    ),
+                },
+            )
+    try:
+        row = repo.set_schedule_enabled(
+            strategy_id, owner_id=owner, enabled=payload.enabled, actor=owner
+        )
+    except StrategyNotFound as exc:
+        raise HTTPException(status_code=404, detail="Schedule not found") from exc
+    except StrategyDisabled as exc:
+        raise HTTPException(status_code=409, detail="STRATEGY_DISABLED") from exc
+    return _schedule_out(row, repo=repo)
+
+
+@router.get(
+    "/{strategy_id}/schedule/occurrences",
+    response_model=List[HostedScheduleOccurrenceResponse],
+)
+async def list_hosted_schedule_occurrences(
+    strategy_id: str,
+    limit: int = Query(default=20, ge=1, le=200),
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+):
+    """Materialised occurrences, newest first (fired, missed and expired)."""
+    _owned_strategy(repo, owner, strategy_id)
+    row = repo.get_schedule(strategy_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return [
+        HostedScheduleOccurrenceResponse(**entry)
+        for entry in repo.list_schedule_occurrences(str(row.id), limit=limit)
+    ]
 
 
 @router.get("/{strategy_id}", response_model=StrategyResponse)
@@ -702,6 +995,47 @@ def _approval_service(session_factory: Any):
     return ApprovalService(session_factory=session_factory)
 
 
+def _authorization_service(session_factory: Any):
+    """The governed-execution authorization service (Phase 2).
+
+    Mode, grant and policy decisions live in the service, never in a route.
+    """
+    from backend.strategies.execution_authorization import ExecutionAuthorizationService
+
+    return ExecutionAuthorizationService(session_factory=session_factory)
+
+
+def _plan_pipeline(request: Request, session_factory: Any) -> PlanExecutionPipeline:
+    """The ONE pipeline the operator routes and the dispatcher both use.
+
+    The router contributes only the collaborators it already owns: the
+    app-state executors and its margin reader (which stays patchable here, so
+    existing tests keep their seam and there is still one implementation).
+    """
+    from backend.strategies.plan_pipeline import PlanExecutionPipeline
+
+    return PlanExecutionPipeline(
+        session_factory,
+        proposal_store=_proposal_store(request, session_factory),
+        admission_service=_admission_service(session_factory),
+        reservation_ledger=_reservation_ledger(session_factory),
+        approval_service=_approval_service(session_factory),
+        margin_reader=_live_margin_evidence,
+        paper_executor_factory=lambda: _paper_plan_executor(request, session_factory),
+        live_executor_factory=lambda: _live_plan_executor(request, session_factory),
+    )
+
+
+def _execution_request_service(request: Request, session_factory: Any):
+    from backend.strategies.execution_requests import ExecutionRequestService
+
+    return ExecutionRequestService(
+        session_factory,
+        pipeline=_plan_pipeline(request, session_factory),
+        authorization=_authorization_service(session_factory),
+    )
+
+
 def _plan_or_404(store: Any, *, owner: str, repo: Any, strategy_id: str, plan_id: str) -> Dict[str, Any]:
     _owned_strategy(repo, owner, strategy_id)
     plan = store.get_plan(plan_id)
@@ -841,7 +1175,7 @@ async def preview_admission(
     strategy_id: str,
     plan_id: str,
     request: Request,
-    execution_environment: str = "live",
+    execution_environment: Optional[str] = None,
     owner: str = Depends(require_strategy_owner),
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
     session_factory: Any = Depends(_strategies_db),
@@ -854,23 +1188,16 @@ async def preview_admission(
     enforce_same_origin(request)
     plan = _plan_or_404(_proposal_store(request, session_factory), owner=owner, repo=repo,
                         strategy_id=strategy_id, plan_id=plan_id)
-    # ADMISSION is gated too. The planning environment is still DERIVED from the
-    # persisted binding, so a request parameter can never turn a paper plan into
-    # a live reservation; it may only name the environment an already-paper
-    # plan is admitted in.
-    binding_environment = _plan_environment(session_factory, plan)
-    _refuse_live_when_disabled(
-        binding_environment, surface="plan_reserve", plan_id=plan_id
+    # ADMISSION is gated too, and the environment is DERIVED from the persisted
+    # binding: a request parameter can no longer name a different environment.
+    # An explicit disagreeing value is refused rather than ignored.
+    environment = _derived_environment(
+        session_factory, plan, requested=execution_environment, surface="plan_reserve",
+        plan_id=plan_id,
     )
-    environment = (
-        "live"
-        if binding_environment == "live"
-        else str(execution_environment or binding_environment or "live").lower()
-    )
-    service = _admission_service(session_factory)
-    margin = _live_margin_evidence(str(plan["account_id"]), plan) if environment == "live" else None
-    verdict = service.evaluate(plan, execution_environment=environment, margin_evidence=margin)
-    return AdmissionVerdictResponse(**verdict.as_dict())
+    return AdmissionVerdictResponse(**_plan_pipeline(request, session_factory).admit(
+        plan, environment=environment
+    ))
 
 
 @router.post("/{strategy_id}/plans/{plan_id}/reserve", response_model=ReservationResponse)
@@ -878,45 +1205,29 @@ async def reserve_plan(
     strategy_id: str,
     plan_id: str,
     request: Request,
-    execution_environment: str = "live",
+    execution_environment: Optional[str] = None,
     owner: str = Depends(require_strategy_owner),
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
     session_factory: Any = Depends(_strategies_db),
 ):
     """Admit and claim capacity in one transaction; first claim wins."""
-    from backend.strategies.reservations import ClaimRequest, ReservationError
+    from backend.strategies.reservations import ReservationError
 
     enforce_same_origin(request)
     plan = _plan_or_404(_proposal_store(request, session_factory), owner=owner, repo=repo,
                         strategy_id=strategy_id, plan_id=plan_id)
-    environment = str(execution_environment or "live").lower()
-    service = _admission_service(session_factory)
-    margin = _live_margin_evidence(str(plan["account_id"]), plan) if environment == "live" else None
-    verdict = service.evaluate(plan, execution_environment=environment, margin_evidence=margin)
-    if not verdict.admitted:
-        raise HTTPException(status_code=409, detail=verdict.as_dict())
-
-    policy = service.policy_for(strategy_id) or {}
-    from datetime import datetime, timedelta, timezone
-
+    environment = _derived_environment(
+        session_factory, plan, requested=execution_environment, surface="plan_reserve",
+        plan_id=plan_id,
+    )
     try:
         return ReservationResponse(
-            **_reservation_ledger(session_factory).claim(
-                ClaimRequest(
-                    plan_id=plan_id,
-                    strategy_id=strategy_id,
-                    account_id=str(plan["account_id"]),
-                    evaluation_id=str(plan.get("evaluation_id") or plan_id),
-                    execution_environment=environment,
-                    requirement_inr=float(verdict.detail.get("plan_requirement_inr") or 0.0),
-                    valid_until=datetime.now(timezone.utc) + timedelta(seconds=900),
-                    allocation_inr=policy.get("allocation_inr"),
-                    margin_evidence=margin,
-                    margin_as_of=(margin or {}).get("as_of"),
-                    actor_id=owner,
-                )
+            **_plan_pipeline(request, session_factory).reserve(
+                plan, environment=environment, actor=owner
             )
         )
+    except PipelineRefusal as exc:
+        raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
     except ReservationError as exc:
         raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
 
@@ -1285,37 +1596,51 @@ async def approve_plan(
     plan_id: str,
     request: Request,
     payload: ApprovalRequestModel,
-    execution_environment: str = "live",
+    execution_environment: Optional[str] = None,
     owner: str = Depends(require_strategy_owner),
     repo: SqlAlchemyStrategyRepository = Depends(_repository),
     session_factory: Any = Depends(_strategies_db),
 ):
     """Record the owner's authorisation, bound to every structural pin."""
-    from backend.strategies.admission import session_product_snapshot
-    from backend.strategies.approvals import ApprovalError, ApprovalRequest
+    from backend.strategies.approvals import ApprovalError
 
     enforce_same_origin(request)
     plan = _plan_or_404(_proposal_store(request, session_factory), owner=owner, repo=repo,
                         strategy_id=strategy_id, plan_id=plan_id)
-    products = [
-        str(leg.get("product") or "")
-        for leg in (plan.get("resolved_plan") or {}).get("legs") or []
-        if leg.get("product")
-    ]
+    environment = _derived_environment(
+        session_factory,
+        plan,
+        requested=execution_environment,
+        surface="plan_approval",
+        plan_id=plan_id,
+    )
     try:
-        approval = _approval_service(session_factory).approve(
-            ApprovalRequest(
-                plan=plan,
-                actor_id=owner,
-                reservation_id=payload.reservation_id,
-                validity_seconds=payload.validity_seconds,
-                execution_environment=execution_environment,
-                session_product_snapshot=session_product_snapshot(products),
-            )
+        approval = _plan_pipeline(request, session_factory).approve(
+            plan,
+            actor=owner,
+            reservation_id=payload.reservation_id,
+            environment=environment,
+            actor_kind="manual",
+            validity_seconds=payload.validity_seconds,
         )
     except ApprovalError as exc:
         status = 403 if exc.reason_code == "APPROVAL_ACTOR_NOT_OWNER" else 409
         raise HTTPException(status_code=status, detail=exc.as_detail()) from exc
+    except PipelineRefusal as exc:
+        raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
+    if approval is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "APPROVAL_NOT_REQUIRED",
+                "plan_id": plan_id,
+                "environment": environment,
+                "message": (
+                    "paper and dry-run plans are exempt from the low-level approval row; "
+                    "an approval-based paper request waits for its owner decision instead"
+                ),
+            },
+        )
     return ApprovalResponse(
         **approval,
         structural_validity=_approval_service(session_factory).structural_validity(plan, approval),
@@ -1348,6 +1673,275 @@ async def revoke_plan_approval(
         raise HTTPException(status_code=status, detail=exc.as_detail()) from exc
     return ApprovalResponse(
         **revoked, structural_validity=service.structural_validity(plan, revoked)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Governed execution authorization (Phase 2)
+#
+# The owner's mode, grants and execution-request decisions. Mode/grant writes go
+# through the service, which takes the hosted-strategy row lock; the frontend
+# never supplies an actor, a source hash, an account or a policy hash.
+# ---------------------------------------------------------------------------
+
+
+def _authorization_http(exc: Any) -> HTTPException:
+    return HTTPException(
+        status_code=int(getattr(exc, "status_code", 409)),
+        detail=exc.as_detail(),
+    )
+
+
+@router.get("/{strategy_id}/authorization", response_model=AuthorizationStatusResponse)
+async def get_authorization(
+    strategy_id: str,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Authorization mode, active grant, current policy evidence and refusals."""
+    from backend.strategies.execution_authorization import AuthorizationError
+
+    _owned_strategy(repo, owner, strategy_id)
+    try:
+        status = _authorization_service(session_factory).status(owner, strategy_id)
+    except AuthorizationError as exc:
+        raise _authorization_http(exc) from exc
+    return AuthorizationStatusResponse(**status)
+
+
+@router.put("/{strategy_id}/authorization", response_model=AuthorizationModeResponse)
+async def put_authorization_mode(
+    strategy_id: str,
+    request: Request,
+    payload: AuthorizationModeRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Select ``approval_based`` (default) or ``autonomous``.
+
+    Selecting autonomous grants nothing: it only makes an owner-issued grant
+    usable. Moving back to approval-based supersedes an active grant in the same
+    transaction rather than leaving an unusable grant looking live.
+    """
+    from backend.strategies.execution_authorization import AuthorizationError
+
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    try:
+        result = _authorization_service(session_factory).set_mode(
+            owner, strategy_id, payload.mode, actor=owner, reason=payload.reason
+        )
+    except AuthorizationError as exc:
+        raise _authorization_http(exc) from exc
+    return AuthorizationModeResponse(**result)
+
+
+@router.post("/{strategy_id}/authorization/grants", response_model=ExecutionGrantResponse)
+async def create_execution_grant(
+    strategy_id: str,
+    request: Request,
+    payload: ExecutionGrantRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Issue the owner's standing authorisation, or replay an identical request.
+
+    The server derives the version's source hash, the canonical account and the
+    policy hash; a repeat with the same idempotency key returns the original
+    grant (including its revocation state) and never resurrects it.
+    """
+    from backend.strategies.execution_authorization import AuthorizationError
+
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    canonical = repo.get_canonical_strategy(owner, strategy_id)
+    if canonical is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    authorize_account_scope(str(canonical.account_scope))
+    try:
+        result = _authorization_service(session_factory).issue_grant(
+            owner,
+            strategy_id,
+            actor=owner,
+            idempotency_key=payload.idempotency_key,
+            version_id=payload.version_id,
+            execution_environment=payload.execution_environment,
+            expires_at=payload.expires_at,
+        )
+    except AuthorizationError as exc:
+        raise _authorization_http(exc) from exc
+    return ExecutionGrantResponse(
+        **result["grant"], idempotent=bool(result.get("idempotent"))
+    )
+
+
+@router.post(
+    "/{strategy_id}/authorization/grants/revoke",
+    response_model=ExecutionGrantRevokeResponse,
+)
+async def revoke_execution_grant(
+    strategy_id: str,
+    request: Request,
+    payload: ExecutionGrantRevokeRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Revoke the active grant (or one named grant). Terminal, and audited.
+
+    Revocation denies later dispatch claims. It does not, and is not described
+    as, cancelling an order the broker already has.
+    """
+    from backend.strategies.execution_authorization import AuthorizationError
+
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    try:
+        result = _authorization_service(session_factory).revoke_grant(
+            owner,
+            strategy_id,
+            actor=owner,
+            reason=payload.reason,
+            grant_id=payload.grant_id,
+        )
+    except AuthorizationError as exc:
+        raise _authorization_http(exc) from exc
+    return ExecutionGrantRevokeResponse(**result)
+
+
+@router.get(
+    "/{strategy_id}/authorization/grants", response_model=List[ExecutionGrantResponse]
+)
+async def list_execution_grants(
+    strategy_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Grant history, newest first (revoked and superseded rows are kept)."""
+    _owned_strategy(repo, owner, strategy_id)
+    rows = _authorization_service(session_factory).list_grants(strategy_id, limit=limit)
+    return [ExecutionGrantResponse(**row) for row in rows]
+
+
+@router.get("/{strategy_id}/execution-requests", response_model=ExecutionRequestListResponse)
+async def list_execution_requests(
+    strategy_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """The strategy's durable execution requests, newest first."""
+    _owned_strategy(repo, owner, strategy_id)
+    from backend.strategies.execution_requests import ExecutionRequestService
+
+    service = ExecutionRequestService(
+        session_factory, authorization=_authorization_service(session_factory)
+    )
+    return ExecutionRequestListResponse(
+        strategy_id=strategy_id,
+        requests=[ExecutionRequestRow(**row) for row in service.list_for_strategy(strategy_id, limit=limit)],
+    )
+
+
+@router.get(
+    "/{strategy_id}/execution-requests/{request_id}", response_model=ExecutionRequestRow
+)
+async def get_execution_request(
+    strategy_id: str,
+    request_id: str,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    from backend.strategies.execution_requests import ExecutionRequestService
+
+    _owned_strategy(repo, owner, strategy_id)
+    service = ExecutionRequestService(session_factory)
+    row = service.get_for_owner(owner, strategy_id, request_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Execution request not found")
+    return ExecutionRequestRow(**row)
+
+
+@router.post(
+    "/{strategy_id}/execution-requests/{request_id}/approve",
+    response_model=ExecutionRequestDecisionResponse,
+)
+async def approve_execution_request(
+    strategy_id: str,
+    request_id: str,
+    request: Request,
+    payload: ExecutionRequestDecisionRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Owner authorises the exact requested plan; the request becomes dispatchable.
+
+    The decision is durable in one transaction, so an approved action cannot be
+    lost to a dropped HTTP response, and it queues exactly ONE dispatch.
+    """
+    from backend.strategies.execution_requests import (
+        ExecutionRequestError,
+        ExecutionRequestService,
+    )
+
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    service = ExecutionRequestService(session_factory)
+    try:
+        result = service.approve(
+            request_id, owner_id=owner, strategy_id=strategy_id, actor=owner
+        )
+    except ExecutionRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+    return ExecutionRequestDecisionResponse(
+        request=ExecutionRequestRow(**result["request"]),
+        approved=bool(result.get("approved")),
+    )
+
+
+@router.post(
+    "/{strategy_id}/execution-requests/{request_id}/reject",
+    response_model=ExecutionRequestDecisionResponse,
+)
+async def reject_execution_request(
+    strategy_id: str,
+    request_id: str,
+    request: Request,
+    payload: ExecutionRequestDecisionRequest,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """Owner refuses the requested plan. Terminal; nothing is dispatched."""
+    from backend.strategies.execution_requests import (
+        ExecutionRequestError,
+        ExecutionRequestService,
+    )
+
+    enforce_same_origin(request)
+    _owned_strategy(repo, owner, strategy_id)
+    service = ExecutionRequestService(session_factory)
+    try:
+        result = service.reject(
+            request_id,
+            owner_id=owner,
+            strategy_id=strategy_id,
+            actor=owner,
+            reason=payload.reason,
+        )
+    except ExecutionRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+    return ExecutionRequestDecisionResponse(
+        request=ExecutionRequestRow(**result["request"]),
+        rejected=bool(result.get("rejected")),
     )
 
 
@@ -1403,6 +1997,33 @@ async def list_strategy_proposals(
     )
 
 
+@router.get("/{strategy_id}/plans/by-id/{plan_id}", response_model=PlanResponse)
+async def get_strategy_plan_by_id(
+    strategy_id: str,
+    plan_id: str,
+    request: Request,
+    owner: str = Depends(require_strategy_owner),
+    repo: SqlAlchemyStrategyRepository = Depends(_repository),
+    session_factory: Any = Depends(_strategies_db),
+):
+    """One frozen plan looked up by its own id.
+
+    A durable execution request records ``plan_id`` (its proposal id is not part
+    of that row), so the operator's plan review needs this lookup to explain what
+    a request is about to do. The plan row is immutable; ``invalidation_state``
+    is derived on read.
+    """
+    plan = _plan_or_404(
+        _proposal_store(request, session_factory),
+        owner=owner,
+        repo=repo,
+        strategy_id=strategy_id,
+        plan_id=plan_id,
+    )
+    state = plan_invalidation_state(plan, session_factory=session_factory)
+    return PlanResponse(**plan, invalidation_state=state)
+
+
 @router.get("/{strategy_id}/plans/{proposal_id}", response_model=PlanResponse)
 async def get_strategy_plan(
     strategy_id: str,
@@ -1456,7 +2077,15 @@ def _live_plan_executor(request: Request, session_factory: Any):
     executor = getattr(request.app.state, "live_plan_executor", None)
     if executor is not None:
         return executor
-    return LivePlanExecutor(session_factory=session_factory)
+    from backend.strategies.execution_requests import ExecutionRequestService
+
+    return LivePlanExecutor(
+        session_factory=session_factory,
+        authorization=ExecutionRequestService(
+            session_factory,
+            authorization=_authorization_service(session_factory),
+        ),
+    )
 
 
 def _refuse_live_when_disabled(
@@ -1502,6 +2131,51 @@ def _plan_environment(session_factory: Any, plan: Dict[str, Any]) -> str:
         raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
 
 
+def _derived_environment(
+    session_factory: Any,
+    plan: Dict[str, Any],
+    *,
+    requested: Optional[str],
+    surface: str,
+    plan_id: str,
+) -> str:
+    """The environment for this plan, derived; an explicit disagreement is refused.
+
+    Phase 2 closed a real weakness here: ``/reserve`` used to take its
+    environment from a query parameter, so a paper plan could be reserved in the
+    ``live`` environment. Now the persisted binding decides, the deployment gate
+    is applied to the DERIVED environment, and a caller that explicitly names a
+    different one gets ``PLAN_ENVIRONMENT_MISMATCH`` instead of a silent switch.
+    """
+    environment = _plan_environment(session_factory, plan)
+    if environment not in ("paper", "dry_run", "live"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "PLAN_ENVIRONMENT_UNRESOLVED",
+                "plan_id": str(plan_id),
+                "environment": environment,
+            },
+        )
+    wanted = None if requested is None else str(requested).strip().lower() or None
+    if wanted is not None and wanted != environment:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "rejection_reason": "PLAN_ENVIRONMENT_MISMATCH",
+                "plan_id": str(plan_id),
+                "bound_environment": environment,
+                "requested_environment": wanted,
+                "message": (
+                    "the execution environment is derived from the plan's persisted "
+                    "run binding and cannot be selected by the caller"
+                ),
+            },
+        )
+    _refuse_live_when_disabled(environment, surface=surface, plan_id=str(plan_id))
+    return environment
+
+
 @router.post("/{strategy_id}/plans/{plan_id}/execute", response_model=ExecutionResponse)
 async def execute_plan(
     strategy_id: str,
@@ -1519,19 +2193,12 @@ async def execute_plan(
     releases it ``terminal_unfilled`` on rejections; every transition — every
     refusal included — lands in the append-only execution trail.
     """
-    from backend.strategies.execution import ExecutionRefusal
-
     enforce_same_origin(request)
     plan = _plan_or_404(_proposal_store(request, session_factory), owner=owner, repo=repo,
                         strategy_id=strategy_id, plan_id=plan_id)
-    environment = _plan_environment(session_factory, plan)
-    if environment == "live":
-        executor = _live_plan_executor(request, session_factory)
-    else:
-        executor = _paper_plan_executor(request, session_factory)
     try:
-        result = await executor.execute(plan, actor=owner)
-    except ExecutionRefusal as exc:
+        result = await _plan_pipeline(request, session_factory).execute(plan, actor=owner)
+    except PipelineRefusal as exc:
         raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
     return ExecutionResponse(**result)
 

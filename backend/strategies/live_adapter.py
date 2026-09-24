@@ -1544,6 +1544,7 @@ class LivePlanAdapter:
         quote_reader: Any = None,
         all_specs: Optional[Sequence[Any]] = None,
         parent: Optional[Mapping[str, Any]] = None,
+        governed_authority_check: Optional[Callable[[Any], Optional[Mapping[str, Any]]]] = None,
     ) -> Dict[str, Any]:
         """Release ONE ``withheld`` step, or refuse by name without placing anything.
 
@@ -1583,6 +1584,28 @@ class LivePlanAdapter:
                 strategy_id=strategy_id,
                 execution_environment="live",
             )
+            # Phase 2: the governed authorization is re-derived INSIDE this
+            # transaction, after the hosted-strategy row lock and therefore before
+            # the ``withheld -> releasing`` CAS below. Revocation takes the same
+            # lock, so either the revocation wins (nothing is released) or this
+            # claim wins - which the audit records rather than pretending a stop
+            # cancels an order the broker may already hold.
+            if governed_authority_check is not None:
+                self._lock_governed_strategy(session, strategy_id)
+                governed_refusal = governed_authority_check(session)
+                if governed_refusal is not None:
+                    session.rollback()
+                    raise LiveRefusal(
+                        str(
+                            governed_refusal.get("reason_code")
+                            or "GOVERNED_RELEASE_REFUSED"
+                        ),
+                        {
+                            "plan_id": plan_id,
+                            "step_no": step_no,
+                            **dict(governed_refusal),
+                        },
+                    )
             stored = self.submissions.get(plan_id=plan_id, step_no=step_no, db=session)
             if stored is None:
                 raise LiveRefusal(
@@ -1735,6 +1758,26 @@ class LivePlanAdapter:
             self._rewind_release(plan_id=plan_id, step_no=step_no)
             raise
         return {"state": str(outcome.get("state") or ""), "skipped": False, "released": True}
+
+    @staticmethod
+    def _lock_governed_strategy(session: Any, strategy_id: str) -> None:
+        """Take the SAME row lock a grant revocation takes (PostgreSQL only).
+
+        SQLite serialises writes at the database level and does not support
+        ``FOR UPDATE``, so this is a no-op there exactly as the canonical book
+        lock is. A strategy with no hosted row (an external or legacy plan) has
+        nothing to lock; the governed authority check that follows still runs.
+        """
+        dialect = getattr(getattr(session, "bind", None), "dialect", None)
+        if getattr(dialect, "name", "") != "postgresql":
+            return
+        session.execute(
+            text(
+                "SELECT id FROM public.hosted_strategies WHERE id = :strategy_id "
+                "FOR UPDATE"
+            ),
+            {"strategy_id": str(strategy_id)},
+        ).fetchall()
 
     def _rewind_release(self, *, plan_id: str, step_no: int) -> None:
         session = self.session_factory()

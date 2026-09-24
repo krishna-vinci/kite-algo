@@ -37,6 +37,85 @@ def test_load_strategy_main_requires_main(tmp_path):
         load_strategy_main(str(source))
 
 
+#: A real strategy shape: future annotations plus ``@dataclass``. Before the
+#: loader registered the module in ``sys.modules`` this raised
+#: ``AttributeError: 'NoneType' object has no attribute '__dict__'`` from
+#: ``dataclasses`` -- the supplied Nifty-500 momentum source failed on exactly
+#: this line, inside the real runner, before any strategy code ran.
+_DATACLASS_STRATEGY = '''\
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Sequence
+
+
+class RegimeState(StrEnum):
+    RISK_ON = "RISK_ON"
+
+
+@dataclass(frozen=True)
+class Candle:
+    session: str
+    close: float
+    final: bool = True
+
+
+@dataclass(frozen=True)
+class Decision:
+    previous_state: RegimeState
+    state: RegimeState
+    candles: Sequence[Candle] = ()
+
+
+def main(ctx):
+    decision = Decision(RegimeState.RISK_ON, RegimeState.RISK_ON, (Candle("2026-09-23", 10.0),))
+    ctx.progress(decision.state.value)
+    return 0
+'''
+
+
+def test_dataclass_source_with_string_annotations_loads(tmp_path):
+    """The loader registers its module, so ``@dataclass`` can resolve annotations."""
+    source = tmp_path / "momentum_like.py"
+    source.write_text(_DATACLASS_STRATEGY)
+    main = load_strategy_main(str(source))
+
+    import dataclasses
+
+    notes: list = []
+    assert main(type("Ctx", (), {"progress": lambda self, note=None: notes.append(note)})()) == 0
+    assert notes == ["RISK_ON"]
+
+    module = sys.modules["hosted_strategy"]
+    fields = [field.name for field in dataclasses.fields(module.Decision)]
+    assert fields == ["previous_state", "state", "candles"]
+
+
+def test_failed_load_does_not_leave_a_module_behind(tmp_path):
+    """A source that dies mid-import must not leave a half-built module registered."""
+    sys.modules.pop("hosted_strategy", None)
+    source = tmp_path / "explodes.py"
+    source.write_text(_DATACLASS_STRATEGY + "\nraise RuntimeError('boom')\n")
+    with pytest.raises(RuntimeError):
+        load_strategy_main(str(source))
+    assert "hosted_strategy" not in sys.modules
+
+
+def test_failed_load_restores_a_previous_module(tmp_path):
+    """The failure path puts back whatever occupied the name before."""
+    sentinel = object()
+    sys.modules["hosted_strategy"] = sentinel
+    try:
+        source = tmp_path / "explodes.py"
+        source.write_text("raise RuntimeError('boom')\n")
+        with pytest.raises(RuntimeError):
+            load_strategy_main(str(source))
+        assert sys.modules["hosted_strategy"] is sentinel
+    finally:
+        sys.modules.pop("hosted_strategy", None)
+
+
 def test_child_context_progress_delegates_to_managed_run(tmp_path):
     class FakeRun:
         def __init__(self):

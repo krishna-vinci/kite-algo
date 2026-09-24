@@ -24,7 +24,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, model_validator
 
-from backend.api.routers.worker_shared import _require_action, require_worker_token
+from backend.api.routers.worker_shared import require_worker_read_action, require_worker_token
 from backend.app.database import get_db_connection
 from fundamentals.index_scopes import canonical_index_key, is_supported_index, supported_index_scopes
 from fundamentals.ingestion import (
@@ -73,7 +73,7 @@ async def _authorize(request: Request, schema_version: int = 1) -> None:
     if schema_version != 1:
         raise HTTPException(422, {"rejection_reason": "UNSUPPORTED_SCHEMA_VERSION", "supported": [1]})
     token = await require_worker_token(request)
-    _require_action(token, "market:read")
+    await require_worker_read_action(request, token, "market:read")
 
 
 def _resolve_scope_filter(symbols: Optional[List[str]], index: Optional[str]) -> List[str]:

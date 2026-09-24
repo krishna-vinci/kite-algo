@@ -87,9 +87,22 @@ async def start_live_outcome_consumer(app: FastAPI) -> Optional[asyncio.Task]:
         # public execute route uses, so a withheld dependent leg is released
         # through exactly one implementation (authority, approval, admission,
         # reservation and the lane's own release rule all re-checked there).
+        #
+        # Phase 2: the releaser is constructed WITH the governed authorization
+        # reader. A dependent release re-derives the authority of the request that
+        # started the plan - mode, grant, version, source, policy and attempt -
+        # inside the release claim transaction, so a revocation (or a switch back
+        # to manual mode) between two legs prevents the second submission.
+        from backend.strategies.execution_requests import ExecutionRequestService
         from backend.strategies.live_service import LivePlanExecutor
 
-        releaser = LivePlanExecutor()
+        factory = getattr(app.state, "strategies_session_factory", None)
+        if factory is None:
+            factory = SessionLocal
+        releaser = LivePlanExecutor(
+            session_factory=factory,
+            authorization=ExecutionRequestService(factory),
+        )
         consumer = LiveOutcomeConsumer(sequence_releaser=releaser.release_sequence)
         app.state.live_outcome_consumer = consumer
         app.state.live_sequence_executor = releaser
@@ -120,6 +133,128 @@ async def start_live_outcome_consumer(app: FastAPI) -> Optional[asyncio.Task]:
         logging.error("Failed to start hosted live outcome consumer: %s", exc, exc_info=True)
         set_component_status("live_outcome_consumer", "degraded", detail=str(exc))
         return None
+
+
+def ensure_governed_execution_state(app: FastAPI) -> None:
+    """Wire the shared plan pipeline into app state (idempotent).
+
+    The operator routes and the background dispatcher must take the SAME path
+    from a frozen plan to an execution, so the pipeline is built once here from
+    the app's session factory and executors. Injected state wins, so a test can
+    supply SQLite-backed collaborators.
+    """
+    if getattr(app.state, "plan_execution_pipeline", None) is not None:
+        return
+    from backend.strategies.admission import AdmissionService
+    from backend.strategies.approvals import ApprovalService
+    from backend.strategies.execution import PaperPlanExecutor
+    from backend.strategies.execution_requests import ExecutionRequestService
+    from backend.strategies.live_service import LivePlanExecutor
+    from backend.strategies.plan_pipeline import PlanExecutionPipeline
+    from backend.strategies.proposals import ProposalStore
+    from backend.strategies.reservations import ReservationLedger
+
+    factory = getattr(app.state, "strategies_session_factory", None) or SessionLocal
+
+    def _live_executor() -> Any:
+        return LivePlanExecutor(
+            session_factory=factory,
+            authorization=ExecutionRequestService(factory),
+        )
+
+    def _paper_executor() -> Any:
+        return PaperPlanExecutor(
+            session_factory=factory,
+            paper_service=getattr(app.state, "paper_runtime_service", None),
+        )
+
+    app.state.plan_execution_pipeline = PlanExecutionPipeline(
+        factory,
+        proposal_store=ProposalStore(session_factory=factory),
+        admission_service=AdmissionService(session_factory=factory),
+        reservation_ledger=ReservationLedger(session_factory=factory),
+        approval_service=ApprovalService(session_factory=factory),
+        paper_executor_factory=_paper_executor,
+        live_executor_factory=_live_executor,
+    )
+
+
+async def start_hosted_execution_dispatcher(app: FastAPI) -> Optional[asyncio.Task]:
+    """Start the bounded governed-execution dispatcher, or record it as disabled.
+
+    Phase 2 queues durable execution requests: an owner approval or a matching
+    autonomous grant marks work ready, and THIS loop is what turns it into an
+    execution through the shared pipeline. ``HOSTED_EXECUTION_DISPATCH_ENABLED``
+    (default on) is the deployment switch; the health snapshot is published
+    through the ordinary component-status surface so a degraded dispatcher is
+    visible rather than silent.
+    """
+    try:
+        from backend.strategies.execution_dispatcher import (
+            HostedExecutionDispatcher,
+            hosted_execution_dispatch_enabled,
+        )
+        from backend.strategies.execution_requests import ExecutionRequestService
+
+        factory = getattr(app.state, "strategies_session_factory", None)
+        if factory is None:
+            factory = SessionLocal
+        pipeline = app.state.plan_execution_pipeline
+        dispatcher = HostedExecutionDispatcher(
+            factory,
+            service=ExecutionRequestService(factory, pipeline=pipeline),
+        )
+        app.state.hosted_execution_dispatcher = dispatcher
+
+        def _dispatcher_health(snapshot: dict) -> None:
+            set_component_status(
+                "hosted_execution_dispatcher",
+                str(snapshot.get("state") or "unknown"),
+                detail=str(snapshot.get("last_error") or "") or None,
+                meta={
+                    "enabled": snapshot.get("enabled"),
+                    "last_pass_at": snapshot.get("last_pass_at"),
+                    "last_counts": snapshot.get("last_counts"),
+                },
+            )
+
+        if not hosted_execution_dispatch_enabled():
+            app.state.hosted_execution_dispatcher_task = None
+            set_component_status(
+                "hosted_execution_dispatcher",
+                "disabled",
+                detail="Hosted execution dispatch disabled by HOSTED_EXECUTION_DISPATCH_ENABLED",
+            )
+            return None
+        task = asyncio.create_task(dispatcher.run_forever(health_sink=_dispatcher_health))
+        app.state.hosted_execution_dispatcher_task = task
+        set_component_status(
+            "hosted_execution_dispatcher",
+            "starting",
+            detail="Hosted execution dispatcher started",
+        )
+        return task
+    except Exception as exc:  # noqa: BLE001 - a broken dispatcher must not break startup
+        logging.error(
+            "Failed to start hosted execution dispatcher: %s", exc, exc_info=True
+        )
+        set_component_status("hosted_execution_dispatcher", "degraded", detail=str(exc))
+        return None
+
+
+async def stop_hosted_execution_dispatcher(app: FastAPI) -> None:
+    """Cancel the dispatcher task and wait for it, so shutdown is deterministic."""
+    task = getattr(app.state, "hosted_execution_dispatcher_task", None)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 - shutdown continues regardless
+        pass
+    app.state.hosted_execution_dispatcher_task = None
 
 
 async def stop_live_outcome_consumer(app: FastAPI) -> None:
@@ -559,6 +694,14 @@ async def combined_lifespan(app: FastAPI):
         # inside it.
         await start_live_outcome_consumer(app)
 
+        # Governed hosted execution (Phase 2): the bounded dispatcher turns an
+        # owner approval or a matching autonomous grant into work through the
+        # SAME shared pipeline the operator routes use. The paper/live executors
+        # are constructed lazily and read the app-state services, so a
+        # deployment without a paper runtime refuses paper execution by name.
+        ensure_governed_execution_state(app)
+        await start_hosted_execution_dispatcher(app)
+
         if os.getenv("ACCOUNT_INGEST_ENABLED", "true").lower() in {"1", "true", "yes"}:
             account_ingest_task = asyncio.create_task(_account_ingest_loop(app))
         else:
@@ -747,6 +890,7 @@ async def combined_lifespan(app: FastAPI):
     except Exception:
         pass
     # Cancel hosted live outcome consumer
+    await stop_hosted_execution_dispatcher(app)
     await stop_live_outcome_consumer(app)
     # Stop Candle Aggregator
     try:

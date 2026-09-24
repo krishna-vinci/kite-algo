@@ -10,4 +10,18 @@ export const hostedKeys = {
     ["hosted", "notifications", strategyId, jobId] as const,
   reconciliation: (strategyId: string, jobId: string) =>
     ["hosted", "reconciliation", strategyId, jobId] as const,
+  authorization: (strategyId: string) => ["hosted", "authorization", strategyId] as const,
+  grants: (strategyId: string) => ["hosted", "grants", strategyId] as const,
+  executionRequests: (strategyId: string) =>
+    ["hosted", "execution-requests", strategyId] as const,
+  admissionPolicy: (strategyId: string) => ["hosted", "admission-policy", strategyId] as const,
+  schedule: (strategyId: string) => ["hosted", "schedule", strategyId] as const,
+  scheduleOccurrences: (strategyId: string) =>
+    ["hosted", "schedule-occurrences", strategyId] as const,
+  plan: (strategyId: string, proposalId: string) =>
+    ["hosted", "plan", strategyId, proposalId] as const,
+  positions: (strategyId: string, environment: string) =>
+    ["hosted", "positions", strategyId, environment] as const,
+  calendar: (exchange: string, segment: string) =>
+    ["hosted", "calendar", exchange, segment] as const,
 };

@@ -62,6 +62,12 @@ LOOKBACK_DAYS = 24
 
 DEFAULT_MISFIRE_GRACE_SECONDS = 3600
 
+#: What the runtime does when an occurrence is due while the previous evaluation
+#: is still unresolved: the row stays ``pending`` and is retried on a later tick
+#: (never fired early, never silently skipped). Reported verbatim by the
+#: operator schedule view so the UI cannot invent a "skip" policy.
+OVERLAP_POLICY = "defer_until_resolved"
+
 #: Occurrence statuses that mean "this occurrence is done with".
 SETTLED_OCCURRENCE_STATUSES = ("fired", "skipped", "expired")
 
@@ -1089,6 +1095,87 @@ class ScheduleScheduler:
                 }
                 for row in rows
             ]
+
+
+def next_occurrence(schedule: Mapping[str, Any], *, now: datetime) -> Optional[Occurrence]:
+    """The next occurrence at or after ``now``, mirroring the due-time rules.
+
+    ``due_occurrences`` walks *backwards* to find work whose time has passed;
+    the operator's "next run" question walks the same rules forward. Both read
+    the same kind/timezone/clock fields and derive the same occurrence key, so a
+    displayed next run cannot disagree with the row the scheduler materialises.
+    Pure and bounded: it never touches the database and returns ``None`` rather
+    than raising when no future occurrence exists (e.g. a calendar schedule
+    whose dates have all passed).
+    """
+    kind = str(schedule.get("schedule_kind") or "")
+    zone = _local_timezone(str(schedule.get("timezone") or "Asia/Kolkata"))
+    at_time = _parse_hhmm(str(schedule.get("at_time") or "09:30"))
+    moment = now.astimezone(zone)
+    schedule_id = str(schedule.get("id") or "")
+
+    def occurrence_for(day: date) -> Optional[Occurrence]:
+        due_local = datetime.combine(day, at_time, tzinfo=zone)
+        if due_local <= moment:
+            return None
+        return Occurrence(
+            occurrence_key=f"{schedule_id}:{day.isoformat()}",
+            due_at=due_local.astimezone(timezone.utc),
+            evaluation_id=f"sched:{schedule_id}:{day.isoformat()}",
+        )
+
+    if kind == "monthly":
+        day = int(schedule.get("day_of_month") or 1)
+        cursor = date(moment.year, moment.month, 1)
+        for _ in range(24):
+            day_clamped = min(day, _calendar.monthrange(cursor.year, cursor.month)[1])
+            candidate = occurrence_for(date(cursor.year, cursor.month, day_clamped))
+            if candidate is not None:
+                return candidate
+            cursor = (cursor + timedelta(days=31)).replace(day=1)
+        return None
+    if kind == "calendar":
+        raw = schedule.get("calendar_dates") or []
+        if isinstance(raw, str):
+            import json
+
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                raw = []
+        candidates: List[Occurrence] = []
+        for entry in raw:
+            try:
+                day = date.fromisoformat(str(entry))
+            except ValueError:
+                continue
+            candidate = occurrence_for(day)
+            if candidate is not None:
+                candidates.append(candidate)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: (item.due_at, item.occurrence_key))
+    if kind == "daily":
+        today = moment.date()
+        for offset in range(LOOKBACK_DAYS):
+            candidate = occurrence_for(today + timedelta(days=offset))
+            if candidate is not None:
+                return candidate
+        return None
+    if kind == "weekly":
+        weekday = schedule.get("weekday")
+        if not isinstance(weekday, int) or isinstance(weekday, bool) or not 0 <= weekday <= 6:
+            return None
+        today = moment.date()
+        for offset in range(LOOKBACK_DAYS * 7):
+            day = today + timedelta(days=offset)
+            if day.weekday() != weekday:
+                continue
+            candidate = occurrence_for(day)
+            if candidate is not None:
+                return candidate
+        return None
+    return None
 
 
 def pinned_launch_identity(

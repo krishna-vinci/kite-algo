@@ -17,7 +17,13 @@ from backend.broker_api.timeline.worker_timeline import worker_timeline_store
 from backend.app.database import SessionLocal
 from backend.api.schemas.worker import WorkerDecisionEventRequest, WorkerProtectionPatchRequest, WorkerRiskPatchRequest, WorkerRunPnlLeg, WorkerRunPnlSnapshot, WorkerRunPnlTotals, WorkerFundsSegment, WorkerFundsSnapshot, WorkerExitRequest
 from backend.api.routers.worker_shared import *
-from backend.api.services.hosted_attempt import enforce_hosted_attempt_authority
+from backend.api.services.hosted_attempt import (
+    assert_hosted_discretionary_mutation_allowed,
+    assert_hosted_owner_policy_keys_untouched,
+    assert_hosted_risk_update_within_mandate,
+    enforce_hosted_attempt_authority,
+    enforce_hosted_read_authority,
+)
 
 router = APIRouter(prefix='/algo-workers', tags=['Algo Workers'])
 
@@ -1044,6 +1050,7 @@ async def patch_worker_run_risk(request: Request, strategy_run_id: str, payload:
     _assert_run_access(token, run)
     await enforce_hosted_attempt_authority(request, token, run)
     await require_active_worker_run_session(request, run)
+    await assert_hosted_risk_update_within_mandate(request, run, payload.patch)
     if run.get("status") in {"closed", "failed"}:
         raise HTTPException(status_code=409, detail="Closed strategy runs cannot be risk-edited")
     return await _repo(request).update_run_risk(strategy_run_id, payload.patch)
@@ -1057,6 +1064,15 @@ async def patch_worker_run_protection(request: Request, strategy_run_id: str, pa
     _assert_run_access(token, run)
     await enforce_hosted_attempt_authority(request, token, run)
     await require_active_worker_run_session(request, run)
+    # Phase 2: backend protection can disable or relax the platform's exit/stale
+    # protection, so for a hosted child it is a discretionary risk-surface
+    # mutation and goes through the governed request contract (or is refused by
+    # name). The platform's own protection runtime and stale-exit policy are
+    # unaffected: they never travel through a child token.
+    assert_hosted_discretionary_mutation_allowed(run, operation="protection:patch")
+    assert_hosted_owner_policy_keys_untouched(
+        run, payload.backend_protection, operation="protection:patch"
+    )
     if run.get("status") in {"closed", "failed"}:
         raise HTTPException(status_code=409, detail="Closed strategy runs cannot be protection-edited")
 
@@ -1428,6 +1444,7 @@ async def create_worker_decision_event(
 
 async def worker_ticks_ws(websocket: WebSocket):
     token = await require_worker_ws_token(websocket)
+    await enforce_hosted_read_authority(websocket, token)
     _require_action(token, "market:stream")
     await websocket.accept()
     symbols = _parse_csv_values(websocket.query_params.get("symbols"))
@@ -1444,12 +1461,14 @@ async def worker_ticks_ws(websocket: WebSocket):
 
 async def worker_candles_ws(websocket: WebSocket):
     token = await require_worker_ws_token(websocket)
+    await enforce_hosted_read_authority(websocket, token)
     _require_action(token, "market:stream")
     await websocket.accept()
     instrument_token_param = websocket.query_params.get("instrument_token")
     instrument_token = normalize_instrument_token(instrument_token_param) if instrument_token_param else None
     async for event, payload in _market_data_service(websocket).stream_candles_ws(
         websocket,
+        token=token,
         symbol=websocket.query_params.get("symbol"),
         instrument_token=instrument_token,
         interval=websocket.query_params.get("interval") or "5minute",

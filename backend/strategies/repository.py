@@ -36,7 +36,11 @@ from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backend.strategies.attribution_models import ExternalStrategyAdapter, Strategy
+from backend.strategies.attribution_models import (
+    ExternalStrategyAdapter,
+    Strategy,
+    StrategyScheduleOccurrence,
+)
 from backend.strategies.models import (
     HostedStrategy,
     HostedStrategySchedule,
@@ -1683,6 +1687,184 @@ class SqlAlchemyStrategyRepository:
             ).scalar_one_or_none()
         finally:
             session.close()
+
+    def save_schedule(
+        self,
+        *,
+        strategy_id: str,
+        version_id: str,
+        owner_id: str,
+        job_kind: str,
+        execution_mode: str,
+        params: Optional[Dict[str, Any]] = None,
+        schedule_kind: str = "daily",
+        at_time: str,
+        weekday: Optional[int] = None,
+        day_of_month: Optional[int] = None,
+        calendar_dates: Optional[List[str]] = None,
+        timezone: str = "Asia/Kolkata",
+        window_end: Optional[str] = None,
+        squareoff_at: Optional[str] = None,
+        enabled: bool = True,
+    ) -> "HostedStrategySchedule":
+        """Create or edit this strategy's single stored schedule.
+
+        The same validation and identity derivation as :meth:`create_schedule`,
+        but an existing row is updated in place: its ``id`` is stable, so the
+        occurrence history and the scheduler's ``UNIQUE (schedule_id,
+        occurrence_key)`` fence stay bound to the same schedule instead of a
+        re-created one. A disabled strategy cannot (re-)enable its schedule,
+        because the scheduler's launch path would refuse the pinned job anyway;
+        the stored schedule never silently resumes work.
+        """
+        schedule = service.validate_schedule(
+            schedule_kind=schedule_kind,
+            at_time=at_time,
+            weekday=weekday,
+            day_of_month=day_of_month,
+            calendar_dates=calendar_dates,
+            timezone=timezone,
+            window_end=window_end,
+            squareoff_at=squareoff_at,
+        )
+        if job_kind not in service.ALLOWED_JOB_KINDS:
+            raise service.StrategyValidationError("unsupported job_kind")
+        if execution_mode not in service.ALLOWED_EXECUTION_MODES:
+            raise service.StrategyValidationError("unsupported execution_mode")
+
+        session = self._session()
+        try:
+            strategy = self._lock_strategy(session, strategy_id, owner_id)
+            if strategy is None:
+                raise StrategyNotFound("strategy not found for this owner")
+            if enabled and strategy.status != "active":
+                raise StrategyDisabled("strategy is disabled")
+            service.validate_account_scope(strategy.default_account_scope, execution_mode)
+            version = session.execute(
+                select(HostedStrategyVersion).where(
+                    HostedStrategyVersion.id == version_id,
+                    HostedStrategyVersion.strategy_id == strategy_id,
+                )
+            ).scalar_one_or_none()
+            if version is None:
+                raise StrategyIdentityError("version does not belong to this strategy")
+            params_snapshot = service.validate_parameters(version.parameters_schema, params)
+            policy_snapshot = service.build_policy_snapshot(
+                stale_exit_policy=strategy.stale_exit_policy,
+                max_duration_s=strategy.max_duration_s,
+                progress_deadline_s=strategy.progress_deadline_s,
+            )
+
+            row = session.execute(
+                select(HostedStrategySchedule).where(
+                    HostedStrategySchedule.strategy_id == strategy_id
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = HostedStrategySchedule(id=service.new_schedule_id(), strategy_id=strategy_id)
+                session.add(row)
+            # Every pinned field is rewritten: an edit is a re-pin, never a
+            # partial update that leaves one snapshot from the previous config.
+            row.version_id = version_id
+            row.owner_id = owner_id
+            row.account_scope = str(strategy.default_account_scope)
+            row.params_snapshot = copy.deepcopy(params_snapshot)
+            row.execution_mode = execution_mode
+            row.job_kind = job_kind
+            row.policy_snapshot = copy.deepcopy(policy_snapshot)
+            row.capabilities_snapshot = copy.deepcopy(dict(version.capabilities_snapshot or {}))
+            row.max_duration_s = int(strategy.max_duration_s)
+            row.progress_deadline_s = int(strategy.progress_deadline_s)
+            row.schedule_kind = schedule["schedule_kind"]
+            row.at_time = schedule["at_time"]
+            row.weekday = schedule["weekday"]
+            row.day_of_month = schedule["day_of_month"]
+            row.calendar_dates = (
+                copy.deepcopy(schedule["calendar_dates"])
+                if schedule["calendar_dates"] is not None
+                else None
+            )
+            row.timezone = schedule["timezone"]
+            row.window_end = schedule["window_end"]
+            row.squareoff_at = schedule["squareoff_at"]
+            row.enabled = bool(enabled)
+            if row.enabled:
+                row.manual_paused_at = None
+            row.updated_at = _utcnow()
+            session.commit()
+            return row
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def set_schedule_enabled(
+        self, strategy_id: str, *, owner_id: str, enabled: bool, actor: Optional[str] = None
+    ) -> "HostedStrategySchedule":
+        """Enable or disable the strategy's stored schedule (idempotent).
+
+        Enabling refuses when the strategy itself is disabled: the scheduler
+        would only materialise work the launch path refuses, so the schedule
+        must not be presented as resumed.
+        """
+        session = self._session()
+        try:
+            strategy = self._lock_strategy(session, strategy_id, owner_id)
+            if strategy is None:
+                raise StrategyNotFound("strategy not found for this owner")
+            row = session.execute(
+                select(HostedStrategySchedule).where(
+                    HostedStrategySchedule.strategy_id == strategy_id
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                raise StrategyNotFound("schedule not found")
+            if enabled and strategy.status != "active":
+                raise StrategyDisabled("strategy is disabled")
+            row.enabled = bool(enabled)
+            if enabled:
+                row.manual_paused_at = None
+            row.updated_at = _utcnow()
+            session.commit()
+            return row
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def list_schedule_occurrences(
+        self, schedule_id: str, *, limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Materialised occurrences, newest due time first.
+
+        Read-only: a missed run is a row the scheduler already wrote
+        (``skipped``/``expired`` with its reason), so the operator view reports
+        what happened instead of re-deriving it.
+        """
+        session = self._session()
+        try:
+            rows = session.execute(
+                select(StrategyScheduleOccurrence)
+                .where(StrategyScheduleOccurrence.schedule_id == str(schedule_id))
+                .order_by(StrategyScheduleOccurrence.due_at.desc())
+                .limit(int(limit))
+            ).scalars().all()
+        finally:
+            session.close()
+        return [
+            {
+                "occurrence_key": str(row.occurrence_key),
+                "due_at": row.due_at.isoformat() if row.due_at else None,
+                "status": str(row.status),
+                "fired_at": row.fired_at.isoformat() if row.fired_at else None,
+                "evaluation_id": row.evaluation_id,
+                "skip_reason": row.skip_reason,
+                "detail": dict(row.detail or {}),
+            }
+            for row in rows
+        ]
 
     # -- operator controls: run-now idempotency, stop, bounded logs ---------
 

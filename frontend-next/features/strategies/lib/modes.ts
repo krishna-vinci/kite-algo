@@ -27,6 +27,78 @@ export function executionModeLabel(mode: string | null | undefined): string {
   return MODE_LABELS[key] ?? key;
 }
 
+/**
+ * Where the money goes. Deliberately separate wording from the authorization
+ * mode below: "paper" is an environment, "review first" is a decision rule.
+ */
+const ENVIRONMENT_LABELS: Record<string, string> = {
+  [PAPER_MODE]: "Paper account (no real orders)",
+  [DRY_RUN_MODE]: "Dry run (no orders at all)",
+  [LIVE_MODE]: "Live account (real orders)",
+};
+
+export function environmentLabel(mode: string | null | undefined): string {
+  const key = String(mode ?? "").trim();
+  if (!key) return "Unknown";
+  return ENVIRONMENT_LABELS[key] ?? executionModeLabel(key);
+}
+
+export const APPROVAL_BASED = "approval_based";
+export const AUTONOMOUS = "autonomous";
+
+const AUTHORIZATION_MODE_LABELS: Record<string, string> = {
+  [APPROVAL_BASED]: "Review trades first",
+  [AUTONOMOUS]: "Trade automatically within my limits",
+};
+
+export function authorizationModeLabel(mode: string | null | undefined): string {
+  const key = String(mode ?? "").trim();
+  return AUTHORIZATION_MODE_LABELS[key] ?? (key ? key : "Unknown");
+}
+
+export function authorizationModeExplanation(mode: string | null | undefined): string {
+  switch (String(mode ?? "").trim()) {
+    case APPROVAL_BASED:
+      return "Every trade this strategy proposes waits for your decision.";
+    case AUTONOMOUS:
+      return "Trades the strategy proposes are placed automatically, but only inside an authorization you issue for the exact version, account, environment and limits, and only until you revoke it.";
+    default:
+      return "This deployment did not report an authorization mode for the strategy.";
+  }
+}
+
+export function isKnownAuthorizationMode(mode: string | null | undefined): boolean {
+  return String(mode ?? "").trim() in AUTHORIZATION_MODE_LABELS;
+}
+
+/**
+ * Permissions are labelled by what they let the strategy DO. Importing or
+ * scanning the source grants nothing: the operator's own declaration is the
+ * only thing that becomes a child capability.
+ */
+export const PERMISSION_KEYS = ["data", "trade", "notify"] as const;
+export type PermissionKey = (typeof PERMISSION_KEYS)[number];
+
+const PERMISSION_LABELS: Record<PermissionKey, string> = {
+  data: "Read market data",
+  trade: "Propose trades",
+  notify: "Send notifications",
+};
+
+const PERMISSION_PURPOSES: Record<PermissionKey, string> = {
+  data: "Quotes, candles, indices, indicators, option chains and owned universes.",
+  trade: "Submit trade proposals for admission and your approval. It never places an order on its own.",
+  notify: "Publish run notifications through the configured channels.",
+};
+
+export function permissionLabel(key: string): string {
+  return PERMISSION_LABELS[key as PermissionKey] ?? key;
+}
+
+export function permissionPurpose(key: string): string {
+  return PERMISSION_PURPOSES[key as PermissionKey] ?? "";
+}
+
 /** The modes this deployment's server actually offers, in server order. */
 export function supportedExecutionModes(options: HostedStrategyOptions | undefined): string[] {
   return options?.execution_modes ?? [];
@@ -71,8 +143,15 @@ export function liveLaneSummary(options: HostedStrategyOptions | undefined): str
 }
 
 /**
- * Live always requires the owner's own plan approval. A server that does not
- * report the flag is an older server, whose live path is approval-gated too, so
+ * The server's own answer to "is a live attempt approved by the owner rather
+ * than by the platform?".
+ *
+ * The flag means **the owner's authority is required**, and the owner can
+ * provide it in either of the two lanes: a decision on that one plan
+ * (review-first) or a standing authorization they issue for a version, account,
+ * limits and environment (autonomous). It never means "per-plan approval is
+ * always required", and it is never the platform's own consent: a deployment
+ * that omits the field is an older one whose live path is owner-gated too, so
  * only an explicit `false` relaxes this.
  */
 export function liveRequiresOwnerApproval(options: HostedStrategyOptions | undefined): boolean {

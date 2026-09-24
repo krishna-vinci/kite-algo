@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from fastapi import HTTPException, Request
 
@@ -32,11 +32,19 @@ from backend.strategies.repository import SqlAlchemyStrategyRepository
 
 __all__ = [
     "HOSTED_TEMPLATE_PREFIX",
+    "GOVERNED_EXECUTION_SURFACE",
+    "OWNER_MANDATED_LIMIT_KEYS",
+    "OWNER_MANDATED_POLICY_KEYS",
+    "assert_hosted_discretionary_mutation_allowed",
+    "assert_hosted_owner_policy_keys_untouched",
+    "assert_hosted_risk_update_within_mandate",
     "assert_child_lifecycle_forbidden",
     "assert_hosted_run_binding",
     "enforce_hosted_attempt_authority",
+    "enforce_hosted_read_authority",
     "hosted_job_for_run",
     "hosted_job_for_token",
+    "hosted_owner_for_token",
     "is_hosted_run",
     "is_hosted_template_id",
     "record_hosted_progress",
@@ -94,37 +102,52 @@ def _load_hosted_job(repo: SqlAlchemyStrategyRepository, run_id: str) -> Optiona
 def _validate_authority(
     job: StrategyJob,
     token: WorkerToken,
-    run: Dict[str, Any],
+    run: Optional[Dict[str, Any]],
 ) -> None:
+    """Validate the persisted hosted attempt for this token.
+
+    ``run`` is the worker run record when the route is run-scoped. Read routes
+    are not run-scoped (a quote or a universe read names no run), so they pass
+    ``None`` and the token/attempt binding is still fully checked against the
+    persisted job.
+    """
+    run = run or {}
     run_id = str(run.get("strategy_run_id") or "")
     strategy_id = str(job.strategy_id or "")
 
-    # The run must be the one this job recorded, and the token must be the child
-    # credential minted for it. Neither the run id nor the token id alone grants
-    # authority.
-    if str(job.run_id or "") != run_id or str(job.token_id or "") != token.token_id:
+    # The token must be the child credential minted for this attempt. Neither a
+    # run id nor a token id alone grants authority.
+    if str(job.token_id or "") != token.token_id:
         raise _reject(
             403,
             "HOSTED_ATTEMPT_TOKEN_MISMATCH",
             strategy_run_id=run_id,
         )
-    if str(run.get("template_id") or "") != strategy_service.template_id_for(strategy_id):
-        raise _reject(
-            403,
-            "HOSTED_ATTEMPT_TEMPLATE_MISMATCH",
-            strategy_run_id=run_id,
-        )
+    if run:
+        # The run must be the one this job recorded.
+        if str(job.run_id or "") != run_id:
+            raise _reject(
+                403,
+                "HOSTED_ATTEMPT_TOKEN_MISMATCH",
+                strategy_run_id=run_id,
+            )
+        if str(run.get("template_id") or "") != strategy_service.template_id_for(strategy_id):
+            raise _reject(
+                403,
+                "HOSTED_ATTEMPT_TEMPLATE_MISMATCH",
+                strategy_run_id=run_id,
+            )
 
-    # Configuration is derived from the persisted job, never from the request.
-    if (
-        str(job.execution_mode or "") != str(run.get("execution_mode") or "")
-        or str(job.account_scope or "") != str(run.get("account_scope") or "")
-    ):
-        raise _reject(
-            409,
-            "HOSTED_ATTEMPT_CONFIG_MISMATCH",
-            strategy_run_id=run_id,
-        )
+        # Configuration is derived from the persisted job, never from the request.
+        if (
+            str(job.execution_mode or "") != str(run.get("execution_mode") or "")
+            or str(job.account_scope or "") != str(run.get("account_scope") or "")
+        ):
+            raise _reject(
+                409,
+                "HOSTED_ATTEMPT_CONFIG_MISMATCH",
+                strategy_run_id=run_id,
+            )
 
     if str(job.desired_state or "") != "started":
         raise _reject(
@@ -173,6 +196,17 @@ def _enforce_sync(request: Request, token: WorkerToken, run: Dict[str, Any]) -> 
     _validate_authority(job, token, run)
 
 
+def _enforce_read_sync(request: Request, token: WorkerToken) -> Optional[StrategyJob]:
+    repo = _strategies_repo(request)
+    job = repo.get_job_by_token_id(token.token_id)
+    if job is None:
+        # A hosted-shaped token with no persisted attempt is not a live
+        # credential: fail closed rather than granting the read.
+        raise _reject(403, "HOSTED_ATTEMPT_UNKNOWN")
+    _validate_authority(job, token, None)
+    return job
+
+
 async def enforce_hosted_attempt_authority(
     request: Request, token: WorkerToken, run: Optional[Dict[str, Any]]
 ) -> None:
@@ -184,6 +218,41 @@ async def enforce_hosted_attempt_authority(
     if not is_hosted_run(run):
         return
     await asyncio.to_thread(_enforce_sync, request, token, run)
+
+
+async def enforce_hosted_read_authority(
+    request: Request, token: WorkerToken
+) -> Optional[StrategyJob]:
+    """Refuse a hosted child **read** whose persisted attempt is no longer live.
+
+    A hosted child token is bound to a ``strategy_jobs`` row. Reads are not
+    run-scoped, so this checks the persisted attempt itself: the token must be
+    the one minted for the job, ``desired_state`` must still be ``started``,
+    the attempt must not be fenced/stopped/failed/hung, and its lease must not
+    have expired. Raises 403 for an unknown/fenced attempt and 409 for a
+    stopped or expired one.
+
+    External (non-hosted) tokens are untouched: the cheap
+    ``token_is_hosted_candidate`` pre-filter returns ``None`` without touching
+    the strategies store, preserving the established external contract.
+    """
+    if not token_is_hosted_candidate(token):
+        return None
+    return await asyncio.to_thread(_enforce_read_sync, request, token)
+
+
+async def hosted_owner_for_token(request: Request, token: WorkerToken) -> Optional[str]:
+    """The **application** owner of a hosted strategy, or ``None``.
+
+    The owner is derived from the persisted ``strategy_jobs``/strategy record
+    (``app:<username>``), never from the token's ``account_scope`` — the broker
+    account scope is a trading-account selection and is not owner identity.
+    """
+    job = await hosted_job_for_token(request, token)
+    if job is None:
+        return None
+    owner = str(getattr(job, "owner_id", "") or "").strip()
+    return owner or None
 
 
 def assert_child_lifecycle_forbidden(run: Optional[Dict[str, Any]], operation: str) -> None:
@@ -202,6 +271,116 @@ def assert_child_lifecycle_forbidden(run: Optional[Dict[str, Any]], operation: s
             "rejection_reason": "HOSTED_CHILD_LIFECYCLE_FORBIDDEN",
             "operation": operation,
             "strategy_run_id": str(run.get("strategy_run_id") or ""),
+        },
+    )
+
+
+#: The governed surface a hosted child must use for discretionary exposure.
+GOVERNED_EXECUTION_SURFACE = "/api/algo-workers/worker/executions"
+
+#: The recorded limit keys a hosted child's risk patch may not raise. They are
+#: the owner-mandated ceilings the platform already enforces at admission, so a
+#: child-editable risk blob must never be able to move them upward.
+OWNER_MANDATED_LIMIT_KEYS = (
+    "allocation_inr",
+    "per_instrument_notional_inr",
+    "gross_notional_inr",
+    "max_open_instruments",
+    "admissions_per_window",
+    "admission_window_seconds",
+    "daily_loss_budget_inr",
+)
+
+#: The owner-recorded capital/risk policy keys. A hosted child may not write ANY
+#: of them, in either direction: the recorded policy is an owner surface, and
+#: even a tightening is an owner decision (it invalidates the standing grant).
+OWNER_MANDATED_POLICY_KEYS = frozenset(OWNER_MANDATED_LIMIT_KEYS)
+
+
+def assert_hosted_owner_policy_keys_untouched(
+    run: Optional[Dict[str, Any]],
+    payload: Optional[Mapping[str, Any]],
+    *,
+    operation: str,
+) -> None:
+    """A hosted child may not write an owner-mandated policy key at all.
+
+    An earlier numeric comparison was too clever and too weak: an unreadable
+    mandate let the patch through, only one ceiling direction was compared, and
+    ``None``/NaN values were silently ignored. The owner's recorded capital/risk
+    policy is an OWNER surface, so for a hosted child any payload that names one
+    of those keys is refused by name. Per-run behaviour keys are unaffected, and
+    external worker runs are untouched.
+    """
+    if not is_hosted_run(run):
+        return
+    named = sorted(
+        {
+            str(key)
+            for key in dict(payload or {}).keys()
+            if str(key) in OWNER_MANDATED_POLICY_KEYS
+        }
+    )
+    if not named:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "rejection_reason": "HOSTED_OWNER_POLICY_MUTATION_FORBIDDEN",
+            "operation": str(operation),
+            "strategy_run_id": str(run.get("strategy_run_id") or ""),
+            "owner_mandated_keys": named,
+            "message": (
+                "the strategy's capital/risk policy is owner-recorded; a hosted child "
+                "cannot write these keys. Change the admission policy through the owner "
+                "surface instead."
+            ),
+        },
+    )
+
+
+async def assert_hosted_risk_update_within_mandate(
+    request: Request, run: Optional[Dict[str, Any]], patch: Optional[Dict[str, Any]]
+) -> None:
+    """A hosted child's risk patch may not write an owner-mandated policy key.
+
+    The mandated capital/risk keys are an OWNER surface, so the check refuses any
+    patch that names one (rather than trying to decide whether one direction of
+    one key is a "relaxation"). An unreadable, absent, ``None`` or NaN mandate is
+    therefore irrelevant: the key list is a static vocabulary, not a read.
+    """
+    _ = request  # kept in the signature for the route's existing call shape
+    assert_hosted_owner_policy_keys_untouched(run, patch, operation="risk:update")
+
+
+def assert_hosted_discretionary_mutation_allowed(
+    run: Optional[Dict[str, Any]], *, operation: str
+) -> None:
+    """A hosted child may not make discretionary raw exposure-changing calls.
+
+    Phase 2 closed a real bypass: a hosted child holding ``intents:submit`` (or
+    ``runs:exit``) could place, modify, bracket or flatten orders directly,
+    entirely outside the approval/autonomous decision the owner chose. Those
+    calls now go through the governed execution-request contract
+    (``POST /api/algo-workers/worker/executions``), or they are refused by name.
+
+    External worker runs are untouched: this returns immediately for them, and
+    platform-authorised risk reduction does not travel through a child token.
+    """
+    if not is_hosted_run(run):
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "rejection_reason": "HOSTED_RAW_MUTATION_FORBIDDEN",
+            "operation": str(operation),
+            "strategy_run_id": str(run.get("strategy_run_id") or ""),
+            "governed_surface": GOVERNED_EXECUTION_SURFACE,
+            "message": (
+                "hosted discretionary order mutation is not available on the raw worker "
+                "surface: submit the change as a proposal and request execution under the "
+                "strategy's authorisation mode"
+            ),
         },
     )
 

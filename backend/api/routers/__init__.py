@@ -1,6 +1,7 @@
 # Auto-discovered routers — add new routers here
 from backend.api.routers.worker_auth import router as worker_auth_router
 from backend.api.routers.worker_execution import router as worker_execution_router
+from backend.api.routers.worker_executions import router as worker_executions_router
 from backend.api.routers.worker_market import router as worker_market_router
 from backend.api.routers.worker_notifications import router as worker_notifications_router
 from backend.api.routers.worker_universes import router as worker_universes_router
@@ -45,6 +46,7 @@ ALL_ROUTERS = [
     (worker_auth_router, "/api"),
     (worker_market_router, "/api"),
     (worker_execution_router, "/api"),
+    (worker_executions_router, "/api"),
     (worker_proposals_router, "/api"),
     (worker_protection_router, "/api"),
     (worker_workflows_router, "/api"),
