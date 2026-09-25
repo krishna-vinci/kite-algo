@@ -158,6 +158,44 @@ class ExecutionTestCase(unittest.TestCase):
                     WHERE phase = 'entry'
                 """
             )
+            # Durable protection ownership (B2.4 S1): the entry hook claims a
+            # row in the same transaction as the run and its entry edge. The
+            # constraints and FKs are the production database's job; here the
+            # shape is what matters, exactly like the two tables above.
+            cursor.execute(
+                """
+                CREATE TABLE public.option_protection_owners (
+                    option_run_id TEXT PRIMARY KEY,
+                    strategy_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    execution_environment TEXT NOT NULL,
+                    owner_run_id TEXT,
+                    owner_epoch INTEGER NOT NULL DEFAULT 1,
+                    policy_version TEXT NOT NULL,
+                    policy TEXT NOT NULL,
+                    action_state TEXT NOT NULL DEFAULT 'none',
+                    stage_digest TEXT,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    released_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE public.option_protection_owner_events (
+                    id TEXT PRIMARY KEY,
+                    option_run_id TEXT NOT NULL,
+                    owner_epoch INTEGER NOT NULL,
+                    event TEXT NOT NULL,
+                    owner_run_id TEXT,
+                    actor_id TEXT,
+                    detail TEXT NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
             dbapi_connection.commit()
 
         from backend.strategies.attribution_models import (

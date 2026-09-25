@@ -2880,6 +2880,50 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_option_run_entry
     ON public.strategy_plan_option_runs (option_run_id)
     WHERE phase = 'entry';
 
+-- Durable protection ownership (B2.4 S1). Protection used to be enumerated per
+-- OPEN worker run, so a run left protection by status change alone and nothing
+-- outlived the closure. One owner row per option run makes "two owners"
+-- unrepresentable, and ``owner_epoch`` is the CAS ticket a transfer increments.
+-- The event log is append-only evidence of who held the run and when.
+CREATE TABLE IF NOT EXISTS public.option_protection_owners (
+    option_run_id        TEXT PRIMARY KEY
+        REFERENCES public.option_run_states(strategy_run_id) ON DELETE RESTRICT,
+    strategy_id          TEXT NOT NULL,
+    account_id           TEXT NOT NULL,
+    execution_environment TEXT NOT NULL,
+    owner_run_id         TEXT,
+    owner_epoch          BIGINT NOT NULL DEFAULT 1,
+    policy_version       TEXT NOT NULL,
+    policy               JSONB NOT NULL,
+    action_state         TEXT NOT NULL DEFAULT 'none'
+        CHECK (action_state IN ('none','claimed','staging','unresolved')),
+    stage_digest         TEXT,
+    state                TEXT NOT NULL DEFAULT 'active'
+        CHECK (state IN ('active','released')),
+    released_at          TIMESTAMPTZ,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_opo_owner_present
+        CHECK ((state = 'active') = (owner_run_id IS NOT NULL)),
+    CONSTRAINT ck_opo_environment
+        CHECK (execution_environment IN ('live','paper','dry_run')),
+    CONSTRAINT fk_opo_strategy FOREIGN KEY (strategy_id, account_id)
+        REFERENCES public.strategies(id, account_scope) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS public.option_protection_owner_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    option_run_id TEXT NOT NULL,
+    owner_epoch BIGINT NOT NULL,
+    event TEXT NOT NULL CHECK (event IN
+        ('claimed','transferred','policy_changed','action_claimed',
+         'action_resolved','released')),
+    owner_run_id TEXT,
+    actor_id TEXT,
+    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- The durable claim/outcome row for one live plan step (internal live adapter,
 -- public live routes remain closed). The UNIQUE (plan_id, step_no) claim is what
 -- stops two adapter instances or a restart from dispatching the same step twice.

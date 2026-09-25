@@ -6,6 +6,10 @@ from typing import Any, Callable
 
 from sqlalchemy import text
 from backend.app.database import SessionLocal
+from backend.options.protection.ownership import (
+    TERMINAL_RUN_STATUSES,
+    OptionProtectionOwnerStore,
+)
 
 from .models import OptionRunCreateRequest, OptionRunState
 
@@ -301,6 +305,7 @@ class DurableOptionRunStore:
         session = self._session_factory()
         try:
             self._update_run_in_session(session, run)
+            self._release_protection_owner_if_terminal(session, run)
             session.commit()
             return run
         except Exception:
@@ -308,6 +313,20 @@ class DurableOptionRunStore:
             raise
         finally:
             session.close()
+
+    def _release_protection_owner_if_terminal(self, session: Any, run: OptionRunState) -> None:
+        """Release the protection owner in the SAME transaction as the status write.
+
+        The owner row outlives the worker run, so it ends with the OPTION run's
+        terminal state and not with anything else. Doing it inside this
+        transaction - rather than after it - is what keeps "terminal but still
+        owned" and "released but still running" from being observable.
+        """
+        if str(getattr(run, "status", "") or "") not in TERMINAL_RUN_STATUSES:
+            return
+        OptionProtectionOwnerStore(session_factory=self._session_factory).release(
+            run.strategy_run_id, db=session
+        )
 
     def _update_run_in_session(self, session: Any, run: OptionRunState) -> None:
         json_args = {
@@ -437,6 +456,8 @@ class DurableOptionRunStore:
                 params,
             )
             won = int(getattr(result, "rowcount", 0) or 0) > 0
+            if won:
+                self._release_protection_owner_if_terminal(session, run)
             if owns_session:
                 session.commit()
             return won

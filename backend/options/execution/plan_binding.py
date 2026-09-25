@@ -22,6 +22,11 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from sqlalchemy import text
 from backend.app.database import SessionLocal
+from backend.options.protection.ownership import (
+    OptionProtectionOwnerStore,
+    option_protection_policy_version,
+    option_protection_policy_snapshot,
+)
 
 from .durable_store import DurableOptionRunStore
 from .models import OptionRunCreateRequest, OptionRunState
@@ -1510,6 +1515,23 @@ def _create_entry_run_atomically(
                     "OPTION_PLAN_BINDING_MISSING", {"plan_id": plan_id}
                 )
             return _existing(winner)
+        # The owner row is written in the SAME transaction as the run and its
+        # entry edge: a run that exists without a protection owner (or the other
+        # way round) is not a state this platform can be left in. The owner is
+        # the worker run, so a run created without one refuses by name here
+        # rather than committing an ownerless "active" row.
+        policy_snapshot = option_protection_policy_snapshot(
+            plan.get("resolved_plan") or {}
+        )
+        OptionProtectionOwnerStore(
+            session_factory=binding_store.session_factory
+        ).claim(
+            run,
+            worker_run_id,
+            policy_snapshot,
+            option_protection_policy_version(policy_snapshot),
+            db=session,
+        )
         session.commit()
         return {
             "phase": "entry",

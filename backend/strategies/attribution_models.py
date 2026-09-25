@@ -627,6 +627,101 @@ class StrategyPlanOptionRun(Base):
     )
 
 
+class OptionProtectionOwner(Base):
+    """The durable protection ownership record for ONE option run (B2.4 S1).
+
+    Protection used to be enumerated per OPEN worker run, so a run left
+    protection by status change alone and no record outlived the closure. This
+    row is that record, and its primary key (``option_run_id``, which is
+    ``option_run_states.strategy_run_id``) is the whole point: two owners are
+    unrepresentable.
+
+    * ``owner_epoch`` is the compare-and-swap ticket: every claim/transfer/policy
+      change increments it, so a superseded caller that observed an old epoch
+      updates zero rows instead of overwriting a newer owner;
+    * ``state`` has exactly two values - there is deliberately no
+      ``transferring``, because a two-phase state has a committed instant with no
+      owner;
+    * ``ck_opo_owner_present`` ties the state to the owner column, so an ACTIVE
+      row always names the authoritative run and a released row never does.
+
+    The FK to ``option_run_states`` is **not** declared here: that table has no
+    ORM model in this codebase, so the database (migration and ``schema.sql``)
+    stays the enforcement point, per the module precedent. The FK to
+    ``strategies`` IS declared, because that table is in this metadata.
+    """
+
+    __tablename__ = "option_protection_owners"
+
+    option_run_id = Column(Text, primary_key=True)
+    strategy_id = Column(Text, nullable=False)
+    account_id = Column(Text, nullable=False)
+    execution_environment = Column(Text, nullable=False)
+    owner_run_id = Column(Text, nullable=True)
+    owner_epoch = Column(BigInteger, nullable=False, server_default=text("1"))
+    policy_version = Column(Text, nullable=False)
+    policy = Column(JSON, nullable=False)
+    action_state = Column(Text, nullable=False, server_default=text("'none'"))
+    stage_digest = Column(Text, nullable=True)
+    state = Column(Text, nullable=False, server_default=text("'active'"))
+    released_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "action_state IN ('none', 'claimed', 'staging', 'unresolved')",
+            name="ck_opo_action_state",
+        ),
+        CheckConstraint(
+            "state IN ('active', 'released')",
+            name="ck_opo_state",
+        ),
+        CheckConstraint(
+            "(state = 'active') = (owner_run_id IS NOT NULL)",
+            name="ck_opo_owner_present",
+        ),
+        CheckConstraint(
+            "execution_environment IN ('live', 'paper', 'dry_run')",
+            name="ck_opo_environment",
+        ),
+        ForeignKeyConstraint(
+            ["strategy_id", "account_id"],
+            ["strategies.id", "strategies.account_scope"],
+            name="fk_opo_strategy",
+            ondelete="RESTRICT",
+        ),
+    )
+
+
+class OptionProtectionOwnerEvent(Base):
+    """Append-only evidence of who held an option run, and when (B2.4 S1).
+
+    The owner row is the current truth; this log is the sequence that produced
+    it. A correction is a NEW event, never an edit, which is what makes
+    "who was authoritative at that instant" answerable after the fact.
+    """
+
+    __tablename__ = "option_protection_owner_events"
+
+    id = Column(Text, primary_key=True)
+    option_run_id = Column(Text, nullable=False)
+    owner_epoch = Column(BigInteger, nullable=False)
+    event = Column(Text, nullable=False)
+    owner_run_id = Column(Text, nullable=True)
+    actor_id = Column(Text, nullable=True)
+    detail = Column(JSON, nullable=False, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "event IN ('claimed', 'transferred', 'policy_changed', "
+            "'action_claimed', 'action_resolved', 'released')",
+            name="ck_opo_event",
+        ),
+    )
+
+
 class LivePlanSubmission(Base):
     """The DURABLE claim for one live plan step (preparatory live adapter).
 
