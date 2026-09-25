@@ -34,12 +34,13 @@ and settlement. **No real-money order is placed by any step of this plan.**
   (`backend/strategies/compiler/option_structure.py`) freezes `entry` or `exit` only. No adjust phase.
 - B1: duplicate equivalent entry refused at **execution** (`OPTION_STRUCTURE_ALREADY_OPEN`); option-run work is a
   continuation axis; unresolved protective stage blocks exit and continuation.
-- No repair path for `partial_entry` / `cleanup_required` option runs (only `lifecycle.mark_cleanup_required`).
+- ~~No repair path for `partial_entry` / `cleanup_required` option runs.~~ Superseded by B2.1b (`22766f8`).
 - Per-strategy admission policy exists as an operator-set row (`StrategyAdmissionPolicy`: allocation, per-instrument
   and gross notional, max open instruments, rate, daily loss). It is not declared by the strategy version and has no
   options fields (max loss, margin, structure families, naked permission).
 - Live: all lanes wired and deployed with `HOSTED_LIVE_ENABLED=true` (2026-09-22), no live account in
-  `HOSTED_STRATEGY_ACCOUNT_SCOPES`. Live staged financing refuses `STAGED_LIVE_FINANCING_UNSUPPORTED`.
+  `HOSTED_STRATEGY_ACCOUNT_SCOPES`. ~~Live staged financing refuses `STAGED_LIVE_FINANCING_UNSUPPORTED`.~~ Superseded by
+  C1.1 (`61f9c46`, `be0a94e`, `7cf54c4`): the refusal is removed and the `staged_funding_gate` replaces it.
 
 ## Phase B2: governed dynamic options (paper)
 
@@ -127,7 +128,8 @@ recurring regression passes once; report `documents/hosted-options-dynamic-b2-<d
   places no orders.**
 - **C1 exit requirement:** gated dependent live CNC buys use bounded LIMIT orders before any real account is
   enabled (C1.1 design, decision 1).
-- Runbooks per lane: `documents/runbooks/hosted-live-<lane>.md` (enable, verify, halt, repair, rollback).
+- Runbooks per lane: `documents/runbooks/hosted-live-<lane>.md` (enable, verify, halt, repair, rollback). Update them
+  when C1.2 S2-S5 land (live adjust, approval binding, bounded LIMIT, protection continuity).
 
 ## Phase C2: sequential production rollout
 
@@ -182,5 +184,8 @@ notifications. Record in `documents/hosted-strategies-rollout-<lane>-<date>.md`.
 | C1.1 S3 repair + funds under lock | done, reviewed | `7cf54c4` |
 | B2.6b S3 flatten + owner display | done | `b7c7159` |
 | **B2 paper gate** | **passed - 5/5 scenarios `ok=true`** | `documents/hosted-options-b2-completion-2026-09-26.md`; `examples/hosted_platform/evidence/phase5-20260925T183422Z.json` |
-| C1.2 design | in progress | |
+| C1.2 design | accepted | `4af40b2` |
+| C1.2 S1 option margin + chain freshness | done, reviewed | `9dbba29` |
+| C1.2 S2 live adjust/roll | in progress | |
+| C1 runbooks (4 lanes) | done, reviewed | this commit |
 | Independent review: C1.1 + B2.4 | done (C1.1 clean; 3 B2.4 findings fixed) | |
