@@ -106,7 +106,7 @@ def _owner_store(factory):
     return OptionProtectionOwnerStore(session_factory=factory)
 
 
-def _entry(pg) -> tuple[object, str, str, str]:
+def _entry(pg, *, seed_worker: bool = False) -> tuple[object, str, str, str]:
     """One entry plan resolved on POSTGRES: the owner claim happens inline.
 
     Returns ``(factory, option_run_id, owner_run_id, strategy_id)`` where
@@ -117,14 +117,38 @@ def _entry(pg) -> tuple[object, str, str, str]:
     legs = _structure_legs()
     run_id = _new_run_id()
     strategy_id, plan_id = _strategy_and_plan(
-        factory, legs=legs, run_id=run_id, account=ACCOUNT
+        factory,
+        legs=legs,
+        run_id=run_id,
+        account=ACCOUNT,
+        resolved_extra={
+            "structure_digest": "digest-entry-1",
+            "structure_id": "structure-entry-1",
+            "underlying": "NIFTY",
+            "expiry": "2026-10-29",
+        },
     )
     _bind_run(factory, run_id=run_id, strategy_id=strategy_id, account=ACCOUNT)
-    target = _resolve(
-        factory, plan_id, strategy_id=strategy_id, account=ACCOUNT, environment="paper"
-    )
-    # ``_resolve`` hardcodes the hosted worker run this entry is attributed to.
-    return factory, str(target["option_run_id"]), "run-hosted-1", str(strategy_id)
+    if seed_worker:
+        target = _resolve(
+            factory,
+            plan_id,
+            strategy_id=strategy_id,
+            account=ACCOUNT,
+            environment="paper",
+            worker_run_id=run_id,
+        )
+        owner_run_id = run_id
+    else:
+        target = _resolve(
+            factory,
+            plan_id,
+            strategy_id=strategy_id,
+            account=ACCOUNT,
+            environment="paper",
+        )
+        owner_run_id = "run-hosted-1"
+    return factory, str(target["option_run_id"]), owner_run_id, str(strategy_id)
 
 
 def _owner_rows(factory, option_run_id: str) -> list[dict]:
@@ -173,7 +197,9 @@ class TestEntryClaim:
             option_protection_policy_version,
         )
 
-        factory, option_run_id, owner_run_id, strategy_id = _entry(pg)
+        factory, option_run_id, owner_run_id, strategy_id = _entry(
+            pg, seed_worker=True
+        )
 
         rows = _owner_rows(factory, option_run_id)
         assert len(rows) == 1
@@ -198,6 +224,24 @@ class TestEntryClaim:
         assert [event["event"] for event in events] == ["claimed"]
         assert int(events[0]["owner_epoch"]) == 1
         assert events[0]["owner_run_id"] == owner_run_id
+
+        # The creation hook also puts the SAME frozen digest on the worker run,
+        # so the generic protection loop does not depend on a second owner read.
+        from sqlalchemy import text
+
+        with factory() as session:
+            state = session.execute(
+                text(
+                    "SELECT runtime_state_json FROM public.algo_worker_runs "
+                    "WHERE strategy_run_id = :run"
+                ),
+                {"run": owner_run_id},
+            ).scalar()
+        if isinstance(state, str):
+            state = json.loads(state)
+        assert state["backend_protection"]["structure"] == {
+            "structure_digest": "digest-entry-1"
+        }
 
         # A reader on a run that genuinely has no owner row gets ``None`` (never
         # a fabricated "active"), while an unreadable row raises: that distinction
@@ -748,8 +792,10 @@ class TestSafetyGateResolvesThroughTheOwnerRow:
         assert snapshot["blocking_reason"] == gate._OPTION_PROTECTION_OWNER_UNKNOWN, snapshot
         assert _gate_reasons(snapshot) == ["OPTION_PROTECTION_OWNER_UNKNOWN"], snapshot
 
-    def test_an_unreadable_owner_row_leaves_a_non_option_run_alone(self, pg, monkeypatch):
-        """Twin: a worker run with NO option runs keeps the old, clean answer."""
+    def test_an_unreadable_owner_row_fails_closed_even_for_no_known_option_runs(
+        self, pg, monkeypatch
+    ):
+        """Owner enumeration failure is unknown; it never reports a clean run."""
         from backend.options.protection.ownership import OptionProtectionOwnerStore
 
         def _unreadable(self, *args, **kwargs):
@@ -759,9 +805,10 @@ class TestSafetyGateResolvesThroughTheOwnerRow:
 
         snapshot = _option_snapshot_for_worker(pg, monkeypatch, worker_run_id="run-no-options")
 
-        assert snapshot["applicable"] is False, snapshot
-        assert snapshot["blocking"] is False, snapshot
-        assert _gate_reasons(snapshot) == [], snapshot
+        assert snapshot["applicable"] is True, snapshot
+        assert snapshot["blocking"] is True, snapshot
+        assert snapshot["blocking_reason"] == "OPTION_PROTECTION_OWNER_UNKNOWN", snapshot
+        assert _gate_reasons(snapshot) == ["OPTION_PROTECTION_OWNER_UNKNOWN"], snapshot
 
 
 def test_migration_round_trip_on_a_scratch_database():

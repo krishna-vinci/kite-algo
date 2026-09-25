@@ -478,6 +478,17 @@ class _FakeWorkerRepository:
         run["runtime_state"] = state
         return dict(run)
 
+    async def update_run_backend_protection_with_owner_policy(self, strategy_run_id, protection, protection_state, *, expected_generation=None, expected_triggered_rule=None, expected_exit_claim_id=None, timeline_events=None, owner_policy_writer=None):
+        run = await self.update_run_backend_protection(
+            strategy_run_id,
+            protection,
+            protection_state,
+            expected_generation=expected_generation,
+            expected_triggered_rule=expected_triggered_rule,
+            expected_exit_claim_id=expected_exit_claim_id,
+        )
+        return None if run is None else {"run": run, "timeline_events": []}
+
     async def update_run_backend_protection_state(self, strategy_run_id, protection_state, *, expected_generation=None, expected_triggered_rule=None, expected_exit_claim_id=None):
         run = self.runs[strategy_run_id]
         state = dict(run.get("runtime_state") or {})
@@ -2225,6 +2236,88 @@ class AlgoWorkerProtectionApiTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(ctx.exception.status_code, 409)
+
+    async def test_patch_owner_policy_failure_rolls_back_run_config(self):
+        """The run config and owner CAS are one write; an owner failure is not success."""
+        repo = _FakeWorkerRepository()
+        repo.runs["run-owner-cas-fails"] = {
+            "strategy_run_id": "run-owner-cas-fails",
+            "token_id": "worker-1",
+            "template_id": "momentum",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {"backend_protection": {"enabled": False}},
+            "metadata": {},
+        }
+        calls = []
+
+        async def atomic_update(_run_id, _protection, _state, **_kwargs):
+            calls.append("run_write")
+            raise RuntimeError("owner CAS unavailable")
+
+        repo.update_run_backend_protection_with_owner_policy = atomic_update
+        request = self._request(repo)
+
+        with self.assertRaises(HTTPException) as ctx:
+            await patch_worker_run_protection(
+                request,
+                "run-owner-cas-fails",
+                WorkerProtectionPatchRequest(
+                    backend_protection={
+                        "enabled": True,
+                        "basket": {"stoploss_pct": 4},
+                    }
+                ),
+            )
+
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(calls, ["run_write"])
+        self.assertEqual(repo.runs["run-owner-cas-fails"]["runtime_state"]["backend_protection"]["enabled"], False)
+
+    async def test_patch_commits_run_config_and_owner_policy_together(self):
+        """Twin: the shared-session writer is the only committed patch path."""
+        repo = _FakeWorkerRepository()
+        repo.runs["run-owner-cas-ok"] = {
+            "strategy_run_id": "run-owner-cas-ok",
+            "token_id": "worker-1",
+            "template_id": "momentum",
+            "account_scope": "kite:paper-a",
+            "execution_mode": "paper",
+            "status": "open",
+            "runtime_state": {"backend_protection": {"enabled": False}},
+            "metadata": {},
+        }
+        seen = []
+        shared_db = []
+
+        async def atomic_update(run_id, protection, state, *, owner_policy_writer=None, **_kwargs):
+            owner_policy_writer("shared-session")
+            seen.append((run_id, protection["enabled"], state["generation"], "shared-session"))
+            return {
+                "run": await repo.update_run_backend_protection(run_id, protection, state)
+            }
+
+        repo.update_run_backend_protection_with_owner_policy = atomic_update
+        with patch(
+            "backend.api.routers.worker_protection._sync_protection_owner_policy",
+            lambda run_id, protection, **kwargs: shared_db.append(kwargs.get("db"))
+            or "opt_run_1",
+        ):
+            result = await patch_worker_run_protection(
+                self._request(repo),
+                "run-owner-cas-ok",
+                WorkerProtectionPatchRequest(
+                    backend_protection={
+                        "enabled": True,
+                        "basket": {"stoploss_pct": 4},
+                    }
+                ),
+            )
+
+        self.assertEqual(result["runtime_state"]["backend_protection"]["enabled"], True)
+        self.assertEqual(seen[0][1:3], (True, 1))
+        self.assertEqual(shared_db, ["shared-session"])
 
     async def test_live_worker_intent_routes_through_live_order_service_with_attribution(self):
         sys.modules.pop("broker_api.orders", None)
@@ -5703,7 +5796,7 @@ class ProtectionOwnerPolicySyncTests(unittest.TestCase):
         calls = []
 
         class _Store:
-            def list_protection_owners(self, *, owner_run_id):
+            def list_protection_owners(self, *, owner_run_id, db=None):
                 self.owner_run_id = owner_run_id
                 return [
                     {
@@ -5713,7 +5806,7 @@ class ProtectionOwnerPolicySyncTests(unittest.TestCase):
                     }
                 ]
 
-            def update_policy(self, option_run_id, policy, observed_epoch, *, owner_run_id=None):
+            def update_policy(self, option_run_id, policy, observed_epoch, *, owner_run_id=None, db=None):
                 calls.append((option_run_id, policy, observed_epoch, owner_run_id))
                 return {"option_run_id": option_run_id}
 
@@ -5735,6 +5828,55 @@ class ProtectionOwnerPolicySyncTests(unittest.TestCase):
         self.assertEqual(owner_run_id, "run-1")
         self.assertEqual(policy["structure_digest"], "digest-new")
         self.assertEqual(policy["structure_id"], "structure-1")
+
+    def test_failed_owner_read_fails_closed_before_the_legacy_fallback(self):
+        """An owner read failure is unknown even when the second lookup clears it."""
+        from backend.api.routers import worker_protection as wp
+
+        class _Store:
+            def get_run_in_session(self, _session, run_id):
+                self.run_id = run_id
+                raise KeyError(run_id)
+
+        store = _Store()
+        with patch.object(
+            wp, "_option_run_ids_owned_by_worker", side_effect=RuntimeError("owner read failed")
+        ), patch.object(wp, "_worker_run_has_option_runs", return_value=False):
+            snapshot = wp._resolve_option_observation_snapshot(store, object(), "worker-run")
+
+        self.assertTrue(snapshot["applicable"])
+        self.assertTrue(snapshot["blocking"])
+        self.assertEqual(snapshot["blocking_reason"], "OPTION_PROTECTION_OWNER_UNKNOWN")
+        self.assertFalse(hasattr(store, "run_id"))
+
+    def test_a_successful_owner_read_reports_the_option_reason(self):
+        from backend.api.routers import worker_protection as wp
+
+        class _Store:
+            def get_run_in_session(self, _session, run_id):
+                self.run_id = run_id
+                return object()
+
+        snapshot_payload = {
+            "applicable": True,
+            "run_status": "entered",
+            "evaluation_mode": "run_state",
+            "triggered": True,
+            "blocking": True,
+            "blocking_reason": "OPTIONS_PROTECTION_TRIGGERED",
+        }
+        with patch.object(
+            wp,
+            "_option_run_ids_owned_by_worker",
+            return_value=["opt_run_hosted"],
+        ), patch.object(
+            wp,
+            "_build_option_observation_snapshot",
+            return_value=snapshot_payload,
+        ):
+            snapshot = wp._resolve_option_observation_snapshot(_Store(), object(), "worker-run")
+
+        self.assertEqual(snapshot["blocking_reason"], "OPTIONS_PROTECTION_TRIGGERED")
 
 
 if __name__ == "__main__":

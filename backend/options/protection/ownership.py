@@ -76,6 +76,37 @@ POLICY_SNAPSHOT_KEYS = (
     "max_loss",
 )
 
+def option_protection_policy_for_patch(
+    current_policy: Mapping[str, Any] | None, protection: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Project a worker-run protection patch onto an owner-row policy.
+
+    The plan facts survive from the row; the keys the patch actually determines
+    are replaced. Both the worker API and continuation use this projection, so
+    they derive the same policy version from the same run config.
+    """
+
+    policy = dict(current_policy or {}) if isinstance(current_policy, Mapping) else {}
+    source = protection if isinstance(protection, Mapping) else {}
+    structure = source.get("structure")
+    if isinstance(structure, Mapping) and str(structure.get("structure_digest") or ""):
+        policy["structure_digest"] = str(structure["structure_digest"])
+    operations = source.get("operations")
+    if isinstance(operations, Mapping):
+        policy["operations"] = dict(operations)
+        stale = bool(operations.get("exit_on_worker_stale")) or (
+            operations.get("worker_stale_sec") is not None
+        )
+        if stale:
+            policy["stale_exit_policy"] = "exit_on_worker_stale"
+    positions = source.get("positions")
+    if isinstance(positions, list):
+        policy["rules"] = [dict(row) for row in positions if isinstance(row, Mapping)]
+    if "basket" in source:
+        policy["basket"] = source.get("basket")
+    policy["enabled"] = bool(source.get("enabled"))
+    return policy
+
 ACTION_STATES = ("none", "claimed", "staging", "unresolved")
 
 CONFLICT = "OPTION_PROTECTION_OWNER_CONFLICT"

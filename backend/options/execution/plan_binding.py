@@ -1,5 +1,4 @@
 """Durable edge: frozen ``option_structure`` plan -> existing option run.
-
 The options lane already has a durable run engine (``option_run_states`` +
 ``DurableOptionRunStore`` + ``lifecycle``). What it did not have was a durable
 way for a *paper plan execution* to say which run it created (entry) or which
@@ -1955,6 +1954,127 @@ def resolve_plan_option_run(
     }
 
 
+def _seed_worker_protection_structure(
+    session: Any, worker_run_id: str, policy_snapshot: Mapping[str, Any]
+) -> None:
+    """Put the entry's structure identity on the worker run, in THIS txn.
+
+    The owner row remains authoritative, but seeding the run config removes the
+    protection loop's dependence on a second owner read. A worker row that is
+    not reachable here is not fatal: the runtime still resolves the identity
+    from that ACTIVE owner policy.
+    """
+
+    digest = str(policy_snapshot.get("structure_digest") or "")
+    if not digest:
+        return
+    dialect = _dialect_name(session)
+    if dialect != "postgresql":
+        return
+    lock = " FOR UPDATE" if dialect == "postgresql" else ""
+    row = session.execute(
+        text(
+            "SELECT runtime_state_json FROM public.algo_worker_runs "
+            "WHERE strategy_run_id = :run" + lock
+        ),
+        {"run": str(worker_run_id)},
+    ).first()
+    if row is None:
+        return
+    raw_state = row[0]
+    if isinstance(raw_state, str):
+        try:
+            runtime_state = json.loads(raw_state)
+        except ValueError as exc:
+            raise PlanBindingRefusal(
+                "OPTION_WORKER_RUN_STATE_UNREADABLE",
+                {"worker_run_id": str(worker_run_id)},
+            ) from exc
+    else:
+        runtime_state = dict(raw_state or {})
+    if not isinstance(runtime_state, Mapping):
+        raise PlanBindingRefusal(
+            "OPTION_WORKER_RUN_STATE_UNREADABLE",
+            {"worker_run_id": str(worker_run_id)},
+        )
+    protection = dict(runtime_state.get("backend_protection") or {})
+    structure = protection.get("structure")
+    existing_digest = (
+        str(structure.get("structure_digest") or "")
+        if isinstance(structure, Mapping)
+        else ""
+    )
+    if existing_digest and existing_digest != digest:
+        raise PlanBindingRefusal(
+            "OPTION_WORKER_STRUCTURE_MISMATCH",
+            {
+                "worker_run_id": str(worker_run_id),
+                "existing_structure_digest": existing_digest,
+                "plan_structure_digest": digest,
+            },
+        )
+    protection["structure"] = {"structure_digest": digest}
+    runtime_state = dict(runtime_state)
+    runtime_state["backend_protection"] = protection
+    encoded = json.dumps(runtime_state)
+    value_sql = "CAST(:state AS jsonb)" if dialect == "postgresql" else ":state"
+    session.execute(
+        text(
+            "UPDATE public.algo_worker_runs "
+            f"SET runtime_state_json = {value_sql}, updated_at = "
+            + ("NOW()" if dialect == "postgresql" else "CURRENT_TIMESTAMP")
+            + " WHERE strategy_run_id = :run"
+        ),
+        {"state": encoded, "run": str(worker_run_id)},
+    )
+
+
+def _entry_policy_for_worker(
+    session: Any, worker_run_id: str, policy_snapshot: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Freeze the worker run's operational block with the plan's structure facts.
+
+    Stale-exit operations are declared by the hosted run, while identity and
+    rule facts are frozen by the option plan. Recording both at entry keeps the
+    owner-row policy version comparable to the run config before any patch.
+    """
+
+    snapshot = dict(policy_snapshot)
+    if _dialect_name(session) != "postgresql":
+        return snapshot
+    row = session.execute(
+        text(
+            "SELECT runtime_state_json FROM public.algo_worker_runs "
+            "WHERE strategy_run_id = :run"
+        ),
+        {"run": str(worker_run_id)},
+    ).first()
+    if row is None:
+        return snapshot
+    raw_state = row[0]
+    if isinstance(raw_state, str):
+        try:
+            state = json.loads(raw_state)
+        except ValueError:
+            state = None
+    else:
+        state = raw_state
+    config = dict((state or {}).get("backend_protection") or {})
+    operations = config.get("operations")
+    if isinstance(operations, Mapping):
+        snapshot["operations"] = dict(operations)
+        if bool(operations.get("exit_on_worker_stale")) or (
+            operations.get("worker_stale_sec") is not None
+        ):
+            snapshot["stale_exit_policy"] = "exit_on_worker_stale"
+    positions = config.get("positions")
+    if isinstance(positions, list):
+        snapshot["rules"] = [dict(row) for row in positions if isinstance(row, Mapping)]
+    if "basket" in config:
+        snapshot["basket"] = config.get("basket")
+    return snapshot
+
+
 def _create_entry_run_atomically(
     plan: Mapping[str, Any],
     *,
@@ -2076,8 +2196,13 @@ def _create_entry_run_atomically(
         # way round) is not a state this platform can be left in. The owner is
         # the worker run, so a run created without one refuses by name here
         # rather than committing an ownerless "active" row.
-        policy_snapshot = option_protection_policy_snapshot(
+        frozen_policy = option_protection_policy_snapshot(
             plan.get("resolved_plan") or {}
+        )
+        policy_snapshot = (
+            _entry_policy_for_worker(session, str(worker_run_id), frozen_policy)
+            if worker_run_id is not None
+            else frozen_policy
         )
         OptionProtectionOwnerStore(
             session_factory=binding_store.session_factory
@@ -2088,6 +2213,8 @@ def _create_entry_run_atomically(
             option_protection_policy_version(policy_snapshot),
             db=session,
         )
+        if worker_run_id is not None:
+            _seed_worker_protection_structure(session, worker_run_id, frozen_policy)
         session.commit()
         return {
             "phase": "entry",

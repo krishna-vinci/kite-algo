@@ -6,7 +6,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, AsyncGenerator, Dict, List, Mapping, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Mapping, NoReturn, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
@@ -17,6 +17,7 @@ from backend.broker_api.timeline.worker_timeline import worker_timeline_store
 from backend.app.database import SessionLocal
 from backend.options.protection.ownership import (
     OWNER_UNKNOWN as _OPTION_PROTECTION_OWNER_UNKNOWN,
+    OptionProtectionOwnerRefusal,
 )
 from backend.api.schemas.worker import WorkerDecisionEventRequest, WorkerProtectionPatchRequest, WorkerRiskPatchRequest, WorkerRunPnlLeg, WorkerRunPnlSnapshot, WorkerRunPnlTotals, WorkerFundsSegment, WorkerFundsSnapshot, WorkerExitRequest
 from backend.api.routers.worker_shared import *
@@ -797,15 +798,13 @@ def _resolve_option_observation_snapshot(
             pass
 
     if owner_read_failed:
-        try:
-            has_option_runs = _worker_run_has_option_runs(session, strategy_run_id)
-        except Exception:
-            has_option_runs = False
-        if has_option_runs:
-            return _option_observation_snapshot(
-                applicable=True,
-                blocking_reason=_OPTION_PROTECTION_OWNER_UNKNOWN,
-            )
+        # The fallback is safe only after we know there is NO owner row. While
+        # the authoritative owner read itself failed, even a clean-looking second
+        # read cannot rule out a hosted structure keyed by another identity.
+        return _option_observation_snapshot(
+            applicable=True,
+            blocking_reason=_OPTION_PROTECTION_OWNER_UNKNOWN,
+        )
 
     if not option_run_ids:
         try:
@@ -1045,70 +1044,52 @@ def _protection_owner_policy_for_patch(
     when the protection did.
     """
 
-    policy = dict(current_policy or {}) if isinstance(current_policy, Mapping) else {}
-    structure = protection.get("structure")
-    if isinstance(structure, Mapping) and str(structure.get("structure_digest") or ""):
-        policy["structure_digest"] = str(structure["structure_digest"])
-    operations = protection.get("operations")
-    if isinstance(operations, Mapping):
-        policy["operations"] = dict(operations)
-        stale = bool(operations.get("exit_on_worker_stale")) or (
-            operations.get("worker_stale_sec") is not None
-        )
-        if stale:
-            policy["stale_exit_policy"] = "exit_on_worker_stale"
-    positions = protection.get("positions")
-    if isinstance(positions, list):
-        policy["rules"] = [dict(row) for row in positions if isinstance(row, Mapping)]
-    if "basket" in protection:
-        policy["basket"] = protection.get("basket")
-    policy["enabled"] = bool(protection.get("enabled"))
-    return policy
+    from backend.options.protection.ownership import option_protection_policy_for_patch
+
+    return option_protection_policy_for_patch(current_policy, protection)
 
 
-def _sync_protection_owner_policy(strategy_run_id: str, protection: Dict[str, Any]) -> Optional[str]:
+def _sync_protection_owner_policy(
+    strategy_run_id: str, protection: Dict[str, Any], *, db: Any = None
+) -> Optional[str]:
     """Mirror a patched protection policy onto the run's ACTIVE owner row.
 
-    Returns the option run id the policy was frozen on, or ``None`` when this
-    worker run owns no structure. ORDERING: the run's own config write commits
-    first (that config is what the protection loop evaluates), and this then
-    freezes the same policy on the owner row in ONE epoch CAS. A row that moved
-    under us - a successor transfer, or a competing adjust - leaves the policy
-    where it is rather than reporting a structure's policy twice; the caller
-    re-reads and reconciles. Mirroring is bookkeeping: it never turns a
-    successful config write into a failed route.
+    Pass ``db`` to freeze the policy on the CALLER'S transaction; the worker API
+    joins this to the run-config CAS. Without ``db`` this is a separate,
+    authoritative pre-write used only by repositories that cannot share a
+    session. Any refusal or database failure propagates: a protection patch may
+    not silently leave the owner row stale.
     """
 
-    try:
-        from backend.options.protection.ownership import (
-            OptionProtectionOwnerStore,
-            OptionProtectionOwnerRefusal,
-        )
+    from backend.options.protection.ownership import OptionProtectionOwnerStore
 
-        store = OptionProtectionOwnerStore()
-        rows = store.list_protection_owners(owner_run_id=str(strategy_run_id))
-    except Exception:  # noqa: BLE001 - bookkeeping never fails the config write
-        return None
+    store = OptionProtectionOwnerStore()
+    rows = store.list_protection_owners(owner_run_id=str(strategy_run_id), db=db)
     mirrored: Optional[str] = None
     for row in rows:
         option_run_id = str(row.get("option_run_id") or "")
         if not option_run_id:
             continue
-        try:
-            store.update_policy(
-                option_run_id,
-                _protection_owner_policy_for_patch(row.get("policy"), protection),
-                int(row.get("owner_epoch") or 0),
-                owner_run_id=str(strategy_run_id),
-            )
-        except OptionProtectionOwnerRefusal:
-            # A row that moved under this write keeps its own policy: the
-            # successor (or the adjust that won the epoch) is authoritative.
-            continue
-        except Exception:  # noqa: BLE001 - bookkeeping, never the config write
-            continue
+        store.update_policy(
+            option_run_id,
+            _protection_owner_policy_for_patch(row.get("policy"), protection),
+            int(row.get("owner_epoch") or 0),
+            owner_run_id=str(strategy_run_id),
+            db=db,
+        )
         mirrored = option_run_id
     return mirrored
+
+def _raise_owner_sync_failure(exc: Exception) -> NoReturn:
+    if isinstance(exc, OptionProtectionOwnerRefusal):
+        raise HTTPException(
+            status_code=409,
+            detail="Protection ownership changed concurrently; reload and retry",
+        ) from exc
+    raise HTTPException(
+        status_code=503,
+        detail="Protection owner policy could not be synchronized",
+    ) from exc
 
 def _preserve_backend_trailing_state(next_state: Dict[str, Any], previous_state: Dict[str, Any]) -> Dict[str, Any]:
     preserved = dict(next_state)
@@ -1314,7 +1295,47 @@ async def patch_worker_run_protection(request: Request, strategy_run_id: str, pa
         reason=payload.reason,
     )
     previous_generation = _to_int(previous_state.get("generation"), default=0)
+    if hasattr(_repo(request), "update_run_backend_protection_with_owner_policy"):
+        def owner_policy_writer(db: Any) -> Optional[str]:
+            return _sync_protection_owner_policy(
+                strategy_run_id, protection, db=db
+            )
+
+        try:
+            result = await _repo(
+                request
+            ).update_run_backend_protection_with_owner_policy(
+                strategy_run_id,
+                protection,
+                next_state,
+                expected_generation=previous_generation,
+                expected_triggered_rule=previous_state.get("triggered_rule") or "",
+                expected_exit_claim_id=previous_state.get("exit_claim_id") or "",
+                timeline_events=[reset_event] if reset_event else [],
+                owner_policy_writer=owner_policy_writer,
+            )
+        except OptionProtectionOwnerRefusal as exc:
+            _raise_owner_sync_failure(exc)
+        except Exception as exc:
+            _raise_owner_sync_failure(exc)
+        if result is None:
+            raise HTTPException(status_code=409, detail="Backend protection changed concurrently; reload and retry")
+        for event in list(result.get("timeline_events") or []):
+            await publish_event(f"worker.execution.events:{strategy_run_id}", event)
+        return result.get("run")
+
     if hasattr(_repo(request), "update_run_backend_protection_with_events"):
+        try:
+            # This fallback is used by older test doubles only: the owner CAS is
+            # authoritative before the config write, so an owner refusal cannot
+            # leave a new run config behind.
+            await asyncio.to_thread(
+                _sync_protection_owner_policy, strategy_run_id, protection
+            )
+        except OptionProtectionOwnerRefusal as exc:
+            _raise_owner_sync_failure(exc)
+        except Exception as exc:
+            _raise_owner_sync_failure(exc)
         result = await _repo(request).update_run_backend_protection_with_events(
             strategy_run_id,
             protection,
@@ -1326,13 +1347,18 @@ async def patch_worker_run_protection(request: Request, strategy_run_id: str, pa
         )
         if result is None:
             raise HTTPException(status_code=409, detail="Backend protection changed concurrently; reload and retry")
-        # The patched policy is the structure's protection now, so the owner row
-        # that the option gates read is frozen on the same policy (B2.4 S4).
-        await asyncio.to_thread(_sync_protection_owner_policy, strategy_run_id, protection)
         for event in list(result.get("timeline_events") or []):
             await publish_event(f"worker.execution.events:{strategy_run_id}", event)
         return result.get("run")
 
+    try:
+        await asyncio.to_thread(
+            _sync_protection_owner_policy, strategy_run_id, protection
+        )
+    except OptionProtectionOwnerRefusal as exc:
+        _raise_owner_sync_failure(exc)
+    except Exception as exc:
+        _raise_owner_sync_failure(exc)
     updated = await _repo(request).update_run_backend_protection(
         strategy_run_id,
         protection,
@@ -1343,7 +1369,6 @@ async def patch_worker_run_protection(request: Request, strategy_run_id: str, pa
     )
     if updated is None:
         raise HTTPException(status_code=409, detail="Backend protection changed concurrently; reload and retry")
-    await asyncio.to_thread(_sync_protection_owner_policy, strategy_run_id, protection)
     return updated
 
 async def list_worker_execution_events(

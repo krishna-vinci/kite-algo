@@ -697,7 +697,24 @@ def test_a_protected_held_option_structure_hands_over_and_keeps_its_owner(factor
     option_run_id = _hold_option_structure(
         factory, strategy.id, run_id=run_id, status="entered"
     )
-    claimed = _claim_protection_owner(factory, option_run_id, run_id)
+    claimed = _claim_protection_owner(
+            factory,
+            option_run_id,
+            run_id,
+            policy={
+                "structure_digest": "sha256:structure-1",
+                "structure_id": "vertical_spread",
+                "underlying": "NIFTY",
+                "expiry": "2026-10-29",
+                "expiry_policy": "exit_before_cutoff",
+                "operations": {
+                    "exit_on_worker_stale": True,
+                    "worker_stale_sec": 600,
+                },
+                "stale_exit_policy": "exit_on_worker_stale",
+                "rules": [],
+            },
+        )
     policy_version = str(claimed["policy_version"])
 
     response = _release(repo, factory, job, completion="exited", exit_code=0)

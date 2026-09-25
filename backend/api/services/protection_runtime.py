@@ -225,6 +225,21 @@ class WorkerProtectionRuntime:
         )
         did_trigger = bool(next_state.get("status") == "triggered" and not state.get("exit_submitted"))
         if did_trigger:
+            owner = self._protection_owner_context(run)
+            structure = self._structure_identity(config)
+            if structure is None and owner is not None:
+                policy = owner.get("policy")
+                digest = str((policy or {}).get("structure_digest") or "")
+                if digest:
+                    structure = {"structure_digest": digest}
+            if owner is not None and structure is None:
+                # Resolve before the durable claim: an ACTIVE option owner with
+                # no structure identity is refused by name, never sent to the
+                # generic whole-book submitter and never left claim-only.
+                raise RuntimeError(
+                    "OPTION_PROTECTION_STRUCTURE_UNKNOWN: active owner policy "
+                    "does not name a structure"
+                )
             claim_id = str(uuid.uuid4())
             claimed_state = {
                 **next_state,
@@ -244,14 +259,12 @@ class WorkerProtectionRuntime:
                 return False
             await self._publish_timeline_rows(claimed_result.get("timeline_events") or [])
 
-            structure = self._structure_identity(config)
             if structure is not None:
                 # Structure-aware: the exit is derived SERVER-SIDE from the
                 # durable option run's own legs and own confirmed fills, staged
                 # short-first, and submitted through the platform's own
                 # risk-reducing authority. An evaluator's recommended orders are
                 # never trusted, and a whole-book liquidation is never used here.
-                owner = self._protection_owner_context(run)
                 # The CLAIM is mirrored before the stage: the owner row is where
                 # the action state lives, so a gate that reads it while the stage
                 # is in flight must already see the claim, not "none".

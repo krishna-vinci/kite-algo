@@ -82,11 +82,14 @@ class _OwnerRowRepo(_StructureRepo):
     row.
     """
 
-    def __init__(self, *, owner_state="active", also_in_run_list=True):
+    def __init__(self, *, owner_state="active", also_in_run_list=True, owner_policy=None):
         super().__init__(structure=dict(_OWNED_STRUCTURE))
         self.runs[0]["status"] = "closed"
         self.owner_state = owner_state
         self.also_in_run_list = also_in_run_list
+        self.owner_policy = dict(owner_policy) if owner_policy is not None else {
+            "structure_digest": "digest-owned"
+        }
 
     async def list_protection_enabled_runs(self):
         if not self.also_in_run_list:
@@ -107,7 +110,7 @@ class _OwnerRowRepo(_StructureRepo):
                     "owner_epoch": 1,
                     "action_state": "none",
                     "policy_version": "v" * 64,
-                    "policy": {"structure_digest": "digest-owned"},
+                    "policy": dict(self.owner_policy),
                     "option_run_status": "entered",
                 },
             }
@@ -483,6 +486,68 @@ class WorkerProtectionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(owner_store.calls[0][3], 1)
         self.assertEqual(owner_store.calls[1][2], "stage-1")
+
+    async def test_an_owner_row_supplies_the_missing_run_structure_identity(self):
+        """An active option owner never falls through to whole-book liquidation."""
+        repo = _OwnerRowRepo()
+        repo.runs[0]["runtime_state"]["backend_protection"].pop("structure")
+        owner_store = _OwnerMirrorStore()
+        structure_exit = AsyncMock(
+            return_value={
+                "submitted": True,
+                "complete": True,
+                "reason": "submitted",
+                "option_run_id": "opt_run_abc123",
+                "stage_digest": "stage-1",
+            }
+        )
+        exit_submitter = AsyncMock(return_value={"status": "closed"})
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": [
+                {"symbol": "NSE:INFY", "product": "CNC", "side": "BUY", "quantity": 1,
+                 "net_quantity": 1, "average_price": 100, "last_price": 94}
+            ]}),
+            exit_submitter=exit_submitter,
+            structure_exit_submitter=structure_exit,
+            owner_store=owner_store,
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result, {"evaluated": 1, "triggered": 1, "errors": 0})
+        structure_exit.assert_awaited_once()
+        exit_submitter.assert_not_awaited()
+
+    async def test_an_owner_row_without_a_resolvable_structure_refuses(self):
+        """Unknown structure identity is an error, never generic liquidation."""
+        repo = _OwnerRowRepo(owner_policy={})
+        repo.runs[0]["runtime_state"]["backend_protection"].pop("structure")
+        exit_submitter = AsyncMock()
+        structure_exit = AsyncMock()
+        runtime = WorkerProtectionRuntime(
+            repo=repo,
+            pnl_loader=AsyncMock(return_value={"legs": [
+                {"symbol": "NSE:INFY", "product": "CNC", "side": "BUY", "quantity": 1,
+                 "net_quantity": 1, "average_price": 100, "last_price": 94}
+            ]}),
+            exit_submitter=exit_submitter,
+            structure_exit_submitter=structure_exit,
+            owner_store=_OwnerMirrorStore(),
+            now_fn=lambda: datetime(2026, 4, 25, 12, 1, tzinfo=timezone.utc),
+            squareoff_schedule={},
+        )
+
+        result = await runtime.evaluate_once()
+
+        self.assertEqual(result, {"evaluated": 1, "triggered": 0, "errors": 1})
+        exit_submitter.assert_not_awaited()
+        structure_exit.assert_not_awaited()
+        state = repo.saved[-1][1]["backend_protection_state"]
+        self.assertEqual(state["status"], "error")
+        self.assertIn("OPTION_PROTECTION_STRUCTURE_UNKNOWN", state["error"])
 
     async def test_a_released_owner_row_is_not_evaluated(self):
         """Twin: no owner row, no evaluation - even for a structure we know about."""

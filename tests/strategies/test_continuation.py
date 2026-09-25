@@ -339,6 +339,51 @@ def test_an_owner_row_that_disagrees_with_itself_is_not_an_owner():
     assert result.reason_code == CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED
 
 
+def test_a_predecessor_policy_that_differs_from_the_owner_row_refuses():
+    """Even without a recorded handover, the run's current config is authority."""
+    from backend.options.protection.ownership import (
+        option_protection_policy_for_patch,
+        option_protection_policy_version,
+    )
+
+    policy = {
+        "structure_digest": "owner-digest",
+        "underlying": "NIFTY",
+        "rules": [],
+        "operations": {},
+    }
+    row = _owner(policy=policy)
+    protection = {
+        "structure": {"structure_digest": "run-digest"},
+        "positions": [{"symbol": "NSE:INFY"}],
+        "operations": {"exit_on_worker_stale": True},
+    }
+    result = assess_continuation(
+        _protected_option_book(
+            option_protection_owners=[row],
+            option_protection=protection,
+        )
+    )
+
+    assert result.allowed is False
+    assert result.reason_code == CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED
+
+    # The twin pins the comparison to the same patch projection, not raw config.
+    matching_row = _owner(
+        policy=option_protection_policy_for_patch(policy, protection)
+    )
+    result = assess_continuation(
+        _protected_option_book(
+            option_protection_owners=[matching_row],
+            option_protection=protection,
+        )
+    )
+    assert result.allowed is True
+    assert matching_row["policy_version"] == option_protection_policy_version(
+        option_protection_policy_for_patch(policy, protection)
+    )
+
+
 @pytest.mark.parametrize(
     "owner",
     [

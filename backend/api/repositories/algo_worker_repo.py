@@ -276,6 +276,7 @@ class SqlAlchemyAlgoWorkerRepository:
         expected_triggered_rule: Optional[str] = None,
         expected_exit_claim_id: Optional[str] = None,
         timeline_events: Optional[List[Dict[str, Any]]] = None,
+        owner_policy_writer: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(
             self._update_run_backend_protection_with_events_sync,
@@ -286,6 +287,30 @@ class SqlAlchemyAlgoWorkerRepository:
             expected_triggered_rule,
             expected_exit_claim_id,
             timeline_events,
+        )
+
+    async def update_run_backend_protection_with_owner_policy(
+        self,
+        strategy_run_id: str,
+        protection: Dict[str, Any],
+        protection_state: Dict[str, Any],
+        *,
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+        timeline_events: Optional[List[Dict[str, Any]]] = None,
+        owner_policy_writer: Optional[Any] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._update_run_backend_protection_with_owner_policy_sync,
+            strategy_run_id,
+            protection,
+            protection_state,
+            expected_generation,
+            expected_triggered_rule,
+            expected_exit_claim_id,
+            timeline_events,
+            owner_policy_writer,
         )
 
     async def update_run_backend_protection_state(
@@ -315,6 +340,7 @@ class SqlAlchemyAlgoWorkerRepository:
         expected_triggered_rule: Optional[str] = None,
         expected_exit_claim_id: Optional[str] = None,
         timeline_events: Optional[List[Dict[str, Any]]] = None,
+        owner_policy_writer: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(
             self._update_run_backend_protection_state_with_events_sync,
@@ -1072,6 +1098,7 @@ class SqlAlchemyAlgoWorkerRepository:
         expected_triggered_rule: Optional[str] = None,
         expected_exit_claim_id: Optional[str] = None,
         timeline_events: Optional[List[Dict[str, Any]]] = None,
+        owner_policy_writer: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
         db = self.session_factory()
         try:
@@ -1127,6 +1154,11 @@ class SqlAlchemyAlgoWorkerRepository:
                 db.rollback()
                 return None
 
+            if owner_policy_writer is not None:
+                # The owner CAS joins this transaction. A refusal here rolls the
+                # run config and timeline rows back before anything is visible.
+                owner_policy_writer(db)
+
             committed_events: List[Dict[str, Any]] = []
             for timeline_event in list(timeline_events or []):
                 payload = dict(timeline_event)
@@ -1155,6 +1187,28 @@ class SqlAlchemyAlgoWorkerRepository:
             raise
         finally:
             db.close()
+
+    def _update_run_backend_protection_with_owner_policy_sync(
+        self,
+        strategy_run_id: str,
+        protection: Dict[str, Any],
+        protection_state: Dict[str, Any],
+        expected_generation: Optional[int] = None,
+        expected_triggered_rule: Optional[str] = None,
+        expected_exit_claim_id: Optional[str] = None,
+        timeline_events: Optional[List[Dict[str, Any]]] = None,
+        owner_policy_writer: Optional[Any] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return self._persist_backend_protection_change_sync(
+            strategy_run_id=strategy_run_id,
+            protection=protection,
+            protection_state=protection_state,
+            expected_generation=expected_generation,
+            expected_triggered_rule=expected_triggered_rule,
+            expected_exit_claim_id=expected_exit_claim_id,
+            timeline_events=timeline_events,
+            owner_policy_writer=owner_policy_writer,
+        )
 
     def _update_run_backend_protection_with_events_sync(
         self,

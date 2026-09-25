@@ -235,6 +235,10 @@ class ContinuationEvidence:
     #: empty list means no owner evidence was readable - which a protected book
     #: refuses BY NAME, never as "nobody owns it".
     option_protection_owners: List[Dict[str, Any]] = field(default_factory=list)
+    #: The predecessor's CURRENT protection config. The owner row is compared
+    #: against the policy this config projects, even when no handover record was
+    #: seeded on an initial attempt.
+    option_protection: Optional[Mapping[str, Any]] = None
     #: The ownership the predecessor run was HANDED when it took the structure
     #: (``runtime_state.protection_owner``): ``{"owner_epoch", "policy_version"}``.
     #: ``None`` on a run that predates the owner model; the row's own consistency
@@ -325,6 +329,7 @@ def continuation_digest(evidence: ContinuationEvidence) -> str:
         "option_protection_owner_recorded": dict(
             evidence.option_protection_owner_recorded or {}
         ),
+        "option_protection": dict(evidence.option_protection or {}),
         "unavailable": sorted(evidence.unavailable),
     }
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
@@ -378,16 +383,30 @@ def _owner_row_matches_predecessor(
       seeded), the row must still carry that exact epoch and policy version. A
       newer epoch means somebody moved the structure; a different version means
       the policy changed under the attempt.
+    * the row must also match the policy implied by the predecessor's CURRENT
+      run config. This closes the initial-attempt case that never had a handover
+      record: an owner row cannot silently keep an older policy after a patch.
     """
 
-    from backend.options.protection.ownership import option_protection_policy_version
+    from backend.options.protection.ownership import (
+        option_protection_policy_for_patch,
+        option_protection_policy_version,
+    )
 
     try:
         version = str(row.get("policy_version") or "")
         if not version:
             return False
-        if str(option_protection_policy_version(row.get("policy"))) != version:
+        policy = row.get("policy")
+        if str(option_protection_policy_version(policy)) != version:
             return False
+        if evidence.option_protection is not None:
+            expected = option_protection_policy_for_patch(
+                policy if isinstance(policy, Mapping) else {},
+                evidence.option_protection,
+            )
+            if str(option_protection_policy_version(expected)) != version:
+                return False
         recorded = evidence.option_protection_owner_recorded
         if not isinstance(recorded, Mapping) or not recorded:
             return True
@@ -1047,6 +1066,7 @@ class ContinuationCollector:
             protection_state = "unknown"
             protection_enabled = False
             protection_owner_record: Dict[str, Any] = {}
+            option_protection: Optional[Mapping[str, Any]] = None
             recovery_action_required = False
             run_status: Optional[str] = None
             try:
@@ -1057,8 +1077,13 @@ class ContinuationCollector:
             if run is not None:
                 run_status = str(run["status"] or "")
                 runtime_state = dict(run.get("runtime_state") or {})
+                config = runtime_state.get("backend_protection")
+                if isinstance(config, Mapping):
+                    option_protection = dict(config)
+                elif "backend_protection" in runtime_state:
+                    unavailable.append("backend_protection")
                 protection_enabled = bool(
-                    dict(runtime_state.get("backend_protection") or {}).get("enabled")
+                    dict(config or {}).get("enabled")
                 )
                 # The ownership THIS run was handed when it took the structure,
                 # if it was handed one: the successor's creation seeds it, so a
@@ -1222,6 +1247,7 @@ class ContinuationCollector:
             option_work_state=str(option_work.get("state") or "unknown"),
             option_runs=[str(item) for item in list(option_work.get("runs") or [])],
             option_protection_owners=protection_owners,
+            option_protection=option_protection,
             option_protection_owner_recorded=(
                 protection_owner_record or None
             ),

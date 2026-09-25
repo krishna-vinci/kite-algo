@@ -291,7 +291,15 @@ def _plan_for(
     return plan_id
 
 
-def _resolve(factory, plan_id: str, *, strategy_id: str, account: str = ACCOUNT, environment: str = "paper"):
+def _resolve(
+    factory,
+    plan_id: str,
+    *,
+    strategy_id: str,
+    account: str = ACCOUNT,
+    environment: str = "paper",
+    worker_run_id: str = "run-hosted-1",
+):
     import json
 
     from sqlalchemy import text
@@ -319,7 +327,7 @@ def _resolve(factory, plan_id: str, *, strategy_id: str, account: str = ACCOUNT,
         strategy_id=strategy_id,
         account_id=account,
         execution_environment=environment,
-        worker_run_id="run-hosted-1",
+        worker_run_id=worker_run_id,
         binding_store=PlanOptionRunBindingStore(session_factory=factory),
         run_store=DurableOptionRunStore(session_factory=factory),
     )
