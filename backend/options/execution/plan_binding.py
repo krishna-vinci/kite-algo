@@ -59,12 +59,18 @@ _BINDING_COLUMNS = (
 #: longer move) the structure, so it is not a duplicate of a new entry.
 _TERMINAL_RUN_STATUSES = frozenset({"exited", "settled"})
 
+#: A run in one of these states still owns work the platform has neither proved
+#: finished nor repaired, so opening ANY new option structure on top of it would
+#: stack exposure the operator never approved. ``entered`` is deliberately
+#: absent: a cleanly held DIFFERENT structure never blocks a new entry.
+_UNRESOLVED_RUN_STATUSES = frozenset(
+    {"created", "entry_previewed", "entering", "partial_entry",
+     "cleanup_required", "exit_previewed", "exiting", "partial_exit"}
+)
+
 #: The durable vocabulary of ``backend.options.execution.models.OptionRunStatus``.
 #: A status outside it is UNKNOWN, which is never treated as "finished".
-_KNOWN_RUN_STATUSES = frozenset(
-    {"created", "entry_previewed", "entering", "entered", "partial_entry",
-     "cleanup_required", "exit_previewed", "exiting", "partial_exit"}
-) | _TERMINAL_RUN_STATUSES
+_KNOWN_RUN_STATUSES = _UNRESOLVED_RUN_STATUSES | {"entered"} | _TERMINAL_RUN_STATUSES
 
 
 class PlanOptionRunBindingStore:
@@ -314,29 +320,68 @@ def _same_structure(
     return plan_keys == run_keys
 
 
-def _assert_no_equivalent_open_structure(
-    *,
+def is_option_entry_plan(plan: Mapping[str, Any]) -> bool:
+    """Whether the option-entry gate applies to this frozen plan.
+
+    The gate covers exactly an ``option_structure`` plan whose frozen phase is
+    ``entry``. An exit plan closes work that already exists, and every other plan
+    kind has no option run to duplicate, so both are left untouched. The phase is
+    read from the FROZEN block only: re-deciding it here would be a second copy
+    of the compiler's contract.
+    """
+    resolved = plan.get("resolved_plan") or {}
+    if str(resolved.get("target_kind") or "") != "option_structure":
+        return False
+    block = resolved.get("option_run")
+    declared = block.get("phase") if isinstance(block, Mapping) else None
+    return str(declared or "entry").strip().lower() == "entry"
+
+
+def assess_option_entry_admissibility(
     plan: Mapping[str, Any],
-    plan_id: str,
+    *,
     strategy_id: str,
     account_id: str,
     execution_environment: str,
     session: Any,
 ) -> None:
-    """Refuse a duplicate equivalent option structure BEFORE a run is created.
+    """Refuse an option ENTRY this strategy's own durable work already blocks.
 
-    A retry of the SAME plan is idempotent through its binding (the caller checks
-    that first). What this refuses is a DIFFERENT plan that would open the same
-    structure while this strategy already owns it, in the same account and
-    environment: a restarted strategy, a re-issued signal, or a second plan for
-    one structure. Only a structure that is provably finished (``exited`` /
-    ``settled``) stops blocking.
+    This is the ONE rule, asked from three places with the same answer: before
+    the owner is asked to approve (request creation), at admission, and at
+    execution under the entry advisory locks. It is side-effect free - it reads
+    this strategy's own scope-derived option runs and either returns or raises;
+    it never creates a run, a binding or an order.
+
+    A retry of the SAME plan is idempotent through its binding (the execution
+    caller checks that first). What this refuses is:
+
+    * an EQUIVALENT structure this strategy already owns, in any status that is
+      not provably finished - a restarted strategy, a re-issued signal, or a
+      second plan for one structure (``OPTION_STRUCTURE_ALREADY_OPEN``);
+    * ANY of this strategy's runs in a status that is not finished, and any run
+      whose own records still carry an unresolved protective stage
+      (``OPTION_STRUCTURE_UNRESOLVED``). A cleanly ``entered`` DIFFERENT
+      structure is the one non-terminal state that stays admissible.
+
+    A run THIS plan is already bound to never blocks this plan: it is the plan's
+    own structure, not a second one, so a retry keeps resolving to it exactly as
+    the execution path's binding re-read does. (The live lane asks this again
+    while its own entry is legitimately in flight, between materialization and
+    the release of its withheld steps.)
+
+    Only a structure that is provably finished (``exited`` / ``settled``, with
+    no unresolved protective stage) stops blocking. Non-option plans and option
+    EXIT plans are not gated at all.
 
     The discovery is the platform's OWN scope-derived option-run read, and it
     fails closed: unknown or truncated discovery, a run whose identity cannot be
     compared, or a run whose status is outside the durable vocabulary all refuse
     rather than behave as "no runs".
     """
+    if not is_option_entry_plan(plan):
+        return
+    plan_id = str(plan.get("plan_id") or "")
     from backend.strategies.execution_snapshot import OwnedWorkSnapshotService
 
     try:
@@ -378,7 +423,11 @@ def _assert_no_equivalent_open_structure(
     for row in list(runs or []):
         run_status = str(row.get("status") or "").strip().lower()
         option_run_id = str(row.get("option_run_id") or "")
-        if run_status in _TERMINAL_RUN_STATUSES:
+        protective_unresolved = bool(row.get("protective_exit_unresolved"))
+        if plan_id and plan_id in {str(value) for value in (row.get("plan_ids") or [])}:
+            # This plan's OWN run, reached through this plan's own edge.
+            continue
+        if run_status in _TERMINAL_RUN_STATUSES and not protective_unresolved:
             # Finished structures do not block a new entry.
             continue
         same = _same_structure(plan, row)
@@ -407,6 +456,22 @@ def _assert_no_equivalent_open_structure(
                     "message": (
                         "a held option run of this strategy cannot be compared against "
                         "the frozen structure; refusing to open a second one"
+                    ),
+                },
+            )
+        if protective_unresolved or run_status in _UNRESOLVED_RUN_STATUSES:
+            raise PlanBindingRefusal(
+                "OPTION_STRUCTURE_UNRESOLVED",
+                {
+                    "plan_id": str(plan_id),
+                    "option_run_id": option_run_id,
+                    "status": run_status or "unknown",
+                    "originating_plan_id": row.get("originating_plan_id"),
+                    "message": (
+                        "this strategy already owns an option run that is not finished"
+                        if not protective_unresolved
+                        else "this strategy already owns an option run whose protective "
+                        "stage is unresolved; resolve it before opening another structure"
                     ),
                 },
             )
@@ -739,11 +804,13 @@ def _create_entry_run_atomically(
             session.rollback()
             return _existing(existing)
 
-        # Before a NEW run exists: refuse a duplicate equivalent structure this
-        # strategy already holds. Unknown discovery refuses (never "no runs").
-        _assert_no_equivalent_open_structure(
+        # Before a NEW run exists: refuse an option entry this strategy's own
+        # durable work already blocks (an equivalent structure, or any run that
+        # is not finished). Unknown discovery refuses (never "no runs"). This is
+        # the SAME rule the early callers ask, re-read here under the entry locks
+        # so it stays the race-safe one.
+        assess_option_entry_admissibility(
             plan=plan,
-            plan_id=plan_id,
             strategy_id=strategy_id,
             account_id=account_id,
             execution_environment=execution_environment,

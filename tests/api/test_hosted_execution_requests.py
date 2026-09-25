@@ -47,6 +47,7 @@ from backend.strategies.attribution_models import (  # noqa: E402
     LivePlanSubmission,
     StrategyPlanExecutionEvent,
     StrategyPlan,
+    StrategyPlanOptionRun,
     StrategyPositionProjection,
     StrategyProjectionState,
     StrategyProposal,
@@ -64,7 +65,10 @@ from backend.strategies.models import (  # noqa: E402
     HostedExecutionAudit,
     StrategyJob,
 )
-from backend.strategies.plan_pipeline import PlanExecutionPipeline  # noqa: E402
+from backend.strategies.plan_pipeline import (  # noqa: E402
+    PlanExecutionPipeline,
+    PipelineRefusal,
+)
 from backend.strategies.proposals import ProposalStore  # noqa: E402
 from backend.strategies.repository import SqlAlchemyStrategyRepository  # noqa: E402
 from backend.strategies.reservations import ReservationLedger  # noqa: E402
@@ -103,6 +107,27 @@ _PUBLIC_DDL = (
         mapping_id TEXT PRIMARY KEY, instrument_id TEXT, broker TEXT, broker_exchange TEXT,
         broker_symbol TEXT, broker_token TEXT, valid_from_generation TEXT,
         valid_to_generation TEXT, is_current INTEGER
+    )
+    """,
+    # The options lane's durable run table, exactly as ``schema.sql`` defines it.
+    # The plan/run discovery reads it with a raw ``public.`` query, so it must
+    # exist here for an option-entry plan to be assessed at all.
+    """
+    CREATE TABLE public.option_run_states (
+        strategy_run_id TEXT PRIMARY KEY,
+        strategy_name TEXT NOT NULL,
+        product VARCHAR(8) NOT NULL CHECK (product IN ('MIS', 'NRML')),
+        status VARCHAR(64) NOT NULL,
+        legs TEXT NOT NULL DEFAULT '[]',
+        protection TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        orders TEXT NOT NULL DEFAULT '[]',
+        trades TEXT NOT NULL DEFAULT '[]',
+        completed_legs TEXT NOT NULL DEFAULT '[]',
+        failed_legs TEXT NOT NULL DEFAULT '[]',
+        pending_legs TEXT NOT NULL DEFAULT '[]',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
     """,
 )
@@ -299,6 +324,150 @@ def _plan(
         )
         session.commit()
     return plan_id, plan_hash
+
+
+#: Frozen structure identities for the option-entry gate tests. Two DIFFERENT
+#: digests are two different structures; the same digest is a duplicate.
+HELD_DIGEST = "a" * 64
+OTHER_DIGEST = "b" * 64
+
+
+def _option_legs():
+    """Two frozen option legs, shaped exactly as the compiler emits them."""
+    return [
+        {
+            "instrument_id": "opt-sold-25000",
+            "tradingsymbol": "NIFTY26OCT25000CE",
+            "broker_symbol": "NIFTY26OCT25000CE",
+            "broker_exchange": "NFO",
+            "exchange": "NFO",
+            "product": "NRML",
+            "side": "SELL",
+            "ratio": 1,
+            "quantity": 75,
+            "signed_quantity": -75,
+            "reference_price": 100.0,
+            "lot_size": 75,
+        },
+        {
+            "instrument_id": "opt-bought-26000",
+            "tradingsymbol": "NIFTY26OCT26000CE",
+            "broker_symbol": "NIFTY26OCT26000CE",
+            "broker_exchange": "NFO",
+            "exchange": "NFO",
+            "product": "NRML",
+            "side": "BUY",
+            "ratio": 1,
+            "quantity": 75,
+            "signed_quantity": 75,
+            "reference_price": 80.0,
+            "lot_size": 75,
+        },
+    ]
+
+
+def _option_plan(
+    factory,
+    *,
+    strategy,
+    run_id=RUN_ID,
+    account=ACCOUNT,
+    digest=OTHER_DIGEST,
+    plan_id=None,
+):
+    """A validated frozen ``option_structure`` ENTRY plan of this strategy."""
+    plan_id = plan_id or str(uuid.uuid4())
+    proposal_id = str(uuid.uuid4())
+    legs = _option_legs()
+    resolved = {
+        "target_kind": "option_structure",
+        "product": "NRML",
+        "structure_digest": digest,
+        "legs": legs,
+        "option_run": {"phase": "entry", "option_run_id": None},
+    }
+    with factory() as session:
+        session.add(
+            StrategyProposal(
+                proposal_id=proposal_id,
+                strategy_id=str(strategy.id),
+                account_id=str(account),
+                evaluation_id=f"eval-{proposal_id}",
+                evaluation_kind="run_now",
+                job_id=None,
+                strategy_run_id=str(run_id),
+                target_kind="option_structure",
+                payload={"legs": legs, "phase": "entry"},
+                payload_sha256="o" * 64,
+                status="validated",
+            )
+        )
+        session.flush()
+        session.add(
+            StrategyPlan(
+                plan_id=plan_id,
+                proposal_id=proposal_id,
+                strategy_id=str(strategy.id),
+                account_id=str(account),
+                plan_kind="option_structure",
+                plan_hash="h" * 64,
+                logical_plan={"legs": legs},
+                resolved_plan=resolved,
+                pinned_universe_revision_id=None,
+                pinned_member_hash=None,
+                pinned_catalog_generation=GENERATION_ID,
+            )
+        )
+        session.commit()
+    return plan_id
+
+
+def _own_option_run(world, *, plan_id, status=None):
+    """A durable option run THIS strategy owns, reached from ``plan_id``'s edge."""
+    from backend.options.execution.durable_store import DurableOptionRunStore
+    from backend.options.execution.models import OptionRunCreateRequest
+
+    run = DurableOptionRunStore(session_factory=world["factory"]).create_run(
+        OptionRunCreateRequest(
+            strategy_name="held-structure",
+            product="NRML",
+            legs=[
+                {
+                    "tradingsymbol": "NIFTY26OCT25000CE",
+                    "transaction_type": "SELL",
+                    "quantity": 75,
+                },
+                {
+                    "tradingsymbol": "NIFTY26OCT26000CE",
+                    "transaction_type": "BUY",
+                    "quantity": 75,
+                },
+            ],
+            metadata={"source": "b21a-entry-gate"},
+        )
+    )
+    with world["factory"]() as session:
+        session.add(
+            StrategyPlanOptionRun(
+                plan_id=str(plan_id),
+                option_run_id=run.strategy_run_id,
+                strategy_id=str(world["strategy"].id),
+                account_id=ACCOUNT,
+                execution_environment="paper",
+                phase="entry",
+            )
+        )
+        session.commit()
+        if status is not None:
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states SET status = :status "
+                    "WHERE strategy_run_id = :run"
+                ),
+                {"status": str(status), "run": run.strategy_run_id},
+            )
+            session.commit()
+    return run.strategy_run_id
 
 
 @pytest.fixture()
@@ -555,6 +724,149 @@ def test_manual_request_waits_and_executes_nothing(world):
     # And nothing is claimable while it waits.
     assert world["service"].claim_next(limit=10, now=NOW) == []
     assert _audit_events(world)[-1] == "requested"
+
+
+# ---------------------------------------------------------------------------
+# option entries: the structure gate runs BEFORE the owner is asked
+# ---------------------------------------------------------------------------
+
+
+def test_an_option_entry_request_refuses_a_structure_the_strategy_already_holds(world):
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    held_run = _own_option_run(world, plan_id=held_plan, status="created")
+    # A DIFFERENT plan freezing the SAME structure (a restarted evaluation).
+    candidate = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=candidate, idempotency_key="opt-dup-0001", now=NOW
+    )
+
+    request = created["request"]
+    assert request["status"] == "refused"
+    assert request["refusal_code"] == "OPTION_STRUCTURE_ALREADY_OPEN"
+    assert request["refusal_detail"]["option_run_id"] == held_run
+    assert request["refusal_detail"]["option_run_status"] == "created"
+    assert request["refusal_detail"]["stage"] == "request"
+    # The owner is never asked to approve it, and nothing became dispatchable.
+    assert world["service"].claim_next(limit=10, now=NOW) == []
+
+    # Admission asks the SAME rule and refuses the SAME plan by the SAME name.
+    with pytest.raises(PipelineRefusal) as ctx:
+        world["pipeline"].admit(world["pipeline"].plan(candidate), environment="paper")
+    assert ctx.value.reason_code == "OPTION_STRUCTURE_ALREADY_OPEN"
+
+
+def test_an_option_entry_request_refuses_while_an_unresolved_run_is_owned(world):
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    held_run = _own_option_run(world, plan_id=held_plan, status="partial_entry")
+    # A DIFFERENT structure: nothing about it is a duplicate, and a new entry is
+    # refused anyway while the strategy's own partial run is unresolved.
+    candidate = _option_plan(world["factory"], strategy=world["strategy"], digest=OTHER_DIGEST)
+
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=candidate, idempotency_key="opt-unres-0001", now=NOW
+    )
+
+    request = created["request"]
+    assert request["status"] == "refused"
+    assert request["refusal_code"] == "OPTION_STRUCTURE_UNRESOLVED"
+    assert request["refusal_detail"]["option_run_id"] == held_run
+    assert request["refusal_detail"]["status"] == "partial_entry"
+    assert request["refusal_detail"]["plan_id"] == candidate
+
+    with pytest.raises(PipelineRefusal) as ctx:
+        world["pipeline"].admit(world["pipeline"].plan(candidate), environment="paper")
+    assert ctx.value.reason_code == "OPTION_STRUCTURE_UNRESOLVED"
+    assert ctx.value.detail["option_run_id"] == held_run
+
+
+def test_approval_refuses_when_an_unresolved_run_appears_while_waiting(world):
+    candidate = _option_plan(world["factory"], strategy=world["strategy"], digest=OTHER_DIGEST)
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=candidate, idempotency_key="opt-approve-0001", now=NOW
+    )
+    assert created["request"]["status"] == "awaiting_approval"
+
+    # The world moved while the owner was deciding: another plan of this strategy
+    # now owns a run that is entering, so this plan must not become dispatchable.
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    held_run = _own_option_run(world, plan_id=held_plan, status="entering")
+
+    approved = world["service"].approve(
+        created["request"]["request_id"],
+        owner_id=OWNER,
+        strategy_id=world["strategy"].id,
+        actor=OWNER,
+        now=NOW,
+    )
+
+    assert approved["approved"] is False
+    assert approved["request"]["status"] == "refused"
+    assert approved["request"]["refusal_code"] == "OPTION_STRUCTURE_UNRESOLVED"
+    assert approved["request"]["refusal_detail"]["stage"] == "approval"
+    assert approved["request"]["refusal_detail"]["option_run_id"] == held_run
+    assert world["service"].claim_next(limit=10, now=NOW) == []
+
+
+def test_a_cleanly_entered_different_structure_is_still_admitted(world):
+    _record_policy(world)
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    _own_option_run(world, plan_id=held_plan, status="entered")
+    candidate = _option_plan(world["factory"], strategy=world["strategy"], digest=OTHER_DIGEST)
+
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=candidate, idempotency_key="opt-clean-0001", now=NOW
+    )
+
+    assert created["request"]["status"] == "awaiting_approval"
+    assert created["request"]["refusal_code"] is None
+
+    verdict = world["pipeline"].admit(world["pipeline"].plan(candidate), environment="paper")
+    assert verdict["admitted"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_admission_preview_refuses_a_duplicate_structure_by_name(world):
+    """The owner's own preview is a decision too: 409 with the named refusal."""
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    _own_option_run(world, plan_id=held_plan, status="entered")
+    candidate = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+
+    app, patches = _operator_client(world)
+    try:
+        async with _client(app) as client:
+            response = await client.post(
+                f"/api/strategies/{world['strategy'].id}/plans/{candidate}/admission"
+            )
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert response.status_code == 409, response.text
+    assert (
+        response.json()["detail"]["rejection_reason"] == "OPTION_STRUCTURE_ALREADY_OPEN"
+    )
+
+
+def test_the_option_gate_covers_entry_plans_only():
+    """Exit plans close work that exists; another lane has no option run at all."""
+    from backend.options.execution.plan_binding import is_option_entry_plan
+
+    def frozen(resolved):
+        return {"resolved_plan": resolved}
+
+    entry = frozen({"target_kind": "option_structure", "option_run": {"phase": "entry"}})
+    closing = frozen(
+        {
+            "target_kind": "option_structure",
+            "option_run": {"phase": "exit", "option_run_id": "run-1"},
+        }
+    )
+    other = frozen({"target_kind": "single_instrument", "legs": []})
+
+    assert is_option_entry_plan(entry) is True
+    assert is_option_entry_plan(closing) is False
+    assert is_option_entry_plan(other) is False
 
 
 def test_manual_request_is_idempotent_and_conflicts_on_changed_content(world):

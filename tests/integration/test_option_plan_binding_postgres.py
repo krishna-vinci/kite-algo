@@ -395,7 +395,20 @@ class TestDuplicateStructureAdmission:
         assert self._entry_edge_count(factory, strategy_id) == 2
 
     def test_a_different_structure_is_not_a_duplicate(self, pg):
+        from sqlalchemy import text
+
         factory, strategy_id, _plan_id, _legs, target = self._enter(pg)
+        # A cleanly ENTERED structure is the one non-terminal state that leaves a
+        # DIFFERENT structure admissible (an unresolved one refuses instead).
+        with factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states SET status = 'entered' "
+                    "WHERE strategy_run_id = :r"
+                ),
+                {"r": target["option_run_id"]},
+            )
+            session.commit()
         other_legs = _structure_legs()
         other_legs[0]["tradingsymbol"] = "NIFTY26OCT22500CE"
         other_legs[0]["strike"] = 22500.0
@@ -407,6 +420,28 @@ class TestDuplicateStructureAdmission:
 
         assert resolved["option_run_id"] != target["option_run_id"]
         assert self._entry_edge_count(factory, strategy_id) == 2
+
+    def test_a_different_structure_while_a_run_is_unresolved_refuses(self, pg):
+        """ANY unresolved run of this strategy blocks a new entry, twin or not."""
+        from backend.options.execution.plan_binding import PlanBindingRefusal
+
+        factory, strategy_id, _plan_id, _legs, target = self._enter(pg)
+        other_legs = _structure_legs()
+        other_legs[0]["tradingsymbol"] = "NIFTY26OCT22500CE"
+        other_legs[0]["strike"] = 22500.0
+        other_legs[1]["tradingsymbol"] = "NIFTY26OCT27500CE"
+        other_legs[1]["strike"] = 27500.0
+        second_plan = self._second_attempt(factory, strategy_id, legs=other_legs)
+
+        with pytest.raises(PlanBindingRefusal) as ctx:
+            _resolve(factory, second_plan, strategy_id=strategy_id)
+
+        assert ctx.value.reason_code == "OPTION_STRUCTURE_UNRESOLVED"
+        assert ctx.value.detail["option_run_id"] == target["option_run_id"]
+        assert ctx.value.detail["status"] == "created"
+        assert ctx.value.detail["plan_id"] == second_plan
+        assert self._entry_edge_count(factory, strategy_id) == 1
+        assert _store(factory).get(second_plan) is None
 
     def test_unknown_discovery_refuses_rather_than_reading_no_runs(self, pg):
         """A scope-mismatched edge makes the read UNKNOWN, and unknown refuses."""

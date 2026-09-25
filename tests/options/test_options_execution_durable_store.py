@@ -14,8 +14,18 @@ def _create_request(product: Literal["MIS", "NRML"] = "MIS") -> OptionRunCreateR
         strategy_name="bull_call_spread",
         product=product,
         legs=[
-            {"leg_id": "buy_1", "transaction_type": "BUY", "quantity": 75},
-            {"leg_id": "sell_1", "transaction_type": "SELL", "quantity": 75},
+            {
+                "leg_id": "buy_1",
+                "tradingsymbol": "NIFTY26OCT25000CE",
+                "transaction_type": "BUY",
+                "quantity": 75,
+            },
+            {
+                "leg_id": "sell_1",
+                "tradingsymbol": "NIFTY26OCT26000CE",
+                "transaction_type": "SELL",
+                "quantity": 75,
+            },
         ],
         protection={"stoploss_pct": 20},
         metadata={"source": "test"},

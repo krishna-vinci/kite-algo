@@ -218,12 +218,45 @@ class PlanExecutionPipeline:
         return reader(str(plan.get("account_id") or ""), plan)
 
     def admit(self, plan: Mapping[str, Any], *, environment: str) -> Dict[str, Any]:
+        self._assert_option_entry_admissible(plan, environment=environment)
         verdict = self.admission.evaluate(
             plan,
             execution_environment=environment,
             margin_evidence=self.margin(plan, environment),
         )
         return verdict.as_dict() if hasattr(verdict, "as_dict") else dict(verdict)
+
+    def _assert_option_entry_admissible(
+        self, plan: Mapping[str, Any], *, environment: str
+    ) -> None:
+        """Refuse an option ENTRY the strategy's own durable work already blocks.
+
+        The rule lives with the plan/run binding edge and is the SAME one the
+        execution-time gate applies; asking it BEFORE admission means a plan that
+        would be refused at submission is never admitted (or later approved) as
+        if it could run. Non-option plans and option EXIT plans are untouched.
+        """
+        from backend.options.execution.plan_binding import (
+            PlanBindingRefusal,
+            assess_option_entry_admissibility,
+            is_option_entry_plan,
+        )
+
+        if not is_option_entry_plan(plan):
+            # Every other plan kind and every option EXIT is untouched - answered
+            # here so a non-option admission never opens a session for this.
+            return
+        try:
+            with self.session_factory() as session:
+                assess_option_entry_admissibility(
+                    plan,
+                    strategy_id=str(plan.get("strategy_id") or ""),
+                    account_id=str(plan.get("account_id") or ""),
+                    execution_environment=str(environment),
+                    session=session,
+                )
+        except PlanBindingRefusal as exc:
+            raise PipelineRefusal(exc.reason_code, exc.detail) from exc
 
     def reservation_for_plan(self, plan_id: str) -> Optional[Dict[str, Any]]:
         return self.ledger.for_plan(str(plan_id))

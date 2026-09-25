@@ -1233,9 +1233,14 @@ async def preview_admission(
         session_factory, plan, requested=execution_environment, surface="plan_reserve",
         plan_id=plan_id,
     )
-    return AdmissionVerdictResponse(**_plan_pipeline(request, session_factory).admit(
-        plan, environment=environment
-    ))
+    # A preview is still a decision: an option ENTRY the strategy's own durable
+    # work blocks refuses BY NAME here (409), exactly as it would at reserve.
+    try:
+        return AdmissionVerdictResponse(**_plan_pipeline(request, session_factory).admit(
+            plan, environment=environment
+        ))
+    except PipelineRefusal as exc:
+        raise HTTPException(status_code=409, detail=exc.as_detail()) from exc
 
 
 @router.post("/{strategy_id}/plans/{plan_id}/reserve", response_model=ReservationResponse)

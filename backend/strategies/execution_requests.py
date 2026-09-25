@@ -420,7 +420,29 @@ class ExecutionRequestService:
                 "refusal_code": None,
                 "refusal_detail": {},
             }
-            if mode == "autonomous":
+            # An option ENTRY this strategy's own durable work already blocks is
+            # refused HERE, by name: the owner must never be asked to approve a
+            # plan the platform would refuse at execution anyway.
+            entry_refusal = self._option_entry_refusal(
+                plan=plan,
+                strategy_id=strategy_id,
+                account_id=account_id,
+                execution_environment=environment,
+                session=session,
+            )
+            if entry_refusal is not None:
+                decision.update(
+                    {
+                        "status": "refused",
+                        "refusal_code": entry_refusal["reason_code"],
+                        "refusal_detail": {
+                            "checked_at": moment.isoformat(),
+                            "stage": "request",
+                            **entry_refusal["detail"],
+                        },
+                    }
+                )
+            elif mode == "autonomous":
                 evaluation = self.authorization.evaluate(
                     strategy_id=strategy_id,
                     mode=mode,
@@ -609,6 +631,27 @@ class ExecutionRequestService:
                         "plan_id": str(row.plan_id),
                     }
                 )
+            # The state may have moved while the request waited: re-ask the
+            # structural rule before this becomes dispatchable work.
+            entry_refusal = self._option_entry_refusal(
+                plan=plan,
+                strategy_id=str(row.strategy_id),
+                account_id=str(row.account_id),
+                execution_environment=str(row.execution_environment),
+                session=session,
+            )
+            if entry_refusal is not None:
+                row.status = "refused"
+                row.refusal_code = entry_refusal["reason_code"]
+                row.refusal_detail = {
+                    "checked_at": moment.isoformat(),
+                    "stage": "approval",
+                    **entry_refusal["detail"],
+                }
+                row.updated_at = moment
+                session.add(self._audit(row, "refused", actor, "owner", moment))
+                session.commit()
+                return {"request": self._view(row), "approved": False}
             refusal = self._attempt_refusal(session, row, moment)
             if refusal is not None:
                 row.status = "refused"
@@ -1550,6 +1593,43 @@ class ExecutionRequestService:
             if grant is not None:
                 return str(grant.get("issued_by") or row.get("decision_actor") or "")
         return str(row.get("decision_actor") or "").strip()
+
+    # -- structural admission -----------------------------------------------
+
+    @staticmethod
+    def _option_entry_refusal(
+        *,
+        plan: Mapping[str, Any],
+        strategy_id: str,
+        account_id: str,
+        execution_environment: str,
+        session: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """The named option-entry structural refusal for this plan, or ``None``.
+
+        The rule itself lives with the plan/run binding edge
+        (``assess_option_entry_admissibility``): this only asks it through the
+        service's own session, so an option ENTRY the platform would refuse at
+        execution is refused BY NAME before the owner is ever asked to approve
+        it. An unreadable discovery refuses (``OPTION_STRUCTURE_DISCOVERY_UNKNOWN``)
+        exactly as it does at execution - never "no runs".
+        """
+        from backend.options.execution.plan_binding import (
+            PlanBindingRefusal,
+            assess_option_entry_admissibility,
+        )
+
+        try:
+            assess_option_entry_admissibility(
+                plan,
+                strategy_id=str(strategy_id),
+                account_id=str(account_id),
+                execution_environment=str(execution_environment),
+                session=session,
+            )
+        except PlanBindingRefusal as exc:
+            return {"reason_code": exc.reason_code, "detail": exc.detail}
+        return None
 
     def _attempt_refusal(
         self, session: Any, row: HostedExecutionRequest, moment: datetime

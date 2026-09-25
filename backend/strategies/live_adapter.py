@@ -952,6 +952,7 @@ class LivePlanAdapter:
         margin_evidence: Optional[Mapping[str, Any]],
         catalog_state: Optional[Mapping[str, Any]],
     ) -> Dict[str, Any]:
+        self._check_option_entry_admissibility(plan)
         verdict = self.admission.evaluate(
             plan,
             execution_environment="live",
@@ -969,6 +970,38 @@ class LivePlanAdapter:
                 },
             )
         return {"admitted": True, "detail": dict(verdict.detail or {})}
+
+    def _check_option_entry_admissibility(self, plan: Mapping[str, Any]) -> None:
+        """Refuse a live option ENTRY the strategy's own durable work blocks.
+
+        The rule is the plan/run binding edge's own
+        (``assess_option_entry_admissibility``) - the SAME one the paper
+        admission and the execution-time gate apply - asked here because the live
+        lane admits through its own service rather than ``pipeline.admit``. A run
+        this plan itself is bound to does not block it, so the entry's own
+        withheld steps can still be released.
+        """
+        from backend.options.execution.plan_binding import (
+            PlanBindingRefusal,
+            assess_option_entry_admissibility,
+            is_option_entry_plan,
+        )
+
+        if not is_option_entry_plan(plan):
+            # Every other lane and every option EXIT is untouched - answered here
+            # so a per-step release never opens a session for this.
+            return
+        try:
+            with self.session_factory() as session:
+                assess_option_entry_admissibility(
+                    plan,
+                    strategy_id=str(plan.get("strategy_id") or ""),
+                    account_id=str(plan.get("account_id") or ""),
+                    execution_environment="live",
+                    session=session,
+                )
+        except PlanBindingRefusal as exc:
+            raise LiveRefusal(exc.reason_code, exc.detail) from exc
 
     # -- dispatch -----------------------------------------------------------
 
