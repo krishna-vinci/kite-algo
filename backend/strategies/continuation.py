@@ -97,6 +97,7 @@ CONTINUATION_APPROVAL_OUTSTANDING = "CONTINUATION_APPROVAL_OUTSTANDING"
 CONTINUATION_RECOVERY_ACTION_PENDING = "CONTINUATION_RECOVERY_ACTION_PENDING"
 CONTINUATION_PROTECTION_IN_FLIGHT = "CONTINUATION_PROTECTION_IN_FLIGHT"
 CONTINUATION_PROTECTION_UNKNOWN = "CONTINUATION_PROTECTION_UNKNOWN"
+CONTINUATION_PROTECTION_OWNER_UNKNOWN = "CONTINUATION_PROTECTION_OWNER_UNKNOWN"
 CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED = (
     "CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED"
 )
@@ -125,6 +126,7 @@ CONTINUATION_BLOCKERS = (
     CONTINUATION_RECOVERY_ACTION_PENDING,
     CONTINUATION_PROTECTION_IN_FLIGHT,
     CONTINUATION_PROTECTION_UNKNOWN,
+    CONTINUATION_PROTECTION_OWNER_UNKNOWN,
     CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED,
     CONTINUATION_EXPOSURE_UNKNOWN,
     CONTINUATION_OPTION_WORK_OUTSTANDING,
@@ -227,6 +229,17 @@ class ContinuationEvidence:
     #: One ``option_run_id=state`` entry per run this strategy owns, sorted so
     #: the digest is stable. Evidence for the proof, never an input to the axes.
     option_runs: List[str] = field(default_factory=list)
+    #: The OWNER ROW of every HELD option structure this strategy carries
+    #: (B2.4 S3): ``{"option_run_id", "state", "owner_run_id", "owner_epoch",
+    #: "policy_version", "policy", "action_state", "stage_unresolved"}``. An
+    #: empty list means no owner evidence was readable - which a protected book
+    #: refuses BY NAME, never as "nobody owns it".
+    option_protection_owners: List[Dict[str, Any]] = field(default_factory=list)
+    #: The ownership the predecessor run was HANDED when it took the structure
+    #: (``runtime_state.protection_owner``): ``{"owner_epoch", "policy_version"}``.
+    #: ``None`` on a run that predates the owner model; the row's own consistency
+    #: is then the check.
+    option_protection_owner_recorded: Optional[Dict[str, Any]] = None
     unavailable: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
@@ -293,6 +306,25 @@ def continuation_digest(evidence: ContinuationEvidence) -> str:
         "approval_state": evidence.approval_state,
         "option_work_state": evidence.option_work_state,
         "option_runs": sorted(evidence.option_runs),
+        # A protection owner that moves, is released, or starts acting under the
+        # caller fails the recheck closed - the successor would otherwise adopt a
+        # book whose protection changed between the two reads.
+        "option_protection_owners": [
+            {
+                "option_run_id": str(row.get("option_run_id") or ""),
+                "state": str(row.get("state") or ""),
+                "owner_run_id": row.get("owner_run_id"),
+                "owner_epoch": row.get("owner_epoch"),
+                "policy_version": row.get("policy_version"),
+                "action_state": str(row.get("action_state") or "none"),
+                "stage_unresolved": bool(row.get("stage_unresolved")),
+            }
+            for row in (evidence.option_protection_owners or [])
+            if isinstance(row, Mapping)
+        ],
+        "option_protection_owner_recorded": dict(
+            evidence.option_protection_owner_recorded or {}
+        ),
         "unavailable": sorted(evidence.unavailable),
     }
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
@@ -329,6 +361,47 @@ def _proof(evidence: ContinuationEvidence) -> Dict[str, Any]:
         "protection_enabled": evidence.protection_enabled,
         "evidence_digest": continuation_digest(evidence),
     }
+
+
+def _owner_row_matches_predecessor(
+    row: Mapping[str, Any], evidence: ContinuationEvidence
+) -> bool:
+    """Whether an owner row is still the policy THIS predecessor is running.
+
+    Two checks, and both fail closed:
+
+    * the row must agree with ITSELF - ``policy_version`` is the digest of its
+      own frozen ``policy``, so a row that disagrees with itself is unreadable
+      evidence rather than an owner;
+    * when the predecessor run recorded the ownership it was handed
+      (``runtime_state.protection_owner``, written when the successor's policy is
+      seeded), the row must still carry that exact epoch and policy version. A
+      newer epoch means somebody moved the structure; a different version means
+      the policy changed under the attempt.
+    """
+
+    from backend.options.protection.ownership import option_protection_policy_version
+
+    try:
+        version = str(row.get("policy_version") or "")
+        if not version:
+            return False
+        if str(option_protection_policy_version(row.get("policy"))) != version:
+            return False
+        recorded = evidence.option_protection_owner_recorded
+        if not isinstance(recorded, Mapping) or not recorded:
+            return True
+        recorded_epoch = recorded.get("owner_epoch")
+        if recorded_epoch is not None and int(recorded_epoch) != int(
+            row.get("owner_epoch") or 0
+        ):
+            return False
+        recorded_version = str(recorded.get("policy_version") or "")
+        if recorded_version and recorded_version != version:
+            return False
+        return True
+    except Exception:  # noqa: BLE001 - unreadable evidence is not an owner
+        return False
 
 
 def assess_continuation(evidence: ContinuationEvidence) -> ContinuationAssessment:
@@ -438,19 +511,63 @@ def assess_continuation(evidence: ContinuationEvidence) -> ContinuationAssessmen
     if evidence.protection_state != "settled":
         return blocked(CONTINUATION_PROTECTION_UNKNOWN)
 
-    # 11b. Standing protection ownership is RUN-scoped, not strategy-scoped: the
-    #      protection machinery only covers a run whose own ``status`` is
-    #      ``open`` (see ``_list_protection_enabled_runs`` / the protection
-    #      reader's ``RUN_NOT_OPEN`` gate), and each run carries its OWN pinned
-    #      policy. Handing a held book to a successor run would therefore leave
-    #      TWO protection owners over overlapping positions - a stale policy on
-    #      the predecessor and a new one on the successor - and no supported
-    #      mechanism merges them. There is no safe automatic handover for a
-    #      protected book today, so it is refused BY NAME and stays for explicit
-    #      operator reconciliation. Protection is never disabled to make this
-    #      pass.
+    # 11b. Standing protection ownership. Protection is carried by the OWNER ROW,
+    #      not by the worker run's status (B2.4): one row per option structure,
+    #      moved by a single compare-and-swap, read by the loop even after the
+    #      owning run closes. So a held OPTION structure whose owner row is still
+    #      active under THIS predecessor may continue - the successor's creation
+    #      transfers the row, and there is never an ownerless interval. Every
+    #      other protected book (a non-option run with a generic stale-exit
+    #      policy) still has no safe automatic handover and is refused BY NAME.
+    #      Protection is never disabled to make either shape pass.
     if evidence.protection_enabled:
-        return blocked(CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED)
+        if evidence.option_work_state == "held":
+            owners = [
+                dict(row)
+                for row in (evidence.option_protection_owners or [])
+                if isinstance(row, Mapping)
+            ]
+            # No row, an unreadable row, or a row released while the run is not
+            # terminal: the owner is UNKNOWN. ``absent`` is never read as "nobody
+            # owns this" and never as "safe to continue".
+            if not owners or any(
+                str(row.get("state") or "") != "active" for row in owners
+            ):
+                return blocked(CONTINUATION_PROTECTION_OWNER_UNKNOWN)
+            for row in owners:
+                # The predecessor really is the owner, and the row is still the
+                # policy that predecessor was running. A superseded epoch means
+                # somebody else moved the structure under this attempt.
+                if str(row.get("owner_run_id") or "") != str(evidence.run_id or ""):
+                    return blocked(CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED)
+                if not _owner_row_matches_predecessor(row, evidence):
+                    return blocked(CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED)
+            # ``action_state`` is only a HINT. The run's own stage records are the
+            # evidence, and "none" is never proof that nothing is in flight.
+            if any(
+                str(row.get("action_state") or "none") != "none"
+                or bool(row.get("stage_unresolved"))
+                for row in owners
+            ):
+                return blocked(CONTINUATION_PROTECTION_IN_FLIGHT)
+            notes.append(
+                "a held option structure keeps its protection owner across the "
+                f"handover ({len(owners)} owner row(s), same policy)"
+            )
+        elif not evidence.option_runs:
+            # A protected book with NO option structure at all: the generic,
+            # non-option stale-exit case, whose scope is unchanged (design
+            # decision 4). Its protection has no owner row to hand over.
+            return blocked(CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED)
+        else:
+            # The strategy's options lane exists and holds nothing: every
+            # structure it owns is FINISHED, and a terminal run releases its
+            # owner row (S1). There is no standing protection to hand over, so
+            # the attempt continues exactly as an unprotected one does.
+            notes.append(
+                "the option structures this strategy owns are all finished; "
+                "their protection owners were released with their runs"
+            )
 
     # 12. Discretionary evaluation/approval still outstanding.
     if evidence.approval_state == "outstanding":
@@ -763,16 +880,18 @@ class ContinuationCollector:
             return {
                 "state": "unknown",
                 "runs": [],
+                "detail": [],
                 "reason": str(coverage.get("reason") or "option_run_discovery_unknown"),
             }
         classified = [
             (
                 str(row.get("option_run_id") or ""),
                 self._option_run_state(row),
+                bool(row.get("protective_exit_unresolved")),
             )
             for row in list(runs or [])
         ]
-        states = {state for _run_id, state in classified}
+        states = {state for _run_id, state, _stage in classified}
         if "outstanding" in states:
             aggregate = "outstanding"
         elif "held" in states:
@@ -781,9 +900,75 @@ class ContinuationCollector:
             aggregate = "none"
         return {
             "state": aggregate,
-            "runs": sorted(f"{run_id}={state}" for run_id, state in classified),
+            "runs": sorted(f"{run_id}={state}" for run_id, state, _stage in classified),
+            # The owner evidence needs the run ID and the run's OWN unresolved
+            # stage flag; ``runs`` stays the human-readable axis above.
+            "detail": [
+                {
+                    "option_run_id": run_id,
+                    "state": state,
+                    "stage_unresolved": stage_unresolved,
+                }
+                for run_id, state, stage_unresolved in classified
+            ],
             "reason": "",
         }
+
+    def _option_protection_owner_evidence(
+        self, detail: List[Mapping[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """The owner row of every HELD option structure (B2.4 S3).
+
+        ``OptionProtectionOwnerStore.read`` returns ``None`` only when the row
+        genuinely does not exist; a database error is UNREADABLE. The two are
+        recorded as different states so the assessment refuses by name instead of
+        reading a failed read as "nobody owns this structure".
+
+        The run's own ``stage_unresolved`` flag rides along with each row: the
+        row's ``action_state`` is the loop's hint, the run's stage records are the
+        evidence, and the assessment must consult both.
+        """
+
+        try:
+            from backend.options.protection.ownership import OptionProtectionOwnerStore
+
+            store = OptionProtectionOwnerStore(session_factory=self._session_factory)
+        except Exception:  # noqa: BLE001 - no store means no owner evidence
+            store = None
+
+        rows: List[Dict[str, Any]] = []
+        for item in detail:
+            if str(item.get("state") or "") != "held":
+                continue
+            option_run_id = str(item.get("option_run_id") or "")
+            stage_unresolved = bool(item.get("stage_unresolved"))
+            base: Dict[str, Any] = {
+                "option_run_id": option_run_id,
+                "stage_unresolved": stage_unresolved,
+            }
+            if store is None:
+                rows.append({**base, "state": "unreadable"})
+                continue
+            try:
+                row = store.read(option_run_id)
+            except Exception:  # noqa: BLE001 - an unreadable row is its own state
+                rows.append({**base, "state": "unreadable"})
+                continue
+            if row is None:
+                rows.append({**base, "state": "absent"})
+                continue
+            rows.append(
+                {
+                    **base,
+                    "state": str(row.get("state") or "unknown"),
+                    "owner_run_id": row.get("owner_run_id"),
+                    "owner_epoch": int(row.get("owner_epoch") or 0),
+                    "policy_version": row.get("policy_version"),
+                    "policy": dict(row.get("policy") or {}),
+                    "action_state": str(row.get("action_state") or "none"),
+                }
+            )
+        return rows
 
     # -- the collection ----------------------------------------------------
 
@@ -861,6 +1046,7 @@ class ContinuationCollector:
             # run + protection ownership
             protection_state = "unknown"
             protection_enabled = False
+            protection_owner_record: Dict[str, Any] = {}
             recovery_action_required = False
             run_status: Optional[str] = None
             try:
@@ -874,6 +1060,13 @@ class ContinuationCollector:
                 protection_enabled = bool(
                     dict(runtime_state.get("backend_protection") or {}).get("enabled")
                 )
+                # The ownership THIS run was handed when it took the structure,
+                # if it was handed one: the successor's creation seeds it, so a
+                # handover can compare the row against the epoch and the policy
+                # the predecessor is actually carrying.
+                recorded = runtime_state.get("protection_owner")
+                if isinstance(recorded, Mapping):
+                    protection_owner_record = dict(recorded)
                 protection = dict(runtime_state.get("backend_protection_state") or {})
                 protection_state = "active" if protection.get("exit_submitted") else "settled"
                 recovery = dict(runtime_state.get("runtime_recovery") or {})
@@ -933,8 +1126,16 @@ class ContinuationCollector:
                 option_work = {
                     "state": "unknown",
                     "runs": [],
+                    "detail": [],
                     "reason": "option_run_read_failed",
                 }
+
+            # The owner row of every HELD structure (B2.4 S3). This is a SEPARATE
+            # read from the option-run discovery above: the run's own rows say
+            # what is held, the owner row says who is protecting it.
+            protection_owners = self._option_protection_owner_evidence(
+                option_work.get("detail") or []
+            )
 
             # pending commitments (evidence only; the barrier owns quiescence)
             pending = session.execute(
@@ -1020,6 +1221,10 @@ class ContinuationCollector:
             approval_state=approval_state,
             option_work_state=str(option_work.get("state") or "unknown"),
             option_runs=[str(item) for item in list(option_work.get("runs") or [])],
+            option_protection_owners=protection_owners,
+            option_protection_owner_recorded=(
+                protection_owner_record or None
+            ),
             unavailable=sorted(set(unavailable)),
             notes=notes,
         )

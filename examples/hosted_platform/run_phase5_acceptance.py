@@ -912,6 +912,44 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
             "deadline_seconds": 240,
         },
     },
+    "options_protection_handover": {
+        # Phase B2.4 S3: the SAME persistent strategy, but with a DECLARED
+        # protection policy (``exit_on_worker_stale``), held across two
+        # evaluations. Job 1 enters the structure and finishes with it HELD; job
+        # 2 continues the same durable run and closes it. Between them the
+        # structure is protected by its OWNER ROW, which survives job 1's run
+        # closure and is transferred to job 2's successor run at creation.
+        "source": "options_index_setup_adjustment.py",
+        "schema": "options_index_setup.schema.json",
+        "risk_policy": {
+            "allowed_structure_families": ["vertical_spread"],
+            "naked_permitted": False,
+        },
+        "options_recurring": True,
+        # A protection policy the strategy actually declares: not "none".
+        "stale_exit_policy": "exit_on_worker_stale",
+        "protection_handover": True,
+        "autonomous": False,
+        "expects_manual": True,
+        "final_marker": "structure closed with no outstanding work",
+        "recurring_jobs": [
+            {"phase": "entry", "params": {"hold_after_entry": True}},
+            {"phase": "close", "params": {}},
+        ],
+        "params": {
+            "underlying": "NIFTY",
+            "index_ticker": "NSE:NIFTY50",
+            "interval": "5minute",
+            "lookback": 40,
+            "rsi_period": 5,
+            "bullish_rsi_level": 40,
+            "long_offset_points": 0,
+            "short_offset_points": 100,
+            "product": "NRML",
+            "expiry_policy": "exit_before_cutoff",
+            "deadline_seconds": 240,
+        },
+    },
     "options_dynamic_resize_roll": {
         # Phase B2.2 S5: ONE persistent delta-neutral straddle with protective
         # wings, managed across four supervised evaluations against the SAME
@@ -2413,7 +2451,9 @@ def run_options_recurring_scenario(
             "account_scope": account,
             "max_duration_s": 1800,
             "progress_deadline_s": 900,
-            "stale_exit_policy": "none",
+            # A scenario may DECLARE a standing protection policy (B2.4's
+            # handover case does); the B1 restart case declares none.
+            "stale_exit_policy": str(spec.get("stale_exit_policy") or "none"),
         },
     )
     strategy_id = str(created["strategy_id"])
@@ -2436,6 +2476,8 @@ def run_options_recurring_scenario(
     failures: List[str] = []
     jobs_evidence: List[Dict[str, Any]] = []
     phases: List[Dict[str, Any]] = []
+    #: B2.4 S3 handover checkpoints: who owned the structure at each instant.
+    protection_checkpoints: List[Dict[str, Any]] = []
     job_specs = list(spec.get("recurring_jobs") or [])
     requests_so_far = 0
 
@@ -2488,6 +2530,10 @@ def run_options_recurring_scenario(
         approvals_while_child_alive = 0
         orders_before_approval: Optional[int] = None
         requests_at_child_exit: List[Dict[str, Any]] = []
+        #: The owner row BEFORE the attempt is released (B2.4 S3). Taken once the
+        #: child's own worker run exists AND this strategy has an active owner
+        #: row, so it shows the predecessor owning the structure while it holds.
+        during_run_checkpoint: Optional[Dict[str, Any]] = None
         while time.monotonic() < deadline:
             for row in _requests_for(session_factory, strategy_id):
                 status = str(row["status"])
@@ -2508,6 +2554,33 @@ def run_options_recurring_scenario(
                 elif status == "queued":
                     _dispatch_once(app)
                     _publish_positions(operator, strategy_id)
+            if spec.get("protection_handover") and during_run_checkpoint is None:
+                phase_run_id = _job_run_id(session_factory, job_id)
+                if phase_run_id:
+                    checkpoint = _protection_checkpoint(
+                        session_factory,
+                        strategy_id,
+                        phase=phase,
+                        at="during_run",
+                    )
+                    if checkpoint["active"]:
+                        # A triggered exit RESOLVES its worker run before it can
+                        # submit anything: record the production resolver's own
+                        # answer while the owner row is live.
+                        checkpoint["resolution_probe"] = _protection_resolution_probe(
+                            session_factory,
+                            worker_run_id=phase_run_id,
+                            account_id=account,
+                        )
+                        if job_index > 0 and phases:
+                            checkpoint["superseded_resolution_probe"] = (
+                                _protection_resolution_probe(
+                                    session_factory,
+                                    worker_run_id=str(phases[0].get("run_id") or ""),
+                                    account_id=account,
+                                )
+                            )
+                        during_run_checkpoint = checkpoint
             if supervisor_result:
                 child_exited = True
                 requests_at_child_exit = _requests_for(session_factory, strategy_id)
@@ -2576,11 +2649,27 @@ def run_options_recurring_scenario(
         evidence["child_log"] = log_path.read_text()[-4000:] if log_path.exists() else ""
         job_requests = _requests_for(session_factory, strategy_id)[requests_before:]
         jobs_evidence.append(evidence)
+        job_run_id = _job_run_id(session_factory, job_id) or ""
+        if spec.get("protection_handover"):
+            # The owner row BEFORE this attempt was released, and the one AFTER
+            # its block cleared (which is when the next evaluation may start).
+            if during_run_checkpoint is not None:
+                during_run_checkpoint["expected_owner_run_id"] = job_run_id
+                protection_checkpoints.append(during_run_checkpoint)
+            protection_checkpoints.append(
+                _protection_checkpoint(
+                    session_factory,
+                    strategy_id,
+                    phase=phase,
+                    at="after_block_cleared",
+                )
+            )
         phases.append(
             {
                 "phase": phase,
                 "job_id": job_id,
                 "job_index": job_index,
+                "run_id": job_run_id,
                 "child_exited": child_exited,
                 "params": dict(params),
                 "requests": job_requests,
@@ -2637,11 +2726,6 @@ def run_options_recurring_scenario(
         for row in _requests_for(session_factory, strategy_id)
         if str(row.get("refusal_code") or "") == "OPTION_STRUCTURE_ALREADY_OPEN"
     ]
-    if len(probe) != 1:
-        failures.append(
-            "the platform did not refuse exactly one duplicate-entry probe "
-            f"(refusals={probe!r})"
-        )
     probes_expected = sum(
         1
         for job_spec in job_specs
@@ -2653,6 +2737,9 @@ def run_options_recurring_scenario(
             f"platform refused {len(probe)}"
         )
 
+    if spec.get("protection_handover"):
+        failures.extend(_protection_handover_failures(protection_checkpoints, phases))
+
     for failure in failures:
         fail(f"{label}_acceptance", AssertionError(failure))
 
@@ -2663,6 +2750,7 @@ def run_options_recurring_scenario(
         "requests_total": requests_so_far,
         "option_runs": option_runs,
         "duplicate_entry_refusals": probe,
+        "protection_owner_checkpoints": protection_checkpoints,
         "jobs": jobs_evidence,
         "acceptance": {"ok": not failures, "failures": failures},
     }
@@ -3150,6 +3238,233 @@ def _option_run_ids(session_factory, strategy_id: str) -> List[str]:
                 )
             }
         )
+
+
+def _job_run_id(session_factory, job_id: str) -> Optional[str]:
+    """The worker run the launch bound to this attempt, once it exists."""
+    from sqlalchemy import text
+
+    with session_factory() as session:
+        value = session.execute(
+            text("SELECT run_id FROM public.strategy_jobs WHERE id = :j"),
+            {"j": str(job_id)},
+        ).scalar_one_or_none()
+    return None if value is None else str(value)
+
+
+def _protection_owner_snapshot(session_factory, strategy_id: str) -> Dict[str, Any]:
+    """This strategy's protection OWNER rows and their append-only events (B2.4).
+
+    Protection is carried by the owner row, not by the owning worker run's status,
+    so the row is the fact to check at a handover: exactly one row per structure,
+    one owner, one policy.
+    """
+    from sqlalchemy import text
+
+    with session_factory() as session:
+        active = [
+            dict(row)
+            for row in session.execute(
+                text(
+                    "SELECT o.option_run_id, o.owner_run_id, o.owner_epoch,"
+                    "       o.policy_version, o.action_state, o.state,"
+                    "       s.status AS option_run_status"
+                    "  FROM public.option_protection_owners o"
+                    "  LEFT JOIN option_run_states s"
+                    "    ON s.strategy_run_id = o.option_run_id"
+                    " WHERE o.strategy_id = :sid AND o.state = 'active'"
+                    " ORDER BY o.option_run_id"
+                ),
+                {"sid": str(strategy_id)},
+            ).mappings()
+        ]
+        events = [
+            dict(row)
+            for row in session.execute(
+                text(
+                    "SELECT e.option_run_id, e.event, e.owner_epoch, e.owner_run_id"
+                    "  FROM public.option_protection_owner_events e"
+                    "  JOIN public.option_protection_owners o"
+                    "    ON o.option_run_id = e.option_run_id"
+                    " WHERE o.strategy_id = :sid"
+                    " ORDER BY e.created_at, e.event"
+                ),
+                {"sid": str(strategy_id)},
+            ).mappings()
+        ]
+        statuses = sorted(
+            {
+                str(value or "")
+                for value in session.execute(
+                    text(
+                        "SELECT s.status FROM public.strategy_plan_option_runs b"
+                        "  JOIN option_run_states s ON s.strategy_run_id = b.option_run_id"
+                        " WHERE b.strategy_id = :sid"
+                    ),
+                    {"sid": str(strategy_id)},
+                ).scalars()
+            }
+        )
+    return {"active": active, "events": events, "option_run_statuses": statuses}
+
+
+def _protection_checkpoint(
+    session_factory, strategy_id: str, *, phase: str, at: str
+) -> Dict[str, Any]:
+    """One handover checkpoint: who owned the structure at this instant."""
+    snapshot = _protection_owner_snapshot(session_factory, strategy_id)
+    statuses = list(snapshot["option_run_statuses"])
+    terminal = bool(statuses) and all(
+        status in ("exited", "settled") for status in statuses
+    )
+    return {
+        "phase": phase,
+        "at": at,
+        "active": snapshot["active"],
+        "events": snapshot["events"],
+        "option_run_statuses": statuses,
+        "option_run_terminal": terminal,
+    }
+
+
+def _protection_resolution_probe(
+    session_factory, *, worker_run_id: str, account_id: str
+) -> Dict[str, Any]:
+    """Which option run the PRODUCTION staged-exit engine resolves (B2.4 S3).
+
+    A protective exit's first step is this resolution. The scenario cannot make a
+    stale-exit trigger deterministic inside its own timing, so it asks the same
+    resolver a triggered exit asks - the production call, not a fake trigger -
+    and asserts the answer follows the ACTIVE owner row across the handover.
+    """
+
+    from backend.options.protection.staged_exit import StagedStructureExit
+
+    run_id = str(worker_run_id or "")
+    try:
+        run, resolution = StagedStructureExit(
+            session_factory=session_factory
+        ).resolve_run_for_worker_run(worker_run_id=run_id, account_id=str(account_id or ""))
+    except Exception as exc:  # noqa: BLE001 - reported as its own probe result
+        return {
+            "worker_run_id": run_id,
+            "resolved": None,
+            "reason": f"{type(exc).__name__}",
+            "error": str(exc)[:200],
+        }
+    return {
+        "worker_run_id": run_id,
+        "resolved": None if run is None else str(run.strategy_run_id),
+        "reason": str(resolution.get("reason") or ""),
+        "source": str(resolution.get("source") or ""),
+    }
+
+
+def _protection_handover_failures(
+    checkpoints: List[Dict[str, Any]], phases: List[Dict[str, Any]]
+) -> List[str]:
+    """Every named invariant the B2.4 handover scenario exists to prove."""
+    failures: List[str] = []
+    if len(checkpoints) < 3:
+        failures.append(
+            f"only {len(checkpoints)} protection-owner checkpoint(s) were captured"
+        )
+    policy_versions: set = set()
+    owners_seen: List[set] = []
+    for checkpoint in checkpoints:
+        where = f"{checkpoint['phase']}/{checkpoint['at']}"
+        active = list(checkpoint.get("active") or [])
+        owners = {str(row.get("owner_run_id") or "") for row in active}
+        owners_seen.append(owners)
+        if len(active) > 1:
+            failures.append(f"{where}: {len(active)} active owner rows for one strategy")
+        if len(owners) > 1:
+            failures.append(f"{where}: owner rows disagree about the owner {sorted(owners)}")
+        if not active and not checkpoint.get("option_run_terminal"):
+            failures.append(
+                f"{where}: no ACTIVE owner row while the structure is not terminal "
+                f"(run statuses={checkpoint.get('option_run_statuses')})"
+            )
+        expected = str(checkpoint.get("expected_owner_run_id") or "")
+        if expected and active and owners != {expected}:
+            failures.append(
+                f"{where}: the owner row names {sorted(owners)} but this attempt's "
+                f"worker run is {expected!r}"
+            )
+        # A protective exit's FIRST step is resolving its worker run through the
+        # production engine. After a handover that must find the structure the
+        # owner row names - the creation binding still names the predecessor.
+        resolution = checkpoint.get("resolution_probe")
+        if resolution is not None and active:
+            owner_option_run = str(active[0].get("option_run_id") or "")
+            if str(resolution.get("resolved") or "") != owner_option_run:
+                failures.append(
+                    f"{where}: a triggered exit resolved "
+                    f"{resolution.get('resolved')!r} for the owning worker run, not "
+                    f"{owner_option_run!r} (reason={resolution.get('reason')!r})"
+                )
+        superseded = checkpoint.get("superseded_resolution_probe")
+        if superseded is not None and superseded.get("resolved") is not None:
+            failures.append(
+                f"{where}: a SUPERSEDED worker run still resolved "
+                f"{superseded['resolved']!r} after the handover"
+            )
+        for row in active:
+            policy_versions.add(str(row.get("policy_version") or ""))
+
+    if len(policy_versions) > 1:
+        failures.append(
+            f"the protection policy changed across the handover: {sorted(policy_versions)}"
+        )
+
+    phase_run_ids = [str(item.get("run_id") or "") for item in phases]
+    observed: set = set().union(*owners_seen) if owners_seen else set()
+    if phase_run_ids and phase_run_ids[0]:
+        if phase_run_ids[0] not in observed:
+            failures.append(
+                "the predecessor was never the recorded protection owner "
+                f"(owners seen={sorted(observed)})"
+            )
+    if len(phase_run_ids) > 1 and phase_run_ids[1]:
+        if phase_run_ids[1] not in observed:
+            failures.append(
+                "the successor never became the recorded protection owner "
+                f"(owners seen={sorted(observed)})"
+            )
+    # The predecessor must OWN the structure while its attempt runs AND after its
+    # block cleared: that is the protection that survives the closure, and both
+    # checkpoints name the SAME run.
+    first_phase = str((phases[0] if phases else {}).get("phase") or "")
+    phase_one = [cp for cp in checkpoints if str(cp.get("phase")) == first_phase]
+    if not phase_one or any(
+        {str(row.get("owner_run_id") or "") for row in (cp.get("active") or [])}
+        != {phase_run_ids[0]}
+        for cp in phase_one
+        if cp.get("active")
+    ):
+        failures.append(
+            "the predecessor did not own the structure at every point before the "
+            f"successor existed (run={phase_run_ids[0] if phase_run_ids else ''})"
+        )
+
+    # Every checkpoint snapshots the SAME append-only log, so de-duplicate by the
+    # event's own identity before counting: one transfer is one epoch advance.
+    events = {
+        (
+            str(event.get("option_run_id") or ""),
+            str(event.get("event") or ""),
+            str(event.get("owner_epoch") or ""),
+            str(event.get("owner_run_id") or ""),
+        )
+        for checkpoint in checkpoints
+        for event in checkpoint.get("events") or []
+    }
+    transfers = [event for event in events if event[1] == "transferred"]
+    if len(transfers) != 1:
+        failures.append(
+            f"the handover recorded {len(transfers)} transfer event(s), not exactly one"
+        )
+    return failures
 
 
 def _paper_available_funds(session_factory, account_id: str) -> Optional[float]:

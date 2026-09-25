@@ -232,7 +232,13 @@ class OptionProtectionOwnerStore:
         return None if row is None else self._view(dict(row))
 
     def list_protection_owners(
-        self, db: Any = None, *, owner_run_id: Optional[str] = None
+        self,
+        db: Any = None,
+        *,
+        owner_run_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
+        account_id: Optional[str] = None,
+        execution_environment: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Every ACTIVE owner row, with its option run's live evidence.
 
@@ -247,6 +253,10 @@ class OptionProtectionOwnerStore:
         authoritative for, which is how the safety gate resolves a hosted,
         plan-created run (``opt_run_<uuid>``) whose option-run id shares nothing
         with the worker run id.
+
+        ``strategy_id``/``account_id``/``execution_environment`` narrow it to one
+        strategy's own book, which is how a successor's hosted-run creation finds
+        the structures it is about to continue.
         """
 
         conditions = ["o.state = 'active'"]
@@ -254,6 +264,15 @@ class OptionProtectionOwnerStore:
         if owner_run_id is not None:
             conditions.append("o.owner_run_id = :owner_run_id")
             params["owner_run_id"] = str(owner_run_id)
+        if strategy_id is not None:
+            conditions.append("o.strategy_id = :strategy_id")
+            params["strategy_id"] = str(strategy_id)
+        if account_id is not None:
+            conditions.append("o.account_id = :account_id")
+            params["account_id"] = str(account_id)
+        if execution_environment is not None:
+            conditions.append("o.execution_environment = :execution_environment")
+            params["execution_environment"] = str(execution_environment)
         owns_session = db is None
         session = db or self._session_factory()
         try:

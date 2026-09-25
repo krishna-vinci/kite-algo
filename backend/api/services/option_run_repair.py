@@ -10,7 +10,7 @@ here leaves the router with the two handlers and their response mapping.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from fastapi import HTTPException
 
@@ -118,6 +118,27 @@ def repair_audit_job(repo: Any, run: Any) -> Any:
     if not worker_run_id:
         return None
     return repo.get_job_by_run_id(worker_run_id)
+
+
+def current_protection_owner_run_id(session_factory: Any, run: Any) -> Optional[str]:
+    """The worker run CURRENTLY authoritative for this structure, or ``None``.
+
+    The ACTIVE protection owner row is the live relation (B2.4); ``metadata.
+    worker_run_id`` is only the creation-time snapshot, which a handover does not
+    rewrite. ``None`` means the run has no active owner row (a direct-options-API
+    run, or one created before B2.4) and the caller falls back to the snapshot. An
+    unreadable row propagates: the caller refuses by name rather than guessing.
+    """
+
+    from backend.options.protection.ownership import OptionProtectionOwnerStore
+
+    row = OptionProtectionOwnerStore(session_factory=session_factory).read(
+        str(getattr(run, "strategy_run_id", "") or "")
+    )
+    if not isinstance(row, Mapping) or str(row.get("state") or "") != "active":
+        return None
+    owner = str(row.get("owner_run_id") or "")
+    return owner or None
 
 
 def record_repair_audit(
@@ -278,11 +299,31 @@ async def submit_residual_close(
     inventing one.
     """
     from backend.options.execution.durable_store import DurableOptionRunStore
-    from backend.options.protection.staged_exit import StagedStructureExit
+    from backend.options.protection.staged_exit import (
+        OWNER_UNREADABLE,
+        StagedStructureExit,
+    )
 
     require_residual_close_available(request, run)
     paper_service = getattr(_app_state(request), "paper_runtime_service", None)
     metadata = dict(getattr(run, "metadata", None) or {})
+    # The close is ATTRIBUTED to the structure's CURRENT protection owner, not to
+    # the creation-time snapshot: after a handover the owner row names the
+    # successor while ``metadata.worker_run_id`` still names the predecessor, and
+    # the resolver refuses a superseded binding rather than acting for it (B2.4).
+    # An unreadable owner row is a named refusal here too - never a silent
+    # fallback to the stale binding.
+    try:
+        attribution_run_id = current_protection_owner_run_id(session_factory, run)
+    except Exception as exc:  # noqa: BLE001 - unreadable ownership refuses by name
+        return {
+            "submitted": False,
+            "complete": False,
+            "reason": OWNER_UNREADABLE,
+            "option_run_id": str(run.strategy_run_id),
+            "error": f"{type(exc).__name__}: {exc}",
+            "orders": [],
+        }
     run_store = getattr(_app_state(request), "option_run_store", None)
     if run_store is None:
         run_store = DurableOptionRunStore(session_factory=session_factory)
@@ -294,7 +335,9 @@ async def submit_residual_close(
     protection = dict(getattr(run, "protection", None) or {})
     return await staged.submit(
         worker_run={
-            "strategy_run_id": str(metadata.get("worker_run_id") or ""),
+            "strategy_run_id": str(
+                attribution_run_id or metadata.get("worker_run_id") or ""
+            ),
             "account_scope": str(scope.get("account_id") or ""),
             "metadata": metadata,
             "runtime_state": {

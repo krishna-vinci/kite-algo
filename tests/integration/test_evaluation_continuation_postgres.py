@@ -182,7 +182,7 @@ class _FakeWorkerRepo:
         return None
 
 
-def _strategy(repo):
+def _strategy(repo, *, stale_exit_policy="none"):
     return repo.create_strategy(
         owner_id=OWNER,
         name=f"strat-{uuid.uuid4().hex[:8]}",
@@ -192,7 +192,7 @@ def _strategy(repo):
         account_scope=ACCOUNT,
         max_duration_s=21600,
         progress_deadline_s=600,
-        stale_exit_policy="none",
+        stale_exit_policy=stale_exit_policy,
     )
 
 
@@ -207,7 +207,7 @@ def _version(repo, strategy_id):
     )
 
 
-def _launched_job(repo, factory, strategy, version, *, run_id="run-1"):
+def _launched_job(repo, factory, strategy, version, *, run_id="run-1", runtime_state=None):
     """A queued job driven through the real launch CAS to ``running``."""
     job = repo.create_job(
         strategy_id=strategy.id,
@@ -257,10 +257,14 @@ def _launched_job(repo, factory, strategy, version, *, run_id="run-1"):
                 "INSERT INTO public.algo_worker_runs "
                 "(strategy_run_id, token_id, template_id, account_scope, execution_mode, "
                 " status, runtime_state_json) "
-                "VALUES (:run, 'tok-1', 'tmpl-1', :a, 'paper', 'open', '{}'::jsonb) "
+                "VALUES (:run, 'tok-1', 'tmpl-1', :a, 'paper', 'open', CAST(:state AS jsonb)) "
                 "ON CONFLICT (strategy_run_id) DO NOTHING"
             ),
-            {"a": ACCOUNT, "run": run_id},
+            {
+                "a": ACCOUNT,
+                "run": run_id,
+                "state": json.dumps(dict(runtime_state or {})),
+            },
         )
         session.execute(
             text(
@@ -426,7 +430,13 @@ def _hold_option_structure(
                 "run": option_run_id,
                 "status": status,
                 "legs": json.dumps(legs),
-                "metadata": json.dumps({"strategy_id": str(strategy_id)}),
+                "metadata": json.dumps(
+                    {
+                        "strategy_id": str(strategy_id),
+                        "account_id": ACCOUNT,
+                        "execution_environment": "paper",
+                    }
+                ),
                 "orders": json.dumps(list(orders or [])),
                 "pending": json.dumps(list(pending_legs or [])),
             },
@@ -577,6 +587,292 @@ def test_a_held_option_structure_continues_as_held_never_flat(factory):
     assert proof["exposure_state"] == "flat"
     assert proof["option_work_state"] == "held"
     assert proof["option_runs"] == [f"{option_run_id}=held"]
+
+
+def _claim_protection_owner(factory, option_run_id, owner_run_id, *, policy=None):
+    """The owner row the plan-binding entry hook writes (B2.4 S1)."""
+    from backend.options.execution.durable_store import DurableOptionRunStore
+    from backend.options.protection.ownership import (
+        OptionProtectionOwnerStore,
+        option_protection_policy_version,
+    )
+
+    run = DurableOptionRunStore(session_factory=factory).get_run(str(option_run_id))
+    snapshot = dict(
+        policy
+        or {
+            "structure_digest": "sha256:structure-1",
+            "structure_id": "vertical_spread",
+            "underlying": "NIFTY",
+            "expiry": "2026-10-29",
+            "expiry_policy": "exit_before_cutoff",
+        }
+    )
+    return OptionProtectionOwnerStore(session_factory=factory).claim(
+        run,
+        owner_run_id,
+        snapshot,
+        option_protection_policy_version(snapshot),
+    )
+
+
+def _owner_store(factory):
+    from backend.options.protection.ownership import OptionProtectionOwnerStore
+
+    return OptionProtectionOwnerStore(session_factory=factory)
+
+
+def _owner_events(factory, option_run_id):
+    with factory() as session:
+        return [
+            dict(row)
+            for row in session.execute(
+                text(
+                    "SELECT event, owner_epoch, owner_run_id FROM "
+                    "public.option_protection_owner_events WHERE option_run_id = :r "
+                    "ORDER BY owner_epoch, event"
+                ),
+                {"r": str(option_run_id)},
+            ).mappings()
+        ]
+
+
+class _RunStatuses:
+    """A worker-run reader: only the statuses a handover decision needs."""
+
+    def __init__(self, statuses):
+        self._statuses = {str(key): str(value) for key, value in statuses.items()}
+
+    async def get_run(self, run_id):
+        status = self._statuses.get(str(run_id))
+        if status is None:
+            return None
+        return {"strategy_run_id": str(run_id), "status": status}
+
+
+class _JobStub:
+    def __init__(self, *, strategy_id, account_scope, execution_mode, job_id="hsj-1"):
+        self.id = job_id
+        self.strategy_id = strategy_id
+        self.account_scope = account_scope
+        self.execution_mode = execution_mode
+
+
+def _protection_runtime_state(worker_stale_sec=600):
+    return {
+        "backend_protection": {
+            "enabled": True,
+            "operations": {
+                "exit_on_worker_stale": True,
+                "worker_stale_sec": worker_stale_sec,
+            },
+        }
+    }
+
+
+def test_a_protected_held_option_structure_hands_over_and_keeps_its_owner(factory):
+    """B2.4 S3: successor creation TRANSFERS the owner row, once, and the row
+    survives the predecessor's closure in between.
+
+    The predecessor's continuation is cleared because its owner row is still
+    active under it; closing the predecessor's worker run does NOT release the
+    row; and the successor's hosted-run creation moves the row with one CAS,
+    leaving exactly one active owner at every step.
+    """
+    repo = SqlAlchemyStrategyRepository(factory)
+    strategy = _strategy(repo, stale_exit_policy="exit_on_worker_stale")
+    version = _version(repo, strategy.id)
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    job = _launched_job(
+        repo,
+        factory,
+        strategy,
+        version,
+        run_id=run_id,
+        runtime_state=_protection_runtime_state(),
+    )
+    repo.report_process_cleanup(job.id, state="confirmed", actor=LEASE_OWNER, expected_attempt=1)
+    _publish_flat_book(factory, strategy.id)
+    _bind_worker_run(factory, run_id=run_id, strategy_id=strategy.id)
+    option_run_id = _hold_option_structure(
+        factory, strategy.id, run_id=run_id, status="entered"
+    )
+    claimed = _claim_protection_owner(factory, option_run_id, run_id)
+    policy_version = str(claimed["policy_version"])
+
+    response = _release(repo, factory, job, completion="exited", exit_code=0)
+
+    assert response["continuation"]["continued"] is True, response
+    assert response["continuation"]["held"] is True, response
+
+    # BEFORE the successor exists: the predecessor is STILL the owner, even though
+    # its own worker run has just been closed by the continuation.
+    with factory() as session:
+        predecessor_status = session.execute(
+            text("SELECT status FROM public.algo_worker_runs WHERE strategy_run_id = :r"),
+            {"r": run_id},
+        ).scalar_one()
+    assert str(predecessor_status) == "closed"
+
+    store = _owner_store(factory)
+    row = store.read(option_run_id)
+    assert row["state"] == "active"
+    assert row["owner_run_id"] == run_id
+    assert int(row["owner_epoch"]) == 1
+    assert str(row["policy_version"]) == policy_version
+
+    # SUCCESSOR CREATION: the ended predecessor's row is inherited, then moved to
+    # the successor with one CAS.
+    successor_run_id = f"run-{uuid.uuid4().hex[:8]}"
+    job_stub = _JobStub(
+        strategy_id=strategy.id, account_scope=ACCOUNT, execution_mode="paper"
+    )
+    inherited = asyncio.run(
+        hosted_lifecycle._handover_protection_rows(
+            strategy_repo=repo,
+            worker_repo=_RunStatuses({run_id: "closed"}),
+            job=job_stub,
+        )
+    )
+    assert [str(item["option_run_id"]) for item in inherited] == [option_run_id]
+    assert [int(item["owner_epoch"]) for item in inherited] == [1]
+
+    refused = asyncio.run(
+        hosted_lifecycle._transfer_inherited_structures(
+            owner_store=store,
+            rows=inherited,
+            successor_run_id=successor_run_id,
+        )
+    )
+    assert refused is None, refused
+
+    row = store.read(option_run_id)
+    assert row["state"] == "active"
+    assert row["owner_run_id"] == successor_run_id
+    assert int(row["owner_epoch"]) == 2
+    # The handover carries the SAME policy: only the owner moved.
+    assert str(row["policy_version"]) == policy_version
+    events = _owner_events(factory, option_run_id)
+    assert len([item for item in events if item["event"] == "claimed"]) == 1
+    transfers = [item for item in events if item["event"] == "transferred"]
+    assert len(transfers) == 1
+    assert int(transfers[0]["owner_epoch"]) == 2
+    assert transfers[0]["owner_run_id"] == successor_run_id
+
+    # A SECOND successor holding the OLD snapshot loses by name, and the winner
+    # stays the owner - a lost CAS never releases the row.
+    refused = asyncio.run(
+        hosted_lifecycle._transfer_inherited_structures(
+            owner_store=store,
+            rows=inherited,
+            successor_run_id=f"run-{uuid.uuid4().hex[:8]}",
+        )
+    )
+    assert refused is not None
+    assert refused["reason_code"] == "OPTION_PROTECTION_OWNER_CONFLICT"
+    assert refused["option_run_id"] == option_run_id
+    row = store.read(option_run_id)
+    assert row["owner_run_id"] == successor_run_id
+    assert int(row["owner_epoch"]) == 2
+
+
+def test_the_run_level_structure_identity_comes_from_the_owner_policy(factory):
+    """The successor's ``backend_protection.structure`` is seeded from the SAME
+    frozen policy the owner row carries, so the generic loop and the option
+    evaluator read one policy (design section 2 step 1)."""
+    from backend.options.protection.ownership import option_protection_policy_version
+
+    repo = SqlAlchemyStrategyRepository(factory)
+    strategy = _strategy(repo, stale_exit_policy="exit_on_worker_stale")
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    with factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO public.algo_worker_runs "
+                "(strategy_run_id, token_id, template_id, account_scope, execution_mode, "
+                " status) VALUES (:run, 'tok-verify', 'tmpl', :a, 'paper', 'closed')"
+            ),
+            {"run": run_id, "a": ACCOUNT},
+        )
+        session.commit()
+    _bind_worker_run(factory, run_id=run_id, strategy_id=strategy.id)
+    option_run_id = _hold_option_structure(
+        factory, strategy.id, run_id=run_id, status="entered"
+    )
+    policy = {
+        "structure_digest": "sha256:structure-1",
+        "structure_id": "vertical_spread",
+        "underlying": "NIFTY",
+        "expiry": "2026-10-29",
+        "expiry_policy": "exit_before_cutoff",
+    }
+    claimed = _claim_protection_owner(factory, option_run_id, run_id, policy=policy)
+
+    assert hosted_lifecycle._protection_structure_from_policy(policy) == {
+        "structure_digest": policy["structure_digest"]
+    }
+    assert str(claimed["policy_version"]) == option_protection_policy_version(policy)
+
+
+def test_a_superseded_owner_epoch_never_clears_the_block(factory):
+    """The predecessor's own record of the epoch it was handed is the ticket.
+
+    A row that has moved on (a newer ``owner_epoch``) means somebody else took
+    the structure over: the attempt is not the owner any more, so continuation is
+    refused BY NAME and the block stays for an operator."""
+    repo = SqlAlchemyStrategyRepository(factory)
+    strategy = _strategy(repo, stale_exit_policy="exit_on_worker_stale")
+    version = _version(repo, strategy.id)
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    job = _launched_job(
+        repo,
+        factory,
+        strategy,
+        version,
+        run_id=run_id,
+        runtime_state={
+            **_protection_runtime_state(),
+            # What the successor's creation RECORDED on the run it handed the
+            # structure to: epoch 1.
+            "protection_owner": {"owner_epoch": 1},
+        },
+    )
+    repo.report_process_cleanup(job.id, state="confirmed", actor=LEASE_OWNER, expected_attempt=1)
+    _publish_flat_book(factory, strategy.id)
+    _bind_worker_run(factory, run_id=run_id, strategy_id=strategy.id)
+    option_run_id = _hold_option_structure(
+        factory, strategy.id, run_id=run_id, status="entered"
+    )
+    _claim_protection_owner(factory, option_run_id, run_id)
+    # ... and the row has moved on to ONE MORE epoch, still naming this run.
+    _owner_store(factory).transfer(
+        option_run_id,
+        run_id,
+        1,
+        {"structure_digest": "sha256:structure-1"},
+    )
+
+    response = _release(repo, factory, job, completion="exited", exit_code=0)
+
+    assert response["continuation"]["continued"] is False, response
+    assert (
+        response["continuation"]["reason_code"]
+        == "CONTINUATION_PROTECTION_OWNERSHIP_UNSUPPORTED"
+    ), response
+    assert response["replacement_blocked"] is True, response
+
+    # Account-scoped state is shared across this module's disposable database, and
+    # a BOUND run must not be deleted (it is immutable attribution history): close
+    # it so no open, protection-enabled run leaks into another scenario.
+    with factory() as session:
+        session.execute(
+            text(
+                "UPDATE public.algo_worker_runs SET status = 'closed' "
+                "WHERE strategy_run_id = :r"
+            ),
+            {"r": run_id},
+        )
+        session.commit()
 
 
 @pytest.mark.parametrize(

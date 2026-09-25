@@ -600,6 +600,62 @@ async def test_a_residual_repair_submits_only_the_risk_reducing_close(pg, monkey
 
 
 @pytest.mark.asyncio
+async def test_a_residual_close_after_a_handover_follows_the_owner_row(pg, monkeypatch):
+    """B2.4 S3: the operator close is attributed to the CURRENT owner.
+
+    The run's creation binding still names the predecessor, so a close attributed
+    from metadata would be resolved - and refused - as a superseded run. The
+    ACTIVE owner row names the successor, and that is what the stage is attributed
+    to.
+    """
+    from backend.options.execution.durable_store import DurableOptionRunStore
+    from backend.options.protection.ownership import (
+        OptionProtectionOwnerStore,
+        option_protection_policy_snapshot,
+        option_protection_policy_version,
+    )
+
+    factory = pg["factory"]
+    env = _Env(factory)
+    option_run_id = env.seed_run(
+        status="partial_entry",
+        trades=[_open_trade("leg_short", "SELL"), _open_trade("leg_hedge", "BUY")],
+    )
+    runs = DurableOptionRunStore(session_factory=factory)
+    store = OptionProtectionOwnerStore(session_factory=factory)
+    policy = option_protection_policy_snapshot({})
+    policy_version = option_protection_policy_version(policy)
+    store.claim(runs.get_run(option_run_id), env.run_id, policy, policy_version)
+    successor_run_id = f"run-successor-{uuid.uuid4().hex[:8]}"
+    store.transfer(option_run_id, successor_run_id, 1, policy, policy_version)
+
+    async with _client(factory, monkeypatch) as client:
+        inspection = await client.get(_repair_url(env.strategy_id, option_run_id))
+        assert inspection.status_code == 200, inspection.text
+        body = inspection.json()
+        assert body["state"] == "residual"
+        with patch("backend.paper_runtime.service.publish_event", autospec=True):
+            repair = await client.post(
+                _repair_url(env.strategy_id, option_run_id),
+                json={"action": "close_residual", "evidence_digest": body["evidence_digest"]},
+            )
+        assert repair.status_code == 200, repair.text
+        submission = repair.json()["submission"]
+        assert submission["submitted"] is True, submission
+        assert {order["tradingsymbol"] for order in submission["orders"]} == {SHORT_SYMBOL}
+
+    stages = [
+        order
+        for order in _json(_run_row(factory, option_run_id)["orders"])
+        if order.get("stage_digest")
+    ]
+    assert stages, "the residual close is a durable stage on the run itself"
+    # The stage names the worker run the close is attributed to: the SUCCESSOR,
+    # not the superseded run the creation binding still names.
+    assert stages[-1]["worker_run_id"] == successor_run_id, stages[-1]
+
+
+@pytest.mark.asyncio
 async def test_an_ambiguous_run_is_refused_by_name_and_changes_nothing(pg, monkeypatch):
     factory = pg["factory"]
     env = _Env(factory)

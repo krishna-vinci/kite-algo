@@ -240,6 +240,135 @@ def _protection_runtime_state(
     return None
 
 
+#: Worker-run statuses that still OWN their protection. An owner row whose run is
+#: in one of these is never taken over by a new attempt: the live run stays
+#: authoritative, and the successor must not claim protection it does not own.
+_LIVE_RUN_STATUSES = ("open", "exiting")
+
+
+def _protection_owner_store(strategy_repo: Any) -> Any:
+    """The owner-row store on the SAME database as the job and run records."""
+
+    from backend.options.protection.ownership import OptionProtectionOwnerStore
+
+    session_factory = getattr(strategy_repo, "session_factory", None)
+    if session_factory is None:
+        return None
+    return OptionProtectionOwnerStore(session_factory=session_factory)
+
+
+def _protection_structure_from_policy(policy: Any) -> Optional[Dict[str, Any]]:
+    """The run-level structure identity a frozen option policy names.
+
+    The owner row's ``policy`` is the frozen snapshot the option evaluator reads.
+    The successor's ``backend_protection.structure`` is seeded from the SAME
+    digest, so the generic loop and the option evaluator can never disagree about
+    which structure they are protecting (design section 2 step 1).
+    """
+
+    digest = str((policy or {}).get("structure_digest") or "").strip()
+    if not digest:
+        return None
+    return {"structure_digest": digest}
+
+
+async def _handover_protection_rows(
+    *,
+    strategy_repo: Any,
+    worker_repo: Any,
+    job: Any,
+) -> List[Dict[str, Any]]:
+    """ACTIVE owner rows a successor INHERITS from this strategy's previous run.
+
+    A successor continues the strategy's durable book, so the structures that the
+    predecessor's owner rows still carry move to it. The predecessor is the run
+    being continued: its owner run has ENDED (the continuation closed it). A row
+    whose owner run is still live is NEVER taken over - the successor must not
+    claim protection it does not own, and the live owner stays authoritative.
+
+    An unreadable read returns no rows rather than refusing the launch: the owner
+    row is what protects the structure, and a launch must not become impossible
+    because an optional bookkeeping read failed.
+    """
+
+    try:
+        store = _protection_owner_store(strategy_repo)
+        if store is None:
+            return []
+        rows = await asyncio.to_thread(
+            store.list_protection_owners,
+            None,
+            strategy_id=str(job.strategy_id),
+            account_id=str(job.account_scope),
+            execution_environment=str(job.execution_mode),
+        )
+    except Exception:  # noqa: BLE001 - an optional read never blocks a launch
+        logger.exception(
+            "hosted_protection_owner_read_failed",
+            extra={"job_id": str(getattr(job, "id", ""))},
+        )
+        return []
+
+    inherited: List[Dict[str, Any]] = []
+    for row in rows or []:
+        owner_run_id = str(row.get("owner_run_id") or "")
+        if not owner_run_id:
+            continue
+        try:
+            run = await worker_repo.get_run(owner_run_id)
+        except Exception:  # noqa: BLE001 - an unreadable owner run is not taken over
+            run = None
+        if run is None:
+            continue
+        if str(run.get("status") or "") in _LIVE_RUN_STATUSES:
+            continue
+        inherited.append(dict(row))
+    return inherited
+
+
+async def _transfer_inherited_structures(
+    *,
+    owner_store: Any,
+    rows: List[Dict[str, Any]],
+    successor_run_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Move every inherited structure to the successor in ONE CAS each.
+
+    Returns ``None`` when every row moved, or the refused row's named detail
+    (``{"reason_code", "option_run_id", "detail"}``) when a compare-and-swap was
+    LOST. A lost CAS means the structure moved under this successor: the row is
+    left exactly as it was - the winner (normally the predecessor) stays
+    authoritative - and the caller refuses the launch by name rather than
+    pretending the successor owns protection it does not.
+    """
+
+    for row in rows:
+        option_run_id = str(row.get("option_run_id") or "")
+        if not option_run_id:
+            continue
+        if str(row.get("owner_run_id") or "") == str(successor_run_id):
+            # A repeat preparation for this same successor: already transferred.
+            continue
+        try:
+            await asyncio.to_thread(
+                owner_store.transfer,
+                option_run_id,
+                successor_run_id,
+                int(row.get("owner_epoch") or 0),
+                dict(row.get("policy") or {}),
+                row.get("policy_version"),
+            )
+        except Exception as exc:  # noqa: BLE001 - reported as its own named refusal
+            return {
+                "reason_code": str(
+                    getattr(exc, "reason_code", type(exc).__name__)
+                ),
+                "option_run_id": option_run_id,
+                "detail": dict(getattr(exc, "detail", {}) or {}),
+            }
+    return None
+
+
 async def prepare_launch(
     request: Request,
     *,
@@ -410,6 +539,31 @@ async def prepare_launch(
         # worker: run creation normalizes it and seeds the protection state.
         runtime_state["backend_protection"] = protection
 
+    # A successor CONTINUES the strategy's durable book: every owner row the
+    # predecessor's ended run still holds is read HERE, so the successor's run
+    # config is seeded from the SAME frozen policy the owner row carries - and so
+    # the transfer below can CAS on the epoch observed before the run existed.
+    handover_rows = await _handover_protection_rows(
+        strategy_repo=strategy_repo,
+        worker_repo=worker_repo,
+        job=job,
+    )
+    # Only a DECLARED run-level policy is seeded with the structure identity: a
+    # strategy that declares none keeps exactly the run config it had, and the
+    # owner row alone carries its structure.
+    if protection is not None and len(handover_rows) == 1:
+        structure = _protection_structure_from_policy(handover_rows[0].get("policy"))
+        if structure is not None:
+            runtime_state["backend_protection"] = {**protection, "structure": structure}
+            # The epoch this run is ABOUT to be handed: the transfer below CASes
+            # on the observed epoch, so the successor's own record and the owner
+            # row agree, and a later handover can detect a superseded owner.
+            runtime_state["protection_owner"] = {
+                "option_run_id": str(handover_rows[0].get("option_run_id") or ""),
+                "owner_epoch": int(handover_rows[0].get("owner_epoch") or 0) + 1,
+                "policy_version": handover_rows[0].get("policy_version"),
+            }
+
     run_id = hooks.run_id_factory()
     run_payload = WorkerRunCreateRequest(
         strategy_run_id=run_id,
@@ -456,6 +610,51 @@ async def prepare_launch(
             token=token_id,
             status_code=503,
             code="HOSTED_RUN_CREATE_FAILED",
+        )
+
+    # Transfer the continued structures to the successor. It runs RIGHT AFTER the
+    # run exists (never before: an owner row must not name a run that was never
+    # created) and in ONE compare-and-swap per structure under the option run's
+    # advisory lock. Until that CAS commits the predecessor stays authoritative,
+    # so there is no interval in which the structure is ownerless.
+    owner_store = _protection_owner_store(strategy_repo) if handover_rows else None
+    refused = (
+        await _transfer_inherited_structures(
+            owner_store=owner_store,
+            rows=handover_rows,
+            successor_run_id=run_id,
+        )
+        if owner_store is not None
+        else None
+    )
+    if refused is not None:
+        # A LOST CAS means the structure moved under this successor: it must NOT
+        # claim protection it does not own. The owner row is untouched (the
+        # predecessor, or whoever won, stays authoritative), the child authority
+        # is withdrawn, and the launch is refused BY NAME.
+        logger.warning(
+            "hosted_protection_owner_transfer_refused",
+            extra={
+                "job_id": job_id,
+                "run_id": run_id,
+                "option_run_id": str(refused.get("option_run_id") or ""),
+                "reason": str(refused.get("reason_code") or ""),
+            },
+        )
+        try:
+            # Stop the successor's own run from being evaluated as a generic
+            # protection owner now that it owns nothing.
+            await worker_repo.update_run_status(run_id, "closed")
+        except Exception:  # noqa: BLE001 - best effort on the abort path
+            logger.exception(
+                "hosted_protection_owner_transfer_run_close_failed",
+                extra={"run_id": run_id},
+            )
+        await _abort(
+            "protection_owner_conflict",
+            token=token_id,
+            status_code=409,
+            code="OPTION_PROTECTION_OWNER_CONFLICT",
         )
 
     try:

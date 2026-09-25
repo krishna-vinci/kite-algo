@@ -66,6 +66,14 @@ STAGE_UNKNOWN = "unknown"
 
 RESOLVED_STAGE_STATES = (STAGE_SUBMITTED, STAGE_PARTIAL, STAGE_REJECTED, STAGE_UNKNOWN)
 
+#: Owner-row resolution refusals (B2.4). The owner row is the worker-run ->
+#: option-run relation that MOVES at a handover, so an unreadable owner table is
+#: a refusal: falling back to the creation-time metadata binding would resolve a
+#: structure to a superseded owner's run.
+OWNER_UNREADABLE = "protection_owner_unreadable"
+#: The creation-time binding and the structure's CURRENT owner disagree.
+BINDING_CONFLICT = "option_run_binding_conflict"
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -184,15 +192,234 @@ class StagedStructureExit:
     ) -> tuple[Optional[Any], Dict[str, Any]]:
         """The ONE durable option run bound to a hosted worker run.
 
+        Resolution is OWNER ROW FIRST (B2.4): the ACTIVE protection owner row whose
+        ``owner_run_id`` is this worker run IS the relation between a hosted run
+        and the structure it protects. The row MOVES when a handover transfers the
+        structure to a successor, while the creation-time
+        ``metadata.worker_run_id`` binding does not - so resolving from metadata
+        after a handover would find nothing and leave the structure unprotected.
+
+        The creation-time binding remains the FALLBACK, for the direct options API
+        (where the caller chooses the worker run id as the option run id) and for
+        runs that predate B2.4. It may only be used when NO active owner row names
+        this worker run AND the run it resolves has no active owner of its own: a
+        stale binding whose structure has moved is refused by name.
+
         More than one binding is AMBIGUOUS, not "pick the newest": a worker run
         whose structures cannot be told apart must not be declared complete on the
-        strength of whichever row happened to be updated last, so the caller
-        refuses instead. The run's recorded account must also match the worker
-        run's account - a run belonging to another account is never this run's.
+        strength of whichever row happened to be updated last. An owner row that
+        CONTRADICTS the creation binding is a data error, not a preference; both
+        refuse by name. An unreadable owner row refuses too (fail closed), never
+        falling back silently to the stale metadata. The run's recorded account
+        must also match the worker run's account in either shape - a run belonging
+        to another account is never this run's.
         """
         run_id = str(worker_run_id or "")
         if not run_id:
             return None, {"reason": "no_bound_option_run", "worker_run_id": run_id}
+        owner_candidates, owner_refusal = self._owner_bound_runs(
+            run_id, account_id=account_id
+        )
+        if owner_refusal is not None:
+            return None, owner_refusal
+        if owner_candidates:
+            return self._resolve_from_owner_row(
+                run_id, owner_candidates, account_id=account_id
+            )
+        return self._resolve_from_metadata_binding(run_id, account_id=account_id)
+
+    def _resolve_from_owner_row(
+        self,
+        run_id: str,
+        owner_candidates: List[Dict[str, Any]],
+        *,
+        account_id: str,
+    ) -> tuple[Optional[Any], Dict[str, Any]]:
+        """Resolve through the ACTIVE owner row(s) naming this worker run."""
+
+        if len(owner_candidates) > 1:
+            return None, {
+                "reason": "option_run_ambiguous",
+                "source": "protection_owner",
+                "worker_run_id": run_id,
+                "candidates": sorted(
+                    str(row["option_run_id"]) for row in owner_candidates
+                ),
+            }
+        chosen = str(owner_candidates[0]["option_run_id"])
+        metadata_candidates, metadata_refusal, metadata_mismatch = (
+            self._metadata_bound_runs(run_id, account_id=account_id)
+        )
+        if metadata_refusal is not None or metadata_mismatch:
+            # The creation-time binding does not agree with the row that owns the
+            # structure NOW: refuse rather than pick, exactly as ambiguity does.
+            return None, {
+                "reason": BINDING_CONFLICT,
+                "worker_run_id": run_id,
+                "owner_run_candidates": [chosen],
+                "metadata_candidates": list(metadata_candidates),
+                "metadata_reason": (
+                    None if metadata_refusal is None else metadata_refusal["reason"]
+                ),
+            }
+        if metadata_candidates and metadata_candidates != [chosen]:
+            return None, {
+                "reason": BINDING_CONFLICT,
+                "worker_run_id": run_id,
+                "owner_run_candidates": [chosen],
+                "metadata_candidates": list(metadata_candidates),
+            }
+        return self._runs().get_run(chosen), {
+            "reason": "ok",
+            "option_run_id": chosen,
+            "candidates": 1,
+            "source": "protection_owner",
+        }
+
+    def _resolve_from_metadata_binding(
+        self, run_id: str, *, account_id: str
+    ) -> tuple[Optional[Any], Dict[str, Any]]:
+        """The pre-B2.4 / direct-options-API fallback."""
+
+        candidates, refusal, _mismatch = self._metadata_bound_runs(
+            run_id, account_id=account_id
+        )
+        if refusal is not None:
+            return None, refusal
+        if not candidates:
+            return None, {"reason": "no_bound_option_run", "worker_run_id": run_id}
+        if len(candidates) > 1:
+            return None, {
+                "reason": "option_run_ambiguous",
+                "source": "metadata_binding",
+                "worker_run_id": run_id,
+                "candidates": list(candidates),
+            }
+        # The binding must not resolve a structure that now has a DIFFERENT active
+        # owner: that run is superseded, and a superseded run must not act.
+        stale, stale_refusal = self._active_owners_for_option_runs(candidates)
+        if stale_refusal is not None:
+            return None, stale_refusal
+        if stale:
+            return None, {
+                "reason": BINDING_CONFLICT,
+                "worker_run_id": run_id,
+                "metadata_candidates": list(candidates),
+                "current_owner_run_id": str(
+                    (stale[0] or {}).get("owner_run_id") or ""
+                ),
+            }
+        chosen = str(candidates[0])
+        return self._runs().get_run(chosen), {
+            "reason": "ok",
+            "option_run_id": chosen,
+            "candidates": 1,
+            "source": "metadata_binding",
+        }
+
+    def _owner_bound_runs(
+        self, run_id: str, *, account_id: str
+    ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """The ACTIVE owner rows naming this worker run, or a named refusal.
+
+        The creation-time binding is a SNAPSHOT; the owner row is the live record.
+        An unreadable owner read therefore refuses by name - it never falls back to
+        the snapshot, which after a handover names the predecessor.
+
+        The row's account is checked the same way the creation binding's is: a row
+        whose account is missing or different is a mismatch, and a mismatch refuses
+        rather than being skipped.
+        """
+
+        rows, refusal = self._owner_rows(
+            "owner_run_id = :run_id",
+            {"run_id": run_id},
+            refusal_extra={"worker_run_id": run_id},
+        )
+        if refusal is not None:
+            return [], refusal
+        candidates: List[Dict[str, Any]] = []
+        mismatched: List[Dict[str, Any]] = []
+        for row in rows:
+            bound_account = str(row.get("account_id") or "")
+            if not bound_account or (account_id and bound_account != str(account_id)):
+                mismatched.append(
+                    {
+                        "option_run_id": str(row.get("option_run_id") or ""),
+                        "bound_account_id": bound_account or None,
+                    }
+                )
+                continue
+            candidates.append(row)
+        if mismatched:
+            return [], {
+                "reason": "option_run_account_mismatch",
+                "source": "protection_owner",
+                "worker_run_id": run_id,
+                "account_id": str(account_id),
+                "mismatched": mismatched,
+            }
+        return candidates, None
+
+    def _active_owners_for_option_runs(
+        self, option_run_ids: Sequence[str]
+    ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """The ACTIVE owner rows of these option runs, or a named refusal."""
+
+        ids = [str(value) for value in option_run_ids if str(value)]
+        if not ids:
+            return [], None
+        placeholders = ", ".join(f":id{index}" for index in range(len(ids)))
+        params = {f"id{index}": value for index, value in enumerate(ids)}
+        return self._owner_rows(
+            f"option_run_id IN ({placeholders})",
+            params,
+            refusal_extra={"option_run_ids": ids},
+        )
+
+    def _owner_rows(
+        self,
+        predicate: str,
+        params: Dict[str, Any],
+        *,
+        refusal_extra: Dict[str, Any],
+    ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """ACTIVE owner rows matching one predicate; unreadable refuses by name."""
+
+        try:
+            with self.session_factory() as session:
+                rows = (
+                    session.execute(
+                        text(
+                            "SELECT option_run_id, owner_run_id, account_id "
+                            "FROM public.option_protection_owners "
+                            f"WHERE state = 'active' AND {predicate} "
+                            "ORDER BY option_run_id"
+                        ),
+                        params,
+                    )
+                    .mappings()
+                    .all()
+                )
+        except Exception as exc:  # noqa: BLE001 - fail closed, never fall back
+            return [], {
+                "reason": OWNER_UNREADABLE,
+                "error": f"{type(exc).__name__}: {exc}",
+                **refusal_extra,
+            }
+        return [dict(row) for row in rows], None
+
+    def _metadata_bound_runs(
+        self, run_id: str, *, account_id: str
+    ) -> tuple[List[str], Optional[Dict[str, Any]], bool]:
+        """The option runs whose CREATION binding names this worker run.
+
+        Returns ``(candidates, refusal, account_mismatch)``: the same rule this
+        method has always applied (a row whose recorded account is missing or
+        different is a mismatch, and any mismatch refuses rather than being
+        skipped).
+        """
+
         with self.session_factory() as session:
             rows = (
                 session.execute(
@@ -207,7 +434,7 @@ class StagedStructureExit:
                 .all()
             )
         if not rows:
-            return None, {"reason": "no_bound_option_run", "worker_run_id": run_id}
+            return [], None, False
         candidates: List[str] = []
         mismatched: List[Dict[str, Any]] = []
         for row in rows:
@@ -229,23 +456,13 @@ class StagedStructureExit:
                 continue
             candidates.append(str(row["strategy_run_id"]))
         if mismatched:
-            return None, {
+            return [], {
                 "reason": "option_run_account_mismatch",
                 "worker_run_id": run_id,
                 "account_id": str(account_id),
                 "mismatched": mismatched,
-            }
-        if len(candidates) != 1:
-            return None, {
-                "reason": "option_run_ambiguous",
-                "worker_run_id": run_id,
-                "candidates": candidates,
-            }
-        return self._runs().get_run(candidates[0]), {
-            "reason": "ok",
-            "option_run_id": candidates[0],
-            "candidates": 1,
-        }
+            }, True
+        return candidates, None, False
 
     # -- ordinary ingestion reads -------------------------------------------
 

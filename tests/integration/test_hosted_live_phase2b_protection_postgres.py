@@ -1721,3 +1721,252 @@ def test_a_released_owner_row_leaves_the_closed_run_unprotected(pg):
     # No stage was ever taken for this structure: the released row really did
     # stop the loop rather than only the counter.
     assert _stage_states(pg, option_run.strategy_run_id) == []
+
+
+def _seed_handover_successor_run(factory, *, structure: dict, protection: dict) -> str:
+    """The successor's own OPEN, structured worker run (B2.4 S3).
+
+    This is the run ``hosted_lifecycle`` creates once the predecessor's
+    continuation cleared its block: it carries the structure protection config
+    seeded from the owner row's frozen policy, and it is the run the owner row
+    names after the transfer.
+    """
+    import json as _json
+
+    from sqlalchemy import text
+
+    run_id = f"run-successor-{uuid.uuid4().hex[:10]}"
+    token_id = f"tok-successor-{uuid.uuid4().hex[:8]}"
+    with factory() as session:
+        session.execute(
+            text(
+                "INSERT INTO public.algo_worker_tokens "
+                "(token_id, name, token_hash, account_scope, allowed_modes, "
+                " allowed_actions, status) "
+                "VALUES (:tid, 'successor', :hash, :account, '[\"live\"]'::jsonb, "
+                " '[\"runs:exit\"]'::jsonb, 'revoked')"
+            ),
+            {"tid": token_id, "hash": f"successor-{uuid.uuid4().hex}", "account": ACCOUNT},
+        )
+        session.execute(
+            text(
+                "INSERT INTO public.algo_worker_runs "
+                "(strategy_run_id, token_id, template_id, account_scope, execution_mode, "
+                " status, runtime_state_json, metadata_json, last_heartbeat_at) "
+                "VALUES (:run, :tid, 'phase2b', :account, 'live', 'open', "
+                " CAST(:runtime AS jsonb), CAST(:metadata AS jsonb), :heartbeat)"
+            ),
+            {
+                "run": run_id,
+                "tid": token_id,
+                "account": ACCOUNT,
+                "runtime": _json.dumps(
+                    {
+                        "backend_protection": {
+                            "enabled": True,
+                            "mode": "exposure",
+                            "version": 1,
+                            "operations": protection,
+                            "structure": structure,
+                        }
+                    }
+                ),
+                "metadata": _json.dumps(
+                    {
+                        "strategy_family": "options_strategy",
+                        "strategy_name": "phase2b-successor",
+                    }
+                ),
+                "heartbeat": datetime.now(timezone.utc) - timedelta(seconds=3600),
+            },
+        )
+        session.commit()
+    return run_id
+
+
+def _transfer_owner(pg, option_run_id: str, successor_run_id: str) -> None:
+    """The hosted-run creation's CAS, made directly: owner moves, policy does not."""
+    from backend.options.protection.ownership import OptionProtectionOwnerStore
+
+    store = OptionProtectionOwnerStore(session_factory=pg["factory"])
+    current = store.read(option_run_id)
+    store.transfer(
+        option_run_id,
+        successor_run_id,
+        int(current["owner_epoch"]),
+        dict(current["policy"] or {}),
+        current["policy_version"],
+    )
+
+
+def _attributed_runs(pg) -> set:
+    """The worker runs the platform's own pre-send records attribute orders to."""
+    from sqlalchemy import text
+
+    with pg["factory"]() as session:
+        return {
+            str(value or "")
+            for value in session.execute(
+                text(
+                    "SELECT strategy_run_id FROM public.live_order_intents "
+                    "WHERE account_id = :account "
+                    "AND entry_surface = 'hosted_option_protection'"
+                ),
+                {"account": ACCOUNT},
+            ).scalars()
+        }
+
+
+def test_a_protection_trigger_after_a_handover_resolves_the_successor(pg):
+    """B2.4 S3: the trigger AFTER a handover must still find the structure.
+
+    The predecessor is closed and the ACTIVE owner row names the successor, but the
+    option run's CREATION binding (``metadata.worker_run_id``) still names the
+    predecessor. Resolving from that binding finds nothing - the structure would be
+    unprotected - so the staged exit resolves through the OWNER ROW and submits the
+    short-first close, attributed to the successor.
+    """
+    broker, seeded, option_run = _owned_structure_seed(pg)
+    structure = {
+        "structure_digest": "phase2b-owned-structure",
+        "legs": [
+            {"tradingsymbol": "NIFTY26OCT25000CE", "side": "SELL", "quantity": -75},
+            {"tradingsymbol": "NIFTY26OCT30000CE", "side": "BUY", "quantity": 75},
+        ],
+        "closed_short_quantities": {},
+    }
+    successor_run_id = _seed_handover_successor_run(
+        pg["factory"],
+        structure=structure,
+        protection={"exit_on_worker_stale": True, "worker_stale_sec": 60},
+    )
+    _transfer_owner(pg, option_run.strategy_run_id, successor_run_id)
+
+    # The creation binding still names the PREDECESSOR: metadata alone is stale.
+    from backend.options.execution.durable_store import DurableOptionRunStore
+
+    bound = DurableOptionRunStore(session_factory=pg["factory"]).get_run(
+        option_run.strategy_run_id
+    )
+    assert str(dict(bound.metadata or {}).get("worker_run_id") or "") == seeded["run_id"]
+    assert str(_owner_row(pg["factory"], option_run.strategy_run_id)["owner_run_id"]) == (
+        successor_run_id
+    )
+
+    clock = _MoveableClock(datetime.now(timezone.utc))
+    runtime, _request = _runtime(pg["factory"], broker, pnl_legs=[], now_fn=clock)
+
+    result = asyncio.run(runtime.evaluate_once())
+
+    assert result == {"evaluated": 1, "triggered": 1, "errors": 0}, result
+    assert _placed_orders(broker) == [("NIFTY26OCT25000CE", "BUY", 75)], _placed_orders(
+        broker
+    )
+    # ... and the platform's OWN pre-send record attributes the close to the
+    # successor, so the exit was resolved through the owner row (B2.4).
+    assert _attributed_runs(pg) == {successor_run_id}, _attributed_runs(pg)
+    owner = _owner_row(pg["factory"], option_run.strategy_run_id)
+    assert owner["state"] == "active"
+    assert owner["owner_run_id"] == successor_run_id
+    assert owner["action_state"] == "staging", owner
+
+
+def test_a_superseded_worker_run_cannot_resolve_after_a_handover(pg):
+    """Twin: the run the structure moved AWAY from must not act for it.
+
+    The predecessor's creation binding still matches the option run, so a
+    metadata-only resolution would let a superseded run submit a close. The active
+    owner row is the authority, and a binding that contradicts it is refused by
+    name rather than acted on.
+    """
+    from backend.options.protection.staged_exit import (
+        BINDING_CONFLICT,
+        StagedStructureExit,
+    )
+
+    _broker, seeded, option_run = _owned_structure_seed(pg)
+    successor_run_id = _seed_handover_successor_run(
+        pg["factory"],
+        structure={"structure_digest": "phase2b-owned-structure", "legs": []},
+        protection={"exit_on_worker_stale": True, "worker_stale_sec": 60},
+    )
+    staged = StagedStructureExit(session_factory=pg["factory"])
+
+    # BEFORE the handover the predecessor - and only the predecessor - resolves.
+    run, resolution = staged.resolve_run_for_worker_run(
+        worker_run_id=seeded["run_id"], account_id=ACCOUNT
+    )
+    assert str(run.strategy_run_id) == option_run.strategy_run_id
+    assert resolution["reason"] == "ok"
+    assert resolution["source"] == "protection_owner"
+    absent, absent_resolution = staged.resolve_run_for_worker_run(
+        worker_run_id=successor_run_id, account_id=ACCOUNT
+    )
+    assert absent is None
+    assert absent_resolution["reason"] == "no_bound_option_run"
+
+    _transfer_owner(pg, option_run.strategy_run_id, successor_run_id)
+
+    # AFTER the handover the successor resolves ...
+    run, resolution = staged.resolve_run_for_worker_run(
+        worker_run_id=successor_run_id, account_id=ACCOUNT
+    )
+    assert str(run.strategy_run_id) == option_run.strategy_run_id
+    assert resolution["source"] == "protection_owner"
+    # ... and the superseded predecessor is refused BY NAME, never handed the run.
+    stale, stale_resolution = staged.resolve_run_for_worker_run(
+        worker_run_id=seeded["run_id"], account_id=ACCOUNT
+    )
+    assert stale is None
+    assert stale_resolution["reason"] == BINDING_CONFLICT
+
+
+def test_two_active_owner_rows_for_one_worker_run_are_ambiguous(pg):
+    """One worker run naming two structures is AMBIGUOUS, never "pick one"."""
+    from backend.options.protection.staged_exit import StagedStructureExit
+
+    _broker, seeded, option_run = _owned_structure_seed(pg)
+    second = _seed_option_run(
+        pg["factory"],
+        worker_run_id=seeded["run_id"],
+        strategy_id=seeded["strategy_id"],
+        short_symbol="NIFTY26OCT26000CE",
+        hedge_symbol="NIFTY26OCT31000CE",
+    )
+    _claim_owner(pg["factory"], second, seeded["run_id"])
+
+    staged = StagedStructureExit(session_factory=pg["factory"])
+    run, resolution = staged.resolve_run_for_worker_run(
+        worker_run_id=seeded["run_id"], account_id=ACCOUNT
+    )
+
+    assert run is None
+    assert resolution["reason"] == "option_run_ambiguous"
+    assert resolution["source"] == "protection_owner"
+    assert sorted(resolution["candidates"]) == sorted(
+        [option_run.strategy_run_id, second.strategy_run_id]
+    )
+
+
+def test_an_unreadable_owner_table_refuses_rather_than_falling_back():
+    """Fail closed: the record that MOVED at a handover is never guessed at.
+
+    The creation binding here would happily resolve (it is queried second), so a
+    silent fallback would look like success while resolving a superseded owner.
+    """
+    from backend.options.protection.staged_exit import (
+        OWNER_UNREADABLE,
+        StagedStructureExit,
+    )
+
+    class _UnreadableOwnerTable:
+        def __call__(self):
+            raise RuntimeError("owner table unavailable")
+
+    run, resolution = StagedStructureExit(
+        session_factory=_UnreadableOwnerTable()
+    ).resolve_run_for_worker_run(worker_run_id="run-some-worker-run", account_id=ACCOUNT)
+
+    assert run is None
+    assert resolution["reason"] == OWNER_UNREADABLE
+    assert resolution["worker_run_id"] == "run-some-worker-run"
