@@ -602,6 +602,7 @@ class PlanExecutionPipeline:
         evidence: Optional[Mapping[str, Any]] = None,
         validity_seconds: Optional[int] = None,
         reuse_existing: bool = False,
+        version_binding: Optional[Mapping[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Record the authorisation for the exact plan, or ``None`` if exempt.
 
@@ -633,6 +634,9 @@ class PlanExecutionPipeline:
             execution_environment=environment,
             validity_seconds=int(validity_seconds or DEFAULT_APPROVAL_VALIDITY_SECONDS),
             session_product_snapshot=session_product_snapshot(products),
+            version_binding=(
+                dict(version_binding) if version_binding else None
+            ),
         )
         try:
             return self.approvals.approve(request, actor_kind=actor_kind, evidence=evidence)

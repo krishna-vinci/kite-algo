@@ -3175,6 +3175,17 @@ CREATE TABLE IF NOT EXISTS public.strategy_approvals (
     reconciliation_version BIGINT NOT NULL,
     catalog_generation UUID NOT NULL,
     session_product_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- C1.2 S3: the immutable version identity the request pinned, plus the
+    -- frozen option target/generation/policy the owner authorised against.
+    strategy_version_id TEXT,
+    version_number INTEGER,
+    source_sha256 TEXT,
+    policy_hash TEXT,
+    option_run_id TEXT,
+    based_on_generation BIGINT,
+    protection_policy_version TEXT,
+    -- "This approval owns the right to move the run FROM this generation."
+    reserved_option_generation BIGINT,
     actor_id TEXT NOT NULL,
     actor_kind TEXT NOT NULL DEFAULT 'manual',
     authorization_evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -3196,6 +3207,15 @@ CREATE TABLE IF NOT EXISTS public.strategy_approvals (
 -- double-approval resolves to a unique violation, never to two live approvals.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_approvals_plan_active
     ON public.strategy_approvals (plan_id) WHERE status = 'active';
+-- Two approvals can never both own one option run generation: only plans that
+-- MOVE a generation (an adjust/roll) reserve one, so several exit plans may
+-- still reference the same run.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_approvals_option_generation_active
+    ON public.strategy_approvals (option_run_id, reserved_option_generation)
+    WHERE status = 'active' AND option_run_id IS NOT NULL
+      AND reserved_option_generation IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_approvals_option_run
+    ON public.strategy_approvals (option_run_id);
 CREATE INDEX IF NOT EXISTS idx_approvals_strategy
     ON public.strategy_approvals (strategy_id, created_at);
 

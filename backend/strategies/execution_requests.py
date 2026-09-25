@@ -1048,6 +1048,16 @@ class ExecutionRequestService:
                 reservation_id=str(reservation["reservation_id"]),
                 environment=environment,
                 actor_kind="automatic" if str(row["authorization_mode"]) == "autonomous" else "manual",
+                # S3: the approval is bound to the immutable version identity the
+                # REQUEST pinned, so a version, source or policy change after the
+                # request is a named refusal at release rather than a silent
+                # re-interpretation of what the owner authorised.
+                version_binding={
+                    "strategy_version_id": str(row["version_id"]),
+                    "version_number": row["version_number"],
+                    "source_sha256": str(row["source_sha256"]),
+                    "policy_hash": str(row["policy_hash"]),
+                },
                 evidence={
                     "authorization_mode": str(row["authorization_mode"]),
                     "grant_id": row["grant_id"],

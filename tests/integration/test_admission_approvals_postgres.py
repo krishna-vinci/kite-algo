@@ -68,6 +68,11 @@ G1 = "11111111-1111-1111-1111-111111111111"
 #: plan_id is a native UUID column, so plans need real uuids.
 PLAN_A = "d0000000-0000-0000-0000-00000000000a"
 PLAN_B = "d0000000-0000-0000-0000-00000000000b"
+#: Two option-structure plans that would each take ONE run from generation 2.
+OPT_1 = "d0000000-0000-0000-0000-00000000000c"
+OPT_2 = "d0000000-0000-0000-0000-00000000000d"
+OPT_RUN = "option-run-c12-s3"
+OPT_GEN = 2
 
 
 def _url_for(dbname: str) -> str:
@@ -106,6 +111,21 @@ def _upgrade(db_url: str, revision: str = "head") -> None:
     cfg.set_main_option("script_location", "backend/alembic")
     try:
         command.upgrade(cfg, revision)
+    finally:
+        if original is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = original
+
+
+def _downgrade(db_url: str, revision: str) -> None:
+    original = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = db_url
+    cfg = Config("backend/alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", db_url)
+    cfg.set_main_option("script_location", "backend/alembic")
+    try:
+        command.downgrade(cfg, revision)
     finally:
         if original is None:
             os.environ.pop("DATABASE_URL", None)
@@ -237,6 +257,70 @@ def plan_dict(plan_id, *, plan_hash="h" * 64):
     }
 
 
+def seed_option_plan(
+    sf,
+    plan_id,
+    *,
+    option_run_id=OPT_RUN,
+    generation=OPT_GEN,
+    plan_hash="o" * 64,
+):
+    """One frozen option-structure ADJUST plan claiming a run generation.
+
+    The generation reservation is read from the IMMUTABLE frozen block, so the
+    constraint is proved at the approval boundary without needing the run row.
+    """
+    _exec(
+        sf,
+        "INSERT INTO public.strategy_proposals "
+        "(proposal_id, strategy_id, account_id, evaluation_id, evaluation_kind, strategy_run_id, "
+        " target_kind, payload, payload_sha256, status) "
+        "VALUES (gen_random_uuid(), 'stg-A', 'kite:A', :eid, 'run_now', 'run-1', "
+        " 'option_structure', '{}'::jsonb, 'sha', 'validated')",
+        {"eid": f"eval-{plan_id}"},
+    )
+    resolved = (
+        '{"target_kind": "option_structure", "option_run": {"phase": "adjust", '
+        f'"option_run_id": "{option_run_id}", "based_on_generation": {int(generation)}'
+        '}, "legs": []}'
+    )
+    _exec(
+        sf,
+        "INSERT INTO public.strategy_plans "
+        "(plan_id, proposal_id, strategy_id, account_id, plan_kind, plan_hash, logical_plan, "
+        " resolved_plan, pinned_catalog_generation) "
+        "VALUES (:pid, (SELECT proposal_id FROM public.strategy_proposals WHERE evaluation_id=:eid), "
+        " 'stg-A', 'kite:A', 'option_structure', :hash, '{}'::jsonb, :resolved, :gen)",
+        {
+            "pid": plan_id,
+            "eid": f"eval-{plan_id}",
+            "hash": plan_hash,
+            "resolved": resolved,
+            "gen": G1,
+        },
+    )
+
+
+def option_plan_dict(plan_id, *, option_run_id=OPT_RUN, generation=OPT_GEN, plan_hash="o" * 64):
+    return {
+        "plan_id": plan_id,
+        "proposal_id": "prop",
+        "strategy_id": "stg-A",
+        "account_id": "kite:A",
+        "plan_hash": plan_hash,
+        "pinned_catalog_generation": G1,
+        "resolved_plan": {
+            "target_kind": "option_structure",
+            "option_run": {
+                "phase": "adjust",
+                "option_run_id": option_run_id,
+                "based_on_generation": generation,
+            },
+            "legs": [],
+        },
+    }
+
+
 def claim(ledger, plan_id, *, requirement=1000.0, allocation=10000.0, actor="app:owner"):
     seed = getattr(ledger, "_seed_done", None)
     return ledger.claim(
@@ -302,6 +386,59 @@ class TestMigration(_PgTestCase):
             "account_reconciliation_versions",
         ):
             assert _scalar(sf, f"SELECT COUNT(*) FROM public.{table}") == 0
+
+    def test_live_approval_binding_migration_round_trips(self):
+        """000051 adds the version/option binding columns and the generation index.
+
+        The downgrade must restore the prior head VERBATIM - the columns, the
+        partial unique index and the lookup index all leave exactly what they
+        added, so a re-upgrade reproduces the same shape.
+        """
+        sf = self.make_db()
+        binding_columns = {
+            "strategy_version_id",
+            "version_number",
+            "source_sha256",
+            "policy_hash",
+            "option_run_id",
+            "based_on_generation",
+            "protection_policy_version",
+            "reserved_option_generation",
+        }
+
+        def _present() -> set:
+            with sf() as session:
+                rows = session.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema='public' AND table_name='strategy_approvals'"
+                    )
+                ).fetchall()
+            return {row[0] for row in rows}
+
+        assert binding_columns <= _present()
+        assert _scalar(
+            sf,
+            "SELECT COUNT(*) FROM pg_indexes "
+            "WHERE indexname='uq_approvals_option_generation_active'",
+        ) == 1
+        assert _scalar(
+            sf,
+            "SELECT COUNT(*) FROM pg_indexes WHERE indexname='idx_approvals_option_run'",
+        ) == 1
+
+        db_url = _url_for(self._created[-1])
+        _downgrade(db_url, "20260925_000050")
+        assert not (binding_columns & _present())
+        assert _scalar(
+            sf,
+            "SELECT COUNT(*) FROM pg_indexes "
+            "WHERE indexname IN "
+            "('uq_approvals_option_generation_active','idx_approvals_option_run')",
+        ) == 0
+
+        _upgrade(db_url, "head")
+        assert binding_columns <= _present()
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +802,115 @@ class TestApprovals(_PgTestCase):
 
 
 # ---------------------------------------------------------------------------
-# 7. reconciliation version under concurrency
+# 7. one option run generation, one owning approval
+# ---------------------------------------------------------------------------
+
+
+class TestOptionGenerationOwnership(_PgTestCase):
+    """C1.2 S3: a run is moved from one generation by exactly ONE approval.
+
+    Two plans can each want to take the same run from generation N; the partial
+    unique index over ``(option_run_id, reserved_option_generation)`` is what
+    makes that a database fact rather than a read-then-write race.
+    """
+
+    def _world(self):
+        sf = self.make_db()
+        seed_world(sf)
+        seed_option_plan(sf, OPT_1)
+        seed_option_plan(sf, OPT_2)
+        ledger = ReservationLedger(session_factory=sf)
+        return sf, ledger, claim(ledger, OPT_1), claim(ledger, OPT_2)
+
+    def test_concurrent_adjust_approvals_cannot_own_one_generation(self):
+        from backend.strategies.approvals import OptionGenerationOwned
+
+        sf, _ledger, res_1, res_2 = self._world()
+        service = ApprovalService(session_factory=sf)
+        outcomes: list = []
+        barrier = threading.Barrier(2)
+
+        def attempt(plan_id, reservation_id):
+            try:
+                barrier.wait(timeout=30)
+                service.approve(
+                    ApprovalRequest(
+                        plan=option_plan_dict(plan_id),
+                        actor_id="app:owner",
+                        reservation_id=reservation_id,
+                        session_product_snapshot={"products": ["NRML"]},
+                    ),
+                    now=NOW,
+                )
+                outcomes.append(("ok", plan_id))
+            except OptionGenerationOwned as exc:
+                outcomes.append(("owned", exc.reason_code))
+            except Exception as exc:  # noqa: BLE001
+                outcomes.append(("error", repr(exc)))
+
+        threads = [
+            threading.Thread(target=attempt, args=(OPT_1, res_1["reservation_id"])),
+            threading.Thread(target=attempt, args=(OPT_2, res_2["reservation_id"])),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        errors = [item for item in outcomes if item[0] == "error"]
+        assert not errors, errors
+        assert len([item for item in outcomes if item[0] == "ok"]) == 1, outcomes
+        assert _scalar(
+            sf,
+            "SELECT COUNT(*) FROM public.strategy_approvals "
+            "WHERE status='active' AND option_run_id=:run AND reserved_option_generation=:gen",
+            {"run": OPT_RUN, "gen": OPT_GEN},
+        ) == 1
+
+    def test_a_second_generation_row_is_refused_by_the_index(self):
+        sf, _ledger, res_1, res_2 = self._world()
+        service = ApprovalService(session_factory=sf)
+        service.approve(
+            ApprovalRequest(
+                plan=option_plan_dict(OPT_1), actor_id="app:owner",
+                reservation_id=res_1["reservation_id"],
+                session_product_snapshot={"products": ["NRML"]},
+            ),
+            now=NOW,
+        )
+        # A second plan of the SAME run and generation is refused, and the row
+        # that owns the generation is untouched.
+        with pytest.raises(Exception) as ctx:
+            service.approve(
+                ApprovalRequest(
+                    plan=option_plan_dict(OPT_2), actor_id="app:owner",
+                    reservation_id=res_2["reservation_id"],
+                    session_product_snapshot={"products": ["NRML"]},
+                ),
+                now=NOW,
+            )
+        assert getattr(ctx.value, "reason_code", "") == "APPROVAL_OPTION_GENERATION_OWNED"
+        assert _scalar(
+            sf,
+            "SELECT plan_id::text FROM public.strategy_approvals WHERE status='active'",
+        ) == OPT_1
+        # A LATER generation is a different artifact and stays admissible.
+        seed_option_plan(sf, PLAN_B, generation=OPT_GEN + 1)
+        res_later = claim(ReservationLedger(session_factory=sf), PLAN_B)
+        later = service.approve(
+            ApprovalRequest(
+                plan=option_plan_dict(PLAN_B, generation=OPT_GEN + 1),
+                actor_id="app:owner",
+                reservation_id=res_later["reservation_id"],
+                session_product_snapshot={"products": ["NRML"]},
+            ),
+            now=NOW,
+        )
+        assert later["reserved_option_generation"] == OPT_GEN + 1
+
+
+# ---------------------------------------------------------------------------
+# 8. reconciliation version under concurrency
 # ---------------------------------------------------------------------------
 
 

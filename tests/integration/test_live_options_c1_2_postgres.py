@@ -1295,3 +1295,111 @@ async def test_gated_option_legs_are_bounded_limits_and_a_timeout_cancels_once(
         assert len([i for i in broker_calls if i.intent_type == "cancel_order"]) == 1
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_released_reservation_blocks_the_gated_release_by_name(
+    pg, live_env, _margin_boundary
+):
+    """C1.2 S3 reservation gate: the release re-reads capacity and never renews.
+
+    The withheld short stays withheld while the plan's reservation is released -
+    refused by NAME, not as a generic approval failure - and it is released only
+    once the capacity is restored. The release pass never renews the reservation
+    itself.
+    """
+    _seed_catalog(pg["factory"])
+    clock = _clock()
+    broker_calls = []
+
+    class _Broker:
+        async def handle(self, intent, *, context=None):
+            broker_calls.append(intent)
+            return {"result": {"order_id": f"O-{len(broker_calls)}"}}
+
+    app, executor = _build_app(pg["factory"], _Broker(), clock)
+    client = await _operator_client(app)
+    try:
+        attempt = await _prepare_live_attempt(
+            client,
+            account_scope=live_env["account_scope"],
+            lease_until=clock() + timedelta(hours=12),
+        )
+        _declare_version_risk_policy(
+            pg["factory"],
+            attempt["strategy_id"],
+            {"allowed_structure_families": ["vertical_spread"]},
+        )
+        proposed = await _submit_proposal(
+            client,
+            attempt,
+            _option_payload(phase="entry"),
+            account_scope=live_env["account_scope"],
+        )
+        assert proposed.status_code < 400, proposed.text
+        plan = proposed.json()["plan"]
+        executed, reservation = await _execute(
+            client, attempt["strategy_id"], plan["plan_id"]
+        )
+        assert executed.status_code < 400, executed.text
+        assert len(broker_calls) == 1, executed.text
+        hedge_order = executed.json()["broker_order_ids"][0]
+
+        _ingest_fill(
+            pg["factory"],
+            account_id=live_env["account_scope"],
+            run_id=attempt["run_id"],
+            order_id=hedge_order,
+            trade_id="TR-C12-S3-HEDGE",
+            quantity=75,
+            side="BUY",
+            symbol="NIFTY26OCT30000CE",
+            token=900002,
+        )
+
+        # The owner released the capacity after the hedge filled: the withheld
+        # short is NOT dispatched against a reservation that no longer holds.
+        from backend.strategies.reservations import ReservationLedger
+
+        ledger = ReservationLedger(session_factory=pg["factory"])
+        ledger.release(
+            reservation["reservation_id"], reason="c12-s3", actor_id="app:owner"
+        )
+        assert ledger.get(reservation["reservation_id"])["status"] == "released"
+
+        from backend.strategies.live_ingestion import LiveOutcomeConsumer
+
+        consumer = LiveOutcomeConsumer(
+            session_factory=pg["factory"],
+            clock=clock,
+            sequence_releaser=executor.release_sequence,
+        )
+        counts = await consumer.poll_once()
+        claims = _claims(pg["factory"], plan["plan_id"])
+        assert counts["sequence_blocked"] == 1, (counts, claims)
+        assert claims[0]["state"] == "withheld", claims
+        assert claims[0]["detail"]["release_blocked"] == "LIVE_RESERVATION_REQUIRED", claims
+        assert len(broker_calls) == 1, "a released reservation released the short"
+        # Never renewed by the release pass: the row is still released.
+        assert ledger.get(reservation["reservation_id"])["status"] == "released"
+
+        # Capacity restored (an operator action, not the release path): the SAME
+        # withheld short now releases.
+        with pg["factory"]() as session:
+            from sqlalchemy import text
+
+            session.execute(
+                text(
+                    "UPDATE public.strategy_reservations SET status = 'active' "
+                    "WHERE reservation_id = :rid"
+                ),
+                {"rid": reservation["reservation_id"]},
+            )
+            session.commit()
+        counts = await consumer.poll_once()
+        claims = _claims(pg["factory"], plan["plan_id"])
+        assert counts["sequence_released"] == 1, (counts, claims)
+        assert claims[0]["state"] == "pending", claims
+        assert len(broker_calls) == 2
+    finally:
+        await client.aclose()

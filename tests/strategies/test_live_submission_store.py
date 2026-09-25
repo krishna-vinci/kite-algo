@@ -427,6 +427,269 @@ class _Durable:
         pass
 
 
+class _BindingApprovals:
+    """A stand-in whose CURRENT binding is supplied by the test.
+
+    The approval's own pins travel in the ``approval`` mapping; this only answers
+    "what does the world say NOW", so each gate can be aimed at one moved input.
+    """
+
+    def __init__(self, *, version=None, option=None):
+        self._version = dict(version or {})
+        self._option = dict(option or {})
+
+    def version_binding_for_plan(self, _plan):
+        return dict(self._version)
+
+    def option_binding_state(self, _plan):
+        return dict(self._option)
+
+
+class LiveApprovalBindingTests(unittest.TestCase):
+    """C1.2 S3 refusals: one named refusal and one admitted twin per gate."""
+
+    NOW = datetime(2026, 9, 26, 10, 0, tzinfo=timezone.utc)
+
+    def _adapter(self, *, version=None, option=None):
+        from backend.strategies.live_adapter import LivePlanAdapter
+
+        return LivePlanAdapter(
+            session_factory=lambda: None,
+            admission=_Admission(),
+            approvals=_BindingApprovals(version=version, option=option),
+            ledger=_Durable(),
+            barrier=_Durable(),
+            submissions=_Durable(),
+            clock=lambda: self.NOW,
+        )
+
+    @staticmethod
+    def _plan():
+        return {
+            "plan_id": "plan-1",
+            "plan_kind": "target_weights",
+            "resolved_plan": {"legs": []},
+        }
+
+    @staticmethod
+    def _option_plan():
+        return {
+            "plan_id": "plan-opt",
+            "plan_kind": "option_structure",
+            "resolved_plan": {
+                "target_kind": "option_structure",
+                "option_run": {
+                    "phase": "adjust",
+                    "option_run_id": "run-9",
+                    "based_on_generation": 2,
+                },
+                "legs": [],
+            },
+        }
+
+    def _approved(self, **overrides):
+        approval = {
+            "approval_id": "appr-1",
+            "strategy_version_id": None,
+            "version_number": None,
+            "source_sha256": None,
+            "policy_hash": None,
+            "option_run_id": None,
+            "based_on_generation": None,
+            "reserved_option_generation": None,
+            "protection_policy_version": None,
+            "catalog_generation": "gen-1",
+        }
+        approval.update(overrides)
+        return approval
+
+    def _refusal(self, adapter, plan, approval):
+        from backend.strategies.live_adapter import LiveRefusal
+
+        with self.assertRaises(LiveRefusal) as ctx:
+            adapter._check_approval_binding(plan, approval)
+        return ctx.exception.reason_code, ctx.exception.detail
+
+    def test_version_source_and_policy_pins_refuse_when_they_move(self):
+        approved = self._approved(
+            strategy_version_id="ver-1",
+            version_number=1,
+            source_sha256="s1",
+            policy_hash="p1",
+        )
+        matching = self._adapter(
+            version={
+                "strategy_version_id": "ver-1",
+                "version_number": 1,
+                "source_sha256": "s1",
+                "policy_hash": "p1",
+            }
+        )
+        proof = matching._check_approval_binding(self._plan(), approved)
+        self.assertEqual(proof["version_binding"]["strategy_version_id"], "ver-1")
+
+        moved_version = self._adapter(
+            version={
+                "strategy_version_id": "ver-2",
+                "version_number": 2,
+                "source_sha256": "s1",
+                "policy_hash": "p1",
+            }
+        )
+        code, detail = self._refusal(moved_version, self._plan(), approved)
+        self.assertEqual(code, "LIVE_APPROVAL_VERSION_CHANGED")
+        self.assertIn("strategy_version_id", detail["changed"])
+
+        moved_source = self._adapter(
+            version={
+                "strategy_version_id": "ver-1",
+                "version_number": 1,
+                "source_sha256": "s2",
+                "policy_hash": "p1",
+            }
+        )
+        code, detail = self._refusal(moved_source, self._plan(), approved)
+        self.assertEqual(code, "LIVE_APPROVAL_VERSION_CHANGED")
+        self.assertIn("source_sha256", detail["changed"])
+
+        moved_policy = self._adapter(
+            version={
+                "strategy_version_id": "ver-1",
+                "version_number": 1,
+                "source_sha256": "s1",
+                "policy_hash": "p2",
+            }
+        )
+        code, detail = self._refusal(moved_policy, self._plan(), approved)
+        self.assertEqual(code, "LIVE_APPROVAL_VERSION_CHANGED")
+        self.assertIn("policy_hash", detail["changed"])
+
+    def test_an_unpinned_version_is_never_read_as_a_mismatch(self):
+        # A legacy approval (or unresolved chain) binds nothing; changing the
+        # world's version must not manufacture a refusal out of nothing.
+        adapter = self._adapter(version={"strategy_version_id": "ver-9"})
+        proof = adapter._check_approval_binding(self._plan(), self._approved())
+        self.assertEqual(proof, {})
+
+    def test_option_catalog_generation_change_refuses(self):
+        approved = self._approved(option_run_id="run-9", catalog_generation="gen-1")
+        matching = self._adapter(
+            option={
+                "option_run_id": "run-9",
+                "structure_generation": 2,
+                "catalog_generation": "gen-1",
+                "protection_policy_version": None,
+                "unreadable": None,
+            }
+        )
+        proof = matching._check_approval_binding(self._option_plan(), approved)
+        self.assertEqual(proof["option_binding"]["option_run_id"], "run-9")
+
+        moved = self._adapter(
+            option={
+                "option_run_id": "run-9",
+                "structure_generation": 2,
+                "catalog_generation": "gen-2",
+                "protection_policy_version": None,
+                "unreadable": None,
+            }
+        )
+        code, detail = self._refusal(moved, self._option_plan(), approved)
+        self.assertEqual(code, "LIVE_OPTION_CATALOG_GENERATION_CHANGED")
+        self.assertEqual(detail["current_catalog_generation"], "gen-2")
+
+    def test_a_stale_option_generation_refuses(self):
+        approved = self._approved(
+            option_run_id="run-9", reserved_option_generation=2
+        )
+        matching = self._adapter(
+            option={
+                "option_run_id": "run-9",
+                "structure_generation": 2,
+                "catalog_generation": "gen-1",
+                "protection_policy_version": None,
+                "unreadable": None,
+            }
+        )
+        proof = matching._check_approval_binding(self._option_plan(), approved)
+        self.assertEqual(proof["option_binding"]["reserved_option_generation"], 2)
+
+        moved = self._adapter(
+            option={
+                "option_run_id": "run-9",
+                "structure_generation": 3,
+                "catalog_generation": "gen-1",
+                "protection_policy_version": None,
+                "unreadable": None,
+            }
+        )
+        code, detail = self._refusal(moved, self._option_plan(), approved)
+        self.assertEqual(code, "OPTION_ADJUSTMENT_STALE_BASIS")
+        self.assertEqual(detail["structure_generation"], 3)
+
+    def test_protection_policy_change_and_lost_owner_refuse(self):
+        approved = self._approved(
+            option_run_id="run-9",
+            reserved_option_generation=2,
+            protection_policy_version="policy-1",
+        )
+        matching = self._adapter(
+            option={
+                "option_run_id": "run-9",
+                "structure_generation": 2,
+                "catalog_generation": "gen-1",
+                "protection_policy_version": "policy-1",
+                "unreadable": None,
+            }
+        )
+        proof = matching._check_approval_binding(self._option_plan(), approved)
+        self.assertEqual(
+            proof["option_binding"]["protection_policy_version"], "policy-1"
+        )
+
+        changed = self._adapter(
+            option={
+                "option_run_id": "run-9",
+                "structure_generation": 2,
+                "catalog_generation": "gen-1",
+                "protection_policy_version": "policy-2",
+                "unreadable": None,
+            }
+        )
+        code, detail = self._refusal(changed, self._option_plan(), approved)
+        self.assertEqual(code, "OPTION_PROTECTION_POLICY_CHANGED")
+        self.assertEqual(detail["current_protection_policy_version"], "policy-2")
+
+        gone = self._adapter(
+            option={
+                "option_run_id": "run-9",
+                "structure_generation": 2,
+                "catalog_generation": "gen-1",
+                "protection_policy_version": None,
+                "unreadable": None,
+            }
+        )
+        code, detail = self._refusal(gone, self._option_plan(), approved)
+        self.assertEqual(code, "OPTION_PROTECTION_OWNER_CONFLICT")
+        self.assertEqual(detail["reason"], "OPTION_PROTECTION_OWNER_UNKNOWN")
+
+    def test_an_unpinned_policy_leaves_reduce_only_work_admissible(self):
+        # An exit approved with no owner row pins no policy: an unknown owner is
+        # NOT a conflict for a pin the owner never granted.
+        approved = self._approved(option_run_id="run-9")
+        adapter = self._adapter(
+            option={
+                "option_run_id": "run-9",
+                "structure_generation": 1,
+                "catalog_generation": "gen-1",
+                "protection_policy_version": None,
+                "unreadable": "ProgrammingError",
+            }
+        )
+        proof = adapter._check_approval_binding(self._option_plan(), approved)
+        self.assertEqual(proof["option_binding"]["protection_policy_version"], None)
+
+
 class StagedFundingGateTests(unittest.TestCase):
     """Named refusal/admit twins for the executable staged funding stages."""
 

@@ -899,7 +899,183 @@ class LivePlanAdapter:
                     "detail": detail,
                 },
             )
+        self._check_approval_binding(plan, approval)
         return approval
+
+    @staticmethod
+    def _is_option_plan(plan: Mapping[str, Any]) -> bool:
+        resolved = plan.get("resolved_plan") or {}
+        if not isinstance(resolved, Mapping):
+            resolved = {}
+        return (
+            str(resolved.get("target_kind") or "") == "option_structure"
+            or str(plan.get("plan_kind") or "") == "option_structure"
+        )
+
+    def _check_approval_binding(
+        self, plan: Mapping[str, Any], approval: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """The VERSION and OPTION-GENERATION pins this approval froze (C1.2 S3).
+
+        A plan hash still matching is not enough: the same logical plan can be
+        recompiled under a moved strategy version, a re-mapped catalog generation
+        or a moved option structure, and trading the frozen artifact against any
+        of those is exactly what the owner did not authorise. Each divergence is
+        its OWN named refusal, so the operator learns which input moved.
+
+        Not-pinned is not a mismatch: a legacy approval (or a run with no owner
+        row at approval time) binds nothing, and binding nothing must never read
+        as "cleared". A reduce-only exit remains admissible with an unknown owner
+        for the same reason - only a pin the owner DID grant is enforced.
+        """
+        plan_id = str(plan.get("plan_id") or "")
+        approved_version = {
+            "strategy_version_id": approval.get("strategy_version_id"),
+            "version_number": approval.get("version_number"),
+            "source_sha256": approval.get("source_sha256"),
+            "policy_hash": approval.get("policy_hash"),
+        }
+        proof: Dict[str, Any] = {}
+        if any(value not in (None, "") for value in approved_version.values()):
+            current_version = dict(
+                self.approvals.version_binding_for_plan(plan) or {}
+            )
+            changed = {
+                key: {"approved": value, "current": current_version.get(key)}
+                for key, value in approved_version.items()
+                if value not in (None, "")
+                and str(current_version.get(key)) != str(value)
+            }
+            if changed:
+                raise LiveRefusal(
+                    "LIVE_APPROVAL_VERSION_CHANGED",
+                    {
+                        "plan_id": plan_id,
+                        "approval_id": str(approval.get("approval_id") or ""),
+                        "changed": changed,
+                        "message": (
+                            "the strategy version, source or policy this approval was "
+                            "bound to no longer matches the plan's persisted version; "
+                            "the changed artifact needs a new plan and approval"
+                        ),
+                    },
+                )
+            proof["version_binding"] = dict(approved_version)
+
+        approved_run = str(approval.get("option_run_id") or "")
+        if not self._is_option_plan(plan) or not approved_run:
+            return proof
+
+        state = dict(self.approvals.option_binding_state(plan) or {})
+        if str(state.get("option_run_id") or "") != approved_run:
+            raise LiveRefusal(
+                "OPTION_ADJUSTMENT_STALE_BASIS",
+                {
+                    "plan_id": plan_id,
+                    "approval_id": str(approval.get("approval_id") or ""),
+                    "approved_option_run_id": approved_run,
+                    "current_option_run_id": str(state.get("option_run_id") or ""),
+                    "message": "the frozen option target no longer names this approval's run",
+                },
+            )
+
+        current_catalog = str(state.get("catalog_generation") or "")
+        approved_catalog = str(approval.get("catalog_generation") or "")
+        if current_catalog and current_catalog != approved_catalog:
+            raise LiveRefusal(
+                "LIVE_OPTION_CATALOG_GENERATION_CHANGED",
+                {
+                    "plan_id": plan_id,
+                    "approval_id": str(approval.get("approval_id") or ""),
+                    "approved_catalog_generation": approved_catalog,
+                    "current_catalog_generation": current_catalog,
+                    "message": (
+                        "every option leg is a pinned derivative contract, so a moved "
+                        "catalog generation invalidates the approval even when the "
+                        "pinned coordinates re-resolve"
+                    ),
+                },
+            )
+
+        reserved = approval.get("reserved_option_generation")
+        if reserved is not None:
+            held = state.get("structure_generation")
+            if held is None:
+                raise LiveRefusal(
+                    "OPTION_ADJUSTMENT_STALE_BASIS",
+                    {
+                        "plan_id": plan_id,
+                        "approval_id": str(approval.get("approval_id") or ""),
+                        "option_run_id": approved_run,
+                        "reserved_option_generation": int(reserved),
+                        "reason": "OPTION_RUN_UNREADABLE",
+                        "error": state.get("unreadable"),
+                    },
+                )
+            if int(held) != int(reserved):
+                raise LiveRefusal(
+                    "OPTION_ADJUSTMENT_STALE_BASIS",
+                    {
+                        "plan_id": plan_id,
+                        "approval_id": str(approval.get("approval_id") or ""),
+                        "option_run_id": approved_run,
+                        "reserved_option_generation": int(reserved),
+                        "structure_generation": int(held),
+                        "message": (
+                            "the run has moved to a different leg generation than the "
+                            "one this approval owns; the run is never re-derived "
+                            "against a newer structure"
+                        ),
+                    },
+                )
+
+        approved_policy = approval.get("protection_policy_version")
+        if approved_policy:
+            if state.get("unreadable"):
+                raise LiveRefusal(
+                    "OPTION_PROTECTION_OWNER_CONFLICT",
+                    {
+                        "plan_id": plan_id,
+                        "approval_id": str(approval.get("approval_id") or ""),
+                        "option_run_id": approved_run,
+                        "reason": "OPTION_PROTECTION_OWNER_UNREADABLE",
+                        "error": state.get("unreadable"),
+                    },
+                )
+            current_policy = state.get("protection_policy_version")
+            if not current_policy:
+                raise LiveRefusal(
+                    "OPTION_PROTECTION_OWNER_CONFLICT",
+                    {
+                        "plan_id": plan_id,
+                        "approval_id": str(approval.get("approval_id") or ""),
+                        "option_run_id": approved_run,
+                        "approved_protection_policy_version": str(approved_policy),
+                        "reason": "OPTION_PROTECTION_OWNER_UNKNOWN",
+                        "message": (
+                            "the approval pinned a protection owner policy and the run "
+                            "no longer has a readable owner row"
+                        ),
+                    },
+                )
+            if str(current_policy) != str(approved_policy):
+                raise LiveRefusal(
+                    "OPTION_PROTECTION_POLICY_CHANGED",
+                    {
+                        "plan_id": plan_id,
+                        "approval_id": str(approval.get("approval_id") or ""),
+                        "option_run_id": approved_run,
+                        "approved_protection_policy_version": str(approved_policy),
+                        "current_protection_policy_version": str(current_policy),
+                    },
+                )
+        proof["option_binding"] = {
+            "option_run_id": approved_run,
+            "based_on_generation": approval.get("based_on_generation"),
+            "reserved_option_generation": reserved,
+            "protection_policy_version": approved_policy,
+        }
+        return proof
 
     def _approval_pin_state(
         self, plan: Mapping[str, Any]
@@ -2456,6 +2632,26 @@ class LivePlanAdapter:
                 unexplained = sorted(
                     set(mismatched) - set(SEQUENCE_TOLERATED_PIN_MISMATCHES)
                 )
+                # An option plan's approval carries a live reservation, and a
+                # released/expired capacity is its OWN named blocker rather than a
+                # generic approval failure: the owner is told to re-reserve, not
+                # to re-approve a plan whose pins all still hold.
+                if (
+                    self._is_option_plan(plan)
+                    and unexplained
+                    and set(unexplained) <= {"RESERVATION_NOT_ACTIVE"}
+                ):
+                    self._check_reservation(plan)
+                # A moved catalog GENERATION is stricter for options than for any
+                # other lane: every option leg is a pinned derivative contract, so
+                # the named option refusal is reported instead of the general
+                # "relevant listing changed" pin.
+                if (
+                    self._is_option_plan(plan)
+                    and unexplained
+                    and set(unexplained) <= {"CATALOG_RELEVANT_CHANGE"}
+                ):
+                    self._check_approval_binding(plan, approval)
                 if unexplained or parent is None:
                     raise LiveRefusal(
                         "LIVE_APPROVAL_INVALID",
@@ -2495,6 +2691,13 @@ class LivePlanAdapter:
                         },
                     )
             exposure_proof["pin"] = "EXPOSURE_SNAPSHOT_CHANGED"
+            # S3: the version/policy and option-generation pins are re-checked in
+            # the SAME release transaction, and an option plan's reservation is
+            # re-read here (never renewed) so a released or expired capacity is a
+            # named blocker rather than a silently released leg.
+            self._check_approval_binding(plan, approval)
+            if self._is_option_plan(plan):
+                self._check_reservation(plan)
             staged_detail = None
             if str(getattr(spec, "release_rule", "")) == RULE_STAGED_FUNDING_GATE:
                 # STAGE 1 - sequencing and price evidence only: it reads no money,

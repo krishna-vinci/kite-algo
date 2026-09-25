@@ -965,6 +965,22 @@ class StrategyApproval(Base):
     reconciliation_version = Column(BigInteger, nullable=False)
     catalog_generation = Column(Text, nullable=False)
     session_product_snapshot = Column(JSON, nullable=False, server_default=text("'{}'"))
+    #: The immutable version identity the originating request pinned (C1.2 S3).
+    #: NULL on a legacy approval, which is why the checks treat "not pinned" as
+    #: "nothing to compare" rather than as a mismatch.
+    strategy_version_id = Column(Text, nullable=True)
+    version_number = Column(Integer, nullable=True)
+    source_sha256 = Column(Text, nullable=True)
+    policy_hash = Column(Text, nullable=True)
+    #: The frozen option target, its generation basis and the B2.4 owner policy
+    #: snapshot this approval was granted against.
+    option_run_id = Column(Text, nullable=True)
+    based_on_generation = Column(BigInteger, nullable=True)
+    protection_policy_version = Column(Text, nullable=True)
+    #: The run generation this approval owns the right to MOVE FROM. Only a
+    #: generation-moving plan (an adjust/roll) carries one; an exit closes the
+    #: run rather than moving it, so several exits may share one generation.
+    reserved_option_generation = Column(BigInteger, nullable=True)
     actor_id = Column(Text, nullable=False)
     #: ``manual`` when the owner acted on one plan; ``automatic`` when the
     #: server recorded a standing grant's authorization. The distinction is
@@ -1000,6 +1016,23 @@ class StrategyApproval(Base):
             ondelete="RESTRICT",
         ),
         Index("idx_approvals_strategy", "strategy_id", "created_at"),
+        Index("idx_approvals_option_run", "option_run_id"),
+        #: Two approvals can never both own one option run generation: the partial
+        #: unique index is the real contract, so the check is not a read-then-write.
+        Index(
+            "uq_approvals_option_generation_active",
+            "option_run_id",
+            "reserved_option_generation",
+            unique=True,
+            postgresql_where=text(
+                "status = 'active' AND option_run_id IS NOT NULL "
+                "AND reserved_option_generation IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "status = 'active' AND option_run_id IS NOT NULL "
+                "AND reserved_option_generation IS NOT NULL"
+            ),
+        ),
     )
 
 

@@ -707,6 +707,17 @@ class ApprovalResponse(BaseModel):
     reconciliation_version: int
     catalog_generation: str
     session_product_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    #: C1.2 S3 binding: the immutable version identity the request pinned, and
+    #: the frozen option target/generation/policy the owner authorised against.
+    #: ``None`` means "not pinned" - a legacy approval binds nothing.
+    strategy_version_id: Optional[str] = None
+    version_number: Optional[int] = None
+    source_sha256: Optional[str] = None
+    policy_hash: Optional[str] = None
+    option_run_id: Optional[str] = None
+    based_on_generation: Optional[int] = None
+    protection_policy_version: Optional[str] = None
+    reserved_option_generation: Optional[int] = None
     actor_id: str
     #: ``manual`` for the owner's own click, ``automatic`` for the server
     #: recording a standing grant's authorisation. The decision is auditable and

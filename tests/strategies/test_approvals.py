@@ -548,6 +548,111 @@ class StructuralValidityTests(ApprovalTestCase):
         self.assertFalse(state["valid"])
 
 
+class BindingTests(ApprovalTestCase):
+    """C1.2 S3: the approval also pins version identity and the option generation.
+
+    A matching plan hash is not enough — the same logical plan can be recompiled
+    under a moved strategy version or against a run that has moved on, and the
+    owner authorised ONE of those artifacts, not its successor.
+    """
+
+    def _approve(self, plan_id="plan-1", *, now=NOW, version_binding=None, **overrides):
+        from backend.strategies.approvals import ApprovalRequest
+
+        reservation = self.reserve(plan_id)
+        return self.approvals.approve(
+            ApprovalRequest(
+                plan=self.plan(plan_id=plan_id, **overrides),
+                actor_id="app:owner",
+                reservation_id=reservation["reservation_id"],
+                session_product_snapshot={
+                    "products": ["CNC"],
+                    "valid_products": ["CNC", "MIS", "NRML"],
+                },
+                version_binding=version_binding,
+            ),
+            now=now,
+        )
+
+    @staticmethod
+    def _option_resolved(*, phase="adjust", run="run-opt-1", generation=2):
+        block = {"phase": phase, "option_run_id": run}
+        if generation is not None and phase == "adjust":
+            block["based_on_generation"] = generation
+        return {
+            "legs": [
+                {
+                    "instrument_id": "inst-REL",
+                    "product": "NRML",
+                    "tradingsymbol": "RELIANCE",
+                    "broker_exchange": "NFO",
+                    "broker_symbol": "RELIANCE",
+                }
+            ],
+            "option_run": block,
+        }
+
+    def test_an_explicit_version_binding_is_pinned_and_exposed(self):
+        approval = self._approve(
+            version_binding={
+                "strategy_version_id": "ver-7",
+                "version_number": 7,
+                "source_sha256": "src" * 10,
+                "policy_hash": "pol" * 10,
+            }
+        )
+        self.assertEqual(approval["strategy_version_id"], "ver-7")
+        self.assertEqual(approval["version_number"], 7)
+        self.assertEqual(approval["source_sha256"], "src" * 10)
+        self.assertEqual(approval["policy_hash"], "pol" * 10)
+
+    def test_an_unresolved_chain_binds_nothing_rather_than_the_empty_string(self):
+        # The bare fixture has no job/version chain, so nothing is pinned: a
+        # later release must read that as "nothing to compare", never as a match
+        # against an empty string.
+        approval = self._approve()
+        self.assertIsNone(approval["strategy_version_id"])
+        self.assertIsNone(approval["version_number"])
+        self.assertIsNone(approval["policy_hash"])
+        self.assertIsNone(approval["option_run_id"])
+
+    def test_an_adjust_approval_reserves_the_generation_it_moves_from(self):
+        approval = self._approve(
+            resolved_plan=self._option_resolved(run="run-opt-9", generation=3)
+        )
+        self.assertEqual(approval["option_run_id"], "run-opt-9")
+        self.assertEqual(approval["based_on_generation"], 3)
+        self.assertEqual(approval["reserved_option_generation"], 3)
+
+    def test_two_plans_cannot_both_own_one_option_run_generation(self):
+        from backend.strategies.approvals import OptionGenerationOwned
+
+        self._approve(
+            plan_id="plan-1",
+            resolved_plan=self._option_resolved(run="run-opt-9", generation=3),
+        )
+        with self.assertRaises(OptionGenerationOwned) as ctx:
+            self._approve(
+                plan_id="plan-2",
+                resolved_plan=self._option_resolved(run="run-opt-9", generation=3),
+            )
+        self.assertEqual(ctx.exception.reason_code, "APPROVAL_OPTION_GENERATION_OWNED")
+        self.assertEqual(ctx.exception.detail["owning_plan_id"], "plan-1")
+
+    def test_a_later_generation_on_the_same_run_is_admissible(self):
+        self._approve(
+            plan_id="plan-1",
+            resolved_plan=self._option_resolved(run="run-opt-9", generation=3),
+        )
+        # Generation 4 is a DIFFERENT artifact: the approval that owns gen 3 does
+        # not block a plan that takes the run from gen 4.
+        later = self._approve(
+            plan_id="plan-2",
+            resolved_plan=self._option_resolved(run="run-opt-9", generation=4),
+        )
+        self.assertEqual(later["reserved_option_generation"], 4)
+
+
 class ExemptionTests(ApprovalTestCase):
     def test_paper_and_dry_run_are_approval_exempt(self):
         from backend.strategies.approvals import ApprovalNotRequired, ApprovalRequest
