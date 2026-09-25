@@ -146,6 +146,9 @@ notifications. Record in `documents/hosted-strategies-rollout-<lane>-<date>.md`.
 2. `tests/options/test_options_execution_durable_store.py` fixture misses required `tradingsymbol`. Small fix
    inside B2.1.
 4. An adjust plan whose process died with a `submitted` event that has no outcome keeps its run `adjusting`: takeover and repair both refuse by name (`OPTION_RUN_ADJUST_IN_FLIGHT` / `adjust_in_flight`). It needs an operator disposition for the unanswered step. That lands with the repair UI in B2.6.
+5. `tests/sdk/test_worker_protection_runtime.py`: two structure-seam tests already fail at `ebc98ac`, before this work.
+   They expect a default structure-exit seam, but the runtime only gets one from `background.py`. Their
+   expectations need updating.
 3. One hosted execution API test stalls in the dirty checkout but passes from a clean worktree.
 
 ## Progress
@@ -165,5 +168,8 @@ notifications. Record in `documents/hosted-strategies-rollout-<lane>-<date>.md`.
 | B2.5 risk policy | done, reviewed | `0e02f39` |
 | B2.6a options view + repair UI | done, reviewed | `4679956` |
 | B2.2 hardening (review findings) | in progress | |
-| B2.4 S1 owner row | in progress | |
+| B2.5 follow-up (roll pricing) | done, reviewed | `6dc3fd3` |
+| C1.1 design | accepted | `dbfe46e` |
+| B2.4 S1 owner row | done, reviewed | `df5d29d` |
+| B2.4 S2a loop + safety gate | done, reviewed | `d32d1d1` |
 | B2.6b owner actions | design | |
