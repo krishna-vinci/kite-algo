@@ -76,6 +76,17 @@ PENDING_COMMITMENT_STATUSES = ("active", "renewed", "action_required")
 
 DEFAULT_MARGIN_MAX_AGE_SECONDS = 60
 
+
+def _option_margin_refusal(generic_reason: str, plan: Mapping[str, Any]) -> str:
+    """Use the option lane's named evidence vocabulary on the live option path."""
+    if str(plan.get("plan_kind") or "") != "option_structure":
+        return generic_reason
+    return {
+        "MARGIN_UNAVAILABLE": "LIVE_OPTION_MARGIN_EVIDENCE_UNAVAILABLE",
+        "MARGIN_QUOTE_STALE": "LIVE_OPTION_MARGIN_EVIDENCE_STALE",
+    }.get(generic_reason, generic_reason)
+
+
 #: The ONE live plan kind eligible for staged CNC financing (C1.1 §1). A live
 #: ``intent_bundle`` still refuses: it is not a persisted ``target_weights`` plan
 #: and its own lane rule governs it (``LIVE_PLAN_KIND_UNSUPPORTED`` at the
@@ -692,8 +703,12 @@ class AdmissionService:
                 required_margin = _as_float(margin_evidence.get("required_margin_inr"))
             if required_margin is None:
                 # No margin source is invented here: without evidence the limit
-                # is honestly reported as unchecked rather than read as zero.
                 detail["margin_check"] = "unavailable"
+                return AdmissionVerdict(
+                    False,
+                    _option_margin_refusal("MARGIN_UNAVAILABLE", plan),
+                    {**detail, "message": "No authoritative margin evidence is available"},
+                )
             else:
                 detail.update(
                     {
@@ -702,6 +717,8 @@ class AdmissionService:
                         "margin_limit_inr": float(margin_limit),
                     }
                 )
+                if margin_evidence.get("margin_basis") is not None:
+                    detail["margin_basis"] = str(margin_evidence["margin_basis"])
                 if required_margin > float(margin_limit):
                     return AdmissionVerdict(
                         False,
@@ -1316,14 +1333,14 @@ class AdmissionService:
             if not margin or margin.get("usable") is None:
                 return AdmissionVerdict(
                     False,
-                    "MARGIN_UNAVAILABLE",
+                    _option_margin_refusal("MARGIN_UNAVAILABLE", plan),
                     {**detail, "message": "No authoritative margin evidence is available"},
                 )
             as_of = margin.get("as_of")
             if as_of is None:
                 return AdmissionVerdict(
                     False,
-                    "MARGIN_QUOTE_STALE",
+                    _option_margin_refusal("MARGIN_QUOTE_STALE", plan),
                     {**detail, "message": "Margin evidence carries no as_of"},
                 )
             age = (moment - _coerce_datetime(as_of)).total_seconds()
@@ -1331,7 +1348,7 @@ class AdmissionService:
             if age > margin_max_age_seconds():
                 return AdmissionVerdict(
                     False,
-                    "MARGIN_QUOTE_STALE",
+                    _option_margin_refusal("MARGIN_QUOTE_STALE", plan),
                     {**detail, "margin_age_seconds": age, "max_age_seconds": margin_max_age_seconds()},
                 )
             available = _as_float(margin.get("usable"))

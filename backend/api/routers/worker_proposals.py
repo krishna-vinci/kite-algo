@@ -57,6 +57,7 @@ from backend.api.routers.worker_shared import (
     require_worker_token,
 )
 from backend.api.schemas.proposals import PlanResponse, ProposalSubmitRequest, ProposalSubmitResponse
+from backend.options.market.service import OptionsMarketService
 from backend.strategies.proposals import ProposalConflict, ProposalStore, ProposalStoreError
 from backend.strategies.proposals import ProposalSubmission
 
@@ -77,12 +78,46 @@ def _strategies_session_factory(request: Request):
     return SessionLocal
 
 
-def _store(request: Request) -> ProposalStore:
+def _store(request: Request, *, with_option_market: bool = True) -> ProposalStore:
     store = getattr(request.app.state, "proposal_store", None)
+    manager = (
+        getattr(request.app.state, "options_session_manager", None)
+        if with_option_market
+        else None
+    )
+    if manager is not None:
+        return ProposalStore(
+            session_factory=_strategies_session_factory(request),
+            option_market_reader=lambda: OptionsMarketService(manager),
+        )
     if store is None:
         store = ProposalStore(session_factory=_strategies_session_factory(request))
         request.app.state.proposal_store = store
     return store
+
+
+def _require_option_market_source(
+    request: Request, *, target_kind: str, account_scope: str
+) -> None:
+    """Live options cannot freeze without the canonical session source."""
+    from backend.algo_runtime.account_scope import parse_account_scope
+
+    if target_kind != "option_structure" or (
+        getattr(request.app.state, "options_session_manager", None) is not None
+    ):
+        return
+    try:
+        parsed = parse_account_scope(account_scope)
+    except ValueError:
+        return
+    if parsed.mode == "live":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "rejection_reason": "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE",
+                "message": "No active option market session source is configured",
+            },
+        )
 
 
 def _authority_for(
@@ -156,6 +191,15 @@ def _authority_for(
     }
 
 
+def _is_paper_account(account_scope: str) -> bool:
+    from backend.algo_runtime.account_scope import parse_account_scope
+
+    try:
+        return parse_account_scope(account_scope).mode == "paper"
+    except ValueError:
+        return False
+
+
 def _bound_job_id(payload: ProposalSubmitRequest, hosted_job: Any) -> Any:
     """The job id the envelope records: derived from authority, never the caller.
 
@@ -220,13 +264,23 @@ async def submit_proposal(request: Request, payload: ProposalSubmitRequest) -> P
 
     hosted_job = await hosted_job_for_run(request, run)
     authority = _authority_for(request, run, payload, hosted_job=hosted_job)
+    target_kind = str(payload.target_kind or "")
+    _require_option_market_source(
+        request,
+        target_kind=target_kind,
+        account_scope=authority["account_id"],
+    )
+    option_market = (
+        target_kind == "option_structure"
+        and not _is_paper_account(authority["account_id"])
+    )
     job_id = _bound_job_id(payload, hosted_job)
     bound_evaluation_id = _bound_evaluation_id(hosted_job)
     if bound_evaluation_id is not None:
         _require_bound_evaluation(payload, bound_evaluation_id)
 
     try:
-        result = _store(request).submit(
+        result = _store(request, with_option_market=option_market).submit(
             ProposalSubmission(
                 strategy_id=authority["strategy_id"],
                 account_id=authority["account_id"],

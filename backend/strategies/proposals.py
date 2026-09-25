@@ -49,6 +49,10 @@ from backend.strategies.compiler import (
     compute_plan_hash,
     plan_pin,
 )
+from backend.options.market.freshness import (
+    OptionChainEvidenceRefusal,
+    option_chain_freeze_evidence,
+)
 
 #: Evaluation kinds a client may assert (mirrors ``ck_proposals_evaluation_kind``).
 EVALUATION_KINDS = ("scheduled_occurrence", "run_now")
@@ -104,6 +108,7 @@ class ProposalStore:
         *,
         catalog: Optional[PinnedCatalogRead] = None,
         compiler: Any = None,
+        option_market_reader: Optional[Callable[[], Any]] = None,
     ) -> None:
         if session_factory is None:
             from backend.app.database import SessionLocal
@@ -112,6 +117,7 @@ class ProposalStore:
         self.session_factory = session_factory
         self._catalog = catalog
         self._compiler = compiler
+        self._option_market_reader = option_market_reader
 
     # -- reads --------------------------------------------------------------
 
@@ -237,6 +243,25 @@ class ProposalStore:
                 )
         except ValidationRefusal as exc:
             refusal = exc
+
+        if refusal is None and submission.target_kind == "option_structure" and self._option_market_reader is not None:
+            try:
+                market_service = self._option_market_reader()
+                if market_service is None:
+                    raise ValidationRefusal(
+                        "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE",
+                        {"message": "no active option market session source is configured"},
+                    )
+                compiled.resolved["option_chain_evidence"] = option_chain_freeze_evidence(
+                    market_service,
+                    {"resolved_plan": compiled.resolved},
+                )
+            except OptionChainEvidenceRefusal as exc:
+                refusal = ValidationRefusal(exc.reason_code, exc.detail)
+            except Exception as exc:
+                refusal = ValidationRefusal(
+                    "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE", {"reason": str(exc)}
+                )
 
         try:
             return self._write(

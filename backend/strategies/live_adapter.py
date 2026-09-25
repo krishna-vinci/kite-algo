@@ -56,6 +56,10 @@ from backend.app.database import SessionLocal
 
 from .admission import AdmissionService, margin_max_age_seconds
 from .approvals import ApprovalService
+from backend.options.market.freshness import (
+    LIVE_OPTION_CHAIN_MAX_AGE_SECONDS,
+    validate_option_chain_evidence,
+)
 from .reservations import CapacityExceeded, ReservationLedger
 from .settlement import ExecutionBarrier
 
@@ -479,6 +483,7 @@ class LivePlanAdapter:
         fill_reader: Any = None,
         clock: Optional[Callable[[], datetime]] = None,
         quote_max_age_seconds: float = QUOTE_MAX_AGE_SECONDS,
+        live_option_chain_max_age_seconds: float = LIVE_OPTION_CHAIN_MAX_AGE_SECONDS,
         submissions: Any = None,
         position_reader: Any = None,
         authority_reader: Any = None,
@@ -503,6 +508,7 @@ class LivePlanAdapter:
         self.authority_reader = authority_reader
         self._clock = clock or _utcnow
         self.quote_max_age_seconds = float(quote_max_age_seconds)
+        self.live_option_chain_max_age_seconds = float(live_option_chain_max_age_seconds)
         #: Durable per-step claim/outcome: the ONLY submission state.
         self.submissions = submissions or LiveSubmissionStore(session_factory=session_factory)
         #: The DOMAIN seams (roll state machine, durable option run binding and
@@ -957,6 +963,20 @@ class LivePlanAdapter:
         margin_evidence: Optional[Mapping[str, Any]],
         catalog_state: Optional[Mapping[str, Any]],
     ) -> Dict[str, Any]:
+        resolved_target_kind = str((plan.get("resolved_plan") or {}).get("target_kind") or "")
+        if resolved_target_kind == "option_structure":
+            try:
+                validate_option_chain_evidence(
+                    plan,
+                    now=self._clock(),
+                    max_age_seconds=self.live_option_chain_max_age_seconds,
+                )
+            except Exception as exc:
+                from backend.options.market.freshness import OptionChainEvidenceRefusal
+
+                if not isinstance(exc, OptionChainEvidenceRefusal):
+                    raise
+                raise LiveRefusal(exc.reason_code, exc.detail) from exc
         self._check_option_structure_admissibility(plan)
         verdict = self.admission.evaluate(
             plan,

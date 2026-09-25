@@ -694,6 +694,78 @@ class _Env:
         )
 
 
+def test_option_chain_gating_is_option_only(pg, live_env):
+    """CNC trades are untouched without options data; live options fail closed."""
+
+    env = _Env(pg, live_env)
+    catalog = _seed_catalog(env.factory)
+
+    async def _run():
+        client = await _operator_client(env.app)
+        try:
+            attempt = await _prepare_live_attempt(
+                client, account_scope=env.account_scope, lease_until=env.lease_until
+            )
+
+            # A live CNC plan is proposed, admitted and dispatched even though
+            # this app deliberately has NO option session manager configured.
+            cnc = await _submit_proposal(
+                client,
+                attempt,
+                {
+                    "target_kind": "target_weights",
+                    "payload": {
+                        "universe_revision_id": catalog["universe_revision_id"],
+                        "target_weights": {RELIANCE: 0.0, INFY: 0.02},
+                        "reference_prices": {RELIANCE: 1500.0, INFY: 1500.0},
+                    },
+                },
+                account_scope=env.account_scope,
+            )
+            assert cnc.status_code < 400, cnc.text
+            cnc_plan = cnc.json()["plan"]
+            executed, _reservation = await _execute(
+                client, attempt["strategy_id"], cnc_plan["plan_id"]
+            )
+            assert executed.status_code < 400, executed.text
+            assert executed.json()["broker_order_ids"], executed.text
+
+            # The same app refuses a LIVE option plan before compiling work.
+            option = await _submit_proposal(
+                client,
+                attempt,
+                {
+                    "target_kind": "option_structure",
+                    "payload": {
+                        "legs": [
+                            {
+                                "instrument_token": 900001,
+                                "exchange": "NFO",
+                                "tradingsymbol": "NIFTY26OCT25000CE",
+                                "side": "SELL",
+                                "ratio": 1,
+                                "reference_price": 100.0,
+                            }
+                        ],
+                        "product": "NRML",
+                        "underlying": "NIFTY",
+                        "expiry": "2026-10-29",
+                        "expiry_policy": "exit_before_cutoff",
+                    },
+                },
+                account_scope=env.account_scope,
+            )
+            assert option.status_code == 422, option.text
+            assert option.json()["detail"]["rejection_reason"] == (
+                "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE"
+            ), option.text
+            assert len(env.broker.calls) == 1
+        finally:
+            await client.aclose()
+
+    asyncio.run(_run())
+
+
 # ---------------------------------------------------------------- CNC basket
 
 

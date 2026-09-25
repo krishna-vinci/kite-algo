@@ -258,6 +258,40 @@ class _Clock:
         return self.now
 
 
+class _FakeOptionsManager:
+    """The canonical session shape, frozen to the harness clock."""
+
+    def __init__(self, clock):
+        self.clock = clock
+        soon = (clock() + timedelta(days=2)).date().isoformat()
+        self.packets = {
+            OPT_SHORT_TOKEN: {
+                "token": OPT_SHORT_TOKEN, "tsym": OPT_SHORT, "ltp": 100.0,
+                "iv": 0.14, "delta": 0.42, "updated_at": clock(),
+            },
+            OPT_HEDGE_TOKEN: {
+                "token": OPT_HEDGE_TOKEN, "tsym": OPT_HEDGE, "ltp": 40.0,
+                "iv": 0.16, "delta": 0.63, "updated_at": clock(),
+            },
+        }
+        self.soon = soon
+
+    def get_snapshot(self, _underlying):
+        rows = [
+            {"strike": 25000.0, "ce": self.packets[OPT_SHORT_TOKEN], "pe": None},
+            {"strike": 30000.0, "ce": None, "pe": self.packets[OPT_HEDGE_TOKEN]},
+        ]
+        return {
+            "underlying": "NIFTY",
+            "expiries": ["2026-10-29", self.soon],
+            "per_expiry": {
+                "2026-10-29": {"rows": rows},
+                self.soon: {"rows": rows},
+            },
+            "updated_at": self.clock(),
+        }
+
+
 def _build_app(factory, broker, clock):
     from fastapi import FastAPI
 
@@ -282,6 +316,7 @@ def _build_app(factory, broker, clock):
         app.include_router(router, prefix="/api")
 
     app.state.strategies_session_factory = factory
+    app.state.options_session_manager = _FakeOptionsManager(clock)
     app.state.attribution_store = SqlAttributionStore(session_factory=factory)
     app.state.algo_worker_repository = SqlAlchemyAlgoWorkerRepository(factory)
     app.state.settlement_barrier = ExecutionBarrier(session_factory=factory)
@@ -299,6 +334,7 @@ def _build_app(factory, broker, clock):
         },
         margin_reader=lambda account, plan: {
             "usable": 5_000_000.0,
+            "required_margin_inr": 1_000_000.0,
             "as_of": clock().isoformat(),
         },
     )
@@ -361,6 +397,7 @@ async def _prepare_live_attempt(client, *, account_scope: str, lease_until: date
             "source": "print('phase2b')",
             "parameters_schema": {"type": "object", "properties": {}},
             "capabilities": {"trade": True, "data": True},
+            "risk_policy": {"allowed_structure_families": ["vertical_spread"]},
         },
     )
     assert version.status_code < 400, version.text

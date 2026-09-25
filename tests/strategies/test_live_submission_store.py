@@ -423,5 +423,110 @@ class StagedFundingGateTests(unittest.TestCase):
         self.assertFalse(covered)
         self.assertEqual(detail["required_inr"], 10000.0)
 
+class _FakeOptionMarket:
+    """A canonical session shape with exactly the two frozen legs."""
+
+    def __init__(self, *, now):
+        self.snapshot_updated_at = now
+        self.greek_updated_at = now
+        self.packets = {
+            "opt-a": {"token": "opt-a", "tsym": "A", "ltp": 101.0, "iv": 0.12, "delta": 0.3, "updated_at": now},
+            "opt-b": {"token": "opt-b", "tsym": "B", "ltp": 41.0, "iv": 0.13, "delta": -0.2, "updated_at": now},
+        }
+
+    def _payload(self):
+        return [
+            {"strike": 100.0, "ce": self.packets["opt-a"], "pe": None},
+            {"strike": 110.0, "ce": None, "pe": self.packets["opt-b"]},
+        ]
+
+    def get_chain(self, _underlying, _expiry):
+        return {
+            "underlying": "NIFTY", "expiry": "2026-10-29", "chain": self._payload(),
+            "updated_at": self.snapshot_updated_at,
+        }
+
+    def get_greeks(self, _underlying, _expiry):
+        return {"contracts": self._payload(), "updated_at": self.greek_updated_at}
+
+
+class LiveOptionChainFreshnessTests(unittest.TestCase):
+    """Freeze binds the plan; the release pass rechecks the immutable evidence."""
+
+    NOW = datetime(2026, 9, 25, 10, 0, tzinfo=timezone.utc)
+
+    def _plan(self, *, age_seconds=0.0, greek_age_seconds=0.0, drop=False):
+        market = _FakeOptionMarket(now=self.NOW)
+        market.snapshot_updated_at = self.NOW - timedelta(seconds=age_seconds)
+        market.greek_updated_at = self.NOW - timedelta(seconds=greek_age_seconds)
+        for packet in market.packets.values():
+            packet["updated_at"] = market.greek_updated_at
+        if drop:
+            market.packets.pop("opt-b")
+        plan = {
+            "plan_id": "plan-opt", "plan_kind": "option_structure",
+            "resolved_plan": {
+                "target_kind": "option_structure",
+                "underlying": "NIFTY", "expiry": "2026-10-29",
+                "option_run": {"phase": "exit"},
+                "legs": [
+                    {"instrument_id": "opt-a", "broker_token": "opt-a"},
+                    {"instrument_id": "opt-b", "broker_token": "opt-b"},
+                ],
+            },
+        }
+        from backend.options.market.freshness import option_chain_freeze_evidence
+
+        plan["resolved_plan"]["option_chain_evidence"] = option_chain_freeze_evidence(
+            market, plan, now=self.NOW
+        )
+        return plan, market
+
+    def test_freeze_has_the_design_shape_and_leg_digest(self):
+        plan, _market = self._plan()
+        evidence = plan["resolved_plan"]["option_chain_evidence"]
+
+        self.assertEqual(set(evidence), {
+            "underlying", "expiry", "snapshot_updated_at", "snapshot_digest", "legs"
+        })
+        self.assertTrue(evidence["snapshot_digest"])
+        self.assertEqual(evidence["legs"]["opt-a"]["ltp"], 101.0)
+
+    def test_a_missing_leg_is_chain_snapshot_unavailable(self):
+        from backend.options.market.freshness import OptionChainEvidenceRefusal
+
+        with self.assertRaises(OptionChainEvidenceRefusal) as ctx:
+            self._plan(drop=True)
+        self.assertEqual(ctx.exception.reason_code, "OPTION_CHAIN_SNAPSHOT_UNAVAILABLE")
+
+    def test_stale_snapshot_and_stale_greeks_are_separate_refusals(self):
+        from backend.strategies.live_adapter import LivePlanAdapter, LiveRefusal
+
+        adapter = LivePlanAdapter(
+            session_factory=lambda: None,
+            admission=_Admission(),
+            approvals=_Durable(),
+            ledger=_Durable(),
+            barrier=_Durable(),
+            submissions=_Durable(),
+            clock=lambda: self.NOW,
+        )
+        stale_plan, _ = self._plan(age_seconds=6)
+        with self.assertRaises(LiveRefusal) as stale:
+            adapter._check_admission(stale_plan, margin_evidence=None, catalog_state=None)
+        self.assertEqual(stale.exception.reason_code, "OPTION_CHAIN_SNAPSHOT_STALE")
+
+        stale_greeks, _ = self._plan(greek_age_seconds=6)
+        with self.assertRaises(LiveRefusal) as greeks:
+            adapter._check_admission(stale_greeks, margin_evidence=None, catalog_state=None)
+        self.assertEqual(greeks.exception.reason_code, "OPTION_GREEKS_STALE")
+
+        fresh_plan, _ = self._plan()
+        result = adapter._check_admission(
+            fresh_plan, margin_evidence=None, catalog_state=None
+        )
+        self.assertTrue(result["admitted"])
+
+
 if __name__ == "__main__":
     unittest.main()

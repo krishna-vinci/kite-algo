@@ -23,6 +23,15 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Mapping, Optional
 
 
+class OptionMarginEvidenceRefusal(Exception):
+    """An option margin read that must not collapse into generic unavailable."""
+
+    def __init__(self, reason_code: str, detail: Optional[Mapping[str, Any]] = None) -> None:
+        super().__init__(reason_code)
+        self.reason_code = str(reason_code)
+        self.detail = dict(detail or {})
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -184,6 +193,7 @@ def live_margin_evidence(
         return {
             "usable": usable,
             "required_inr": required_inr,
+            "required_margin_inr": required_inr,
             "as_of": _utcnow(),
             "source": "portfolio_snapshot:funds.equity.available.cash",
             "account_scope": str(account_scope or ""),
@@ -196,6 +206,161 @@ def live_margin_evidence(
         # A programming error is a bug to surface, not "unavailable evidence".
         raise
     except Exception:  # noqa: BLE001 - a genuine read failure is not headroom
+        return None
+
+
+def _option_margin_items(kite: Any, account_scope: str, legs: list[Any]) -> Optional[list[Any]]:
+    from backend.broker_api.orders.models import OrderMarginInput
+
+    items = []
+    for leg in legs:
+        quantity = abs(float(leg.get("signed_quantity") or 0.0))
+        if quantity <= 0:
+            continue
+        reference_price = float(leg.get("reference_price") or 0.0)
+        if reference_price <= 0:
+            return None
+        items.append(
+            OrderMarginInput(
+                exchange=str(leg.get("broker_exchange") or leg.get("exchange") or "NFO"),
+                tradingsymbol=str(leg.get("broker_symbol") or leg.get("tradingsymbol") or ""),
+                transaction_type="BUY" if float(leg.get("signed_quantity") or 0) >= 0 else "SELL",
+                variety="regular",
+                product=str(leg.get("product") or "NRML"),
+                order_type="MARKET",
+                quantity=quantity,
+                price=reference_price,
+            )
+        )
+    return items
+
+
+def _basket_required_inr(
+    kite: Any,
+    account_scope: str,
+    items: list[Any],
+    *,
+    consider_positions: bool = True,
+) -> Optional[float]:
+    from backend.broker_api.orders.service import OrdersService
+
+    basket = OrdersService().basket_margins(
+        kite,
+        items,
+        consider_positions=consider_positions,
+        corr_id=f"admission-{account_scope}",
+        mode="compact",
+    )
+    total = getattr(basket, "final", None)
+    if total is None or getattr(total, "total", None) is None:
+        return None
+    return float(total.total)
+
+
+def _option_available_funds(kite: Any) -> Optional[float]:
+    margins = kite.margins()
+    equity = dict(margins).get("equity")
+    available = dict(equity).get("available") if isinstance(equity, Mapping) else None
+    cash = dict(available).get("cash") if isinstance(available, Mapping) else None
+    if cash is None or isinstance(cash, bool):
+        return None
+    try:
+        return float(cash)
+    except (TypeError, ValueError):
+        return None
+
+
+def _option_is_reduction_only(plan: Mapping[str, Any], legs: list[Any]) -> bool:
+    option_run = dict((plan.get("resolved_plan") or {}).get("option_run") or {})
+    return str(option_run.get("phase") or "") == "exit" or all(
+        float(leg.get("signed_quantity") or 0.0) <= 0 for leg in legs
+    )
+
+
+def option_live_margin_evidence(
+    account_scope: str,
+    plan: Mapping[str, Any],
+    *,
+    session_factory: Optional[Callable[[], Any]] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Authoritative live option basket-margin evidence, fail-closed by name.
+
+    A broker read failure or unusable funds becomes generic unavailable. Roll
+    overlap is special: a missing overlap basket is not the final basket, so it
+    raises ``LIVE_OPTION_ROLL_PEAK_UNAVAILABLE`` rather than understating risk.
+    """
+    try:
+        resolved = dict(plan.get("resolved_plan") or {})
+        legs = list(resolved.get("legs") or [])
+        if not legs:
+            return None
+        kite = _live_kite_for_account(account_scope, session_factory)
+        observed_scope = getattr(kite, "account_scope", None)
+        if observed_scope is not None and str(observed_scope) != str(account_scope or ""):
+            raise OptionMarginEvidenceRefusal(
+                "LIVE_OPTION_MARGIN_EVIDENCE_SCOPE_MISMATCH",
+                {"expected_account_scope": str(account_scope or ""), "observed": str(observed_scope)},
+            )
+        items = _option_margin_items(kite, account_scope, legs)
+        if items is None:
+            return None
+        if _option_is_reduction_only(plan, legs):
+            required = 0.0
+            final_required = 0.0
+            peak_required = 0.0
+            basis = "basket_final"
+        else:
+            final_required = _basket_required_inr(kite, account_scope, items)
+            if final_required is None:
+                return None
+            old_legs = list(resolved.get("old_legs") or [])
+            option_run = dict(resolved.get("option_run") or {})
+            is_roll = str(option_run.get("phase") or "") == "adjust" and bool(old_legs)
+            if is_roll:
+                old_items = _option_margin_items(kite, account_scope, old_legs)
+                if old_items is None:
+                    raise OptionMarginEvidenceRefusal(
+                        "LIVE_OPTION_ROLL_PEAK_UNAVAILABLE",
+                        {"reason": "old_generation_items_unavailable"},
+                    )
+                peak_required = _basket_required_inr(kite, account_scope, items + old_items)
+                if peak_required is None:
+                    raise OptionMarginEvidenceRefusal(
+                        "LIVE_OPTION_ROLL_PEAK_UNAVAILABLE",
+                        {"reason": "overlap_basket_unavailable"},
+                    )
+                required = max(float(final_required), float(peak_required))
+                basis = "roll_peak"
+            else:
+                peak_required = float(final_required)
+                required = float(final_required)
+                basis = "basket_final"
+        usable = _option_available_funds(kite)
+        if usable is None:
+            return None
+        return {
+            "usable": usable,
+            "required_inr": required,
+            "required_margin_inr": required,
+            "margin_basis": basis,
+            "as_of": now or _utcnow(),
+            "source": "broker_basket_margin",
+            "account_scope": str(account_scope or ""),
+            "legs": [
+                str(leg.get("instrument_id") or leg.get("tradingsymbol") or "")
+                for leg in legs
+            ],
+            "breakdown": {
+                "final_required_inr": final_required,
+                "peak_required_inr": peak_required,
+            },
+        }
+    except OptionMarginEvidenceRefusal:
+        raise
+    except (TypeError, AttributeError, NameError):
+        raise
+    except Exception:
         return None
 
 
@@ -302,9 +467,20 @@ class PlanExecutionPipeline:
             return None
         account_scope = str(plan.get("account_id") or "")
         if self._margin_reader is not None:
-            # An injected reader keeps its established two-argument seam; the
-            # built-in CNC funding reader owns its own session resolution.
-            return self._margin_reader(account_scope, plan)
+            try:
+                return self._margin_reader(account_scope, plan)
+            except OptionMarginEvidenceRefusal as exc:
+                raise PipelineRefusal(exc.reason_code, exc.detail) from exc
+        if (
+            str((plan.get("resolved_plan") or {}).get("target_kind") or "")
+            == "option_structure"
+        ):
+            try:
+                return option_live_margin_evidence(
+                    account_scope, plan, session_factory=self.session_factory
+                )
+            except OptionMarginEvidenceRefusal as exc:
+                raise PipelineRefusal(exc.reason_code, exc.detail) from exc
         return live_margin_evidence(account_scope, plan, session_factory=self.session_factory)
 
     def admit(self, plan: Mapping[str, Any], *, environment: str) -> Dict[str, Any]:

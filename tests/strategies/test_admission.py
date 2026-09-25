@@ -203,8 +203,16 @@ class AdmissionTestCase(unittest.TestCase):
             "reference_price": 100.0,
         }
 
-    def margin(self, *, usable=10000.0, age_seconds=0.0):
-        return {"usable": usable, "as_of": NOW - timedelta(seconds=age_seconds)}
+    def margin(
+        self, *, usable=10000.0, age_seconds=0.0, required_margin_inr=1000.0,
+        margin_basis="basket_final"
+    ):
+        return {
+            "usable": usable,
+            "required_margin_inr": required_margin_inr,
+            "margin_basis": margin_basis,
+            "as_of": NOW - timedelta(seconds=age_seconds),
+        }
 
     def policy(self, **overrides):
         values = {"allocation_inr": 1000.0}
@@ -1708,6 +1716,68 @@ class StrategyRiskPolicyTests(AdmissionTestCase):
         self.assertTrue(verdict.admitted, verdict.detail)
         self.assertFalse(verdict.detail.get("risk_policy_applies", True))
 
+    def test_live_option_margin_limit_uses_required_margin_and_bites(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy({"margin_limit_inr": 2000.0})
+        plan = self._option_plan(self._vertical())
+
+        over = self.service.evaluate(
+            plan,
+            now=NOW,
+            margin_evidence=self.margin(usable=1000000.0, required_margin_inr=2001.0),
+        )
+        under = self.service.evaluate(
+            plan,
+            now=NOW,
+            margin_evidence=self.margin(usable=1000000.0, required_margin_inr=1000.0),
+        )
+
+        self.assertFalse(over.admitted, over.detail)
+        self.assertEqual(over.refusal_reason, "MARGIN_INSUFFICIENT")
+        self.assertEqual(over.detail["margin_required_inr"], 2001.0)
+        self.assertTrue(under.admitted, under.detail)
+        self.assertEqual(under.detail["margin_required_inr"], 1000.0)
+
+    def test_live_option_margin_unavailable_and_stale_have_lane_names(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy({"margin_limit_inr": 2000.0})
+        plan = self._option_plan(self._vertical())
+
+        unavailable = self.service.evaluate(
+            plan, now=NOW, margin_evidence=self.margin(usable=1000000.0, required_margin_inr=None)
+        )
+        stale = self.service.evaluate(
+            plan,
+            now=NOW,
+            margin_evidence=self.margin(
+                usable=1000000.0, required_margin_inr=1000.0, age_seconds=61
+            ),
+        )
+
+        self.assertEqual(
+            unavailable.refusal_reason, "LIVE_OPTION_MARGIN_EVIDENCE_UNAVAILABLE"
+        )
+        self.assertEqual(stale.refusal_reason, "LIVE_OPTION_MARGIN_EVIDENCE_STALE")
+
+    def test_live_roll_peak_exceeds_the_margin_limit(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy({"margin_limit_inr": 3000.0})
+        plan = self._roll_plan()
+
+        verdict = self.service.evaluate(
+            plan,
+            now=NOW,
+            margin_evidence=self.margin(
+                usable=1000000.0,
+                required_margin_inr=3001.0,
+                margin_basis="roll_peak",
+            ),
+        )
+
+        self.assertFalse(verdict.admitted, verdict.detail)
+        self.assertEqual(verdict.refusal_reason, "MARGIN_INSUFFICIENT")
+        self.assertEqual(verdict.detail["margin_basis"], "roll_peak")
+
 
 class LiveMarginEvidenceReaderTests(unittest.TestCase):
     """The ONE CNC funding reader: funds evidence and honest failure modes.
@@ -1749,6 +1819,7 @@ class LiveMarginEvidenceReaderTests(unittest.TestCase):
 
         self.assertEqual(evidence["usable"], 5000.0)
         self.assertEqual(evidence["required_inr"], 1000.0)
+        self.assertEqual(evidence["required_margin_inr"], 1000.0)
         self.assertEqual(evidence["account_scope"], "kite:A")
         self.assertEqual(evidence["legs"], ["inst-REL"])
         self.assertIn("source", evidence)
@@ -1793,6 +1864,129 @@ class LiveMarginEvidenceReaderTests(unittest.TestCase):
         self.assertEqual(_cnc_available_cash(_Kite({"equity": {"available": {"cash": 0.0}}}), "kite:A"), 0.0)
         self.assertEqual(
             _cnc_available_cash(_Kite({"equity": {"available": {"cash": 1234.5}}}), "kite:A"), 1234.5
+        )
+
+
+class LiveOptionMarginReaderTests(unittest.TestCase):
+    """The option reader is a broker BASKET read with honest roll-peak math."""
+
+    @staticmethod
+    def _plan(*, old_legs=None):
+        resolved = {
+            "option_run": {"phase": "entry" if old_legs is None else "adjust"},
+            "legs": [
+                {
+                    "instrument_id": "opt-short",
+                    "broker_exchange": "NFO",
+                    "broker_symbol": "SHORT",
+                    "product": "NRML",
+                    "signed_quantity": -75,
+                    "reference_price": 100.0,
+                },
+                {
+                    "instrument_id": "opt-long",
+                    "broker_exchange": "NFO",
+                    "broker_symbol": "LONG",
+                    "product": "NRML",
+                    "signed_quantity": 75,
+                    "reference_price": 40.0,
+                },
+            ],
+        }
+        if old_legs is not None:
+            resolved["old_legs"] = old_legs
+        return {"plan_kind": "option_structure", "resolved_plan": resolved}
+
+    def test_entry_reads_final_basket_and_account_funds(self):
+        from backend.strategies import plan_pipeline
+
+        with mock.patch.object(
+            plan_pipeline, "_live_kite_for_account", lambda *a, **k: object()
+        ), mock.patch.object(
+            plan_pipeline, "_basket_required_inr", lambda *a, **k: 23456.0
+        ), mock.patch.object(
+            plan_pipeline, "_option_available_funds", lambda _kite: 123456.0
+        ):
+            evidence = plan_pipeline.option_live_margin_evidence(
+                "kite:A", self._plan(), session_factory=lambda: None
+            )
+
+        self.assertEqual(evidence["usable"], 123456.0)
+        self.assertEqual(evidence["required_margin_inr"], 23456.0)
+        self.assertEqual(evidence["margin_basis"], "basket_final")
+        self.assertEqual(evidence["breakdown"]["final_required_inr"], 23456.0)
+
+    def test_roll_carrys_the_maximum_overlap_basket(self):
+        from backend.strategies import plan_pipeline
+
+        with mock.patch.object(
+            plan_pipeline, "_live_kite_for_account", lambda *a, **k: object()
+        ), mock.patch.object(
+            plan_pipeline,
+            "_basket_required_inr",
+            side_effect=[23456.0, 34567.0],
+        ), mock.patch.object(
+            plan_pipeline, "_option_available_funds", lambda _kite: 40000.0
+        ):
+            evidence = plan_pipeline.option_live_margin_evidence(
+                "kite:A",
+                self._plan(old_legs=[{"signed_quantity": -75, "reference_price": 90.0}]),
+            )
+
+        self.assertEqual(evidence["required_margin_inr"], 34567.0)
+        self.assertEqual(evidence["margin_basis"], "roll_peak")
+        self.assertEqual(evidence["breakdown"]["peak_required_inr"], 34567.0)
+
+    def test_a_missing_roll_overlap_is_never_the_final_requirement(self):
+        from backend.strategies import plan_pipeline
+
+        with mock.patch.object(
+            plan_pipeline, "_live_kite_for_account", lambda *a, **k: object()
+        ), mock.patch.object(
+            plan_pipeline,
+            "_basket_required_inr",
+            side_effect=[23456.0, None],
+        ):
+            with self.assertRaises(plan_pipeline.OptionMarginEvidenceRefusal) as ctx:
+                plan_pipeline.option_live_margin_evidence(
+                    "kite:A",
+                    self._plan(old_legs=[{"signed_quantity": -75, "reference_price": 90.0}]),
+                )
+        self.assertEqual(ctx.exception.reason_code, "LIVE_OPTION_ROLL_PEAK_UNAVAILABLE")
+
+    def test_exit_requires_funds_but_not_option_margin(self):
+        from backend.strategies import plan_pipeline
+
+        plan = self._plan()
+        plan["resolved_plan"]["option_run"]["phase"] = "exit"
+        with mock.patch.object(
+            plan_pipeline, "_live_kite_for_account", lambda *a, **k: object()
+        ), mock.patch.object(
+            plan_pipeline, "_basket_required_inr", side_effect=AssertionError("no basket")
+        ), mock.patch.object(
+            plan_pipeline,
+            "_option_available_funds",
+            mock.Mock(return_value=123.0),
+        ) as funds:
+            evidence = plan_pipeline.option_live_margin_evidence("kite:A", plan)
+
+        self.assertEqual(evidence["required_margin_inr"], 0.0)
+        self.assertEqual(evidence["usable"], 123.0)
+        funds.assert_called_once()
+
+    def test_wrong_broker_account_scope_is_named(self):
+        from backend.strategies import plan_pipeline
+
+        class _WrongKite:
+            account_scope = "kite:B"
+
+        with mock.patch.object(
+            plan_pipeline, "_live_kite_for_account", lambda *a, **k: _WrongKite()
+        ):
+            with self.assertRaises(plan_pipeline.OptionMarginEvidenceRefusal) as ctx:
+                plan_pipeline.option_live_margin_evidence("kite:A", self._plan())
+        self.assertEqual(
+            ctx.exception.reason_code, "LIVE_OPTION_MARGIN_EVIDENCE_SCOPE_MISMATCH"
         )
 
     def test_an_absent_or_non_numeric_cash_is_unavailable_never_zero(self):

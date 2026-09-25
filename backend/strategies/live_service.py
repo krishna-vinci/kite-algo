@@ -31,7 +31,11 @@ from backend.strategies.live_readers import (
     live_quote_for_leg,
     live_session_id_for_account,
 )
-from backend.strategies.plan_pipeline import live_margin_evidence
+from backend.strategies.plan_pipeline import (
+    OptionMarginEvidenceRefusal,
+    live_margin_evidence,
+    option_live_margin_evidence,
+)
 from backend.strategies.live_settings import hosted_live_disabled_detail, hosted_live_enabled
 from backend.strategies.live_sequence import (
     BLOCKER_HEDGE_NOT_FILLED,
@@ -237,9 +241,19 @@ class LivePlanExecutor:
 
         account_id = str(plan.get("account_id") or "")
         try:
-            margin_reader = self._margin_reader or (
-                lambda account, plan: live_margin_evidence(account, plan, session_factory=self.session_factory)
-            )
+            if self._margin_reader is not None:
+                margin_reader = self._margin_reader
+            elif (
+                str((plan.get("resolved_plan") or {}).get("target_kind") or "")
+                == "option_structure"
+            ):
+                margin_reader = lambda account, plan: option_live_margin_evidence(
+                    account, plan, session_factory=self.session_factory
+                )
+            else:
+                margin_reader = lambda account, plan: live_margin_evidence(
+                    account, plan, session_factory=self.session_factory
+                )
             margin = margin_reader(account_id, plan)
             session_id_reader = self._session_id_reader or (
                 lambda account: live_session_id_for_account(account, session_factory=self.session_factory)
@@ -276,6 +290,10 @@ class LivePlanExecutor:
             self._record_refusal(plan_id=plan_id, actor=actor, exc=wrapped)
             raise wrapped from exc
         except LiveEvidenceUnavailable as exc:
+            wrapped = ExecutionRefusal(exc.reason_code, exc.detail)
+            self._record_refusal(plan_id=plan_id, actor=actor, exc=wrapped)
+            raise wrapped from exc
+        except OptionMarginEvidenceRefusal as exc:
             wrapped = ExecutionRefusal(exc.reason_code, exc.detail)
             self._record_refusal(plan_id=plan_id, actor=actor, exc=wrapped)
             raise wrapped from exc
@@ -666,11 +684,19 @@ class LivePlanExecutor:
 
             account_id = str(plan.get("account_id") or "")
             try:
-                margin_reader = self._margin_reader or (
-                    lambda account, plan: live_margin_evidence(
+                if self._margin_reader is not None:
+                    margin_reader = self._margin_reader
+                elif (
+                    str((plan.get("resolved_plan") or {}).get("target_kind") or "")
+                    == "option_structure"
+                ):
+                    margin_reader = lambda account, plan: option_live_margin_evidence(
                         account, plan, session_factory=self.session_factory
                     )
-                )
+                else:
+                    margin_reader = lambda account, plan: live_margin_evidence(
+                        account, plan, session_factory=self.session_factory
+                    )
                 session_id_reader = self._session_id_reader or (
                     lambda account: live_session_id_for_account(
                         account, session_factory=self.session_factory
@@ -703,6 +729,7 @@ class LivePlanExecutor:
                 ExecutionRefusal,
                 LiveAuthorityRefusal,
                 LiveEvidenceUnavailable,
+                OptionMarginEvidenceRefusal,
             ) as exc:
                 self.sequence.record_release_blocker(
                     plan_id=plan_id,

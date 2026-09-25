@@ -1115,8 +1115,16 @@ def _live_margin_evidence(account_scope: str, plan: Dict[str, Any]) -> Optional[
     admission preview can disagree with the submission it authorises. The seam
     (a two-argument reader the pipeline can be given) is preserved for tests.
     """
-    from backend.strategies.plan_pipeline import live_margin_evidence
+    from backend.strategies.plan_pipeline import (
+        live_margin_evidence,
+        option_live_margin_evidence,
+    )
 
+    if (
+        str((plan.get("resolved_plan") or {}).get("target_kind") or "")
+        == "option_structure"
+    ):
+        return option_live_margin_evidence(account_scope, plan)
     return live_margin_evidence(account_scope, plan)
 
 
