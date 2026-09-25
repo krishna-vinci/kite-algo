@@ -6,7 +6,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Mapping, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
@@ -1031,6 +1031,85 @@ def _next_backend_protection_for_patch(protection: Dict[str, Any], previous_runt
     next_protection["version"] = max(_to_int(next_protection.get("version"), default=1), previous_version + 1)
     return next_protection
 
+
+def _protection_owner_policy_for_patch(
+    current_policy: Any, protection: Dict[str, Any]
+) -> Dict[str, Any]:
+    """The owner row's policy after the platform patches a run's protection.
+
+    B2.4 S4: the owner row records WHAT a structure is protected by, and the
+    patch is the platform's own config write. The facts the plan declared (the
+    structure id, the underlying, the expiry) SURVIVE from the row's current
+    policy; the keys the patch actually determines - the structure digest, the
+    rules and the operational block - are replaced, so the digest moves exactly
+    when the protection did.
+    """
+
+    policy = dict(current_policy or {}) if isinstance(current_policy, Mapping) else {}
+    structure = protection.get("structure")
+    if isinstance(structure, Mapping) and str(structure.get("structure_digest") or ""):
+        policy["structure_digest"] = str(structure["structure_digest"])
+    operations = protection.get("operations")
+    if isinstance(operations, Mapping):
+        policy["operations"] = dict(operations)
+        stale = bool(operations.get("exit_on_worker_stale")) or (
+            operations.get("worker_stale_sec") is not None
+        )
+        if stale:
+            policy["stale_exit_policy"] = "exit_on_worker_stale"
+    positions = protection.get("positions")
+    if isinstance(positions, list):
+        policy["rules"] = [dict(row) for row in positions if isinstance(row, Mapping)]
+    if "basket" in protection:
+        policy["basket"] = protection.get("basket")
+    policy["enabled"] = bool(protection.get("enabled"))
+    return policy
+
+
+def _sync_protection_owner_policy(strategy_run_id: str, protection: Dict[str, Any]) -> Optional[str]:
+    """Mirror a patched protection policy onto the run's ACTIVE owner row.
+
+    Returns the option run id the policy was frozen on, or ``None`` when this
+    worker run owns no structure. ORDERING: the run's own config write commits
+    first (that config is what the protection loop evaluates), and this then
+    freezes the same policy on the owner row in ONE epoch CAS. A row that moved
+    under us - a successor transfer, or a competing adjust - leaves the policy
+    where it is rather than reporting a structure's policy twice; the caller
+    re-reads and reconciles. Mirroring is bookkeeping: it never turns a
+    successful config write into a failed route.
+    """
+
+    try:
+        from backend.options.protection.ownership import (
+            OptionProtectionOwnerStore,
+            OptionProtectionOwnerRefusal,
+        )
+
+        store = OptionProtectionOwnerStore()
+        rows = store.list_protection_owners(owner_run_id=str(strategy_run_id))
+    except Exception:  # noqa: BLE001 - bookkeeping never fails the config write
+        return None
+    mirrored: Optional[str] = None
+    for row in rows:
+        option_run_id = str(row.get("option_run_id") or "")
+        if not option_run_id:
+            continue
+        try:
+            store.update_policy(
+                option_run_id,
+                _protection_owner_policy_for_patch(row.get("policy"), protection),
+                int(row.get("owner_epoch") or 0),
+                owner_run_id=str(strategy_run_id),
+            )
+        except OptionProtectionOwnerRefusal:
+            # A row that moved under this write keeps its own policy: the
+            # successor (or the adjust that won the epoch) is authoritative.
+            continue
+        except Exception:  # noqa: BLE001 - bookkeeping, never the config write
+            continue
+        mirrored = option_run_id
+    return mirrored
+
 def _preserve_backend_trailing_state(next_state: Dict[str, Any], previous_state: Dict[str, Any]) -> Dict[str, Any]:
     preserved = dict(next_state)
     if "best_basket_pnl_pct" in previous_state:
@@ -1247,6 +1326,9 @@ async def patch_worker_run_protection(request: Request, strategy_run_id: str, pa
         )
         if result is None:
             raise HTTPException(status_code=409, detail="Backend protection changed concurrently; reload and retry")
+        # The patched policy is the structure's protection now, so the owner row
+        # that the option gates read is frozen on the same policy (B2.4 S4).
+        await asyncio.to_thread(_sync_protection_owner_policy, strategy_run_id, protection)
         for event in list(result.get("timeline_events") or []):
             await publish_event(f"worker.execution.events:{strategy_run_id}", event)
         return result.get("run")
@@ -1261,6 +1343,7 @@ async def patch_worker_run_protection(request: Request, strategy_run_id: str, pa
     )
     if updated is None:
         raise HTTPException(status_code=409, detail="Backend protection changed concurrently; reload and retry")
+    await asyncio.to_thread(_sync_protection_owner_policy, strategy_run_id, protection)
     return updated
 
 async def list_worker_execution_events(

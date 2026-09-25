@@ -344,6 +344,107 @@ class TestTransfer:
         assert row["owner_run_id"] == "run-first-successor"
 
 
+class TestPolicyChangeAtomicity:
+    """An adjust completion freezes its policy in the RUN's own transaction (S4).
+
+    The requirement is that the run write and the owner row's policy change
+    commit TOGETHER: a run that reads as adjusted under a policy the owner row
+    never saw (or the reverse) is not a state the platform may be left in. Both
+    halves are proved here, on the production database - the commit, and the
+    rollback when the CAS loses the epoch.
+    """
+
+    @staticmethod
+    def _new_protection() -> dict:
+        return {
+            "expiry": "2026-11-26",
+            "expiry_policy": "exit_before_cutoff",
+            "structure_digest": "digest-rolled",
+            "structure_id": "structure-rolled",
+            "underlying": "NIFTY",
+        }
+
+    def test_a_landed_policy_change_commits_with_the_run_write(self, pg):
+        from backend.options.execution.durable_store import DurableOptionRunStore
+        from backend.options.protection.ownership import (
+            option_protection_policy_snapshot,
+            option_protection_policy_version,
+        )
+
+        factory, option_run_id, owner_run_id, _strategy_id = _entry(pg)
+        runs = DurableOptionRunStore(session_factory=factory)
+        observed = _owner_store(factory).read(option_run_id)
+        assert int(observed["owner_epoch"]) == 1
+        assert observed["owner_run_id"] == owner_run_id
+
+        # One landed adjust: a new held generation and its frozen policy.
+        run = runs.get_run(option_run_id)
+        run.status = "entered"
+        run.protection = self._new_protection()
+        policy = option_protection_policy_snapshot(run.protection)
+        runs.save_run(
+            run,
+            owner_policy=policy,
+            owner_run_id=owner_run_id,
+            owner_observed_epoch=1,
+        )
+
+        # BOTH halves are visible on a FRESH read: the run's own record and the
+        # owner row the protection loop and the gates read.
+        fresh = runs.get_run(option_run_id)
+        assert fresh.status == "entered"
+        assert str(fresh.protection.get("structure_digest")) == "digest-rolled"
+        row = _owner_store(factory).read(option_run_id)
+        assert int(row["owner_epoch"]) == 2
+        assert row["owner_run_id"] == owner_run_id
+        assert row["state"] == "active"
+        assert row["policy"]["structure_digest"] == "digest-rolled"
+        assert row["policy_version"] == option_protection_policy_version(policy)
+        events = _events(factory, option_run_id)
+        assert [event["event"] for event in events] == ["claimed", "policy_changed"]
+        changed = events[1]
+        assert int(changed["owner_epoch"]) == 2
+        detail = changed["detail"] if isinstance(changed["detail"], dict) else json.loads(changed["detail"])
+        assert detail["policy_version"] == row["policy_version"]
+        assert detail["previous_policy_version"] == observed["policy_version"]
+
+    def test_a_losing_policy_cas_takes_the_run_write_down_with_it(self, pg):
+        from backend.options.execution.durable_store import DurableOptionRunStore
+        from backend.options.protection.ownership import (
+            CONFLICT,
+            OptionProtectionOwnerRefusal,
+            option_protection_policy_snapshot,
+        )
+
+        factory, option_run_id, owner_run_id, _strategy_id = _entry(pg)
+        runs = DurableOptionRunStore(session_factory=factory)
+        before = runs.get_run(option_run_id)
+        observed = _owner_store(factory).read(option_run_id)
+
+        run = runs.get_run(option_run_id)
+        run.status = "entered"
+        run.protection = self._new_protection()
+        policy = option_protection_policy_snapshot(run.protection)
+        # Somebody else moved the row first: the epoch the caller observed is
+        # stale, so the CAS loses and the WHOLE transaction is rolled back.
+        with pytest.raises(OptionProtectionOwnerRefusal) as ctx:
+            runs.save_run(
+                run,
+                owner_policy=policy,
+                owner_run_id=owner_run_id,
+                owner_observed_epoch=int(observed["owner_epoch"]) + 1,
+            )
+
+        assert ctx.value.reason_code == CONFLICT
+        after = runs.get_run(option_run_id)
+        assert after.status == before.status
+        assert str(after.protection.get("structure_digest") or "") != "digest-rolled"
+        row = _owner_store(factory).read(option_run_id)
+        assert int(row["owner_epoch"]) == int(observed["owner_epoch"])
+        assert row["policy_version"] == observed["policy_version"]
+        assert [event["event"] for event in _events(factory, option_run_id)] == ["claimed"]
+
+
 class TestSingleOwnerRow:
     """The primary key is the rule: a second owner row is unrepresentable."""
 

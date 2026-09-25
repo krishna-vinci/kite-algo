@@ -567,6 +567,123 @@ class OptionProtectionOwnerStore:
                 session.close()
         return self._view(dict(row or {"option_run_id": option_run_id}))
 
+    def update_policy(
+        self,
+        option_run_id: str,
+        policy: Mapping[str, Any] | None,
+        observed_epoch: int,
+        *,
+        owner_run_id: Optional[str] = None,
+        policy_version: Optional[str] = None,
+        db: Any = None,
+    ) -> dict[str, Any]:
+        """Freeze a NEW policy on an ACTIVE owner row in ONE compare-and-swap.
+
+        This is the policy half of B2.4 S4: an adjust completion and the
+        platform's own protection patch both change WHAT the structure is
+        protected by, and both have to advance the row the loop reads exactly
+        once. The CAS ticket is the epoch the caller OBSERVED while it held the
+        run's transition (or the run's config write); zero rows means somebody
+        else moved the run first, which is the named
+        :data:`CONFLICT` - never a blind retry. ``owner_run_id``, when given,
+        must still be the row's owner: a superseded caller does not rewrite the
+        policy of a structure it no longer owns.
+
+        One CAS, one ``policy_changed`` event, one epoch step. A changed policy
+        is still ONE statement, so there is never a window in which two policies
+        are both active.
+        """
+
+        option_run_id = self._require_id(option_run_id)
+        observed = int(observed_epoch)
+        snapshot = dict(policy or {})
+        version = str(policy_version or "") or option_protection_policy_version(snapshot)
+        owns_session = db is None
+        session = db or self._session_factory()
+        try:
+            self._advisory_lock(session, option_run_id)
+            current = self._select_for_update(session, option_run_id)
+            if current is None:
+                raise OptionProtectionOwnerRefusal(
+                    OWNER_UNKNOWN,
+                    {
+                        "option_run_id": option_run_id,
+                        "reason": "owner_row_absent",
+                        "message": (
+                            "there is no protection owner row for this run; a policy "
+                            "change never invents one"
+                        ),
+                    },
+                )
+            json_args = self._json_value(session, "policy")
+            params: dict[str, Any] = {
+                "option_run_id": option_run_id,
+                "policy": json.dumps(snapshot),
+                "policy_version": version,
+                "observed_epoch": observed,
+            }
+            owner_predicate = ""
+            if owner_run_id is not None:
+                owner_predicate = "AND owner_run_id = :owner_run_id"
+                params["owner_run_id"] = str(owner_run_id)
+            result = session.execute(
+                text(
+                    f"""
+                    UPDATE public.option_protection_owners
+                    SET
+                        policy = {json_args},
+                        policy_version = :policy_version,
+                        owner_epoch = owner_epoch + 1,
+                        updated_at = {self._now_expression(session)}
+                    WHERE option_run_id = :option_run_id
+                      AND state = 'active'
+                      AND owner_epoch = :observed_epoch
+                      {owner_predicate}
+                    """
+                ),
+                params,
+            )
+            if int(getattr(result, "rowcount", 0) or 0) == 0:
+                raise OptionProtectionOwnerRefusal(
+                    CONFLICT,
+                    {
+                        "option_run_id": option_run_id,
+                        "observed_epoch": observed,
+                        "owner_run_id": owner_run_id,
+                        "current_epoch": int(current.get("owner_epoch") or 0),
+                        "current_owner_run_id": current.get("owner_run_id"),
+                        "current_state": str(current.get("state") or ""),
+                        "message": (
+                            "another owner moved this run first; the caller must "
+                            "re-read, never retry blindly"
+                        ),
+                    },
+                )
+            new_epoch = observed + 1
+            self._append_event(
+                session,
+                option_run_id=option_run_id,
+                owner_epoch=new_epoch,
+                event="policy_changed",
+                owner_run_id=current.get("owner_run_id"),
+                actor_id=str(owner_run_id) if owner_run_id is not None else None,
+                detail={
+                    "previous_policy_version": current.get("policy_version"),
+                    "policy_version": version,
+                    "observed_epoch": observed,
+                },
+            )
+            row = self._select_for_update(session, option_run_id)
+            if owns_session:
+                session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            if owns_session:
+                session.close()
+        return self._view(dict(row or {"option_run_id": option_run_id}))
+
     def release(self, option_run_id: str, db: Any = None) -> Optional[dict[str, Any]]:
         """Release an owner row for a TERMINAL run. Idempotent.
 

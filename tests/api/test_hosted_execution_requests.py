@@ -579,10 +579,14 @@ def _move_structure_generation(world, option_run_id, *, generation):
         session.commit()
 
 
-def _own_option_run(world, *, plan_id, status=None):
+def _own_option_run(world, *, plan_id, status=None, owner=True):
     """A durable option run THIS strategy owns, reached from ``plan_id``'s edge."""
     from backend.options.execution.durable_store import DurableOptionRunStore
     from backend.options.execution.models import OptionRunCreateRequest
+    from backend.options.protection.ownership import (
+        OptionProtectionOwnerStore,
+        option_protection_policy_snapshot,
+    )
 
     run = DurableOptionRunStore(session_factory=world["factory"]).create_run(
         OptionRunCreateRequest(
@@ -600,9 +604,28 @@ def _own_option_run(world, *, plan_id, status=None):
                     "quantity": 75,
                 },
             ],
-            metadata={"source": "b21a-entry-gate"},
+            metadata={
+                "source": "b21a-entry-gate",
+                # The scope the protection owner row has to agree with: a
+                # plan-created run carries it, and B2.4's gate reads the owner
+                # row for every run reached through ``strategy_plan_option_runs``.
+                "strategy_id": str(world["strategy"].id),
+                "account_id": ACCOUNT,
+                "execution_environment": "paper",
+                "worker_run_id": "run-held-structure",
+            },
         )
     )
+    # The entry hook's own rule, done here because this fixture creates the run
+    # directly: a run bound through ``strategy_plan_option_runs`` carries an
+    # ACTIVE protection owner, and B2.4 S2b refuses to grow exposure for one
+    # whose ownership cannot be read.
+    if owner:
+        OptionProtectionOwnerStore(session_factory=world["factory"]).claim(
+            run,
+            "run-held-structure",
+            option_protection_policy_snapshot({"structure_digest": HELD_DIGEST}),
+        )
     with world["factory"]() as session:
         session.add(
             StrategyPlanOptionRun(
@@ -1002,6 +1025,50 @@ def test_a_cleanly_entered_different_structure_is_still_admitted(world):
 
     verdict = world["pipeline"].admit(world["pipeline"].plan(candidate), environment="paper")
     assert verdict["admitted"] is True
+
+
+def test_an_entry_into_an_ownerless_held_structure_is_refused_by_name(world):
+    """B2.4 S2b: a held structure whose protection ownership cannot be read is
+    never "nothing to protect". The request refuses by name at creation and is
+    never handed to the owner to approve."""
+    _record_policy(world)
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    held_run = _own_option_run(world, plan_id=held_plan, status="entered", owner=False)
+    candidate = _option_plan(world["factory"], strategy=world["strategy"], digest=OTHER_DIGEST)
+
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=candidate, idempotency_key="opt-ownerless-0001", now=NOW
+    )
+
+    request = created["request"]
+    assert request["status"] == "refused"
+    assert request["refusal_code"] == "OPTION_PROTECTION_OWNER_UNKNOWN"
+    assert request["refusal_detail"]["option_run_id"] == held_run
+    assert request["refusal_detail"]["stage"] == "request"
+    assert world["service"].claim_next(limit=10, now=NOW) == []
+
+    # Admission asks the SAME rule and refuses the SAME plan by the SAME name.
+    with pytest.raises(PipelineRefusal) as ctx:
+        world["pipeline"].admit(world["pipeline"].plan(candidate), environment="paper")
+    assert ctx.value.reason_code == "OPTION_PROTECTION_OWNER_UNKNOWN"
+
+
+def test_the_same_entry_is_admitted_once_the_held_structure_has_an_active_owner(world):
+    """The admit twin: the identical request with a readable owner is approved."""
+    _record_policy(world)
+    held_plan = _option_plan(world["factory"], strategy=world["strategy"], digest=HELD_DIGEST)
+    _own_option_run(world, plan_id=held_plan, status="entered")
+    candidate = _option_plan(world["factory"], strategy=world["strategy"], digest=OTHER_DIGEST)
+
+    created = world["service"].create_for_job(
+        job=world["job"], plan_id=candidate, idempotency_key="opt-owned-0001", now=NOW
+    )
+
+    assert created["request"]["status"] == "awaiting_approval"
+    assert created["request"]["refusal_code"] is None
+    assert world["pipeline"].admit(world["pipeline"].plan(candidate), environment="paper")[
+        "admitted"
+    ] is True
 
 
 @pytest.mark.asyncio

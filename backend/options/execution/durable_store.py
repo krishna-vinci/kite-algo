@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from sqlalchemy import text
 from backend.app.database import SessionLocal
@@ -300,12 +300,38 @@ class DurableOptionRunStore:
             raise KeyError(f"Option run not found: {strategy_run_id}")
         return self._row_to_state(dict(row))
 
-    def save_run(self, run: OptionRunState) -> OptionRunState:
+    def save_run(
+        self,
+        run: OptionRunState,
+        *,
+        owner_policy: Any = None,
+        owner_run_id: Optional[str] = None,
+        owner_observed_epoch: Optional[int] = None,
+    ) -> OptionRunState:
+        """Write the durable run, and - when asked - its owner row's new policy.
+
+        B2.4 S4: an adjust completion freezes a NEW protection policy on the
+        owner row in the SAME transaction as the run's completion write. Passing
+        ``owner_policy`` therefore hands the CAS its observed epoch, and the two
+        writes commit together or not at all: a run that reads as ``adjusted``
+        under a policy the owner row never saw (or the reverse) is not a state
+        this platform can be left in.
+        """
         self._require_id(run.strategy_run_id)
         session = self._session_factory()
         try:
             self._update_run_in_session(session, run)
             self._release_protection_owner_if_terminal(session, run)
+            if owner_policy is not None:
+                OptionProtectionOwnerStore(
+                    session_factory=self._session_factory
+                ).update_policy(
+                    run.strategy_run_id,
+                    owner_policy,
+                    int(owner_observed_epoch or 0),
+                    owner_run_id=owner_run_id,
+                    db=session,
+                )
             session.commit()
             return run
         except Exception:

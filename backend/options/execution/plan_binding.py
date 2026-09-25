@@ -24,6 +24,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from sqlalchemy import text
 from backend.app.database import SessionLocal
 from backend.options.protection.ownership import (
+    ACTION_STATES as OWNER_ROW_ACTION_STATES,
+    CONFLICT as OWNER_CONFLICT,
+    OWNER_UNKNOWN,
     OptionProtectionOwnerStore,
     option_protection_policy_version,
     option_protection_policy_snapshot,
@@ -31,6 +34,12 @@ from backend.options.protection.ownership import (
 
 from .durable_store import DurableOptionRunStore
 from .models import OptionRunCreateRequest, OptionRunState
+
+#: The owner row's action states that mean protective work is OUTSTANDING. The
+#: vocabulary lives on the store (it is the row's own CHECK); ``none`` is
+#: excluded because it is a HINT, never proof of "clear" - the run's stage
+#: records are the evidence (``unresolved_stage_claim``).
+OWNER_ACTION_STATES = frozenset(OWNER_ROW_ACTION_STATES) - {"none"}
 
 
 class PlanBindingRefusal(Exception):
@@ -424,6 +433,209 @@ def _scoped_option_runs(
     return list(runs or [])
 
 
+def _json_sequence(value: Any) -> List[Any]:
+    """A JSON list, whichever shape the driver handed back; ``[]`` when unreadable.
+
+    ``jsonb`` arrives decoded on PostgreSQL and as text on SQLite, so a caller
+    that iterates a durable list column must never iterate characters.
+    """
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            return []
+        return list(decoded) if isinstance(decoded, (list, tuple)) else []
+    return []
+
+
+def option_run_entry_worker_run(option_run_id: str, *, session: Any) -> Optional[str]:
+    """The worker run recorded on ONE option run's ENTRY binding edge, or ``None``.
+
+    This is the run the platform itself says OPENED the structure - the "origin"
+    the owner row is expected to agree with until a successor's transfer moves
+    it. A run with no entry edge has no origin at all, which is reported as
+    ``None`` rather than invented.
+    """
+    row = session.execute(
+        text(
+            """
+            SELECT worker_run_id
+            FROM public.strategy_plan_option_runs
+            WHERE option_run_id = :run AND phase = 'entry'
+            ORDER BY created_at, plan_id
+            LIMIT 1
+            """
+        ),
+        {"run": str(option_run_id)},
+    ).first()
+    if row is None or row[0] is None:
+        return None
+    value = str(row[0]).strip()
+    return value or None
+
+
+def read_option_protection_owner(
+    option_run_id: str, *, session: Any
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """One option run's owner row as ``(row, unreadable_reason)``.
+
+    ``(None, None)`` means the row genuinely does not exist; a database error is
+    reported as an unreadable reason, because the gate that decides whether
+    exposure is admissible must never read "unknown" as "no owner".
+    """
+    try:
+        store = OptionProtectionOwnerStore(session_factory=lambda: session)
+        return store.read(option_run_id, db=session), None
+    except Exception as exc:  # noqa: BLE001 - an unreadable row is its own state
+        return None, type(exc).__name__
+
+
+def option_protection_action_outstanding(
+    owner_row: Mapping[str, Any] | None, *, protective_exit_unresolved: bool
+) -> bool:
+    """Whether protective work is still outstanding for one option run.
+
+    The owner row's ``action_state`` is a HINT the protection loop keeps in sync;
+    the run's own stage records are the EVIDENCE. This ORs the two, so
+    ``action_state == 'none'`` is never read as "clear" while the run still
+    carries an unresolved stage claim.
+    """
+
+    state = str((owner_row or {}).get("action_state") or "none").strip().lower()
+    return bool(protective_exit_unresolved) or state in OWNER_ACTION_STATES
+
+
+def require_option_protection_owner(
+    option_run_id: str,
+    *,
+    session: Any,
+    run_status: str,
+    increasing: bool,
+    caller_worker_run_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """The owner row of one HELD option run, or the named owner refusal.
+
+    WHICH RUNS REQUIRE AN OWNER: a plan-created option run bound through
+    ``strategy_plan_option_runs``. The entry hook claims the row in the same
+    transaction as the run and its edge, so such a run without a readable ACTIVE
+    row is a gap the platform cannot vouch for. A run created through the direct
+    options API has no such binding (and no owner by design), so it never
+    reaches this rule.
+
+    The split is the design's own (section 3):
+
+    * a FINISHED run has no protection left to own, so it is not gated;
+    * an absent, unreadable or ``released`` row on a run that is NOT terminal
+      refuses ``OPTION_PROTECTION_OWNER_UNKNOWN`` for anything that would grow
+      exposure, and leaves risk-reducing work admissible;
+    * an ACTIVE row whose ``owner_run_id`` names neither the caller nor the
+      structure's own recorded origin refuses ``OPTION_PROTECTION_OWNER_CONFLICT``:
+      the structure has been handed to somebody else, so the run the caller acts
+      for is superseded and must not act. A caller that IS the row's owner, and a
+      plan taking over an adjust the row still attributes to the run's own
+      origin (the platform's existing takeover path), are admissible.
+    """
+
+    option_run_id = str(option_run_id or "")
+    status = str(run_status or "").strip().lower()
+    if status in _TERMINAL_RUN_STATUSES:
+        return None
+    row, read_error = read_option_protection_owner(option_run_id, session=session)
+    if read_error is not None or row is None or str(row.get("state") or "") != "active":
+        if not increasing:
+            return None
+        reason = (
+            read_error
+            or ("owner_row_absent" if row is None else f"owner_row_{row.get('state')}")
+        )
+        raise PlanBindingRefusal(
+            OWNER_UNKNOWN,
+            {
+                "option_run_id": option_run_id,
+                "option_run_status": status or "unknown",
+                "reason": str(reason),
+                "message": (
+                    "this run's protection ownership cannot be read as active, so an "
+                    "adjust that increases exposure is refused; reduce-only work and "
+                    "exits stay admissible"
+                ),
+            },
+        )
+    caller = str(caller_worker_run_id or "").strip()
+    owner = str(row.get("owner_run_id") or "").strip()
+    if caller and owner and caller != owner:
+        origin = option_run_entry_worker_run(option_run_id, session=session)
+        if not origin or owner != str(origin):
+            raise PlanBindingRefusal(
+                OWNER_CONFLICT,
+                {
+                    "option_run_id": option_run_id,
+                    "option_run_status": status or "unknown",
+                    "caller_worker_run_id": caller,
+                    "owner_run_id": owner,
+                    "origin_worker_run_id": origin,
+                    "message": (
+                        "this structure's protection owner is not the run this caller "
+                        "acts for, and the row no longer names the run that opened it: "
+                        "the caller is superseded and must not act"
+                    ),
+                },
+            )
+    return row
+
+
+def option_adjust_increases_exposure(plan: Mapping[str, Any], run_row: Mapping[str, Any]) -> bool:
+    """Whether an adjust's frozen TARGET asks for more exposure than the run holds.
+
+    Same per-leg rule the executor applies (grows the book, or crosses flat),
+    asked of the run's OWN confirmed ledger - never of the strategy's aggregate
+    book, which mixes structures that share a contract. A target leg the run does
+    not hold is an OPEN, so a plan that only removes legs is a reduction. An
+    unreadable size is an INCREASE, because the gate fails closed.
+    """
+
+    frozen = _entry_legs(plan)
+    if not frozen:
+        return True
+    open_by_leg: dict[str, int] = {}
+    for trade in _json_sequence(run_row.get("trades")):
+        if not isinstance(trade, Mapping):
+            continue
+        leg_id = str(trade.get("leg_id") or "")
+        if not leg_id:
+            continue
+        quantity = int(trade.get("quantity") or 0)
+        sign = 1 if str(trade.get("transaction_type") or "").upper() == "BUY" else -1
+        open_by_leg[leg_id] = open_by_leg.get(leg_id, 0) + sign * quantity
+    run_legs = {
+        _run_leg_identity(leg): leg
+        for leg in _json_sequence(run_row.get("legs"))
+        if isinstance(leg, Mapping)
+    }
+    for leg in frozen:
+        identity = _leg_identity(leg)
+        if not identity:
+            return True
+        held_leg = run_legs.get(identity)
+        current = (
+            int(open_by_leg.get(str(held_leg.get("leg_id") or ""), 0))
+            if isinstance(held_leg, Mapping)
+            else 0
+        )
+        target = int(
+            leg.get("signed_quantity")
+            if leg.get("signed_quantity") is not None
+            else leg.get("quantity") or 0
+        )
+        if target == 0:
+            continue
+        if abs(target) > abs(current) or (target > 0 > current) or (target < 0 < current):
+            return True
+    return False
+
+
 def assess_option_entry_admissibility(
     plan: Mapping[str, Any],
     *,
@@ -546,6 +758,17 @@ def assess_option_entry_admissibility(
                     ),
                 },
             )
+        # B2.4 S2b: an option ENTRY always grows exposure, so a HELD run of this
+        # strategy whose protection ownership cannot be read as active refuses by
+        # name. It is asked LAST so it decides only the residual case the rules
+        # above leave admissible (a cleanly entered DIFFERENT structure): every
+        # run they already refuse keeps its own refusal.
+        require_option_protection_owner(
+            option_run_id,
+            session=session,
+            run_status=run_status,
+            increasing=True,
+        )
 
 
 def option_adjust_would_unhedge(plan: Mapping[str, Any]) -> Optional[dict[str, Any]]:
@@ -973,6 +1196,7 @@ def assess_option_adjust_admissibility(
     account_id: str,
     execution_environment: str,
     session: Any,
+    caller_worker_run_id: Optional[str] = None,
 ) -> None:
     """Refuse an option ADJUST that must not run against the run it names.
 
@@ -1009,6 +1233,12 @@ def assess_option_adjust_admissibility(
     * the frozen desired state would leave a short leg short of protective long
       coverage (``OPTION_ADJUSTMENT_WOULD_UNHEDGE``), unless the frozen
       protection policy declares the structure naked.
+    * the run's protection ownership is not readable as active
+      (``OPTION_PROTECTION_OWNER_UNKNOWN``) while the target grows exposure, or
+      the caller acts for a run the owner row has already moved past
+      (``OPTION_PROTECTION_OWNER_CONFLICT``). ``caller_worker_run_id`` is the
+      worker run this plan executes FOR; when it is not supplied the identity
+      rule is not asked (the request path only needs the unknown-owner rule).
 
     Unknown discovery refuses (``OPTION_STRUCTURE_DISCOVERY_UNKNOWN``), exactly
     as the entry gate does. Non-adjust plans are not gated at all.
@@ -1083,6 +1313,12 @@ def assess_option_adjust_admissibility(
         )
     referenced = {**dict(referenced), "trades": ledger_row[0]}
     run_status = str(referenced.get("status") or "").strip().lower()
+    # B2.4 S2b/S4: the owner row is read ONCE, and used twice - as the HINT that
+    # protective work is still outstanding (ORed with the run's own stage
+    # records below) and as the ownership the caller must hold.
+    owner_row, _owner_read_error = read_option_protection_owner(
+        option_run_id, session=session
+    )
     owned_by_this_plan = bool(plan_id) and plan_id in {
         str(value) for value in (referenced.get("plan_ids") or [])
     }
@@ -1176,13 +1412,18 @@ def assess_option_adjust_admissibility(
                 "error": type(exc).__name__,
             },
         ) from exc
-    if bool(referenced.get("protective_exit_unresolved")):
+    if option_protection_action_outstanding(
+        owner_row,
+        protective_exit_unresolved=bool(referenced.get("protective_exit_unresolved")),
+    ):
         raise PlanBindingRefusal(
             "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
             {
                 "plan_id": plan_id,
                 "option_run_id": option_run_id,
                 "option_run_status": run_status,
+                "owner_action_state": str((owner_row or {}).get("action_state") or "none"),
+                "stage_unresolved": bool(referenced.get("protective_exit_unresolved")),
                 "message": (
                     "a protective exit stage is unresolved for this run; it is "
                     "reconciled from the platform's own pre-send records before the "
@@ -1214,6 +1455,17 @@ def assess_option_adjust_admissibility(
                     ),
                 },
             )
+    # B2.4 S2b: the ownership the caller must hold, asked LAST so every rule above
+    # keeps its own refusal. An exposure-INCREASING target refuses when the run's
+    # ownership cannot be read as active; a caller acting for a run the owner row
+    # has moved past refuses whichever way the target sizes.
+    require_option_protection_owner(
+        option_run_id,
+        session=session,
+        run_status=run_status,
+        increasing=option_adjust_increases_exposure(plan, referenced),
+        caller_worker_run_id=caller_worker_run_id,
+    )
 
 
 def _entry_legs(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1512,6 +1764,9 @@ def _resolve_adjust_binding(
             account_id=str(account_id),
             execution_environment=str(execution_environment),
             session=session,
+            # The plan executes FOR this worker run: the ownership rule is asked
+            # with it, so a superseded caller refuses before the edge is written.
+            caller_worker_run_id=worker_run_id,
         )
         binding = binding_store.bind(
             plan_id=plan_id,
@@ -1540,6 +1795,7 @@ def _resolve_adjust_binding(
         "option_run_id": run.strategy_run_id,
         "run": run,
         "binding": binding,
+        "worker_run_id": None if worker_run_id is None else str(worker_run_id),
         "expected_structure_generation": expected_generation,
     }
 
@@ -1601,6 +1857,14 @@ def resolve_plan_option_run(
             "option_run_id": run.strategy_run_id,
             "run": run,
             "binding": dict(existing),
+            # The worker run this plan executes FOR, as the caller identity the
+            # ownership rules are asked with. It rides with the resolved target
+            # so the execution path never has to re-derive it.
+            "worker_run_id": (
+                str(worker_run_id)
+                if worker_run_id
+                else existing.get("worker_run_id")
+            ),
             "expected_structure_generation": expected_generation,
         }
 
@@ -1682,7 +1946,15 @@ def resolve_plan_option_run(
         phase="exit",
         worker_run_id=worker_run_id,
     )
-    return {"phase": "exit", "option_run_id": run.strategy_run_id, "run": run, "binding": binding}
+    return {
+        "phase": "exit",
+        "option_run_id": run.strategy_run_id,
+        "run": run,
+        "binding": binding,
+        "worker_run_id": None if worker_run_id is None else str(worker_run_id),
+    }
+
+
 def _create_entry_run_atomically(
     plan: Mapping[str, Any],
     *,
@@ -1725,6 +1997,9 @@ def _create_entry_run_atomically(
             "option_run_id": run.strategy_run_id,
             "run": run,
             "binding": dict(existing),
+            "worker_run_id": (
+                str(worker_run_id) if worker_run_id else existing.get("worker_run_id")
+            ),
         }
 
     session = binding_store.session_factory()
@@ -1819,6 +2094,7 @@ def _create_entry_run_atomically(
             "option_run_id": run.strategy_run_id,
             "run": run,
             "binding": binding,
+            "worker_run_id": None if worker_run_id is None else str(worker_run_id),
         }
     except Exception:
         session.rollback()

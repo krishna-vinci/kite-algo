@@ -244,6 +244,140 @@ class ExecutionTestCase(unittest.TestCase):
     def tearDown(self):
         self.engine.dispose()
 
+    # ------------------------------------------------ protection owner row
+    #
+    # B2.4's owner record is what outlives the worker run, so the gates that
+    # decide whether a HELD structure's exposure may grow read it directly. These
+    # helpers are the seam a transfer, a claim and a resolved stage write
+    # through; they are shared by the plan-run binding and continuity suites.
+
+    def _owner_row(self, option_run_id):
+        """The run's protection owner row, or ``None`` when it has none."""
+        with self.factory() as session:
+            row = (
+                session.execute(
+                    text(
+                        "SELECT option_run_id, owner_run_id, owner_epoch, action_state, "
+                        "state, policy, policy_version "
+                        "FROM public.option_protection_owners WHERE option_run_id = :r"
+                    ),
+                    {"r": option_run_id},
+                )
+                .mappings()
+                .first()
+            )
+            return None if row is None else dict(row)
+
+    def _owner_events(self, option_run_id):
+        """The owner row's append-only trail, oldest first."""
+        with self.factory() as session:
+            return [
+                {
+                    "event": str(row["event"]),
+                    "owner_epoch": int(row["owner_epoch"]),
+                    "owner_run_id": row["owner_run_id"],
+                    "detail": json.loads(row["detail"] or "{}"),
+                }
+                for row in session.execute(
+                    text(
+                        "SELECT event, owner_epoch, owner_run_id, detail "
+                        "FROM public.option_protection_owner_events "
+                        "WHERE option_run_id = :r ORDER BY created_at, event"
+                    ),
+                    {"r": option_run_id},
+                ).mappings()
+            ]
+
+    def _delete_protection_owner(self, option_run_id):
+        """Remove the owner row: the run's ownership is now UNKNOWN, not clear."""
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "DELETE FROM public.option_protection_owners WHERE option_run_id = :r"
+                ),
+                {"r": option_run_id},
+            )
+            session.commit()
+
+    def _seed_owner_row(
+        self,
+        option_run_id,
+        *,
+        owner_run_id,
+        owner_epoch=1,
+        action_state="none",
+        state="active",
+    ):
+        """Move an owner row by hand: the seam a transfer (S3) writes through."""
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.option_protection_owners "
+                    "SET owner_run_id = :owner, owner_epoch = :epoch, "
+                    "    action_state = :action, state = :state "
+                    "WHERE option_run_id = :r"
+                ),
+                {
+                    "owner": owner_run_id,
+                    "epoch": int(owner_epoch),
+                    "action": str(action_state),
+                    "state": str(state),
+                    "r": option_run_id,
+                },
+            )
+            session.commit()
+
+    def _seed_unresolved_stage(self, option_run_id, *, state="sending"):
+        """A durable protective stage claim the run committed and has NOT resolved."""
+        with self.factory() as session:
+            row = session.execute(
+                text("SELECT orders FROM public.option_run_states WHERE strategy_run_id = :r"),
+                {"r": option_run_id},
+            ).first()
+            orders = json.loads((row[0] if row is not None else None) or "[]")
+            orders.append(
+                {
+                    "leg_id": "plan-op:1",
+                    "tradingsymbol": "TCS26OCT2500CE",
+                    "transaction_type": "BUY",
+                    "quantity": 75,
+                    "phase": "exit",
+                    "stage_digest": "stage-digest-1",
+                    "attempt": 1,
+                    "state": str(state),
+                    "order_id": None,
+                }
+            )
+            session.execute(
+                text(
+                    "UPDATE public.option_run_states SET orders = :orders "
+                    "WHERE strategy_run_id = :r"
+                ),
+                {"r": option_run_id, "orders": json.dumps(orders)},
+            )
+            session.commit()
+
+    def _seed_owner_policy(self, option_run_id, policy):
+        """Freeze a protection policy on the owner row - the structure's own."""
+        from backend.options.protection.ownership import (
+            option_protection_policy_version,
+        )
+
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "UPDATE public.option_protection_owners "
+                    "SET policy = :policy, policy_version = :version "
+                    "WHERE option_run_id = :r"
+                ),
+                {
+                    "r": option_run_id,
+                    "policy": json.dumps(policy),
+                    "version": option_protection_policy_version(policy),
+                },
+            )
+            session.commit()
+
     # ------------------------------------------------------------------ seeds
 
     def seed_strategy(self, *, sid=STRATEGY, account=ACCOUNT, owner=OWNER):
@@ -3601,6 +3735,251 @@ class ExecutorOptionRunBindingTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
             {"plan-op:1": 75, "plan-op:2": 75},
         )
 
+    async def test_an_increase_is_refused_while_the_owner_row_is_unknown(self):
+        """A held structure with no readable owner may not grow exposure."""
+        executor, option_run_id = await self._enter_two_units()
+        self._delete_protection_owner(option_run_id)
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=3)
+        )
+        self.claim_reservation(plan_id="plan-adjust")
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_PROTECTION_OWNER_UNKNOWN")
+        (trail,) = self.events("plan-adjust")
+        self.assertEqual(trail["refusal_reason"], "OPTION_PROTECTION_OWNER_UNKNOWN")
+        self.assertEqual(trail["detail"]["option_run_id"], option_run_id)
+        # Nothing was placed, no edge was written, and the run did not move.
+        self.assertEqual(len(executor._paper_service.repository.orders), 2)
+        self.assertEqual(self._binding_rows("plan-adjust"), [])
+        run = self._run_row(option_run_id)
+        self.assertEqual(run["status"], "entered")
+        self.assertEqual(json.loads(run["metadata"]).get("structure_generation", 1), 1)
+
+    async def test_a_released_owner_row_on_a_held_run_is_still_unknown(self):
+        """``released`` belongs to a TERMINAL run: on a held one it is a gap, not
+        a licence to grow the structure."""
+        executor, option_run_id = await self._enter_two_units()
+        self._seed_owner_row(
+            option_run_id, owner_run_id=None, owner_epoch=2, state="released"
+        )
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=3)
+        )
+        self.claim_reservation(plan_id="plan-adjust")
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_PROTECTION_OWNER_UNKNOWN")
+        self.assertEqual(self._run_row(option_run_id)["status"], "entered")
+        self.assertEqual(len(executor._paper_service.repository.orders), 2)
+
+    async def test_the_same_increase_is_admitted_while_the_owner_row_is_active(self):
+        """The admit twin: the identical plan with a readable owner resizes."""
+        executor, option_run_id, result = await self._enter_and_resize(units=2)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(
+            json.loads(self._run_row(option_run_id)["metadata"])["structure_generation"], 2
+        )
+        owner = self._owner_row(option_run_id)
+        self.assertEqual(owner["state"], "active")
+        self.assertEqual(int(owner["owner_epoch"]), 2)
+
+    async def test_a_reduce_only_adjust_is_admitted_while_the_owner_row_is_unknown(self):
+        """Risk reduction is never blocked by an unknown owner, exactly like the
+        triggered-policy split: the reduction converges toward flat."""
+        executor, option_run_id = await self._enter_two_units()
+        self._delete_protection_owner(option_run_id)
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=1)
+        )
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(
+            [row["refusal_reason"] for row in self.events("plan-adjust") if row["refusal_reason"]],
+            [],
+        )
+        self.assertEqual(
+            json.loads(self._run_row(option_run_id)["metadata"])["structure_generation"], 2
+        )
+
+    async def test_the_owner_rows_policy_is_the_structures_protection(self):
+        """S4: the gate reads the OWNER policy. A triggered owner policy refuses
+        an increase whose run block carries no rule at all."""
+        executor, option_run_id = await self._enter_two_units()
+        # The run's own block is stripped of rules: the only protection left is
+        # the one the owner row carries.
+        self._seed_run_protection(option_run_id, {})
+        self._seed_owner_policy(
+            option_run_id,
+            {
+                "structure_digest": "digest-iron-condor",
+                "rules": [
+                    {
+                        "key": "owner-stop",
+                        "metric": "open_quantity",
+                        "operator": "gte",
+                        "threshold": 1,
+                        "role": "exit",
+                        "action": "exit",
+                    }
+                ],
+                "precedence": ["exit"],
+            },
+        )
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=3)
+        )
+        self.claim_reservation(plan_id="plan-adjust")
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_ADJUSTMENT_PROTECTION_ACTIVE")
+        (trail,) = self.events("plan-adjust")
+        self.assertEqual(trail["refusal_reason"], "OPTION_ADJUSTMENT_PROTECTION_ACTIVE")
+        self.assertTrue(trail["detail"]["triggered"])
+        self.assertEqual(trail["detail"]["source"], "owner_policy")
+        self.assertEqual(len(executor._paper_service.repository.orders), 2)
+        self.assertEqual(self._run_row(option_run_id)["status"], "entered")
+
+    async def test_a_reduction_is_admitted_while_the_owner_policy_is_triggered(self):
+        """The reduce-only twin of the same split: a triggered owner policy never
+        blocks the trade that takes risk OFF."""
+        executor, option_run_id = await self._enter_two_units()
+        self._seed_owner_policy(
+            option_run_id,
+            {
+                "structure_digest": "digest-iron-condor",
+                "rules": [
+                    {
+                        "key": "owner-stop",
+                        "metric": "open_quantity",
+                        "operator": "gte",
+                        "threshold": 1,
+                        "role": "exit",
+                        "action": "exit",
+                    }
+                ],
+                "precedence": ["exit"],
+            },
+        )
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=1)
+        )
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(
+            [row["refusal_reason"] for row in self.events("plan-adjust") if row["refusal_reason"]],
+            [],
+        )
+
+    async def test_a_superseded_worker_run_may_not_adjust_the_structure(self):
+        """The owner row has moved off the run that opened the structure, so a
+        plan acting for neither refuses by name instead of mutating it."""
+        executor, option_run_id = await self._enter_two_units()
+        self._seed_owner_row(
+            option_run_id, owner_run_id="run-plan-op-successor", owner_epoch=2
+        )
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=3)
+        )
+        self.claim_reservation(plan_id="plan-adjust")
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_PROTECTION_OWNER_CONFLICT")
+        self.assertEqual(ctx.exception.detail["owner_run_id"], "run-plan-op-successor")
+        self.assertEqual(ctx.exception.detail["origin_worker_run_id"], "run-plan-op")
+        (trail,) = self.events("plan-adjust")
+        self.assertEqual(trail["refusal_reason"], "OPTION_PROTECTION_OWNER_CONFLICT")
+        self.assertEqual(len(executor._paper_service.repository.orders), 2)
+        self.assertEqual(self._binding_rows("plan-adjust"), [])
+        self.assertEqual(self._run_row(option_run_id)["status"], "entered")
+
+    async def test_an_owner_hint_of_none_never_clears_an_unresolved_stage(self):
+        """``action_state`` is a HINT; the run's own stage records are the evidence."""
+        executor, option_run_id = await self._enter_two_units()
+        self._seed_owner_row(
+            option_run_id, owner_run_id="run-plan-op", owner_epoch=1, action_state="none"
+        )
+        self._seed_unresolved_stage(option_run_id)
+        self._seed_adjust_plan(
+            "plan-adjust", reference=option_run_id, legs=self._adjust_legs(units=3)
+        )
+        self.claim_reservation(plan_id="plan-adjust")
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-adjust"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_PROTECTIVE_EXIT_UNRESOLVED")
+        (trail,) = self.events("plan-adjust")
+        self.assertEqual(trail["refusal_reason"], "OPTION_PROTECTIVE_EXIT_UNRESOLVED")
+        self.assertEqual(trail["detail"]["owner_action_state"], "none")
+        self.assertTrue(trail["detail"]["stage_unresolved"])
+        self.assertEqual(len(executor._paper_service.repository.orders), 2)
+        self.assertEqual(self._run_row(option_run_id)["status"], "entered")
+
+    async def test_an_adjust_completion_freezes_its_policy_on_the_owner_row_once(self):
+        """One landed adjust = one policy change = one epoch step (B2.4 S4)."""
+        from backend.options.protection.ownership import (
+            option_protection_policy_version,
+        )
+
+        executor, option_run_id, result = await self._enter_and_resize(units=2)
+
+        self.assertEqual(result["status"], "filled")
+        owner = self._owner_row(option_run_id)
+        self.assertEqual(owner["state"], "active")
+        self.assertEqual(owner["owner_run_id"], "run-plan-op")
+        # The row carries the run's NEW protection block as its policy, and the
+        # version is that policy's own digest - not an integer.
+        policy = owner["policy"] if isinstance(owner["policy"], dict) else json.loads(owner["policy"])
+        self.assertEqual(policy["structure_digest"], "digest-iron-condor")
+        self.assertEqual(policy["expiry"], "2026-10-29")
+        self.assertEqual(owner["policy_version"], option_protection_policy_version(policy))
+        self.assertEqual(int(owner["owner_epoch"]), 2)
+        changed = [event for event in self._owner_events(option_run_id) if event["event"] == "policy_changed"]
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0]["owner_epoch"], 2)
+        self.assertEqual(changed[0]["detail"]["policy_version"], owner["policy_version"])
+        self.assertNotEqual(
+            changed[0]["detail"]["previous_policy_version"], owner["policy_version"]
+        )
+
+    async def test_a_withheld_adjust_mints_no_policy_version(self):
+        """Only a LANDED adjust changes the generation, so only it changes the
+        owner row's policy: a withheld increase leaves the row where it was."""
+        executor, option_run_id = await self._enter_two_units()
+        before = self._owner_row(option_run_id)
+        self._seed_adjust_plan(
+            "plan-roll",
+            reference=option_run_id,
+            legs=self._roll_legs(units=2),
+            expiry="2026-11-26",
+        )
+        self.claim_reservation(plan_id="plan-roll")
+        executor._paper_service = _PartialFillStubService(partial_side="SELL")
+
+        await executor.execute(_plan_view_for(self.factory, "plan-roll"), actor=OWNER)
+
+        after = self._owner_row(option_run_id)
+        self.assertEqual(int(after["owner_epoch"]), int(before["owner_epoch"]))
+        self.assertEqual(after["policy_version"], before["policy_version"])
+        self.assertEqual(
+            [event["event"] for event in self._owner_events(option_run_id)],
+            ["claimed"],
+        )
+
 
 class ExecutorOptionContinuityTests(ExecutorTestCase, unittest.IsolatedAsyncioTestCase):
     """Phase B1: a held structure is never opened twice, and never closed twice.
@@ -3887,6 +4266,36 @@ class ExecutorOptionContinuityTests(ExecutorTestCase, unittest.IsolatedAsyncioTe
 
         self.assertEqual(ctx.exception.reason_code, "OPTION_EXIT_CONTRACT_MISMATCH")
         self.assertEqual(self._run_row(option_run_id)["status"], "entered")
+
+    async def test_a_governed_exit_from_a_superseded_worker_run_refuses_by_name(self):
+        """The structure has moved off the run that opened it: a plan acting for
+        neither the owner nor the origin closes nothing (B2.4 S2b)."""
+        executor, option_run_id = await self._enter()
+        self._seed_owner_row(
+            option_run_id, owner_run_id="run-plan-op-successor", owner_epoch=2
+        )
+        self._seed_exit_plan("plan-exit", reference=option_run_id)
+        orders_before = len(executor._paper_service.repository.orders)
+
+        with self.assertRaises(self._refusal) as ctx:
+            await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(ctx.exception.reason_code, "OPTION_PROTECTION_OWNER_CONFLICT")
+        self.assertEqual(ctx.exception.detail["owner_run_id"], "run-plan-op-successor")
+        self.assertEqual(len(executor._paper_service.repository.orders), orders_before)
+        self.assertEqual(self._run_row(option_run_id)["status"], "entered")
+
+    async def test_a_governed_exit_is_admitted_while_the_owner_row_is_unknown(self):
+        """The admit twin on the risk-reducing side: closing a held structure is
+        never blocked by an unreadable owner - only new exposure is."""
+        executor, option_run_id = await self._enter()
+        self._delete_protection_owner(option_run_id)
+        self._seed_exit_plan("plan-exit", reference=option_run_id)
+
+        result = await executor.execute(_plan_view_for(self.factory, "plan-exit"), actor=OWNER)
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(self._run_row(option_run_id)["status"], "exited")
 
     async def test_an_unresolved_protective_stage_blocks_a_conflicting_governed_exit(self):
         executor, option_run_id = await self._enter()

@@ -1224,27 +1224,133 @@ class PaperPlanExecutor:
             return recorded
         return str((getattr(run, "protection", None) or {}).get("structure_digest") or "")
 
-    @staticmethod
-    def _option_protection_block(run: Any) -> Optional[Dict[str, Any]]:
-        """The run's protection state when it is ACTIVE, else ``None``.
+    def _option_protection_block(self, run: Any) -> Optional[Dict[str, Any]]:
+        """The structure's protection state when it is ACTIVE, else ``None``.
 
-        The read is the worker safety gate's own: ``evaluate_option_protection_state``
-        over the run's frozen protection block. Protection counts as ACTIVE when
-        it has TRIGGERED, or when it is UNREADABLE - not knowing is never treated
-        as "clear" for a step that would increase exposure.
+        B2.4 S4: the OWNER ROW's frozen policy is the structure's protection when
+        the platform has one; the run's own protection block is the fallback (a
+        run the owner model has never claimed). Both are read, because the owner
+        row is the single place the policy lives and a run's own block can carry
+        constraints the owner snapshot does not - protection counts as ACTIVE
+        when EITHER read has TRIGGERED, and UNREADABLE when either cannot be
+        read. Not knowing is never treated as "clear" for a step that would
+        increase exposure.
         """
         from backend.options.protection.runtime import evaluate_option_protection_state
 
+        blocks: List[tuple[str, Any]] = [("run_block", None)]
+        owner_row, owner_read_error = self._option_protection_owner_row(run)
+        if owner_row is not None and isinstance(owner_row.get("policy"), Mapping):
+            blocks.append(("owner_policy", dict(owner_row["policy"])))
+        triggered_source: Optional[str] = None
+        triggered_rule: Any = None
         try:
-            verdict = evaluate_option_protection_state(run=run)
+            for source, block in blocks:
+                verdict = evaluate_option_protection_state(run=run, protection=block)
+                if bool(verdict.get("triggered")) and triggered_source is None:
+                    triggered_source = source
+                    triggered_rule = verdict.get("matched_rule")
         except Exception as exc:  # noqa: BLE001 - an unreadable state is never "clear"
-            return {"triggered": None, "unreadable": True, "error": type(exc).__name__}
-        if not bool(verdict.get("triggered")):
+            return {
+                "triggered": None,
+                "unreadable": True,
+                "error": type(exc).__name__,
+                "owner_read_error": owner_read_error,
+            }
+        if triggered_source is None:
             return None
         return {
             "triggered": True,
             "unreadable": False,
-            "matched_rule": verdict.get("matched_rule"),
+            "matched_rule": triggered_rule,
+            "source": triggered_source,
+        }
+
+    def _option_protection_owner_row(
+        self, run: Any
+    ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """The run's protection owner row as ``(row, unreadable_reason)``.
+
+        ``(None, None)`` means the run genuinely has no owner row (a run the
+        owner model has never claimed); an unreadable read is reported as a
+        reason, because the gate that decides whether exposure may grow must
+        never read "unknown" as "nobody owns it, so it is clear".
+        """
+        from backend.options.execution.plan_binding import (
+            read_option_protection_owner,
+        )
+
+        option_run_id = str(getattr(run, "strategy_run_id", "") or "")
+        if not option_run_id:
+            return None, None
+        try:
+            with self.session_factory() as session:
+                return read_option_protection_owner(option_run_id, session=session)
+        except Exception as exc:  # noqa: BLE001 - an unreadable row is its own state
+            return None, type(exc).__name__
+
+    def _require_option_protection_owner(
+        self,
+        run: Any,
+        *,
+        plan_id: str,
+        increasing: bool,
+        caller_worker_run_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """The run's protection owner row, or the named owner refusal (B2.4 S2b).
+
+        The rule itself is the binding edge's own
+        (``require_option_protection_owner``), asked here so the execution path
+        and the request/admission gates can never disagree about who may grow a
+        held structure's exposure. ``increasing=False`` asks ONLY the superseded
+        rule, which is what an exit (risk-reducing by construction) needs.
+        """
+        from backend.options.execution.plan_binding import (
+            PlanBindingRefusal,
+            require_option_protection_owner,
+        )
+
+        option_run_id = str(getattr(run, "strategy_run_id", "") or "")
+        try:
+            with self.session_factory() as session:
+                return require_option_protection_owner(
+                    option_run_id,
+                    session=session,
+                    run_status=str(getattr(run, "status", "") or ""),
+                    increasing=bool(increasing),
+                    caller_worker_run_id=caller_worker_run_id,
+                )
+        except PlanBindingRefusal as exc:
+            raise ExecutionRefusal(
+                exc.reason_code,
+                {"plan_id": plan_id, **exc.as_detail()},
+            ) from exc
+
+    def _unresolved_protection_action(self, run: Any) -> Optional[Dict[str, Any]]:
+        """The outstanding protective action owning this run's next transition.
+
+        The owner row's ``action_state`` is the loop's HINT; the run's own stage
+        records are the EVIDENCE. The two are ORed (B2.4 design section 3), so
+        ``action_state == 'none'`` is never read as "clear" while a stage claim is
+        unresolved - and a claim the loop has taken but not yet staged still owns
+        the transition. ``None`` means nothing protective is in flight.
+        """
+        from backend.options.execution.plan_binding import OWNER_ACTION_STATES
+        from backend.options.protection.staged_exit import unresolved_stage_claim
+
+        try:
+            unresolved = unresolved_stage_claim(getattr(run, "orders", None) or [])
+        except Exception:  # noqa: BLE001 - unreadable records keep the claim
+            unresolved = {"state": "unknown", "reason": "stage_records_unreadable"}
+        owner_row, _read_error = self._option_protection_owner_row(run)
+        action_state = str((owner_row or {}).get("action_state") or "none").strip().lower()
+        if unresolved is None and action_state not in OWNER_ACTION_STATES:
+            return None
+        return {
+            "stage_digest": str((unresolved or {}).get("stage_digest") or ""),
+            "stage_state": str((unresolved or {}).get("state") or action_state or "unknown"),
+            "stage_attempt": int((unresolved or {}).get("attempt") or 1),
+            "owner_action_state": action_state,
         }
 
     @staticmethod
@@ -1659,6 +1765,20 @@ class PaperPlanExecutor:
         increasing_steps = [
             step for step in steps if bool(step[1].get("_increases_exposure"))
         ]
+        # B2.4 S2b: the structure's protection OWNERSHIP is the second split on
+        # the same axis. A target that touches the run at all refuses when the
+        # caller is superseded (the owner row has moved off this run's origin);
+        # a target that GROWS exposure also refuses when the ownership cannot be
+        # read as active. Reduce-only work and exits stay admissible under an
+        # unknown owner, exactly like the triggered-policy split below.
+        touching_steps = [step for step in steps if int(step[2] or 0) != 0]
+        if touching_steps:
+            target["_protection_owner"] = self._require_option_protection_owner(
+                run,
+                plan_id=plan_id,
+                increasing=bool(increasing_steps),
+                caller_worker_run_id=str(target.get("worker_run_id") or "") or None,
+            )
         if protection is not None and increasing_steps:
             raise ExecutionRefusal(
                 "OPTION_ADJUSTMENT_PROTECTION_ACTIVE",
@@ -1929,6 +2049,20 @@ class PaperPlanExecutor:
         phase = str(target.get("phase") or "")
         store = self._option_runs()
         observed = str(run.status)
+        if phase in ("adjust", "exit"):
+            # B2.4 S2b: a plan mutating or closing a structure must act for the
+            # run the owner row is authoritative for (or for the run that opened
+            # it, which the platform's takeover path admits). A superseded caller
+            # refuses by name BEFORE the transition CAS, so nothing is submitted
+            # on behalf of a run the structure has already moved past. This is
+            # asked with ``increasing=False``: an exit reduces risk, and the
+            # exposure split belongs to the adjust sizing above.
+            self._require_option_protection_owner(
+                run,
+                plan_id=plan_id,
+                increasing=False,
+                caller_worker_run_id=str(target.get("worker_run_id") or "") or None,
+            )
         try:
             if phase == "entry":
                 if observed in ("entering", "entered"):
@@ -1983,11 +2117,7 @@ class PaperPlanExecutor:
                     # A stage the platform committed and has not resolved owns the
                     # run's next transition, so the structure is not mutated beside
                     # it.
-                    from backend.options.protection.staged_exit import (
-                        unresolved_stage_claim,
-                    )
-
-                    unresolved = unresolved_stage_claim(getattr(run, "orders", None) or [])
+                    unresolved = self._unresolved_protection_action(run)
                     if unresolved is not None:
                         raise ExecutionRefusal(
                             "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
@@ -1995,9 +2125,7 @@ class PaperPlanExecutor:
                                 "plan_id": plan_id,
                                 "option_run_id": run.strategy_run_id,
                                 "option_run_status": observed,
-                                "stage_digest": str(unresolved.get("stage_digest") or ""),
-                                "stage_state": str(unresolved.get("state") or ""),
-                                "stage_attempt": int(unresolved.get("attempt") or 1),
+                                **unresolved,
                                 "message": (
                                     "a protective exit stage is unresolved for this run; "
                                     "it is reconciled from the platform's own pre-send "
@@ -2012,11 +2140,7 @@ class PaperPlanExecutor:
                 # beside it would be a second, possibly-overclosing order against
                 # a structure whose live stage is still unknown, so it is refused
                 # BY NAME and awaits reconciliation of that stage.
-                from backend.options.protection.staged_exit import (
-                    unresolved_stage_claim,
-                )
-
-                unresolved = unresolved_stage_claim(getattr(run, "orders", None) or [])
+                unresolved = self._unresolved_protection_action(run)
                 if unresolved is not None:
                     raise ExecutionRefusal(
                         "OPTION_PROTECTIVE_EXIT_UNRESOLVED",
@@ -2024,9 +2148,7 @@ class PaperPlanExecutor:
                             "plan_id": plan_id,
                             "option_run_id": run.strategy_run_id,
                             "option_run_status": observed,
-                            "stage_digest": str(unresolved.get("stage_digest") or ""),
-                            "stage_state": str(unresolved.get("state") or ""),
-                            "stage_attempt": int(unresolved.get("attempt") or 1),
+                            **unresolved,
                             "message": (
                                 "a protective exit stage is unresolved for this run; "
                                 "it is reconciled from the platform's own pre-send "
@@ -2208,6 +2330,10 @@ class PaperPlanExecutor:
             run = store.record_leg_evidence_once(
                 run.strategy_run_id, orders=orders, trades=trades
             )
+        #: The protection policy a LANDED adjust just froze (B2.4 S4), or ``None``
+        #: for every other outcome - a withheld or rejected adjust changes no
+        #: generation, so it must not mint a new policy version either.
+        frozen_protection: Optional[Dict[str, Any]] = None
         try:
             if phase == "entry":
                 if failed:
@@ -2280,6 +2406,7 @@ class PaperPlanExecutor:
                     metadata["structure_generation_history"] = history[-10:]
                     run.metadata = metadata
                     run.protection = self._adjusted_protection(run, plan)
+                    frozen_protection = dict(run.protection or {})
                     if desired_legs:
                         run.legs = desired_legs
                     run = mark_adjusted(run, completed_legs=list(dict.fromkeys(completed)))
@@ -2328,7 +2455,44 @@ class PaperPlanExecutor:
                 )
             )
             return
-        target["run"] = store.save_run(run)
+        owner_row = target.get("_protection_owner") if phase == "adjust" else None
+        if frozen_protection is not None and isinstance(owner_row, Mapping):
+            # B2.4 S4: the adjust landed a NEW generation, so its frozen policy
+            # becomes the owner row's policy in the SAME transaction as this run
+            # write, CASed against the epoch the platform observed while it held
+            # the transition. A row that moved under the caller refuses by name
+            # and takes the run write down with it: the structure is never left
+            # reading as adjusted under a policy the owner row never saw.
+            from backend.options.protection.ownership import (
+                OptionProtectionOwnerRefusal,
+                option_protection_policy_snapshot,
+            )
+
+            try:
+                target["run"] = store.save_run(
+                    run,
+                    owner_policy=option_protection_policy_snapshot(frozen_protection),
+                    owner_run_id=str(owner_row.get("owner_run_id") or "") or None,
+                    owner_observed_epoch=int(owner_row.get("owner_epoch") or 0),
+                )
+            except OptionProtectionOwnerRefusal as exc:
+                outcomes.append(
+                    self._record_event(
+                        plan_id,
+                        step_no=1,
+                        event="failed",
+                        refusal_reason=exc.reason_code,
+                        actor_id=actor,
+                        detail={
+                            "option_run_id": run.strategy_run_id,
+                            "option_run_status": run.status,
+                            **exc.as_detail(),
+                        },
+                    )
+                )
+                raise ExecutionRefusal(exc.reason_code, exc.as_detail()) from exc
+        else:
+            target["run"] = store.save_run(run)
 
     def _roll_preconditions(
         self, plan: Mapping[str, Any], roll_ref: Mapping[str, Any]

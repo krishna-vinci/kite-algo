@@ -5663,5 +5663,79 @@ class AlgoWorkerOrderOwnershipLookupTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ProtectionOwnerPolicySyncTests(unittest.TestCase):
+    """B2.4 S4: the platform's protection patch freezes the new policy on the
+    owner row the option gates read - one CAS, at the observed epoch."""
+
+    def test_the_patched_policy_replaces_the_rules_and_keeps_the_plan_facts(self):
+        from backend.api.routers import worker_protection as wp
+
+        patched = wp._protection_owner_policy_for_patch(
+            {
+                "structure_digest": "digest-old",
+                "structure_id": "structure-1",
+                "underlying": "NIFTY",
+                "expiry": "2026-10-29",
+                "rules": [{"key": "old-rule"}],
+            },
+            {
+                "enabled": True,
+                "structure": {"structure_digest": "digest-new", "legs": []},
+                "positions": [{"symbol": "NSE:INFY", "product": "CNC"}],
+                "operations": {"exit_on_worker_stale": True},
+            },
+        )
+
+        # The patch decides the digest, the rules and the operational block ...
+        self.assertEqual(patched["structure_digest"], "digest-new")
+        self.assertEqual(patched["rules"], [{"symbol": "NSE:INFY", "product": "CNC"}])
+        self.assertEqual(patched["stale_exit_policy"], "exit_on_worker_stale")
+        self.assertTrue(patched["enabled"])
+        # ... while the facts the PLAN declared are still the row's.
+        self.assertEqual(patched["structure_id"], "structure-1")
+        self.assertEqual(patched["underlying"], "NIFTY")
+        self.assertEqual(patched["expiry"], "2026-10-29")
+
+    def test_the_patch_freezes_the_policy_on_the_owner_row_at_its_observed_epoch(self):
+        from backend.api.routers import worker_protection as wp
+        from backend.options.protection import ownership
+
+        calls = []
+
+        class _Store:
+            def list_protection_owners(self, *, owner_run_id):
+                self.owner_run_id = owner_run_id
+                return [
+                    {
+                        "option_run_id": "opt_run_1",
+                        "owner_epoch": 3,
+                        "policy": {"structure_id": "structure-1"},
+                    }
+                ]
+
+            def update_policy(self, option_run_id, policy, observed_epoch, *, owner_run_id=None):
+                calls.append((option_run_id, policy, observed_epoch, owner_run_id))
+                return {"option_run_id": option_run_id}
+
+        original = ownership.OptionProtectionOwnerStore
+        ownership.OptionProtectionOwnerStore = lambda *args, **kwargs: _Store()
+        try:
+            mirrored = wp._sync_protection_owner_policy(
+                "run-1",
+                {"enabled": True, "structure": {"structure_digest": "digest-new"}},
+            )
+        finally:
+            ownership.OptionProtectionOwnerStore = original
+
+        self.assertEqual(mirrored, "opt_run_1")
+        self.assertEqual(len(calls), 1)
+        option_run_id, policy, observed_epoch, owner_run_id = calls[0]
+        self.assertEqual(option_run_id, "opt_run_1")
+        self.assertEqual(observed_epoch, 3)
+        self.assertEqual(owner_run_id, "run-1")
+        self.assertEqual(policy["structure_digest"], "digest-new")
+        self.assertEqual(policy["structure_id"], "structure-1")
+
+
 if __name__ == "__main__":
     unittest.main()
