@@ -125,6 +125,8 @@ recurring regression passes once; report `documents/hosted-options-dynamic-b2-<d
 - **C1.3 Live account scope (after B2 paper gate).** Verify own broker account identity read-only, add to
   `HOSTED_STRATEGY_ACCOUNT_SCOPES`, verify selectors and readiness read-only. **Requires explicit user go-ahead;
   places no orders.**
+- **C1 exit requirement:** gated dependent live CNC buys use bounded LIMIT orders before any real account is
+  enabled (C1.1 design, decision 1).
 - Runbooks per lane: `documents/runbooks/hosted-live-<lane>.md` (enable, verify, halt, repair, rollback).
 
 ## Phase C2: sequential production rollout
