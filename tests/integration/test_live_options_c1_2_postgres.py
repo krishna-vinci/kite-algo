@@ -307,3 +307,119 @@ async def test_margin_limit_enforces_required_margin_inr_on_live_option_entry(pg
         assert len(broker_calls) == 1
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_gated_option_legs_are_bounded_limits_and_a_timeout_cancels_once(
+    pg, live_env, _margin_boundary
+):
+    """C1.2 S4 end to end: an immediate hedge stays MARKET, the gated short is a
+    bounded LIMIT at the derived price, and a working LIMIT that outlives the
+    platform timeout is cancelled exactly once - never repriced, never replaced,
+    and never repeated after a restart."""
+    _seed_catalog(pg["factory"])
+    clock = _clock()
+    broker_calls = []
+
+    class _Broker:
+        async def handle(self, intent, *, context=None):
+            broker_calls.append(intent)
+            return {"result": {"order_id": f"O-{len(broker_calls)}", "status": "success"}}
+
+    app, executor = _build_app(pg["factory"], _Broker(), clock)
+    client = await _operator_client(app)
+    try:
+        attempt = await _prepare_live_attempt(
+            client,
+            account_scope=live_env["account_scope"],
+            lease_until=clock() + timedelta(hours=12),
+        )
+        _declare_version_risk_policy(
+            pg["factory"],
+            attempt["strategy_id"],
+            {"allowed_structure_families": ["vertical_spread"]},
+        )
+        proposed = await _submit_proposal(
+            client,
+            attempt,
+            _option_payload(phase="entry"),
+            account_scope=live_env["account_scope"],
+        )
+        assert proposed.status_code < 400, proposed.text
+        plan = proposed.json()["plan"]
+
+        executed, _reservation = await _execute(client, attempt["strategy_id"], plan["plan_id"])
+        assert executed.status_code < 400, executed.text
+        assert len(broker_calls) == 1, executed.text
+        hedge_order = executed.json()["broker_order_ids"][0]
+        # The immediate hedge is NOT a gated dependent leg: it keeps MARKET.
+        assert broker_calls[0].payload["order"]["order_type"] == "MARKET"
+
+        _ingest_fill(
+            pg["factory"],
+            account_id=live_env["account_scope"],
+            run_id=attempt["run_id"],
+            order_id=hedge_order,
+            trade_id="TR-C12-S4-HEDGE",
+            quantity=75,
+            side="BUY",
+            symbol="NIFTY26OCT30000CE",
+            token=900002,
+        )
+        from backend.strategies.live_ingestion import LiveOutcomeConsumer
+
+        consumer = LiveOutcomeConsumer(
+            session_factory=pg["factory"],
+            clock=clock,
+            sequence_releaser=executor.release_sequence,
+        )
+        counts = await consumer.poll_once()
+        assert counts["sequence_released"] == 1, counts
+        assert len(broker_calls) == 2, counts
+        released = broker_calls[1].payload["order"]
+        assert released["order_type"] == "LIMIT", released
+        # LTP 1500.0 (the harness quote) is the fallback reference; the band is
+        # the frozen reference price 100.0 with a 0.5% half-width.
+        assert abs(released["price"] - 1500.0 * 0.995) < 1e-6, released
+
+        claims = _claims(pg["factory"], plan["plan_id"])
+        short_claim = next(claim for claim in claims if claim["state"] == "pending")
+        evidence = short_claim["detail"]["execution_order"]
+        assert evidence["order_type"] == "LIMIT"
+        assert evidence["reference_price_inr"] == 100.0
+        assert abs(evidence["bound_price_inr"] - 100.0 * 0.995) < 1e-9
+        assert evidence["reference_source"] == "ltp"
+        assert evidence["tick_size"] == 0.05
+        assert evidence["tick_source"] == "catalog"
+        assert evidence["submitted_at"]
+        short_orders = list(short_claim["broker_order_ids"])
+        assert len(short_orders) == 1, short_claim
+        short_order = short_orders[0]
+
+        # The working LIMIT outlives the platform timeout: it is cancelled once,
+        # with an explicit terminal outcome, and the dependent behaviour is
+        # unchanged (an unfilled leg never becomes a market order).
+        clock.now = clock.now + timedelta(seconds=31)
+        counts = await consumer.poll_once()
+        assert counts["sequence_released"] == 0, counts
+        cancels = [intent for intent in broker_calls if intent.intent_type == "cancel_order"]
+        assert len(cancels) == 1, broker_calls
+        assert cancels[0].payload["order"]["order_id"] == short_order
+        short_claim = next(
+            claim
+            for claim in _claims(pg["factory"], plan["plan_id"])
+            if claim["detail"].get("execution_order")
+        )
+        assert short_claim["state"] == "rejected", short_claim
+        assert short_claim["detail"]["limit_timeout"]["terminal"] == "cancelled"
+
+        # A restart (a fresh pass, a fresh consumer) never sends a second cancel.
+        restarted = LiveOutcomeConsumer(
+            session_factory=pg["factory"],
+            clock=clock,
+            sequence_releaser=executor.release_sequence,
+        )
+        await restarted.poll_once()
+        assert len([i for i in broker_calls if i.intent_type == "cancel_order"]) == 1
+    finally:
+        await client.aclose()

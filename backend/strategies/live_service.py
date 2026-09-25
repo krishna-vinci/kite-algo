@@ -28,6 +28,7 @@ from backend.strategies.live_readers import (
     LiveEvidenceUnavailable,
     attributed_position_reader,
     ingested_fill_reader,
+    live_catalog_tick_size,
     live_quote_for_leg,
     live_session_id_for_account,
 )
@@ -119,6 +120,11 @@ def build_live_plan_adapter(
         fill_reader=fill_reader or ingested_fill_reader(factory),
         position_reader=position_reader or attributed_position_reader(factory),
         authority_reader=authority_reader or live_authority_reader(factory),
+        # The bounded-LIMIT dispatch needs the broker TICK from the instrument
+        # catalog; an unknown tick refuses rather than guessing a grid.
+        tick_reader=lambda plan, leg: live_catalog_tick_size(
+            plan, leg, session_factory=factory
+        ),
         clock=clock or _utcnow,
     )
 
@@ -512,6 +518,32 @@ class LivePlanExecutor:
             return counts
         from backend.strategies.proposals import ProposalStore
 
+        # C1.2 S4: a GATED LIMIT that has worked past the platform timeout is
+        # cancelled BEFORE any dependent release, so a dead hedge can never
+        # release the short it defends. The cancel is sent once (the durable
+        # claim records the attempt first) and never repriced or replaced.
+        try:
+            expired = await self._expire_working_limits(limit=limit)
+            counts["limit_expired"] = int(expired.get("expired") or 0)
+            counts["limit_partial"] = int(expired.get("partial") or 0)
+            counts["limit_uncertain"] = int(expired.get("uncertain") or 0)
+            if expired.get("errors"):
+                counts["errors"] += int(expired.get("errors") or 0)
+            for leg in expired.get("declared") or []:
+                # The parent records the leg's terminal outcome so a fully
+                # terminal parent settles exactly once (an unfilled acquisition
+                # releases nothing and releases no dependent).
+                self.sequence.declare_leg_terminal(
+                    plan_id=str(leg.get("plan_id") or ""),
+                    step_no=int(leg.get("step_no") or 0),
+                    outcome=str(leg.get("outcome") or ""),
+                    filled=int(leg.get("filled") or 0),
+                    ordered=int(leg.get("ordered") or 0),
+                )
+        except Exception as exc:  # noqa: BLE001 - a bad pass is not a clean pass
+            counts["errors"] += 1
+            counts["error_detail"] = f"limit_timeout: {exc}"
+
         store = ProposalStore(session_factory=self.session_factory)
         try:
             parents = self.sequence.releasable_parents(limit=limit)
@@ -543,6 +575,15 @@ class LivePlanExecutor:
             except Exception:  # noqa: BLE001 - retried on the next pass
                 counts["errors"] += 1
         return counts
+
+    async def _expire_working_limits(self, *, limit: int) -> Dict[str, Any]:
+        """Run the bounded-LIMIT timeout sweep through the adapter's broker boundary."""
+        adapter = self.adapter or build_live_plan_adapter(
+            self.session_factory,
+            intent_handler=self._intent_handler,
+            clock=self._clock,
+        )
+        return await adapter.expire_timed_out_limits(limit=limit)
 
     def _release_authority_check(self, plan: Mapping[str, Any]):
         """The governed authority check for one plan's dependent release, or None.

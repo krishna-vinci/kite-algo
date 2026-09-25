@@ -44,7 +44,6 @@ from that delta), floored to the pinned lot and recorded as the delta snapshot.
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -60,6 +59,22 @@ from backend.options.market.freshness import (
     LIVE_OPTION_CHAIN_MAX_AGE_SECONDS,
     validate_option_chain_evidence,
 )
+from .live_limit_orders import (
+    # Re-exported under its historical name: C1.1's drift bound and the
+    # bounded-LIMIT derivation it feeds now both live in ``live_limit_orders``.
+    DEFAULT_STAGED_BUY_MAX_PRICE_DRIFT_PCT,
+    LIVE_LIMIT_TICK_UNKNOWN,
+    ORDER_TYPE_LIMIT,
+    ORDER_TYPE_MARKET,
+    LimitOrderRefusal,
+    derive_bounded_limit,
+    frozen_reference_price,
+    gated_limit_timeout_seconds,
+    is_gated_limit_release_rule,
+    option_limit_max_drift_pct,
+    staged_buy_max_price_drift_pct,
+)
+from .live_readers import live_catalog_tick_size
 from .reservations import CapacityExceeded, ReservationLedger
 from .settlement import ExecutionBarrier
 
@@ -78,10 +93,6 @@ QUOTE_MAX_AGE_SECONDS = 5.0
 
 #: How far ahead the evaluation authority must still be valid.
 AUTHORITY_MIN_REMAINING_SECONDS = 1.0
-
-#: The largest relative move from a frozen buy reference that the staged
-#: funding gate will authorize. A tighter operator limit stays configurable.
-DEFAULT_STAGED_BUY_MAX_PRICE_DRIFT_PCT = 0.005
 
 #: The ONE approval pin a released dependent leg may explain away, and only when
 #: it can PROVE the book moved by nothing but this parent's own confirmed fills.
@@ -218,6 +229,48 @@ class LiveSubmissionStore:
             if owns:
                 session.close()
         return None if row is None else self._row(dict(row))
+
+    def working_limit_steps(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        """Non-terminal GATED LIMIT claims, oldest first.
+
+        Only steps that actually reached the broker as a bounded LIMIT (the
+        durable ``execution_order`` evidence says so) and are still working
+        (``pending``/``partial``) are returned. A ``releasing`` claim is NOT one
+        of these: the send's outcome is unknown there, which is the pre-send
+        fence's business, not the timeout's.
+        """
+        session = self.session_factory()
+        try:
+            dialect = self._dialect(session)
+            if dialect == "sqlite":
+                limit_filter = (
+                    "json_extract(detail, '$.execution_order.order_type') = :order_type"
+                )
+            else:
+                limit_filter = "detail -> 'execution_order' ->> 'order_type' = :order_type"
+            rows = (
+                session.execute(
+                    text(
+                        f"""
+                        SELECT submission_id, plan_id, step_no, step_ref, state,
+                               broker_order_ids, delta_snapshot, detail,
+                               consumer_token, consumer_until
+                        FROM public.live_plan_submissions
+                        WHERE execution_environment = 'live'
+                          AND state IN ('pending', 'partial')
+                          AND {limit_filter}
+                        ORDER BY updated_at
+                        LIMIT :limit
+                        """
+                    ),
+                    {"order_type": ORDER_TYPE_LIMIT, "limit": int(limit)},
+                )
+                .mappings()
+                .all()
+            )
+        finally:
+            session.close()
+        return [self._row(dict(row)) for row in rows]
 
     # ------------------------------------------------------- consumer leasing
 
@@ -487,6 +540,7 @@ class LivePlanAdapter:
         submissions: Any = None,
         position_reader: Any = None,
         authority_reader: Any = None,
+        tick_reader: Any = None,
     ) -> None:
         if session_factory is None:
             session_factory = SessionLocal
@@ -506,6 +560,14 @@ class LivePlanAdapter:
         #: moment of dispatch. Without it the authority cannot be re-verified, so
         #: the adapter refuses rather than claiming a check it did not perform.
         self.authority_reader = authority_reader
+        #: The instrument catalog's broker TICK for one frozen leg. A price can
+        #: only be placed on the broker's own grid, so an unknown tick refuses
+        #: (``LIVE_LIMIT_TICK_UNKNOWN``) rather than guessing one.
+        self.tick_reader = tick_reader or (
+            lambda plan, leg: live_catalog_tick_size(
+                plan, leg, session_factory=session_factory
+            )
+        )
         self._clock = clock or _utcnow
         self.quote_max_age_seconds = float(quote_max_age_seconds)
         self.live_option_chain_max_age_seconds = float(live_option_chain_max_age_seconds)
@@ -998,14 +1060,13 @@ class LivePlanAdapter:
 
     @staticmethod
     def staged_buy_max_price_drift_pct() -> float:
-        raw = os.environ.get("LIVE_STAGED_BUY_MAX_PRICE_DRIFT_PCT")
-        if raw is None:
-            return DEFAULT_STAGED_BUY_MAX_PRICE_DRIFT_PCT
-        try:
-            value = float(raw)
-        except ValueError:
-            return DEFAULT_STAGED_BUY_MAX_PRICE_DRIFT_PCT
-        return value if value >= 0.0 else DEFAULT_STAGED_BUY_MAX_PRICE_DRIFT_PCT
+        """C1.1's drift bound, under its established name and default.
+
+        The value and the bounded-LIMIT derivation it feeds are shared with the
+        option lane through ``live_limit_orders``; this accessor keeps the C1.1
+        name (and its env var) working.
+        """
+        return staged_buy_max_price_drift_pct()
 
     async def _staged_funding_gate(
         self,
@@ -1587,6 +1648,127 @@ class LivePlanAdapter:
             "variety": str(getattr(spec, "variety", "") or "regular"),
         }
 
+    def _tick_for_step(self, plan: Mapping[str, Any], leg: Mapping[str, Any]) -> tuple[float, str]:
+        """The broker tick for one gated leg, and where it came from.
+
+        The frozen leg answers first (the futures compiler records its tick);
+        otherwise the instrument catalog is read. An unknown tick refuses: a
+        price that is not on the broker's own grid is not a price we may send.
+        """
+        plan_id = str(plan.get("plan_id") or "")
+        own = leg.get("tick_size")
+        try:
+            own_value = float(own) if own not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            own_value = 0.0
+        if own_value > 0.0:
+            return own_value, "leg"
+        if not callable(self.tick_reader):
+            raise LiveRefusal(
+                LIVE_LIMIT_TICK_UNKNOWN,
+                {"plan_id": plan_id, "instrument_id": str(leg.get("instrument_id") or "")},
+            )
+        try:
+            value = self.tick_reader(plan, leg)
+        except LiveRefusal:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an unreadable catalog is UNKNOWN
+            raise LiveRefusal(
+                LIVE_LIMIT_TICK_UNKNOWN,
+                {
+                    "plan_id": plan_id,
+                    "instrument_id": str(leg.get("instrument_id") or ""),
+                    "error": str(exc),
+                },
+            ) from exc
+        try:
+            tick = float(value) if value not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            tick = 0.0
+        if tick <= 0.0:
+            raise LiveRefusal(
+                LIVE_LIMIT_TICK_UNKNOWN,
+                {
+                    "plan_id": plan_id,
+                    "instrument_id": str(leg.get("instrument_id") or ""),
+                    "tick_size": None if value is None else str(value),
+                },
+            )
+        return tick, "catalog"
+
+    def _gated_execution_order(
+        self,
+        plan: Mapping[str, Any],
+        spec: Any,
+        *,
+        leg: Mapping[str, Any],
+        side: str,
+        quantity: int,
+        quote: Optional[Mapping[str, Any]],
+        session_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """The bounded-LIMIT ``execution_order`` block for a GATED leg, or ``None``.
+
+        ``None`` means the leg is not gated (an immediate leg, or a MIS
+        square-off released by the platform clock): it keeps its current
+        behaviour. A gated leg is always a LIMIT, and the whole derivation is
+        recorded so the durable step detail carries the frozen reference, the
+        observed quote, the chosen price, the band and the tick source.
+        """
+        rule = str(getattr(spec, "release_rule", "") or "")
+        if not is_gated_limit_release_rule(rule):
+            return None
+        plan_id = str(plan.get("plan_id") or "")
+        step_no = int(getattr(spec, "step_no", 0) or 0)
+        ordered = abs(int(quantity or 0))
+        lane = str(getattr(spec, "lane", "") or "")
+        detail = dict(getattr(spec, "detail", {}) or {})
+        reference = frozen_reference_price(
+            detail=detail,
+            notional_inr=getattr(spec, "notional_inr", 0.0),
+            quantity=ordered,
+        )
+        if reference <= 0.0:
+            raise LiveRefusal(
+                "LIVE_REFERENCE_PRICE_UNAVAILABLE",
+                {"plan_id": plan_id, "step_no": step_no, "release_rule": rule, "lane": lane},
+            )
+        max_drift_env = (
+            "LIVE_OPTION_LIMIT_MAX_DRIFT_PCT"
+            if lane == "option_structure"
+            else "LIVE_STAGED_BUY_MAX_PRICE_DRIFT_PCT"
+        )
+        max_drift = (
+            option_limit_max_drift_pct()
+            if lane == "option_structure"
+            else staged_buy_max_price_drift_pct()
+        )
+        tick, tick_source = self._tick_for_step(plan, leg)
+        try:
+            derived = derive_bounded_limit(
+                side,
+                reference,
+                dict(quote or {}),
+                max_drift,
+                tick,
+                tick_source=tick_source,
+            )
+        except LimitOrderRefusal as exc:
+            raise LiveRefusal(
+                exc.reason_code,
+                {"plan_id": plan_id, "step_no": step_no, "lane": lane, "release_rule": rule, **exc.detail},
+            ) from exc
+        return {
+            **derived,
+            "lane": lane,
+            "release_rule": rule,
+            "quantity": int(ordered),
+            "variety": str(getattr(spec, "variety", "") or "regular"),
+            "max_drift_env": max_drift_env,
+            "session_id": str(session_id or ""),
+            "submitted_at": self._clock().isoformat(),
+        }
+
     async def dispatch_step(
         self,
         plan: Mapping[str, Any],
@@ -1682,6 +1864,21 @@ class LivePlanAdapter:
                 "LIVE_INTENT_HANDLER_MISSING", {"plan_id": plan_id, "step_ref": step_ref}
             )
 
+        # A GATED dependent leg is a bounded platform-side LIMIT, never a MARKET
+        # order: the price is derived here, at release time, inside the band
+        # frozen with the plan, and a price outside that band is a named refusal
+        # rather than a widened bound. Non-gated legs keep their current
+        # behaviour.
+        execution_order = self._gated_execution_order(
+            plan,
+            spec,
+            leg=leg,
+            side=side,
+            quantity=quantity,
+            quote=quote,
+            session_id=session_id,
+        )
+
         from backend.algo_runtime.models import OrderIntent
 
         payload = {
@@ -1694,8 +1891,11 @@ class LivePlanAdapter:
                 "transaction_type": side,
                 "variety": str(spec.variety or "regular"),
                 "product": str(spec.product or ""),
-                "order_type": "MARKET",
+                "order_type": (
+                    str(execution_order["order_type"]) if execution_order else ORDER_TYPE_MARKET
+                ),
                 "quantity": int(quantity),
+                **({"price": float(execution_order["price"])} if execution_order else {}),
                 # Attribution binds the broker order id to THIS plan step's run
                 # BEFORE the order exists, so ingestion can attribute the fill
                 # without the child ever asserting ownership.
@@ -1718,6 +1918,18 @@ class LivePlanAdapter:
             },
         }
         intent = OrderIntent(intent_type="place_order", payload=payload, dedupe_key=step_ref)
+        if execution_order is not None:
+            # PRE-SEND evidence: the frozen reference, the observed quote, the
+            # chosen price, the band and the tick are durable BEFORE the broker
+            # call, so a crash between here and the response still says exactly
+            # what was about to be sent - and the timeout can measure how long
+            # this order has worked from ``submitted_at``.
+            self.submissions.record_outcome(
+                plan_id=plan_id,
+                step_no=step_no,
+                state="releasing",
+                detail={"execution_order": execution_order, "delta": delta, **release_evidence},
+            )
         try:
             result = await self.intent_handler.handle(intent, context={"plan_id": plan_id})
         except Exception as exc:  # noqa: BLE001 - transport uncertainty is not a retry
@@ -1729,6 +1941,7 @@ class LivePlanAdapter:
                     "error": str(exc),
                     "delta": delta,
                     **release_evidence,
+                    **({"execution_order": execution_order} if execution_order else {}),
                     "note": "work and reservation are retained; never auto-repeated",
                 },
             )
@@ -1744,6 +1957,7 @@ class LivePlanAdapter:
                 detail={
                     "delta": delta,
                     **release_evidence,
+                    **({"execution_order": execution_order} if execution_order else {}),
                     "note": "accepted: fills come from ingestion",
                 },
             )
@@ -1763,7 +1977,12 @@ class LivePlanAdapter:
                 plan_id=plan_id,
                 step_no=step_no,
                 state="rejected",
-                detail={"delta": delta, "result": result, **release_evidence},
+                detail={
+                    "delta": delta,
+                    "result": result,
+                    **release_evidence,
+                    **({"execution_order": execution_order} if execution_order else {}),
+                },
             )
             return dict(stored or {})
 
@@ -1777,10 +1996,344 @@ class LivePlanAdapter:
                 "delta": delta,
                 "result": result,
                 **release_evidence,
+                **({"execution_order": execution_order} if execution_order else {}),
                 "note": "no authoritative order reference; recovery required",
             },
         )
         return dict(stored or {})
+
+    # -- gated-LIMIT timeout ------------------------------------------------
+
+    async def expire_timed_out_limits(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        timeout_seconds: Optional[float] = None,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Cancel GATED LIMIT orders that have worked past the platform timeout.
+
+        Only an order id already KNOWN through the durable claim (the accepted
+        response / ingestion) is cancelled, through the SAME broker intent
+        boundary that placed it. The attempt is recorded durably BEFORE the cancel
+        is sent, so a crash, a repeated pass or a restarted process can never send
+        a second cancel; an UNCERTAIN cancel leaves the work unresolved for the
+        existing fence/repair boundary instead of guessing.
+
+        Outcomes are explicit and migration-free, in the states this protocol
+        already owns:
+
+        * zero-filled cancel -> terminal ``rejected`` carrying
+          ``limit_timeout.terminal="cancelled"`` (an unfilled acquisition), or the
+          named action-required ``repair_required`` when the leg was a RISK
+          REDUCTION that could not be executed inside its bound;
+        * partial -> ``partial`` with the remainder retained;
+        * a cancel that raced a COMPLETE fill -> the claim is left for ingestion;
+        * uncertain -> the claim stays in flight and is never re-cancelled.
+
+        "Zero-filled" is measured from the platform's CONFIRMED ingestion at the
+        instant of the cancel, which is the same evidence the ordinary outcome
+        pass decides on; a trade that lands afterwards is still attributed to the
+        run by ingestion.
+
+        There is no automatic repricing and no replacement order.
+        """
+        counters: Dict[str, Any] = {
+            "expired": 0,
+            "partial": 0,
+            "uncertain": 0,
+            "skipped": 0,
+            "filled": 0,
+            "errors": 0,
+        }
+        declared: List[Dict[str, Any]] = []
+        lister = getattr(self.submissions, "working_limit_steps", None)
+        if not callable(lister) or self.intent_handler is None:
+            return {**counters, "declared": declared}
+        try:
+            rows = list(lister(limit=int(limit)) or [])
+        except Exception as exc:  # noqa: BLE001 - an unreadable scan is not a clean one
+            counters["errors"] = 1
+            counters["error_detail"] = str(exc)
+            return {**counters, "declared": declared}
+        moment = now if now is not None else self._clock()
+        timeout = (
+            gated_limit_timeout_seconds() if timeout_seconds is None else float(timeout_seconds)
+        )
+        for row in rows:
+            try:
+                outcome = await self._expire_one_limit(row, moment=moment, timeout=timeout)
+            except Exception as exc:  # noqa: BLE001 - one bad row never kills the pass
+                counters["errors"] += 1
+                counters["error_detail"] = (
+                    f"{row.get('plan_id')}:{row.get('step_no')}: {exc}"
+                )
+                continue
+            if outcome is None:
+                counters["skipped"] += 1
+            elif outcome.get("declared"):
+                counters["expired"] += 1
+                declared.append(dict(outcome["declared"]))
+            else:
+                counters[str(outcome.get("tag") or "skipped")] += 1
+        return {**counters, "declared": declared}
+
+    async def _expire_one_limit(
+        self, row: Mapping[str, Any], *, moment: datetime, timeout: float
+    ) -> Optional[Dict[str, Any]]:
+        """One claim's timeout decision. ``None`` means "not mine to touch"."""
+        plan_id = str(row.get("plan_id") or "")
+        step_no = int(row.get("step_no") or 0)
+        state = str(row.get("state") or "pending")
+        detail = dict(row.get("detail") or {})
+        execution_order = dict(detail.get("execution_order") or {})
+        if str(execution_order.get("order_type") or "") != ORDER_TYPE_LIMIT:
+            return None
+        submitted_at = _as_datetime(execution_order.get("submitted_at"))
+        if submitted_at is None:
+            return None
+        elapsed = (moment - submitted_at).total_seconds()
+        if elapsed < timeout:
+            return None
+        prior = dict(detail.get("limit_timeout") or {})
+        if prior.get("cancel_attempted_at") or prior.get("cancel_state") in (
+            "attempted",
+            "accepted",
+            "uncertain",
+            "refused",
+        ):
+            # The cancel is NEVER repeated - not by a later pass, and not by the
+            # same pass after a restart.
+            return None
+        orders = [str(value) for value in (row.get("broker_order_ids") or []) if str(value)]
+        if not orders:
+            return None
+        delta = dict(row.get("delta_snapshot") or {})
+        ordered = abs(int(delta.get("quantity") or execution_order.get("quantity") or 0))
+        risk_reducing = not bool(delta.get("increases_exposure", True))
+        attempt = {
+            **prior,
+            "cancel_attempted_at": moment.isoformat(),
+            "cancel_state": "attempted",
+            "order_ids": orders,
+            "timeout_seconds": float(timeout),
+            "elapsed_seconds": elapsed,
+            "note": "platform timeout on a working gated LIMIT; no repricing, no replacement",
+        }
+        # PRE-SEND for the cancel: recorded before the broker call, so an
+        # interrupted cancel can never be sent twice.
+        self.submissions.record_outcome(
+            plan_id=plan_id,
+            step_no=step_no,
+            state=state,
+            detail={"execution_order": execution_order, "limit_timeout": attempt},
+        )
+        try:
+            acknowledged, refused, results = await self._send_limit_cancel(
+                plan_id=plan_id,
+                step_ref=str(row.get("step_ref") or f"live-plan:{plan_id}:step:{step_no}"),
+                orders=orders,
+                session_id=str(execution_order.get("session_id") or ""),
+                variety=str(execution_order.get("variety") or "regular"),
+            )
+        except Exception as exc:  # noqa: BLE001 - an uncertain cancel is not a retry
+            self.submissions.record_outcome(
+                plan_id=plan_id,
+                step_no=step_no,
+                state=state,
+                detail={
+                    "execution_order": execution_order,
+                    "limit_timeout": {
+                        **attempt,
+                        "cancel_state": "uncertain",
+                        "error": str(exc),
+                        "note": (
+                            "the cancel outcome is unknown: the work stays unresolved "
+                            "for the fence/repair boundary and the cancel is never repeated"
+                        ),
+                    },
+                },
+            )
+            return {"tag": "uncertain"}
+
+        fills = self._confirmed_fill_total(plan_id=plan_id, orders=orders)
+        resolved = {
+            **attempt,
+            "cancel_state": "accepted" if acknowledged else ("refused" if refused else "uncertain"),
+            "cancel_results": list(results),
+        }
+        if fills is None:
+            self.submissions.record_outcome(
+                plan_id=plan_id,
+                step_no=step_no,
+                state=state,
+                detail={
+                    "execution_order": execution_order,
+                    "limit_timeout": {
+                        **resolved,
+                        "cancel_state": "uncertain",
+                        "note": "the confirmed-fill read failed, so no terminal outcome is claimed",
+                    },
+                },
+            )
+            return {"tag": "uncertain"}
+        if not acknowledged:
+            # An explicit broker refusal (or an ambiguous answer) is not an
+            # outcome: the claim stays unresolved and is never re-cancelled.
+            self.submissions.record_outcome(
+                plan_id=plan_id,
+                step_no=step_no,
+                state=state,
+                detail={
+                    "execution_order": execution_order,
+                    "limit_timeout": {
+                        **resolved,
+                        "note": (
+                            "the broker did not acknowledge the cancel; the claim stays "
+                            "unresolved and the cancel is never repeated"
+                        ),
+                    },
+                },
+            )
+            return {"tag": "uncertain"}
+        if ordered and fills >= ordered:
+            # The cancel raced a COMPLETE fill: ingestion owns the finalisation.
+            self.submissions.record_outcome(
+                plan_id=plan_id,
+                step_no=step_no,
+                state=state,
+                detail={
+                    "execution_order": execution_order,
+                    "limit_timeout": {
+                        **resolved,
+                        "filled_quantity": fills,
+                        "note": "the order filled completely before the cancel landed; ingestion finalises it",
+                    },
+                },
+            )
+            return {"tag": "filled"}
+        if fills > 0:
+            self.submissions.record_outcome(
+                plan_id=plan_id,
+                step_no=step_no,
+                state="partial",
+                detail={
+                    "execution_order": execution_order,
+                    "limit_timeout": {
+                        **resolved,
+                        "filled_quantity": fills,
+                        "ordered_quantity": ordered,
+                        "residual_quantity": max(0, ordered - fills),
+                        "blocking": "limit_timeout_partial_residual_retained",
+                    },
+                },
+            )
+            return {"tag": "partial"}
+
+        terminal_state = "repair_required" if risk_reducing else "rejected"
+        self.submissions.record_outcome(
+            plan_id=plan_id,
+            step_no=step_no,
+            state=terminal_state,
+            detail={
+                "execution_order": execution_order,
+                "limit_timeout": {
+                    **resolved,
+                    "filled_quantity": 0,
+                    "ordered_quantity": ordered,
+                    "terminal": "cancelled",
+                    "blocking": (
+                        "limit_timeout_reduction_unfilled"
+                        if risk_reducing
+                        else "limit_timeout_unfilled"
+                    ),
+                    "action_required": bool(risk_reducing),
+                },
+            },
+        )
+        return {
+            "tag": "expired",
+            "declared": {
+                "plan_id": plan_id,
+                "step_no": step_no,
+                "outcome": terminal_state,
+                "filled": 0,
+                "ordered": ordered,
+            },
+        }
+
+    async def _send_limit_cancel(
+        self,
+        *,
+        plan_id: str,
+        step_ref: str,
+        orders: Sequence[str],
+        session_id: str,
+        variety: str,
+    ) -> tuple[bool, bool, List[Any]]:
+        """Cancel the step's KNOWN order ids through the broker intent boundary."""
+        from backend.algo_runtime.models import OrderIntent
+
+        acknowledged = False
+        refused = False
+        results: List[Any] = []
+        for order_id in orders:
+            dedupe_key = f"{step_ref}:cancel:{order_id}"
+            intent = OrderIntent(
+                intent_type="cancel_order",
+                payload={
+                    "session_id": session_id,
+                    "correlation_id": f"{step_ref}:cancel",
+                    "idempotency_key": dedupe_key,
+                    "order": {"order_id": str(order_id), "variety": str(variety or "regular")},
+                },
+                dedupe_key=dedupe_key,
+            )
+            result = await self.intent_handler.handle(intent, context={"plan_id": plan_id})
+            results.append(result)
+            if self._cancel_acknowledged(result):
+                acknowledged = True
+            elif self._is_explicit_rejection(result):
+                refused = True
+        return acknowledged, refused, results
+
+    @staticmethod
+    def _cancel_acknowledged(result: Any) -> bool:
+        payload = dict(result or {}) if isinstance(result, Mapping) else {}
+        body = payload.get("result") if isinstance(payload.get("result"), Mapping) else payload
+        if not isinstance(body, Mapping):
+            return False
+        if body.get("order_id") or body.get("broker_order_id"):
+            return True
+        status = str(body.get("status") or body.get("state") or "").strip().lower()
+        return status in (
+            "cancelled",
+            "canceled",
+            "cancel_pending",
+            "success",
+            "ok",
+            "submitted",
+            "accepted",
+        )
+
+    def _confirmed_fill_total(self, *, plan_id: str, orders: Sequence[str]) -> Optional[int]:
+        """Confirmed fill quantity for the step's orders, or ``None`` if unknown."""
+        if self.fill_reader is None:
+            return None
+        try:
+            rows = self.fill_reader(
+                broker_order_ids=[str(value) for value in orders],
+                plan={"plan_id": str(plan_id)},
+            )
+        except Exception:  # noqa: BLE001 - unknown fill evidence is UNKNOWN
+            return None
+        total = 0
+        for row in rows or []:
+            try:
+                total += abs(int(dict(row).get("quantity") or 0))
+            except (TypeError, ValueError):
+                return None
+        return total
 
     async def release_step(
         self,

@@ -61,6 +61,23 @@ class KiteOrdersIntentHandler:
             )
             return {"mode": "live", "intent_type": intent.intent_type, "result": result.model_dump(mode="json")}
 
+        if intent.intent_type == "cancel_order":
+            # The platform's bounded cancel boundary for an order id ALREADY
+            # known through ingestion/intents (a timed-out gated LIMIT). It is
+            # the same handler that placed the order, so the same fake broker in
+            # tests and the same session/broker wiring in production serve it.
+            order_payload = payload.get("order") or {}
+            order_id = str(order_payload.get("order_id") or "").strip()
+            if not order_id:
+                raise ValueError("cancel_order payload must include order.order_id")
+            result = await self.orders_service.cancel_order(
+                kite,
+                str(order_payload.get("variety") or "regular"),
+                order_id,
+                corr_id,
+            )
+            return {"mode": "live", "intent_type": intent.intent_type, "result": result}
+
         raise ValueError(f"Unsupported order intent type '{intent.intent_type}'")
 
     def _load_kite_client(self, session_id: str):

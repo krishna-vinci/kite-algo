@@ -244,6 +244,51 @@ async def live_quote_for_leg(leg: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def live_catalog_tick_size(
+    plan: Optional[Mapping[str, Any]] = None,
+    leg: Optional[Mapping[str, Any]] = None,
+    *,
+    session_factory: Optional[Callable[[], Any]] = None,
+) -> Optional[float]:
+    """The broker tick for one frozen leg, from the instrument catalog.
+
+    A leg that already carries its own ``tick_size`` (the futures compiler
+    records it) answers from the frozen leg; otherwise the PINNED instrument
+    catalog is read for the leg's broker coordinate. ``None`` means the catalog
+    does not know the tick, which the caller must treat as unknown rather than
+    defaulting to a guessed grid.
+    """
+    from backend.strategies.compiler.base import PinnedCatalogRead
+
+    frozen_leg = dict(leg or {})
+    own_tick = _positive_float(frozen_leg.get("tick_size"))
+    if own_tick is not None:
+        return own_tick
+
+    exchange = str(frozen_leg.get("broker_exchange") or frozen_leg.get("exchange") or "")
+    symbol = str(frozen_leg.get("broker_symbol") or frozen_leg.get("tradingsymbol") or "")
+    if not exchange or not symbol:
+        return None
+    generation = str(dict(plan or {}).get("pinned_catalog_generation") or "") or None
+    read = PinnedCatalogRead(session_factory, generation=generation)
+    row = read.resolve_symbol(exchange, symbol)
+    if row is None:
+        return None
+    return _positive_float(row.get("tick_size"))
+
+
+def _positive_float(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0.0:
+        return None
+    return number
+
+
 def ingested_fill_reader(session_factory: Optional[Callable[[], Any]] = None) -> Callable[..., List[Dict[str, Any]]]:
     """Confirmed fills for a plan step, from the canonical ingestion fact table.
 
