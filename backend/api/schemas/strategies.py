@@ -225,6 +225,9 @@ class VersionCreateRequest(BaseModel):
     #: Explicit capability declaration for this version. Omitted/empty means
     #: data-only (no trading rights). Unknown keys or non-boolean values are 422.
     capabilities: Optional[Dict[str, Any]] = None
+    #: Per-version risk policy (B2.5). Omitted means the version declares none,
+    #: which the options lane refuses by name. Invalid values are 422.
+    risk_policy: Optional[Dict[str, Any]] = None
 
 
 class StrategyResponse(BaseModel):
@@ -270,6 +273,7 @@ class VersionResponse(BaseModel):
     source_sha256: str
     parameters_schema: Dict[str, Any]
     capabilities_snapshot: Dict[str, Any]
+    risk_policy: Optional[Dict[str, Any]] = None
     created_by: str
     created_at: Optional[str] = None
 

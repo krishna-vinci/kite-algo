@@ -51,6 +51,11 @@ ADMISSION_REFUSALS = (
     "MAX_OPEN_INSTRUMENTS_EXCEEDED",
     "ORDER_RATE_EXCEEDED",
     "DAILY_LOSS_BUDGET_UNAVAILABLE",
+    "STRATEGY_RISK_POLICY_MISSING",
+    "OPTION_STRUCTURE_FAMILY_NOT_ALLOWED",
+    "OPTION_NAKED_NOT_PERMITTED",
+    "OPTION_MAX_LOSS_EXCEEDED",
+    "STRATEGY_NOTIONAL_LIMIT_EXCEEDED",
     "CATALOG_INVALID",
     "SESSION_PRODUCT_INVALID",
     "MARGIN_UNAVAILABLE",
@@ -85,6 +90,12 @@ def _as_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _min_optional(*values: Optional[float]) -> Optional[float]:
+    """The smallest value a level states, ignoring the levels that state none."""
+    present = [float(value) for value in values if value is not None]
+    return min(present) if present else None
 
 
 @dataclass(frozen=True)
@@ -372,6 +383,354 @@ class AdmissionService:
             ).scalar_one_or_none()
             return int(row.version) if row is not None else 0
 
+    # -- per-strategy risk policy (B2.5) ------------------------------------
+
+    def declared_risk_policy(self, plan: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """The risk policy the plan's OWN frozen version declared, or ``None``.
+
+        Resolution walks only PERSISTED authority - the plan's proposal, the
+        hosted job that produced it and the immutable version that job pinned -
+        so a plan is never judged against a policy the strategy adopted later.
+        An unreadable chain (an external run with no hosted job, or a store that
+        cannot answer) is treated as "no declaration"; the options lane then
+        refuses by name, which is the fail-closed reading.
+        """
+        plan_id = str(plan.get("plan_id") or "")
+        if not plan_id:
+            return None
+        from sqlalchemy import or_
+
+        from backend.strategies.attribution_models import StrategyPlan, StrategyProposal
+        from backend.strategies.models import HostedStrategyVersion, StrategyJob
+
+        try:
+            with self.session_factory() as session:
+                row = session.execute(
+                    select(HostedStrategyVersion.risk_policy)
+                    .join(
+                        StrategyJob,
+                        StrategyJob.version_id == HostedStrategyVersion.id,
+                    )
+                    .join(
+                        StrategyProposal,
+                        or_(
+                            StrategyProposal.job_id == StrategyJob.id,
+                            StrategyProposal.strategy_run_id == StrategyJob.run_id,
+                        ),
+                    )
+                    .join(
+                        StrategyPlan,
+                        StrategyPlan.proposal_id == StrategyProposal.proposal_id,
+                    )
+                    .where(StrategyPlan.plan_id == plan_id)
+                    .order_by(StrategyJob.created_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+        except SQLAlchemyError:
+            return None
+        return dict(row) if isinstance(row, Mapping) else None
+
+    def _risk_policy_gate(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        policy: Optional[Mapping[str, Any]],
+        exposure: Mapping[str, Any],
+        notional: Mapping[str, Any],
+        detail: Dict[str, Any],
+        margin_evidence: Optional[Mapping[str, Any]],
+    ) -> Optional[AdmissionVerdict]:
+        """Enforce the effective per-strategy risk policy (B2.5).
+
+        The options lane (an ENTRY, or an ADJUST that increases exposure) is
+        gated on the whole policy; every other lane is only tightened by the
+        notional limit, which composes with the existing allocation/gross checks
+        rather than replacing them. EXITS and risk-REDUCING adjustments are never
+        blocked: closing risk is not a decision this policy gets to refuse.
+        """
+        from backend.options.execution.plan_binding import (
+            is_option_adjust_plan,
+            is_option_entry_plan,
+        )
+        from backend.strategies.risk_policy import (
+            classify_structure_family,
+            effective_risk_policy,
+            frozen_protection_stop,
+            operator_risk_policy,
+            platform_risk_ceiling,
+            unhedged_target,
+            worst_case_loss_inr,
+        )
+
+        is_adjust = is_option_adjust_plan(plan)
+        is_option = is_adjust or is_option_entry_plan(plan)
+        if is_adjust:
+            if not any(row.get("increases_exposure") for row in exposure["per_instrument"]):
+                detail["risk_policy_applies"] = False
+                detail["risk_policy_reason"] = "risk_reducing_adjust"
+                return None
+
+        declared = self.declared_risk_policy(plan)
+        ceiling = platform_risk_ceiling()
+        operator = operator_risk_policy(policy) if is_option else {}
+        if not is_option and declared is None and not ceiling:
+            return None
+
+        resolved = dict(plan.get("resolved_plan") or {})
+        legs = [
+            dict(leg)
+            for leg in (resolved.get("legs") or [])
+            if isinstance(leg, Mapping)
+        ]
+        if is_option and declared is None:
+            return AdmissionVerdict(
+                False,
+                "STRATEGY_RISK_POLICY_MISSING",
+                {
+                    **detail,
+                    "plan_id": str(plan.get("plan_id") or ""),
+                    "message": (
+                        "this strategy version declares no risk policy, so it may "
+                        "not enter options exposure"
+                    ),
+                },
+            )
+
+        effective = effective_risk_policy(declared, operator, ceiling)
+        detail["risk_policy_applies"] = True
+        detail["risk_policy"] = {"declared": declared, "effective": effective}
+
+        notional_limit = effective.get("notional_limit_inr")
+        if notional_limit is not None:
+            target_notional, peak_notional, peak_unknown = self._risk_notionals(
+                exposure=exposure, notional=notional
+            )
+            enforced_notional = (
+                target_notional
+                if peak_notional is None
+                else max(target_notional, peak_notional)
+            )
+            detail.update(
+                {
+                    "strategy_notional_limit_inr": notional_limit,
+                    "strategy_target_notional_inr": target_notional,
+                    "strategy_roll_peak_notional_inr": peak_notional,
+                    "strategy_roll_peak_unavailable": peak_unknown,
+                    "strategy_enforced_notional_inr": enforced_notional,
+                }
+            )
+
+        if not is_option:
+            if notional_limit is not None:
+                if notional["reference_price_missing"] or notional["capital_basis_missing"]:
+                    return AdmissionVerdict(
+                        False,
+                        "REFERENCE_PRICE_UNAVAILABLE",
+                        {
+                            **detail,
+                            "missing_for": notional["reference_price_missing"],
+                            "capital_basis_missing_for": notional["capital_basis_missing"],
+                            "message": (
+                                "a strategy notional limit is declared but the plan "
+                                "carries no reference price (or no frozen capital basis)"
+                            ),
+                        },
+                    )
+                if detail["strategy_enforced_notional_inr"] > float(notional_limit):
+                    return AdmissionVerdict(
+                        False, "STRATEGY_NOTIONAL_LIMIT_EXCEEDED", detail
+                    )
+            return None
+
+        family = classify_structure_family(legs)
+        detail["structure_family"] = family
+        allowed_families = effective.get("allowed_structure_families")
+        if allowed_families is not None and family not in set(allowed_families):
+            return AdmissionVerdict(
+                False,
+                "OPTION_STRUCTURE_FAMILY_NOT_ALLOWED",
+                {**detail, "allowed_structure_families": list(allowed_families)},
+            )
+
+        allowed_expiry = effective.get("expiry_policy")
+        frozen_expiry_policy = str(resolved.get("expiry_policy") or "")
+        if allowed_expiry is not None and frozen_expiry_policy:
+            detail["expiry_policy"] = frozen_expiry_policy
+            if frozen_expiry_policy not in set(allowed_expiry):
+                return AdmissionVerdict(
+                    False,
+                    "OPTION_STRUCTURE_FAMILY_NOT_ALLOWED",
+                    {
+                        **detail,
+                        "allowed_expiry_policies": list(allowed_expiry),
+                        "message": (
+                            "the frozen expiry policy is not one this version permits"
+                        ),
+                    },
+                )
+
+        protection_policy = resolved.get("protection_policy")
+        frozen_naked = bool(
+            isinstance(protection_policy, Mapping)
+            and protection_policy.get("naked")
+        )
+        unhedged = unhedged_target(plan)
+        detail["naked_permitted"] = bool(effective.get("naked_permitted"))
+        if unhedged is not None and not (
+            bool(effective.get("naked_permitted")) and frozen_naked
+        ):
+            return AdmissionVerdict(
+                False,
+                "OPTION_NAKED_NOT_PERMITTED",
+                {
+                    **detail,
+                    "frozen_naked": frozen_naked,
+                    "message": (
+                        "the target leaves a short leg uncovered; a version admits "
+                        "that only when its policy permits naked exposure AND the "
+                        "frozen structure declares it"
+                    ),
+                    **unhedged,
+                },
+            )
+
+        worst_loss = worst_case_loss_inr(legs)
+        frozen_max_loss = self._frozen_max_loss(resolved)
+        loss_ceiling = _min_optional(effective.get("max_loss_inr"), frozen_max_loss)
+        detail.update(
+            {
+                "worst_case_loss_inr": worst_loss,
+                "frozen_max_loss_inr": frozen_max_loss,
+                "effective_max_loss_inr": loss_ceiling,
+            }
+        )
+        if worst_loss is None:
+            # A permitted naked structure has no numeric bound to check, so it
+            # must be stoppable instead: the declaration must require a stop and
+            # the frozen structure must actually carry one.
+            protection = dict(effective.get("protection") or {})
+            if not (
+                protection.get("stop_required")
+                and frozen_protection_stop(protection_policy)
+            ):
+                return AdmissionVerdict(
+                    False,
+                    "OPTION_NAKED_NOT_PERMITTED",
+                    {
+                        **detail,
+                        "reason": "unbounded_loss_requires_protection_stop",
+                        "message": (
+                            "an unbounded structure is only admitted when the policy "
+                            "requires a protective stop and the frozen structure "
+                            "declares one"
+                        ),
+                    },
+                )
+        elif loss_ceiling is not None and worst_loss > float(loss_ceiling):
+            return AdmissionVerdict(
+                False,
+                "OPTION_MAX_LOSS_EXCEEDED",
+                {**detail, "max_loss_inr": loss_ceiling},
+            )
+
+        if notional_limit is not None:
+            if (
+                notional["reference_price_missing"]
+                or exposure["unvalued"]
+                or peak_unknown
+            ):
+                return AdmissionVerdict(
+                    False,
+                    "REFERENCE_PRICE_UNAVAILABLE",
+                    {
+                        **detail,
+                        "missing_for": notional["reference_price_missing"],
+                        "unvalued": exposure["unvalued"],
+                        "reason": (
+                            "held_book_unpriceable" if peak_unknown else None
+                        ),
+                        "message": (
+                            "a strategy notional limit is declared but the frozen "
+                            "target or the held book carries no usable price; an "
+                            "adjust's overlap cannot be bounded against the "
+                            "post-plan book, so the limit refuses instead"
+                        ),
+                    },
+                )
+            if detail["strategy_enforced_notional_inr"] > float(notional_limit):
+                return AdmissionVerdict(False, "STRATEGY_NOTIONAL_LIMIT_EXCEEDED", detail)
+
+        margin_limit = effective.get("margin_limit_inr")
+        if margin_limit is not None:
+            required_margin = None
+            if isinstance(margin_evidence, Mapping):
+                required_margin = _as_float(margin_evidence.get("required_margin_inr"))
+            if required_margin is None:
+                # No margin source is invented here: without evidence the limit
+                # is honestly reported as unchecked rather than read as zero.
+                detail["margin_check"] = "unavailable"
+            else:
+                detail.update(
+                    {
+                        "margin_check": "enforced",
+                        "margin_required_inr": required_margin,
+                        "margin_limit_inr": float(margin_limit),
+                    }
+                )
+                if required_margin > float(margin_limit):
+                    return AdmissionVerdict(
+                        False,
+                        "MARGIN_INSUFFICIENT",
+                        {**detail, "reason": "strategy_margin_limit"},
+                    )
+        return None
+
+    @staticmethod
+    def _risk_notionals(
+        *, exposure: Mapping[str, Any], notional: Mapping[str, Any]
+    ) -> Tuple[float, Optional[float], bool]:
+        """The frozen target's notional, the roll's overlap PEAK, and whether that
+        peak is UNKNOWN because a held coordinate the plan does not price cannot
+        be valued.
+
+        The peak is what the strategy actually holds during the plan: the current
+        book plus the legs the target OPENS on coordinates the book does not
+        already carry. It is deliberately not the post-plan book, which has
+        already released the old generation - checking against that would let a
+        roll's overlap window through unseen.
+
+        The released generation carries no price of its own (the plan that closes
+        it never names it), so the peak is reported as unknown rather than
+        quietly valued at zero. The caller refuses a configured limit on unknown
+        evidence; it never reads "unpriceable" as "nothing".
+        """
+        target_notional = float(notional["total_notional_inr"] or 0.0)
+        held = exposure["current_exposure_inr"]
+        opens_new = any(
+            row.get("increases_exposure") and int(row.get("current_quantity") or 0) == 0
+            for row in exposure["per_instrument"]
+        )
+        if held is None:
+            return target_notional, None, opens_new
+        opening = 0.0
+        for row in exposure["per_instrument"]:
+            if not row.get("increases_exposure"):
+                continue
+            if int(row.get("current_quantity") or 0) != 0:
+                continue
+            if row.get("notional_inr") is None:
+                return target_notional, None, True
+            opening += float(row["notional_inr"])
+        return target_notional, float(held) + opening, False
+
+    @staticmethod
+    def _frozen_max_loss(resolved: Mapping[str, Any]) -> Optional[float]:
+        """The strategy-supplied ``max_loss`` the frozen plan carries, if any."""
+        block = resolved.get("max_loss")
+        if not isinstance(block, Mapping):
+            return None
+        return _as_float(block.get("max_loss_inr"))
+
     # -- the verdict --------------------------------------------------------
 
     def evaluate(
@@ -654,6 +1013,20 @@ class AdmissionService:
                         "realized_loss_inr": float(realized_loss_inr),
                     },
                 )
+
+        # The strategy's OWN declared risk policy (B2.5), resolved from the
+        # immutable version the plan was produced under and enforced here so
+        # request creation, approval and paper/live admission all see one answer.
+        risk_refusal = self._risk_policy_gate(
+            plan,
+            policy=policy,
+            exposure=exposure,
+            notional=notional,
+            detail=detail,
+            margin_evidence=margin_evidence,
+        )
+        if risk_refusal is not None:
+            return risk_refusal
 
         state = dict(catalog_state or {})
         if not state:

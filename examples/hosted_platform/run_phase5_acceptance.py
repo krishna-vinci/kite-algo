@@ -837,6 +837,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
     "options_adjustment": {
         "source": "options_index_setup_adjustment.py",
         "schema": "options_index_setup.schema.json",
+        # The example trades ONE covered vertical (a bull call spread); the
+        # version declares it, and declines naked exposure.
+        "risk_policy": {
+            "allowed_structure_families": ["vertical_spread"],
+            "naked_permitted": False,
+        },
         "autonomous": False,
         "expects_manual": True,
         # The entry runs, then the SAME strategy discovers its option run from
@@ -880,6 +886,10 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         # REFUSED a second entry for it, submits no duplicate, and closes it.
         "source": "options_index_setup_adjustment.py",
         "schema": "options_index_setup.schema.json",
+        "risk_policy": {
+            "allowed_structure_families": ["vertical_spread"],
+            "naked_permitted": False,
+        },
         "options_recurring": True,
         "autonomous": False,
         "expects_manual": True,
@@ -913,6 +923,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         # asserts is read from the platform's own rows.
         "source": "options_dynamic_straddle.py",
         "schema": "options_dynamic_straddle.schema.json",
+        # The example trades ONE covered shape: a short straddle whose wings are
+        # long, which the classifier names ``iron_butterfly``. It is never naked.
+        "risk_policy": {
+            "allowed_structure_families": ["iron_butterfly"],
+            "naked_permitted": False,
+        },
         "option_dynamic": True,
         "autonomous": False,
         "expects_manual": True,
@@ -1246,6 +1262,8 @@ def run_scenario(
             "source": source,
             "parameters_schema": schema,
             "capabilities": {"trade": True, "data": True},
+            # The version's OWN risk policy (B2.5); the options specs declare one.
+            "risk_policy": spec.get("risk_policy"),
         },
     )
     version_id = str(version["version_id"])
@@ -1529,6 +1547,8 @@ def run_momentum_scenario(
             "source": source,
             "parameters_schema": schema,
             "capabilities": {"trade": True, "data": True},
+            # The version's OWN risk policy (B2.5); the options specs declare one.
+            "risk_policy": spec.get("risk_policy"),
         },
     )
     version_id = str(version["version_id"])
@@ -1958,6 +1978,8 @@ def run_momentum_recurring_scenario(
             "source": source,
             "parameters_schema": schema,
             "capabilities": {"trade": True, "data": True},
+            # The version's OWN risk policy (B2.5); the options specs declare one.
+            "risk_policy": spec.get("risk_policy"),
         },
     )
     version_id = str(version["version_id"])
@@ -2401,6 +2423,8 @@ def run_options_recurring_scenario(
             "source": source,
             "parameters_schema": schema,
             "capabilities": {"trade": True, "data": True},
+            # The version's OWN risk policy (B2.5); the options specs declare one.
+            "risk_policy": spec.get("risk_policy"),
         },
     )
     version_id = str(version["version_id"])
@@ -2880,6 +2904,8 @@ def run_options_dynamic_scenario(
             "source": source,
             "parameters_schema": schema,
             "capabilities": {"trade": True, "data": True},
+            # The version's OWN risk policy (B2.5); the options specs declare one.
+            "risk_policy": spec.get("risk_policy"),
         },
     )
     version_id = str(version["version_id"])

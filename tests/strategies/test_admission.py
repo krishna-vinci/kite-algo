@@ -10,6 +10,7 @@ SQLite runs with the established ``public.`` ATTACH fixture.
 
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -82,6 +83,11 @@ class AdmissionTestCase(unittest.TestCase):
             StrategyReservation,
             StrategyReservationEvent,
         )
+        from backend.strategies.models import (
+            HostedStrategy,
+            HostedStrategyVersion,
+            StrategyJob,
+        )
 
         _Base.metadata.create_all(
             self.engine,
@@ -96,6 +102,11 @@ class AdmissionTestCase(unittest.TestCase):
                 AccountReconciliationVersion.__table__,
                 StrategyPositionProjection.__table__,
                 StrategyProjectionState.__table__,
+                # The per-version risk policy (B2.5) resolves from the plan's own
+                # frozen version: plan -> proposal -> job -> version.
+                HostedStrategy.__table__,
+                HostedStrategyVersion.__table__,
+                StrategyJob.__table__,
             ],
         )
         self.factory = sessionmaker(bind=self.engine)
@@ -130,6 +141,18 @@ class AdmissionTestCase(unittest.TestCase):
                 text(
                     "INSERT INTO strategies (id, owner_id, name, account_scope, status) "
                     "VALUES ('stg-A', 'app:o', 'A', 'kite:A', 'active')"
+                )
+            )
+            # The hosted strategy the versions (and the risk-policy chain) hang
+            # off. Its id IS the canonical strategy id, as the store binds them.
+            session.execute(
+                text(
+                    "INSERT INTO hosted_strategies "
+                    "(id, owner_id, name, template_id, default_execution_mode, "
+                    " default_job_kind, default_account_scope, max_duration_s, "
+                    " progress_deadline_s, stale_exit_policy, status) "
+                    "VALUES ('stg-A', 'app:o', 'A', 'hosted:stg-A', 'paper', 'finite', "
+                    " 'kite:A', 3600, 900, 'none', 'active')"
                 )
             )
             session.commit()
@@ -209,6 +232,22 @@ class AdmissionTestCase(unittest.TestCase):
             )
             session.commit()
 
+    def book_option_leg(self, canonical_id, quantity):
+        """Seed this strategy's attributed book with one held OPTION leg."""
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT INTO strategy_position_projection "
+                    "(account_id, strategy_id, execution_environment, identity_kind, identity_key, "
+                    " canonical_instrument_id, product, instrument_token, exchange, tradingsymbol, "
+                    " net_quantity, projection_version) "
+                    "VALUES ('kite:A', 'stg-A', 'live', 'canonical', :key, :key, 'NRML', 700, "
+                    " 'NFO', 'NIFTY26OCT22500CE', :qty, 1)"
+                ),
+                {"key": canonical_id, "qty": int(quantity)},
+            )
+            session.commit()
+
     def publish_state(self, *, at=None, environment="live"):
         """Publish this book (the normal publication marker) at a given instant."""
         moment = at or NOW
@@ -254,6 +293,74 @@ class AdmissionTestCase(unittest.TestCase):
     def reserve(self, notional, *, status="active", strategy_id="stg-A", plan_id="plan-old"):
         self.seed_plan_row(plan_id, strategy_id=strategy_id)
         return self._reserve(notional, status=status, strategy_id=strategy_id, plan_id=plan_id)
+
+    # -- per-version risk policy fixtures (B2.5) ----------------------------
+
+    def declare_risk_policy(self, risk_policy, *, plan_id="plan-1", strategy_id="stg-A"):
+        """Freeze a risk policy on the version the plan was produced under.
+
+        The chain admission resolves is plan -> proposal -> job -> version, so a
+        test that wants a DECLARED policy must seed the same chain the platform
+        writes: an immutable version, the job that pinned it, and the proposal
+        that job submitted the plan through.
+        """
+        version_id = f"ver-{strategy_id}"
+        job_id = f"job-{strategy_id}"
+        with self.factory() as session:
+            session.execute(
+                text(
+                    "INSERT OR IGNORE INTO hosted_strategy_versions "
+                    "(id, strategy_id, version, source, source_sha256, "
+                    " parameters_schema, capabilities_snapshot, risk_policy, created_by) "
+                    "VALUES (:vid, :sid, 1, 'print(1)', 'sha', '{}', '{}', "
+                    " :policy, 'app:o')"
+                ),
+                {
+                    "vid": version_id,
+                    "sid": strategy_id,
+                    "policy": (
+                        None if risk_policy is None else json.dumps(risk_policy)
+                    ),
+                },
+            )
+            session.execute(
+                text(
+                    "INSERT OR REPLACE INTO strategy_jobs "
+                    "(id, strategy_id, version_id, owner_id, account_scope, job_kind, "
+                    " execution_mode, desired_state, run_id, attempt, lease_epoch, status, "
+                    " params_snapshot, capabilities_snapshot, policy_snapshot, identity_json, "
+                    " max_duration_s, progress_deadline_s, logs_discarded) "
+                    "VALUES (:jid, :sid, :vid, 'app:o', 'kite:A', 'finite', 'paper', "
+                    " 'started', 'run-1', 1, 0, 'running', '{}', '{}', '{}', '{}', 3600, 900, 0)"
+                ),
+                {"jid": job_id, "sid": strategy_id, "vid": version_id},
+            )
+            session.execute(
+                text(
+                    "INSERT OR REPLACE INTO strategy_proposals "
+                    "(proposal_id, strategy_id, account_id, evaluation_id, evaluation_kind, "
+                    " job_id, strategy_run_id, target_kind, payload, payload_sha256, status) "
+                    "VALUES (:pid, :sid, 'kite:A', :pid, 'run_now', :jid, 'run-1', "
+                    " 'option_structure', '{}', 'sha', 'validated')"
+                ),
+                {"pid": f"prop-{plan_id}", "sid": strategy_id, "jid": job_id},
+            )
+            session.execute(
+                text(
+                    "INSERT OR REPLACE INTO strategy_plans "
+                    "(plan_id, proposal_id, strategy_id, account_id, plan_kind, plan_hash, "
+                    " logical_plan, resolved_plan, pinned_catalog_generation) "
+                    "VALUES (:pid, :prop, :sid, 'kite:A', 'option_structure', 'h', '{}', "
+                    " '{}', :gen)"
+                ),
+                {
+                    "pid": plan_id,
+                    "prop": f"prop-{plan_id}",
+                    "sid": strategy_id,
+                    "gen": G1,
+                },
+            )
+            session.commit()
 
     def _reserve(self, notional, *, status, strategy_id, plan_id, consumed_at=None):
         self.seed_plan_row(plan_id, strategy_id=strategy_id)
@@ -761,21 +868,6 @@ class OptionalAxisTests(AdmissionTestCase):
             },
         )
 
-    def _book_option_leg(self, canonical_id, quantity):
-        with self.factory() as session:
-            session.execute(
-                text(
-                    "INSERT INTO strategy_position_projection "
-                    "(account_id, strategy_id, execution_environment, identity_kind, identity_key, "
-                    " canonical_instrument_id, product, instrument_token, exchange, tradingsymbol, "
-                    " net_quantity, projection_version) "
-                    "VALUES ('kite:A', 'stg-A', 'live', 'canonical', :key, :key, 'NRML', 700, "
-                    " 'NFO', 'NIFTY26OCT22500CE', :qty, 1)"
-                ),
-                {"key": canonical_id, "qty": int(quantity)},
-            )
-            session.commit()
-
     def test_an_option_adjust_releases_the_legs_its_target_does_not_name(self):
         """A roll's OLD generation is released, not 'held unchanged'.
 
@@ -784,7 +876,7 @@ class OptionalAxisTests(AdmissionTestCase):
         in the plan that closes them.
         """
         self.policy(allocation_inr=100000.0)
-        self._book_option_leg("inst-OLD", -50)
+        self.book_option_leg("inst-OLD", -50)
         self.publish_state()
         plan = self._option_adjust_plan()
 
@@ -807,7 +899,7 @@ class OptionalAxisTests(AdmissionTestCase):
         """The release rule zeroes only the coordinates the target OMITS: a
         coordinate the desired state names is still the resize the plan describes."""
         self.policy(allocation_inr=100000.0)
-        self._book_option_leg("inst-OLD", -50)
+        self.book_option_leg("inst-OLD", -50)
         self.publish_state()
         plan = self._option_adjust_plan()
         plan["resolved_plan"]["legs"][0]["instrument_id"] = "inst-OLD"
@@ -986,6 +1078,342 @@ class OrderingTests(AdmissionTestCase):
         first = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
         second = self.service.evaluate(self.plan(), now=NOW, margin_evidence=self.margin())
         self.assertEqual(first.as_dict(), second.as_dict())
+
+
+class StrategyRiskPolicyTests(AdmissionTestCase):
+    """B2.5: the version's declared risk policy, enforced at admission.
+
+    One refusal and one admit twin per gate. The declaration is resolved from the
+    plan's OWN frozen version (plan -> proposal -> job -> version), so a declared
+    policy is seeded through :meth:`declare_risk_policy` exactly as the platform
+    writes it.
+    """
+
+    def _option_leg(
+        self,
+        *,
+        side,
+        option_type,
+        strike,
+        quantity=75,
+        price,
+        instrument_id,
+    ):
+        return {
+            "instrument_id": instrument_id,
+            "tradingsymbol": f"NIFTY26OCT{int(strike)}{option_type}",
+            "broker_symbol": f"NIFTY26OCT{int(strike)}{option_type}",
+            "broker_exchange": "NFO",
+            "exchange": "NFO",
+            "product": "NRML",
+            "instrument_type": option_type,
+            "option_type": option_type,
+            "strike": float(strike),
+            "expiry": "2026-10-29",
+            "lot_size": 75,
+            "ratio": 1,
+            "side": side,
+            "quantity": int(quantity),
+            "signed_quantity": int(quantity) if side == "BUY" else -int(quantity),
+            "reference_price": float(price),
+        }
+
+    def _vertical(self, *, unit=75):
+        """A covered bear call spread: short 25000 CE, long 26000 CE."""
+        return [
+            self._option_leg(
+                side="SELL", option_type="CE", strike=25000, quantity=unit,
+                price=100.0, instrument_id="opt-short-25000CE",
+            ),
+            self._option_leg(
+                side="BUY", option_type="CE", strike=26000, quantity=unit,
+                price=80.0, instrument_id="opt-long-26000CE",
+            ),
+        ]
+
+    def _option_plan(
+        self,
+        legs,
+        *,
+        phase="entry",
+        option_run_id=None,
+        generation=None,
+        protection_policy=None,
+        frozen_max_loss=None,
+        plan_id="plan-1",
+    ):
+        option_run = {"phase": phase, "option_run_id": option_run_id}
+        if generation is not None:
+            option_run["based_on_generation"] = int(generation)
+        resolved = {
+            "target_kind": "option_structure",
+            "product": "NRML",
+            "expiry": "2026-10-29",
+            "expiry_policy": "exit_before_cutoff",
+            "legs": legs,
+            "option_run": option_run,
+        }
+        if protection_policy is not None:
+            resolved["protection_policy"] = protection_policy
+        if frozen_max_loss is not None:
+            resolved["max_loss"] = {
+                "basis": "worst_case_at_expiry",
+                "max_loss_inr": float(frozen_max_loss),
+            }
+        return self.plan(plan_kind="option_structure", resolved_plan=resolved, plan_id=plan_id)
+
+    def _admitted(self, plan, **kwargs):
+        verdict = self.service.evaluate(
+            plan, now=NOW, margin_evidence=self.margin(usable=1000000.0), **kwargs
+        )
+        self.assertTrue(verdict.admitted, verdict.detail)
+        return verdict
+
+    def _refused(self, plan, reason, **kwargs):
+        verdict = self.service.evaluate(
+            plan, now=NOW, margin_evidence=self.margin(usable=1000000.0), **kwargs
+        )
+        self.assertFalse(verdict.admitted, verdict.detail)
+        self.assertEqual(verdict.refusal_reason, reason)
+        return verdict
+
+    # -- the policy must exist ---------------------------------------------
+
+    def test_an_options_entry_without_a_declared_policy_is_refused(self):
+        self.policy(allocation_inr=1000000.0)
+        self._refused(self._option_plan(self._vertical()), "STRATEGY_RISK_POLICY_MISSING")
+
+    def test_an_options_entry_with_a_declared_policy_is_admitted(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy({"allowed_structure_families": ["vertical_spread"]})
+        verdict = self._admitted(self._option_plan(self._vertical()))
+        self.assertEqual(verdict.detail["structure_family"], "vertical_spread")
+
+    # -- structure family ---------------------------------------------------
+
+    def test_a_structure_family_the_version_does_not_allow_is_refused(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy({"allowed_structure_families": ["straddle"]})
+        verdict = self._refused(
+            self._option_plan(self._vertical()), "OPTION_STRUCTURE_FAMILY_NOT_ALLOWED"
+        )
+        self.assertEqual(verdict.detail["structure_family"], "vertical_spread")
+
+    def test_an_allowed_structure_family_is_admitted(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {"allowed_structure_families": ["vertical_spread", "custom"]}
+        )
+        self._admitted(self._option_plan(self._vertical()))
+
+    # -- naked exposure -----------------------------------------------------
+
+    def _short_call(self, *, instrument_id="opt-naked-25000CE"):
+        return [
+            self._option_leg(
+                side="SELL", option_type="CE", strike=25000, quantity=75,
+                price=100.0, instrument_id=instrument_id,
+            )
+        ]
+
+    def test_a_naked_target_is_refused_without_the_permission_and_the_declaration(self):
+        self.policy(allocation_inr=1000000.0)
+        # The version permits naked structures, but the frozen structure does not
+        # declare itself naked: BOTH are required.
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["short_single"],
+                "naked_permitted": True,
+            }
+        )
+        self._refused(
+            self._option_plan(self._short_call()), "OPTION_NAKED_NOT_PERMITTED"
+        )
+
+    def test_a_declared_naked_structure_is_refused_without_the_version_permission(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["short_single"],
+                "naked_permitted": False,
+            }
+        )
+        self._refused(
+            self._option_plan(
+                self._short_call(), protection_policy={"naked": True, "stop_loss_pct": 25}
+            ),
+            "OPTION_NAKED_NOT_PERMITTED",
+        )
+
+    def test_a_permitted_naked_target_needs_a_required_frozen_stop(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["short_single"],
+                "naked_permitted": True,
+            }
+        )
+        # Permission + a naked declaration, but no stop is required: an unbounded
+        # loss is never admitted without a stoppable protective rule.
+        self._refused(
+            self._option_plan(
+                self._short_call(), protection_policy={"naked": True, "stop_loss_pct": 25}
+            ),
+            "OPTION_NAKED_NOT_PERMITTED",
+        )
+
+    def test_a_permitted_naked_target_with_a_required_stop_is_admitted(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["short_single"],
+                "naked_permitted": True,
+                "protection": {"stop_required": True},
+            }
+        )
+        verdict = self._admitted(
+            self._option_plan(
+                self._short_call(),
+                protection_policy={"naked": True, "stop_loss_pct": 25},
+            )
+        )
+        # Unbounded: there is no numeric bound to check.
+        self.assertIsNone(verdict.detail["worst_case_loss_inr"])
+
+    # -- max loss -----------------------------------------------------------
+
+    def test_a_worst_case_over_the_declared_max_loss_is_refused(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["vertical_spread"],
+                "max_loss_inr": 50000.0,
+            }
+        )
+        verdict = self._refused(
+            self._option_plan(self._vertical()), "OPTION_MAX_LOSS_EXCEEDED"
+        )
+        self.assertEqual(verdict.detail["worst_case_loss_inr"], 75000.0)
+
+    def test_a_worst_case_within_the_declared_max_loss_is_admitted(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["vertical_spread"],
+                "max_loss_inr": 100000.0,
+            }
+        )
+        self._admitted(self._option_plan(self._vertical()))
+
+    def test_the_frozen_plan_max_loss_may_only_tighten_further(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["vertical_spread"],
+                "max_loss_inr": 100000.0,
+            }
+        )
+        self._refused(
+            self._option_plan(self._vertical(), frozen_max_loss=50000.0),
+            "OPTION_MAX_LOSS_EXCEEDED",
+        )
+
+    # -- notional, including the roll's overlap peak ------------------------
+
+    def test_a_target_notional_over_the_declared_limit_is_refused(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["vertical_spread"],
+                "notional_limit_inr": 10000.0,
+            }
+        )
+        verdict = self._refused(
+            self._option_plan(self._vertical()), "STRATEGY_NOTIONAL_LIMIT_EXCEEDED"
+        )
+        self.assertEqual(verdict.detail["strategy_target_notional_inr"], 13500.0)
+
+    def test_a_target_notional_within_the_declared_limit_is_admitted(self):
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["vertical_spread"],
+                "notional_limit_inr": 20000.0,
+            }
+        )
+        self._admitted(self._option_plan(self._vertical()))
+
+    def test_a_roll_overlap_is_never_checked_against_the_post_plan_book(self):
+        """A roll holds BOTH generations; the post-plan book holds only one.
+
+        The released generation carries no price of its own (the plan that closes
+        it never names it), so the overlap peak is UNKNOWN rather than the
+        post-plan book. A declared notional limit therefore refuses on unknown
+        evidence instead of silently bounding the wrong number.
+        """
+        self.policy(allocation_inr=1000000.0)
+        self.declare_risk_policy(
+            {
+                "allowed_structure_families": ["vertical_spread"],
+                "notional_limit_inr": 25000.0,
+            }
+        )
+        self.book_option_leg("inst-OLD-25000CE", -75)
+        self.publish_state()
+        # A roll: the same shape on a NEW expiry is a different coordinate set,
+        # so the plan releases the old generation and opens the new one.
+        rolled = [
+            self._option_leg(
+                side="SELL", option_type="CE", strike=25000, quantity=75,
+                price=100.0, instrument_id="opt-NOV-25000CE",
+            ),
+            self._option_leg(
+                side="BUY", option_type="CE", strike=26000, quantity=75,
+                price=80.0, instrument_id="opt-NOV-26000CE",
+            ),
+        ]
+        plan = self._option_plan(
+            rolled, phase="adjust", option_run_id="run-opt", generation=1
+        )
+        verdict = self._refused(plan, "REFERENCE_PRICE_UNAVAILABLE")
+        self.assertTrue(verdict.detail["strategy_roll_peak_unavailable"])
+        self.assertIsNone(verdict.detail["strategy_roll_peak_notional_inr"])
+
+    # -- risk reduction is never blocked ------------------------------------
+
+    def test_an_exit_is_never_blocked_by_the_risk_policy(self):
+        """Closing an uncovered structure is a REDUCTION: no policy can refuse it."""
+        self.policy(allocation_inr=1000000.0)
+        # Deliberately no declared policy at all: even STRATEGY_RISK_POLICY_MISSING
+        # must not fire for work that removes exposure.
+        closing = [
+            self._option_leg(
+                side="BUY", option_type="CE", strike=25000, quantity=75,
+                price=100.0, instrument_id="opt-naked-25000CE",
+            )
+        ]
+        verdict = self._admitted(
+            self._option_plan(closing, phase="exit", option_run_id="run-opt")
+        )
+        self.assertNotIn("risk_policy_applies", verdict.detail)
+
+    def test_a_risk_reducing_adjust_is_never_blocked_by_the_risk_policy(self):
+        self.policy(allocation_inr=1000000.0)
+        self.book_option_leg("opt-short-25000CE", -150)
+        self.book_option_leg("opt-long-26000CE", 150)
+        self.publish_state()
+        # Both held coordinates shrink: a pure reduction, so no policy applies.
+        plan = self._option_plan(
+            self._vertical(unit=75),
+            phase="adjust",
+            option_run_id="run-opt",
+            generation=1,
+        )
+        verdict = self.service.evaluate(
+            plan, now=NOW, margin_evidence=self.margin(usable=1000000.0)
+        )
+        self.assertTrue(verdict.admitted, verdict.detail)
+        self.assertFalse(verdict.detail.get("risk_policy_applies", True))
 
 
 if __name__ == "__main__":

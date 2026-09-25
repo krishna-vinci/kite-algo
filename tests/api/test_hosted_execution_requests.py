@@ -343,12 +343,15 @@ def _option_legs():
             "broker_exchange": "NFO",
             "exchange": "NFO",
             "product": "NRML",
+            "instrument_type": "CE",
+            "option_type": "CE",
             "side": "SELL",
             "ratio": 1,
             "quantity": 75,
             "signed_quantity": -75,
             "reference_price": 100.0,
             "lot_size": 75,
+            "strike": 25000.0,
         },
         {
             "instrument_id": "opt-bought-26000",
@@ -357,12 +360,15 @@ def _option_legs():
             "broker_exchange": "NFO",
             "exchange": "NFO",
             "product": "NRML",
+            "instrument_type": "CE",
+            "option_type": "CE",
             "side": "BUY",
             "ratio": 1,
             "quantity": 75,
             "signed_quantity": 75,
             "reference_price": 80.0,
             "lot_size": 75,
+            "strike": 26000.0,
         },
     ]
 
@@ -609,6 +615,12 @@ def world():
         source_sha256="a" * 64,
         parameters_schema={"type": "object"},
         capabilities_snapshot={"schema_version": 1},
+        # A declared per-version risk policy (B2.5): the frozen structure this
+        # world trades is a vertical spread, and the policy admits one.
+        risk_policy={
+            "allowed_structure_families": ["vertical_spread"],
+            "naked_permitted": False,
+        },
         created_by=OWNER,
     )
     version2 = repo.create_version(
@@ -617,6 +629,10 @@ def world():
         source_sha256="b" * 64,
         parameters_schema={"type": "object"},
         capabilities_snapshot={"schema_version": 1},
+        risk_policy={
+            "allowed_structure_families": ["vertical_spread"],
+            "naked_permitted": False,
+        },
         created_by=OWNER,
     )
     job = _make_job(repo, strategy=strategy, version=version)

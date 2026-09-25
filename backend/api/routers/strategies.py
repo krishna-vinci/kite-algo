@@ -312,6 +312,7 @@ def _version_out(row: Any) -> VersionResponse:
         source_sha256=row.source_sha256,
         parameters_schema=dict(row.parameters_schema or {}),
         capabilities_snapshot=dict(row.capabilities_snapshot or {}),
+        risk_policy=None if row.risk_policy is None else dict(row.risk_policy),
         created_by=row.created_by,
         created_at=_iso(row.created_at),
     )
@@ -2697,6 +2698,7 @@ async def create_version(
         source, digest = service.validate_source(payload.source)
         schema = service.validate_parameters_schema(payload.parameters_schema)
         capabilities = service.validate_capabilities(payload.capabilities)
+        risk_policy = service.validate_risk_policy(payload.risk_policy)
     except service.StrategyValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
@@ -2706,6 +2708,7 @@ async def create_version(
             source_sha256=digest,
             parameters_schema=schema,
             capabilities_snapshot=capabilities,
+            risk_policy=risk_policy,
             created_by=owner,
         )
     except StrategyConflict as exc:

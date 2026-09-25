@@ -355,6 +355,64 @@ async def test_version_rejects_unknown_or_non_boolean_capabilities(session_facto
         ).status_code == 422
 
 
+# ---------------------------------------------------------------------------
+# per-version risk policy (B2.5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_version_declares_and_returns_a_risk_policy(session_factory, monkeypatch):
+    async with _client(session_factory, monkeypatch) as client:
+        created = await _create(client)
+        sid = created["strategy_id"]
+        response = await client.post(
+            f"{BASE}/{sid}/versions",
+            json={
+                "source": "x",
+                "risk_policy": {
+                    "max_loss_inr": 25000,
+                    "notional_limit_inr": 500000,
+                    "protection": {"stop_required": True},
+                    "allowed_structure_families": ["vertical_spread"],
+                    "naked_permitted": False,
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        declared = response.json()["risk_policy"]
+        assert declared["max_loss_inr"] == 25000.0
+        assert declared["allowed_structure_families"] == ["vertical_spread"]
+        assert declared["naked_permitted"] is False
+
+        # A version that declares no policy reports none, not an empty object.
+        silent = await client.post(f"{BASE}/{sid}/versions", json={"source": "y"})
+        assert silent.status_code == 200
+        assert silent.json()["risk_policy"] is None
+
+
+@pytest.mark.asyncio
+async def test_version_refuses_an_invalid_risk_policy_by_name(session_factory, monkeypatch):
+    async with _client(session_factory, monkeypatch) as client:
+        created = await _create(client)
+        sid = created["strategy_id"]
+        refused = await client.post(
+            f"{BASE}/{sid}/versions",
+            json={"source": "x", "risk_policy": {"max_loss_inr": -1}},
+        )
+        assert refused.status_code == 422
+        assert "risk_policy.max_loss_inr" in str(refused.json()["detail"])
+
+        unknown = await client.post(
+            f"{BASE}/{sid}/versions",
+            json={"source": "x", "risk_policy": {"allowed_structure_families": ["diagonal"]}},
+        )
+        assert unknown.status_code == 422
+        assert "allowed_structure_families" in str(unknown.json()["detail"])
+
+        # An invalid version is never stored: the strategy still has no versions.
+        assert (await client.get(f"{BASE}/{sid}/versions")).json()["versions"] == []
+
+
 @pytest.mark.asyncio
 async def test_hosted_options_expose_only_authorized_account_scopes(session_factory, monkeypatch):
     monkeypatch.setattr(strategies_router, "authorized_account_scopes", lambda: ["kite:paper"])

@@ -75,6 +75,7 @@ __all__ = [
     "validate_name",
     "validate_parameters",
     "validate_parameters_schema",
+    "validate_risk_policy",
     "validate_source",
 ]
 
@@ -626,6 +627,22 @@ def parse_capability_snapshot(snapshot: Optional[Mapping[str, Any]]) -> Dict[str
             )
         parsed[key] = value
     return parsed
+
+
+def validate_risk_policy(payload: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Validate an author-supplied version risk policy into a canonical object.
+
+    ``None`` means the version declares no policy. Every field is optional, so
+    an explicit ``{}`` is a real (if permissive) declaration. A malformed value
+    is refused at version creation with the offending field named, and the
+    stored object is then immutable with the rest of the version.
+    """
+    from backend.strategies import risk_policy as risk_policy_module
+
+    try:
+        return risk_policy_module.validate_risk_policy(payload)
+    except risk_policy_module.RiskPolicyError as exc:
+        raise StrategyValidationError(str(exc)) from exc
 
 
 def capability_actions(capabilities: Mapping[str, bool]) -> List[str]:

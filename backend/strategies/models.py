@@ -115,6 +115,9 @@ class HostedStrategyVersion(Base):
     source_sha256 = Column(Text, nullable=False)
     parameters_schema = Column(JSON, nullable=False, default=dict)
     capabilities_snapshot = Column(JSON, nullable=False, default=dict)
+    #: The risk policy this immutable version declares (B2.5). ``NULL`` means the
+    #: version declares none, which the options lane refuses by name.
+    risk_policy = Column(JSON, nullable=True)
     created_by = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

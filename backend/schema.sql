@@ -2323,6 +2323,7 @@ CREATE TABLE IF NOT EXISTS public.hosted_strategy_versions (
     source_sha256 TEXT NOT NULL,
     parameters_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
     capabilities_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    risk_policy JSONB,
     created_by TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT uq_hosted_strategy_versions_number UNIQUE (strategy_id, version),

@@ -437,6 +437,7 @@ class SqlAlchemyStrategyRepository:
         source_sha256: str,
         parameters_schema: Dict[str, Any],
         capabilities_snapshot: Dict[str, Any],
+        risk_policy: Optional[Dict[str, Any]] = None,
         created_by: str,
     ) -> HostedStrategyVersion:
         """Append the next immutable version under a row lock."""
@@ -460,6 +461,9 @@ class SqlAlchemyStrategyRepository:
                 source_sha256=source_sha256,
                 parameters_schema=copy.deepcopy(dict(parameters_schema or {})),
                 capabilities_snapshot=copy.deepcopy(dict(capabilities_snapshot or {})),
+                risk_policy=(
+                    None if risk_policy is None else copy.deepcopy(dict(risk_policy))
+                ),
                 created_by=created_by,
             )
             session.add(row)
