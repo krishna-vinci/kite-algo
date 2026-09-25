@@ -1750,7 +1750,7 @@ class ExecutorStagedFinancingTests(ExecutorTestCase, unittest.IsolatedAsyncioTes
         authorized = [
             row
             for row in self.ledger.events(reservation["reservation_id"])
-            if row["detail"].get("staged_increase_authorized")
+            if row["event"] == "staged_increase_authorized"
         ]
         self.assertEqual(len(authorized), 1)
         self.assertEqual(authorized[0]["detail"]["account_capacity_inr"], 20000.0)

@@ -1867,9 +1867,9 @@ class LivePlanAdapter:
                             ),
                         },
                     )
-                exposure_proof["pin"] = "EXPOSURE_SNAPSHOT_CHANGED"
+            exposure_proof["pin"] = "EXPOSURE_SNAPSHOT_CHANGED"
+            staged_detail = None
             if str(getattr(spec, "release_rule", "")) == RULE_STAGED_FUNDING_GATE:
-                staged_detail = None
                 validated_quote, funds = await self._staged_funding_gate(
                     plan,
                     spec,

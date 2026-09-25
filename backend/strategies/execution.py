@@ -541,6 +541,7 @@ class PaperPlanExecutor:
                     plan,
                     reservation,
                     leg=leg,
+                    step_no=step_no,
                     quantity=int(quantity),
                     actor=actor,
                 )
@@ -812,6 +813,7 @@ class PaperPlanExecutor:
         reservation: Optional[Dict[str, Any]],
         *,
         leg: Mapping[str, Any],
+        step_no: int,
         quantity: int,
         actor: str,
     ) -> Dict[str, Any]:
@@ -882,6 +884,7 @@ class PaperPlanExecutor:
         try:
             return self.ledger.authorize_staged_increase(
                 plan_id=str(plan.get("plan_id") or ""),
+                step_no=int(step_no),
                 requirement_inr=notional,
                 account_capacity_inr=float(available),
                 actor_id=actor,
