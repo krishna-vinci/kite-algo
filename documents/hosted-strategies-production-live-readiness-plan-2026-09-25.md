@@ -176,5 +176,10 @@ notifications. Record in `documents/hosted-strategies-rollout-<lane>-<date>.md`.
 | B2.4 S3 handover + protected continuation | done, reviewed | `965ca05` |
 | C1.1 S1+S2 live staged CNC financing | done, reviewed | `61f9c46`, `be0a94e` |
 | B2.6b design | accepted | `2dc0143` |
-| B2.6b S1 cancel + dead-submission | in review | |
-| Independent review: C1.1 + B2.4 | running | |
+| B2.6b S1 cancel + dead-submission | done, reviewed | `d917d8f`, `681c9a5` |
+| B2.4 hardening (review findings) | done, reviewed | `724e1c6` |
+| B2.6b S2 owner exit | done, reviewed | `f092ffe` |
+| C1.1 S3 repair + funds under lock | done, reviewed | `7cf54c4` |
+| B2.6b S3 flatten + owner display | in progress | |
+| C1.2 design | in progress | |
+| Independent review: C1.1 + B2.4 | done (C1.1 clean; 3 B2.4 findings fixed) | |
